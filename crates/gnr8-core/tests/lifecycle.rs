@@ -631,7 +631,7 @@ fn naming_overrides_apply() {
         .operations
         .insert("goalUuidPut".to_string(), "RenamedUpdateGoal".to_string());
 
-    lifecycle::apply_naming(&mut graph, &naming);
+    lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a valid override");
     let yaml = gnr8_core::lower::to_openapi(&graph).expect("to_openapi after naming override");
 
     assert!(
@@ -649,7 +649,7 @@ fn naming_overrides_apply() {
     noop_naming
         .operations
         .insert("doesNotExist".to_string(), "Whatever".to_string());
-    lifecycle::apply_naming(&mut graph2, &noop_naming);
+    lifecycle::apply_naming(&mut graph2, &noop_naming).expect("an unmatched key is a no-op");
     assert!(
         gnr8_core::lower::to_openapi(&graph2).is_ok(),
         "an unmatched naming key must be a silent no-op"
@@ -673,7 +673,7 @@ fn naming_type_rename_updates_refs_no_dangling() {
         .types
         .insert("CreateGoalInput".to_string(), "NewGoalRequest".to_string());
 
-    lifecycle::apply_naming(&mut graph, &naming);
+    lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a referenced rename");
 
     // to_openapi MUST succeed — a dangling $ref would raise CoreError::Lowering.
     let yaml = gnr8_core::lower::to_openapi(&graph)
@@ -692,6 +692,70 @@ fn naming_type_rename_updates_refs_no_dangling() {
         !yaml.contains("CreateGoalInput"),
         "no reference to the old type name may remain:\n{yaml}"
     );
+}
+
+/// WR-02: a `naming.types` rename whose TARGET collides with an existing type, COLLAPSES two types
+/// into one, or CHAINS off another rename must fail loud with a typed `CoreError::Config` rather than
+/// silently mis-generating a malformed/ambiguous artifact (the "never silently mis-generate" stance).
+#[test]
+fn naming_type_rename_collision_is_a_typed_error() {
+    if !go_available() {
+        eprintln!(
+            "skipping naming_type_rename_collision_is_a_typed_error: go toolchain unavailable"
+        );
+        return;
+    }
+
+    // Collision: rename CreateGoalInput → GoalResponse, but GoalResponse already exists in the fixture.
+    {
+        let mut graph = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut naming = gnr8_core::config::NamingOverrides::default();
+        naming
+            .types
+            .insert("CreateGoalInput".to_string(), "GoalResponse".to_string());
+        let err = lifecycle::apply_naming(&mut graph, &naming)
+            .expect_err("a target colliding with an existing type must error");
+        assert!(
+            matches!(err, CoreError::Config { .. }),
+            "collision must be CoreError::Config, got {err:?}"
+        );
+    }
+
+    // Collapse: two distinct types renamed to the SAME target.
+    {
+        let mut graph = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut naming = gnr8_core::config::NamingOverrides::default();
+        naming
+            .types
+            .insert("CreateGoalInput".to_string(), "Merged".to_string());
+        naming
+            .types
+            .insert("UpdateGoalInput".to_string(), "Merged".to_string());
+        let err = lifecycle::apply_naming(&mut graph, &naming)
+            .expect_err("two types renamed to the same target must error");
+        assert!(
+            matches!(err, CoreError::Config { .. }),
+            "collapse must be CoreError::Config, got {err:?}"
+        );
+    }
+
+    // Chain: A → B while B → C in the same pass (order-dependent → reject).
+    {
+        let mut graph = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut naming = gnr8_core::config::NamingOverrides::default();
+        naming
+            .types
+            .insert("CreateGoalInput".to_string(), "UpdateGoalInput".to_string());
+        naming
+            .types
+            .insert("UpdateGoalInput".to_string(), "RenamedUpdate".to_string());
+        let err =
+            lifecycle::apply_naming(&mut graph, &naming).expect_err("a chained rename must error");
+        assert!(
+            matches!(err, CoreError::Config { .. }),
+            "chain must be CoreError::Config, got {err:?}"
+        );
+    }
 }
 
 /// Recursively copy `src` into `dst` (creating `dst`), so a test can stage a self-contained copy of

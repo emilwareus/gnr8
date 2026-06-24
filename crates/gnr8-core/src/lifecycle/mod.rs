@@ -270,59 +270,136 @@ fn safe_output_path(
 ///   `CoreError::Lowering`. By keeping `id == name == new value` and rewriting every ref, the
 ///   component key, the resolved `$ref` name, and the references all stay consistent.
 ///
-/// A key with no matching operation/schema is a silent no-op (NOT an error).
-pub fn apply_naming(graph: &mut ApiGraph, naming: &NamingOverrides) {
-    // Operation-id remaps.
+/// `naming.types` keys MUST reference the ORIGINAL type ids/names: all keys are resolved against the
+/// pre-rename graph in one pass, so the order of the (sorted) `BTreeMap` can never make one rename
+/// observe another's output (WR-02). A key with no matching operation/schema is a silent no-op (NOT an
+/// error) — it is a documented "remap if present" escape hatch.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Config`] when `naming.types` would silently MIS-generate rather than
+/// fail loud (WR-02, the "fail loud, never silently mis-generate" stance this phase takes elsewhere):
+/// - **collapse** — two different keys rename distinct types to the SAME target name (two schemas would
+///   share `id == name`, and `to_openapi`'s id-keyed `BTreeMap` would drop one);
+/// - **collision** — a target name equals an existing schema that is NOT itself being renamed away (the
+///   rename would shadow an unrelated type);
+/// - **chain/cycle** — a target name equals the SOURCE of another rename in the same pass (e.g. `A="B"`
+///   with `B="C"`), whose result would otherwise be order-dependent and surprising.
+pub fn apply_naming(
+    graph: &mut ApiGraph,
+    naming: &NamingOverrides,
+) -> Result<(), crate::CoreError> {
+    // Operation-id remaps (independent of the type-rename collision analysis below).
     for op in &mut graph.operations {
         if let Some(new_id) = naming.operations.get(&op.id) {
             op.id = new_id.clone();
         }
     }
 
-    // Type remaps: rename the schema (id + name) AND rewrite every ref pointing at the old id.
+    // Resolve EVERY type key against the ORIGINAL (pre-rename) graph first, so iteration order can
+    // never let one rename observe another's output (WR-02). Each resolved rename carries the schema's
+    // (old_id, old_name, new_name). The COMPONENT KEY emitted by `to_openapi` is the bare `name`
+    // (lower/mod.rs maps `schema.id -> schema.name`), so the uniqueness invariant we must protect is
+    // over the bare NAMES post-rename, not the package-qualified ids.
+    let original_names: std::collections::BTreeSet<&str> =
+        graph.schemas.iter().map(|s| s.name.as_str()).collect();
+    let mut renames: Vec<(String, String, String)> = Vec::new();
+    let mut seen_old_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The bare names being vacated by renames (so a target may legitimately reuse a freed name).
+    let mut freed_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (key, new_name) in &naming.types {
-        // Find the schema by id or bare name; capture its current id so we can rewrite refs.
-        let Some(old_id) = graph
+        let Some((old_id, old_name)) = graph
             .schemas
             .iter()
             .find(|s| &s.id == key || &s.name == key)
-            .map(|s| s.id.clone())
+            .map(|s| (s.id.clone(), s.name.clone()))
         else {
-            continue; // unmatched key → silent no-op
+            continue; // unmatched key → silent no-op (remap-if-present escape hatch).
         };
+        // Two keys (e.g. one by id, one by bare name) resolving to the SAME original schema is
+        // ambiguous — reject rather than apply a sorted-order-dependent winner.
+        if !seen_old_ids.insert(old_id.clone()) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "naming.types: multiple overrides match the same type {old_id:?}; \
+                     each type may be renamed at most once"
+                ),
+            });
+        }
+        freed_names.insert(old_name.clone());
+        renames.push((old_id, old_name, new_name.clone()));
+    }
 
-        // Rename the schema itself (both id and name → the new value).
+    // Detect target collisions/collapses/chains against the ORIGINAL graph BEFORE mutating anything,
+    // so a bad config fails loud and the graph is left untouched.
+    let mut targets: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for (old_id, old_name, new_name) in &renames {
+        if new_name == old_name {
+            continue; // renaming a type to its own current name is a harmless no-op.
+        }
+        // Collapse: two distinct renames target the same new name.
+        if let Some(prev_old) = targets.insert(new_name.as_str(), old_id.as_str()) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "naming.types: {prev_old:?} and {old_id:?} both rename to {new_name:?}; \
+                     a rename target must be unique (this would collapse two types into one)"
+                ),
+            });
+        }
+        // Chain/cycle: the target equals the SOURCE (current bare name) of ANOTHER rename
+        // (e.g. A→B while B→C) — the outcome would be order-dependent, so reject it.
+        if freed_names.contains(new_name.as_str()) && new_name.as_str() != old_name.as_str() {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "naming.types: target {new_name:?} of {old_id:?} is itself being renamed; \
+                     chained renames are not supported — keys must reference original type names"
+                ),
+            });
+        }
+        // Collision: the target equals an existing type's bare name that is NOT being vacated by a
+        // rename (the component key would shadow an unrelated type).
+        if original_names.contains(new_name.as_str()) && !freed_names.contains(new_name.as_str()) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "naming.types: target {new_name:?} of {old_id:?} collides with an existing \
+                     type; choose a name that is not already a generated type"
+                ),
+            });
+        }
+    }
+
+    // Apply every resolved rename in one pass (rename the schema id+name, then rewrite all refs).
+    for (old_id, _old_name, new_name) in &renames {
         for schema in &mut graph.schemas {
-            if schema.id == old_id {
+            if &schema.id == old_id {
                 schema.id.clone_from(new_name);
                 schema.name.clone_from(new_name);
             }
         }
-
-        // Rewrite every reference to the old id so no $ref dangles (PLAN-CHECK W2).
         for schema in &mut graph.schemas {
             for field in &mut schema.fields {
-                rewrite_schema_type_ref(&mut field.schema, &old_id, new_name);
+                rewrite_schema_type_ref(&mut field.schema, old_id, new_name);
             }
         }
         for op in &mut graph.operations {
             if let Some(body) = op.request_body.as_mut() {
-                if body.ref_id == old_id {
+                if &body.ref_id == old_id {
                     body.ref_id.clone_from(new_name);
                 }
             }
             for resp in &mut op.responses {
                 if let Some(body) = resp.body.as_mut() {
-                    if body.ref_id == old_id {
+                    if &body.ref_id == old_id {
                         body.ref_id.clone_from(new_name);
                     }
                 }
             }
             for param in &mut op.params {
-                rewrite_schema_type_ref(&mut param.schema, &old_id, new_name);
+                rewrite_schema_type_ref(&mut param.schema, old_id, new_name);
             }
         }
     }
+    Ok(())
 }
 
 /// Rewrite a `ref`-kind [`crate::graph::SchemaType`]'s `ref_id` (recursing into array `items`) from
@@ -422,7 +499,7 @@ fn build_outputs(
     // configured output paths (or `.gnr8/`) BEFORE naming/lowering, so `init → generate → generate`
     // under the default config is a true no-op rather than duplicating every schema (WATCH-01).
     exclude_output_paths(&mut graph, config);
-    apply_naming(&mut graph, &config.naming);
+    apply_naming(&mut graph, &config.naming)?;
 
     let openapi = crate::lower::to_openapi(&graph)?;
     let bundle = crate::sdk::generate(&graph)?;
