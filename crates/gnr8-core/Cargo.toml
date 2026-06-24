@@ -1,0 +1,18 @@
+[package]
+name = "gnr8-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+# NOTE: the ergonomic binary-boundary error crate is intentionally absent here —
+# it lives only in the gnr8 binary (D-09). Library code uses thiserror typed errors.
+
+[dev-dependencies]
+insta = { workspace = true }

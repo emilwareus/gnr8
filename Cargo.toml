@@ -1,0 +1,36 @@
+# gnr8 — Cargo workspace root.
+# Single source of truth for shared lint policy (D-08) and dependency versions
+# (verified 2026-06-24 against the crates.io sparse index — see 01-RESEARCH.md).
+[workspace]
+members = ["crates/gnr8-core", "crates/gnr8"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"        # D-08
+rust-version = "1.85"   # MSRV floor: clap 4.6 requires 1.85
+license = "MIT"         # matches repo LICENSE
+
+# Shared lint policy (rust-best-practices skill ch.2 + D-08).
+# `priority` resolves conflicts: a lower priority is overridden by a higher one;
+# group-level lints use priority -1 so individual lints below them win.
+[workspace.lints.rust]
+unsafe_code = "forbid"      # T-01-02: no unsafe memory in gnr8-core/gnr8
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# RUST-04 / T-01-03 enforcement: ban panicking paths in production code.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"               # surface scaffolding TODOs without failing the build
+
+[workspace.dependencies]
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2.0"           # NOTE: v2, not v1
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+insta = { version = "1.48", features = ["yaml"] }
+gnr8-core = { path = "crates/gnr8-core" }
