@@ -499,7 +499,10 @@ pub(crate) fn emit_operations(
     let mut imports: Vec<&str> = vec!["bytes", "context", "encoding/json", "fmt", "net/http"];
     imports.extend(query_imports(ops, graph)?);
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
-    if ops.iter().any(|op| op.params.iter().any(|p| p.location == "path")) {
+    if ops
+        .iter()
+        .any(|op| op.params.iter().any(|p| p.location == "path"))
+    {
         imports.push("net/url");
     }
     let _ = tag; // the tag names the FILE (handled by the bundle), not the imports.
@@ -1483,7 +1486,9 @@ mod tests {
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "Goals", &ops).unwrap();
             assert!(
-                out.contains("reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"),
+                out.contains(
+                    "reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"
+                ),
                 "path arg must be wrapped in url.PathEscape:\n{out}"
             );
             assert!(
