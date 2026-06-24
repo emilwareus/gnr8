@@ -343,37 +343,47 @@ return e.StatusCode == 404
     file(&["fmt"], body)
 }
 
-/// The success model + status of an operation's first 2xx response, if any.
+/// The success status + (optional) model of an operation's first 2xx response.
+///
+/// WR-01: `model` is `Option` because a 2xx response can carry no body (e.g. a `204 No Content` or a
+/// body-less `201`); the `status` is always the response's real status so the dispatch compares
+/// against the actual success code rather than a hard-coded `200`.
 struct Success {
     status: u16,
-    model: String,
+    model: Option<String>,
 }
 
-/// Resolve an operation's primary success (lowest 2xx) response model name.
+/// Resolve an operation's primary success (lowest 2xx) response status + model name.
+///
+/// Returns the first 2xx response's status regardless of whether it carries a body (WR-01); the
+/// model is `Some` only when that response has a typed body. An operation with no 2xx response at all
+/// yields `None`.
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling. A response with no body is
-/// permitted (some ops only return a status) and yields `None`.
+/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
 fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<Success>, CoreError> {
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
-            let Some(body) = &resp.body else {
-                return Ok(None);
+            let model = match &resp.body {
+                Some(body) => {
+                    let model = graph
+                        .schemas
+                        .iter()
+                        .find(|s| s.id == body.ref_id)
+                        .ok_or_else(|| CoreError::SdkGen {
+                            message: format!(
+                                "operation '{}' success response references dangling $ref '{}'",
+                                op.id, body.ref_id
+                            ),
+                        })?;
+                    Some(model.name.clone())
+                }
+                None => None,
             };
-            let model = graph
-                .schemas
-                .iter()
-                .find(|s| s.id == body.ref_id)
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "operation '{}' success response references dangling $ref '{}'",
-                        op.id, body.ref_id
-                    ),
-                })?;
             return Ok(Some(Success {
                 status: resp.status,
-                model: model.name.clone(),
+                model,
             }));
         }
     }
@@ -509,10 +519,14 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
 
     let body_model = body_model_of(op, graph)?;
     let success = success_of(op, graph)?;
+    // The return type is the success model when one exists, else an empty struct.
     let return_model = success
         .as_ref()
-        .map_or("struct{}", |s| s.model.as_str())
+        .and_then(|s| s.model.as_deref())
+        .unwrap_or("struct{}")
         .to_string();
+    // WR-01: compare against the operation's REAL success status (e.g. 201/204), not a default 200.
+    // An op with no 2xx response declared falls back to 200 (the conventional default).
     let success_status = success.as_ref().map_or(200, |s| s.status);
 
     // Build the signature argument list.
@@ -543,7 +557,7 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
     writeln!(body, "var out {return_model}").map_err(sink)?;
 
     let has_body = body_model.is_some();
-    let has_decode = success.as_ref().is_some_and(|s| s.model != "struct{}");
+    let has_decode = success.as_ref().is_some_and(|s| s.model.is_some());
     emit_request_dispatch(
         body,
         op,
@@ -984,6 +998,32 @@ mod tests {
         ApiGraph::from_facts(facts, "/root")
     }
 
+    /// A minimal graph with ONE POST operation whose only success response is a body-less `{status}`
+    /// (no response body) — used to prove WR-01 compares against the operation's real success status.
+    fn body_less_success_graph(status: u16) -> ApiGraph {
+        let facts = format!(
+            r#"{{
+              "module": "github.com/acme/svc",
+              "routes": [
+                {{
+                  "method": "POST", "path": "/", "router_path": null, "handler": "createGoal",
+                  "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
+                  "security_schemes": ["ApiKeyAuth"], "params": [],
+                  "request_body": null,
+                  "responses": [
+                    {{ "status": {status}, "body": null, "description": "created" }}
+                  ],
+                  "span": {{ "file": "/root/http.go", "start_line": 1, "end_line": 1 }}
+                }}
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }}"#
+        );
+        let facts = serde_json::from_str(&facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
     /// A minimal graph with ONE GET operation that declares ONLY a `200` response (no error body),
     /// so the SDK has no graph error model and must fall back to an anonymous struct (CR-01).
     fn no_error_response_graph() -> ApiGraph {
@@ -1221,6 +1261,40 @@ mod tests {
                 "absent error model must not reference any named error type:\n{out}"
             );
             assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+        }
+
+        #[test]
+        fn body_less_201_compares_against_its_real_status_not_a_default_200() {
+            // WR-01: an operation whose only success response is a body-less `201` must compare
+            // `resp.StatusCode != 201`, not the previous hard-coded `!= 200` (which treated the real
+            // 201 success as an error). The method also returns an empty `struct{}` (no body model).
+            let graph = super::body_less_success_graph(201);
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("if resp.StatusCode != 201 {"),
+                "body-less 201 must compare against 201:\n{out}"
+            );
+            assert!(
+                !out.contains("if resp.StatusCode != 200 {"),
+                "body-less 201 must NOT default to 200:\n{out}"
+            );
+            assert!(
+                out.contains("(struct{}, error)"),
+                "a body-less success returns an empty struct:\n{out}"
+            );
+        }
+
+        #[test]
+        fn body_less_204_compares_against_its_real_status() {
+            // WR-01: a body-less `204 No Content` must likewise compare against 204.
+            let graph = super::body_less_success_graph(204);
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("if resp.StatusCode != 204 {"),
+                "body-less 204 must compare against 204:\n{out}"
+            );
         }
 
         #[test]
