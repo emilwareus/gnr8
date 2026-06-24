@@ -238,9 +238,15 @@ fn blake3_hex_is_stable() {
     let a = gnr8_core::manifest::blake3_hex(b"package goalservice\n");
     let b = gnr8_core::manifest::blake3_hex(b"package goalservice\n");
     assert_eq!(a, b, "same bytes must hash to the same digest");
-    assert_eq!(a.len(), 64, "blake3 hex digest is 64 chars, got {}", a.len());
+    assert_eq!(
+        a.len(),
+        64,
+        "blake3 hex digest is 64 chars, got {}",
+        a.len()
+    );
     assert!(
-        a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+        a.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
         "digest must be lowercase hex, got {a}"
     );
     // A different input must yield a different digest.
@@ -294,7 +300,8 @@ fn manifest_absent_loads_empty() {
     let gnr8 = root.join(".gnr8");
     std::fs::create_dir_all(&gnr8).expect("create .gnr8");
 
-    let manifest = gnr8_core::manifest::load(&gnr8).expect("absent manifest loads as empty default");
+    let manifest =
+        gnr8_core::manifest::load(&gnr8).expect("absent manifest loads as empty default");
     assert!(
         manifest.files.is_empty(),
         "absent manifest must load with no files"
