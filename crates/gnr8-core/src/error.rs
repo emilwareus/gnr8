@@ -23,4 +23,85 @@ pub enum CoreError {
         /// The roadmap phase that will implement it.
         phase: u8,
     },
+
+    /// The Go toolchain could not be spawned (e.g. `go` is not installed or not on `PATH`).
+    ///
+    /// Wraps the [`std::io::Error`] from spawning the `goextract` subprocess so the cause is
+    /// preserved without panicking (GO-06).
+    #[error("Go toolchain not available (is `go` installed and on PATH?): {source}")]
+    GoToolchainMissing {
+        /// The underlying spawn error from [`std::process::Command::output`].
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The `goextract` helper ran but exited with a non-zero status.
+    ///
+    /// Carries the exit `code` (absent if the process was signal-terminated) and the captured
+    /// `stderr` text so callers can diagnose the failure (GO-06).
+    #[error("goextract helper exited with status {code:?}:\n{stderr}")]
+    HelperExit {
+        /// The process exit code, or `None` if terminated by a signal.
+        code: Option<i32>,
+        /// The captured standard-error output of the helper.
+        stderr: String,
+    },
+
+    /// The helper's stdout could not be parsed as the expected JSON facts document.
+    ///
+    /// Wraps the [`serde_json::Error`] (including position info) so malformed or
+    /// forward-incompatible JSON is a typed error, never a panic (GO-06 / Security V5).
+    #[error("failed to parse goextract JSON facts: {source}")]
+    FactsParse {
+        /// The underlying deserialization error.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5);
+    // scope the allow so the workspace-wide RUST-04 deny stays intact for prod code.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::CoreError;
+
+    mod display {
+        use super::CoreError;
+
+        #[test]
+        fn go_toolchain_missing_renders_with_source() {
+            let err = CoreError::GoToolchainMissing {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Go toolchain not available"), "{msg}");
+            assert!(msg.contains("no such file"), "{msg}");
+        }
+
+        #[test]
+        fn helper_exit_renders_code_and_stderr() {
+            let err = CoreError::HelperExit {
+                code: Some(2),
+                stderr: "go: cannot find module".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("exited with status"), "{msg}");
+            assert!(msg.contains("Some(2)"), "{msg}");
+            assert!(msg.contains("go: cannot find module"), "{msg}");
+        }
+
+        #[test]
+        fn facts_parse_renders_underlying_serde_error() {
+            // Force a real serde_json::Error by parsing invalid JSON.
+            let parse_err = serde_json::from_str::<serde_json::Value>("{ not json }").unwrap_err();
+            let err = CoreError::FactsParse { source: parse_err };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("failed to parse goextract JSON facts"),
+                "{msg}"
+            );
+        }
+    }
 }

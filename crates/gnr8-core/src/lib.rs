@@ -50,12 +50,11 @@ mod tests {
     fn not_yet_returns_typed_error() {
         let result = not_yet::<()>("init", 4);
         let err = result.unwrap_err();
-        match err {
-            CoreError::NotYetImplemented { command, phase } => {
-                assert_eq!(command, "init");
-                assert_eq!(phase, 4);
-            }
-        }
+        let CoreError::NotYetImplemented { command, phase } = err else {
+            unreachable!("not_yet must return NotYetImplemented, got {err:?}");
+        };
+        assert_eq!(command, "init");
+        assert_eq!(phase, 4);
     }
 
     #[test]

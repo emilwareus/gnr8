@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
+# serde_json deserializes the goextract JSON facts (analyze::facts) and is the source
+# error type for CoreError::FactsParse. Pinned via [workspace.dependencies] (1.0).
+serde_json = { workspace = true }
 # NOTE: the ergonomic binary-boundary error crate is intentionally absent here —
 # it lives only in the gnr8 binary (D-09). Library code uses thiserror typed errors.
 
