@@ -106,6 +106,55 @@ pub enum CoreError {
         /// The captured standard-error output of `go build`.
         stderr: String,
     },
+
+    /// The `.gnr8/` workspace scaffold could not be created (Phase 4 / WS-01, D-01).
+    ///
+    /// Raised by [`crate::workspace::init`] when a directory cannot be created or a workspace
+    /// file cannot be written. Carries an owned `message` (built with `format!` at the call site
+    /// from the underlying [`std::io::Error`]) so the variant matches the existing Lowering/SdkGen
+    /// owned-message shape and stays free of `#[source]` coupling. No panic (RUST-04 / T-04-01-01).
+    #[error("workspace scaffold failed: {message}")]
+    Workspace {
+        /// Human-readable failure detail naming the offending path.
+        message: String,
+    },
+
+    /// A `.gnr8/config.toml` could not be read or parsed into the typed [`crate::config::Config`]
+    /// (Phase 4 / WS-03, D-03).
+    ///
+    /// Raised by [`crate::config::parse`]/[`crate::config::load`] for a missing/unreadable config
+    /// file or malformed/typo'd TOML. `#[serde(deny_unknown_fields)]` makes an unrecognized key a
+    /// clean typed error here rather than a silent mis-generation (V5 / T-04-01-02, T-04-01-03).
+    /// Carries the owned `message`; never a panic.
+    #[error("config error: {message}")]
+    Config {
+        /// Human-readable failure detail (the toml parse error or an actionable hint).
+        message: String,
+    },
+
+    /// The ownership manifest (`.gnr8/cache/manifest.json`) could not be loaded, parsed, or saved
+    /// (Phase 4 / WS-04, D-04).
+    ///
+    /// Defined here in 04-01 so plan 04-02 (the ownership manifest + `plan_writes`) consumes it
+    /// without editing `error.rs` — mirroring how 03-01 pre-defined SdkGen/GoFmt/GoBuild for later
+    /// plans. First CONSUMED in 04-02. Carries an owned `message`; never a panic.
+    #[error("manifest error: {message}")]
+    Manifest {
+        /// Human-readable failure detail.
+        message: String,
+    },
+
+    /// A general filesystem I/O failure in the lifecycle/watch layer (Phase 4).
+    ///
+    /// Defined here in 04-01 so plans 04-02 (write application) and 04-03 (watch loop) consume it
+    /// without editing `error.rs`. First CONSUMED in 04-02/04-03. Carries an owned `message` built
+    /// with `format!("...: {err}")` at the call site (owned-message shape, no `#[source]` coupling);
+    /// never a panic.
+    #[error("io error: {message}")]
+    Io {
+        /// Human-readable failure detail naming the offending operation/path.
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -195,6 +244,46 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("Some(1)"), "{msg}");
             assert!(msg.contains("imported and not used"), "{msg}");
+        }
+
+        #[test]
+        fn workspace_renders_with_message() {
+            let err = CoreError::Workspace {
+                message: "failed to write /tmp/proj/.gnr8/config.toml: permission denied".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("workspace scaffold failed"), "{msg}");
+            assert!(msg.contains("permission denied"), "{msg}");
+        }
+
+        #[test]
+        fn config_renders_with_message() {
+            let err = CoreError::Config {
+                message: "unknown field `bogus`".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("config error"), "{msg}");
+            assert!(msg.contains("unknown field `bogus`"), "{msg}");
+        }
+
+        #[test]
+        fn manifest_renders_with_message() {
+            let err = CoreError::Manifest {
+                message: "malformed manifest.json".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("manifest error"), "{msg}");
+            assert!(msg.contains("malformed manifest.json"), "{msg}");
+        }
+
+        #[test]
+        fn io_renders_with_message() {
+            let err = CoreError::Io {
+                message: "failed to read sdk/client.go: not found".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("io error"), "{msg}");
+            assert!(msg.contains("failed to read sdk/client.go: not found"), "{msg}");
         }
     }
 }

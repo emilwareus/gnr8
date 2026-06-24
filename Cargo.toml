@@ -33,4 +33,11 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 insta = { version = "1.48", features = ["yaml"] }
+# Phase-4 lifecycle/watch runtime crates — versions verified 2026-06-24 against the
+# crates.io sparse index (04-RESEARCH.md). Pinned here as the single source of truth;
+# member crates reference them with `{ workspace = true }`. Stable releases ONLY — the
+# notify 9.0 / debouncer 0.8 release candidates are deliberately NOT used.
+blake3 = "1.8"                  # content hashing for the ownership manifest (consumed in 04-02)
+toml = "1.1"                    # parse the checked-in .gnr8/config.toml PoC config (consumed in 04-01)
+notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consumed in 04-03)
 gnr8-core = { path = "crates/gnr8-core" }

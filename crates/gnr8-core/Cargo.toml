@@ -14,6 +14,12 @@ serde = { workspace = true }
 # serde_json deserializes the goextract JSON facts (analyze::facts) and is the source
 # error type for CoreError::FactsParse. Pinned via [workspace.dependencies] (1.0).
 serde_json = { workspace = true }
+# toml parses the checked-in .gnr8/config.toml PoC config surface (config::parse, 04-01).
+# blake3 is pinned in [workspace.dependencies] but NOT added here yet: it is unused until
+# 04-02's ownership manifest consumes it, and adding an unused crate would trip the
+# `-D warnings` clippy gate (unused_crate_dependencies). 04-02 adds the blake3 line when
+# the manifest lands (PLAN-CHECK W1).
+toml = { workspace = true }
 # NOTE: the ergonomic binary-boundary error crate is intentionally absent here —
 # it lives only in the gnr8 binary (D-09). Library code uses thiserror typed errors.
 
