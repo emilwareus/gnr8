@@ -109,3 +109,37 @@ the internal graph stores **router-agnostic HTTP route facts** (method, path tem
 request type, response type + status). This keeps chi / echo / net-http addable later without
 reshaping the graph or revisiting OpenAPI lowering and SDK generation. Do not introduce
 router-framework-specific fields into the graph types.
+
+---
+
+## 5. CI policy — blocking gates vs. the red-by-design contract suite (RUST-03 + FIX-04)
+
+Phase 1 deliberately ships a test suite that is **red by design**: the four contract snapshot tests
+(`crates/gnr8-core/tests/snapshot_{graph,openapi,sdk,diagnostics}.rs`) call gnr8-core seams that
+still return `CoreError::NotYetImplemented`, so they **fail clearly today** (FIX-04 — they are never
+`#[ignore]`d / silently skipped). This is in direct tension with RUST-03, which requires
+`cargo fmt` / `cargo clippy -D warnings` / `cargo test` to **pass**.
+
+These two requirements are reconciled with **Open Question 1, option (d)** from the phase research:
+**split the gate from the contract suite.** CI (`.github/workflows/ci.yml`) and local `make` define
+three concerns:
+
+| Job / target | Blocking? | What it runs | Status today |
+|--------------|-----------|--------------|--------------|
+| `gates` (CI) / `make gates` | **BLOCKING** | `cargo fmt --check`, `cargo clippy --all-targets --all-features --locked -- -D warnings`, and the **genuinely-green** tests only (`cargo test -p gnr8-core --lib && cargo test -p gnr8` — the integration `tests/` dir is excluded) | **Green.** Enforces RUST-03; a real regression (compile / clippy / unit / parse failure) still blocks merges. |
+| `go-fixture` (CI) / `make fixture-build` | **BLOCKING** | `go build ./...` + `go vet ./...` in `fixtures/goalservice/` | **Green.** Keeps the standalone Go fixture (which cargo never compiles) from rotting. |
+| `contract` (CI) / `make contract` | **NON-BLOCKING** (`continue-on-error: true`) | The four red-by-design snapshot tests | **Red on purpose.** Visibly fails (FIX-04) without blocking merges. |
+
+**Why a `.expect()`-driven red (not a missing snapshot):** the primary redness mechanism is a
+panicking `.expect()` on the stubbed seam, which fires *before* any `insta::assert_*`. Because CI sets
+`CI=true`, insta runs in `INSTA_UPDATE=no` mode, so it never auto-accepts an empty snapshot — but the
+panic happens first anyway, so a real failing assertion is what turns the suite red. No `.snap` files
+are pre-authored in Phase 1.
+
+**Local parity:** `make check` runs the *full* gate, so `make test` shows the same four red contract
+failures a developer would see in the non-blocking CI job — the contract is visible locally, not just
+in CI.
+
+**Promotion to blocking:** the `contract` job is promoted to a **blocking** gate once **Phase 3**
+lands the analyzer, OpenAPI lowering, and Go SDK generation and the four snapshots are reviewed and
+accepted (turning the suite green). Until then, blocking enforcement lives in `gates` + `go-fixture`.

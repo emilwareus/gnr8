@@ -1,0 +1,74 @@
+# gnr8 CI — RUST-03 quality gates + Go fixture compile + red-by-design contract suite.
+#
+# Reconciles RUST-03 (gates must pass) with FIX-04 (the four snapshot tests are visibly RED until
+# Phases 2-3) via RESEARCH Open Q1 option (d):
+#
+#   * gates      (BLOCKING)     fmt-check + clippy(-D warnings, --locked) + genuinely-green tests
+#   * go-fixture (BLOCKING)     go build/vet of the standalone Gin fixture module (Pitfall 5)
+#   * contract   (NON-BLOCKING) the four red-by-design snapshot tests — continue-on-error: true
+#
+# The `contract` job is VISIBLY RED today (the seams return NotYetImplemented → the .expect() panics)
+# but does NOT block merges. It is PROMOTED TO BLOCKING once Phase 3 lands the analyzer + lowering +
+# SDK generation and the snapshots are reviewed/accepted (see docs/poc-contract.md §"CI policy").
+#
+# Third-party actions are pinned to major-version tags from well-known publishers (actions/*, dtolnay,
+# Swatinem) per the threat register (T-03-02). GitHub Actions sets CI=true, so insta runs in
+# INSTA_UPDATE=no mode — a missing/mismatched snapshot is a hard failure, never an auto-accept (FIX-04).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # BLOCKING — the RUST-03 gate. Runs only genuinely-green tests so this job stays green in Phase 1.
+  gates:
+    name: gates (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # Run only the green unit + CLI parse tests (exclude the integration tests/ dir, which holds the
+      # four red-by-design contract tests). Keeps the blocking gate green while FIX-04 redness lives in
+      # the separate `contract` job below.
+      - name: test (lib + bin, excluding red-by-design contract tests)
+        run: |
+          cargo test -p gnr8-core --lib
+          cargo test -p gnr8
+
+  # BLOCKING — the Go fixture is a separate module cargo never compiles; gate it so it can't rot.
+  go-fixture:
+    name: go-fixture (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: go build + vet
+        run: cd fixtures/goalservice && go build ./... && go vet ./...
+
+  # NON-BLOCKING — the four red-by-design contract tests. VISIBLY RED until Phases 2-3 implement the
+  # seams. continue-on-error keeps a red `main` from blocking merges while honoring FIX-04 (never
+  # #[ignore]d). PROMOTE TO BLOCKING in Phase 3 once the snapshots turn green.
+  contract:
+    name: contract (non-blocking, red-by-design)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: red-by-design contract suite (expected to FAIL until Phase 3)
+        run: cargo test -p gnr8-core --test snapshot_graph --test snapshot_openapi --test snapshot_sdk --test snapshot_diagnostics
