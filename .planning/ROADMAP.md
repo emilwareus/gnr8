@@ -26,9 +26,9 @@ The PoC moves from a minimal Rust CLI and realistic Go fixtures to a complete Go
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: Lock PoC contract and scaffold the Rust workspace.
-- [ ] 01-02: Add realistic Go fixtures and expected snapshot structure.
-- [ ] 01-03: Wire quality gates, fixture harness, and baseline failing expectations.
+- [ ] 01-01-PLAN.md — Lock the PoC contract (docs/poc-contract.md) and scaffold the Cargo workspace: gnr8-core lib (CoreError + module seams) + gnr8 clap CLI.
+- [ ] 01-02-PLAN.md — Add the realistic Go Gin fixture module (CRUD + list-with-filters, full DTO coverage incl. map[string]any) and expected/ acceptance scaffolds.
+- [ ] 01-03-PLAN.md — Wire fmt/clippy/test gates (Makefile + CI), the insta harness, and the four red-by-design contract tests; blocking checkpoint on phase-gate state.
 
 ### Phase 2: Go Analysis And API Graph
 **Goal**: Build the native Go extraction path and produce inspectable API graph reports.
