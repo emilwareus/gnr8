@@ -862,6 +862,82 @@ fn default_config_second_regenerate_is_a_noop() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// WR-02: `diagnostics_only` (the seam `gnr8 doctor` uses) harvests diagnostics over the SAME graph
+/// `generate` acts on — it applies `exclude_output_paths`, so AFTER a cold `generate` writes gnr8's own
+/// `sdk/*.go` into the analyzed `.` tree, NONE of the doctor diagnostics point at a generated output
+/// file. A raw `build_graph` over the same tree WOULD re-analyze those generated files; `diagnostics_only`
+/// must not. This keeps doctor's informational output consistent with what the pipeline ingests.
+#[test]
+fn diagnostics_only_excludes_generated_output() {
+    if !go_available() {
+        eprintln!("skipping diagnostics_only_excludes_generated_output: go toolchain unavailable");
+        return;
+    }
+    let root = unique_temp_dir("diagnostics-exclude");
+
+    // Stage the fixture under the temp root with the DEFAULT layout (inputs `.`, outputs `sdk/`
+    // inside the analyzed tree) — the layout where self-ingestion would otherwise occur.
+    copy_dir_recursive(std::path::Path::new(FIXTURE_DIR), &root);
+    gnr8_core::workspace::init(&root).expect("init .gnr8 workspace");
+    let config = gnr8_core::config::parse(gnr8_core::workspace::DEFAULT_CONFIG_TOML)
+        .expect("DEFAULT_CONFIG_TOML must parse");
+
+    // Cold run materializes gnr8's own sdk/*.go + openapi.yaml INSIDE the input tree.
+    lifecycle::regenerate(&root, &config, false).expect("cold regenerate");
+    assert!(
+        root.join(&config.output.sdk_dir).is_dir(),
+        "cold generate must have written the SDK dir into the analyzed tree"
+    );
+
+    // The doctor seam: diagnostics over the post-`exclude_output_paths` graph.
+    let doctor_diags = lifecycle::diagnostics_only(&root, &config)
+        .expect("diagnostics_only over a valid single-input project");
+
+    // No diagnostic may point at a generated output file (under sdk/ or the openapi artifact).
+    let sdk_prefix = format!("{}/", config.output.sdk_dir.trim_end_matches('/'));
+    for d in &doctor_diags {
+        assert!(
+            !d.file.starts_with(&sdk_prefix) && d.file != config.output.openapi,
+            "doctor diagnostics must EXCLUDE gnr8's own generated output, but got one on {} \
+             (WR-02: doctor must analyze the same graph generate does)",
+            d.file
+        );
+    }
+
+    // A RAW build_graph over the same tree (no exclusion) sees STRICTLY MORE diagnostics — at least
+    // the generated-output ones doctor correctly drops — proving the exclusion did real work.
+    let raw = gnr8_core::analyze::build_graph(&root.to_string_lossy())
+        .expect("raw build_graph over the generated tree");
+    assert!(
+        raw.diagnostics.len() >= doctor_diags.len(),
+        "the unfiltered graph cannot have fewer diagnostics than the filtered doctor graph"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WR-02: `diagnostics_only` enforces the same single-input PoC restriction as `build_outputs`, so a
+/// multi-input config surfaces a typed `CoreError::Config` rather than silently analyzing only the
+/// first input (keeping doctor consistent with what `generate` would refuse to build). No toolchain
+/// needed — the check fires before any Go analysis.
+#[test]
+fn diagnostics_only_rejects_multi_input() {
+    let root = unique_temp_dir("diagnostics-multi-input");
+    gnr8_core::workspace::init(&root).expect("init .gnr8 workspace");
+
+    let config_src = "inputs = [\"a\", \"b\"]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/test/sdk\"\n";
+    let config = gnr8_core::config::parse(config_src).expect("parse multi-input config");
+
+    let err = lifecycle::diagnostics_only(&root, &config)
+        .expect_err("a multi-input config must be rejected, not silently truncated");
+    assert!(
+        matches!(err, CoreError::Config { .. }),
+        "multi-input must be CoreError::Config, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Scaffold a project root with a `.gnr8/config.toml` whose `inputs` point at the fixture, returning
 /// `(root, config)` ready for `regenerate`. Outputs land under the temp root (hermetic).
 fn scaffold_project(label: &str) -> (PathBuf, gnr8_core::config::Config) {

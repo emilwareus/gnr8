@@ -320,12 +320,11 @@ fn run_doctor(json: bool) -> Result<()> {
     // "diagnostics/drift unavailable", never propagated as a crash (Pitfall 4 / D-02).
     let (overlap, diagnostics, drift) = if let (Ok(cfg), true) = (&config, go_present) {
         let overlap = inputs_overlap_outputs(cfg);
-        let diagnostics = cfg.inputs.first().and_then(|input| {
-            let resolved = root.join(input);
-            gnr8_core::analyze::build_graph(&resolved.to_string_lossy())
-                .ok()
-                .map(|g| g.diagnostics)
-        });
+        // Harvest diagnostics over the SAME graph `generate` acts on — `diagnostics_only` applies the
+        // `exclude_output_paths` filter `build_outputs` uses, so `doctor` never re-analyzes gnr8's own
+        // generated `sdk/*.go` / `openapi.yaml` and reports the diagnostics the real pipeline sees
+        // (WR-02). An analysis error degrades to a graceful `None`, never `?`/unwrap'd (Pitfall 4).
+        let diagnostics = gnr8_core::lifecycle::diagnostics_only(&root, cfg).ok();
         let drift = gnr8_core::lifecycle::plan_only(&root, cfg).ok();
         (overlap, diagnostics, drift)
     } else {

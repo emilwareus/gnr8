@@ -541,6 +541,65 @@ fn build_outputs(
     Ok(outputs)
 }
 
+/// Harvest the analysis diagnostics for `config` over the SAME graph the generation pipeline acts on.
+///
+/// Runs the identical front half of [`build_outputs`] — resolve the first configured input against
+/// `project_root`, [`build_graph`](crate::analyze::build_graph), then [`exclude_output_paths`] — and
+/// returns the resulting [`crate::graph::Diagnostic`]s. The output-path exclusion is the crux: without
+/// it, `doctor` would re-analyze gnr8's OWN generated `sdk/*.go` / `openapi.yaml` under the default
+/// `inputs = ["."]` config and surface spurious diagnostics on files `generate` would never ingest
+/// (WR-02). Sharing the front half guarantees `doctor` reports the diagnostics the real pipeline sees.
+///
+/// This is READ-ONLY (no naming/lowering/sdkgen, no writes) and reuses the existing seams verbatim, so
+/// `doctor` performs no new analysis. The single-input PoC restriction is enforced here too (mirrors
+/// [`build_outputs`]) so a multi-input config surfaces the SAME `CoreError::Config` rather than
+/// silently analyzing only the first input.
+///
+/// # Errors
+///
+/// Propagates the analysis errors `build_outputs`/`plan_only` would raise (Go toolchain missing, a
+/// multi-input config, a source parse/build error) as their typed `CoreError`. Never panics.
+pub fn diagnostics_only(
+    project_root: &Path,
+    config: &Config,
+) -> Result<Vec<crate::graph::Diagnostic>, crate::CoreError> {
+    if config.inputs.len() > 1 {
+        return Err(crate::CoreError::Config {
+            message: format!(
+                "config.inputs lists {} dirs, but multi-input analysis is not yet supported — \
+                 configure a single source dir (multi-input fan-in is a documented v2 direction, D-02)",
+                config.inputs.len()
+            ),
+        });
+    }
+    let input = config
+        .inputs
+        .first()
+        .ok_or_else(|| crate::CoreError::Config {
+            message: "config.inputs is empty — at least one Go source dir is required".to_string(),
+        })?;
+    let resolved_input = project_root.join(input);
+    let input_arg = resolved_input.to_string_lossy();
+    let mut graph = crate::analyze::build_graph(&input_arg)?;
+    // Drop gnr8's own generated outputs from the graph exactly as `build_outputs` does, so `doctor`
+    // analyzes the same operations/schemas `generate` acts on (WR-02). `exclude_output_paths` filters
+    // operations + schemas; the DIAGNOSTICS list is provenance-tagged independently, so apply the SAME
+    // output anchors to it here — otherwise doctor would still surface WARNs on gnr8's own generated
+    // `sdk/*.go` (e.g. a "duplicate handler" WARN on the SDK), diverging from what `generate` ingests.
+    exclude_output_paths(&mut graph, config);
+    let anchors = [
+        config.output.sdk_dir.as_str(),
+        config.output.openapi.as_str(),
+        WORKSPACE_DIR,
+    ];
+    graph.diagnostics.retain(|d| {
+        !anchors
+            .iter()
+            .any(|anchor| is_under_output(&d.file, anchor))
+    });
+    Ok(graph.diagnostics)
+}
+
 /// Compute the [`WritePlan`] for `config` WITHOUT touching disk — the dry-run seam `gnr8 check` uses.
 ///
 /// Runs the same graph → outputs pipeline as [`regenerate`], loads the manifest from `.gnr8/`, and
