@@ -45,12 +45,14 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 /// One regeneration's latency + counts — the `--json` shape for WATCH-03.
 ///
-/// `scenario` is one of `"cold"` / `"warm-noop"` / `"single-file-edit"`; `millis` is the wall-clock
-/// duration of the `regenerate` call; `written`/`unchanged` are the per-bucket counts. The same struct
-/// renders both the human line and (under `--json`) a machine-readable record.
+/// `scenario` is one of `"cold"` / `"single-file-edit"` / `"multi-file-edit"`; `millis` is the
+/// wall-clock duration of the `regenerate` call; `written`/`unchanged` are the per-bucket counts. The
+/// label is derived from the distinct trigger count, so a coalesced multi-file batch is NOT mislabeled
+/// `single-file-edit` (WR-03). The same struct renders both the human line and (under `--json`) a
+/// machine-readable record.
 #[derive(Debug, serde::Serialize)]
 struct LatencyReport {
-    /// Which WATCH-03 scenario this measurement is: `cold` | `warm-noop` | `single-file-edit`.
+    /// Which WATCH-03 scenario this measurement is: `cold` | `single-file-edit` | `multi-file-edit`.
     scenario: String,
     /// Wall-clock milliseconds the `regenerate` call took (`Instant::elapsed`).
     millis: u128,
@@ -103,6 +105,29 @@ fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
 #[must_use]
 fn batch_should_regenerate(paths: &[PathBuf], output_set: &HashSet<PathBuf>) -> bool {
     paths.iter().any(|p| is_trigger_path(p, output_set))
+}
+
+/// Count the DISTINCT trigger paths in a debounced batch (PURE) — the input to the WATCH-03 scenario
+/// label so the `--json` record does not over-claim `single-file-edit` for a multi-file batch (WR-03).
+#[must_use]
+fn count_trigger_paths(paths: &[PathBuf], output_set: &HashSet<PathBuf>) -> usize {
+    paths
+        .iter()
+        .filter(|p| is_trigger_path(p, output_set))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Derive the WATCH-03 scenario label from the number of distinct source files that triggered the
+/// regeneration (WR-03). Exactly one ⇒ `single-file-edit`; more (a multi-file edit or coalesced burst)
+/// ⇒ `multi-file-edit`, so downstream latency tooling never reads a coalesced batch as a single edit.
+#[must_use]
+fn scenario_for_trigger_count(triggers: usize) -> &'static str {
+    if triggers <= 1 {
+        "single-file-edit"
+    } else {
+        "multi-file-edit"
+    }
 }
 
 /// Whether `path` is equal to, or nested under, any output path in `output_set`.
@@ -212,8 +237,10 @@ pub(crate) fn run(
     let output_set = build_output_set(project_root, config);
 
     // The coalesced "a source file changed → regenerate" channel. The debouncer callback (a separate
-    // thread) sends `()`; the main loop receives. A single debounced batch sends at most one signal.
-    let (tx, rx) = mpsc::channel::<()>();
+    // thread) sends the count of DISTINCT source files that triggered (WR-03 — so the scenario label
+    // can distinguish a single-file edit from a multi-file/coalesced batch); the main loop receives.
+    // A single debounced batch sends at most one signal.
+    let (tx, rx) = mpsc::channel::<usize>();
 
     // The in-process shutdown flag (W4): the receive loop runs while it is false and observes it via
     // recv_timeout ticks. Set by the Ctrl-C handler (below) and on channel disconnect. NOT tied to
@@ -242,9 +269,10 @@ pub(crate) fn run(
                     .map(|p| canonicalize_or_keep(p))
                     .collect();
                 if batch_should_regenerate(&paths, &filter_set) {
-                    // Coalesce: one signal per qualifying batch. A closed receiver (loop exiting) is
-                    // a benign send error — ignore it rather than panic.
-                    let _ = tx.send(());
+                    // Coalesce: one signal per qualifying batch, carrying the distinct trigger count
+                    // (WR-03) so the scenario label can tell a single-file edit from a multi-file
+                    // batch. A closed receiver (loop exiting) is a benign send error — ignore it.
+                    let _ = tx.send(count_trigger_paths(&paths, &filter_set));
                 }
             }
             // A watcher error must NOT kill the loop (T-04-03-03): log and keep watching.
@@ -271,11 +299,20 @@ pub(crate) fn run(
     let poll = Duration::from_millis(200);
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(poll) {
-            Ok(()) => {
+            Ok(first) => {
                 // Drain any extra signals that piled up so a burst of debounced batches collapses into
-                // a single regeneration (further coalescing on top of the debouncer).
-                while rx.try_recv().is_ok() {}
-                regenerate_and_report("single-file-edit", project_root, config, json);
+                // a single regeneration (further coalescing on top of the debouncer), summing the
+                // distinct trigger counts so a coalesced burst is labeled multi-file, not single (WR-03).
+                let mut triggers = first;
+                while let Ok(more) = rx.try_recv() {
+                    triggers += more;
+                }
+                regenerate_and_report(
+                    scenario_for_trigger_count(triggers),
+                    project_root,
+                    config,
+                    json,
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {} // tick — re-check the stop flag.
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -359,8 +396,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        batch_should_regenerate, canonicalize_or_keep, is_trigger_path, is_under_any_output,
-        GenerateOutcome, LatencyReport,
+        batch_should_regenerate, canonicalize_or_keep, count_trigger_paths, is_trigger_path,
+        is_under_any_output, scenario_for_trigger_count, GenerateOutcome, LatencyReport,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -460,6 +497,46 @@ mod tests {
         assert_eq!(obj["millis"], serde_json::json!(42));
         assert_eq!(obj["written"], serde_json::json!(2));
         assert_eq!(obj["unchanged"], serde_json::json!(1));
+    }
+
+    /// WR-03: the scenario label is derived from the distinct trigger count — one source file →
+    /// `single-file-edit`, more (a multi-file edit or coalesced burst) → `multi-file-edit`, so the
+    /// machine-readable latency record never claims `single-file-edit` for a multi-file batch.
+    #[test]
+    fn scenario_label_distinguishes_single_from_multi_file_batches() {
+        let out = output_set();
+
+        // One trigger path (plus an ignored output write) → single.
+        let one = vec![
+            PathBuf::from("/proj/handlers/goal.go"),
+            PathBuf::from("/proj/sdk/client.go"), // output write — not a trigger.
+        ];
+        assert_eq!(count_trigger_paths(&one, &out), 1);
+        assert_eq!(
+            scenario_for_trigger_count(count_trigger_paths(&one, &out)),
+            "single-file-edit"
+        );
+
+        // Two distinct source edits → multi.
+        let two = vec![
+            PathBuf::from("/proj/handlers/goal.go"),
+            PathBuf::from("/proj/handlers/user.go"),
+        ];
+        assert_eq!(count_trigger_paths(&two, &out), 2);
+        assert_eq!(
+            scenario_for_trigger_count(count_trigger_paths(&two, &out)),
+            "multi-file-edit"
+        );
+
+        // A duplicate path counts once (debouncers can report the same path twice).
+        let dup = vec![
+            PathBuf::from("/proj/handlers/goal.go"),
+            PathBuf::from("/proj/handlers/goal.go"),
+        ];
+        assert_eq!(count_trigger_paths(&dup, &out), 1);
+
+        // A degenerate 0 count still yields a valid (single) label rather than panicking.
+        assert_eq!(scenario_for_trigger_count(0), "single-file-edit");
     }
 
     /// WR-01: a DELETE/RENAME event names a leaf that no longer exists, so plain `canonicalize` fails.
