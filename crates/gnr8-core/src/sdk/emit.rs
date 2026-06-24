@@ -494,7 +494,10 @@ pub(crate) fn emit_operations(
         emit_operation(&mut body, op, graph)?;
     }
     // Operation methods always touch context/net-http/encoding-json/bytes/fmt (request build + decode).
-    let imports = ["bytes", "context", "encoding/json", "fmt", "net/http"];
+    // WR-02: non-string query params additionally need `strconv`/`time` to URL-encode; `file` sorts +
+    // de-duplicates the union, so the all-string fixture (no extras) stays byte-identical.
+    let mut imports: Vec<&str> = vec!["bytes", "context", "encoding/json", "fmt", "net/http"];
+    imports.extend(query_imports(ops, graph)?);
     let _ = tag; // the tag names the FILE (handled by the bundle), not the imports.
     Ok(file(&imports, &body))
 }
@@ -624,11 +627,18 @@ fn emit_request_dispatch(
         writeln!(body, "q := req.URL.Query()").map_err(sink)?;
         for p in query_params {
             let field = exported(&p.name);
+            // WR-02: `url.Values.Set` takes a string, so a non-string typed query field is coerced to
+            // a string at the call site (the conversion is the identity for string fields, keeping the
+            // all-string fixture byte-identical). The required path reads the value directly; the
+            // optional path dereferences the pointer inside the nil-guard.
+            let value_ty = go_type(&p.schema, false, graph)?;
             if p.required {
-                writeln!(body, "q.Set(\"{}\", params.{field})", p.name).map_err(sink)?;
+                let expr = query_string_expr(&value_ty, &format!("params.{field}"))?;
+                writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
             } else {
                 writeln!(body, "if params.{field} != nil {{").map_err(sink)?;
-                writeln!(body, "q.Set(\"{}\", *params.{field})", p.name).map_err(sink)?;
+                let expr = query_string_expr(&value_ty, &format!("*params.{field}"))?;
+                writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
                 writeln!(body, "}}").map_err(sink)?;
             }
         }
@@ -714,6 +724,62 @@ fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Res
     }
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
+}
+
+/// Build the Go expression that coerces a query-param value of Go type `value_ty` to a `string` for
+/// `url.Values.Set` (WR-02).
+///
+/// A `string` field is passed through unchanged (so the all-string fixture stays byte-identical);
+/// the supported scalar Go types are converted precisely via `strconv`; a `time.Time` is formatted
+/// as RFC 3339. Any other Go type (e.g. a slice or a named struct) is an unsupported query-param
+/// shape and returns a typed [`CoreError::SdkGen`] rather than emitting non-compiling Go.
+///
+/// `accessor` is the Go expression that reads the value (e.g. `params.Page` or `*params.Cursor`).
+fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError> {
+    match value_ty {
+        "string" => Ok(accessor.to_string()),
+        "int64" => Ok(format!("strconv.FormatInt({accessor}, 10)")),
+        "float32" => Ok(format!("strconv.FormatFloat(float64({accessor}), 'g', -1, 32)")),
+        "bool" => Ok(format!("strconv.FormatBool({accessor})")),
+        "time.Time" => Ok(format!("{accessor}.Format(time.RFC3339)")),
+        other => Err(CoreError::SdkGen {
+            message: format!(
+                "unsupported query-param Go type '{other}': only string/int64/float32/bool/time.Time \
+                 query parameters can be URL-encoded"
+            ),
+        }),
+    }
+}
+
+/// The stdlib import a query-param value of Go type `value_ty` needs to be URL-encoded (WR-02), if any.
+///
+/// `string` needs nothing; the `strconv`-converted scalars need `strconv`; `time.Time` needs `time`.
+/// Returns `None` for a type with no extra import (or an unsupported one — the error surfaces later in
+/// [`query_string_expr`] during emission, so this stays infallible for the import pre-scan).
+fn query_extra_import(value_ty: &str) -> Option<&'static str> {
+    match value_ty {
+        "int64" | "float32" | "bool" => Some("strconv"),
+        "time.Time" => Some("time"),
+        _ => None,
+    }
+}
+
+/// Collect the extra stdlib imports the operations file needs for non-string query-param encoding.
+///
+/// Scans every query param of every operation in the file; returns the sorted, de-duplicated set of
+/// imports beyond the always-present request-plumbing set. For the all-string fixture this is empty,
+/// so the import block (and the whole file) stays byte-identical (WR-02).
+fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static str>, CoreError> {
+    let mut extra: BTreeSet<&'static str> = BTreeSet::new();
+    for op in ops {
+        for p in op.params.iter().filter(|p| p.location == "query") {
+            let value_ty = go_type(&p.schema, false, graph)?;
+            if let Some(imp) = query_extra_import(&value_ty) {
+                extra.insert(imp);
+            }
+        }
+    }
+    Ok(extra.into_iter().collect())
 }
 
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
@@ -998,6 +1064,49 @@ mod tests {
         ApiGraph::from_facts(facts, "/root")
     }
 
+    /// A minimal graph with ONE GET operation carrying a required `integer` query param (`page`) and
+    /// an optional `boolean` query param (`active`) — used to prove WR-02 converts non-string query
+    /// params to strings via `strconv` (and imports it) instead of emitting `q.Set(string, int64)`.
+    fn typed_query_graph() -> ApiGraph {
+        let facts = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
+              "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
+              "security_schemes": ["ApiKeyAuth"],
+              "params": [
+                { "name": "page", "location": "query", "required": true,
+                  "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
+                  "enum_values": [], "description": "page",
+                  "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } },
+                { "name": "active", "location": "query", "required": false,
+                  "schema": { "kind": "boolean", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+                  "enum_values": [], "description": "active",
+                  "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
+              ],
+              "request_body": null,
+              "responses": [ { "status": 200, "body": { "ref_id": "dto.GoalResponse" }, "description": "ok" } ],
+              "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
+              "fields": [
+                { "json_name": "uuid", "required": true, "optional": false,
+                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "description": null, "example": null }
+              ],
+              "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "diagnostics": []
+        }"#;
+        let facts = serde_json::from_slice(facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
     /// A minimal graph with ONE POST operation whose only success response is a body-less `{status}`
     /// (no response body) — used to prove WR-01 compares against the operation's real success status.
     fn body_less_success_graph(status: u16) -> ApiGraph {
@@ -1261,6 +1370,49 @@ mod tests {
                 "absent error model must not reference any named error type:\n{out}"
             );
             assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+        }
+
+        #[test]
+        fn non_string_query_params_are_converted_to_string_with_strconv() {
+            // WR-02: an `integer` query param (Go int64) and a `boolean` query param (Go bool) cannot
+            // be passed to `q.Set` directly; they must be converted to string via strconv, and the
+            // file must import `strconv`. The all-string fixture stays unaffected (no strconv import).
+            let graph = super::typed_query_graph();
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("q.Set(\"page\", strconv.FormatInt(params.Page, 10))"),
+                "required int64 query param must be strconv.FormatInt:\n{out}"
+            );
+            assert!(
+                out.contains("q.Set(\"active\", strconv.FormatBool(*params.Active))"),
+                "optional bool query param must be strconv.FormatBool of the deref:\n{out}"
+            );
+            assert!(
+                out.contains("\"strconv\""),
+                "the ops file must import strconv for non-string query encoding:\n{out}"
+            );
+        }
+
+        #[test]
+        fn string_query_params_emit_no_conversion_and_no_strconv_import() {
+            // WR-02 regression guard: the all-string query path (the fixture's shape) must emit the
+            // bare `q.Set(name, value)` with NO strconv conversion or import — byte-identity preserved.
+            let graph = sample_graph();
+            let ops: Vec<&crate::graph::Operation> = graph
+                .operations
+                .iter()
+                .filter(|o| o.handler == "listGoals")
+                .collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("q.Set(\"aggregation\", params.Aggregation)"),
+                "string query param must pass through unconverted:\n{out}"
+            );
+            assert!(
+                !out.contains("strconv"),
+                "all-string query encoding must not import strconv:\n{out}"
+            );
         }
 
         #[test]
