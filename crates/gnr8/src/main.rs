@@ -6,6 +6,7 @@
 //! backtrace (D-12 / RUST-04).
 
 mod cli;
+mod doctor;
 mod render;
 mod watch;
 
