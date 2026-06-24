@@ -702,7 +702,9 @@ a stale/edited file to its generator. `version` future-proofs the schema. Sort `
 **Note:** A3 is the one assumption that touches a PROJECT constraint and should be confirmed before it becomes
 a locked decision — the rest are low-risk discretion items the planner can adopt directly.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> RESOLVED by the plans: Q1 debounce 200ms default + `--debounce-ms` (04-03); Q2 single-file-edit latency = full re-run + no-op-filtered writes, partial invalidation is v2/ADV-01 (04-02/03); Q3 `check` = dry-run plan_writes, non-zero exit on Write/UserEdited drift (04-02).
 
 1. **Debounce window default + configurability**
    - What we know: 150–250ms is the typical range; `notify-debouncer-full` needs a `Duration`.
