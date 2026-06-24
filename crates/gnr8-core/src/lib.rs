@@ -58,9 +58,24 @@ mod tests {
     }
 
     #[test]
-    fn build_graph_is_not_yet_implemented() {
-        let result = crate::analyze::build_graph("anywhere");
+    fn build_graph_no_longer_returns_not_yet_implemented() {
+        // 02-03 implemented build_graph: it now runs the goextract helper rather than returning the
+        // NotYetImplemented stub. Against a bad target it surfaces a typed subprocess error (toolchain
+        // missing / helper exit / parse) — never NotYetImplemented and never a panic (GO-06).
+        let result = crate::analyze::build_graph("/gnr8-nonexistent-target-dir-xyz");
         let err = result.unwrap_err();
-        assert!(matches!(err, CoreError::NotYetImplemented { .. }));
+        assert!(
+            !matches!(err, CoreError::NotYetImplemented { .. }),
+            "build_graph is implemented now; got {err:?}"
+        );
+        assert!(
+            matches!(
+                err,
+                CoreError::GoToolchainMissing { .. }
+                    | CoreError::HelperExit { .. }
+                    | CoreError::FactsParse { .. }
+            ),
+            "expected a typed subprocess error, got {err:?}"
+        );
     }
 }
