@@ -589,7 +589,9 @@ if err := enc.Encode(doc); err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1)
 
 **If this table looks long:** A1 and A5 are the load-bearing ones — confirm the graph captures annotation facts and resolves the base path, or Phase 3 cannot reproduce the expected OpenAPI.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three resolved by the plans: path storage (02-02/02-03), diagnostics phrasing (02-03), goextract-dir resolution (02-01).
 
 1. **Does the Phase-2 `ApiGraph` store the resolved absolute path (`/goal/{uuid}`) or group-relative + basePath?**
    - What we know: expected OpenAPI uses `/goal/...`; the code's group prefix is dynamic (`"/" + basePath`); `@Router` annotations give `/list`, `/{uuid}`.
