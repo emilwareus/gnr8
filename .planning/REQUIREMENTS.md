@@ -69,9 +69,9 @@
 
 ### Hardening And Demo
 
-- [ ] **HARD-01**: `doctor` or equivalent diagnostics summarize unsupported route patterns, stale outputs, and lifecycle issues.
+- [x] **HARD-01**: `doctor` or equivalent diagnostics summarize unsupported route patterns, stale outputs, and lifecycle issues.
 - [ ] **HARD-02**: A documented demo shows Go source changing, OpenAPI updating, and Go SDK output updating.
-- [ ] **HARD-03**: All PoC tests, snapshots, and Rust quality gates pass before the milestone is considered complete.
+- [x] **HARD-03**: All PoC tests, snapshots, and Rust quality gates pass before the milestone is considered complete.
 
 ## v2 Requirements
 
@@ -167,9 +167,9 @@
 | WATCH-01 | Phase 4 | Complete |
 | WATCH-02 | Phase 4 | Complete |
 | WATCH-03 | Phase 4 | Complete |
-| HARD-01 | Phase 5 | Pending |
+| HARD-01 | Phase 5 | Complete |
 | HARD-02 | Phase 5 | Pending |
-| HARD-03 | Phase 5 | Pending |
+| HARD-03 | Phase 5 | Complete |
 
 **Coverage:**
 - v1 requirements: 37 total

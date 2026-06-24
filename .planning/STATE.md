@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 5 planned (2 plans, verified, 0 blockers)
-last_updated: "2026-06-24T22:18:14.489Z"
-last_activity: 2026-06-24 -- Phase 04 execution started
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-06-24T22:28:09.855Z"
+last_activity: 2026-06-24 -- Phase 05 execution started
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
   percent: 80
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-24)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 04 — gnr8-lifecycle-and-watch-mode
+**Current focus:** Phase 05 — poc-hardening-and-demo
 
 ## Current Position
 
-Phase: 04 (gnr8-lifecycle-and-watch-mode) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 04
-Last activity: 2026-06-24 -- Phase 04 execution started
+Phase: 05 (poc-hardening-and-demo) — EXECUTING
+Plan: 2 of 2
+Status: Executing Phase 05
+Last activity: 2026-06-24 -- Phase 05 execution started
 
-Progress: [█████████░] 92%
+Progress: [█████████░] 93%
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [█████████░] 92%
 | Phase 03 P03 | 9min | 3 tasks | 5 files |
 | Phase 04 P01 | 8min | 3 tasks | 9 files |
 | Phase 04 P02 | 10 min | 3 tasks | 9 files |
+| Phase 05 P01 | 7min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,9 @@ Recent decisions affecting current work:
 - [Phase 04]: [Phase 04-01]: four new CoreError variants (Workspace/Config consumed now; Manifest/Io reserved for 04-02/04-03) landed once in error.rs to keep it single-plan-owned (mirrors 03-01)
 - [Phase 04]: [Phase 04-02]: blake3 ownership manifest (.gnr8/cache/manifest.json, path->hash+provenance) + a PURE plan_writes five-arm truth table (on_disk injected via closure, --force lives only in apply_writes) deliver no-silent-clobber + no-op=no-write; manifest degrades safely (absent/corrupt -> empty default), output paths path-traversal-guarded (T-04-02-01)
 - [Phase 04]: [Phase 04-02]: naming.types rename rewrites schema id+name AND every matching SchemaRef.ref_id/field ref_id so a referenced-type rename never dangles a $ref (PLAN-CHECK W2, to_openapi succeeds); gnr8 generate (--force) + gnr8 check (dry-run, exit 1 on drift) wired to lifecycle::regenerate/plan_only
+- [Phase 05]: [Phase 05-01]: gnr8 doctor is a read-only aggregator in the binary (run_doctor + doctor module) reusing build_graph().diagnostics + lifecycle::plan_only + config::load + a go-version probe; NO new core analysis (D-02)
+- [Phase 05]: [Phase 05-01]: doctor exit policy mirrors run_check (0 healthy / 1 actionable); informational unsupported-pattern WARNs are EXCLUDED from has_actionable_problem so doctor is never permanently red on the fixture (Pitfall 1); missing Go toolchain reported as a finding via .ok()->None not a crash (Pitfall 4)
+- [Phase 05]: [Phase 05-01]: scripts/bench.sh drives the real release binary on a mktemp -d scratch fixture copy (trap rm -rf EXIT), printing honest cold/warm-no-op/single-file-edit wall-clock numbers with no asserted thresholds (Pitfall 2/3); committed fixture never mutated
 
 ### Pending Todos
 
@@ -118,6 +122,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T22:18:14.483Z
-Stopped at: Phase 5 planned (2 plans, verified, 0 blockers)
-Resume file: .planning/phases/05-poc-hardening-and-demo/05-01-PLAN.md
+Last session: 2026-06-24T22:28:09.849Z
+Stopped at: Completed 05-01-PLAN.md
+Resume file: None
