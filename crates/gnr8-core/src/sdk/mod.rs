@@ -1,5 +1,7 @@
 //! Go SDK generation seam (Phase 3): generates a Go SDK from the API graph.
 
+mod emit;
+
 /// Generate the Go SDK (serialized output) from the [`crate::graph::ApiGraph`].
 ///
 /// Stubbed in Phase 1 — returns [`crate::CoreError::NotYetImplemented`]. Implemented in Phase 3.
