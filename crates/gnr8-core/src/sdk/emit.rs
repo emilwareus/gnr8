@@ -380,6 +380,48 @@ fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<Success>, CoreE
     Ok(None)
 }
 
+/// The fields of the typed `APIError` envelope the non-2xx branch can populate from a decoded
+/// error body. Each maps a Go field on `APIError` to the json field name the error model must carry
+/// for that assignment to be emitted (so the SDK only ever reads a field the resolved struct has).
+const API_ERROR_FIELDS: &[(&str, &str)] =
+    &[("Message", "message"), ("Slug", "slug"), ("Hints", "hints")];
+
+/// Resolve the per-operation error model (the lowest-status non-2xx response body) from the graph.
+///
+/// Mirrors [`success_of`] for the error side (CR-01): rather than hard-coding a Go type literally
+/// named `HttpError`, the non-2xx branch decodes into whatever type the graph's error response
+/// actually references. An operation with no typed non-2xx body yields `None`, and the caller
+/// decodes into a generator-owned anonymous struct instead so the SDK never references a type the
+/// graph does not define.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if the error response body `$ref` is dangling.
+fn error_model_of<'g>(
+    op: &Operation,
+    graph: &'g ApiGraph,
+) -> Result<Option<&'g Schema>, CoreError> {
+    for resp in &op.responses {
+        if !(200..300).contains(&resp.status) {
+            let Some(body) = &resp.body else {
+                continue;
+            };
+            let model = graph
+                .schemas
+                .iter()
+                .find(|s| s.id == body.ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' error response references dangling $ref '{}'",
+                        op.id, body.ref_id
+                    ),
+                })?;
+            return Ok(Some(model));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolve an operation's request-body model name, if it has a typed body.
 ///
 /// # Errors
@@ -505,6 +547,7 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
     emit_request_dispatch(
         body,
         op,
+        graph,
         &path_params,
         &query_params,
         has_body,
@@ -524,6 +567,7 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
 fn emit_request_dispatch(
     body: &mut String,
     op: &Operation,
+    graph: &ApiGraph,
     path_params: &[&str],
     query_params: &[&crate::graph::Param],
     has_body: bool,
@@ -589,16 +633,9 @@ fn emit_request_dispatch(
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "defer resp.Body.Close()").map_err(sink)?;
 
-    // Non-2xx → typed APIError.
+    // Non-2xx → typed APIError, decoding the graph's actual error model (CR-01).
     writeln!(body, "if resp.StatusCode != {success_status} {{").map_err(sink)?;
-    writeln!(body, "var apiErr HttpError").map_err(sink)?;
-    writeln!(body, "_ = json.NewDecoder(resp.Body).Decode(&apiErr)").map_err(sink)?;
-    writeln!(body, "return out, &APIError{{").map_err(sink)?;
-    writeln!(body, "StatusCode: resp.StatusCode,").map_err(sink)?;
-    writeln!(body, "Message: apiErr.Message,").map_err(sink)?;
-    writeln!(body, "Slug: apiErr.Slug,").map_err(sink)?;
-    writeln!(body, "Hints: apiErr.Hints,").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
+    emit_error_decode(body, op, graph)?;
     writeln!(body, "}}").map_err(sink)?;
 
     // 2xx → decode the success model (skip when there is no body type).
@@ -611,6 +648,57 @@ fn emit_request_dispatch(
         writeln!(body, "return out, err").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
+    Ok(())
+}
+
+/// Emit the non-2xx error-decode block: decode the response body into the operation's error model
+/// (or a generator-owned anonymous struct when none is typed) and return a populated `*APIError`.
+///
+/// CR-01: the error type and the fields copied into `APIError` are derived from the graph's actual
+/// error response schema — never a hard-coded `HttpError`. Only the [`API_ERROR_FIELDS`] entries
+/// whose json field the resolved error struct actually declares are copied, so the SDK never reads a
+/// field the user's type does not provide. When the resolved struct carries none of those fields (or
+/// there is no typed error body), the SDK decodes into a small anonymous struct exposing exactly the
+/// fields `APIError` consumes, so a graph whose error model is shaped differently still compiles.
+fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result<(), CoreError> {
+    // Which APIError fields the resolved error struct can supply (by its declared json fields).
+    let error_model = error_model_of(op, graph)?;
+    let usable: Vec<(&str, &str)> = error_model.map_or_else(Vec::new, |model| {
+        API_ERROR_FIELDS
+            .iter()
+            .copied()
+            .filter(|(_, json_name)| model.fields.iter().any(|f| f.json_name == *json_name))
+            .collect()
+    });
+
+    if let (Some(model), false) = (error_model, usable.is_empty()) {
+        // The graph's error model is named + carries at least one APIError field: decode into it.
+        writeln!(body, "var apiErr {}", model.name).map_err(sink)?;
+    } else {
+        // No typed error body, or its shape shares no APIError field: decode into a generator-owned
+        // anonymous struct so the SDK never references a user type it cannot rely on (CR-01 fallback).
+        writeln!(body, "var apiErr struct {{").map_err(sink)?;
+        writeln!(body, "Message string `json:\"message\"`").map_err(sink)?;
+        writeln!(body, "Slug string `json:\"slug\"`").map_err(sink)?;
+        writeln!(body, "Hints []string `json:\"hints\"`").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "_ = json.NewDecoder(resp.Body).Decode(&apiErr)").map_err(sink)?;
+    writeln!(body, "return out, &APIError{{").map_err(sink)?;
+    writeln!(body, "StatusCode: resp.StatusCode,").map_err(sink)?;
+    if error_model.is_none() || usable.is_empty() {
+        // Anonymous fallback struct: all three fields are present, copy them all.
+        for (go_field, _) in API_ERROR_FIELDS {
+            writeln!(body, "{go_field}: apiErr.{go_field},").map_err(sink)?;
+        }
+    } else {
+        // Typed error model: copy only the fields it declares (others stay APIError's zero value).
+        for (go_field, json_name) in &usable {
+            let src = exported(json_name);
+            writeln!(body, "{go_field}: apiErr.{src},").map_err(sink)?;
+        }
+    }
+    writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
 
@@ -846,6 +934,90 @@ mod tests {
         ApiGraph::from_facts(facts, "/root")
     }
 
+    /// A minimal graph with ONE GET operation whose `400` response references an error model named
+    /// `{error_name}` (NOT `HttpError`) — used to prove CR-01 derives the error type from the graph
+    /// rather than hard-coding `HttpError`. The error model carries `message` + `slug` (no `hints`).
+    fn error_model_graph(error_name: &str) -> ApiGraph {
+        let facts = format!(
+            r#"{{
+              "module": "github.com/acme/svc",
+              "routes": [
+                {{
+                  "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
+                  "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
+                  "security_schemes": ["ApiKeyAuth"], "params": [],
+                  "request_body": null,
+                  "responses": [
+                    {{ "status": 200, "body": {{ "ref_id": "dto.GoalResponse" }}, "description": "ok" }},
+                    {{ "status": 400, "body": {{ "ref_id": "dto.{error_name}" }}, "description": "bad" }}
+                  ],
+                  "span": {{ "file": "/root/http.go", "start_line": 1, "end_line": 1 }}
+                }}
+              ],
+              "schemas": [
+                {{
+                  "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
+                  "fields": [
+                    {{ "json_name": "uuid", "required": true, "optional": false,
+                      "schema": {{ "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null }},
+                      "description": null, "example": null }}
+                  ],
+                  "enum_values": [], "span": {{ "file": "/root/g.go", "start_line": 1, "end_line": 1 }}
+                }},
+                {{
+                  "id": "dto.{error_name}", "name": "{error_name}", "kind": "object",
+                  "fields": [
+                    {{ "json_name": "message", "required": true, "optional": false,
+                      "schema": {{ "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null }},
+                      "description": null, "example": null }},
+                    {{ "json_name": "slug", "required": false, "optional": true,
+                      "schema": {{ "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null }},
+                      "description": null, "example": null }}
+                  ],
+                  "enum_values": [], "span": {{ "file": "/root/e.go", "start_line": 1, "end_line": 1 }}
+                }}
+              ],
+              "diagnostics": []
+            }}"#
+        );
+        let facts = serde_json::from_str(&facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    /// A minimal graph with ONE GET operation that declares ONLY a `200` response (no error body),
+    /// so the SDK has no graph error model and must fall back to an anonymous struct (CR-01).
+    fn no_error_response_graph() -> ApiGraph {
+        let facts = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
+              "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
+              "security_schemes": ["ApiKeyAuth"], "params": [],
+              "request_body": null,
+              "responses": [
+                { "status": 200, "body": { "ref_id": "dto.GoalResponse" }, "description": "ok" }
+              ],
+              "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
+              "fields": [
+                { "json_name": "uuid", "required": true, "optional": false,
+                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "description": null, "example": null }
+              ],
+              "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "diagnostics": []
+        }"#;
+        let facts = serde_json::from_slice(facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
     mod exported_names {
         use super::{exported, lower_camel};
 
@@ -1009,6 +1181,62 @@ mod tests {
                     "missing import {imp}:\n{out}"
                 );
             }
+        }
+
+        #[test]
+        fn error_decode_uses_the_graphs_error_model_name_not_a_hardcoded_httperror() {
+            // CR-01 generality: a graph whose error response model is named `ApiError` (NOT
+            // `HttpError`) must emit `var apiErr ApiError`, referencing the type the graph actually
+            // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
+            let graph = super::error_model_graph("ApiError");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("var apiErr ApiError"),
+                "error decode must use the graph's error model name `ApiError`:\n{out}"
+            );
+            assert!(
+                !out.contains("var apiErr HttpError"),
+                "error decode must NOT reference a hard-coded `HttpError`:\n{out}"
+            );
+            // It still populates the APIError from the resolved struct's fields.
+            assert!(out.contains("Message: apiErr.Message,"), "{out}");
+            assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
+        }
+
+        #[test]
+        fn error_decode_falls_back_to_an_anonymous_struct_when_no_error_response_exists() {
+            // An operation with no typed non-2xx response has no graph error model; the SDK must NOT
+            // fabricate a dependency on a named type — it decodes into a generator-owned anonymous
+            // struct exposing exactly the fields APIError consumes, so it always compiles.
+            let graph = super::no_error_response_graph();
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("var apiErr struct {"),
+                "absent error model must decode into an anonymous struct:\n{out}"
+            );
+            assert!(
+                !out.contains("var apiErr HttpError"),
+                "absent error model must not reference any named error type:\n{out}"
+            );
+            assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+        }
+
+        #[test]
+        fn error_decode_only_copies_fields_the_error_model_declares() {
+            // A graph whose error model carries only `message` (no `slug`/`hints`) must copy ONLY
+            // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
+            let graph = super::error_model_graph("ProblemDetails");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            // The synthetic error model in error_model_graph declares message + slug only.
+            assert!(out.contains("Message: apiErr.Message,"), "{out}");
+            assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
+            assert!(
+                !out.contains("Hints: apiErr.Hints,"),
+                "must not read a `Hints` field the error model does not declare:\n{out}"
+            );
         }
     }
 

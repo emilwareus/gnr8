@@ -148,7 +148,11 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoa
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		var apiErr HttpError
+		var apiErr struct {
+			Message string   `json:"message"`
+			Slug    string   `json:"slug"`
+			Hints   []string `json:"hints"`
+		}
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
