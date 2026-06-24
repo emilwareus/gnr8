@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-06-24T20:47:39.393Z"
+last_updated: "2026-06-24T21:02:36.961Z"
 last_activity: 2026-06-24 -- Phase 04 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 12
-  completed_plans: 10
+  completed_plans: 11
   percent: 60
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-24)
 ## Current Position
 
 Phase: 04 (gnr8-lifecycle-and-watch-mode) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 04
 Last activity: 2026-06-24 -- Phase 04 execution started
 
-Progress: [████████░░] 83%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -62,6 +62,7 @@ Progress: [████████░░] 83%
 | Phase 03 P02 | 14min | 3 tasks | 6 files |
 | Phase 03 P03 | 9min | 3 tasks | 5 files |
 | Phase 04 P01 | 8min | 3 tasks | 9 files |
+| Phase 04 P02 | 10 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -96,6 +97,8 @@ Recent decisions affecting current work:
 - [Phase 04]: [Phase 04-01]: gnr8 init idempotently scaffolds .gnr8/ (config.toml + .gitignore ignoring /cache/ + cache dir) via OpenOptions::create_new(true) write-if-absent; re-run preserves user edits byte-for-byte (D-01)
 - [Phase 04]: [Phase 04-01]: WS-03 typed TOML Config = documented knobs ONLY (inputs/output paths/go_module/naming overrides), serde deny_unknown_fields; honest PoC-stand-in docs, NO faked plugin field, v2 (ADV-02) deferred; toml added to gnr8-core, blake3 pinned-only deferred to 04-02 (PLAN-CHECK W1)
 - [Phase 04]: [Phase 04-01]: four new CoreError variants (Workspace/Config consumed now; Manifest/Io reserved for 04-02/04-03) landed once in error.rs to keep it single-plan-owned (mirrors 03-01)
+- [Phase 04]: [Phase 04-02]: blake3 ownership manifest (.gnr8/cache/manifest.json, path->hash+provenance) + a PURE plan_writes five-arm truth table (on_disk injected via closure, --force lives only in apply_writes) deliver no-silent-clobber + no-op=no-write; manifest degrades safely (absent/corrupt -> empty default), output paths path-traversal-guarded (T-04-02-01)
+- [Phase 04]: [Phase 04-02]: naming.types rename rewrites schema id+name AND every matching SchemaRef.ref_id/field ref_id so a referenced-type rename never dangles a $ref (PLAN-CHECK W2, to_openapi succeeds); gnr8 generate (--force) + gnr8 check (dry-run, exit 1 on drift) wired to lifecycle::regenerate/plan_only
 
 ### Pending Todos
 
@@ -115,6 +118,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T20:47:39.387Z
+Last session: 2026-06-24T21:02:06.745Z
 Stopped at: Completed 04-01-PLAN.md
 Resume file: None
