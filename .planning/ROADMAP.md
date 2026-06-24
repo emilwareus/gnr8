@@ -10,7 +10,7 @@ The PoC moves from a minimal Rust CLI and realistic Go fixtures to a complete Go
 - [x] **Phase 2: Go Analysis And API Graph** - Extract Go route, schema, and handler facts into a stable inspectable graph. (completed 2026-06-24)
 - [x] **Phase 3: OpenAPI And Go SDK Generation** - Emit valid OpenAPI and a compiling usable Go SDK from the graph. (completed 2026-06-24)
 - [x] **Phase 4: `.gnr8` Lifecycle And Watch Mode** - Add code-as-config workspace flow, generated-file ownership, and save-time regeneration. (completed 2026-06-24)
-- [ ] **Phase 5: PoC Hardening And Demo** - Tighten diagnostics, performance evidence, docs, and milestone verification.
+- [x] **Phase 5: PoC Hardening And Demo** - Tighten diagnostics, performance evidence, docs, and milestone verification. (completed 2026-06-24)
 
 ## Phase Details
 
@@ -91,7 +91,7 @@ Plans:
 
 Plans:
 - [x] 05-01-PLAN.md — Implement read-only `gnr8 doctor` aggregator (unsupported patterns + stale/drift + lifecycle checks, human report + --json, exit 0 healthy / 1 actionable) and `scripts/bench.sh` for cold/warm-no-op/single-file-edit numbers (HARD-01, HARD-03; wave 1).
-- [ ] 05-02-PLAN.md — Write docs/demo.md (fresh-checkout source-edit → updated OpenAPI + SDK on a scratch fixture copy) and docs/evidence.md (make check GREEN capture + 37-requirement traceability sign-off) (HARD-02, HARD-03; wave 2).
+- [x] 05-02-PLAN.md — Write docs/demo.md (fresh-checkout source-edit → updated OpenAPI + SDK on a scratch fixture copy) and docs/evidence.md (make check GREEN capture + 37-requirement traceability sign-off) (HARD-02, HARD-03; wave 2).
 
 ## Progress
 
@@ -104,4 +104,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 | 2. Go Analysis And API Graph | 3/3 | Complete   | 2026-06-24 |
 | 3. OpenAPI And Go SDK Generation | 3/3 | Complete   | 2026-06-24 |
 | 4. `.gnr8` Lifecycle And Watch Mode | 3/3 | Complete   | 2026-06-24 |
-| 5. PoC Hardening And Demo | 1/2 | In Progress|  |
+| 5. PoC Hardening And Demo | 2/2 | Complete   | 2026-06-24 |
