@@ -7,16 +7,16 @@
 
 ### PoC Contract
 
-- [ ] **POC-01**: The PoC scope is locked to Go source, OpenAPI output, and Go SDK output.
-- [ ] **POC-02**: The first supported router set, OpenAPI target version, Go SDK shape, and `.gnr8/` layout are documented before implementation expands.
-- [ ] **POC-03**: Explicit non-goals prevent dynamic plugins, macro-heavy APIs, graph databases, full framework coverage, and multi-language implementation from entering the PoC.
+- [x] **POC-01**: The PoC scope is locked to Go source, OpenAPI output, and Go SDK output.
+- [x] **POC-02**: The first supported router set, OpenAPI target version, Go SDK shape, and `.gnr8/` layout are documented before implementation expands.
+- [x] **POC-03**: Explicit non-goals prevent dynamic plugins, macro-heavy APIs, graph databases, full framework coverage, and multi-language implementation from entering the PoC.
 
 ### Rust Foundation
 
-- [ ] **RUST-01**: The repo has a minimal Rust workspace with a thin CLI binary and library modules.
-- [ ] **RUST-02**: The CLI exposes initial `init`, `generate`, `watch`, `check`, `inspect`, and `doctor` command surfaces, even if early commands are skeletal.
+- [x] **RUST-01**: The repo has a minimal Rust workspace with a thin CLI binary and library modules.
+- [x] **RUST-02**: The CLI exposes initial `init`, `generate`, `watch`, `check`, `inspect`, and `doctor` command surfaces, even if early commands are skeletal.
 - [ ] **RUST-03**: The codebase passes `cargo fmt`, `cargo test`, and clippy with warnings denied.
-- [ ] **RUST-04**: Library code uses typed errors and avoids production `unwrap` or `expect` paths.
+- [x] **RUST-04**: Library code uses typed errors and avoids production `unwrap` or `expect` paths.
 
 ### Fixtures And Validation
 
@@ -132,13 +132,13 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| POC-01 | Phase 1 | Pending |
-| POC-02 | Phase 1 | Pending |
-| POC-03 | Phase 1 | Pending |
-| RUST-01 | Phase 1 | Pending |
-| RUST-02 | Phase 1 | Pending |
+| POC-01 | Phase 1 | Complete |
+| POC-02 | Phase 1 | Complete |
+| POC-03 | Phase 1 | Complete |
+| RUST-01 | Phase 1 | Complete |
+| RUST-02 | Phase 1 | Complete |
 | RUST-03 | Phase 1 | Pending |
-| RUST-04 | Phase 1 | Pending |
+| RUST-04 | Phase 1 | Complete |
 | FIX-01 | Phase 1 | Pending |
 | FIX-02 | Phase 1 | Pending |
 | FIX-03 | Phase 1 | Pending |
