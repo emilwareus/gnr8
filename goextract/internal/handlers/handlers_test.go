@@ -21,25 +21,26 @@ func fixtureDir(t *testing.T) string {
 	return abs
 }
 
-// analyzeFixture loads the fixture, recognizes routes, builds the handler index,
-// sets the module prefix (so refs use 02-01 schema ids), and returns per-handler
-// code facts plus the accumulated diagnostics.
+// analyzeFixture loads the fixture, recognizes routes, builds an Analyzer (which
+// indexes the handlers and carries the module prefix so refs use 02-01 schema
+// ids), and returns per-handler code facts plus the accumulated diagnostics.
 func analyzeFixture(t *testing.T) (map[string]handlers.CodeFacts, []facts.DiagnosticFact) {
 	t.Helper()
 	res, err := load.Load(fixtureDir(t))
 	if err != nil {
 		t.Fatalf("load fixture: %v", err)
 	}
+	var module string
 	for _, pkg := range res.Packages {
 		if pkg.Module != nil && pkg.Module.Main {
-			handlers.SetModule(pkg.Module.Path)
+			module = pkg.Module.Path
 		}
 	}
-	idx := handlers.BuildIndex(res)
 	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, module, diags)
 	out := map[string]handlers.CodeFacts{}
 	for _, r := range routes.Recognize(res) {
-		out[r.Handler] = handlers.Analyze(r, idx, diags)
+		out[r.Handler] = analyzer.Analyze(r, diags)
 	}
 	return out, diags.Items()
 }

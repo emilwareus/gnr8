@@ -26,11 +26,8 @@ func buildMergedRoutes(t *testing.T) map[string]facts.RouteFact {
 			module = pkg.Module.Path
 		}
 	}
-	handlers.SetModule(module)
-	handlers.SetAnnotationPackages(handlers.AnnotationPackagesFromResult(res, module))
-
-	idx := handlers.BuildIndex(res)
 	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, module, diags)
 	out := map[string]facts.RouteFact{}
 	for _, r := range routes.Recognize(res) {
 		rf := facts.RouteFact{
@@ -38,11 +35,11 @@ func buildMergedRoutes(t *testing.T) map[string]facts.RouteFact {
 			Tags: []string{}, Secured: r.Secured, SecuritySchemes: []string{},
 			Params: []facts.ParamFact{}, Responses: []facts.ResponseFact{}, Span: r.Span,
 		}
-		cf := handlers.Analyze(r, idx, diags)
+		cf := analyzer.Analyze(r, diags)
 		rf.RequestBody = cf.RequestBody
 		rf.Responses = cf.Responses
 		rf.Params = cf.Params
-		handlers.MergeAnnotations(&rf, idx.ParseAnnotations(r.Handler))
+		handlers.MergeAnnotations(&rf, analyzer.ParseAnnotations(r.Handler))
 		out[r.Handler] = rf
 	}
 	return out

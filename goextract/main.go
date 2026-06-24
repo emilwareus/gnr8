@@ -61,11 +61,14 @@ func run(targetDir string, w *os.File) error {
 	// handler-inferred request/response/param facts (Task 2) and swaggo
 	// annotation facts (Task 3). buildRoutes owns the wiring + the per-route
 	// diagnostics (untyped query params, dynamic responses).
-	handlers.SetModule(module) // refs share the 02-01 module-relative schema id.
-	handlers.SetAnnotationPackages(handlers.AnnotationPackagesFromResult(res, module))
+	//
+	// The Analyzer carries the module prefix + swaggo selector->package map as
+	// per-invocation context (WR-03), so the analysis is reentrant rather than
+	// depending on process-global setup ordering. Building it also indexes the
+	// handlers, surfacing any duplicate-bare-name collisions as diagnostics (WR-02).
+	analyzer := handlers.NewAnalyzer(res, module, diags)
 	recognized := routes.Recognize(res)
-	idx := handlers.BuildIndex(res)
-	routeFacts := buildRoutes(recognized, idx, diags)
+	routeFacts := buildRoutes(analyzer, recognized, diags)
 
 	doc := facts.GoFacts{
 		Module:      module,
@@ -84,7 +87,7 @@ func run(targetDir string, w *os.File) error {
 // handler-inferred request/response/param facts and swaggo annotation facts; the
 // enrichment is layered here so the wiring order (code primary, annotation
 // escape-hatch) stays explicit.
-func buildRoutes(recognized []routes.Route, idx handlers.Index, diags *diag.Accumulator) []facts.RouteFact {
+func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *diag.Accumulator) []facts.RouteFact {
 	out := make([]facts.RouteFact, 0, len(recognized))
 	for _, r := range recognized {
 		rf := facts.RouteFact{
@@ -100,7 +103,7 @@ func buildRoutes(recognized []routes.Route, idx handlers.Index, diags *diag.Accu
 		}
 
 		// Task 2: code-inferred request/response/param facts (primary).
-		cf := handlers.Analyze(r, idx, diags)
+		cf := analyzer.Analyze(r, diags)
 		rf.RequestBody = cf.RequestBody
 		rf.Responses = cf.Responses
 		rf.Params = cf.Params
@@ -108,7 +111,7 @@ func buildRoutes(recognized []routes.Route, idx handlers.Index, diags *diag.Accu
 		// Task 3: swaggo annotation facts (escape hatch) fill gaps + add
 		// metadata (summary, tags, @ID, @Security, @Router, query enums,
 		// missing responses) without clobbering code-resolved facts.
-		handlers.MergeAnnotations(&rf, idx.ParseAnnotations(r.Handler))
+		handlers.MergeAnnotations(&rf, analyzer.ParseAnnotations(r.Handler))
 
 		out = append(out, rf)
 	}

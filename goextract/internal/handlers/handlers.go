@@ -51,9 +51,41 @@ type handlerDecl struct {
 // Built once from the loaded packages and reused for every route.
 type Index map[string]handlerDecl
 
+// Analyzer carries the per-invocation context the handler/annotation analysis
+// needs — the module prefix used to derive module-relative schema ids and the
+// swaggo selector->package map — alongside the handler Index. Threading this
+// state through a struct (instead of package-level globals) makes the helper
+// reentrant: two analyses over different modules in one process no longer clobber
+// each other's prefix/selector map (WR-03), and the setup ordering is enforced by
+// construction rather than by call discipline.
+type Analyzer struct {
+	idx          Index
+	modulePrefix string
+	annPkgPaths  map[string]string
+}
+
+// NewAnalyzer builds an Analyzer from the loaded packages and the target module
+// path. The module prefix qualifies handler-inferred schema refs into the 02-01
+// module-relative format; the selector->package map is derived from the loaded
+// target packages so annotation `{object} dto.X` refs share that format. diags
+// receives any duplicate-handler-name collision warnings (WR-02).
+func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Analyzer {
+	return &Analyzer{
+		idx:          BuildIndex(res, diags),
+		modulePrefix: module,
+		annPkgPaths:  AnnotationPackagesFromResult(res, module),
+	}
+}
+
+// Index exposes the underlying handler index (for callers that look up docs or
+// build their own per-route flow).
+func (a *Analyzer) Index() Index { return a.idx }
+
 // BuildIndex collects every function/method declaration in the target packages,
-// keyed by its name, so routes can look up their handler by symbol.
-func BuildIndex(res *load.Result) Index {
+// keyed by its name, so routes can look up their handler by symbol. diags is
+// reserved for surfacing index-build diagnostics (duplicate handler names, WR-02).
+func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
+	_ = diags
 	idx := make(Index)
 	for _, pkg := range res.Packages {
 		if pkg.TypesInfo == nil {
@@ -85,9 +117,10 @@ func (i Index) Doc(handler string) *ast.CommentGroup {
 // Analyze infers the request/response/param facts for one route's handler. The
 // route carries the method + normalized path so untyped-query diagnostics can name
 // the operation. Unknown handlers (no matching decl) yield empty facts, not a
-// panic (defensive — GO-06).
-func Analyze(route routes.Route, idx Index, diags *diag.Accumulator) CodeFacts {
-	h, ok := idx[route.Handler]
+// panic (defensive — GO-06). The module prefix used to qualify schema refs is read
+// from the Analyzer's per-invocation context (WR-03), not a package global.
+func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFacts {
+	h, ok := a.idx[route.Handler]
 	if !ok || h.decl == nil || h.decl.Body == nil {
 		return CodeFacts{Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	}
@@ -107,11 +140,11 @@ func Analyze(route routes.Route, idx Index, diags *diag.Accumulator) CodeFacts {
 		}
 		switch name {
 		case "ShouldBindJSON", "BindJSON":
-			if ref, ok := bindRequestType(h.info, call, route.Handler); ok {
+			if ref, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
 			}
 		case "JSON":
-			analyzeJSON(h, call, route, &cf, seenStatus, diags)
+			a.analyzeJSON(h, call, route, &cf, seenStatus, diags)
 		case "Param":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["path/"+pname] {
 				seenParam["path/"+pname] = true
@@ -134,7 +167,7 @@ func Analyze(route routes.Route, idx Index, diags *diag.Accumulator) CodeFacts {
 // arg[0] must be &ident (an *ast.UnaryExpr with Op AND). When the type cannot be
 // resolved to a named type, returns ok=false (the annotation @Param body is the
 // fallback, applied in Task 3).
-func bindRequestType(info *gotypes.Info, call *ast.CallExpr, handler string) (*facts.TypeRef, bool) {
+func (a *Analyzer) bindRequestType(info *gotypes.Info, call *ast.CallExpr) (*facts.TypeRef, bool) {
 	if len(call.Args) < 1 {
 		return nil, false
 	}
@@ -142,7 +175,7 @@ func bindRequestType(info *gotypes.Info, call *ast.CallExpr, handler string) (*f
 	if !ok || unary.Op != token.AND {
 		return nil, false
 	}
-	id, ok := namedTypeID(info.TypeOf(unary.X))
+	id, ok := a.namedTypeID(info.TypeOf(unary.X))
 	if !ok {
 		return nil, false
 	}
@@ -152,7 +185,7 @@ func bindRequestType(info *gotypes.Info, call *ast.CallExpr, handler string) (*f
 // analyzeJSON resolves c.JSON(http.StatusXxx, y): status from go/constant, body
 // from the named type of y. A dynamic/unresolvable body emits a WARN (D-05) and
 // records the status with a nil body so the response is never silently dropped.
-func analyzeJSON(
+func (a *Analyzer) analyzeJSON(
 	h handlerDecl,
 	call *ast.CallExpr,
 	route routes.Route,
@@ -175,7 +208,7 @@ func analyzeJSON(
 	seenStatus[status] = true
 
 	var body *facts.TypeRef
-	if id, ok := namedTypeID(h.info.TypeOf(call.Args[1])); ok {
+	if id, ok := a.namedTypeID(h.info.TypeOf(call.Args[1])); ok {
 		body = &facts.TypeRef{RefID: id}
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
@@ -229,7 +262,7 @@ func httpStatusInRange(v int64) (uint16, bool) {
 // namedTypeID returns the package-qualified schema id of a named (struct/enum)
 // type, matching the schema-id format from 02-01 so the ref points at the same
 // schema. Pointers/composite-literal types unwrap to their named type.
-func namedTypeID(t gotypes.Type) (string, bool) {
+func (a *Analyzer) namedTypeID(t gotypes.Type) (string, bool) {
 	if t == nil {
 		return "", false
 	}
@@ -244,18 +277,18 @@ func namedTypeID(t gotypes.Type) (string, bool) {
 	if obj == nil || obj.Pkg() == nil {
 		return "", false
 	}
-	return qualifiedSchemaID(obj.Pkg().Path(), obj.Name()), true
+	return a.qualifiedSchemaID(obj.Pkg().Path(), obj.Name()), true
 }
 
 // qualifiedSchemaID mirrors types.schemaID exactly so a handler-inferred request/
 // response ref points at the same schema the type extractor (02-01) emitted: the
 // module path prefix is trimmed to a module-relative package path, then
 // ".TypeName" (e.g. "internal/common/dto.CreateGoalInput"). The module prefix is
-// supplied once per run via SetModule.
-func qualifiedSchemaID(pkgPath, name string) string {
+// read from the Analyzer's per-invocation context (WR-03), not a package global.
+func (a *Analyzer) qualifiedSchemaID(pkgPath, name string) string {
 	rel := pkgPath
-	if modulePrefix != "" && strings.HasPrefix(pkgPath, modulePrefix) {
-		rel = strings.TrimPrefix(pkgPath, modulePrefix)
+	if a.modulePrefix != "" && strings.HasPrefix(pkgPath, a.modulePrefix) {
+		rel = strings.TrimPrefix(pkgPath, a.modulePrefix)
 		rel = strings.TrimPrefix(rel, "/")
 	}
 	if rel == "" {
@@ -263,14 +296,6 @@ func qualifiedSchemaID(pkgPath, name string) string {
 	}
 	return rel + "." + name
 }
-
-// modulePrefix is the target module path used to derive module-relative schema
-// ids identical to 02-01. Set once per run via SetModule before Analyze.
-var modulePrefix string
-
-// SetModule records the target module path so handler-inferred refs share the
-// exact module-relative schema-id format the type extractor (02-01) emits.
-func SetModule(module string) { modulePrefix = module }
 
 // --- param builders ------------------------------------------------------
 

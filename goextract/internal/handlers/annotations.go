@@ -42,11 +42,12 @@ type AnnotationFacts struct {
 }
 
 // ParseAnnotations extracts swaggo facts from a handler's doc comment. A nil/empty
-// doc yields zero facts. modulePrefix is used to qualify `{object} dto.X` type
-// refs into the same module-relative schema ids the type extractor emits.
-func (i Index) ParseAnnotations(handler string) AnnotationFacts {
+// doc yields zero facts. The Analyzer's module-relative selector->package map
+// (WR-03) qualifies `{object} dto.X` type refs into the same module-relative
+// schema ids the type extractor emits.
+func (a *Analyzer) ParseAnnotations(handler string) AnnotationFacts {
 	af := AnnotationFacts{Tags: []string{}, SecuritySchemes: []string{}}
-	doc := i.Doc(handler)
+	doc := a.idx.Doc(handler)
 	if doc == nil {
 		return af
 	}
@@ -55,14 +56,14 @@ func (i Index) ParseAnnotations(handler string) AnnotationFacts {
 		if !strings.HasPrefix(line, "@") {
 			continue
 		}
-		parseAnnotationLine(line, &af)
+		a.parseAnnotationLine(line, &af)
 	}
 	return af
 }
 
 // parseAnnotationLine dispatches one `@directive ...` line into af. Unknown
 // directives are ignored (defensive parsing).
-func parseAnnotationLine(line string, af *AnnotationFacts) {
+func (a *Analyzer) parseAnnotationLine(line string, af *AnnotationFacts) {
 	directive, rest := splitFirst(line)
 	rest = strings.TrimSpace(rest)
 	switch directive {
@@ -83,9 +84,9 @@ func parseAnnotationLine(line string, af *AnnotationFacts) {
 	case "@Router":
 		parseRouter(rest, af)
 	case "@Param":
-		parseParam(rest, af)
+		a.parseParam(rest, af)
 	case "@Success", "@Failure":
-		parseResponse(rest, af)
+		a.parseResponse(rest, af)
 	}
 }
 
@@ -109,7 +110,7 @@ func parseRouter(rest string, af *AnnotationFacts) {
 
 // parseParam parses `<name> <in> <type> <required> "desc" [Enums(a,b,c)]`.
 // A `body` param sets the request_body fallback; others become ParamFacts.
-func parseParam(rest string, af *AnnotationFacts) {
+func (a *Analyzer) parseParam(rest string, af *AnnotationFacts) {
 	fields := tokenize(rest)
 	if len(fields) < 4 {
 		return // malformed; skip (T-02-09).
@@ -119,7 +120,7 @@ func parseParam(rest string, af *AnnotationFacts) {
 
 	if in == "body" {
 		// type is a dto.X qualified ref; record as request_body fallback.
-		if id := schemaRefFromAnnotation(typ); id != "" {
+		if id := a.schemaRefFromAnnotation(typ); id != "" {
 			af.RequestBody = &facts.TypeRef{RefID: id}
 		}
 		return
@@ -138,7 +139,7 @@ func parseParam(rest string, af *AnnotationFacts) {
 
 // parseResponse parses `<status> {object} <type> "desc"` into a ResponseFact used
 // to FILL a missing/typeless response (never to clobber a code-resolved one).
-func parseResponse(rest string, af *AnnotationFacts) {
+func (a *Analyzer) parseResponse(rest string, af *AnnotationFacts) {
 	fields := tokenize(rest)
 	if len(fields) < 1 {
 		return
@@ -149,7 +150,7 @@ func parseResponse(rest string, af *AnnotationFacts) {
 	}
 	var body *facts.TypeRef
 	if typ := objectType(fields); typ != "" {
-		if id := schemaRefFromAnnotation(typ); id != "" {
+		if id := a.schemaRefFromAnnotation(typ); id != "" {
 			body = &facts.TypeRef{RefID: id}
 		}
 	}
@@ -253,8 +254,9 @@ func mergeResponses(rf *facts.RouteFact, annResponses []facts.ResponseFact) {
 // schemaRefFromAnnotation turns a `dto.UpdateGoalInput` annotation type into the
 // module-relative schema id. swaggo writes the local package selector (`dto.X`);
 // the fixture's dto package is `internal/common/dto`, so we resolve the suffix by
-// matching the package selector against the known module-relative dto path.
-func schemaRefFromAnnotation(typ string) string {
+// matching the package selector against the known module-relative dto path. The
+// selector->package map is the Analyzer's per-invocation context (WR-03).
+func (a *Analyzer) schemaRefFromAnnotation(typ string) string {
 	typ = strings.TrimPrefix(typ, "{object}")
 	typ = strings.TrimSpace(typ)
 	dot := strings.LastIndex(typ, ".")
@@ -268,22 +270,10 @@ func schemaRefFromAnnotation(typ string) string {
 	// Map the short package selector to its module-relative path. The fixture uses
 	// `dto` -> `internal/common/dto`. Generic resolution (any pkg selector) is a
 	// post-PoC concern; for now resolve the one selector the fixture annotates.
-	if pkg, ok := annotationPkgPaths[sel]; ok {
+	if pkg, ok := a.annPkgPaths[sel]; ok {
 		return pkg + "." + name
 	}
 	return sel + "." + name
-}
-
-// annotationPkgPaths maps a swaggo annotation package selector to its
-// module-relative path so annotation refs share the 02-01 schema-id format.
-// Populated once per run by SetAnnotationPackages.
-var annotationPkgPaths = map[string]string{}
-
-// SetAnnotationPackages records the selector -> module-relative package-path map
-// used to qualify `{object} dto.X` annotation type refs. Derived from the loaded
-// packages so the helper does not hardcode the fixture's layout.
-func SetAnnotationPackages(m map[string]string) {
-	annotationPkgPaths = m
 }
 
 // AnnotationPackagesFromResult builds the swaggo selector -> module-relative path
