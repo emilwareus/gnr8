@@ -245,6 +245,12 @@ fn run_check(json: bool) -> Result<()> {
 /// pipeline error (Go toolchain missing, lowering, sdkgen) flows through the anyhow boundary — never a
 /// panic (D-09 / RUST-04).
 fn run_watch(debounce_ms: u64, json: bool) -> Result<()> {
+    // Floor the debounce window at a small minimum (IN-04): `--debounce-ms 0` would create a
+    // zero-window debouncer that defeats the burst-coalescing the flag exists for and amplifies the
+    // delete/rename edge case (WR-01). A 10 ms floor keeps coalescing meaningful without perceptibly
+    // slowing the warm-edit latency the watcher reports.
+    const MIN_DEBOUNCE_MS: u64 = 10;
+
     let (root, gnr8_dir) = project_paths()?;
     let config = gnr8_core::config::load(&gnr8_dir)?;
 
@@ -259,13 +265,10 @@ fn run_watch(debounce_ms: u64, json: bool) -> Result<()> {
     // The COLD scenario: an initial regeneration ensures outputs are current and measures cold latency.
     watch::cold_regenerate(&root, &config, json)?;
 
+    let debounce = std::time::Duration::from_millis(debounce_ms.max(MIN_DEBOUNCE_MS));
+
     // Enter the debounced watch loop (blocks until Ctrl-C / channel disconnect, then returns Ok).
-    watch::run(
-        &root,
-        &config,
-        std::time::Duration::from_millis(debounce_ms),
-        json,
-    )
+    watch::run(&root, &config, debounce, json)
 }
 
 /// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and

@@ -19,7 +19,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::CoreError;
 
@@ -135,8 +135,10 @@ fn write_if_absent(
 /// Render `path` relative to `root` for reporting; fall back to the full path if it is not a
 /// descendant of `root` (defensive — `init` only ever passes paths under `root`).
 fn relative(root: &Path, path: &Path) -> String {
+    // Both arms already hold a `&Path`; `Path::to_path_buf` avoids the redundant `PathBuf::from`
+    // round-trip the success arm previously did (IN-03 — cosmetic, behavior unchanged).
     path.strip_prefix(root)
-        .map_or_else(|_| path.to_path_buf(), PathBuf::from)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
         .display()
         .to_string()
 }
