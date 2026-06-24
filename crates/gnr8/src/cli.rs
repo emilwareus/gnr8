@@ -52,15 +52,35 @@ pub(crate) enum Commands {
     Doctor,
 }
 
-/// `inspect` subcommands (D-11).
+/// The default analysis target when `inspect` is run without an explicit path: the goalservice Gin
+/// fixture, resolved relative to this crate's manifest dir (mirrors how the contract tests resolve
+/// `FIXTURE_DIR`). Keeps `gnr8 inspect routes` working out of the box this phase (D-09).
+pub(crate) const DEFAULT_INSPECT_TARGET: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
+
+/// `inspect` subcommands (D-11). Each takes an optional target directory (the Go module to analyze),
+/// defaulting to the goalservice fixture so the command works with no argument and with an explicit
+/// path (`gnr8 inspect routes <dir>`).
 #[derive(Debug, Subcommand)]
 pub(crate) enum InspectAction {
     /// Show discovered routes.
-    Routes,
+    Routes {
+        /// The Go module directory to analyze (defaults to the goalservice fixture).
+        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
+        path: String,
+    },
     /// Show discovered schemas.
-    Schemas,
+    Schemas {
+        /// The Go module directory to analyze (defaults to the goalservice fixture).
+        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
+        path: String,
+    },
     /// Show the raw API graph.
-    Graph,
+    Graph {
+        /// The Go module directory to analyze (defaults to the goalservice fixture).
+        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
+        path: String,
+    },
 }
 
 #[cfg(test)]
@@ -98,10 +118,27 @@ mod tests {
 
     #[test]
     fn cli_parses_inspect_subcommands() {
+        // Each variant now carries a `path` (defaulted to the fixture); discriminant compares the
+        // variant only, so the `want` path is irrelevant.
         for (arg, want) in [
-            ("routes", InspectAction::Routes),
-            ("schemas", InspectAction::Schemas),
-            ("graph", InspectAction::Graph),
+            (
+                "routes",
+                InspectAction::Routes {
+                    path: String::new(),
+                },
+            ),
+            (
+                "schemas",
+                InspectAction::Schemas {
+                    path: String::new(),
+                },
+            ),
+            (
+                "graph",
+                InspectAction::Graph {
+                    path: String::new(),
+                },
+            ),
         ] {
             let cli = Cli::try_parse_from(["gnr8", "inspect", arg]).unwrap();
             match cli.command {
@@ -112,6 +149,32 @@ mod tests {
                 other => panic!("expected Inspect, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn cli_inspect_defaults_target_and_accepts_explicit_path() {
+        // No path → the fixture default.
+        let cli = Cli::try_parse_from(["gnr8", "inspect", "routes"]).unwrap();
+        let Commands::Inspect {
+            action: InspectAction::Routes { path },
+        } = cli.command
+        else {
+            panic!("expected inspect routes");
+        };
+        assert!(
+            path.ends_with("fixtures/goalservice"),
+            "default target: {path}"
+        );
+
+        // Explicit path wins.
+        let cli = Cli::try_parse_from(["gnr8", "inspect", "schemas", "/some/dir"]).unwrap();
+        let Commands::Inspect {
+            action: InspectAction::Schemas { path },
+        } = cli.command
+        else {
+            panic!("expected inspect schemas");
+        };
+        assert_eq!(path, "/some/dir");
     }
 
     #[test]

@@ -25,8 +25,11 @@ pub(crate) mod helper;
 /// - [`crate::CoreError::HelperExit`] if the helper exits non-zero.
 /// - [`crate::CoreError::FactsParse`] if the helper's stdout is not the expected JSON.
 pub fn build_graph(fixture_dir: &str) -> Result<crate::graph::ApiGraph, crate::CoreError> {
-    let facts = helper::run_goextract(fixture_dir)?;
-    Ok(crate::graph::ApiGraph::from_facts(facts, fixture_dir))
+    // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
+    // goextract dir) AND the graph relativizes span file paths against the same root the helper saw.
+    let target = helper::resolve_target(fixture_dir);
+    let facts = helper::run_goextract(&target)?;
+    Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
 
 #[cfg(test)]

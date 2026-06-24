@@ -27,8 +27,11 @@ use crate::analyze::{facts::DiagnosticFact, helper};
 /// - [`crate::CoreError::HelperExit`] if the helper exits non-zero.
 /// - [`crate::CoreError::FactsParse`] if the helper's stdout is not the expected JSON.
 pub fn collect(fixture_dir: &str) -> Result<String, crate::CoreError> {
-    let facts = helper::run_goextract(fixture_dir)?;
-    Ok(render(facts.diagnostics, fixture_dir))
+    // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
+    // goextract dir) AND diagnostic file paths relativize against the same root the helper saw.
+    let target = helper::resolve_target(fixture_dir);
+    let facts = helper::run_goextract(&target)?;
+    Ok(render(facts.diagnostics, &target))
 }
 
 /// Render a diagnostics list to the canonical text block (pure; testable without the subprocess).

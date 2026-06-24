@@ -28,6 +28,26 @@ pub(crate) fn goextract_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../goextract"))
 }
 
+/// Resolve `target_dir` to an absolute path against the process cwd.
+///
+/// The helper subprocess runs with `current_dir(goextract_dir())`, so a RELATIVE `target_dir`
+/// (e.g. `fixtures/goalservice` typed at the repo root) would otherwise be interpreted relative to
+/// `goextract/` and fail. Absolutizing against the caller's cwd here makes `gnr8 inspect routes
+/// <relative-dir>` work, and gives `from_facts`/`collect` the exact module root the helper sees so
+/// span/diagnostic file paths relativize consistently. Absolute inputs (the contract tests) are
+/// returned unchanged. If the cwd cannot be read, the input is passed through untouched (the helper
+/// then surfaces a typed error rather than this function panicking — RUST-04).
+pub(crate) fn resolve_target(target_dir: &str) -> String {
+    let path = std::path::Path::new(target_dir);
+    if path.is_absolute() {
+        return target_dir.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).to_string_lossy().into_owned(),
+        Err(_) => target_dir.to_string(),
+    }
+}
+
 /// Run the `goextract` helper against `target_dir` and return the parsed facts.
 ///
 /// # Errors
