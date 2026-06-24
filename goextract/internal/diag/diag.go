@@ -49,6 +49,37 @@ func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, li
 	})
 }
 
+// UntypedQueryParam records the untyped-query-param warning (TARGET-API.md §5.4):
+// a c.Query("name") read with no binding struct, so the param's type/required-ness
+// is under-specified by code alone. method + route identify the operation; the
+// param name + rule are the machine-stable identity (the canonical rendered
+// wording — which differs per param in expected/diagnostics.txt — is reconciled
+// on the Rust side in 02-03).
+func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityWarn,
+		Message: "untyped query param '" + name + "' on " + method + " " + route +
+			": read via c.Query with no binding struct; param type/required-ness " +
+			"under-specified, type inferred as string only (TARGET-API.md §5.4)",
+		File: file,
+		Line: line,
+	})
+}
+
+// DynamicResponse records the dynamic/unresolvable-response warning (D-05 / GO-06):
+// a c.JSON(...) whose status or body could not be resolved to a constant/named
+// type, so the response is diagnosed rather than guessed or silently dropped.
+func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityWarn,
+		Message: "dynamic response in handler " + handler + ": " + reason +
+			"; cannot infer a typed response from code — falling back to " +
+			"@Success/@Failure annotation (TARGET-API.md §5; D-05)",
+		File: file,
+		Line: line,
+	})
+}
+
 // Warn records a generic warning. Used for go/packages load errors (GO-06) and
 // any rule that does not have a dedicated helper.
 func (a *Accumulator) Warn(message, file string, line uint32) {

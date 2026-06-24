@@ -19,6 +19,7 @@ import (
 
 	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/facts"
+	"github.com/gnr8/goextract/internal/handlers"
 	"github.com/gnr8/goextract/internal/load"
 	"github.com/gnr8/goextract/internal/routes"
 	"github.com/gnr8/goextract/internal/types"
@@ -54,15 +55,19 @@ func run(targetDir string, w *os.File) error {
 
 	schemas := types.Extract(res, diags)
 
+	module := moduleOf(res)
+
 	// 02-02: recognize the Gin route table (Task 1), then enrich each route with
 	// handler-inferred request/response/param facts (Task 2) and swaggo
-	// annotation facts (Task 3). routeFacts() owns the wiring + the per-route
+	// annotation facts (Task 3). buildRoutes owns the wiring + the per-route
 	// diagnostics (untyped query params, dynamic responses).
+	handlers.SetModule(module) // refs share the 02-01 module-relative schema id.
 	recognized := routes.Recognize(res)
-	routeFacts := buildRoutes(recognized, res, diags)
+	idx := handlers.BuildIndex(res)
+	routeFacts := buildRoutes(recognized, idx, diags)
 
 	doc := facts.GoFacts{
-		Module:      moduleOf(res),
+		Module:      module,
 		Routes:      routeFacts,
 		Schemas:     schemas,
 		Diagnostics: diags.Items(),
@@ -78,7 +83,7 @@ func run(targetDir string, w *os.File) error {
 // handler-inferred request/response/param facts and swaggo annotation facts; the
 // enrichment is layered here so the wiring order (code primary, annotation
 // escape-hatch) stays explicit.
-func buildRoutes(recognized []routes.Route, res *load.Result, diags *diag.Accumulator) []facts.RouteFact {
+func buildRoutes(recognized []routes.Route, idx handlers.Index, diags *diag.Accumulator) []facts.RouteFact {
 	out := make([]facts.RouteFact, 0, len(recognized))
 	for _, r := range recognized {
 		rf := facts.RouteFact{
@@ -92,6 +97,13 @@ func buildRoutes(recognized []routes.Route, res *load.Result, diags *diag.Accumu
 			Responses:       []facts.ResponseFact{},
 			Span:            r.Span,
 		}
+
+		// Task 2: code-inferred request/response/param facts (primary).
+		cf := handlers.Analyze(r, idx, diags)
+		rf.RequestBody = cf.RequestBody
+		rf.Responses = cf.Responses
+		rf.Params = cf.Params
+
 		out = append(out, rf)
 	}
 	return out

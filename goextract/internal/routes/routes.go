@@ -32,9 +32,13 @@ import (
 	"github.com/gnr8/goextract/internal/load"
 )
 
-// ginPkgPath is the receiver package the recognizer gates on. Recognition keys on
+// GinPkgPath is the receiver package the recognizer gates on. Recognition keys on
 // this resolved package path, never on the source identifier/alias (T-02-06).
-const ginPkgPath = "github.com/gin-gonic/gin"
+// Exported so the handler analyzer (Task 2) shares the exact identity gate.
+const GinPkgPath = "github.com/gin-gonic/gin"
+
+// ginPkgPath is the unexported alias kept for in-package readability.
+const ginPkgPath = GinPkgPath
 
 // httpMethods is the set of *gin.RouterGroup methods that register a route.
 var httpMethods = map[string]bool{
@@ -138,10 +142,16 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet) []Ro
 	return out
 }
 
-// ginMethod resolves a selector call to (methodName, receiverPkgPath, ok) using
-// go/types selections — the version- and alias-robust identity check (Pattern 2).
-// Only method-value selections on a typed receiver qualify.
+// ginMethod is the in-package alias for GinMethod.
 func ginMethod(info *gotypes.Info, call *ast.CallExpr) (name, recvPkgPath string, ok bool) {
+	return GinMethod(info, call)
+}
+
+// GinMethod resolves a selector call to (methodName, receiverPkgPath, ok) using
+// go/types selections — the version- and alias-robust identity check (Pattern 2).
+// Only method-value selections on a typed receiver qualify. Shared by the route
+// recognizer and the handler analyzer so both gate on the same resolved identity.
+func GinMethod(info *gotypes.Info, call *ast.CallExpr) (name, recvPkgPath string, ok bool) {
 	sel, isSel := call.Fun.(*ast.SelectorExpr)
 	if !isSel {
 		return "", "", false
@@ -206,9 +216,14 @@ func stringLiteral(arg ast.Expr) (string, bool) {
 	return strings.Trim(lit.Value, "`\""), true
 }
 
-// normalizePath converts a Gin path template to the OpenAPI form: each `:param`
+// normalizePath is the in-package alias for NormalizePath.
+func normalizePath(p string) string { return NormalizePath(p) }
+
+// NormalizePath converts a Gin path template to the OpenAPI form: each `:param`
 // segment becomes `{param}` (Pitfall 5). Other segments pass through unchanged.
-func normalizePath(p string) string {
+// Exported so the annotation parser (Task 3) normalizes `@Router` paths the same
+// way the code recognizer normalizes registration paths.
+func NormalizePath(p string) string {
 	if !strings.Contains(p, ":") {
 		return p
 	}
