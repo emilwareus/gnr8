@@ -186,11 +186,18 @@ func analyzeJSON(
 
 // statusOf resolves an HTTP status argument to its numeric value via go/constant.
 // Handles http.StatusXxx selectors and any const expression whose value is an int.
+//
+// The resolved value is bounds-checked to a sane HTTP status range (100..=599)
+// before narrowing to uint16: a non-exact or out-of-range constant (e.g.
+// c.JSON(70000, x), which would otherwise wrap silently to 4464) returns
+// ok=false so the caller emits a dynamic-response diagnostic instead of emitting
+// a corrupted status (GO-06). This matches the guard parseResponse already
+// applies on the annotation path.
 func statusOf(info *gotypes.Info, arg ast.Expr) (uint16, bool) {
 	tv, ok := info.Types[arg]
 	if ok && tv.Value != nil && tv.Value.Kind() == constant.Int {
 		if v, exact := constant.Int64Val(tv.Value); exact {
-			return uint16(v), true
+			return httpStatusInRange(v)
 		}
 	}
 	// Fallback: resolve the identifier to a *types.Const and read its value.
@@ -204,6 +211,16 @@ func statusOf(info *gotypes.Info, arg ast.Expr) (uint16, bool) {
 	}
 	v, exact := constant.Int64Val(c.Val())
 	if !exact {
+		return 0, false
+	}
+	return httpStatusInRange(v)
+}
+
+// httpStatusInRange narrows a resolved int64 status to uint16 only when it is a
+// valid HTTP status code (100..=599); otherwise it reports ok=false so the
+// out-of-range value is diagnosed as a dynamic response rather than truncated.
+func httpStatusInRange(v int64) (uint16, bool) {
+	if v < 100 || v > 599 {
 		return 0, false
 	}
 	return uint16(v), true
