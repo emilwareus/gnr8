@@ -404,5 +404,5 @@ scratch copy — see the pitfall callout at the top.
 
 ---
 
-**See also:** `docs/evidence.md` — the milestone sign-off mapping all 37 v1 requirements to where each
+**See also:** `docs/evidence.md` — the milestone sign-off mapping all 38 v1 requirements to where each
 is satisfied, with the full `make check` gate captured green.
