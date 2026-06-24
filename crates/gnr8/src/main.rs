@@ -7,6 +7,7 @@
 
 mod cli;
 mod render;
+mod watch;
 
 use anyhow::Result;
 use clap::Parser;
@@ -73,7 +74,7 @@ fn main() -> Result<()> {
 fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
     match &cli.command {
         Commands::Init => run_init(),
-        Commands::Watch => gnr8_core::not_yet("watch", 4),
+        Commands::Watch { .. } => gnr8_core::not_yet("watch", 4),
         Commands::Doctor => gnr8_core::not_yet("doctor", 5),
         // Handled in `main` before this dispatch; kept exhaustive for the compiler.
         Commands::Generate { .. } => gnr8_core::not_yet("generate", 4),

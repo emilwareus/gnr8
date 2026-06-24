@@ -18,3 +18,4 @@ clap = { workspace = true }
 serde = { workspace = true }       # derive Serialize on the CLI Report type for --json output
 serde_json = { workspace = true }
 anyhow = { workspace = true }   # anyhow ONLY here, never in gnr8-core (D-09)
+notify-debouncer-full = { workspace = true } # debounced FS watcher for `gnr8 watch` (binary boundary, D-09)
