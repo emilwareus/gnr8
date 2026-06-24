@@ -58,9 +58,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 03-01: Implement OpenAPI lowering and validation snapshots.
-- [ ] 03-02: Implement Go SDK models, client, operations, and errors.
-- [ ] 03-03: Add generated SDK compile tests and end-to-end artifact snapshots.
+- [ ] 03-01-PLAN.md — OpenAPI lowering: typed OpenAPI 3.1 structs + deterministic YAML writer, to_openapi graph→doc mapping (join the /goal base prefix, surface OAPI-03 diagnostics), four new CoreError variants; flip snapshot_openapi GREEN (wave 1).
+- [ ] 03-02-PLAN.md — Go SDK codegen: format!-based emitters (models/functional-options Client/tag-grouped ctx-first ops/typed APIError) + gofmt normalization + SdkBundle file-marker String + write_to_dir; flip snapshot_sdk GREEN (wave 1).
+- [ ] 03-03-PLAN.md — Generated-SDK compile + smoke: hermetic stdlib-only temp-dir go build + httptest smoke (SDK-05), to_openapi/generate determinism asserts, promote all four contract tests + sdk_compile to the blocking CI gate and retire the non-blocking contract job (wave 2).
 
 ### Phase 4: `.gnr8` Lifecycle And Watch Mode
 **Goal**: Prove the code-as-config user workflow and fast regeneration loop.
