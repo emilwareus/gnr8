@@ -1,19 +1,18 @@
-# gnr8 CI — RUST-03 quality gates + Go fixture compile + red-by-design contract suite.
+# gnr8 CI — RUST-03 quality gates + Go fixture compile + the full (now all-green) contract suite.
 #
-# Reconciles RUST-03 (gates must pass) with FIX-04 (the snapshot tests are visibly RED until their
-# owning phase lands) via RESEARCH Open Q1 option (d):
+# As of Phase 3 (D-07), all FOUR contract snapshots are GREEN and BLOCKING — the red-by-design era is
+# over. lower::to_openapi (03-01) and sdk::generate (03-02) are implemented and their snapshots
+# reviewed/accepted, so snapshot_openapi + snapshot_sdk join snapshot_graph + snapshot_diagnostics in
+# the blocking `gates` job, alongside the new sdk_compile test (03-03) that materializes the SDK to a
+# hermetic stdlib-only temp module and runs `go build ./...` + an httptest smoke (SDK-05). The former
+# non-blocking `contract` (continue-on-error) job is RETIRED — no continue-on-error remains in this file.
 #
-#   * gates      (BLOCKING)     fmt-check + clippy(-D warnings, --locked) + genuinely-green tests,
-#                               now INCLUDING snapshot_graph + snapshot_diagnostics + determinism
-#                               (02-03 implemented build_graph + diagnostics::collect). These invoke
-#                               the goextract helper via `go run`, so the job sets up the Go toolchain.
+#   * gates      (BLOCKING)     fmt-check + clippy(-D warnings, --locked) + the full green test set:
+#                               lib + bin + snapshot_graph/diagnostics/openapi/sdk + determinism +
+#                               sdk_compile. These invoke the goextract helper via `go run` and pipe
+#                               generated Go through `gofmt`/`go build`, so the job sets up the Go toolchain.
 #   * go-fixture (BLOCKING)     go build/vet of the standalone Gin fixture module (Pitfall 5)
-#   * contract   (NON-BLOCKING) the TWO remaining red-by-design snapshots (openapi + sdk) —
-#                               continue-on-error: true
-#
-# The `contract` job is VISIBLY RED today (lower::to_openapi + sdk::generate return NotYetImplemented
-# → the .expect() panics) but does NOT block merges. It is PROMOTED TO BLOCKING once Phase 3 lands
-# OpenAPI lowering + SDK generation and those two snapshots are reviewed/accepted.
+#   * goextract  (BLOCKING)     go build/vet/test of the standalone goextract helper module
 #
 # Third-party actions are pinned to major-version tags from well-known publishers (actions/*, dtolnay,
 # Swatinem) per the threat register (T-03-02). GitHub Actions sets CI=true, so insta runs in
@@ -27,9 +26,11 @@ on:
   pull_request:
 
 jobs:
-  # BLOCKING — the RUST-03 gate. Runs the genuinely-green tests, now including the graph/diagnostics/
-  # determinism contract tests that 02-03 turned green. Those invoke the goextract helper via `go run`,
-  # so the job also sets up the Go toolchain (mirrors the go-fixture/goextract jobs).
+  # BLOCKING — the RUST-03 gate. Runs the full green test set, now including ALL FOUR contract
+  # snapshots (graph/diagnostics/openapi/sdk) plus the sdk_compile go-build/httptest gate (03-03).
+  # These invoke the goextract helper via `go run`, pipe generated Go through `gofmt`, and run
+  # `go build`/`go test` on the materialized SDK, so the job sets up the Go toolchain (mirrors the
+  # go-fixture/goextract jobs).
   gates:
     name: gates (blocking)
     runs-on: ubuntu-latest
@@ -46,15 +47,16 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      # The green tests: lib + bin unit/parse tests PLUS the now-green snapshot_graph +
-      # snapshot_diagnostics + determinism integration tests (02-03). snapshot_openapi + snapshot_sdk
-      # stay in the non-blocking `contract` job (red-by-design until Phase 3). CI=true → insta runs
-      # INSTA_UPDATE=no, so a snapshot mismatch hard-fails (FIX-04), never auto-accepts.
-      - name: test (lib + bin + green contract tests)
+      # The full green suite: lib + bin unit/parse tests PLUS all four contract snapshots
+      # (snapshot_graph/diagnostics/openapi/sdk — openapi+sdk turned green in Phase 3-01/03-02) PLUS
+      # determinism + the new sdk_compile test (03-03: temp dir + zero-require go.mod + go build +
+      # httptest smoke, SDK-05). CI=true → insta runs INSTA_UPDATE=no, so a snapshot mismatch
+      # hard-fails (FIX-04), never auto-accepts.
+      - name: test (lib + bin + all four contract tests + sdk_compile)
         run: |
           cargo test -p gnr8-core --lib
           cargo test -p gnr8
-          cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test determinism
+          cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile
 
   # BLOCKING — the Go fixture is a separate module cargo never compiles; gate it so it can't rot.
   go-fixture:
@@ -84,20 +86,6 @@ jobs:
           CGO_ENABLED: '0'
         run: cd goextract && go build ./... && go vet ./... && go test ./...
 
-  # NON-BLOCKING — the TWO remaining red-by-design contract tests (openapi + sdk). VISIBLY RED until
-  # Phase 3 implements lower::to_openapi + sdk::generate (their .expect() panics on NotYetImplemented).
-  # continue-on-error keeps a red `main` from blocking merges while honoring FIX-04 (never #[ignore]d).
-  # PROMOTE TO BLOCKING in Phase 3 once those two snapshots turn green. snapshot_graph +
-  # snapshot_diagnostics moved to the blocking `gates` job in 02-03 (now green).
-  contract:
-    name: contract (non-blocking, red-by-design)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: red-by-design contract suite (expected to FAIL until Phase 3)
-        run: cargo test -p gnr8-core --test snapshot_openapi --test snapshot_sdk
+  # The non-blocking `contract` job (continue-on-error) that ran the red-by-design
+  # snapshot_openapi + snapshot_sdk tests has been RETIRED in Phase 3 (D-07): both snapshots are now
+  # green and run as BLOCKING in the `gates` job above. No `continue-on-error` remains in this file.

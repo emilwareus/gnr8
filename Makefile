@@ -3,15 +3,13 @@
 # `make check` is the full LOCAL gate and mirrors CI. It runs fmt-check, clippy
 # (--locked, -D warnings), the test suite, and the Go fixture build/vet.
 #
-# NOTE (red-by-design, FIX-04): `make test` runs the WHOLE suite, including the four
-# red-by-design contract tests (snapshot_graph/openapi/sdk/diagnostics). Those FAIL on
-# purpose today — they call gnr8-core seams that still return NotYetImplemented, so the
-# .expect() panics. That redness is the contract a developer sees locally. Use
-# `make gates` to run only the genuinely-green blocking gate the CI `gates` job enforces
-# (lib + bin tests, excluding the integration `tests/` dir), and `make contract` to run
-# the four red tests on their own.
+# As of Phase 3 (D-07) the red-by-design era is OVER: all four contract tests
+# (snapshot_graph/diagnostics/openapi/sdk) are GREEN, and `make gates` now runs them as the
+# blocking set alongside determinism + the new sdk_compile test (temp dir + zero-require go.mod +
+# go build + httptest smoke, SDK-05). The standalone `contract` target is retired — there are no
+# longer any red-by-design failures to isolate. `make gates` mirrors the blocking CI `gates` job.
 
-.PHONY: fmt fmt-check clippy test gates contract fixture-build goextract-build check all
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build check all
 
 # Auto-format the workspace in place.
 fmt:
@@ -25,25 +23,20 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
-# Full test suite — INCLUDES the four red-by-design contract tests (they fail on purpose, FIX-04).
+# Full test suite — every test is now green (the red-by-design era ended in Phase 3).
 test:
 	cargo test --all-features
 
-# Blocking gate test set: genuinely-green unit + CLI parse tests, plus the now-green graph/
-# diagnostics/determinism contract tests (02-03 implemented build_graph + diagnostics::collect, so
-# snapshot_graph + snapshot_diagnostics flipped GREEN; determinism proves two runs byte-identical).
-# These three invoke the goextract helper via `go run`, so the Go toolchain must be present.
-# Still excludes snapshot_openapi + snapshot_sdk, which stay red-by-design until Phase 3.
-# Mirrors the CI `gates` job (RUST-03 / Open Q1 option d).
+# Blocking gate test set: green unit + CLI parse tests, ALL FOUR contract tests
+# (snapshot_graph/diagnostics/openapi/sdk — openapi+sdk turned green in Phase 3-01/03-02),
+# determinism (graph + OpenAPI + SDK byte-identical), and sdk_compile (temp dir + zero-require go.mod
+# + go build + httptest smoke, SDK-05). These invoke the goextract helper via `go run`, pipe Go
+# through `gofmt`, and run `go build`/`go test`, so the Go toolchain must be present.
+# Mirrors the CI `gates` job (RUST-03 / D-07).
 gates:
 	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
-	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test determinism
-
-# The remaining red-by-design contract tests, run on their own. VISIBLY RED until Phase 3 (FIX-04)
-# implements lower::to_openapi + sdk::generate. Mirrors the non-blocking CI `contract` job.
-contract:
-	cargo test -p gnr8-core --test snapshot_openapi --test snapshot_sdk
+	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
@@ -54,7 +47,7 @@ fixture-build:
 goextract-build:
 	cd goextract && go build ./... && go vet ./... && go test ./...
 
-# Full local gate, mirrors CI. `test` surfaces the red-by-design contract failures by design.
+# Full local gate, mirrors CI. The whole suite is green now (no red-by-design failures remain).
 check: fmt-check clippy test fixture-build goextract-build
 
 all: check
