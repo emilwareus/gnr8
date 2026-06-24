@@ -64,8 +64,8 @@
 ### Speed And Watch Mode
 
 - [x] **WATCH-01**: No-op generation avoids rewriting unchanged outputs.
-- [ ] **WATCH-02**: Watch mode reacts to source changes, debounces duplicate events, and avoids loops from generated files.
-- [ ] **WATCH-03**: The PoC reports cold generation, warm no-op, and single-file edit latency for fixture services.
+- [x] **WATCH-02**: Watch mode reacts to source changes, debounces duplicate events, and avoids loops from generated files.
+- [x] **WATCH-03**: The PoC reports cold generation, warm no-op, and single-file edit latency for fixture services.
 
 ### Hardening And Demo
 
@@ -165,8 +165,8 @@
 | WS-03 | Phase 4 | Complete |
 | WS-04 | Phase 4 | Complete |
 | WATCH-01 | Phase 4 | Complete |
-| WATCH-02 | Phase 4 | Pending |
-| WATCH-03 | Phase 4 | Pending |
+| WATCH-02 | Phase 4 | Complete |
+| WATCH-03 | Phase 4 | Complete |
 | HARD-01 | Phase 5 | Pending |
 | HARD-02 | Phase 5 | Pending |
 | HARD-03 | Phase 5 | Pending |
@@ -178,5 +178,5 @@
 
 ---
 *Requirements defined: 2026-06-24*
-*Last updated: 2026-06-24 after GSD project initialization*
+*Last updated: 2026-06-24 — marked WATCH-02/WATCH-03 Complete (Phase 4 implemented + verified)*
 
