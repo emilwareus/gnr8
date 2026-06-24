@@ -1,24 +1,73 @@
-//! RED placeholder — the full clap derive CLI surface lands in the GREEN step.
-//! Intentionally incomplete so the parse tests below fail to compile (missing variants).
+//! The gnr8 command-line surface (RUST-02 / D-10..D-12), defined with the clap derive API.
+//!
+//! Six top-level commands plus a nested `inspect` subcommand, with a global `--json` flag and a
+//! repeatable `-v/--verbose` count. Phase 1 only parses the surface; every command dispatches to a
+//! `gnr8-core` seam that returns a typed `NotYetImplemented` error (see `main.rs`).
 
 use clap::{Parser, Subcommand};
 
+// `doc_markdown` flags "OpenAPI" (a proper noun, not a code item); backticks would leak into clap
+// help text, so allow it locally on the doc comments that double as user-facing help (skill ch.2.4).
+/// Code-first OpenAPI + Go SDK generator.
+#[allow(clippy::doc_markdown)]
 #[derive(Debug, Parser)]
-#[command(name = "gnr8", version)]
-pub struct Cli {
+#[command(
+    name = "gnr8",
+    version,
+    about = "Code-first OpenAPI + Go SDK generator"
+)]
+pub(crate) struct Cli {
+    /// Emit machine-readable JSON instead of human-readable output.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+
+    /// Increase output detail (-v, -vv).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
+
+    /// The command to run.
     #[command(subcommand)]
-    pub command: Commands,
+    pub(crate) command: Commands,
 }
 
+/// Top-level gnr8 commands (D-11).
 #[derive(Debug, Subcommand)]
-pub enum Commands {
+pub(crate) enum Commands {
+    /// Scaffold a project-local .gnr8/ workspace.
+    Init,
     /// Generate OpenAPI + Go SDK from Go source.
+    #[allow(clippy::doc_markdown)] // "OpenAPI" is a proper noun; keep clap help text clean.
     Generate,
+    /// Watch source and regenerate on change.
+    Watch,
+    /// Verify generated outputs are up to date.
+    Check,
+    /// Explain inferred API facts and diagnostics.
+    Inspect {
+        /// What to inspect.
+        #[command(subcommand)]
+        action: InspectAction,
+    },
+    /// Summarize unsupported patterns and lifecycle issues.
+    Doctor,
+}
+
+/// `inspect` subcommands (D-11).
+#[derive(Debug, Subcommand)]
+pub(crate) enum InspectAction {
+    /// Show discovered routes.
+    Routes,
+    /// Show discovered schemas.
+    Schemas,
+    /// Show the raw API graph.
+    Graph,
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4); scope the allow to
+    // the test module so the workspace-wide RUST-04 deny stays intact for production code.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{Cli, Commands, InspectAction};
     use clap::Parser;

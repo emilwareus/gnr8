@@ -167,6 +167,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gnr8-core",
+ "serde",
  "serde_json",
 ]
 
