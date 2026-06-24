@@ -57,6 +57,55 @@ pub enum CoreError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// A graph fact could not be lowered into the `OpenAPI` 3.1 target (Phase 3 / OAPI-01).
+    ///
+    /// Raised for forward-incompatible or malformed graph facts that the lowering layer cannot
+    /// represent — e.g. a dangling `$ref` (a `request_body`/`response.body` whose `ref_id` is not
+    /// among `graph.schemas`) or an unknown [`crate::graph::SchemaType`] `kind`. The `message`
+    /// names the offending id so the failure is diagnosable without a panic (RUST-04 / V5, T-03-01-01).
+    #[error("lowering failed: {message}")]
+    Lowering {
+        /// Human-readable failure detail naming the offending id.
+        message: String,
+    },
+
+    /// The Go SDK could not be emitted from the graph (Phase 3 / SDK seam).
+    ///
+    /// Defined here in Phase 3-01 so plan 03-02 (Go SDK emission) needs no `error.rs` edit and the
+    /// two plans stay file-disjoint for parallel execution. Carries an owned `message` describing
+    /// the emission failure.
+    #[error("Go SDK generation failed: {message}")]
+    SdkGen {
+        /// Human-readable failure detail.
+        message: String,
+    },
+
+    /// The `gofmt` subprocess ran but exited with a non-zero status (Phase 3 / SDK formatting).
+    ///
+    /// Mirrors the [`Self::HelperExit`] shape (exit `code` + captured `stderr`) and is kept distinct
+    /// from [`Self::GoToolchainMissing`] (which is a spawn failure) exactly as the existing code does.
+    /// Defined here so plan 03-02 consumes it without editing `error.rs`.
+    #[error("gofmt exited with status {code:?}:\n{stderr}")]
+    GoFmt {
+        /// The process exit code, or `None` if terminated by a signal.
+        code: Option<i32>,
+        /// The captured standard-error output of `gofmt`.
+        stderr: String,
+    },
+
+    /// The `go build` subprocess ran but exited with a non-zero status (Phase 3 / SDK compile gate).
+    ///
+    /// Mirrors the [`Self::HelperExit`] shape (exit `code` + captured `stderr`) and is kept distinct
+    /// from [`Self::GoToolchainMissing`] (a spawn failure) as the existing code does. Defined here so
+    /// plan 03-03 (the SDK compile/smoke test) consumes it without editing `error.rs`.
+    #[error("go build exited with status {code:?}:\n{stderr}")]
+    GoBuild {
+        /// The process exit code, or `None` if terminated by a signal.
+        code: Option<i32>,
+        /// The captured standard-error output of `go build`.
+        stderr: String,
+    },
 }
 
 #[cfg(test)]
@@ -102,6 +151,47 @@ mod tests {
                 msg.contains("failed to parse goextract JSON facts"),
                 "{msg}"
             );
+        }
+
+        #[test]
+        fn lowering_renders_with_message() {
+            let err = CoreError::Lowering {
+                message: "dangling $ref 'internal/dto.Missing'".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("lowering"), "{msg}");
+            assert!(msg.contains("dangling $ref 'internal/dto.Missing'"), "{msg}");
+        }
+
+        #[test]
+        fn sdk_gen_renders_with_message() {
+            let err = CoreError::SdkGen {
+                message: "unknown tag grouping".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("unknown tag grouping"), "{msg}");
+        }
+
+        #[test]
+        fn go_fmt_renders_code_and_stderr() {
+            let err = CoreError::GoFmt {
+                code: Some(2),
+                stderr: "gofmt: invalid syntax".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Some(2)"), "{msg}");
+            assert!(msg.contains("gofmt: invalid syntax"), "{msg}");
+        }
+
+        #[test]
+        fn go_build_renders_code_and_stderr() {
+            let err = CoreError::GoBuild {
+                code: Some(1),
+                stderr: "imported and not used: \"time\"".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Some(1)"), "{msg}");
+            assert!(msg.contains("imported and not used"), "{msg}");
         }
     }
 }
