@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 3 planned (3 plans, verified, 0 issues)
-last_updated: "2026-06-24T18:39:54.896Z"
-last_activity: 2026-06-24 -- Phase 02 execution started
+stopped_at: Completed 03-01-PLAN.md
+last_updated: "2026-06-24T18:55:01.505Z"
+last_activity: 2026-06-24 -- Phase 03 execution started
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 9
-  completed_plans: 6
+  completed_plans: 7
   percent: 40
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-24)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 02 — go-analysis-and-api-graph
+**Current focus:** Phase 03 — openapi-and-go-sdk-generation
 
 ## Current Position
 
-Phase: 02 (go-analysis-and-api-graph) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 02
-Last activity: 2026-06-24 -- Phase 02 execution started
+Phase: 03 (openapi-and-go-sdk-generation) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 03
+Last activity: 2026-06-24 -- Phase 03 execution started
 
-Progress: [██████████] 100%
+Progress: [████████░░] 78%
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Progress: [██████████] 100%
 | Phase 2 P01 | 14min | 3 tasks | 18 files |
 | Phase 02 P02 | 12min | 3 tasks | 13 files |
 | Phase 02 P03 | 14min | 3 tasks | 15 files |
+| Phase 03 P01 | 13min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -82,6 +83,9 @@ Recent decisions affecting current work:
 - [Phase 02]: ApiGraph operation id = @ID annotation when present (goalUuidPut) else the handler symbol (createGoal/listGoals/deleteGoal); schema ids package-qualified; all collections sorted so unchanged source => byte-identical output (GRAPH-02)
 - [Phase 02]: Graph stores group-relative path + @Router override (router_path); absolute /goal/... prefix is the dynamic basePath prefix the facts cannot fold, deferred to Phase-3 lowering; provenance/diagnostic paths relativized against the canonical module root for portable snapshots
 - [Phase 02]: snapshot_graph + snapshot_diagnostics flipped GREEN with reviewed .snap + determinism test, promoted into the blocking gates job (setup-go added); only snapshot_openapi + snapshot_sdk remain red-by-design (non-blocking) until Phase 3
+- [Phase ?]: [Phase 03-01]: Open Q A3 resolved — /goal absolute base prefix joined in lowering from a private const BASE_PATH with slash-collapse (/goal/, /goal/list, /goal/{uuid}), not by reshaping the Phase-2 graph (single-group PoC)
+- [Phase ?]: [Phase 03-01]: Hand-rolled typed OpenAPI 3.1 model + deterministic key-ordered YAML writer (no openapiv3/serde_yaml crate); Vec<(K,V)> never HashMap for byte-stable output; dangling $ref/unknown kind -> typed CoreError::Lowering, no prod unwrap/expect/panic
+- [Phase ?]: [Phase 03-01]: All four Phase-3 CoreError variants (Lowering/SdkGen/GoFmt/GoBuild) defined in 03-01 so 03-02/03-03 stay file-disjoint; snapshot_openapi flipped GREEN via manual insta accept flow (reconciled with expected/openapi.yaml, not byte-copied); snapshot_sdk stays red-by-design
 
 ### Pending Todos
 
@@ -101,6 +105,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T18:39:54.890Z
-Stopped at: Phase 3 planned (3 plans, verified, 0 issues)
-Resume file: .planning/phases/03-openapi-and-go-sdk-generation/03-01-PLAN.md
+Last session: 2026-06-24T18:55:01.499Z
+Stopped at: Completed 03-01-PLAN.md
+Resume file: None

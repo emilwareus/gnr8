@@ -58,7 +58,7 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — OpenAPI lowering: typed OpenAPI 3.1 structs + deterministic YAML writer, to_openapi graph→doc mapping (join the /goal base prefix, surface OAPI-03 diagnostics), four new CoreError variants; flip snapshot_openapi GREEN (wave 1).
+- [x] 03-01-PLAN.md — OpenAPI lowering: typed OpenAPI 3.1 structs + deterministic YAML writer, to_openapi graph→doc mapping (join the /goal base prefix, surface OAPI-03 diagnostics), four new CoreError variants; flip snapshot_openapi GREEN (wave 1).
 - [ ] 03-02-PLAN.md — Go SDK codegen: format!-based emitters (models/functional-options Client/tag-grouped ctx-first ops/typed APIError) + gofmt normalization + SdkBundle file-marker String + write_to_dir; flip snapshot_sdk GREEN (wave 1).
 - [ ] 03-03-PLAN.md — Generated-SDK compile + smoke: hermetic stdlib-only temp-dir go build + httptest smoke (SDK-05), to_openapi/generate determinism asserts, promote all four contract tests + sdk_compile to the blocking CI gate and retire the non-blocking contract job (wave 2).
 
@@ -102,6 +102,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 |-------|----------------|--------|-----------|
 | 1. Foundation And Fixtures | 3/3 | Complete   | 2026-06-24 |
 | 2. Go Analysis And API Graph | 3/3 | Complete   | 2026-06-24 |
-| 3. OpenAPI And Go SDK Generation | 0/3 | Not started | - |
+| 3. OpenAPI And Go SDK Generation | 1/3 | In Progress|  |
 | 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
 | 5. PoC Hardening And Demo | 0/2 | Not started | - |

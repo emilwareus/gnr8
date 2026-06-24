@@ -42,9 +42,9 @@
 
 ### OpenAPI Output
 
-- [ ] **OAPI-01**: The OpenAPI writer emits a valid document for the fixture service.
-- [ ] **OAPI-02**: The document includes info, paths, operations, parameters, request bodies, responses, and component schemas.
-- [ ] **OAPI-03**: Lowering emits diagnostics when the selected OpenAPI target cannot represent a graph fact cleanly.
+- [x] **OAPI-01**: The OpenAPI writer emits a valid document for the fixture service.
+- [x] **OAPI-02**: The document includes info, paths, operations, parameters, request bodies, responses, and component schemas.
+- [x] **OAPI-03**: Lowering emits diagnostics when the selected OpenAPI target cannot represent a graph fact cleanly.
 
 ### Go SDK Output
 
@@ -152,9 +152,9 @@
 | GRAPH-01 | Phase 2 | Complete |
 | GRAPH-02 | Phase 2 | Complete |
 | GRAPH-03 | Phase 2 | Complete |
-| OAPI-01 | Phase 3 | Pending |
-| OAPI-02 | Phase 3 | Pending |
-| OAPI-03 | Phase 3 | Pending |
+| OAPI-01 | Phase 3 | Complete |
+| OAPI-02 | Phase 3 | Complete |
+| OAPI-03 | Phase 3 | Complete |
 | SDK-01 | Phase 3 | Pending |
 | SDK-02 | Phase 3 | Pending |
 | SDK-03 | Phase 3 | Pending |
