@@ -160,7 +160,10 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("lowering"), "{msg}");
-            assert!(msg.contains("dangling $ref 'internal/dto.Missing'"), "{msg}");
+            assert!(
+                msg.contains("dangling $ref 'internal/dto.Missing'"),
+                "{msg}"
+            );
         }
 
         #[test]

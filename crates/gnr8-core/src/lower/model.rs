@@ -1,0 +1,178 @@
+//! Typed `OpenAPI` 3.1.0 document model (D-01).
+//!
+//! Plain, serde-derivable Rust structs mirroring the `OpenAPI` 3.1.0 subset Phase 3 needs: `info`,
+//! `security`, `paths` → operations, `parameters`, `requestBody`, `responses`, and `components`
+//! (`schemas` + `securitySchemes`). The graph is the source of truth; this model is the typed
+//! intermediate the [`super::to_openapi`] mapper builds and the [`super::yaml`] writer serializes.
+//!
+//! Determinism (GRAPH-02 / RESEARCH Pitfall 4): every map-like construct is a `Vec<(String, T)>`,
+//! NEVER a [`std::collections::HashMap`], so key order is explicit + caller-sorted and two writes of
+//! the same document are byte-identical. `serde::Serialize` is derived for forward-compat with a JSON
+//! form (D-01 "support JSON form"), but the PRIMARY emitter is the hand-rolled YAML writer — no YAML
+//! crate is in the tree (`serde_yaml` is deprecated/absent — RESEARCH Alternatives).
+
+/// A complete `OpenAPI` 3.1.0 document, ready to serialize via [`super::yaml::write`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct OpenApiDoc {
+    /// The spec version string — always `"3.1.0"` for this target.
+    pub openapi: &'static str,
+    /// Document metadata (`title`, `version`, optional `description`).
+    pub info: Info,
+    /// Top-level security requirements (e.g. `[{ApiKeyAuth: []}]`), empty when no operation is secured.
+    pub security: Vec<SecurityRequirement>,
+    /// Path templates keyed absolutely (`/goal/`, `/goal/list`, `/goal/{uuid}`), in sorted order.
+    pub paths: Vec<(String, PathItem)>,
+    /// Reusable components: `securitySchemes` and `schemas`.
+    pub components: Components,
+}
+
+/// Document `info` block.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Info {
+    /// Human-readable API title.
+    pub title: String,
+    /// API version string.
+    pub version: String,
+    /// Optional longer description; omitted from the document when `None`.
+    pub description: Option<String>,
+}
+
+/// One top-level (or per-operation) security requirement: a scheme name → required scopes (always
+/// empty for an `apiKey` scheme, per the spec).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SecurityRequirement {
+    /// The referenced security scheme name (e.g. `ApiKeyAuth`).
+    pub scheme: String,
+    /// Required scopes — always empty for an API-key scheme.
+    pub scopes: Vec<String>,
+}
+
+/// All HTTP operations registered under one path template, keyed by method in fixed HTTP order.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub(crate) struct PathItem {
+    /// `GET` operation, if any.
+    pub get: Option<Operation>,
+    /// `POST` operation, if any.
+    pub post: Option<Operation>,
+    /// `PUT` operation, if any.
+    pub put: Option<Operation>,
+    /// `DELETE` operation, if any.
+    pub delete: Option<Operation>,
+}
+
+/// One HTTP operation (an `operationId` + its params/body/responses).
+// `operation_id` mirrors the spec's `operationId` key; the field name intentionally echoes the
+// struct, so the field-name lint is silenced here rather than renamed away from the spec term.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Operation {
+    /// Operation summary, omitted when `None`.
+    pub summary: Option<String>,
+    /// Stable, unique operation id (the graph operation id).
+    pub operation_id: String,
+    /// Tags, in graph (sorted) order; omitted when empty.
+    pub tags: Vec<String>,
+    /// Path + query parameters, in graph (name-sorted) order.
+    pub parameters: Vec<Parameter>,
+    /// The JSON request body, if the operation takes one.
+    pub request_body: Option<RequestBody>,
+    /// Responses keyed by stringified status code, in ascending status order.
+    pub responses: Vec<(String, ResponseObj)>,
+}
+
+/// One path or query parameter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Parameter {
+    /// Parameter name.
+    pub name: String,
+    /// `"path"` or `"query"` — emitted under the `in` key.
+    pub location: String,
+    /// Whether the parameter is required (path params are always required).
+    pub required: bool,
+    /// Optional human description, omitted when `None`.
+    pub description: Option<String>,
+    /// The parameter's schema (primitive, with optional `format`/`enum`).
+    pub schema: SchemaObject,
+}
+
+/// A JSON request body referencing a component schema.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RequestBody {
+    /// Whether the body is required — always `true` for the inferred typed bodies.
+    pub required: bool,
+    /// The JSON-pointer name of the referenced schema (bare component name).
+    pub schema_ref: String,
+}
+
+/// One response keyed by status code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ResponseObj {
+    /// Human-readable response description (a stable default is used when the graph has none).
+    pub description: String,
+    /// The JSON-pointer name of the referenced body schema, if the response has a typed body.
+    pub schema_ref: Option<String>,
+}
+
+/// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub(crate) struct Components {
+    /// Named security schemes (e.g. `ApiKeyAuth` → apiKey/header/X-API-Key), sorted by name.
+    pub security_schemes: Vec<(String, SecurityScheme)>,
+    /// Component schemas, keyed by their bare component name, sorted by name.
+    pub schemas: Vec<(String, SchemaObject)>,
+}
+
+/// An API-key security scheme (`type: apiKey`, `in: header`, `name: <header>`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SecurityScheme {
+    /// The scheme kind — always `"apiKey"` for this target.
+    pub kind: &'static str,
+    /// Where the key is read from — always `"header"` for this target.
+    pub location: &'static str,
+    /// The header name carrying the key (e.g. `X-API-Key`).
+    pub name: String,
+}
+
+/// A `JSON-Schema-2020-12` schema object (the `OpenAPI` 3.1 schema subset this `PoC` emits).
+///
+/// Optionality is expressed purely by omission from [`Self::required`] — there is NO `nullable` key
+/// and NO `type: [T, "null"]` array form in 3.1 (RESEARCH Pattern 2).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub(crate) struct SchemaObject {
+    /// The primitive/composite type name (`string`, `integer`, `number`, `boolean`, `array`,
+    /// `object`); `None` when the schema is a bare `$ref`.
+    pub type_name: Option<String>,
+    /// Format hint (`uuid`, `date-time`, `int64`), emitted alongside `type` when present.
+    pub format: Option<String>,
+    /// Closed value set for string enums, in sorted order; empty otherwise.
+    pub enum_values: Vec<String>,
+    /// Required field names for object schemas, in sorted order; empty otherwise.
+    pub required: Vec<String>,
+    /// Object properties, keyed by json name, in sorted order; empty otherwise.
+    pub properties: Vec<(String, SchemaObject)>,
+    /// Element schema for `array` types.
+    pub items: Option<Box<SchemaObject>>,
+    /// `Some(true)` for a free-form map (`map[string]any` → `additionalProperties: true`).
+    pub additional_properties: Option<bool>,
+    /// A JSON-pointer `$ref` to a component schema (bare name, e.g. `CreateGoalInput`).
+    pub schema_ref: Option<String>,
+}
+
+impl SchemaObject {
+    /// A bare `$ref` schema referencing a component by its local name.
+    pub(crate) fn reference(name: impl Into<String>) -> Self {
+        Self {
+            schema_ref: Some(name.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A primitive schema with an optional `format`.
+    pub(crate) fn primitive(type_name: impl Into<String>, format: Option<String>) -> Self {
+        Self {
+            type_name: Some(type_name.into()),
+            format,
+            ..Self::default()
+        }
+    }
+}
