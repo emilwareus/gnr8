@@ -694,6 +694,88 @@ fn naming_type_rename_updates_refs_no_dangling() {
     );
 }
 
+/// Recursively copy `src` into `dst` (creating `dst`), so a test can stage a self-contained copy of
+/// the fixture module under a temp root. Mirrors the no-`tempfile`/no-extra-dep discipline.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).expect("create dst dir");
+    for entry in std::fs::read_dir(src).expect("read src dir") {
+        let entry = entry.expect("dir entry");
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir_recursive(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).expect("copy file");
+        }
+    }
+}
+
+/// WATCH-01 / GAP (criterion 3): the SHIPPED DEFAULT config (`inputs = ["."]`, `sdk_dir = "sdk"`,
+/// `openapi = "openapi.yaml"`) writes the generated SDK INSIDE the analyzed input tree. Before the
+/// fix, a second `regenerate` re-analyzed gnr8's own `sdk/*.go`, doubled every schema (9 → 18), and
+/// rewrote larger, duplicated output — so `init → generate → generate` was never a no-op.
+///
+/// This test runs the REAL `regenerate` pipeline twice on a staged copy of the fixture via the
+/// default layout (inputs and outputs in the same tree) and asserts the SECOND run writes 0 files and
+/// every output is unchanged, and that `plan_only` (the `gnr8 check` seam) reports NO drift (exit 0).
+/// The exclusion of the configured output paths from analysis is what makes this hold.
+#[test]
+fn default_config_second_regenerate_is_a_noop() {
+    if !go_available() {
+        eprintln!("skipping default_config_second_regenerate_is_a_noop: go toolchain unavailable");
+        return;
+    }
+    let root = unique_temp_dir("default-noop");
+
+    // Stage a self-contained copy of the fixture module under the temp root, then init `.gnr8/` —
+    // this reproduces the DEFAULT layout where inputs (`.`) and outputs (`sdk/`) share one tree.
+    copy_dir_recursive(std::path::Path::new(FIXTURE_DIR), &root);
+    gnr8_core::workspace::init(&root).expect("init .gnr8 workspace");
+
+    // The SHIPPED default config body (inputs=["."], sdk_dir="sdk", openapi="openapi.yaml") — the
+    // exact surface `gnr8 init` writes and the workflow this phase was asked to prove.
+    let config = gnr8_core::config::parse(gnr8_core::workspace::DEFAULT_CONFIG_TOML)
+        .expect("DEFAULT_CONFIG_TOML must parse");
+    assert_eq!(config.inputs, vec![".".to_string()]);
+    assert_eq!(config.output.sdk_dir, "sdk");
+    assert_eq!(config.output.openapi, "openapi.yaml");
+
+    // Cold run: writes the OpenAPI artifact + the SDK files.
+    let cold = lifecycle::regenerate(&root, &config, false).expect("cold regenerate");
+    assert!(
+        !cold.written.is_empty(),
+        "cold run must write the generated outputs, got {cold:?}"
+    );
+    let cold_written = cold.written.len();
+
+    // Warm run: a TRUE no-op — gnr8's own sdk/*.go is excluded from analysis, so the graph is
+    // identical to the cold run and every output is byte-identical.
+    let warm = lifecycle::regenerate(&root, &config, false).expect("warm regenerate");
+    assert!(
+        warm.written.is_empty(),
+        "DEFAULT-config second regenerate must write NOTHING (no self-ingestion), got {:?}",
+        warm.written
+    );
+    assert_eq!(
+        warm.unchanged.len(),
+        cold_written,
+        "every cold-written output must be unchanged on the warm run, got {warm:?}"
+    );
+    assert!(
+        warm.skipped.is_empty(),
+        "no output should be skipped on the warm run, got {warm:?}"
+    );
+
+    // `gnr8 check` (plan_only) must report NO drift on the warm tree → exit 0.
+    let plan = lifecycle::plan_only(&root, &config).expect("plan_only after warm run");
+    assert!(
+        !plan.has_drift(),
+        "plan_only must report no drift after a no-op regenerate (check exit 0)"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Scaffold a project root with a `.gnr8/config.toml` whose `inputs` point at the fixture, returning
 /// `(root, config)` ready for `regenerate`. Outputs land under the temp root (hermetic).
 fn scaffold_project(label: &str) -> (PathBuf, gnr8_core::config::Config) {

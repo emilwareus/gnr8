@@ -338,16 +338,72 @@ fn rewrite_schema_type_ref(schema: &mut crate::graph::SchemaType, old_id: &str, 
     }
 }
 
+/// The workspace directory whose contents are NEVER analyzed (it holds gnr8's own config + cache,
+/// not user Go source). Excluded from the analyzed graph alongside the configured output paths.
+const WORKSPACE_DIR: &str = ".gnr8";
+
+/// Whether a module-relative source `file` lives under (or AT) a configured output `anchor` — the
+/// graph-side twin of the watch loop-safety filter (`watch::is_under_any_output`).
+///
+/// Both answer the SAME question — "is this path one of gnr8's own generated outputs?" — so gnr8
+/// never ingests or loops on its own output (WATCH-01 / WATCH-02). The watch filter compares absolute,
+/// canonicalized paths; this compares the module-relative provenance paths the graph carries against
+/// the project-relative config anchors, matching only on a path-separator boundary so a sibling like
+/// `sdklib/x.go` is NOT mistaken for being under the `sdk` anchor.
+fn is_under_output(file: &str, anchor: &str) -> bool {
+    let anchor = anchor.trim_end_matches('/');
+    if anchor.is_empty() {
+        return false;
+    }
+    file == anchor || file.starts_with(&format!("{anchor}/"))
+}
+
+/// Drop from `graph` every operation/schema whose provenance file is one of gnr8's OWN configured
+/// outputs (the SDK dir, the OpenAPI artifact) or lives under the `.gnr8/` workspace dir — so a
+/// second `generate` under the DEFAULT config (`inputs = ["."]`, outputs inside `.`) never
+/// re-analyzes the `sdk/*.go` it just wrote and duplicates every schema (the WATCH-01 no-op gap).
+///
+/// This is the architectural form of the loop-safety principle: gnr8 must not ingest its own output,
+/// regardless of WHERE the user points outputs. Because it operates on the config-driven output
+/// anchors (NOT on the raw `build_graph` result), the fixture snapshot path
+/// (`build_graph(fixtures/goalservice)`) — which never overlaps its analyzed inputs with its outputs
+/// — is unaffected.
+///
+/// Filtering removes a generated op and its generated schemas together (they share the generated
+/// file's provenance), so no dangling `$ref` is introduced: real-source operations reference only
+/// real-source schemas.
+fn exclude_output_paths(graph: &mut ApiGraph, config: &Config) {
+    let anchors = [
+        config.output.sdk_dir.as_str(),
+        config.output.openapi.as_str(),
+        WORKSPACE_DIR,
+    ];
+    let is_generated = |file: &str| anchors.iter().any(|anchor| is_under_output(file, anchor));
+    graph
+        .operations
+        .retain(|op| !is_generated(&op.provenance.file));
+    graph
+        .schemas
+        .retain(|schema| !is_generated(&schema.provenance.file));
+}
+
 /// Build the full set of generated outputs `(project-relative path, bytes, provenance)` for `config`.
 ///
-/// Runs the deterministic Phase 2-3 pipeline: build the graph over the first configured input dir,
-/// apply naming overrides, lower to OpenAPI, generate the SDK bundle, and split the bundle into
-/// per-file outputs under `output.sdk_dir` (with the frame-name path-safety check). The Go-toolchain /
-/// lowering / sdkgen errors propagate as their existing typed `CoreError` variants.
+/// Runs the deterministic Phase 2-3 pipeline: build the graph over the first configured input dir
+/// (resolved against `project_root`, so inputs and outputs share the SAME anchor and a relative
+/// `inputs = ["."]` analyzes the project — not the process cwd), EXCLUDE gnr8's own generated outputs
+/// from the analyzed graph (so a re-run never ingests the `sdk/*.go` it last wrote — WATCH-01 no-op
+/// safety, the graph-side twin of the watch loop filter), apply naming overrides, lower to OpenAPI,
+/// generate the SDK bundle, and split the bundle into per-file outputs under `output.sdk_dir` (with
+/// the frame-name path-safety check). The Go-toolchain / lowering / sdkgen errors propagate as their
+/// existing typed `CoreError` variants.
 ///
 /// PoC scope: if `config.inputs` has more than one entry, only the FIRST is analyzed (multi-input
 /// fan-in is out of scope this phase — D-02).
-fn build_outputs(config: &Config) -> Result<Vec<(String, Vec<u8>, String)>, crate::CoreError> {
+fn build_outputs(
+    project_root: &Path,
+    config: &Config,
+) -> Result<Vec<(String, Vec<u8>, String)>, crate::CoreError> {
     let input = config
         .inputs
         .first()
@@ -355,7 +411,17 @@ fn build_outputs(config: &Config) -> Result<Vec<(String, Vec<u8>, String)>, crat
             message: "config.inputs is empty — at least one Go source dir is required".to_string(),
         })?;
 
-    let mut graph = crate::analyze::build_graph(input)?;
+    // Resolve the input against the project root so inputs and outputs share one anchor: a relative
+    // `inputs = ["."]` analyzes the PROJECT, not the process cwd (an absolute input is left as-is by
+    // `Path::join`). This keeps the output-path exclusion below meaningful — the provenance paths the
+    // graph carries are relative to the SAME root the configured outputs are.
+    let resolved_input = project_root.join(input);
+    let input_arg = resolved_input.to_string_lossy();
+    let mut graph = crate::analyze::build_graph(&input_arg)?;
+    // Never ingest gnr8's own generated output: drop any operation/schema discovered under the
+    // configured output paths (or `.gnr8/`) BEFORE naming/lowering, so `init → generate → generate`
+    // under the default config is a true no-op rather than duplicating every schema (WATCH-01).
+    exclude_output_paths(&mut graph, config);
     apply_naming(&mut graph, &config.naming);
 
     let openapi = crate::lower::to_openapi(&graph)?;
@@ -398,7 +464,7 @@ fn build_outputs(config: &Config) -> Result<Vec<(String, Vec<u8>, String)>, crat
 /// Propagates any pipeline error (Go toolchain missing, lowering, sdkgen, manifest read I/O) as its
 /// typed `CoreError`. Never panics.
 pub fn plan_only(project_root: &Path, config: &Config) -> Result<WritePlan, crate::CoreError> {
-    let outputs = build_outputs(config)?;
+    let outputs = build_outputs(project_root, config)?;
     let manifest = manifest::load(&project_root.join(".gnr8"))?;
     let root = project_root.to_path_buf();
     let on_disk = move |path: &str| -> Option<Vec<u8>> { std::fs::read(root.join(path)).ok() };
@@ -424,7 +490,7 @@ pub fn regenerate(
     config: &Config,
     force: bool,
 ) -> Result<GenerateOutcome, crate::CoreError> {
-    let outputs = build_outputs(config)?;
+    let outputs = build_outputs(project_root, config)?;
     let gnr8_dir = project_root.join(".gnr8");
     let mut manifest = manifest::load(&gnr8_dir)?;
 
@@ -479,5 +545,30 @@ mod tests {
             matches!(result, Err(crate::CoreError::Io { .. })),
             "a traversal path must be rejected with CoreError::Io, got {result:?}"
         );
+    }
+
+    /// WATCH-01 loop-safety twin: the pure output-anchor test matches a file AT or UNDER an anchor,
+    /// only on a path-separator boundary, so gnr8's own generated files are excluded from analysis
+    /// while a sibling sharing the anchor as a string prefix is NOT mis-excluded.
+    #[test]
+    fn is_under_output_matches_only_on_a_separator_boundary() {
+        use super::is_under_output;
+        // Under the SDK dir → generated, exclude.
+        assert!(is_under_output("sdk/client.go", "sdk"));
+        assert!(is_under_output("sdk/models.go", "sdk"));
+        // The dir itself (exact match).
+        assert!(is_under_output("sdk", "sdk"));
+        // A trailing slash on the anchor is tolerated.
+        assert!(is_under_output("sdk/client.go", "sdk/"));
+        // The OpenAPI artifact path (exact file).
+        assert!(is_under_output("openapi.yaml", "openapi.yaml"));
+        // The workspace dir.
+        assert!(is_under_output(".gnr8/cache/manifest.json", ".gnr8"));
+
+        // A sibling sharing the anchor as a STRING prefix is NOT under it (no false exclusion).
+        assert!(!is_under_output("sdklib/x.go", "sdk"));
+        assert!(!is_under_output("internal/goal/ports/http.go", "sdk"));
+        // An empty anchor never matches (a no-op anchor must not swallow the whole graph).
+        assert!(!is_under_output("internal/dto.go", ""));
     }
 }
