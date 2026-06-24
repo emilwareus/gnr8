@@ -36,9 +36,9 @@
 
 ### API Graph And Inspectability
 
-- [ ] **GRAPH-01**: The internal graph models routes, operations, parameters, request bodies, responses, schemas, generated files, and source provenance.
-- [ ] **GRAPH-02**: Graph node IDs and generated outputs are stable across unchanged runs.
-- [ ] **GRAPH-03**: `inspect routes`, `inspect schemas`, and `inspect graph` explain inferred facts and diagnostics.
+- [x] **GRAPH-01**: The internal graph models routes, operations, parameters, request bodies, responses, schemas, generated files, and source provenance.
+- [x] **GRAPH-02**: Graph node IDs and generated outputs are stable across unchanged runs.
+- [x] **GRAPH-03**: `inspect routes`, `inspect schemas`, and `inspect graph` explain inferred facts and diagnostics.
 
 ### OpenAPI Output
 
@@ -149,9 +149,9 @@
 | GO-04 | Phase 2 | Complete |
 | GO-05 | Phase 2 | Complete |
 | GO-06 | Phase 2 | Complete |
-| GRAPH-01 | Phase 2 | Pending |
-| GRAPH-02 | Phase 2 | Pending |
-| GRAPH-03 | Phase 2 | Pending |
+| GRAPH-01 | Phase 2 | Complete |
+| GRAPH-02 | Phase 2 | Complete |
+| GRAPH-03 | Phase 2 | Complete |
 | OAPI-01 | Phase 3 | Pending |
 | OAPI-02 | Phase 3 | Pending |
 | OAPI-03 | Phase 3 | Pending |
