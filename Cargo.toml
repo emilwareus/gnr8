@@ -40,4 +40,7 @@ insta = { version = "1.48", features = ["yaml"] }
 blake3 = "1.8"                  # content hashing for the ownership manifest (consumed in 04-02)
 toml = "1.1"                    # parse the checked-in .gnr8/config.toml PoC config (consumed in 04-01)
 notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consumed in 04-03)
+ctrlc = "3.5"                   # graceful Ctrl-C → AtomicBool for the watch loop (consumed in 04-03;
+                                # the FSEvents backend suppresses the default SIGINT disposition, so the
+                                # std-only approach proved insufficient — RESEARCH A5 sanctioned fallback)
 gnr8-core = { path = "crates/gnr8-core" }

@@ -155,15 +155,27 @@ fn build_output_set(project_root: &Path, config: &Config) -> HashSet<PathBuf> {
 /// defense), debounces bursts into a single coalesced signal, and on each signal times a
 /// [`lifecycle::regenerate`] call, printing a latency line (human, or a [`LatencyReport`] under `json`).
 /// A `notify` error in a batch is logged to stderr and the loop CONTINUES — it never panics
-/// (T-04-03-03). Ctrl-C sets a shared `AtomicBool`; the receive loop observes it (or a channel
-/// disconnect) and returns `Ok(())` cleanly with the debouncer dropped (no dependency on the `ctrlc`
-/// crate — std `AtomicBool` + the debouncer's mpsc channel suffice for a foreground loop, A5/W4).
+/// (T-04-03-03).
+///
+/// ## Shutdown (W4 / A5 — `AtomicBool` stop flag set by a Ctrl-C handler)
+///
+/// The foreground loop runs while a shared `AtomicBool` is false and observes it via `recv_timeout`
+/// ticks; it also exits on the debouncer's mpsc channel disconnect. A `ctrlc::set_handler` flips the
+/// flag on SIGINT (the loop wakes on the next tick and returns `Ok(())` cleanly, dropping the debouncer
+/// so the watcher stops — no orphan, no panic).
+///
+/// The pure-std approach (rely on the OS default SIGINT disposition) was tried first per A5/W4 and
+/// proved INSUFFICIENT: the macOS FSEvents backend's run loop suppresses the default disposition, so an
+/// interactive Ctrl-C did NOT terminate the process. `unsafe_code = "forbid"` rules out a hand-rolled
+/// signal handler, so the RESEARCH-sanctioned fallback (`ctrlc`, pre-approved in the legitimacy audit)
+/// is used — the choice is documented in the SUMMARY. The handler only flips an `AtomicBool`; the flag
+/// is NOT tied to stdin, so `gnr8 watch` runs fine backgrounded / in a pipe.
 ///
 /// # Errors
 ///
-/// Returns an error if the debouncer cannot be created, the source dir cannot be watched, or the
-/// Ctrl-C handler cannot be installed. Per-batch `regenerate` errors are logged and the loop continues
-/// (a transient pipeline error must not kill a long-running watch).
+/// Returns an error if the Ctrl-C handler cannot be installed, the debouncer cannot be created, or the
+/// source dir cannot be watched. Per-batch `regenerate` errors are logged and the loop continues (a
+/// transient pipeline error must not kill a long-running watch).
 pub(crate) fn run(
     project_root: &Path,
     config: &Config,
@@ -176,14 +188,17 @@ pub(crate) fn run(
     // thread) sends `()`; the main loop receives. A single debounced batch sends at most one signal.
     let (tx, rx) = mpsc::channel::<()>();
 
-    // Shared shutdown flag set by the Ctrl-C handler; the receive loop polls it via recv_timeout.
+    // The in-process shutdown flag (W4): the receive loop runs while it is false and observes it via
+    // recv_timeout ticks. Set by the Ctrl-C handler (below) and on channel disconnect. NOT tied to
+    // stdin, so a backgrounded / piped `gnr8 watch` runs fine.
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
-        // Std-only graceful stop (no `ctrlc` crate, W4): a watchdog flips the flag on stdin EOF; the
-        // loop wakes on the next recv_timeout tick and exits. Interactive Ctrl-C terminates via the OS
-        // default disposition, dropping the debouncer (clean exit, no orphaned watcher).
-        install_graceful_stop(stop).context("failed to install the graceful-stop watchdog")?;
+        // Flip the flag on SIGINT so the foreground loop exits cleanly (W4 / A5 fallback — the default
+        // disposition is suppressed by the FSEvents run loop). The handler does the minimum: a single
+        // atomic store, no allocation/I-O.
+        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
+            .context("failed to install the Ctrl-C handler")?;
     }
 
     let filter_set = output_set.clone();
@@ -224,8 +239,8 @@ pub(crate) fn run(
             .with_context(|| format!("failed to watch source dir {}", dir.display()))?;
     }
 
-    // The receive loop. recv_timeout wakes periodically so the Ctrl-C flag is observed promptly even
-    // when no events arrive. On a signal: time one regeneration and print the latency line.
+    // The receive loop. recv_timeout wakes periodically so the stop flag is observed promptly even when
+    // no events arrive. On a signal: time one regeneration and print the latency line.
     let poll = Duration::from_millis(200);
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(poll) {
@@ -236,42 +251,19 @@ pub(crate) fn run(
                 regenerate_and_report("single-file-edit", project_root, config, json);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {} // tick — re-check the stop flag.
-            Err(mpsc::RecvTimeoutError::Disconnected) => break, // debouncer dropped → exit cleanly.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The debouncer's sender was dropped → no more events can arrive → exit cleanly.
+                stop.store(true, Ordering::Relaxed);
+            }
         }
     }
 
     // Dropping `debouncer` here stops the watcher thread cleanly (no orphaned watcher, T-04-03 lifecycle).
     drop(debouncer);
-    println!("watch: stopped.");
-    Ok(())
-}
-
-/// Install the std-only, dependency-free graceful-stop trigger that flips `stop` to `true` (W4 / A5).
-///
-/// `unsafe_code = "forbid"` rules out a hand-rolled signal handler, and we deliberately do NOT add the
-/// `ctrlc` crate (W4). For a FOREGROUND watch loop the std-sufficient shutdown contract is: the loop
-/// exits when (a) the shared `AtomicBool` flag is set, or (b) the debouncer's mpsc channel disconnects.
-/// This watchdog spawns one thread that blocks reading stdin and flips the flag on EOF / read error —
-/// the "parent exited / pipe closed" graceful path. For an INTERACTIVE Ctrl-C, the OS default SIGINT
-/// disposition terminates the process, which runs `Drop for Debouncer` and stops the watcher — a clean
-/// exit with no panic and no orphaned watcher. No `ctrlc` crate, no `unsafe`, no FFI.
-fn install_graceful_stop(stop: Arc<AtomicBool>) -> std::io::Result<()> {
-    use std::io::Read;
-    std::thread::Builder::new()
-        .name("gnr8-watch-shutdown".to_string())
-        .spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 64];
-            loop {
-                match stdin.read(&mut buf) {
-                    // EOF (Ok(0)) or a read error → request a graceful stop and end the watchdog.
-                    Ok(0) | Err(_) => break,
-                    // Discard any interactive bytes; keep watching.
-                    Ok(_) => {}
-                }
-            }
-            stop.store(true, Ordering::Relaxed);
-        })?;
+    // A human status line only; under `--json` the stream stays pure latency records (no stray text).
+    if !json {
+        println!("watch: stopped.");
+    }
     Ok(())
 }
 

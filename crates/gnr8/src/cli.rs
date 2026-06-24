@@ -43,7 +43,12 @@ pub(crate) enum Commands {
         force: bool,
     },
     /// Watch source and regenerate on change.
-    Watch,
+    Watch {
+        /// Debounce window in milliseconds — coalesce a burst of rapid file events into one
+        /// regeneration (RESEARCH Open Q 1: ship a 200ms default, expose a knob without overconfiguring).
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+    },
     /// Verify generated outputs are up to date.
     Check,
     /// Explain inferred API facts and diagnostics.
@@ -114,9 +119,17 @@ mod tests {
                 .command,
             Commands::Generate { force: true }
         ));
+        // `watch` defaults `--debounce-ms` to 200.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "watch"]).unwrap().command,
-            Commands::Watch
+            Commands::Watch { debounce_ms: 200 }
+        ));
+        // `watch --debounce-ms N` overrides the default window.
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "watch", "--debounce-ms", "100"])
+                .unwrap()
+                .command,
+            Commands::Watch { debounce_ms: 100 }
         ));
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "check"]).unwrap().command,

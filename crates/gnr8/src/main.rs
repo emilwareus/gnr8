@@ -42,9 +42,14 @@ fn main() -> Result<()> {
     // rendering counts (human or --json) and, for `check`, exiting non-zero on drift. Both flow real
     // pipeline errors (Go toolchain missing, lowering, sdkgen, I/O) through this anyhow boundary as a
     // clean stderr message + exit 1, never a panic (D-09 / RUST-04).
+    //
+    // `watch` (Phase 4 / WATCH-02/03) is also dispatched OUTSIDE the `dispatch -> Report` path: it loops
+    // and prints latency lines directly rather than returning a single Report. Ctrl-C exits with code 0;
+    // a config/regenerate error exits via the anyhow boundary (clean stderr, exit 1, no panic).
     match &cli.command {
         Commands::Generate { force } => return run_generate(*force, cli.json),
         Commands::Check => return run_check(cli.json),
+        Commands::Watch { debounce_ms } => return run_watch(*debounce_ms, cli.json),
         _ => {}
     }
 
@@ -74,11 +79,11 @@ fn main() -> Result<()> {
 fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
     match &cli.command {
         Commands::Init => run_init(),
-        Commands::Watch { .. } => gnr8_core::not_yet("watch", 4),
         Commands::Doctor => gnr8_core::not_yet("doctor", 5),
         // Handled in `main` before this dispatch; kept exhaustive for the compiler.
         Commands::Generate { .. } => gnr8_core::not_yet("generate", 4),
         Commands::Check => gnr8_core::not_yet("check", 4),
+        Commands::Watch { .. } => gnr8_core::not_yet("watch", 4),
         Commands::Inspect { .. } => gnr8_core::not_yet("inspect", 2),
     }
 }
@@ -230,6 +235,37 @@ fn run_check(json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Run `gnr8 watch [--debounce-ms N]`: load the config, run an initial COLD regeneration (so the
+/// cold-latency scenario is measured and the outputs are current), print a startup line, then enter the
+/// debounced, loop-safe watch loop (WATCH-02/03). The loop watches the configured SOURCE dirs only,
+/// filters out gnr8's own output writes (no self-loop), and times each regeneration. Ctrl-C exits with
+/// code 0; a missing `.gnr8/config.toml` surfaces a clean `CoreError::Config` (run `gnr8 init`) and a
+/// pipeline error (Go toolchain missing, lowering, sdkgen) flows through the anyhow boundary — never a
+/// panic (D-09 / RUST-04).
+fn run_watch(debounce_ms: u64, json: bool) -> Result<()> {
+    let (root, gnr8_dir) = project_paths()?;
+    let config = gnr8_core::config::load(&gnr8_dir)?;
+
+    // Startup line: name the watched source dir(s) so the user sees the scope; Ctrl-C stops the loop.
+    if !json {
+        println!(
+            "watching {} — press Ctrl-C to stop",
+            config.inputs.join(", ")
+        );
+    }
+
+    // The COLD scenario: an initial regeneration ensures outputs are current and measures cold latency.
+    watch::cold_regenerate(&root, &config, json)?;
+
+    // Enter the debounced watch loop (blocks until Ctrl-C / channel disconnect, then returns Ok).
+    watch::run(
+        &root,
+        &config,
+        std::time::Duration::from_millis(debounce_ms),
+        json,
+    )
 }
 
 /// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and
