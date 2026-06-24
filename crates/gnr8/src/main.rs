@@ -1,2 +1,5 @@
-//! gnr8 — binary crate (placeholder; real CLI lands in Task 3).
+//! gnr8 — binary crate (RED placeholder; full dispatch + anyhow boundary land in the GREEN step).
+
+mod cli;
+
 fn main() {}
