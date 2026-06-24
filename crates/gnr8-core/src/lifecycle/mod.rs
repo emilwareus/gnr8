@@ -475,12 +475,23 @@ fn exclude_output_paths(graph: &mut ApiGraph, config: &Config) {
 /// the frame-name path-safety check). The Go-toolchain / lowering / sdkgen errors propagate as their
 /// existing typed `CoreError` variants.
 ///
-/// PoC scope: if `config.inputs` has more than one entry, only the FIRST is analyzed (multi-input
-/// fan-in is out of scope this phase — D-02).
+/// PoC scope: multi-input fan-in is out of scope this phase (D-02). Rather than SILENTLY analyzing
+/// only the first of several configured inputs while `watch::run` watches them ALL — which would make
+/// edits in the extra dirs look like a non-deterministic no-op (WR-04) — `config.inputs.len() > 1` is
+/// REJECTED with a clear `CoreError::Config`, keeping the analyzed set and any watched set in agreement.
 fn build_outputs(
     project_root: &Path,
     config: &Config,
 ) -> Result<Vec<(String, Vec<u8>, String)>, crate::CoreError> {
+    if config.inputs.len() > 1 {
+        return Err(crate::CoreError::Config {
+            message: format!(
+                "config.inputs lists {} dirs, but multi-input analysis is not yet supported — \
+                 configure a single source dir (multi-input fan-in is a documented v2 direction, D-02)",
+                config.inputs.len()
+            ),
+        });
+    }
     let input = config
         .inputs
         .first()

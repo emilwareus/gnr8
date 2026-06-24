@@ -758,6 +758,28 @@ fn naming_type_rename_collision_is_a_typed_error() {
     }
 }
 
+/// WR-04: multiple `config.inputs` are REJECTED loudly with `CoreError::Config` (multi-input fan-in is
+/// out of scope, D-02) rather than silently analyzing only the first while watch would watch them all.
+/// The check fires before any Go analysis, so it needs no toolchain.
+#[test]
+fn multi_input_config_is_rejected_loudly() {
+    let root = unique_temp_dir("multi-input");
+    gnr8_core::workspace::init(&root).expect("init .gnr8 workspace");
+
+    let config_src = "inputs = [\"a\", \"b\"]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/test/sdk\"\n";
+    let config = gnr8_core::config::parse(config_src).expect("parse multi-input config");
+
+    // plan_only calls build_outputs first, so the rejection happens before the toolchain is touched.
+    let err = lifecycle::plan_only(&root, &config)
+        .expect_err("a multi-input config must be rejected, not silently truncated");
+    assert!(
+        matches!(err, CoreError::Config { .. }),
+        "multi-input must be CoreError::Config, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Recursively copy `src` into `dst` (creating `dst`), so a test can stage a self-contained copy of
 /// the fixture module under a temp root. Mirrors the no-`tempfile`/no-extra-dep discipline.
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
