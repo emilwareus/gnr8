@@ -10,6 +10,7 @@ pub mod diagnostics;
 pub mod graph;
 pub mod lower;
 pub mod sdk;
+pub mod workspace;
 
 /// Stub used by Phase-1 CLI arms and unimplemented seams.
 ///
