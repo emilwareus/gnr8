@@ -75,6 +75,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // CreateGoal -> POST /goal/
@@ -85,8 +86,8 @@ func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMes
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	url := c.baseURL + "/goal/"
-	req, err := http.NewRequestWithContext(ctx, "POST", url, reqBody)
+	reqURL := c.baseURL + "/goal/"
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}
@@ -125,8 +126,8 @@ type ListGoalsParams struct {
 // ListGoals -> GET /goal/list
 func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoalsOutput, error) {
 	var out ListGoalsOutput
-	url := c.baseURL + "/goal/list"
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqURL := c.baseURL + "/goal/list"
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
@@ -170,8 +171,8 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoa
 // DeleteGoal -> DELETE /goal/{uuid}
 func (c *Client) DeleteGoal(ctx context.Context, uuid string) (CommandMessage, error) {
 	var out CommandMessage
-	url := c.baseURL + fmt.Sprintf("/goal/%s", uuid)
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
@@ -207,8 +208,8 @@ func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	url := c.baseURL + fmt.Sprintf("/goal/%s", uuid)
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, reqBody)
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}

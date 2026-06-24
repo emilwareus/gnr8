@@ -495,9 +495,13 @@ pub(crate) fn emit_operations(
     }
     // Operation methods always touch context/net-http/encoding-json/bytes/fmt (request build + decode).
     // WR-02: non-string query params additionally need `strconv`/`time` to URL-encode; `file` sorts +
-    // de-duplicates the union, so the all-string fixture (no extras) stays byte-identical.
+    // de-duplicates the union.
     let mut imports: Vec<&str> = vec!["bytes", "context", "encoding/json", "fmt", "net/http"];
     imports.extend(query_imports(ops, graph)?);
+    // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
+    if ops.iter().any(|op| op.params.iter().any(|p| p.location == "path")) {
+        imports.push("net/url");
+    }
     let _ = tag; // the tag names the FILE (handled by the bundle), not the imports.
     Ok(file(&imports, &body))
 }
@@ -607,7 +611,7 @@ fn emit_request_dispatch(
     let body_arg = if has_body { "reqBody" } else { "nil" };
     writeln!(
         body,
-        "req, err := http.NewRequestWithContext(ctx, \"{}\", url, {body_arg})",
+        "req, err := http.NewRequestWithContext(ctx, \"{}\", reqURL, {body_arg})",
         op.method
     )
     .map_err(sink)?;
@@ -782,26 +786,68 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
     Ok(extra.into_iter().collect())
 }
 
+/// Extract the set of `{token}` placeholder names from a path template, in first-seen order.
+///
+/// `"/goal/{uuid}/sub/{kind}"` → `["uuid", "kind"]`. Used by [`emit_url`] to assert the path's
+/// templated tokens exactly match the operation's declared path params (WR-03).
+fn path_tokens(path: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            tokens.push(after[..close].to_string());
+            rest = &after[close + 1..];
+        } else {
+            break;
+        }
+    }
+    tokens
+}
+
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
+///
+/// WR-03: the set of `{token}`s in the absolute path is asserted to equal the set of declared path
+/// params before emitting, so a token with no matching arg (a runtime `%!s(MISSING)` in the URL) or
+/// an arg with no matching token becomes a typed [`CoreError::SdkGen`] at generation time instead.
+///
+/// WR-04: each interpolated path value is wrapped in `url.PathEscape(...)` so a value containing
+/// `/`, `?`, `#`, `%`, or `..` can never restructure the request URL.
 fn emit_url(body: &mut String, op: &Operation, path_params: &[&str]) -> Result<(), CoreError> {
     let abs = join_path(&op.path);
-    if path_params.is_empty() {
-        writeln!(body, "url := c.baseURL + \"{abs}\"").map_err(sink)?;
+    let tokens = path_tokens(&abs);
+
+    // WR-03: the templated tokens must be exactly the declared path params (order-independent set
+    // equality), so neither a dangling token nor an unused arg can slip through.
+    let token_set: BTreeSet<&str> = tokens.iter().map(String::as_str).collect();
+    let param_set: BTreeSet<&str> = path_params.iter().copied().collect();
+    if token_set != param_set {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
+                op.id, abs, tokens, path_params
+            ),
+        });
+    }
+
+    if tokens.is_empty() {
+        writeln!(body, "reqURL := c.baseURL + \"{abs}\"").map_err(sink)?;
         return Ok(());
     }
-    // Replace each {param} with %s and pass the positional arg (in path order).
+
+    // Replace each {token} with %s and pass the escaped positional arg, in PATH order (so the
+    // Sprintf verbs and args line up regardless of the param sort order).
     let mut format_str = abs.clone();
     let mut args: Vec<String> = Vec::new();
-    for p in path_params {
-        let placeholder = format!("{{{p}}}");
-        if format_str.contains(&placeholder) {
-            format_str = format_str.replace(&placeholder, "%s");
-            args.push(lower_camel(p));
-        }
+    for token in &tokens {
+        let placeholder = format!("{{{token}}}");
+        format_str = format_str.replace(&placeholder, "%s");
+        // WR-04: percent-encode the value so it cannot inject extra path/query segments.
+        args.push(format!("url.PathEscape({})", lower_camel(token)));
     }
     writeln!(
         body,
-        "url := c.baseURL + fmt.Sprintf(\"{format_str}\", {})",
+        "reqURL := c.baseURL + fmt.Sprintf(\"{format_str}\", {})",
         args.join(", ")
     )
     .map_err(sink)?;
@@ -1061,6 +1107,62 @@ mod tests {
             }}"#
         );
         let facts = serde_json::from_str(&facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    /// A minimal graph with ONE DELETE operation on a `/{uuid}` templated path with a matching
+    /// `uuid` path param — used to prove WR-04 percent-escapes the interpolated path value.
+    fn path_param_graph() -> ApiGraph {
+        let facts = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "DELETE", "path": "/{uuid}", "router_path": "/{uuid}", "handler": "deleteGoal",
+              "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
+              "security_schemes": ["ApiKeyAuth"],
+              "params": [
+                { "name": "uuid", "location": "path", "required": true,
+                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "enum_values": [], "description": null,
+                  "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
+              ],
+              "request_body": null,
+              "responses": [ { "status": 200, "body": null, "description": "ok" } ],
+              "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": []
+        }"#;
+        let facts = serde_json::from_slice(facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    /// A minimal graph whose path templates a `{uuid}` token but declares a path param named `id`
+    /// (token set != param set) — used to prove WR-03 rejects the mismatch as a typed error.
+    fn mismatched_path_graph() -> ApiGraph {
+        let facts = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "DELETE", "path": "/{uuid}", "router_path": "/{uuid}", "handler": "deleteGoal",
+              "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
+              "security_schemes": ["ApiKeyAuth"],
+              "params": [
+                { "name": "id", "location": "path", "required": true,
+                  "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+                  "enum_values": [], "description": null,
+                  "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
+              ],
+              "request_body": null,
+              "responses": [ { "status": 200, "body": null, "description": "ok" } ],
+              "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": []
+        }"#;
+        let facts = serde_json::from_slice(facts).unwrap();
         ApiGraph::from_facts(facts, "/root")
     }
 
@@ -1370,6 +1472,38 @@ mod tests {
                 "absent error model must not reference any named error type:\n{out}"
             );
             assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+        }
+
+        #[test]
+        fn templated_path_escapes_each_arg_and_imports_net_url() {
+            // WR-04: a `{uuid}` path param must be interpolated through `url.PathEscape` so a value
+            // containing `/`, `?`, `#`, or `..` cannot restructure the request URL, and the file must
+            // import `net/url`. The local URL var is `reqURL` to avoid shadowing the `url` package.
+            let graph = super::path_param_graph();
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            assert!(
+                out.contains("reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"),
+                "path arg must be wrapped in url.PathEscape:\n{out}"
+            );
+            assert!(
+                out.contains("\"net/url\""),
+                "a templated path must import net/url:\n{out}"
+            );
+        }
+
+        #[test]
+        fn mismatched_path_token_and_param_is_a_typed_error() {
+            // WR-03: a path declaring a `{uuid}` token but a path param named `id` (token set !=
+            // param set) must be a typed SdkGen error, not a silent `%!s(MISSING)` at runtime.
+            let graph = super::mismatched_path_graph();
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let err = emit_operations(&graph, "Goals", &ops).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("do not match its path params"),
+                "expected a path-token mismatch SdkGen error, got: {msg}"
+            );
         }
 
         #[test]
