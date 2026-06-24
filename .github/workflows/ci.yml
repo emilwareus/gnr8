@@ -47,16 +47,20 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      # The full green suite: lib + bin unit/parse tests PLUS all four contract snapshots
+      # The full green suite: lib + bin unit/parse tests (incl. the pure `watch::tests` loop-safety
+      # filter tests in `cargo test -p gnr8`) PLUS all four contract snapshots
       # (snapshot_graph/diagnostics/openapi/sdk — openapi+sdk turned green in Phase 3-01/03-02) PLUS
-      # determinism + the new sdk_compile test (03-03: temp dir + zero-require go.mod + go build +
-      # httptest smoke, SDK-05). CI=true → insta runs INSTA_UPDATE=no, so a snapshot mismatch
-      # hard-fails (FIX-04), never auto-accepts.
-      - name: test (lib + bin + all four contract tests + sdk_compile)
+      # determinism + the sdk_compile test (03-03: temp dir + zero-require go.mod + go build + httptest
+      # smoke, SDK-05) + the Phase-4 `lifecycle` suite (04-03: manifest round-trip + the pure
+      # plan_writes truth table + naming-override $ref rewrites) — now part of the blocking set. The
+      # timing-tolerant watch_smoke is `#[ignore]`d (FS-event flakiness) and is deliberately NOT run in
+      # CI. CI=true → insta runs INSTA_UPDATE=no, so a snapshot mismatch hard-fails (FIX-04), never
+      # auto-accepts.
+      - name: test (lib + bin + all four contract tests + sdk_compile + lifecycle)
         run: |
           cargo test -p gnr8-core --lib
           cargo test -p gnr8
-          cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile
+          cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test lifecycle
 
   # BLOCKING — the Go fixture is a separate module cargo never compiles; gate it so it can't rot.
   go-fixture:

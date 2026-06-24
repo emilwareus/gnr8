@@ -28,7 +28,8 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let dir = std::env::temp_dir().join(format!("gnr8-watch-{label}-{}-{nanos}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("gnr8-watch-{label}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create unique temp dir");
     dir
 }
@@ -37,7 +38,10 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// and so cannot be imported by an integration test). The smoke test asserts the SAME decision the
 /// shell uses: a `*.go` source path NOT under an output path triggers; an output-path write does not.
 fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
-    if output_set.iter().any(|out| path == out || path.starts_with(out)) {
+    if output_set
+        .iter()
+        .any(|out| path == out || path.starts_with(out))
+    {
         return false;
     }
     path.extension().is_some_and(|ext| ext == "go")
@@ -113,8 +117,11 @@ fn single_edit_one_regen() {
     std::thread::sleep(Duration::from_millis(300));
 
     // (1) Edit ONE source `.go` file → expect exactly one regeneration signal.
-    std::fs::write(src_dir.join("handlers.go"), b"package main\n\nfunc Handler() {}\n")
-        .expect("write source file");
+    std::fs::write(
+        src_dir.join("handlers.go"),
+        b"package main\n\nfunc Handler() {}\n",
+    )
+    .expect("write source file");
 
     rx.recv_timeout(Duration::from_secs(5))
         .expect("a source `.go` edit must produce one regeneration signal within 5s");
@@ -126,7 +133,8 @@ fn single_edit_one_regen() {
 
     // Assert NO further signal arrives in a generous window: the output writes did not loop.
     match rx.recv_timeout(Duration::from_secs(2)) {
-        Err(mpsc::RecvTimeoutError::Timeout) => { /* expected — output writes are filtered out */ }
+        Err(mpsc::RecvTimeoutError::Timeout) => { /* expected — output writes are filtered out */
+        }
         Ok(()) => panic!("gnr8's own output write must NOT trigger a regeneration (self-loop!)"),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             panic!("debouncer channel disconnected unexpectedly")

@@ -107,7 +107,9 @@ fn batch_should_regenerate(paths: &[PathBuf], output_set: &HashSet<PathBuf>) -> 
 
 /// Whether `path` is equal to, or nested under, any output path in `output_set`.
 fn is_under_any_output(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
-    output_set.iter().any(|out| path == out || path.starts_with(out))
+    output_set
+        .iter()
+        .any(|out| path == out || path.starts_with(out))
 }
 
 /// Canonicalize `path` to its real, symlink-resolved absolute form, falling back to `path` itself when
@@ -351,15 +353,24 @@ mod tests {
         assert!(!is_trigger_path(&PathBuf::from("/proj/openapi.yaml"), &out));
         // A generated SDK file UNDER the sdk dir is gnr8's own write → NOT a trigger (loop-safe), even
         // though it ends in `.go`.
-        assert!(!is_trigger_path(&PathBuf::from("/proj/sdk/client.go"), &out));
-        assert!(!is_trigger_path(&PathBuf::from("/proj/sdk/models.go"), &out));
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/sdk/client.go"),
+            &out
+        ));
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/sdk/models.go"),
+            &out
+        ));
     }
 
     #[test]
     fn go_source_triggers() {
         let out = output_set();
         // A `.go` source edit OUTSIDE the output paths → a trigger.
-        assert!(is_trigger_path(&PathBuf::from("/proj/handlers/goal.go"), &out));
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/handlers/goal.go"),
+            &out
+        ));
         assert!(is_trigger_path(&PathBuf::from("/proj/main.go"), &out));
     }
 
@@ -406,12 +417,15 @@ mod tests {
         let report =
             LatencyReport::from_outcome("single-file-edit", Duration::from_millis(42), &outcome);
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
-        let obj = value.as_object().expect("latency report serializes to a JSON object");
+        let obj = value
+            .as_object()
+            .expect("latency report serializes to a JSON object");
 
         // Exactly these four keys, no more, no fewer.
         let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
-        let expected: HashSet<&str> =
-            ["scenario", "millis", "written", "unchanged"].into_iter().collect();
+        let expected: HashSet<&str> = ["scenario", "millis", "written", "unchanged"]
+            .into_iter()
+            .collect();
         assert_eq!(keys, expected, "latency --json field set drifted");
 
         assert_eq!(obj["scenario"], serde_json::json!("single-file-edit"));

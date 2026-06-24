@@ -27,16 +27,19 @@ clippy:
 test:
 	cargo test --all-features
 
-# Blocking gate test set: green unit + CLI parse tests, ALL FOUR contract tests
-# (snapshot_graph/diagnostics/openapi/sdk — openapi+sdk turned green in Phase 3-01/03-02),
-# determinism (graph + OpenAPI + SDK byte-identical), and sdk_compile (temp dir + zero-require go.mod
-# + go build + httptest smoke, SDK-05). These invoke the goextract helper via `go run`, pipe Go
-# through `gofmt`, and run `go build`/`go test`, so the Go toolchain must be present.
-# Mirrors the CI `gates` job (RUST-03 / D-07).
+# Blocking gate test set: green unit + CLI parse tests (incl. the pure `watch::tests` loop-safety
+# filter tests in `cargo test -p gnr8`), ALL FOUR contract tests (snapshot_graph/diagnostics/openapi/sdk
+# — openapi+sdk turned green in Phase 3-01/03-02), determinism (graph + OpenAPI + SDK byte-identical),
+# sdk_compile (temp dir + zero-require go.mod + go build + httptest smoke, SDK-05), and the Phase-4
+# `lifecycle` suite (manifest round-trip + the pure `plan_writes` truth table + naming-override $ref
+# rewrites). These invoke the goextract helper via `go run`, pipe Go through `gofmt`, and run
+# `go build`/`go test`, so the Go toolchain must be present. The timing-tolerant `watch_smoke` smoke is
+# `#[ignore]`d (FS-event flakiness) and is therefore NOT in this blocking line — run it opt-in with
+# `cargo test -p gnr8 --test watch_smoke -- --ignored`. Mirrors the CI `gates` job (RUST-03 / D-07).
 gates:
 	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
-	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile
+	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test lifecycle
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
