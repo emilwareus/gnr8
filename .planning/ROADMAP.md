@@ -42,9 +42,9 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 02-01: Implement Go package discovery, struct extraction, and type mapping.
-- [ ] 02-02: Implement selected router and handler contract extraction.
-- [ ] 02-03: Build the API graph and inspect reports with diagnostics.
+- [ ] 02-01-PLAN.md — Create the goextract Go sidecar (go/packages LoadAllSyntax): struct/field/tag/type-mapping extraction, well-known uuid/time, enum const sets, float64+free-form-map diagnostics, sorted JSON facts; Rust serde DTOs + subprocess driver + extended CoreError; Makefile/CI goextract gate (wave 1).
+- [ ] 02-02-PLAN.md — Extend goextract with Gin route recognition (types.Info.Selections), handler request/response/param inference (go/constant), and the swaggo annotation escape hatch (@ID/@Router/@Param/Enums/@Security); untyped-query diagnostics (wave 2).
+- [ ] 02-03-PLAN.md — Build the router-agnostic Rust ApiGraph from facts (stable IDs, sorted serialization, provenance), implement build_graph + diagnostics::collect, wire inspect routes|schemas|graph (table + --json), flip snapshot_graph + snapshot_diagnostics to real green snapshots (wave 3).
 
 ### Phase 3: OpenAPI And Go SDK Generation
 **Goal**: Generate real artifacts from the graph: a valid OpenAPI document and a compiling Go SDK.
@@ -105,4 +105,3 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 | 3. OpenAPI And Go SDK Generation | 0/3 | Not started | - |
 | 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
 | 5. PoC Hardening And Demo | 0/2 | Not started | - |
-
