@@ -20,8 +20,8 @@
 
 ### Fixtures And Validation
 
-- [ ] **FIX-01**: Realistic Go service fixtures exist for the selected router patterns.
-- [ ] **FIX-02**: Fixtures cover path parameters, request bodies, response bodies, JSON tags, optional fields, package boundaries, and at least one unsupported pattern.
+- [x] **FIX-01**: Realistic Go service fixtures exist for the selected router patterns.
+- [x] **FIX-02**: Fixtures cover path parameters, request bodies, response bodies, JSON tags, optional fields, package boundaries, and at least one unsupported pattern.
 - [ ] **FIX-03**: Snapshot tests cover graph reports, OpenAPI output, Go SDK output, and diagnostics.
 - [ ] **FIX-04**: Fixture tests fail clearly before unsupported behavior is implemented.
 
@@ -139,8 +139,8 @@
 | RUST-02 | Phase 1 | Complete |
 | RUST-03 | Phase 1 | Pending |
 | RUST-04 | Phase 1 | Complete |
-| FIX-01 | Phase 1 | Pending |
-| FIX-02 | Phase 1 | Pending |
+| FIX-01 | Phase 1 | Complete |
+| FIX-02 | Phase 1 | Complete |
 | FIX-03 | Phase 1 | Pending |
 | FIX-04 | Phase 1 | Pending |
 | GO-01 | Phase 2 | Pending |

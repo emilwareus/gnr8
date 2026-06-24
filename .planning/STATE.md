@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 1 planned (3 plans, verified)
-last_updated: "2026-06-24T16:14:17.380Z"
+stopped_at: Completed 01-02-PLAN.md
+last_updated: "2026-06-24T16:23:10.420Z"
 last_activity: 2026-06-24 -- Phase 01 execution started
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 3
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-24)
 ## Current Position
 
 Phase: 01 (foundation-and-fixtures) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 01
 Last activity: 2026-06-24 -- Phase 01 execution started
 
-Progress: [███░░░░░░░] 33%
+Progress: [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Progress: [███░░░░░░░] 33%
 
 *Updated after each plan completion*
 | Phase 01 P01 | 8min | 3 tasks | 16 files |
+| Phase 01 P02 | 5min | 3 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -68,6 +69,8 @@ Recent decisions affecting current work:
 - Keep multi-language support as a future design constraint, not PoC scope.
 - [Phase 01]: Skeletal CLI commands return typed CoreError::NotYetImplemented and exit code 2 (no panic) — keeps RUST-04 intact while --help/--version work
 - [Phase 01]: thiserror 2.0 typed errors in gnr8-core; anyhow confined to gnr8/src/main.rs; clippy denies unwrap_used/expect_used/panic workspace-wide
+- [Phase ?]: Go Gin fixture (fixtures/goalservice) is a standalone module outside the Cargo workspace; go build/go vet + CI compile it, cargo does not — Fixture is analyzer INPUT for Phase 2, not part of the Rust binary; keeps cargo build clean and isolates the Go toolchain
+- [Phase ?]: Fixture forces BOTH extraction paths: createGoal is fully code-inferable while listGoals/updateGoal carry swaggo annotation blocks; expected/ files are hand-authored acceptance contracts (D-15) — Validates that gnr8 derives facts from code first and uses comments only as an escape hatch, and gives Phases 2-3 a reviewable target
 
 ### Pending Todos
 
@@ -87,6 +90,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T16:13:49.122Z
-Stopped at: Phase 1 planned (3 plans, verified)
-Resume file: .planning/phases/01-foundation-and-fixtures/01-01-PLAN.md
+Last session: 2026-06-24T16:22:47.599Z
+Stopped at: Completed 01-02-PLAN.md
+Resume file: None
