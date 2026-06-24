@@ -56,9 +56,9 @@
 
 ### Workspace And Lifecycle
 
-- [ ] **WS-01**: `gnr8 init` scaffolds a project-local `.gnr8/` workspace with user-owned generator code.
-- [ ] **WS-02**: `.gnr8/` separates checked-in customization from ignored cache/output lifecycle files.
-- [ ] **WS-03**: Users can customize source inputs, routing recognition, OpenAPI output, SDK output, naming, and transport behavior through code.
+- [x] **WS-01**: `gnr8 init` scaffolds a project-local `.gnr8/` workspace with user-owned generator code.
+- [x] **WS-02**: `.gnr8/` separates checked-in customization from ignored cache/output lifecycle files.
+- [x] **WS-03**: Users can customize source inputs, routing recognition, OpenAPI output, SDK output, naming, and transport behavior through code.
 - [ ] **WS-04**: Generated-file ownership is tracked well enough to avoid clobbering user-owned files silently.
 
 ### Speed And Watch Mode
@@ -160,9 +160,9 @@
 | SDK-03 | Phase 3 | Complete |
 | SDK-04 | Phase 3 | Complete |
 | SDK-05 | Phase 3 | Complete |
-| WS-01 | Phase 4 | Pending |
-| WS-02 | Phase 4 | Pending |
-| WS-03 | Phase 4 | Pending |
+| WS-01 | Phase 4 | Complete |
+| WS-02 | Phase 4 | Complete |
+| WS-03 | Phase 4 | Complete |
 | WS-04 | Phase 4 | Pending |
 | WATCH-01 | Phase 4 | Pending |
 | WATCH-02 | Phase 4 | Pending |

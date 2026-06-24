@@ -74,7 +74,7 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — `.gnr8/` init + lifecycle layout + static TOML config: idempotent `workspace::init` (config.toml + auto `.gitignore` split), typed `Config` (inputs/outputs/go-module/naming knobs, deny_unknown_fields, honest PoC stand-in), new CoreError lifecycle variants, pin blake3/toml/notify-debouncer-full, wire `gnr8 init` (wave 1).
+- [x] 04-01-PLAN.md — `.gnr8/` init + lifecycle layout + static TOML config: idempotent `workspace::init` (config.toml + auto `.gitignore` split), typed `Config` (inputs/outputs/go-module/naming knobs, deny_unknown_fields, honest PoC stand-in), new CoreError lifecycle variants, pin blake3/toml/notify-debouncer-full, wire `gnr8 init` (wave 1).
 - [ ] 04-02-PLAN.md — Ownership manifest + pure write decision + customization: blake3 manifest (load/save/prune, graceful on absent/corrupt), pure `plan_writes` truth table + `apply_writes` (warn+skip / `--force`, no-op skip), `apply_naming` overrides, `regenerate`, wire `gnr8 generate --force` + `gnr8 check` dry-run (wave 2).
 - [ ] 04-03-PLAN.md — No-op detection + watch + debounce + latency: pure event filter (loop-safe, output-path drop), `notify-debouncer-full` shell, Ctrl-C, cold/no-op/single-edit latency (human + --json), `watch_smoke` test, add `--test lifecycle` to blocking make/CI gates (wave 3).
 
@@ -103,5 +103,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 | 1. Foundation And Fixtures | 3/3 | Complete   | 2026-06-24 |
 | 2. Go Analysis And API Graph | 3/3 | Complete   | 2026-06-24 |
 | 3. OpenAPI And Go SDK Generation | 3/3 | Complete   | 2026-06-24 |
-| 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
+| 4. `.gnr8` Lifecycle And Watch Mode | 1/3 | In Progress|  |
 | 5. PoC Hardening And Demo | 0/2 | Not started | - |
