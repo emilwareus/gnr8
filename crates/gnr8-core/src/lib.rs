@@ -9,7 +9,9 @@ pub mod analyze;
 pub mod config;
 pub mod diagnostics;
 pub mod graph;
+pub mod lifecycle;
 pub mod lower;
+pub mod manifest;
 pub mod sdk;
 pub mod workspace;
 

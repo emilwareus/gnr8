@@ -226,3 +226,122 @@ go_module = "example.com/svc/sdk"
         "expected CoreError::Config for an unknown key, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WS-04 — manifest: blake3-hashed ownership record (Task 1)
+// ---------------------------------------------------------------------------
+
+/// WS-04: `blake3_hex` is a stable 64-char lowercase hex digest — same input ⇒ same digest
+/// (a content fingerprint that survives across runs/toolchains, NOT std DefaultHasher).
+#[test]
+fn blake3_hex_is_stable() {
+    let a = gnr8_core::manifest::blake3_hex(b"package goalservice\n");
+    let b = gnr8_core::manifest::blake3_hex(b"package goalservice\n");
+    assert_eq!(a, b, "same bytes must hash to the same digest");
+    assert_eq!(a.len(), 64, "blake3 hex digest is 64 chars, got {}", a.len());
+    assert!(
+        a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+        "digest must be lowercase hex, got {a}"
+    );
+    // A different input must yield a different digest.
+    assert_ne!(
+        a,
+        gnr8_core::manifest::blake3_hex(b"package other\n"),
+        "different bytes must hash differently"
+    );
+}
+
+/// WS-04: `save` then `load` round-trips byte-identically; entries are sorted by path so the
+/// on-disk JSON is a deterministic diff.
+#[test]
+fn manifest_round_trip() {
+    let root = unique_temp_dir("manifest-rt");
+    let gnr8 = root.join(".gnr8");
+    std::fs::create_dir_all(&gnr8).expect("create .gnr8");
+
+    let mut manifest = gnr8_core::manifest::Manifest::default();
+    // Insert out of order — save must sort by path.
+    manifest.record("sdk/client.go", "aaaa", "sdk");
+    manifest.record("openapi.yaml", "bbbb", "openapi");
+    manifest.record("sdk/models.go", "cccc", "sdk");
+    manifest.save(&gnr8).expect("save manifest");
+
+    let loaded = gnr8_core::manifest::load(&gnr8).expect("load manifest");
+    assert_eq!(loaded.recorded_hash("openapi.yaml"), Some("bbbb"));
+    assert_eq!(loaded.recorded_hash("sdk/client.go"), Some("aaaa"));
+    assert_eq!(loaded.recorded_hash("sdk/models.go"), Some("cccc"));
+    assert_eq!(loaded.recorded_hash("missing.go"), None);
+
+    // The serialized form is sorted by path (deterministic diffs).
+    let raw = std::fs::read_to_string(gnr8.join("cache").join("manifest.json"))
+        .expect("read manifest.json");
+    let openapi_at = raw.find("openapi.yaml").expect("openapi entry present");
+    let client_at = raw.find("sdk/client.go").expect("client entry present");
+    let models_at = raw.find("sdk/models.go").expect("models entry present");
+    assert!(
+        openapi_at < client_at && client_at < models_at,
+        "entries must be serialized sorted by path:\n{raw}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WS-04: `load` on an absent manifest.json returns the empty default (graceful — absent
+/// manifest ⇒ treat every output as fresh), never an error.
+#[test]
+fn manifest_absent_loads_empty() {
+    let root = unique_temp_dir("manifest-absent");
+    let gnr8 = root.join(".gnr8");
+    std::fs::create_dir_all(&gnr8).expect("create .gnr8");
+
+    let manifest = gnr8_core::manifest::load(&gnr8).expect("absent manifest loads as empty default");
+    assert!(
+        manifest.files.is_empty(),
+        "absent manifest must load with no files"
+    );
+    assert_eq!(manifest.recorded_hash("openapi.yaml"), None);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WS-04 / DoS (T-04-02-03): a corrupt manifest.json loads as the empty default
+/// (regenerate-from-scratch), never panics, never surfaces a hard error.
+#[test]
+fn manifest_corrupt_loads_empty() {
+    let root = unique_temp_dir("manifest-corrupt");
+    let cache = root.join(".gnr8").join("cache");
+    std::fs::create_dir_all(&cache).expect("create cache dir");
+    std::fs::write(cache.join("manifest.json"), b"{ this is not json")
+        .expect("write corrupt manifest");
+
+    let manifest =
+        gnr8_core::manifest::load(&root.join(".gnr8")).expect("corrupt manifest loads as empty");
+    assert!(
+        manifest.files.is_empty(),
+        "corrupt manifest must degrade to the empty default, not crash"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// WS-04 / D-04: `prune_to` drops manifest entries whose path is not in the supplied current
+/// output set (deleting a file from config drops its entry).
+#[test]
+fn manifest_prunes_dropped() {
+    let mut manifest = gnr8_core::manifest::Manifest::default();
+    manifest.record("openapi.yaml", "aaaa", "openapi");
+    manifest.record("sdk/client.go", "bbbb", "sdk");
+    manifest.record("sdk/dropped.go", "cccc", "sdk");
+
+    // The current generation no longer produces sdk/dropped.go.
+    let current = vec!["openapi.yaml".to_string(), "sdk/client.go".to_string()];
+    manifest.prune_to(&current);
+
+    assert_eq!(manifest.recorded_hash("openapi.yaml"), Some("aaaa"));
+    assert_eq!(manifest.recorded_hash("sdk/client.go"), Some("bbbb"));
+    assert_eq!(
+        manifest.recorded_hash("sdk/dropped.go"),
+        None,
+        "a path no longer generated must be pruned from the manifest"
+    );
+}
