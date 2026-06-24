@@ -702,8 +702,7 @@ fn scaffold_project(label: &str) -> (PathBuf, gnr8_core::config::Config) {
 
     // Point inputs at the fixture (absolute) and keep outputs project-relative under the temp root.
     let config_src = format!(
-        "inputs = [{:?}]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/test/sdk\"\n",
-        FIXTURE_DIR
+        "inputs = [{FIXTURE_DIR:?}]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/test/sdk\"\n"
     );
     std::fs::write(root.join(".gnr8").join("config.toml"), &config_src)
         .expect("write test config.toml");

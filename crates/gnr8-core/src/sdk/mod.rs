@@ -50,6 +50,17 @@ pub fn generate(graph: &ApiGraph) -> Result<String, crate::CoreError> {
     Ok(bundle.to_string())
 }
 
+/// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
+///
+/// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
+/// per-file outputs (to hash + ownership-track each file) without re-implementing the marker split
+/// or reaching into the private `bundle` submodule. Single source of truth for the framing — the
+/// same one [`write_to_dir`] uses. The caller is responsible for the frame-name path-safety check
+/// when materializing (the names are program-controlled; see [`write_to_dir`]).
+pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
+    bundle::parse(bundle)
+}
+
 /// `gofmt` a raw emitted file and wrap it as a named [`SdkFile`].
 fn go_file(name: &str, raw: &str) -> Result<SdkFile, crate::CoreError> {
     Ok(SdkFile {
