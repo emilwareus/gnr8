@@ -57,14 +57,19 @@ fn render(mut diagnostics: Vec<DiagnosticFact>, module_root: &str) -> String {
 }
 
 /// Strip the analyzed-module prefix from a diagnostic file path so output is portable + byte-stable.
+///
+/// Stripping happens only on a path-separator boundary, so a sibling directory whose name shares the
+/// root as a string prefix (e.g. `root = "/a/svc"`, `file = "/a/svc-utils/x.go"`) is left absolute
+/// rather than mis-stripped to `-utils/x.go`. An exact match of the root maps to the empty path.
 fn relativize(file: &str, root: &str) -> String {
     if root.is_empty() {
         return file.to_string();
     }
-    if let Some(rest) = file.strip_prefix(root) {
-        return rest.trim_start_matches('/').to_string();
+    match file.strip_prefix(root) {
+        Some("") => String::new(),
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_string(),
+        _ => file.to_string(), // not actually under root/ — leave it absolute.
     }
-    file.to_string()
 }
 
 #[cfg(test)]

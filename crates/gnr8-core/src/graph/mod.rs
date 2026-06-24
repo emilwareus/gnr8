@@ -368,14 +368,20 @@ fn normalize_root(module_root: &str) -> String {
 /// Make `file` portable + byte-stable (GRAPH-02): strip the analyzed-module prefix so an absolute
 /// path like `<root>/internal/goal/ports/http.go` becomes `internal/goal/ports/http.go`. Paths that
 /// are not under the root (or are already relative) are returned unchanged.
+///
+/// The prefix is stripped only on a path-separator boundary, so a sibling directory whose name
+/// shares the root as a string prefix (e.g. `root = "/a/svc"`, `file = "/a/svc-utils/x.go"`) is left
+/// absolute rather than mis-stripped to `-utils/x.go`. An exact match of the root maps to the empty
+/// relative path.
 fn relativize(file: &str, root: &str) -> String {
     if root.is_empty() {
         return file.to_string();
     }
-    if let Some(rest) = file.strip_prefix(root) {
-        return rest.trim_start_matches('/').to_string();
+    match file.strip_prefix(root) {
+        Some("") => String::new(),
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/').to_string(),
+        _ => file.to_string(), // not actually under root/ — leave it absolute.
     }
-    file.to_string()
 }
 
 /// Map a crate-private `facts::SourceSpan` to the graph-owned [`SourceSpan`], relativizing the file
