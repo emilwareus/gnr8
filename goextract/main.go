@@ -62,6 +62,7 @@ func run(targetDir string, w *os.File) error {
 	// annotation facts (Task 3). buildRoutes owns the wiring + the per-route
 	// diagnostics (untyped query params, dynamic responses).
 	handlers.SetModule(module) // refs share the 02-01 module-relative schema id.
+	handlers.SetAnnotationPackages(handlers.AnnotationPackagesFromResult(res, module))
 	recognized := routes.Recognize(res)
 	idx := handlers.BuildIndex(res)
 	routeFacts := buildRoutes(recognized, idx, diags)
@@ -103,6 +104,11 @@ func buildRoutes(recognized []routes.Route, idx handlers.Index, diags *diag.Accu
 		rf.RequestBody = cf.RequestBody
 		rf.Responses = cf.Responses
 		rf.Params = cf.Params
+
+		// Task 3: swaggo annotation facts (escape hatch) fill gaps + add
+		// metadata (summary, tags, @ID, @Security, @Router, query enums,
+		// missing responses) without clobbering code-resolved facts.
+		handlers.MergeAnnotations(&rf, idx.ParseAnnotations(r.Handler))
 
 		out = append(out, rf)
 	}

@@ -299,4 +299,102 @@ mod tests {
             );
         }
     }
+
+    /// Round-trip a fully-populated route fact (the 02-02 shape) so the serde
+    /// mirror stays in lockstep with `goextract`'s route/handler/annotation output:
+    /// the new `router_path` + `security_schemes` fields, params with enum values,
+    /// and responses by numeric status.
+    mod route_facts {
+        use crate::analyze::facts::GoFacts;
+
+        // Mirrors a real `go run . ../fixtures/goalservice` route entry for
+        // `PUT /goal/{uuid}` (annotation @ID/@Security/@Router merged onto code
+        // facts): operation_id from @ID, a secured route with the ApiKeyAuth
+        // scheme, the @Router override path, a path param, and 200/400/404.
+        const ROUTE: &[u8] = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "PUT",
+              "path": "/{uuid}",
+              "router_path": "/{uuid}",
+              "handler": "updateGoal",
+              "operation_id": "goalUuidPut",
+              "summary": "Update goal",
+              "tags": ["Goals"],
+              "secured": true,
+              "security_schemes": ["ApiKeyAuth"],
+              "params": [
+                {
+                  "name": "uuid",
+                  "location": "path",
+                  "required": true,
+                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "description": "Goal UUID",
+                  "enum_values": [],
+                  "span": { "file": "handlers.go", "start_line": 94, "end_line": 94 }
+                }
+              ],
+              "request_body": { "ref_id": "internal/common/dto.UpdateGoalInput" },
+              "responses": [
+                { "status": 200, "body": { "ref_id": "internal/common/dto.CommandMessage" }, "description": "Goal updated" },
+                { "status": 400, "body": { "ref_id": "internal/common/dto.HttpError" }, "description": "Invalid input" },
+                { "status": 404, "body": { "ref_id": "internal/common/dto.HttpError" }, "description": "Goal not found" }
+              ],
+              "span": { "file": "http.go", "start_line": 57, "end_line": 57 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": []
+        }"#;
+
+        #[test]
+        fn deserializes_populated_route_with_new_fields() {
+            let facts: GoFacts = serde_json::from_slice(ROUTE).unwrap();
+            assert_eq!(facts.routes.len(), 1);
+            let r = &facts.routes[0];
+
+            assert_eq!(r.method, "PUT");
+            assert_eq!(r.path, "/{uuid}");
+            assert_eq!(r.router_path.as_deref(), Some("/{uuid}"));
+            assert_eq!(r.operation_id.as_deref(), Some("goalUuidPut"));
+            assert!(r.secured);
+            assert_eq!(r.security_schemes, vec!["ApiKeyAuth"]);
+
+            let body = r.request_body.as_ref().unwrap();
+            assert!(body.ref_id.ends_with("dto.UpdateGoalInput"));
+
+            let statuses: Vec<u16> = r.responses.iter().map(|x| x.status).collect();
+            assert_eq!(statuses, vec![200, 400, 404]);
+
+            let uuid = &r.params[0];
+            assert_eq!(uuid.name, "uuid");
+            assert_eq!(uuid.location, "path");
+            assert!(uuid.required);
+            assert_eq!(uuid.schema.format.as_deref(), Some("uuid"));
+        }
+
+        #[test]
+        fn rejects_unknown_route_field() {
+            // A new Go field that the Rust mirror has not adopted must fail-fast.
+            let bad = br#"{
+              "module": "x",
+              "routes": [
+                {
+                  "method": "GET", "path": "/", "router_path": null, "handler": "h",
+                  "operation_id": null, "summary": null, "tags": [], "secured": false,
+                  "security_schemes": [], "params": [], "request_body": null,
+                  "responses": [], "span": { "file": "f", "start_line": 1, "end_line": 1 },
+                  "unexpected_route_field": true
+                }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let result: Result<GoFacts, _> = serde_json::from_slice(bad);
+            assert!(
+                result.is_err(),
+                "deny_unknown_fields must reject an unexpected route key"
+            );
+        }
+    }
 }
