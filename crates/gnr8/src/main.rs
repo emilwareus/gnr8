@@ -316,8 +316,12 @@ fn run_doctor(json: bool) -> Result<()> {
     let go_present = probe_go();
 
     // Only harvest analysis diagnostics + drift when we CAN: a valid config and a present toolchain.
-    // Any `Err`/`None` from `build_graph`/`plan_only` degrades to a graceful absence and is reported as
-    // "diagnostics/drift unavailable", never propagated as a crash (Pitfall 4 / D-02).
+    // That precondition IS `drift_computable` — when it holds but `plan_only` still returns `None`, the
+    // drift dry-run FAILED (e.g. a multi-input config `generate` would reject, or a source build error),
+    // which must surface as a distinct "drift unknown" finding rather than a false-healthy "up to date"
+    // (WR-01). Any `Err`/`None` from `diagnostics_only`/`plan_only` degrades to a graceful absence and is
+    // REPORTED, never propagated as a crash (Pitfall 4 / D-02).
+    let drift_computable = config.is_ok() && go_present;
     let (overlap, diagnostics, drift) = if let (Ok(cfg), true) = (&config, go_present) {
         let overlap = inputs_overlap_outputs(cfg);
         // Harvest diagnostics over the SAME graph `generate` acts on — `diagnostics_only` applies the
@@ -329,7 +333,8 @@ fn run_doctor(json: bool) -> Result<()> {
         (overlap, diagnostics, drift)
     } else {
         // No config / no toolchain → overlap is indeterminate (default false), and analysis/drift are
-        // unavailable. The lifecycle findings (invalid config / missing toolchain) carry the verdict.
+        // unavailable. The lifecycle findings (invalid config / missing toolchain) carry the verdict, so
+        // `drift_computable` is false and the uncomputable-drift finding does NOT double-count them.
         (false, None, None)
     };
 
@@ -339,6 +344,7 @@ fn run_doctor(json: bool) -> Result<()> {
         go_present,
         overlap,
         diagnostics,
+        drift_computable,
         drift.as_ref(),
     );
 

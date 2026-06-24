@@ -60,6 +60,15 @@ pub(crate) struct OutputHealth {
     pub(crate) drifted: Vec<String>,
     /// Output paths byte-identical to the generated output (`WriteAction::Unchanged`) — clean.
     pub(crate) unchanged: Vec<String>,
+    /// Whether the drift dry-run could NOT be computed even though config + Go toolchain were present
+    /// (e.g. a multi-input config `generate` would reject, or a source build/parse error). This is a
+    /// DISTINCT state from "no drift" (every output `Unchanged`): the empty stale/drifted/unchanged
+    /// lists below would otherwise render as a clean "all outputs up to date", masking that `doctor`
+    /// could not actually verify staleness. It is ACTIONABLE — the user should know drift is unverified
+    /// and run `gnr8 check`/`gnr8 generate` for the real error (WR-01). When config is invalid or the
+    /// toolchain is absent, drift is also unavailable, but THAT is already carried by the lifecycle
+    /// findings, so this flag stays `false` then to avoid double-counting.
+    pub(crate) drift_unknown: bool,
 }
 
 /// One analysis diagnostic enriched with a short, human explanation of WHY it is flagged and HOW to
@@ -150,16 +159,27 @@ impl DoctorReport {
     /// - `inputs_overlap_outputs` — a configured input overlaps a configured output path.
     /// - `diagnostics` — the structured analysis diagnostics, or `None` when unavailable (no config /
     ///   no Go toolchain / analysis errored — degrades gracefully, never a crash).
+    /// - `drift_computable` — whether a drift dry-run was ATTEMPTABLE (config valid AND Go present). It
+    ///   separates "we tried and got a clean plan" (`drift = Some`) from "we tried but the analysis/plan
+    ///   failed" (`drift_computable && drift = None`) — the latter is the WR-01 uncomputable-drift state,
+    ///   surfaced as `outputs.drift_unknown` rather than a false-healthy "all up to date".
     /// - `drift` — the dry-run [`WritePlan`], or `None` when unavailable (same graceful absence).
     ///
     /// The `WritePlan` is partitioned into stale (`Write`) / drifted (`UserEdited`) / clean
     /// (`Unchanged`), and each `Diagnostic` is enriched with a why/fix explanation.
+    //
+    // Each bool here is an INDEPENDENT collected health fact the impure `run_doctor` shell hands in by
+    // name (mirrors the `struct_excessive_bools` allow on `LifecycleHealth`); collapsing them into a
+    // flags struct would just move the same four fields and obscure the call site, so allow the lint
+    // locally rather than restructure (skill ch.2.4).
+    #[allow(clippy::fn_params_excessive_bools)]
     pub(crate) fn assemble(
         initialized: bool,
         config: &Result<Config, CoreError>,
         go_present: bool,
         inputs_overlap_outputs: bool,
         diagnostics: Option<Vec<Diagnostic>>,
+        drift_computable: bool,
         drift: Option<&WritePlan>,
     ) -> Self {
         let lifecycle = LifecycleHealth {
@@ -179,6 +199,11 @@ impl DoctorReport {
                     WriteAction::Unchanged => outputs.unchanged.push(file.path.clone()),
                 }
             }
+        } else if drift_computable {
+            // Config + toolchain were present, so drift SHOULD have been computable, but the dry-run
+            // failed (multi-input rejection, source build/parse error, ...). Mark it unknown so the
+            // empty partition above never renders as a clean "all outputs up to date" (WR-01).
+            outputs.drift_unknown = true;
         }
 
         // Enrich each informational analysis diagnostic with a short why/fix (D-02 — explain, not
@@ -237,6 +262,11 @@ impl DoctorReport {
         if self.lifecycle.inputs_overlap_outputs {
             count += 1;
         }
+        // An uncomputable drift (config + toolchain present, but the dry-run failed) is actionable:
+        // `doctor` could not verify staleness, so it must NOT pass as healthy (WR-01).
+        if self.outputs.drift_unknown {
+            count += 1;
+        }
         count += self.outputs.stale.len();
         count += self.outputs.drifted.len();
         count
@@ -252,6 +282,7 @@ impl DoctorReport {
             || !self.lifecycle.config_valid
             || !self.lifecycle.go_toolchain
             || self.lifecycle.inputs_overlap_outputs
+            || self.outputs.drift_unknown
             || !self.outputs.stale.is_empty()
             || !self.outputs.drifted.is_empty()
     }
@@ -311,7 +342,14 @@ impl DoctorReport {
                 "  drifted:  {path} (hand-edited; differs from generated)"
             );
         }
-        if self.outputs.stale.is_empty() && self.outputs.drifted.is_empty() {
+        if self.outputs.drift_unknown {
+            // Distinct from "up to date": the drift dry-run failed despite config + toolchain being
+            // present, so staleness is UNVERIFIED — never imply healthy here (WR-01).
+            let _ = writeln!(
+                out,
+                "  drift: UNKNOWN — could not compute (run `gnr8 check` / `gnr8 generate` for the error)"
+            );
+        } else if self.outputs.stale.is_empty() && self.outputs.drifted.is_empty() {
             let _ = writeln!(out, "  (all outputs up to date)");
         }
 
@@ -441,6 +479,7 @@ go_module = "example.com/svc/sdk"
             true,         // go present
             false,        // no input/output overlap
             Some(diags),  // 3 informational WARNs
+            true,         // drift was computable
             Some(&clean_plan()),
         );
         assert!(
@@ -455,7 +494,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: `.gnr8/` missing (initialized=false) is actionable.
     #[test]
     fn missing_init_is_actionable() {
-        let report = DoctorReport::assemble(false, &ok_config(), true, false, None, None);
+        let report = DoctorReport::assemble(false, &ok_config(), true, false, None, false, None);
         assert!(report.has_actionable_problem());
         assert!(!report.healthy);
     }
@@ -463,7 +502,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: an invalid/missing config is actionable.
     #[test]
     fn invalid_config_is_actionable() {
-        let report = DoctorReport::assemble(true, &err_config(), true, false, None, None);
+        let report = DoctorReport::assemble(true, &err_config(), true, false, None, false, None);
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.config_valid);
     }
@@ -471,7 +510,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: a missing Go toolchain is actionable (and reported, not a crash).
     #[test]
     fn missing_go_toolchain_is_actionable() {
-        let report = DoctorReport::assemble(true, &ok_config(), false, false, None, None);
+        let report = DoctorReport::assemble(true, &ok_config(), false, false, None, false, None);
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.go_toolchain);
     }
@@ -479,8 +518,15 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: a configured input overlapping an output is actionable.
     #[test]
     fn input_output_overlap_is_actionable() {
-        let report =
-            DoctorReport::assemble(true, &ok_config(), true, true, None, Some(&clean_plan()));
+        let report = DoctorReport::assemble(
+            true,
+            &ok_config(),
+            true,
+            true,
+            None,
+            true,
+            Some(&clean_plan()),
+        );
         assert!(report.has_actionable_problem());
         assert!(report.lifecycle.inputs_overlap_outputs);
     }
@@ -494,6 +540,7 @@ go_module = "example.com/svc/sdk"
             true,
             false,
             None,
+            true,
             Some(&plan_with(WriteAction::Write)),
         );
         assert!(
@@ -502,8 +549,15 @@ go_module = "example.com/svc/sdk"
         );
         assert_eq!(stale.outputs.stale.len(), 1);
 
-        let clean =
-            DoctorReport::assemble(true, &ok_config(), true, false, None, Some(&clean_plan()));
+        let clean = DoctorReport::assemble(
+            true,
+            &ok_config(),
+            true,
+            false,
+            None,
+            true,
+            Some(&clean_plan()),
+        );
         assert!(
             !clean.has_actionable_problem(),
             "an all-Unchanged plan with no other problems is healthy"
@@ -520,10 +574,74 @@ go_module = "example.com/svc/sdk"
             true,
             false,
             None,
+            true,
             Some(&plan_with(WriteAction::UserEdited)),
         );
         assert!(report.has_actionable_problem());
         assert_eq!(report.outputs.drifted.len(), 1);
+    }
+
+    /// WR-01: when config IS valid and the Go toolchain IS present but the drift dry-run could not be
+    /// computed (`drift_computable = true`, `drift = None` — e.g. a multi-input config `generate` would
+    /// reject, or a source build/parse error), `doctor` must NOT report a clean healthy project. The
+    /// empty stale/drifted/unchanged partition must surface as `drift_unknown` (actionable, `!healthy`)
+    /// and render a DISTINCT "could not compute" line — never the false-reassuring "all outputs up to
+    /// date".
+    #[test]
+    fn uncomputable_drift_is_actionable_not_healthy() {
+        let report = DoctorReport::assemble(
+            true,         // initialized
+            &ok_config(), // config valid
+            true,         // go present — so drift SHOULD have been computable
+            false,        // no overlap
+            None,         // diagnostics also unavailable
+            true,         // drift_computable: a compute WAS attempted
+            None,         // ...but it failed → drift unavailable
+        );
+
+        assert!(
+            report.outputs.drift_unknown,
+            "an uncomputable drift (computable but None) must be flagged drift_unknown (WR-01)"
+        );
+        assert!(
+            report.has_actionable_problem(),
+            "uncomputable drift must be actionable — doctor could not verify staleness (WR-01)"
+        );
+        assert!(
+            !report.healthy,
+            "a project whose drift could not be computed is NOT healthy"
+        );
+        assert!(
+            report.summary.actionable_problems >= 1,
+            "the uncomputable drift must contribute to the actionable count"
+        );
+
+        // The human render must NOT imply the project is up to date, and must say so explicitly.
+        let text = report.render_human();
+        assert!(
+            !text.contains("all outputs up to date"),
+            "uncomputable drift must NOT render as a clean 'all outputs up to date':\n{text}"
+        );
+        assert!(
+            text.contains("drift: UNKNOWN") || text.contains("could not compute"),
+            "uncomputable drift must render a distinct 'could not compute' finding:\n{text}"
+        );
+    }
+
+    /// WR-01 boundary: when config is INVALID (or the toolchain is absent), drift is also unavailable,
+    /// but that is ALREADY carried by the lifecycle finding — so `drift_computable = false` and the
+    /// uncomputable-drift flag must stay OFF (no double-counting, no spurious extra finding).
+    #[test]
+    fn unavailable_drift_from_bad_config_does_not_set_drift_unknown() {
+        let report = DoctorReport::assemble(true, &err_config(), true, false, None, false, None);
+        assert!(
+            !report.outputs.drift_unknown,
+            "drift unavailability from an invalid config must NOT set drift_unknown (the config \
+             finding carries it) — avoids double-counting (WR-01)"
+        );
+        // Still actionable (the invalid config), but for the config reason, not a drift_unknown one.
+        assert!(report.has_actionable_problem());
+        assert!(!report.lifecycle.config_valid);
     }
 
     /// `--json` field-set stability (mirrors watch.rs `latency_report_json_field_set`): the serialized
@@ -536,6 +654,7 @@ go_module = "example.com/svc/sdk"
             true,
             false,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
+            true,
             Some(&clean_plan()),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -580,6 +699,7 @@ go_module = "example.com/svc/sdk"
             true,
             false,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
+            true,
             Some(&clean_plan()),
         );
         let text = healthy.render_human();
@@ -599,7 +719,8 @@ go_module = "example.com/svc/sdk"
         assert!(text.contains("healthy"), "missing healthy verdict:\n{text}");
 
         // An unhealthy report names actionable problems in the verdict.
-        let unhealthy = DoctorReport::assemble(false, &err_config(), false, false, None, None);
+        let unhealthy =
+            DoctorReport::assemble(false, &err_config(), false, false, None, false, None);
         let text = unhealthy.render_human();
         assert!(
             text.contains("actionable problem"),
