@@ -90,8 +90,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 05-01: Harden diagnostics, doctor output, and performance reporting.
-- [ ] 05-02: Finalize demo documentation, verification evidence, and milestone audit.
+- [ ] 05-01-PLAN.md — Implement read-only `gnr8 doctor` aggregator (unsupported patterns + stale/drift + lifecycle checks, human report + --json, exit 0 healthy / 1 actionable) and `scripts/bench.sh` for cold/warm-no-op/single-file-edit numbers (HARD-01, HARD-03; wave 1).
+- [ ] 05-02-PLAN.md — Write docs/demo.md (fresh-checkout source-edit → updated OpenAPI + SDK on a scratch fixture copy) and docs/evidence.md (make check GREEN capture + 37-requirement traceability sign-off) (HARD-02, HARD-03; wave 2).
 
 ## Progress
 
