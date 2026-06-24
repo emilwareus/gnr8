@@ -37,6 +37,16 @@ fn main() -> Result<()> {
         return run_inspect(action, cli.json);
     }
 
+    // `generate` + `check` (Phase 4) run the real deterministic pipeline through the lifecycle core,
+    // rendering counts (human or --json) and, for `check`, exiting non-zero on drift. Both flow real
+    // pipeline errors (Go toolchain missing, lowering, sdkgen, I/O) through this anyhow boundary as a
+    // clean stderr message + exit 1, never a panic (D-09 / RUST-04).
+    match &cli.command {
+        Commands::Generate { force } => return run_generate(*force, cli.json),
+        Commands::Check => return run_check(cli.json),
+        _ => {}
+    }
+
     match dispatch(&cli) {
         Ok(report) => {
             if cli.json {
@@ -63,11 +73,11 @@ fn main() -> Result<()> {
 fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
     match &cli.command {
         Commands::Init => run_init(),
-        Commands::Generate => gnr8_core::not_yet("generate", 3),
         Commands::Watch => gnr8_core::not_yet("watch", 4),
-        Commands::Check => gnr8_core::not_yet("check", 4),
         Commands::Doctor => gnr8_core::not_yet("doctor", 5),
         // Handled in `main` before this dispatch; kept exhaustive for the compiler.
+        Commands::Generate { .. } => gnr8_core::not_yet("generate", 4),
+        Commands::Check => gnr8_core::not_yet("check", 4),
         Commands::Inspect { .. } => gnr8_core::not_yet("inspect", 2),
     }
 }
@@ -100,6 +110,125 @@ fn run_init() -> Result<Report, gnr8_core::CoreError> {
         )
     };
     Ok(Report { message })
+}
+
+/// The current project root + its `.gnr8/` dir, resolved against the working directory.
+///
+/// `regenerate`/`plan_only` take the project root; `config::load` reads `<root>/.gnr8/config.toml`.
+/// A `current_dir` failure surfaces as `CoreError::Workspace` (clean message, never a panic).
+fn project_paths() -> Result<(std::path::PathBuf, std::path::PathBuf), gnr8_core::CoreError> {
+    let root = std::env::current_dir().map_err(|e| gnr8_core::CoreError::Workspace {
+        message: format!("failed to resolve the current directory: {e}"),
+    })?;
+    let gnr8_dir = root.join(".gnr8");
+    Ok((root, gnr8_dir))
+}
+
+/// A serializable generate/check report: the per-bucket counts + paths (the `--json` shape 04-03
+/// extends with latency). The human render summarizes the counts; `--json` serializes this struct.
+#[derive(Debug, serde::Serialize)]
+struct LifecycleReport {
+    /// Paths written (new or changed; under `--force`, overwritten user edits).
+    written: Vec<String>,
+    /// Paths byte-identical and therefore not rewritten (no-op).
+    unchanged: Vec<String>,
+    /// Paths protected (user-edited / pre-existing) and skipped — overwrite with `--force`.
+    skipped: Vec<String>,
+}
+
+/// Run `gnr8 generate` (+ `--force`): load the config, regenerate through the real pipeline, write
+/// only changed files, and report counts. Every protected (user-edited) file is named in a stderr
+/// warning line so the "no silent clobbering" protection is VISIBLE (T-04-02-04). `--json` serializes
+/// the counts. A missing `.gnr8/config.toml` surfaces a clean `CoreError::Config` (run `gnr8 init`);
+/// a missing Go toolchain surfaces `GoToolchainMissing` — both via the anyhow boundary, never a panic.
+fn run_generate(force: bool, json: bool) -> Result<()> {
+    let (root, gnr8_dir) = project_paths()?;
+    let config = gnr8_core::config::load(&gnr8_dir)?;
+    let outcome = gnr8_core::lifecycle::regenerate(&root, &config, force)?;
+
+    // Warn (stderr) for every protected file so the user SEES which outputs were not clobbered.
+    for path in &outcome.skipped {
+        eprintln!(
+            "warning: {path} was hand-edited since gnr8 last wrote it — skipped (use --force to overwrite)"
+        );
+    }
+
+    if json {
+        let report = LifecycleReport {
+            written: outcome.written,
+            unchanged: outcome.unchanged,
+            skipped: outcome.skipped,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "{} written, {} unchanged, {} skipped (user-edited; use --force to overwrite)",
+            outcome.written.len(),
+            outcome.unchanged.len(),
+            outcome.skipped.len()
+        );
+    }
+    Ok(())
+}
+
+/// Run `gnr8 check`: a DRY-RUN of the same `plan_writes` decision (no writes, no manifest save). Exits
+/// NON-ZERO (code 1) if any output is stale (`Write`) or drifted (`UserEdited`); exits 0 when every
+/// output is `Unchanged`. Reuses the exact pure decision function — zero new policy. `--json` emits the
+/// stale/drifted path lists. Pipeline errors flow through the anyhow boundary, never a panic.
+fn run_check(json: bool) -> Result<()> {
+    let (root, gnr8_dir) = project_paths()?;
+    let config = gnr8_core::config::load(&gnr8_dir)?;
+    let plan = gnr8_core::lifecycle::plan_only(&root, &config)?;
+
+    // Partition the plan into stale (would be written) vs drifted (user-edited) vs clean (unchanged).
+    let mut stale: Vec<String> = Vec::new();
+    let mut drifted: Vec<String> = Vec::new();
+    let mut clean: Vec<String> = Vec::new();
+    for file in &plan.files {
+        match file.action {
+            gnr8_core::lifecycle::WriteAction::Write => stale.push(file.path.clone()),
+            gnr8_core::lifecycle::WriteAction::UserEdited => drifted.push(file.path.clone()),
+            gnr8_core::lifecycle::WriteAction::Unchanged => clean.push(file.path.clone()),
+        }
+    }
+    let has_drift = plan.has_drift();
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct CheckReport {
+            up_to_date: bool,
+            stale: Vec<String>,
+            drifted: Vec<String>,
+            unchanged: Vec<String>,
+        }
+        let report = CheckReport {
+            up_to_date: !has_drift,
+            stale,
+            drifted,
+            unchanged: clean,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if has_drift {
+        for path in &stale {
+            eprintln!("stale: {path} is out of date (run `gnr8 generate`)");
+        }
+        for path in &drifted {
+            eprintln!("drifted: {path} was hand-edited and differs from the generated output");
+        }
+        println!(
+            "outputs are NOT up to date: {} stale, {} drifted",
+            stale.len(),
+            drifted.len()
+        );
+    } else {
+        println!("outputs are up to date ({} unchanged)", clean.len());
+    }
+
+    if has_drift {
+        // Deliberate non-zero exit so `gnr8 check` is a usable CI gate (RESEARCH Open Q 3).
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and

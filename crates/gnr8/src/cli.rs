@@ -37,7 +37,11 @@ pub(crate) enum Commands {
     Init,
     /// Generate OpenAPI + Go SDK from Go source.
     #[allow(clippy::doc_markdown)] // "OpenAPI" is a proper noun; keep clap help text clean.
-    Generate,
+    Generate {
+        /// Overwrite generated files a user has hand-edited (D-04 / A4 override verb).
+        #[arg(long)]
+        force: bool,
+    },
     /// Watch source and regenerate on change.
     Watch,
     /// Verify generated outputs are up to date.
@@ -98,9 +102,17 @@ mod tests {
             Cli::try_parse_from(["gnr8", "init"]).unwrap().command,
             Commands::Init
         ));
+        // `generate` defaults `--force` to false.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "generate"]).unwrap().command,
-            Commands::Generate
+            Commands::Generate { force: false }
+        ));
+        // `generate --force` sets the flag.
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "generate", "--force"])
+                .unwrap()
+                .command,
+            Commands::Generate { force: true }
         ));
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "watch"]).unwrap().command,
