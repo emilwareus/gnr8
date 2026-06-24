@@ -112,16 +112,41 @@ fn is_under_any_output(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
         .any(|out| path == out || path.starts_with(out))
 }
 
-/// Canonicalize `path` to its real, symlink-resolved absolute form, falling back to `path` itself when
-/// canonicalization fails (e.g. the file was just deleted/renamed — common in a watch event stream).
+/// Canonicalize `path` to its real, symlink-resolved absolute form.
 ///
 /// This MATTERS for loop safety: on macOS, `notify`/FSEvents reports the CANONICAL path
 /// (`/private/var/...`) while a project root under `std::env::temp_dir()` is the non-canonical
 /// `/var/...`. Without canonicalizing BOTH the output set and each incoming event path, a `starts_with`
 /// comparison silently fails and gnr8's own writes would re-trigger regeneration (a WATCH-02 loop). We
 /// canonicalize once when building the output set and once per event before the pure filter runs.
+///
+/// A DELETE/RENAME event names a leaf that no longer exists, so `canonicalize` fails on the full path
+/// (WR-01). Plain fallback-to-raw then leaves a non-canonical `/var/.../sdk/client.go` that does NOT
+/// match the canonical `/private/.../sdk` in the output set, so a delete/rename of one of gnr8's OWN
+/// outputs would slip the filter and fire a spurious regen. To close that, when the leaf is gone we
+/// canonicalize the nearest EXISTING ancestor and re-append the missing tail, so a just-deleted output
+/// still resolves UNDER the canonical output dir and stays filtered — covering delete/rename event
+/// kinds too, not only create/modify.
 fn canonicalize_or_keep(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    // The leaf is gone (delete/rename): walk up to the nearest existing ancestor, canonicalize it,
+    // then re-append the components below it so the result is still under the canonical output dir.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
+        tail.push(name.to_os_string());
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let mut resolved = canonical_parent;
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Build the absolute, CANONICALIZED output-path set the filter drops: the configured OpenAPI file, the
@@ -333,7 +358,10 @@ mod tests {
     // this module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{batch_should_regenerate, is_trigger_path, GenerateOutcome, LatencyReport};
+    use super::{
+        batch_should_regenerate, canonicalize_or_keep, is_trigger_path, is_under_any_output,
+        GenerateOutcome, LatencyReport,
+    };
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -432,5 +460,45 @@ mod tests {
         assert_eq!(obj["millis"], serde_json::json!(42));
         assert_eq!(obj["written"], serde_json::json!(2));
         assert_eq!(obj["unchanged"], serde_json::json!(1));
+    }
+
+    /// WR-01: a DELETE/RENAME event names a leaf that no longer exists, so plain `canonicalize` fails.
+    /// The ancestor-canonicalizing fallback must still resolve the gone leaf UNDER the canonical output
+    /// dir, so a delete of one of gnr8's own outputs stays filtered (no spurious regen) on macOS where
+    /// the canonical form differs (`/private/var/...` vs `/var/...`).
+    #[test]
+    fn deleted_output_event_still_resolves_under_canonical_output_dir() {
+        // A hermetic temp output dir (PID + nanos, no user input — mirrors the test discipline).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("gnr8-watch-wr01-{}-{nanos}", std::process::id()));
+        let sdk_dir = root.join("sdk");
+        std::fs::create_dir_all(&sdk_dir).expect("create sdk dir");
+
+        // Build the output set exactly as the watcher does: canonicalize the SDK dir once.
+        let mut output_set = HashSet::new();
+        output_set.insert(canonicalize_or_keep(&sdk_dir));
+
+        // gnr8 writes then DELETES a generated file (the WR-01 case). The leaf no longer exists.
+        let generated = sdk_dir.join("client.go");
+        std::fs::write(&generated, b"package sdk\n").expect("write generated file");
+        std::fs::remove_file(&generated).expect("delete generated file");
+        assert!(!generated.exists(), "the leaf must be gone (delete event)");
+
+        // The per-event canonicalization of the now-deleted leaf must still land under the canonical
+        // SDK dir, so the filter treats it as gnr8's own output and does NOT trigger a regen.
+        let event_path = canonicalize_or_keep(&generated);
+        assert!(
+            is_under_any_output(&event_path, &output_set),
+            "a deleted output leaf must still resolve under the canonical output dir; got {event_path:?}"
+        );
+        assert!(
+            !is_trigger_path(&event_path, &output_set),
+            "a delete event for gnr8's own output must NOT trigger a regeneration (WR-01)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
