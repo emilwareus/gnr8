@@ -1,11 +1,14 @@
-//! Red-by-design contract test (FIX-03 / FIX-04): the expected `OpenAPI` 3.1.0 document for goalservice.
+//! Contract test (OAPI-01/02/03): the `OpenAPI` 3.1.0 document `gnr8` lowers from the goalservice
+//! fixture.
 //!
 //! Builds the graph via the Phase-2 `analyze::build_graph` seam, then lowers it via the Phase-3
-//! `lower::to_openapi` seam. Today `build_graph` already returns `CoreError::NotYetImplemented`, so
-//! the first `.expect()` panics BEFORE the snapshot assertion → the test FAILS CLEARLY
-//! (red-by-design). It is never marked ignored (FIX-04), and there is no pre-authored `.snap`.
-//! `to_openapi` returns the serialized `OpenAPI` text, so the snapshot uses `assert_snapshot!`
-//! (plain text). Phases 2-3 implement both seams → the snapshot is reviewed/accepted → it turns green.
+//! `lower::to_openapi` seam. Both seams are now implemented (Phase 2 + Phase 3-01), so this test is
+//! GREEN against a reviewed committed `.snap` that was authored from the real generated output and
+//! reconciled with `fixtures/goalservice/expected/openapi.yaml` for semantic equivalence (same
+//! absolute `/goal/...` paths, operations, params, request bodies, responses, component schemas, and
+//! the `ApiKeyAuth` security scheme) — NOT a byte-copy of the hand-authored reference (RESEARCH
+//! Pitfall 2). `to_openapi` returns the serialized `OpenAPI` text, so the snapshot uses
+//! `assert_snapshot!` (plain text). Requires the Go toolchain (the helper builds the graph).
 
 // Tests legitimately use unwrap/expect (skill ch.4 + ch.5); scoped allow keeps RUST-04 intact
 // for production code (Pitfall 2).

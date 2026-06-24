@@ -188,8 +188,8 @@ fn write_security_scheme(out: &mut String, name: &str, scheme: &SecurityScheme) 
     );
 }
 
-/// Emit a [`SchemaObject`] body with keys in fixed order: `type`, `format`, `enum`, `required`,
-/// `properties`, `items`, `additionalProperties`, `$ref`.
+/// Emit a [`SchemaObject`] body with keys in fixed order: `type`, `format`, `description`, `enum`,
+/// `required`, `properties`, `items`, `additionalProperties`, `$ref`.
 fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     let pad = INDENT.repeat(depth);
     // A bare `$ref` schema emits ONLY the `$ref` key (a `$ref` sibling-keys-are-ignored rule).
@@ -202,6 +202,9 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     }
     if let Some(format) = &schema.format {
         let _ = writeln!(out, "{pad}format: {format}");
+    }
+    if let Some(description) = &schema.description {
+        let _ = writeln!(out, "{pad}description: {}", scalar(description));
     }
     if !schema.enum_values.is_empty() {
         let _ = writeln!(out, "{pad}enum: {}", flow_seq(&schema.enum_values));

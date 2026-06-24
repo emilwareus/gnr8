@@ -1,0 +1,254 @@
+---
+source: crates/gnr8-core/tests/snapshot_openapi.rs
+expression: openapi
+---
+openapi: 3.1.0
+info:
+  title: goalservice
+  version: 0.1.0
+security:
+  - ApiKeyAuth: []
+paths:
+  '/goal/':
+    post:
+      operationId: createGoal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGoalInput'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandMessageWithUUID'
+        '400':
+          description: Response 400
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HttpError'
+  '/goal/list':
+    get:
+      summary: List goals
+      operationId: listGoals
+      tags: [Goals]
+      parameters:
+      - name: aggregation
+        in: query
+        required: true
+        description: Aggregation
+        schema:
+          type: string
+          enum: [avg, count, max, min, sum]
+      - name: cursor
+        in: query
+        required: false
+        description: Cursor UUID for pagination
+        schema:
+          type: string
+      - name: page_size
+        in: query
+        required: false
+        description: Page size
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Goals page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListGoalsOutput'
+  '/goal/{uuid}':
+    put:
+      summary: Update goal
+      operationId: goalUuidPut
+      tags: [Goals]
+      parameters:
+      - name: uuid
+        in: path
+        required: true
+        description: Goal UUID
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGoalInput'
+      responses:
+        '200':
+          description: Goal updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandMessage'
+        '400':
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HttpError'
+        '404':
+          description: Goal not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HttpError'
+    delete:
+      operationId: deleteGoal
+      parameters:
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandMessage'
+        '400':
+          description: Response 400
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HttpError'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    CommandMessage:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    CommandMessageWithUUID:
+      type: object
+      required: [message, uuid]
+      properties:
+        message:
+          type: string
+        uuid:
+          type: string
+          format: uuid
+    CreateGoalInput:
+      type: object
+      required: [analyticsQuery, name]
+      properties:
+        analyticsQuery:
+          $ref: '#/components/schemas/GoalAnalyticsQuery'
+        description:
+          type: string
+          description: Longer explanation
+        name:
+          type: string
+          description: Short human-readable goal name
+        targetDirection:
+          $ref: '#/components/schemas/TargetDirection'
+        targetValue:
+          type: number
+        workflowChainIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+    GoalAnalyticsQuery:
+      type: object
+      required: [metric]
+      properties:
+        includePast:
+          type: boolean
+          description: Whether to include historical data points
+        metric:
+          type: string
+          description: Analytics metric to evaluate
+        windowDays:
+          type: integer
+          format: int64
+          description: Rolling window size in days
+    GoalResponse:
+      type: object
+      required: [name, uuid]
+      properties:
+        analyticsQuery:
+          $ref: '#/components/schemas/GoalAnalyticsQuery'
+        createdAt:
+          type: string
+          format: date-time
+        description:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        name:
+          type: string
+        targetDirection:
+          $ref: '#/components/schemas/TargetDirection'
+        targetValue:
+          type: number
+        uuid:
+          type: string
+          format: uuid
+    HttpError:
+      type: object
+      required: [message]
+      properties:
+        hints:
+          type: array
+          items:
+            type: string
+        message:
+          type: string
+        slug:
+          type: string
+    ListGoalsOutput:
+      type: object
+      properties:
+        goals:
+          type: array
+          items:
+            $ref: '#/components/schemas/GoalResponse'
+        nextCursor:
+          type: string
+          format: uuid
+        pageSize:
+          type: integer
+          format: int64
+        total:
+          type: integer
+          format: int64
+    TargetDirection:
+      type: string
+      enum: [gte, lte]
+    UpdateGoalInput:
+      type: object
+      properties:
+        analyticsQuery:
+          $ref: '#/components/schemas/GoalAnalyticsQuery'
+        description:
+          type: string
+          description: Updated explanation
+        name:
+          type: string
+          description: Updated goal name
+        targetDirection:
+          $ref: '#/components/schemas/TargetDirection'
+        targetValue:
+          type: number
+        workflowChainIds:
+          type: array
+          items:
+            type: string
+            format: uuid

@@ -144,6 +144,9 @@ pub(crate) struct SchemaObject {
     pub type_name: Option<String>,
     /// Format hint (`uuid`, `date-time`, `int64`), emitted alongside `type` when present.
     pub format: Option<String>,
+    /// Optional human description (from a field/param annotation); omitted when `None` and never
+    /// emitted on a bare `$ref` node (sibling keys are ignored beside a `$ref`).
+    pub description: Option<String>,
     /// Closed value set for string enums, in sorted order; empty otherwise.
     pub enum_values: Vec<String>,
     /// Required field names for object schemas, in sorted order; empty otherwise.
