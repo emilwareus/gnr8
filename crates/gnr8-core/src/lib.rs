@@ -12,7 +12,13 @@ pub mod lower;
 pub mod sdk;
 
 /// Stub used by Phase-1 CLI arms and unimplemented seams.
+///
 /// Returns a typed, non-panicking error naming the command and the phase that will implement it.
+///
+/// # Errors
+///
+/// Always returns [`CoreError::NotYetImplemented`] carrying `command` and `phase` — this is a
+/// scaffolding helper, so it never succeeds.
 pub fn not_yet<T>(command: &str, phase: u8) -> Result<T, CoreError> {
     Err(CoreError::NotYetImplemented {
         command: command.to_string(),
