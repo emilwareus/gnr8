@@ -92,22 +92,29 @@ fn group_by_tag(graph: &ApiGraph) -> Vec<(String, Vec<&Operation>)> {
     groups
 }
 
-/// Materialize an [`SdkBundle`]'s framed files to `dir/<name>` (consumed by 03-03's compile test).
+/// Materialize a generated SDK bundle String's framed files to `dir/<name>` (03-03's compile test).
 ///
-/// File names are program-controlled (the fixed `client.go`/`errors.go`/`<tag>.go`/`models.go` set —
-/// threat T-03-03 temp-dir hygiene; no untrusted path is joined). The bundle is re-parsed through the
-/// shared [`bundle::parse`] framing so the on-disk files match the snapshot byte-for-byte.
+/// Takes the public [`generate`] output (the file-marker-framed bundle String) rather than the
+/// crate-private [`bundle::SdkBundle`] so an out-of-crate integration test (`tests/sdk_compile.rs`)
+/// can call it directly. File names are program-controlled — they come from the fixed
+/// `client.go`/`errors.go`/`<tag>.go`/`models.go` frame markers, never from untrusted input — and are
+/// joined onto the caller's program-controlled temp `dir` (threat T-03-03 temp-dir hygiene). The
+/// bundle is split through the shared [`bundle::parse`] framing so the on-disk files match the
+/// snapshot byte-for-byte.
 ///
 /// # Errors
 ///
-/// Returns [`crate::CoreError::SdkGen`] if any file cannot be written.
-#[allow(dead_code)] // consumed by 03-03's compile test; wired here for that plan.
-pub(crate) fn write_to_dir(
-    bundle: &SdkBundle,
-    dir: &std::path::Path,
-) -> Result<(), crate::CoreError> {
-    let framed = bundle.to_string();
-    for (name, contents) in bundle::parse(&framed) {
+/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty/contains a path separator (so no
+/// frame can escape `dir`) or if any file cannot be written.
+pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
+    for (name, contents) in bundle::parse(bundle) {
+        // Defense-in-depth: the frame names are program-generated, but reject anything that is not a
+        // plain file name so a malformed bundle can never traverse out of `dir` (T-03-03).
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err(crate::CoreError::SdkGen {
+                message: format!("refusing to write SDK file with unsafe name {name:?}"),
+            });
+        }
         let path = dir.join(&name);
         std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
             message: format!("failed to write SDK file {}: {err}", path.display()),
