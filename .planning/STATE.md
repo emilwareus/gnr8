@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
+status: Awaiting next milestone
 stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-06-24T22:37:36.318Z"
-last_activity: 2026-06-24 -- Phase 05 execution started
+last_updated: "2026-06-24T23:06:03.470Z"
+last_activity: 2026-06-24 — Milestone v1.0 completed and archived
 progress:
   total_phases: 5
   completed_phases: 5
@@ -25,12 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-24)
 
 ## Current Position
 
-Phase: 05 (poc-hardening-and-demo) — EXECUTING
-Plan: 2 of 2
-Status: Executing Phase 05
-Last activity: 2026-06-24 -- Phase 05 execution started
-
-Progress: [██████████] 100%
+Phase: Milestone v1.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-24 — Milestone v1.0 completed and archived
 
 ## Performance Metrics
 
@@ -127,3 +125,7 @@ None yet.
 Last session: 2026-06-24T22:37:17.831Z
 Stopped at: Completed 05-01-PLAN.md
 Resume file: None
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone

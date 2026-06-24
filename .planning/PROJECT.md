@@ -14,18 +14,32 @@ Generate accurate OpenAPI and SDK outputs from real source code quickly, with co
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ Build a narrow Go source to Go SDK proof of concept before adding other languages. — v1.0
+- ✓ Own the native extraction, graph, OpenAPI lowering, and SDK generation pipeline instead of wrapping existing generators. — v1.0 (goextract → ApiGraph → lower/sdk, no wrapped generators)
+- ✓ Infer API facts primarily from Go code structure and types, using comments only as escape hatches. — v1.0 (go/types code-first; swaggo annotations as escape hatch)
+- ✓ Keep OpenAPI as an output artifact rather than the internal model. — v1.0 (graph is source of truth; OpenAPI 3.1 serialized from it)
+- ✓ Provide a `.gnr8/` project-local workspace where code is configuration. — v1.0 (init + static config knobs; full programmatic customization deferred to v1.1+)
+- ✓ Keep the first implementation simple: no dynamic plugin runtime, macro-heavy API, graph database, or multi-language implementation. — v1.0
+- ✓ Validate the PoC against realistic Go fixtures, not only toy examples. — v1.0 (Gin goalservice fixture derived from a real production service shape)
+- ✓ Follow Rust implementation guardrails from the vendored `rust-best-practices` skill. — v1.0 (thiserror/anyhow boundaries, no prod unwrap, clippy -D warnings)
 
 ### Active
 
-- [ ] Build a narrow Go source to Go SDK proof of concept before adding other languages.
-- [ ] Own the native extraction, graph, OpenAPI lowering, and SDK generation pipeline instead of wrapping existing generators.
-- [ ] Infer API facts primarily from Go code structure and types, using comments only as escape hatches.
-- [ ] Keep OpenAPI as an output artifact rather than the internal model.
-- [ ] Provide a `.gnr8/` project-local workspace where code is configuration.
-- [ ] Keep the first implementation simple: no dynamic plugin runtime, macro-heavy API, graph database, or multi-language implementation.
-- [ ] Validate the PoC against realistic Go fixtures, not only toy examples.
-- [ ] Follow Rust implementation guardrails from the vendored `rust-best-practices` skill.
+(Next milestone — see "Next Milestone Goals" below; define fresh with `/gsd:new-milestone`)
+
+## Current State
+
+**Shipped v1.0** (2026-06-24): a working Go → OpenAPI 3.1 → compiling Go SDK pipeline.
+~10.2K LOC Rust (`gnr8-core` lib + `gnr8` CLI) + ~3.5K LOC Go (`goextract` sidecar + fixtures), 14 plans / 38 requirements across 5 phases.
+
+- **Pipeline:** `goextract` (go/packages + go/types) → router-agnostic `ApiGraph` (stable IDs, deterministic) → `lower::to_openapi` + `sdk::generate` → `.gnr8/` lifecycle (blake3 ownership manifest, no-op detection, loop-safe watch) → `gnr8 doctor`.
+- **CLI:** `init`, `generate` (`--force`), `check`, `inspect routes|schemas|graph`, `watch`, `doctor` — all wired to the real pipeline; human tables + `--json`.
+- **Quality:** `make check` green (fmt, clippy `-D warnings`, all tests, 4 contract snapshots, hermetic SDK `go build` + httptest smoke, determinism, lifecycle/watch). Demo (`docs/demo.md`) and evidence (`docs/evidence.md`) reproducible.
+- **Known tech debt (v1.1+):** `goextract` path baked at compile time (relocatable install); `diagnostics::collect` is a redundant test-only seam.
+
+## Next Milestone Goals
+
+Candidate directions (not yet scoped): additional source frontends (TS/Python/Rust) + SDK targets; packaged/relocatable `goextract`; richer programmatic customization; deeper incremental graph invalidation if benchmarks justify it.
 
 ### Out of Scope
 
@@ -69,14 +83,14 @@ The core product bet is that a small Rust engine can own orchestration, graph ma
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | Stay in research before implementation | Premature scaffolding would freeze weak assumptions. | ✓ Good |
-| Own the native extraction and generation pipeline | The product promise is not to wrap fragmented infrastructure. | — Pending |
-| Code is configuration | YAML/TOML/JSON is not expressive enough for framework-specific generation and SDK customization. | — Pending |
-| Use comments only as escape hatches | Comment-driven API descriptions drift from source behavior. | — Pending |
-| `.gnr8/` is the likely project workspace | Mirrors the desired project-local code and lifecycle model. | — Pending |
-| OpenAPI is an artifact, not the internal model | SDK generation and diagnostics need source-level facts OpenAPI cannot preserve cleanly. | — Pending |
+| Own the native extraction and generation pipeline | The product promise is not to wrap fragmented infrastructure. | ✓ Good |
+| Code is configuration | YAML/TOML/JSON is not expressive enough for framework-specific generation and SDK customization. | ✓ Good (static knobs shipped; programmatic = v2) |
+| Use comments only as escape hatches | Comment-driven API descriptions drift from source behavior. | ✓ Good |
+| `.gnr8/` is the likely project workspace | Mirrors the desired project-local code and lifecycle model. | ✓ Good |
+| OpenAPI is an artifact, not the internal model | SDK generation and diagnostics need source-level facts OpenAPI cannot preserve cleanly. | ✓ Good |
 | Simpler is better until proven otherwise | Avoid overengineering before the product loop works. | ✓ Good |
 | Design for more source and target languages, but do not start multi-language | The core should not bake in Go-only assumptions, but Go must prove the model first. | — Pending |
-| Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | — Pending |
+| Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | ✓ Good |
 
 ## Evolution
 
@@ -96,4 +110,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-24 after initialization*
+*Last updated: 2026-06-24 after v1.0 milestone*
