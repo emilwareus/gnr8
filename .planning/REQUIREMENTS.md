@@ -52,7 +52,7 @@
 - [x] **SDK-02**: The SDK exposes typed methods for generated operations.
 - [x] **SDK-03**: The SDK includes generated request and response models.
 - [x] **SDK-04**: The SDK handles JSON encoding/decoding and typed API errors.
-- [ ] **SDK-05**: The generated SDK compiles and is exercised by fixture tests.
+- [x] **SDK-05**: The generated SDK compiles and is exercised by fixture tests.
 
 ### Workspace And Lifecycle
 
@@ -159,7 +159,7 @@
 | SDK-02 | Phase 3 | Complete |
 | SDK-03 | Phase 3 | Complete |
 | SDK-04 | Phase 3 | Complete |
-| SDK-05 | Phase 3 | Pending |
+| SDK-05 | Phase 3 | Complete |
 | WS-01 | Phase 4 | Pending |
 | WS-02 | Phase 4 | Pending |
 | WS-03 | Phase 4 | Pending |

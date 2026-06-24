@@ -8,7 +8,7 @@ The PoC moves from a minimal Rust CLI and realistic Go fixtures to a complete Go
 
 - [x] **Phase 1: Foundation And Fixtures** - Create the Rust project skeleton, lock the PoC contract, and establish realistic validation fixtures. (completed 2026-06-24)
 - [x] **Phase 2: Go Analysis And API Graph** - Extract Go route, schema, and handler facts into a stable inspectable graph. (completed 2026-06-24)
-- [ ] **Phase 3: OpenAPI And Go SDK Generation** - Emit valid OpenAPI and a compiling usable Go SDK from the graph.
+- [x] **Phase 3: OpenAPI And Go SDK Generation** - Emit valid OpenAPI and a compiling usable Go SDK from the graph. (completed 2026-06-24)
 - [ ] **Phase 4: `.gnr8` Lifecycle And Watch Mode** - Add code-as-config workspace flow, generated-file ownership, and save-time regeneration.
 - [ ] **Phase 5: PoC Hardening And Demo** - Tighten diagnostics, performance evidence, docs, and milestone verification.
 
@@ -60,7 +60,7 @@ Plans:
 Plans:
 - [x] 03-01-PLAN.md — OpenAPI lowering: typed OpenAPI 3.1 structs + deterministic YAML writer, to_openapi graph→doc mapping (join the /goal base prefix, surface OAPI-03 diagnostics), four new CoreError variants; flip snapshot_openapi GREEN (wave 1).
 - [x] 03-02-PLAN.md — Go SDK codegen: format!-based emitters (models/functional-options Client/tag-grouped ctx-first ops/typed APIError) + gofmt normalization + SdkBundle file-marker String + write_to_dir; flip snapshot_sdk GREEN (wave 1).
-- [ ] 03-03-PLAN.md — Generated-SDK compile + smoke: hermetic stdlib-only temp-dir go build + httptest smoke (SDK-05), to_openapi/generate determinism asserts, promote all four contract tests + sdk_compile to the blocking CI gate and retire the non-blocking contract job (wave 2).
+- [x] 03-03-PLAN.md — Generated-SDK compile + smoke: hermetic stdlib-only temp-dir go build + httptest smoke (SDK-05), to_openapi/generate determinism asserts, promote all four contract tests + sdk_compile to the blocking CI gate and retire the non-blocking contract job (wave 2).
 
 ### Phase 4: `.gnr8` Lifecycle And Watch Mode
 **Goal**: Prove the code-as-config user workflow and fast regeneration loop.
@@ -102,6 +102,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 |-------|----------------|--------|-----------|
 | 1. Foundation And Fixtures | 3/3 | Complete   | 2026-06-24 |
 | 2. Go Analysis And API Graph | 3/3 | Complete   | 2026-06-24 |
-| 3. OpenAPI And Go SDK Generation | 2/3 | In Progress|  |
+| 3. OpenAPI And Go SDK Generation | 3/3 | Complete   | 2026-06-24 |
 | 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
 | 5. PoC Hardening And Demo | 0/2 | Not started | - |

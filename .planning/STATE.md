@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 03-01-PLAN.md
-last_updated: "2026-06-24T19:13:58.619Z"
-last_activity: 2026-06-24 -- Phase 03 execution started
+status: ready_for_verification
+stopped_at: Completed 03-03-PLAN.md
+last_updated: "2026-06-24T19:24:54.608Z"
+last_activity: 2026-06-24 -- Phase 03 complete (3/3 plans)
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 9
-  completed_plans: 8
-  percent: 40
+  completed_plans: 9
+  percent: 60
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-24)
 
 ## Current Position
 
-Phase: 03 (openapi-and-go-sdk-generation) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 03
-Last activity: 2026-06-24 -- Phase 03 execution started
+Phase: 03 (openapi-and-go-sdk-generation) — COMPLETE (ready for verification)
+Plan: 3 of 3 (all complete)
+Status: Phase 03 complete — ready for /gsd:verify-work 3 and Phase 4 planning
+Last activity: 2026-06-24 -- Phase 03 complete (3/3 plans)
 
-Progress: [█████████░] 89%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [█████████░] 89%
 | Phase 02 P03 | 14min | 3 tasks | 15 files |
 | Phase 03 P01 | 13min | 3 tasks | 6 files |
 | Phase 03 P02 | 14min | 3 tasks | 6 files |
+| Phase 03 P03 | 9min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 03-01]: All four Phase-3 CoreError variants (Lowering/SdkGen/GoFmt/GoBuild) defined in 03-01 so 03-02/03-03 stay file-disjoint; snapshot_openapi flipped GREEN via manual insta accept flow (reconciled with expected/openapi.yaml, not byte-copied); snapshot_sdk stays red-by-design
 - [Phase 03]: [Phase 03-02]: Go SDK codegen = deterministic format!-based Rust emitters (no template engine, D-05) + real gofmt normalization + file-marker-framed SdkBundle String (D-06); per-file imports computed from emitted content (Pitfall 3); Vec<(K,V)> never HashMap; typed CoreError::SdkGen/GoFmt, no prod unwrap/expect/panic
 - [Phase 03]: [Phase 03-02]: Tag grouping — untagged ops inherit the lexically-first graph tag (else package name) so the fixture's 4 ops land in one goals.go; optionality follows the GRAPH not expected/sdk comments (Pitfall 2); snapshot_sdk flipped GREEN, generated SDK verified to go build + go vet clean (de-risks 03-03)
+- [Phase 03]: [Phase 03-03]: SDK-05 proven end-to-end — tests/sdk_compile.rs materializes the generated SDK to a hermetic stdlib-only temp module (zero-require go.mod, std::env::temp_dir() not tempfile, GOPROXY=off), runs go build + an httptest smoke (CreateGoal POST decode + DeleteGoal 404 -> *APIError); go build failure -> CoreError::GoBuild, no panic
+- [Phase 03]: [Phase 03-03]: D-07 CI promotion — all four contract tests + sdk_compile run BLOCKING in the gates job; non-blocking contract job + Makefile contract target retired; to_openapi + sdk::generate asserted byte-identical across two runs
 
 ### Pending Todos
 
@@ -108,6 +111,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T19:13:37.483Z
-Stopped at: Completed 03-01-PLAN.md
+Last session: 2026-06-24T19:24:34.051Z
+Stopped at: Completed 03-03-PLAN.md
 Resume file: None
