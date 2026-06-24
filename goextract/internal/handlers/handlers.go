@@ -22,6 +22,7 @@ import (
 	"go/constant"
 	"go/token"
 	gotypes "go/types"
+	"strconv"
 	"strings"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -40,11 +41,53 @@ type CodeFacts struct {
 }
 
 // handlerDecl bundles a handler FuncDecl with its owning package's type info and
-// the shared FileSet, so the analyzer can resolve types and positions.
+// the shared FileSet, so the analyzer can resolve types and positions. pkgPath is
+// the owning package's import path, used to disambiguate same-named handlers
+// across packages (WR-02).
 type handlerDecl struct {
-	decl *ast.FuncDecl
-	info *gotypes.Info
-	fset *token.FileSet
+	decl    *ast.FuncDecl
+	info    *gotypes.Info
+	fset    *token.FileSet
+	pkgPath string
+}
+
+// identityKey is the fully-qualified, position-stable identity of a handler decl
+// ("<pkgPath>.<receiver>.<name>@<file>:<line>"), used as a deterministic
+// tie-break when two handlers share a bare name (WR-02). It is independent of
+// package/file load order, so the chosen survivor is reproducible (GRAPH-02).
+func (h handlerDecl) identityKey() string {
+	name := ""
+	if h.decl != nil && h.decl.Name != nil {
+		name = h.decl.Name.Name
+	}
+	recv := receiverTypeName(h.decl)
+	file, line := positionOf(h.fset, declPos(h.decl))
+	return h.pkgPath + "." + recv + "." + name + "@" + file + ":" + strconv.FormatUint(uint64(line), 10)
+}
+
+// receiverTypeName renders the method receiver's base type name (e.g. "Handler"
+// for `func (h *Handler) Foo()`), or "" for a plain function, so two methods of
+// the same name on different receivers have distinct identities (WR-02).
+func receiverTypeName(fn *ast.FuncDecl) string {
+	if fn == nil || fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return ""
+	}
+	t := fn.Recv.List[0].Type
+	if star, ok := t.(*ast.StarExpr); ok {
+		t = star.X
+	}
+	if id, ok := t.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
+}
+
+// declPos returns the declaration's position, or token.NoPos when absent.
+func declPos(fn *ast.FuncDecl) token.Pos {
+	if fn == nil {
+		return token.NoPos
+	}
+	return fn.Pos()
 }
 
 // Index maps handler symbol name -> its declaration across all target packages.
@@ -82,10 +125,16 @@ func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Anal
 func (a *Analyzer) Index() Index { return a.idx }
 
 // BuildIndex collects every function/method declaration in the target packages,
-// keyed by its name, so routes can look up their handler by symbol. diags is
-// reserved for surfacing index-build diagnostics (duplicate handler names, WR-02).
+// keyed by its name, so routes can look up their handler by symbol.
+//
+// A bare function name is not unique across packages/receivers, so two handlers
+// named the same in different packages would otherwise resolve last-write-wins by
+// load order — both a correctness bug (wrong body/responses attached to a route)
+// and a GRAPH-02 determinism hazard. To remove the load-order dependency, the
+// surviving decl for a colliding name is chosen deterministically by its
+// fully-qualified identity (package path, then receiver + file:line position), and
+// the collision is surfaced as a diagnostic so it is never silent (WR-02).
 func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
-	_ = diags
 	idx := make(Index)
 	for _, pkg := range res.Packages {
 		if pkg.TypesInfo == nil {
@@ -97,7 +146,29 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 				if !ok || fn.Name == nil {
 					continue
 				}
-				idx[fn.Name.Name] = handlerDecl{decl: fn, info: pkg.TypesInfo, fset: res.Fset}
+				cand := handlerDecl{decl: fn, info: pkg.TypesInfo, fset: res.Fset, pkgPath: pkg.PkgPath}
+				existing, dup := idx[fn.Name.Name]
+				if !dup {
+					idx[fn.Name.Name] = cand
+					continue
+				}
+				// Deterministic tie-break: keep the candidate whose fully-qualified
+				// identity sorts first, independent of package/file iteration order.
+				winner, loser := existing, cand
+				if cand.identityKey() < existing.identityKey() {
+					winner, loser = cand, existing
+				}
+				idx[fn.Name.Name] = winner
+				if diags != nil {
+					file, line := positionOf(loser.fset, declPos(loser.decl))
+					diags.Warn(
+						"duplicate handler name '"+fn.Name.Name+"': also declared at "+
+							loser.identityKey()+"; route lookups by bare name are ambiguous, "+
+							"keeping "+winner.identityKey()+" deterministically — qualify the "+
+							"handler or disambiguate the route (WR-02)",
+						file, line,
+					)
+				}
 			}
 		}
 	}
