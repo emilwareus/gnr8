@@ -15,15 +15,15 @@
 
 - [x] **RUST-01**: The repo has a minimal Rust workspace with a thin CLI binary and library modules.
 - [x] **RUST-02**: The CLI exposes initial `init`, `generate`, `watch`, `check`, `inspect`, and `doctor` command surfaces, even if early commands are skeletal.
-- [ ] **RUST-03**: The codebase passes `cargo fmt`, `cargo test`, and clippy with warnings denied.
+- [x] **RUST-03**: The codebase passes `cargo fmt`, `cargo test`, and clippy with warnings denied.
 - [x] **RUST-04**: Library code uses typed errors and avoids production `unwrap` or `expect` paths.
 
 ### Fixtures And Validation
 
 - [x] **FIX-01**: Realistic Go service fixtures exist for the selected router patterns.
 - [x] **FIX-02**: Fixtures cover path parameters, request bodies, response bodies, JSON tags, optional fields, package boundaries, and at least one unsupported pattern.
-- [ ] **FIX-03**: Snapshot tests cover graph reports, OpenAPI output, Go SDK output, and diagnostics.
-- [ ] **FIX-04**: Fixture tests fail clearly before unsupported behavior is implemented.
+- [x] **FIX-03**: Snapshot tests cover graph reports, OpenAPI output, Go SDK output, and diagnostics.
+- [x] **FIX-04**: Fixture tests fail clearly before unsupported behavior is implemented.
 
 ### Go Analysis
 
@@ -137,12 +137,12 @@
 | POC-03 | Phase 1 | Complete |
 | RUST-01 | Phase 1 | Complete |
 | RUST-02 | Phase 1 | Complete |
-| RUST-03 | Phase 1 | Pending |
+| RUST-03 | Phase 1 | Complete |
 | RUST-04 | Phase 1 | Complete |
 | FIX-01 | Phase 1 | Complete |
 | FIX-02 | Phase 1 | Complete |
-| FIX-03 | Phase 1 | Pending |
-| FIX-04 | Phase 1 | Pending |
+| FIX-03 | Phase 1 | Complete |
+| FIX-04 | Phase 1 | Complete |
 | GO-01 | Phase 2 | Pending |
 | GO-02 | Phase 2 | Pending |
 | GO-03 | Phase 2 | Pending |

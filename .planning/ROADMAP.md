@@ -6,7 +6,7 @@ The PoC moves from a minimal Rust CLI and realistic Go fixtures to a complete Go
 
 ## Phases
 
-- [ ] **Phase 1: Foundation And Fixtures** - Create the Rust project skeleton, lock the PoC contract, and establish realistic validation fixtures.
+- [x] **Phase 1: Foundation And Fixtures** - Create the Rust project skeleton, lock the PoC contract, and establish realistic validation fixtures. (completed 2026-06-24)
 - [ ] **Phase 2: Go Analysis And API Graph** - Extract Go route, schema, and handler facts into a stable inspectable graph.
 - [ ] **Phase 3: OpenAPI And Go SDK Generation** - Emit valid OpenAPI and a compiling usable Go SDK from the graph.
 - [ ] **Phase 4: `.gnr8` Lifecycle And Watch Mode** - Add code-as-config workspace flow, generated-file ownership, and save-time regeneration.
@@ -28,7 +28,7 @@ The PoC moves from a minimal Rust CLI and realistic Go fixtures to a complete Go
 Plans:
 - [x] 01-01-PLAN.md — Lock the PoC contract (docs/poc-contract.md) and scaffold the Cargo workspace: gnr8-core lib (CoreError + module seams) + gnr8 clap CLI.
 - [x] 01-02-PLAN.md — Add the realistic Go Gin fixture module (CRUD + list-with-filters, full DTO coverage incl. map[string]any) and expected/ acceptance scaffolds.
-- [ ] 01-03-PLAN.md — Wire fmt/clippy/test gates (Makefile + CI), the insta harness, and the four red-by-design contract tests; blocking checkpoint on phase-gate state.
+- [x] 01-03-PLAN.md — Wire fmt/clippy/test gates (Makefile + CI), the insta harness, and the four red-by-design contract tests; blocking checkpoint on phase-gate state.
 
 ### Phase 2: Go Analysis And API Graph
 **Goal**: Build the native Go extraction path and produce inspectable API graph reports.
@@ -100,7 +100,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation And Fixtures | 2/3 | In Progress|  |
+| 1. Foundation And Fixtures | 3/3 | Complete   | 2026-06-24 |
 | 2. Go Analysis And API Graph | 0/3 | Not started | - |
 | 3. OpenAPI And Go SDK Generation | 0/3 | Not started | - |
 | 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
