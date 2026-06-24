@@ -7,7 +7,13 @@
 
 // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4 + ch.5); scope the
 // allow to this test target so the workspace-wide RUST-04 deny stays intact for production code.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// `doc_markdown` is allowed for the acronym-dense prose doc comments (deny_unknown_fields, WS-03, ...).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::doc_markdown
+)]
 
 use std::path::PathBuf;
 

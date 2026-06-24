@@ -87,7 +87,12 @@ pub fn init(root: &Path) -> Result<InitOutcome, CoreError> {
     })?;
 
     let mut outcome = InitOutcome::default();
-    write_if_absent(root, &gnr8.join("config.toml"), DEFAULT_CONFIG_TOML, &mut outcome)?;
+    write_if_absent(
+        root,
+        &gnr8.join("config.toml"),
+        DEFAULT_CONFIG_TOML,
+        &mut outcome,
+    )?;
     write_if_absent(root, &gnr8.join(".gitignore"), GITIGNORE_BODY, &mut outcome)?;
     Ok(outcome)
 }
@@ -110,9 +115,10 @@ fn write_if_absent(
         .open(path)
     {
         Ok(mut file) => {
-            file.write_all(body.as_bytes()).map_err(|e| CoreError::Workspace {
-                message: format!("failed to write {}: {e}", path.display()),
-            })?;
+            file.write_all(body.as_bytes())
+                .map_err(|e| CoreError::Workspace {
+                    message: format!("failed to write {}: {e}", path.display()),
+                })?;
             out.created.push(relative(root, path));
             Ok(())
         }

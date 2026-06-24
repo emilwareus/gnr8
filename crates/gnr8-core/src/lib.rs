@@ -6,6 +6,7 @@ pub mod error;
 pub use error::CoreError;
 
 pub mod analyze;
+pub mod config;
 pub mod diagnostics;
 pub mod graph;
 pub mod lower;

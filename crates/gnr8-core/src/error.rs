@@ -249,7 +249,8 @@ mod tests {
         #[test]
         fn workspace_renders_with_message() {
             let err = CoreError::Workspace {
-                message: "failed to write /tmp/proj/.gnr8/config.toml: permission denied".to_string(),
+                message: "failed to write /tmp/proj/.gnr8/config.toml: permission denied"
+                    .to_string(),
             };
             let msg = err.to_string();
             assert!(msg.contains("workspace scaffold failed"), "{msg}");
@@ -283,7 +284,10 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("io error"), "{msg}");
-            assert!(msg.contains("failed to read sdk/client.go: not found"), "{msg}");
+            assert!(
+                msg.contains("failed to read sdk/client.go: not found"),
+                "{msg}"
+            );
         }
     }
 }

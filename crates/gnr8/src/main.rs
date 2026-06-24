@@ -57,11 +57,12 @@ fn main() -> Result<()> {
     }
 }
 
-/// Map each non-inspect command to its `gnr8-core` seam. These still return a typed
-/// `NotYetImplemented` naming the phase that will implement them (rendered via the [`Report`] path).
+/// Map each non-inspect command to its `gnr8-core` seam. `Init` runs the real `.gnr8/` scaffold
+/// (Phase 4 / WS-01); the remaining lifecycle arms still return a typed `NotYetImplemented` naming
+/// the phase that will implement them (04-02/04-03), rendered via the [`Report`] path.
 fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
     match &cli.command {
-        Commands::Init => gnr8_core::not_yet("init", 4),
+        Commands::Init => run_init(),
         Commands::Generate => gnr8_core::not_yet("generate", 3),
         Commands::Watch => gnr8_core::not_yet("watch", 4),
         Commands::Check => gnr8_core::not_yet("check", 4),
@@ -69,6 +70,36 @@ fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
         // Handled in `main` before this dispatch; kept exhaustive for the compiler.
         Commands::Inspect { .. } => gnr8_core::not_yet("inspect", 2),
     }
+}
+
+/// Scaffold the `.gnr8/` workspace in the current working directory (idempotent) and summarize the
+/// outcome. Re-running over an existing workspace reports "nothing to do" and preserves user edits
+/// (D-01). The `current_dir` I/O failure surfaces as `CoreError::Workspace`; any scaffold failure
+/// flows through the same typed path — never a panic (RUST-04 / D-09).
+fn run_init() -> Result<Report, gnr8_core::CoreError> {
+    let cwd = std::env::current_dir().map_err(|e| gnr8_core::CoreError::Workspace {
+        message: format!("failed to resolve the current directory: {e}"),
+    })?;
+    let outcome = gnr8_core::workspace::init(&cwd)?;
+
+    let message = if outcome.created.is_empty() {
+        format!(
+            "nothing to do — .gnr8/ already present (skipped: {})",
+            outcome.skipped.join(", ")
+        )
+    } else if outcome.skipped.is_empty() {
+        format!(
+            "initialized .gnr8/ (created: {})",
+            outcome.created.join(", ")
+        )
+    } else {
+        format!(
+            "initialized .gnr8/ (created: {}; skipped: {})",
+            outcome.created.join(", "),
+            outcome.skipped.join(", ")
+        )
+    };
+    Ok(Report { message })
 }
 
 /// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and
