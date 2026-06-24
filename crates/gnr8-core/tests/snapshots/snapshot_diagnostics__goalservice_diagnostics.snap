@@ -1,0 +1,11 @@
+---
+source: crates/gnr8-core/tests/snapshot_diagnostics.rs
+expression: diags
+---
+WARN  float64 -> float32 narrowing: field CreateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2) (internal/common/dto/goal.go:32)
+WARN  float64 -> float32 narrowing: field UpdateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2) (internal/common/dto/goal.go:43)
+WARN  float64 -> float32 narrowing: field GoalResponse.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2) (internal/common/dto/goal.go:57)
+WARN  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1) (internal/common/dto/goal.go:62)
+WARN  untyped query param 'cursor' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4) (internal/goal/ports/handlers.go:57)
+WARN  untyped query param 'page_size' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4) (internal/goal/ports/handlers.go:58)
+WARN  untyped query param 'aggregation' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4) (internal/goal/ports/handlers.go:59)

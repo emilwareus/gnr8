@@ -29,17 +29,21 @@ clippy:
 test:
 	cargo test --all-features
 
-# Blocking gate test set: genuinely-green unit + CLI parse tests only.
-# Excludes the integration `tests/` dir so the four red-by-design tests do NOT fail this target.
-# This mirrors the CI `gates` job (RUST-03 / Open Q1 option d).
+# Blocking gate test set: genuinely-green unit + CLI parse tests, plus the now-green graph/
+# diagnostics/determinism contract tests (02-03 implemented build_graph + diagnostics::collect, so
+# snapshot_graph + snapshot_diagnostics flipped GREEN; determinism proves two runs byte-identical).
+# These three invoke the goextract helper via `go run`, so the Go toolchain must be present.
+# Still excludes snapshot_openapi + snapshot_sdk, which stay red-by-design until Phase 3.
+# Mirrors the CI `gates` job (RUST-03 / Open Q1 option d).
 gates:
 	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
+	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test determinism
 
-# The four red-by-design contract tests, run on their own. VISIBLY RED until Phases 2-3 (FIX-04).
-# Mirrors the non-blocking CI `contract` job; promoted to blocking in Phase 3.
+# The remaining red-by-design contract tests, run on their own. VISIBLY RED until Phase 3 (FIX-04)
+# implements lower::to_openapi + sdk::generate. Mirrors the non-blocking CI `contract` job.
 contract:
-	cargo test -p gnr8-core --test snapshot_graph --test snapshot_openapi --test snapshot_sdk --test snapshot_diagnostics
+	cargo test -p gnr8-core --test snapshot_openapi --test snapshot_sdk
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:

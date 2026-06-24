@@ -28,17 +28,25 @@ pub(crate) fn goextract_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../goextract"))
 }
 
-/// Resolve `target_dir` to an absolute path against the process cwd.
+/// Resolve `target_dir` to a CANONICAL absolute path.
 ///
-/// The helper subprocess runs with `current_dir(goextract_dir())`, so a RELATIVE `target_dir`
-/// (e.g. `fixtures/goalservice` typed at the repo root) would otherwise be interpreted relative to
-/// `goextract/` and fail. Absolutizing against the caller's cwd here makes `gnr8 inspect routes
-/// <relative-dir>` work, and gives `from_facts`/`collect` the exact module root the helper sees so
-/// span/diagnostic file paths relativize consistently. Absolute inputs (the contract tests) are
-/// returned unchanged. If the cwd cannot be read, the input is passed through untouched (the helper
-/// then surfaces a typed error rather than this function panicking — RUST-04).
+/// Two reasons (both load-bearing for correctness + determinism, GRAPH-02):
+/// 1. The helper subprocess runs with `current_dir(goextract_dir())`, so a RELATIVE `target_dir`
+///    (e.g. `fixtures/goalservice` typed at the repo root) would otherwise be interpreted relative to
+///    `goextract/` and fail. Absolutizing against the caller's cwd makes relative inspect paths work.
+/// 2. The helper emits CANONICAL absolute file paths in spans/diagnostics (Go resolves `..` and
+///    symlinks). For `from_facts`/`collect` to strip that prefix, the module root we hand them must be
+///    canonical too — otherwise a root like `<manifest>/../../fixtures/goalservice` (the contract
+///    tests') would not prefix-match and the machine-absolute path would leak into the snapshot.
+///
+/// Falls back to the lexical join (or the raw input) if canonicalization fails — e.g. a non-existent
+/// target, which the helper then reports as a typed error rather than this function panicking
+/// (RUST-04). Canonicalizing a path that exists is the common case (the fixture + any real target).
 pub(crate) fn resolve_target(target_dir: &str) -> String {
     let path = std::path::Path::new(target_dir);
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical.to_string_lossy().into_owned();
+    }
     if path.is_absolute() {
         return target_dir.to_string();
     }

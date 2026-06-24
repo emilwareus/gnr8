@@ -1,0 +1,684 @@
+---
+source: crates/gnr8-core/tests/snapshot_graph.rs
+expression: graph
+---
+module: github.com/gnr8/gnr8-fixtures/goalservice
+operations:
+  - id: createGoal
+    method: POST
+    path: /
+    router_path: ~
+    handler: createGoal
+    summary: ~
+    tags: []
+    secured: true
+    security_schemes: []
+    params: []
+    request_body:
+      ref_id: internal/common/dto.CreateGoalInput
+    responses:
+      - status: 201
+        body:
+          ref_id: internal/common/dto.CommandMessageWithUUID
+        description: ~
+      - status: 400
+        body:
+          ref_id: internal/common/dto.HttpError
+        description: ~
+    provenance:
+      file: internal/goal/ports/http.go
+      start_line: 55
+      end_line: 55
+  - id: listGoals
+    method: GET
+    path: /list
+    router_path: /list
+    handler: listGoals
+    summary: List goals
+    tags:
+      - Goals
+    secured: true
+    security_schemes:
+      - ApiKeyAuth
+    params:
+      - name: aggregation
+        location: query
+        required: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        enum_values:
+          - avg
+          - count
+          - max
+          - min
+          - sum
+        description: Aggregation
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 59
+          end_line: 59
+      - name: cursor
+        location: query
+        required: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        enum_values: []
+        description: Cursor UUID for pagination
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 57
+          end_line: 57
+      - name: page_size
+        location: query
+        required: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        enum_values: []
+        description: Page size
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 58
+          end_line: 58
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: internal/common/dto.ListGoalsOutput
+        description: Goals page
+    provenance:
+      file: internal/goal/ports/http.go
+      start_line: 56
+      end_line: 56
+  - id: deleteGoal
+    method: DELETE
+    path: "/{uuid}"
+    router_path: ~
+    handler: deleteGoal
+    summary: ~
+    tags: []
+    secured: true
+    security_schemes: []
+    params:
+      - name: uuid
+        location: path
+        required: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        enum_values: []
+        description: ~
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 119
+          end_line: 119
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: internal/common/dto.CommandMessage
+        description: ~
+      - status: 400
+        body:
+          ref_id: internal/common/dto.HttpError
+        description: ~
+    provenance:
+      file: internal/goal/ports/http.go
+      start_line: 58
+      end_line: 58
+  - id: goalUuidPut
+    method: PUT
+    path: "/{uuid}"
+    router_path: "/{uuid}"
+    handler: updateGoal
+    summary: Update goal
+    tags:
+      - Goals
+    secured: true
+    security_schemes:
+      - ApiKeyAuth
+    params:
+      - name: uuid
+        location: path
+        required: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        enum_values: []
+        description: Goal UUID
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 94
+          end_line: 94
+    request_body:
+      ref_id: internal/common/dto.UpdateGoalInput
+    responses:
+      - status: 200
+        body:
+          ref_id: internal/common/dto.CommandMessage
+        description: Goal updated
+      - status: 400
+        body:
+          ref_id: internal/common/dto.HttpError
+        description: Invalid input
+      - status: 404
+        body:
+          ref_id: internal/common/dto.HttpError
+        description: Goal not found
+    provenance:
+      file: internal/goal/ports/http.go
+      start_line: 57
+      end_line: 57
+schemas:
+  - id: internal/common/dto.CommandMessage
+    name: CommandMessage
+    kind: object
+    fields:
+      - json_name: message
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/common.go
+      start_line: 25
+      end_line: 25
+  - id: internal/common/dto.CommandMessageWithUUID
+    name: CommandMessageWithUUID
+    kind: object
+    fields:
+      - json_name: message
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: uuid
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: uuid
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/common.go
+      start_line: 32
+      end_line: 32
+  - id: internal/common/dto.CreateGoalInput
+    name: CreateGoalInput
+    kind: object
+    fields:
+      - json_name: analyticsQuery
+        required: true
+        optional: false
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.GoalAnalyticsQuery
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: description
+        required: false
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Longer explanation
+        example: ~
+      - json_name: name
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Short human-readable goal name
+        example: ~
+      - json_name: targetDirection
+        required: false
+        optional: true
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.TargetDirection
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: targetValue
+        required: false
+        optional: true
+        schema:
+          kind: number
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: workflowChainIds
+        required: false
+        optional: true
+        schema:
+          kind: array
+          format: ~
+          items:
+            kind: string
+            format: uuid
+            items: ~
+            ref_id: ~
+            additional_properties: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/goal.go
+      start_line: 28
+      end_line: 28
+  - id: internal/common/dto.GoalAnalyticsQuery
+    name: GoalAnalyticsQuery
+    kind: object
+    fields:
+      - json_name: includePast
+        required: false
+        optional: true
+        schema:
+          kind: boolean
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Whether to include historical data points
+        example: ~
+      - json_name: metric
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Analytics metric to evaluate
+        example: ~
+      - json_name: windowDays
+        required: false
+        optional: false
+        schema:
+          kind: integer
+          format: int64
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Rolling window size in days
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/goal.go
+      start_line: 11
+      end_line: 11
+  - id: internal/common/dto.GoalResponse
+    name: GoalResponse
+    kind: object
+    fields:
+      - json_name: analyticsQuery
+        required: false
+        optional: false
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.GoalAnalyticsQuery
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: createdAt
+        required: false
+        optional: false
+        schema:
+          kind: string
+          format: date-time
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: description
+        required: false
+        optional: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: metadata
+        required: false
+        optional: true
+        schema:
+          kind: object
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: true
+        description: ~
+        example: ~
+      - json_name: name
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: targetDirection
+        required: false
+        optional: true
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.TargetDirection
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: targetValue
+        required: false
+        optional: true
+        schema:
+          kind: number
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: uuid
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: uuid
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/goal.go
+      start_line: 52
+      end_line: 52
+  - id: internal/common/dto.HttpError
+    name: HttpError
+    kind: object
+    fields:
+      - json_name: hints
+        required: false
+        optional: true
+        schema:
+          kind: array
+          format: ~
+          items:
+            kind: string
+            format: ~
+            items: ~
+            ref_id: ~
+            additional_properties: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: "hint 1,hint 2"
+      - json_name: message
+        required: true
+        optional: false
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: error message
+      - json_name: slug
+        required: false
+        optional: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: error-slug
+    enum_values: []
+    provenance:
+      file: internal/common/dto/common.go
+      start_line: 18
+      end_line: 18
+  - id: internal/common/dto.ListGoalsOutput
+    name: ListGoalsOutput
+    kind: object
+    fields:
+      - json_name: goals
+        required: false
+        optional: false
+        schema:
+          kind: array
+          format: ~
+          items:
+            kind: ref
+            format: ~
+            items: ~
+            ref_id: internal/common/dto.GoalResponse
+            additional_properties: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: nextCursor
+        required: false
+        optional: true
+        schema:
+          kind: string
+          format: uuid
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: pageSize
+        required: false
+        optional: false
+        schema:
+          kind: integer
+          format: int64
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: total
+        required: false
+        optional: false
+        schema:
+          kind: integer
+          format: int64
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/goal.go
+      start_line: 67
+      end_line: 67
+  - id: internal/common/dto.TargetDirection
+    name: TargetDirection
+    kind: enum
+    fields: []
+    enum_values:
+      - gte
+      - lte
+    provenance:
+      file: internal/common/dto/common.go
+      start_line: 39
+      end_line: 39
+  - id: internal/common/dto.UpdateGoalInput
+    name: UpdateGoalInput
+    kind: object
+    fields:
+      - json_name: analyticsQuery
+        required: false
+        optional: true
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.GoalAnalyticsQuery
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: description
+        required: false
+        optional: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Updated explanation
+        example: ~
+      - json_name: name
+        required: false
+        optional: true
+        schema:
+          kind: string
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: Updated goal name
+        example: ~
+      - json_name: targetDirection
+        required: false
+        optional: true
+        schema:
+          kind: ref
+          format: ~
+          items: ~
+          ref_id: internal/common/dto.TargetDirection
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: targetValue
+        required: false
+        optional: true
+        schema:
+          kind: number
+          format: ~
+          items: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+      - json_name: workflowChainIds
+        required: false
+        optional: true
+        schema:
+          kind: array
+          format: ~
+          items:
+            kind: string
+            format: uuid
+            items: ~
+            ref_id: ~
+            additional_properties: ~
+          ref_id: ~
+          additional_properties: ~
+        description: ~
+        example: ~
+    enum_values: []
+    provenance:
+      file: internal/common/dto/goal.go
+      start_line: 39
+      end_line: 39
+diagnostics:
+  - severity: WARN
+    message: "float64 -> float32 narrowing: field CreateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
+    file: internal/common/dto/goal.go
+    line: 32
+  - severity: WARN
+    message: "float64 -> float32 narrowing: field UpdateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
+    file: internal/common/dto/goal.go
+    line: 43
+  - severity: WARN
+    message: "float64 -> float32 narrowing: field GoalResponse.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
+    file: internal/common/dto/goal.go
+    line: 57
+  - severity: WARN
+    message: "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1)"
+    file: internal/common/dto/goal.go
+    line: 62
+  - severity: WARN
+    message: "untyped query param 'cursor' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
+    file: internal/goal/ports/handlers.go
+    line: 57
+  - severity: WARN
+    message: "untyped query param 'page_size' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
+    file: internal/goal/ports/handlers.go
+    line: 58
+  - severity: WARN
+    message: "untyped query param 'aggregation' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
+    file: internal/goal/ports/handlers.go
+    line: 59

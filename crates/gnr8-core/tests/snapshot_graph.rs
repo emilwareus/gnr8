@@ -1,11 +1,14 @@
-//! Red-by-design contract test (FIX-03 / FIX-04): the expected API graph for the goalservice fixture.
+//! Contract test (FIX-03 / FIX-04): the expected API graph for the goalservice fixture — now GREEN.
 //!
-//! This test calls the Phase-2 `analyze::build_graph` seam, which today returns
-//! `CoreError::NotYetImplemented`, so the `.expect()` panics BEFORE the snapshot assertion runs →
-//! the test FAILS CLEARLY (red-by-design, per RESEARCH Pattern 4 mechanism 1). It is never marked
-//! ignored (silent skip would violate FIX-04), and there is no pre-authored `.snap` (the redness
-//! comes from the stubbed seam, not a missing-file race). Phase 2 implements `build_graph` → the
-//! snapshot is reviewed/accepted → the test turns green.
+//! 02-03 implemented the `analyze::build_graph` seam, so the `.expect()` now succeeds and the test
+//! asserts the real router-agnostic graph against the reviewed
+//! `snapshots/snapshot_graph__goalservice_graph.snap` (4 operations with stable ids — `goalUuidPut`
+//! from `@ID`, the others from the handler symbol — request/response schema refs, the `aggregation`
+//! enum, `secured=true`, relativized provenance spans, all 8 object schemas + the `TargetDirection`
+//! enum). The snapshot was authored from REAL output and reviewed (not hand-written). CI runs insta
+//! in `INSTA_UPDATE=no` (`CI=true`), so a mismatch hard-fails — it never auto-accepts (FIX-04).
+//!
+//! Requires the Go toolchain (the test invokes the helper via `go run`).
 
 // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow to
 // this test target so the workspace-wide RUST-04 deny stays intact for production code (Pitfall 2).
@@ -16,9 +19,9 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 
 #[test]
 fn graph_matches_expected_for_goalservice() {
-    // Phase 1: build_graph(..) returns Err(NotYetImplemented) → .expect() panics → test FAILS (red).
-    // Phase 2: build_graph(..) returns the real graph → snapshot compared → turns green on review.
+    // 02-03: build_graph runs the goextract helper and returns the real router-agnostic graph; the
+    // snapshot below locks its reviewed YAML shape (byte-identical across unchanged source, GRAPH-02).
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 2 must implement analyze::build_graph; red-by-design until then");
+        .expect("analyze::build_graph must succeed (requires the Go toolchain)");
     insta::assert_yaml_snapshot!("goalservice_graph", graph);
 }

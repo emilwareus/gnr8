@@ -1,12 +1,14 @@
-//! Red-by-design contract test (FIX-03 / FIX-04): the expected diagnostics for the goalservice fixture.
+//! Contract test (FIX-03 / FIX-04): the expected diagnostics for the goalservice fixture — now GREEN.
 //!
-//! Calls the Phase-2+ `diagnostics::collect` seam, which today returns
-//! `CoreError::NotYetImplemented`, so the `.expect()` panics BEFORE the snapshot assertion runs →
-//! the test FAILS CLEARLY (red-by-design, per RESEARCH Pattern 4 mechanism 1). It is never marked
-//! ignored (FIX-04), and there is no pre-authored `.snap`. Diagnostics are plain text (the
-//! float64->float32 narrowing, the untyped query param, the free-form `map[string]any` warnings),
-//! so the snapshot uses `assert_snapshot!`. Phase 2+ implements `collect` → the snapshot is
-//! reviewed/accepted → the test turns green.
+//! 02-03 implemented the `diagnostics::collect` seam, so the `.expect()` now succeeds and the test
+//! asserts the real diagnostics text against the reviewed
+//! `snapshots/snapshot_diagnostics__goalservice_diagnostics.snap`: 7 `WARN` lines reconciled with
+//! `fixtures/goalservice/expected/diagnostics.txt` — float64-narrowing ×3, free-form-map ×1,
+//! untyped-query ×3 — normalized to one canonical template per rule and sorted by `(file, line)`.
+//! Plain text → `assert_snapshot!`. The snapshot was authored from REAL output and reviewed. CI runs
+//! insta in `INSTA_UPDATE=no` (`CI=true`), so a mismatch hard-fails — it never auto-accepts (FIX-04).
+//!
+//! Requires the Go toolchain (the test invokes the helper via `go run`).
 
 // Tests legitimately use unwrap/expect (skill ch.4 + ch.5); scoped allow keeps RUST-04 intact
 // for production code (Pitfall 2).
@@ -17,7 +19,9 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 
 #[test]
 fn diagnostics_match_expected_for_goalservice() {
+    // 02-03: collect runs the goextract helper and renders the canonical 7-line WARN text; the
+    // snapshot below locks it (reconciled with expected/diagnostics.txt).
     let diags = gnr8_core::diagnostics::collect(FIXTURE_DIR)
-        .expect("Phase 2+ must implement diagnostics::collect; red-by-design until then");
+        .expect("diagnostics::collect must succeed (requires the Go toolchain)");
     insta::assert_snapshot!("goalservice_diagnostics", diags);
 }
