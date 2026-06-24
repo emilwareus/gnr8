@@ -306,7 +306,10 @@ impl DoctorReport {
             let _ = writeln!(out, "  stale:    {path} (run `gnr8 generate`)");
         }
         for path in &self.outputs.drifted {
-            let _ = writeln!(out, "  drifted:  {path} (hand-edited; differs from generated)");
+            let _ = writeln!(
+                out,
+                "  drifted:  {path} (hand-edited; differs from generated)"
+            );
         }
         if self.outputs.stale.is_empty() && self.outputs.drifted.is_empty() {
             let _ = writeln!(out, "  (all outputs up to date)");
@@ -433,11 +436,11 @@ go_module = "example.com/svc/sdk"
             warn_diag("untyped query param 'cursor' on GET /goal/list ..."),
         ];
         let report = DoctorReport::assemble(
-            true,            // initialized
-            &ok_config(),    // config valid
-            true,            // go present
-            false,           // no input/output overlap
-            Some(diags),     // 3 informational WARNs
+            true,         // initialized
+            &ok_config(), // config valid
+            true,         // go present
+            false,        // no input/output overlap
+            Some(diags),  // 3 informational WARNs
             Some(&clean_plan()),
         );
         assert!(
@@ -452,8 +455,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: `.gnr8/` missing (initialized=false) is actionable.
     #[test]
     fn missing_init_is_actionable() {
-        let report =
-            DoctorReport::assemble(false, &ok_config(), true, false, None, None);
+        let report = DoctorReport::assemble(false, &ok_config(), true, false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.healthy);
     }
@@ -461,8 +463,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: an invalid/missing config is actionable.
     #[test]
     fn invalid_config_is_actionable() {
-        let report =
-            DoctorReport::assemble(true, &err_config(), true, false, None, None);
+        let report = DoctorReport::assemble(true, &err_config(), true, false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.config_valid);
     }
@@ -470,8 +471,7 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: a missing Go toolchain is actionable (and reported, not a crash).
     #[test]
     fn missing_go_toolchain_is_actionable() {
-        let report =
-            DoctorReport::assemble(true, &ok_config(), false, false, None, None);
+        let report = DoctorReport::assemble(true, &ok_config(), false, false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.go_toolchain);
     }
@@ -496,17 +496,14 @@ go_module = "example.com/svc/sdk"
             None,
             Some(&plan_with(WriteAction::Write)),
         );
-        assert!(stale.has_actionable_problem(), "a stale Write output is actionable");
+        assert!(
+            stale.has_actionable_problem(),
+            "a stale Write output is actionable"
+        );
         assert_eq!(stale.outputs.stale.len(), 1);
 
-        let clean = DoctorReport::assemble(
-            true,
-            &ok_config(),
-            true,
-            false,
-            None,
-            Some(&clean_plan()),
-        );
+        let clean =
+            DoctorReport::assemble(true, &ok_config(), true, false, None, Some(&clean_plan()));
         assert!(
             !clean.has_actionable_problem(),
             "an all-Unchanged plan with no other problems is healthy"
@@ -547,10 +544,9 @@ go_module = "example.com/svc/sdk"
             .expect("doctor report serializes to a JSON object");
 
         let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
-        let expected: HashSet<&str> =
-            ["healthy", "lifecycle", "outputs", "diagnostics", "summary"]
-                .into_iter()
-                .collect();
+        let expected: HashSet<&str> = ["healthy", "lifecycle", "outputs", "diagnostics", "summary"]
+            .into_iter()
+            .collect();
         assert_eq!(keys, expected, "doctor --json field set drifted");
 
         // `healthy` is a bool and equals the inverse of the exit policy.
@@ -587,7 +583,10 @@ go_module = "example.com/svc/sdk"
             Some(&clean_plan()),
         );
         let text = healthy.render_human();
-        assert!(text.contains("LIFECYCLE"), "missing LIFECYCLE header:\n{text}");
+        assert!(
+            text.contains("LIFECYCLE"),
+            "missing LIFECYCLE header:\n{text}"
+        );
         assert!(text.contains("OUTPUTS"), "missing OUTPUTS header:\n{text}");
         assert!(
             text.contains("DIAGNOSTICS"),
@@ -600,8 +599,7 @@ go_module = "example.com/svc/sdk"
         assert!(text.contains("healthy"), "missing healthy verdict:\n{text}");
 
         // An unhealthy report names actionable problems in the verdict.
-        let unhealthy =
-            DoctorReport::assemble(false, &err_config(), false, false, None, None);
+        let unhealthy = DoctorReport::assemble(false, &err_config(), false, false, None, None);
         let text = unhealthy.render_human();
         assert!(
             text.contains("actionable problem"),

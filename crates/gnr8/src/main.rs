@@ -47,10 +47,16 @@ fn main() -> Result<()> {
     // `watch` (Phase 4 / WATCH-02/03) is also dispatched OUTSIDE the `dispatch -> Report` path: it loops
     // and prints latency lines directly rather than returning a single Report. Ctrl-C exits with code 0;
     // a config/regenerate error exits via the anyhow boundary (clean stderr, exit 1, no panic).
+    // `doctor` (Phase 5 / HARD-01) is a READ-ONLY aggregator over the same green subsystems `check`
+    // uses: it collects lifecycle facts + analysis diagnostics + drift, groups them, prints a human
+    // report (or `--json`), and exits non-zero ONLY on actionable problems. It is dispatched OUTSIDE the
+    // `dispatch -> Report` path for the same reason as `check`: it returns `anyhow::Result<()>` and may
+    // `process::exit(1)`. A missing Go toolchain or unreadable manifest is REPORTED, not a crash (D-02).
     match &cli.command {
         Commands::Generate { force } => return run_generate(*force, cli.json),
         Commands::Check => return run_check(cli.json),
         Commands::Watch { debounce_ms } => return run_watch(*debounce_ms, cli.json),
+        Commands::Doctor => return run_doctor(cli.json),
         _ => {}
     }
 
@@ -80,8 +86,8 @@ fn main() -> Result<()> {
 fn dispatch(cli: &Cli) -> Result<Report, gnr8_core::CoreError> {
     match &cli.command {
         Commands::Init => run_init(),
-        Commands::Doctor => gnr8_core::not_yet("doctor", 5),
         // Handled in `main` before this dispatch; kept exhaustive for the compiler.
+        Commands::Doctor => gnr8_core::not_yet("doctor", 5),
         Commands::Generate { .. } => gnr8_core::not_yet("generate", 4),
         Commands::Check => gnr8_core::not_yet("check", 4),
         Commands::Watch { .. } => gnr8_core::not_yet("watch", 4),
@@ -233,6 +239,119 @@ fn run_check(json: bool) -> Result<()> {
 
     if has_drift {
         // Deliberate non-zero exit so `gnr8 check` is a usable CI gate (RESEARCH Open Q 3).
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Probe whether the Go toolchain is present by attempting to spawn `go version`.
+///
+/// `.is_ok()` means the `go` binary SPAWNED (a non-zero exit still means `go` exists); a spawn
+/// `io::Error` (binary not found) means it is ABSENT. This matches the `CoreError::GoToolchainMissing`
+/// semantics the analyzer already uses (`helper.rs` treats a spawn failure as "toolchain missing"), and
+/// it never panics. `go`/`version` are passed as DISCRETE `Command` args (never `sh -c`), so no shell
+/// metacharacter can be injected (T-05-01-01).
+fn probe_go() -> bool {
+    std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok()
+}
+
+/// Whether any configured input dir overlaps a configured output path (in EITHER direction), which
+/// would make gnr8 try to analyze its own generated SDK/OpenAPI — an actionable misconfiguration.
+///
+/// Mirrors `lifecycle::is_under_output` semantics: a match is only on a path-separator boundary (so a
+/// sibling like `sdklib` is NOT mistaken for being under `sdk`), and equality counts as overlap. Both
+/// directions are checked because an input nested under an output (gnr8 reads its own output) and an
+/// output nested under an input (gnr8's writes land in the watched/analyzed tree) are both problems.
+fn inputs_overlap_outputs(config: &gnr8_core::config::Config) -> bool {
+    /// `a` is equal to, or nested under, `b` — matched only on a path-separator boundary.
+    fn is_under(a: &str, b: &str) -> bool {
+        let a = a.trim_matches('/');
+        let b = b.trim_matches('/');
+        if a.is_empty() || b.is_empty() {
+            // A "." / "" input vs a non-root output is not itself an overlap signal here; the
+            // direction-pair below still catches an output nested under a "." input correctly because
+            // `b == "."`-trimmed-to-empty short-circuits to false (no false positive for `inputs=["."]`).
+            return false;
+        }
+        a == b || a.starts_with(&format!("{b}/"))
+    }
+    let outputs = [
+        config.output.openapi.as_str(),
+        config.output.sdk_dir.as_str(),
+    ];
+    config.inputs.iter().any(|input| {
+        outputs
+            .iter()
+            .any(|out| is_under(input, out) || is_under(out, input))
+    })
+}
+
+/// Run `gnr8 doctor` (HARD-01 / D-01): a READ-ONLY health aggregator over the existing green
+/// subsystems, mirroring `run_check`'s shell-vs-decision split (this is the impure shell; the pure
+/// grouping + exit policy lives in [`doctor::DoctorReport`]).
+///
+/// Collects four lifecycle facts (`.gnr8/` present, config valid, Go toolchain present, inputs overlap
+/// outputs), then — ONLY when config loads AND Go is present — harvests the structured analysis
+/// diagnostics (`build_graph(...).diagnostics`, the 7 known unsupported patterns with `file:line`) and
+/// the dry-run drift plan (`lifecycle::plan_only`). Operates on the CURRENT PROJECT (`config.inputs[0]`
+/// resolved against the project root, like `generate`/`check`), NOT the inspect fixture default
+/// (Pitfall 5). A missing Go toolchain or an analysis/drift error degrades to a graceful `None` and is
+/// REPORTED as a finding — never `?`/unwrap'd into a crash (Pitfall 4 / D-02). Prints the human report
+/// or `--json`, then exits non-zero ONLY on an actionable problem (mirrors `run_check`).
+///
+/// # Errors
+///
+/// Propagates a `project_paths` (`current_dir`) failure through the anyhow boundary (clean message,
+/// never a panic). Analysis/config/toolchain conditions are REPORTED, not returned as errors.
+fn run_doctor(json: bool) -> Result<()> {
+    let (root, gnr8_dir) = project_paths()?;
+
+    // Lifecycle facts: probe each as a reportable boolean. `config::load` may fail (missing/invalid) —
+    // keep the `Result` (do NOT `?`); its `Err` IS the "config invalid/missing" finding (Pitfall 4).
+    let initialized = gnr8_dir.is_dir();
+    let config = gnr8_core::config::load(&gnr8_dir);
+    let go_present = probe_go();
+
+    // Only harvest analysis diagnostics + drift when we CAN: a valid config and a present toolchain.
+    // Any `Err`/`None` from `build_graph`/`plan_only` degrades to a graceful absence and is reported as
+    // "diagnostics/drift unavailable", never propagated as a crash (Pitfall 4 / D-02).
+    let (overlap, diagnostics, drift) = if let (Ok(cfg), true) = (&config, go_present) {
+        let overlap = inputs_overlap_outputs(cfg);
+        let diagnostics = cfg.inputs.first().and_then(|input| {
+            let resolved = root.join(input);
+            gnr8_core::analyze::build_graph(&resolved.to_string_lossy())
+                .ok()
+                .map(|g| g.diagnostics)
+        });
+        let drift = gnr8_core::lifecycle::plan_only(&root, cfg).ok();
+        (overlap, diagnostics, drift)
+    } else {
+        // No config / no toolchain → overlap is indeterminate (default false), and analysis/drift are
+        // unavailable. The lifecycle findings (invalid config / missing toolchain) carry the verdict.
+        (false, None, None)
+    };
+
+    let report = doctor::DoctorReport::assemble(
+        initialized,
+        &config,
+        go_present,
+        overlap,
+        diagnostics,
+        drift.as_ref(),
+    );
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", report.render_human());
+    }
+
+    if report.has_actionable_problem() {
+        // Deliberate non-zero exit so `gnr8 doctor` is a usable CI gate (mirrors run_check). The
+        // informational analysis WARNs do NOT contribute to this (Pitfall 1).
         std::process::exit(1);
     }
     Ok(())
