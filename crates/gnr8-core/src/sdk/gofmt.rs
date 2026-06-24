@@ -13,11 +13,6 @@
 //! stderr; `child.stdin.take()` is handled with a `let Some(..) else { return Err(..) }` — there is no
 //! `.expect("piped")` (RESEARCH Pattern 3 caveat).
 
-// `gofmt` is called by `sdk::generate` (wired in Task 3 of this plan). Until then it is exercised only
-// by the unit tests below; allow dead_code so the `-D warnings` gate stays green this task. Removed once
-// `generate` calls it.
-#![allow(dead_code)]
-
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 

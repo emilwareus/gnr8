@@ -20,11 +20,6 @@
 //! fails on them). Every un-representable fact (dangling `$ref`, unknown `kind`) returns
 //! [`crate::CoreError::SdkGen`]; there is no prod `unwrap`/`expect`/`panic` (RUST-04).
 
-// The emitters are consumed by `sdk::generate` (wired in Task 3 of this plan). Until then they are
-// exercised only by the unit tests below; allow dead_code so the `-D warnings` gate stays green this
-// task without masking a real signal. Removed once `generate` calls them.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -676,15 +671,23 @@ fn emit_params_struct(
     Ok(())
 }
 
-/// Lower-camelCase a path-param identifier for use as a Go function argument (`uuid` stays `uuid`).
+/// Lower-camelCase a path-param identifier for use as an idiomatic Go function argument.
+///
+/// The FIRST word is fully lower-cased (so the initialism-aware [`exported`] does not yield `uUID` for
+/// `uuid`), and subsequent words use the exported (initialism-aware) form: `uuid`→`uuid`,
+/// `goalId`→`goalID`, `page_size`→`pageSize`. An unexported leading word avoids exporting the local
+/// argument while keeping `gofmt`-clean, compiling Go (03-03 `go build`).
 fn lower_camel(name: &str) -> String {
-    let exported = exported(name);
-    let mut chars = exported.chars();
-    chars.next().map_or_else(String::new, |first| {
-        let mut out: String = first.to_lowercase().collect();
-        out.push_str(chars.as_str());
-        out
-    })
+    let words = split_words(name);
+    let mut out = String::new();
+    for (i, word) in words.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&word.to_ascii_lowercase());
+        } else {
+            out.push_str(&exported(word));
+        }
+    }
+    out
 }
 
 /// Frame a Go file: `package <PACKAGE>`, a computed import block, then the body.
@@ -725,6 +728,7 @@ mod tests {
 
     use super::{
         emit_client, emit_errors, emit_models, emit_operations, exported, go_type, join_path,
+        lower_camel,
     };
     use crate::graph::ApiGraph;
 
@@ -843,7 +847,7 @@ mod tests {
     }
 
     mod exported_names {
-        use super::exported;
+        use super::{exported, lower_camel};
 
         #[test]
         fn handles_go_initialisms_and_word_boundaries() {
@@ -853,6 +857,15 @@ mod tests {
             assert_eq!(exported("createGoal"), "CreateGoal");
             assert_eq!(exported("nextCursor"), "NextCursor");
             assert_eq!(exported("message"), "Message");
+        }
+
+        #[test]
+        fn lower_camel_lowercases_the_first_word_for_idiomatic_args() {
+            // The first word is fully lower-cased so an all-caps initialism does not become `uUID`.
+            assert_eq!(lower_camel("uuid"), "uuid");
+            assert_eq!(lower_camel("page_size"), "pageSize");
+            assert_eq!(lower_camel("goalId"), "goalID");
+            assert_eq!(lower_camel("id"), "id");
         }
     }
 

@@ -1,11 +1,15 @@
-//! Red-by-design contract test (FIX-03 / FIX-04): the expected Go SDK output for goalservice.
+//! GREEN contract test (FIX-03 / FIX-04): the expected Go SDK output for goalservice.
 //!
 //! Builds the graph via the Phase-2 `analyze::build_graph` seam, then generates the Go SDK via the
-//! Phase-3 `sdk::generate` seam. Today `build_graph` already returns `CoreError::NotYetImplemented`,
-//! so the first `.expect()` panics BEFORE the snapshot assertion → the test FAILS CLEARLY
-//! (red-by-design). It is never marked ignored (FIX-04), and there is no pre-authored `.snap`.
-//! `generate` returns the serialized SDK text, so the snapshot uses `assert_snapshot!` (plain text).
-//! Phases 2-3 implement both seams → the snapshot is reviewed/accepted → the test turns green.
+//! Phase-3 `sdk::generate` seam (03-02). Both seams are now implemented: `generate` returns a
+//! deterministic, gofmt-clean multi-file Go SDK bundle String (functional-options `Client`, tag-grouped
+//! ctx-first operations, model structs + enum newtypes, typed `APIError`), framed with stable
+//! `// ==== gnr8:file <name> ====` markers. The committed `.snap` was authored from the real generated
+//! output and reviewed against `fixtures/goalservice/expected/sdk/*.go` for semantic equivalence
+//! (Pitfall 2 — reconcile, not byte-copy). The snapshot uses `assert_snapshot!` (plain text).
+//!
+//! This test runs the Go toolchain (it builds the graph AND pipes each file through `gofmt`), present
+//! on dev + CI (go 1.26).
 
 // Tests legitimately use unwrap/expect (skill ch.4 + ch.5); scoped allow keeps RUST-04 intact
 // for production code (Pitfall 2).
@@ -17,8 +21,8 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 #[test]
 fn sdk_matches_expected_for_goalservice() {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 2 must implement analyze::build_graph; red-by-design until then");
+        .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
     let sdk = gnr8_core::sdk::generate(&graph)
-        .expect("Phase 3 must implement sdk::generate; red-by-design until then");
+        .expect("Phase 3 sdk::generate must succeed (requires gofmt)");
     insta::assert_snapshot!("goalservice_sdk", sdk);
 }

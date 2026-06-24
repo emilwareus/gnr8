@@ -17,11 +17,6 @@
 //! (single source of truth). File order is FIXED + sorted (`client.go`, `errors.go`, one `<tag>.go` per
 //! sorted tag, then `models.go`), and `to_string` is byte-identical across runs (determinism, T-03-02-03).
 
-// The bundle types + framing are assembled by `sdk::generate`/`write_to_dir` (wired in Task 3 of this
-// plan). Until then they are exercised only by the unit tests below; allow dead_code so the
-// `-D warnings` gate stays green this task. Removed once `generate` consumes them.
-#![allow(dead_code)]
-
 /// One generated Go file: its on-disk name (e.g. `client.go`) and its `gofmt`'d contents.
 #[derive(Debug, Clone)]
 pub(crate) struct SdkFile {
