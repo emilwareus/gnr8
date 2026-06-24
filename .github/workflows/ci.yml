@@ -57,6 +57,22 @@ jobs:
       - name: go build + vet
         run: cd fixtures/goalservice && go build ./... && go vet ./...
 
+  # BLOCKING — the goextract helper is a separate module cargo never compiles; gate it.
+  # CGO_ENABLED=0 keeps the build pure-Go (no C toolchain dependency, Pitfall 3). First build
+  # fetches golang.org/x/tools from the module proxy (go.sum committed for reproducibility).
+  goextract:
+    name: goextract (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: go build + vet + test
+        env:
+          CGO_ENABLED: '0'
+        run: cd goextract && go build ./... && go vet ./... && go test ./...
+
   # NON-BLOCKING — the four red-by-design contract tests. VISIBLY RED until Phases 2-3 implement the
   # seams. continue-on-error keeps a red `main` from blocking merges while honoring FIX-04 (never
   # #[ignore]d). PROMOTE TO BLOCKING in Phase 3 once the snapshots turn green.

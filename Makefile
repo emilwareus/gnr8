@@ -11,7 +11,7 @@
 # (lib + bin tests, excluding the integration `tests/` dir), and `make contract` to run
 # the four red tests on their own.
 
-.PHONY: fmt fmt-check clippy test gates contract fixture-build check all
+.PHONY: fmt fmt-check clippy test gates contract fixture-build goextract-build check all
 
 # Auto-format the workspace in place.
 fmt:
@@ -45,7 +45,12 @@ contract:
 fixture-build:
 	cd fixtures/goalservice && go build ./... && go vet ./...
 
+# Build + vet + test the standalone goextract helper module (cargo never builds it).
+# Mirrors the fixture-build gate; the helper is the Go side of the Rust<->Go contract.
+goextract-build:
+	cd goextract && go build ./... && go vet ./... && go test ./...
+
 # Full local gate, mirrors CI. `test` surfaces the red-by-design contract failures by design.
-check: fmt-check clippy test fixture-build
+check: fmt-check clippy test fixture-build goextract-build
 
 all: check
