@@ -48,10 +48,10 @@
 
 ### Go SDK Output
 
-- [ ] **SDK-01**: The Go SDK includes a usable client with base URL and custom `http.Client` support.
-- [ ] **SDK-02**: The SDK exposes typed methods for generated operations.
-- [ ] **SDK-03**: The SDK includes generated request and response models.
-- [ ] **SDK-04**: The SDK handles JSON encoding/decoding and typed API errors.
+- [x] **SDK-01**: The Go SDK includes a usable client with base URL and custom `http.Client` support.
+- [x] **SDK-02**: The SDK exposes typed methods for generated operations.
+- [x] **SDK-03**: The SDK includes generated request and response models.
+- [x] **SDK-04**: The SDK handles JSON encoding/decoding and typed API errors.
 - [ ] **SDK-05**: The generated SDK compiles and is exercised by fixture tests.
 
 ### Workspace And Lifecycle
@@ -155,10 +155,10 @@
 | OAPI-01 | Phase 3 | Complete |
 | OAPI-02 | Phase 3 | Complete |
 | OAPI-03 | Phase 3 | Complete |
-| SDK-01 | Phase 3 | Pending |
-| SDK-02 | Phase 3 | Pending |
-| SDK-03 | Phase 3 | Pending |
-| SDK-04 | Phase 3 | Pending |
+| SDK-01 | Phase 3 | Complete |
+| SDK-02 | Phase 3 | Complete |
+| SDK-03 | Phase 3 | Complete |
+| SDK-04 | Phase 3 | Complete |
 | SDK-05 | Phase 3 | Pending |
 | WS-01 | Phase 4 | Pending |
 | WS-02 | Phase 4 | Pending |

@@ -4,13 +4,13 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Completed 03-01-PLAN.md
-last_updated: "2026-06-24T18:55:01.505Z"
+last_updated: "2026-06-24T19:13:58.619Z"
 last_activity: 2026-06-24 -- Phase 03 execution started
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 9
-  completed_plans: 7
+  completed_plans: 8
   percent: 40
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-24)
 ## Current Position
 
 Phase: 03 (openapi-and-go-sdk-generation) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 03
 Last activity: 2026-06-24 -- Phase 03 execution started
 
-Progress: [████████░░] 78%
+Progress: [█████████░] 89%
 
 ## Performance Metrics
 
@@ -59,6 +59,7 @@ Progress: [████████░░] 78%
 | Phase 02 P02 | 12min | 3 tasks | 13 files |
 | Phase 02 P03 | 14min | 3 tasks | 15 files |
 | Phase 03 P01 | 13min | 3 tasks | 6 files |
+| Phase 03 P02 | 14min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 03-01]: Open Q A3 resolved — /goal absolute base prefix joined in lowering from a private const BASE_PATH with slash-collapse (/goal/, /goal/list, /goal/{uuid}), not by reshaping the Phase-2 graph (single-group PoC)
 - [Phase ?]: [Phase 03-01]: Hand-rolled typed OpenAPI 3.1 model + deterministic key-ordered YAML writer (no openapiv3/serde_yaml crate); Vec<(K,V)> never HashMap for byte-stable output; dangling $ref/unknown kind -> typed CoreError::Lowering, no prod unwrap/expect/panic
 - [Phase ?]: [Phase 03-01]: All four Phase-3 CoreError variants (Lowering/SdkGen/GoFmt/GoBuild) defined in 03-01 so 03-02/03-03 stay file-disjoint; snapshot_openapi flipped GREEN via manual insta accept flow (reconciled with expected/openapi.yaml, not byte-copied); snapshot_sdk stays red-by-design
+- [Phase 03]: [Phase 03-02]: Go SDK codegen = deterministic format!-based Rust emitters (no template engine, D-05) + real gofmt normalization + file-marker-framed SdkBundle String (D-06); per-file imports computed from emitted content (Pitfall 3); Vec<(K,V)> never HashMap; typed CoreError::SdkGen/GoFmt, no prod unwrap/expect/panic
+- [Phase 03]: [Phase 03-02]: Tag grouping — untagged ops inherit the lexically-first graph tag (else package name) so the fixture's 4 ops land in one goals.go; optionality follows the GRAPH not expected/sdk comments (Pitfall 2); snapshot_sdk flipped GREEN, generated SDK verified to go build + go vet clean (de-risks 03-03)
 
 ### Pending Todos
 
@@ -105,6 +108,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T18:55:01.499Z
+Last session: 2026-06-24T19:13:37.483Z
 Stopped at: Completed 03-01-PLAN.md
 Resume file: None
