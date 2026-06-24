@@ -27,12 +27,12 @@
 
 ### Go Analysis
 
-- [ ] **GO-01**: The analyzer discovers Go packages and source files for configured inputs.
-- [ ] **GO-02**: The analyzer extracts structs, fields, JSON tags, source spans, and basic schema facts.
-- [ ] **GO-03**: The analyzer maps common Go types, including primitives, pointers, slices, maps, named structs, aliases, and `time.Time`.
+- [x] **GO-01**: The analyzer discovers Go packages and source files for configured inputs.
+- [x] **GO-02**: The analyzer extracts structs, fields, JSON tags, source spans, and basic schema facts.
+- [x] **GO-03**: The analyzer maps common Go types, including primitives, pointers, slices, maps, named structs, aliases, and `time.Time`.
 - [ ] **GO-04**: The analyzer recognizes the selected router call patterns and extracts method, path, router family, handler symbol, and source span.
 - [ ] **GO-05**: The analyzer infers request and response schemas for supported typed handler patterns.
-- [ ] **GO-06**: Unsupported or uncertain inference produces diagnostics instead of panics or silent omissions.
+- [x] **GO-06**: Unsupported or uncertain inference produces diagnostics instead of panics or silent omissions.
 
 ### API Graph And Inspectability
 
@@ -143,12 +143,12 @@
 | FIX-02 | Phase 1 | Complete |
 | FIX-03 | Phase 1 | Complete |
 | FIX-04 | Phase 1 | Complete |
-| GO-01 | Phase 2 | Pending |
-| GO-02 | Phase 2 | Pending |
-| GO-03 | Phase 2 | Pending |
+| GO-01 | Phase 2 | Complete |
+| GO-02 | Phase 2 | Complete |
+| GO-03 | Phase 2 | Complete |
 | GO-04 | Phase 2 | Pending |
 | GO-05 | Phase 2 | Pending |
-| GO-06 | Phase 2 | Pending |
+| GO-06 | Phase 2 | Complete |
 | GRAPH-01 | Phase 2 | Pending |
 | GRAPH-02 | Phase 2 | Pending |
 | GRAPH-03 | Phase 2 | Pending |

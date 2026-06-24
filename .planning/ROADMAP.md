@@ -42,7 +42,7 @@ Plans:
 **Plans**: 3 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Create the goextract Go sidecar (go/packages LoadAllSyntax): struct/field/tag/type-mapping extraction, well-known uuid/time, enum const sets, float64+free-form-map diagnostics, sorted JSON facts; Rust serde DTOs + subprocess driver + extended CoreError; Makefile/CI goextract gate (wave 1).
+- [x] 02-01-PLAN.md — Create the goextract Go sidecar (go/packages LoadAllSyntax): struct/field/tag/type-mapping extraction, well-known uuid/time, enum const sets, float64+free-form-map diagnostics, sorted JSON facts; Rust serde DTOs + subprocess driver + extended CoreError; Makefile/CI goextract gate (wave 1).
 - [ ] 02-02-PLAN.md — Extend goextract with Gin route recognition (types.Info.Selections), handler request/response/param inference (go/constant), and the swaggo annotation escape hatch (@ID/@Router/@Param/Enums/@Security); untyped-query diagnostics (wave 2).
 - [ ] 02-03-PLAN.md — Build the router-agnostic Rust ApiGraph from facts (stable IDs, sorted serialization, provenance), implement build_graph + diagnostics::collect, wire inspect routes|schemas|graph (table + --json), flip snapshot_graph + snapshot_diagnostics to real green snapshots (wave 3).
 
@@ -101,7 +101,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation And Fixtures | 3/3 | Complete   | 2026-06-24 |
-| 2. Go Analysis And API Graph | 0/3 | Not started | - |
+| 2. Go Analysis And API Graph | 1/3 | In Progress|  |
 | 3. OpenAPI And Go SDK Generation | 0/3 | Not started | - |
 | 4. `.gnr8` Lifecycle And Watch Mode | 0/3 | Not started | - |
 | 5. PoC Hardening And Demo | 0/2 | Not started | - |

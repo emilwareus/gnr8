@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 2 planned (3 plans, verified, 0 blockers)
-last_updated: "2026-06-24T17:00:47.115Z"
-last_activity: 2026-06-24 -- Phase 01 execution started
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-06-24T17:18:27.050Z"
+last_activity: 2026-06-24 -- Phase 02 execution started
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 6
-  completed_plans: 3
+  completed_plans: 4
   percent: 20
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-24)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 01 — foundation-and-fixtures
+**Current focus:** Phase 02 — go-analysis-and-api-graph
 
 ## Current Position
 
-Phase: 01 (foundation-and-fixtures) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 01
-Last activity: 2026-06-24 -- Phase 01 execution started
+Phase: 02 (go-analysis-and-api-graph) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 02
+Last activity: 2026-06-24 -- Phase 02 execution started
 
-Progress: [██████████] 100%
+Progress: [███████░░░] 67%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [██████████] 100%
 | Phase 01 P01 | 8min | 3 tasks | 16 files |
 | Phase 01 P02 | 5min | 3 tasks | 12 files |
 | Phase 01 P03 | 7min | 3 tasks | 7 files |
+| Phase 2 P01 | 14min | 3 tasks | 18 files |
 
 ## Accumulated Context
 
@@ -74,6 +75,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Fixture forces BOTH extraction paths: createGoal is fully code-inferable while listGoals/updateGoal carry swaggo annotation blocks; expected/ files are hand-authored acceptance contracts (D-15) — Validates that gnr8 derives facts from code first and uses comments only as an escape hatch, and gives Phases 2-3 a reviewable target
 - [Phase 01]: RUST-03 vs FIX-04 reconciled via Open Q1 option d: blocking CI gates run only green lib+bin tests; the four red-by-design contract tests run in a separate non-blocking continue-on-error job, promoted to blocking in Phase 3
 - [Phase 01]: Red-by-design contract tests use a panicking .expect() on the NotYetImplemented seams as the primary redness mechanism (fires before insta asserts): no ignore attribute, no pre-authored .snap; tests turn green on snapshot review in Phases 2-3
+- [Phase 2]: goextract Go sidecar extracts DTO schemas via go/packages LoadAllSyntax+NeedModule; scope = module-declared named types with a json: tag — Excludes wiring structs (HttpServer) and expected/ acceptance snapshots; gives the 8 DTO schemas + TargetDirection enum
+- [Phase 2]: JSON facts schema is the Rust<->Go contract: Go sorts+marshals deterministically (GRAPH-02), Rust deserializes with serde deny_unknown_fields; CoreError gains GoToolchainMissing/HelperExit/FactsParse — No-panic subprocess boundary (GO-06/RUST-04); stable schema for 02-02/02-03 to extend
 
 ### Pending Todos
 
@@ -93,6 +96,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-24T17:00:47.108Z
-Stopped at: Phase 2 planned (3 plans, verified, 0 blockers)
-Resume file: .planning/phases/02-go-analysis-and-api-graph/02-01-PLAN.md
+Last session: 2026-06-24T17:18:27.044Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: None
