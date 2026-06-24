@@ -23,20 +23,30 @@ type GoFacts struct {
 	Diagnostics []DiagnosticFact `json:"diagnostics"`
 }
 
-// RouteFact describes one HTTP route. 02-01 emits none (Routes stays empty); the
-// type exists so the schema and the Rust mirror are stable for 02-02.
+// RouteFact describes one HTTP route. 02-02 fills these from the Gin recognizer
+// (Task 1) + handler analysis (Task 2) + swaggo annotations (Task 3).
+//
+// Path storage decision (02-02; RESEARCH Open Q1): the group prefix in the
+// fixture is `"/" + basePath` (a non-constant BinaryExpr) the helper cannot
+// constant-fold, so Path holds the CODE-derived, group-relative, normalized
+// template (`/`, `/list`, `/{uuid}`). RouterPath holds the authoritative
+// @Router annotation override (`/list`, `/{uuid}`) when present. Emitting both
+// lets 02-03 render the absolute `/goal/...` deterministically without this
+// plan guessing the dynamic prefix (router-agnostic facts only).
 type RouteFact struct {
-	Method      string         `json:"method"`
-	Path        string         `json:"path"`
-	Handler     string         `json:"handler"`
-	OperationID *string        `json:"operation_id"`
-	Summary     *string        `json:"summary"`
-	Tags        []string       `json:"tags"`
-	Secured     bool           `json:"secured"`
-	Params      []ParamFact    `json:"params"`
-	RequestBody *TypeRef       `json:"request_body"`
-	Responses   []ResponseFact `json:"responses"`
-	Span        SourceSpan     `json:"span"`
+	Method          string         `json:"method"`
+	Path            string         `json:"path"`
+	RouterPath      *string        `json:"router_path"`
+	Handler         string         `json:"handler"`
+	OperationID     *string        `json:"operation_id"`
+	Summary         *string        `json:"summary"`
+	Tags            []string       `json:"tags"`
+	Secured         bool           `json:"secured"`
+	SecuritySchemes []string       `json:"security_schemes"`
+	Params          []ParamFact    `json:"params"`
+	RequestBody     *TypeRef       `json:"request_body"`
+	Responses       []ResponseFact `json:"responses"`
+	Span            SourceSpan     `json:"span"`
 }
 
 // ParamFact describes a path or query parameter (filled by 02-02).
@@ -156,4 +166,27 @@ func sortDoc(doc *GoFacts) {
 		}
 		return ri.Method < rj.Method
 	})
+	for i := range doc.Routes {
+		sortRoute(&doc.Routes[i])
+	}
+}
+
+// sortRoute stably orders every sub-slice of a route so two runs on unchanged
+// source are byte-identical (GRAPH-02): params by (name, location), each param's
+// enum values lexically, responses by status, and tags/security schemes lexically.
+func sortRoute(r *RouteFact) {
+	sort.Slice(r.Params, func(a, b int) bool {
+		if r.Params[a].Name != r.Params[b].Name {
+			return r.Params[a].Name < r.Params[b].Name
+		}
+		return r.Params[a].Location < r.Params[b].Location
+	})
+	for i := range r.Params {
+		sort.Strings(r.Params[i].EnumValues)
+	}
+	sort.Slice(r.Responses, func(a, b int) bool {
+		return r.Responses[a].Status < r.Responses[b].Status
+	})
+	sort.Strings(r.Tags)
+	sort.Strings(r.SecuritySchemes)
 }

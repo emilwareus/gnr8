@@ -20,6 +20,7 @@ import (
 	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
+	"github.com/gnr8/goextract/internal/routes"
 	"github.com/gnr8/goextract/internal/types"
 )
 
@@ -53,14 +54,47 @@ func run(targetDir string, w *os.File) error {
 
 	schemas := types.Extract(res, diags)
 
+	// 02-02: recognize the Gin route table (Task 1), then enrich each route with
+	// handler-inferred request/response/param facts (Task 2) and swaggo
+	// annotation facts (Task 3). routeFacts() owns the wiring + the per-route
+	// diagnostics (untyped query params, dynamic responses).
+	recognized := routes.Recognize(res)
+	routeFacts := buildRoutes(recognized, res, diags)
+
 	doc := facts.GoFacts{
 		Module:      moduleOf(res),
-		Routes:      []facts.RouteFact{}, // 02-02 fills routes; keep the key present.
+		Routes:      routeFacts,
 		Schemas:     schemas,
 		Diagnostics: diags.Items(),
 	}
 
 	return facts.Marshal(doc, w)
+}
+
+// buildRoutes maps each recognized Gin route to a router-agnostic RouteFact.
+//
+// 02-02 Task 1 emits the route table skeleton (method, group-relative normalized
+// path, handler, secured, span). Tasks 2 and 3 enrich each fact in place with
+// handler-inferred request/response/param facts and swaggo annotation facts; the
+// enrichment is layered here so the wiring order (code primary, annotation
+// escape-hatch) stays explicit.
+func buildRoutes(recognized []routes.Route, res *load.Result, diags *diag.Accumulator) []facts.RouteFact {
+	out := make([]facts.RouteFact, 0, len(recognized))
+	for _, r := range recognized {
+		rf := facts.RouteFact{
+			Method:          r.Method,
+			Path:            r.Path,
+			Handler:         r.Handler,
+			Tags:            []string{},
+			Secured:         r.Secured,
+			SecuritySchemes: []string{},
+			Params:          []facts.ParamFact{},
+			Responses:       []facts.ResponseFact{},
+			Span:            r.Span,
+		}
+		out = append(out, rf)
+	}
+	return out
 }
 
 func moduleOf(res *load.Result) string {

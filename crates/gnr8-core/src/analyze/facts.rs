@@ -38,8 +38,13 @@ pub(crate) struct GoFacts {
 pub(crate) struct RouteFact {
     /// HTTP method, uppercase (e.g. `"POST"`).
     pub(crate) method: String,
-    /// Path template, e.g. `"/goal/{uuid}"` or a group-relative segment.
+    /// Code-derived, group-relative, normalized path template (`/`, `/list`,
+    /// `/{uuid}`). The dynamic `"/" + basePath` group prefix is not folded here.
     pub(crate) path: String,
+    /// Authoritative `@Router` annotation path override (`/list`, `/{uuid}`),
+    /// when present. `None` for routes with no `@Router` annotation. 02-03 uses
+    /// this to render the absolute `/goal/...` path deterministically.
+    pub(crate) router_path: Option<String>,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub(crate) handler: String,
     /// Operation id from an `@ID` annotation, else `None` (derived downstream).
@@ -50,6 +55,9 @@ pub(crate) struct RouteFact {
     pub(crate) tags: Vec<String>,
     /// Whether the route's group carried an auth middleware (D-14).
     pub(crate) secured: bool,
+    /// Named security schemes from `@Security` annotations (e.g. `ApiKeyAuth`),
+    /// sorted. Empty when the route has no annotated scheme.
+    pub(crate) security_schemes: Vec<String>,
     /// Path and query parameters.
     pub(crate) params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
