@@ -30,3 +30,7 @@ target
 
 # scratch / external test copies (not committed)
 .tmp/
+
+# GSD transient state / sensitive auth-capture inbox — never commit
+.planning/HANDOFF.json
+.planning/.pending-auth-captures.*
