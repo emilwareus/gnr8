@@ -3,10 +3,10 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: planning
-last_updated: "2026-06-25T12:53:23.459Z"
+last_updated: "2026-06-25T15:00:00.000Z"
 last_activity: 2026-06-25
 progress:
-  total_phases: 0
+  total_phases: 6
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,23 +17,25 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-24)
+See: .planning/PROJECT.md (updated 2026-06-25)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 05 — poc-hardening-and-demo
+**Current focus:** Phase 1 — Language-Neutral IR + Facts Contract + Fixtures
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-06-25 — Milestone v2.0 started
+Phase: 1 of 6 (Language-Neutral IR + Facts Contract + Fixtures)
+Plan: — (roadmap created; phase not yet planned)
+Status: Ready to plan
+Last activity: 2026-06-25 — v2.0 roadmap created (6 phases, 24/24 requirements mapped); phase numbers reset to start at 1
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 0
+- Total plans completed: 0 (this milestone)
 - Average duration: N/A
 - Total execution time: 0.0 hours
 
@@ -48,60 +50,20 @@ Last activity: 2026-06-25 — Milestone v2.0 started
 - Last 5 plans: N/A
 - Trend: N/A
 
-*Updated after each plan completion*
-| Phase 01 P01 | 8min | 3 tasks | 16 files |
-| Phase 01 P02 | 5min | 3 tasks | 12 files |
-| Phase 01 P03 | 7min | 3 tasks | 7 files |
-| Phase 2 P01 | 14min | 3 tasks | 18 files |
-| Phase 02 P02 | 12min | 3 tasks | 13 files |
-| Phase 02 P03 | 14min | 3 tasks | 15 files |
-| Phase 03 P01 | 13min | 3 tasks | 6 files |
-| Phase 03 P02 | 14min | 3 tasks | 6 files |
-| Phase 03 P03 | 9min | 3 tasks | 5 files |
-| Phase 04 P01 | 8min | 3 tasks | 9 files |
-| Phase 04 P02 | 10 min | 3 tasks | 9 files |
-| Phase 05 P01 | 7min | 3 tasks | 3 files |
-| Phase 05 P02 | 12min | 2 tasks | 3 files |
+*Updated after each plan completion. v1.0 velocity (14 plans, ~10min avg) archived in .planning/milestones/v1.0-*.*
 
 ## Accumulated Context
 
 ### Decisions
 
-Decisions are logged in .planning/PROJECT.md and thoughts/DECISION.md.
+Decisions are logged in .planning/PROJECT.md (Key Decisions) and thoughts/DECISION.md.
 Recent decisions affecting current work:
 
-- Start with a narrow Go source to OpenAPI to Go SDK proof of concept.
-- Own the extraction, graph, OpenAPI lowering, and SDK generation pipeline.
-- Use code-as-config under `.gnr8/`; do not make YAML the main UX.
-- Keep comments as escape hatches, not the primary API definition surface.
-- Keep multi-language support as a future design constraint, not PoC scope.
-- [Phase 01]: Skeletal CLI commands return typed CoreError::NotYetImplemented and exit code 2 (no panic) — keeps RUST-04 intact while --help/--version work
-- [Phase 01]: thiserror 2.0 typed errors in gnr8-core; anyhow confined to gnr8/src/main.rs; clippy denies unwrap_used/expect_used/panic workspace-wide
-- [Phase ?]: Go Gin fixture (fixtures/goalservice) is a standalone module outside the Cargo workspace; go build/go vet + CI compile it, cargo does not — Fixture is analyzer INPUT for Phase 2, not part of the Rust binary; keeps cargo build clean and isolates the Go toolchain
-- [Phase ?]: Fixture forces BOTH extraction paths: createGoal is fully code-inferable while listGoals/updateGoal carry swaggo annotation blocks; expected/ files are hand-authored acceptance contracts (D-15) — Validates that gnr8 derives facts from code first and uses comments only as an escape hatch, and gives Phases 2-3 a reviewable target
-- [Phase 01]: RUST-03 vs FIX-04 reconciled via Open Q1 option d: blocking CI gates run only green lib+bin tests; the four red-by-design contract tests run in a separate non-blocking continue-on-error job, promoted to blocking in Phase 3
-- [Phase 01]: Red-by-design contract tests use a panicking .expect() on the NotYetImplemented seams as the primary redness mechanism (fires before insta asserts): no ignore attribute, no pre-authored .snap; tests turn green on snapshot review in Phases 2-3
-- [Phase 2]: goextract Go sidecar extracts DTO schemas via go/packages LoadAllSyntax+NeedModule; scope = module-declared named types with a json: tag — Excludes wiring structs (HttpServer) and expected/ acceptance snapshots; gives the 8 DTO schemas + TargetDirection enum
-- [Phase 2]: JSON facts schema is the Rust<->Go contract: Go sorts+marshals deterministically (GRAPH-02), Rust deserializes with serde deny_unknown_fields; CoreError gains GoToolchainMissing/HelperExit/FactsParse — No-panic subprocess boundary (GO-06/RUST-04); stable schema for 02-02/02-03 to extend
-- [Phase 02]: ApiGraph operation id = @ID annotation when present (goalUuidPut) else the handler symbol (createGoal/listGoals/deleteGoal); schema ids package-qualified; all collections sorted so unchanged source => byte-identical output (GRAPH-02)
-- [Phase 02]: Graph stores group-relative path + @Router override (router_path); absolute /goal/... prefix is the dynamic basePath prefix the facts cannot fold, deferred to Phase-3 lowering; provenance/diagnostic paths relativized against the canonical module root for portable snapshots
-- [Phase 02]: snapshot_graph + snapshot_diagnostics flipped GREEN with reviewed .snap + determinism test, promoted into the blocking gates job (setup-go added); only snapshot_openapi + snapshot_sdk remain red-by-design (non-blocking) until Phase 3
-- [Phase ?]: [Phase 03-01]: Open Q A3 resolved — /goal absolute base prefix joined in lowering from a private const BASE_PATH with slash-collapse (/goal/, /goal/list, /goal/{uuid}), not by reshaping the Phase-2 graph (single-group PoC)
-- [Phase ?]: [Phase 03-01]: Hand-rolled typed OpenAPI 3.1 model + deterministic key-ordered YAML writer (no openapiv3/serde_yaml crate); Vec<(K,V)> never HashMap for byte-stable output; dangling $ref/unknown kind -> typed CoreError::Lowering, no prod unwrap/expect/panic
-- [Phase ?]: [Phase 03-01]: All four Phase-3 CoreError variants (Lowering/SdkGen/GoFmt/GoBuild) defined in 03-01 so 03-02/03-03 stay file-disjoint; snapshot_openapi flipped GREEN via manual insta accept flow (reconciled with expected/openapi.yaml, not byte-copied); snapshot_sdk stays red-by-design
-- [Phase 03]: [Phase 03-02]: Go SDK codegen = deterministic format!-based Rust emitters (no template engine, D-05) + real gofmt normalization + file-marker-framed SdkBundle String (D-06); per-file imports computed from emitted content (Pitfall 3); Vec<(K,V)> never HashMap; typed CoreError::SdkGen/GoFmt, no prod unwrap/expect/panic
-- [Phase 03]: [Phase 03-02]: Tag grouping — untagged ops inherit the lexically-first graph tag (else package name) so the fixture's 4 ops land in one goals.go; optionality follows the GRAPH not expected/sdk comments (Pitfall 2); snapshot_sdk flipped GREEN, generated SDK verified to go build + go vet clean (de-risks 03-03)
-- [Phase 03]: [Phase 03-03]: SDK-05 proven end-to-end — tests/sdk_compile.rs materializes the generated SDK to a hermetic stdlib-only temp module (zero-require go.mod, std::env::temp_dir() not tempfile, GOPROXY=off), runs go build + an httptest smoke (CreateGoal POST decode + DeleteGoal 404 -> *APIError); go build failure -> CoreError::GoBuild, no panic
-- [Phase 03]: [Phase 03-03]: D-07 CI promotion — all four contract tests + sdk_compile run BLOCKING in the gates job; non-blocking contract job + Makefile contract target retired; to_openapi + sdk::generate asserted byte-identical across two runs
-- [Phase 04]: [Phase 04-01]: gnr8 init idempotently scaffolds .gnr8/ (config.toml + .gitignore ignoring /cache/ + cache dir) via OpenOptions::create_new(true) write-if-absent; re-run preserves user edits byte-for-byte (D-01)
-- [Phase 04]: [Phase 04-01]: WS-03 typed TOML Config = documented knobs ONLY (inputs/output paths/go_module/naming overrides), serde deny_unknown_fields; honest PoC-stand-in docs, NO faked plugin field, v2 (ADV-02) deferred; toml added to gnr8-core, blake3 pinned-only deferred to 04-02 (PLAN-CHECK W1)
-- [Phase 04]: [Phase 04-01]: four new CoreError variants (Workspace/Config consumed now; Manifest/Io reserved for 04-02/04-03) landed once in error.rs to keep it single-plan-owned (mirrors 03-01)
-- [Phase 04]: [Phase 04-02]: blake3 ownership manifest (.gnr8/cache/manifest.json, path->hash+provenance) + a PURE plan_writes five-arm truth table (on_disk injected via closure, --force lives only in apply_writes) deliver no-silent-clobber + no-op=no-write; manifest degrades safely (absent/corrupt -> empty default), output paths path-traversal-guarded (T-04-02-01)
-- [Phase 04]: [Phase 04-02]: naming.types rename rewrites schema id+name AND every matching SchemaRef.ref_id/field ref_id so a referenced-type rename never dangles a $ref (PLAN-CHECK W2, to_openapi succeeds); gnr8 generate (--force) + gnr8 check (dry-run, exit 1 on drift) wired to lifecycle::regenerate/plan_only
-- [Phase 05]: [Phase 05-01]: gnr8 doctor is a read-only aggregator in the binary (run_doctor + doctor module) reusing build_graph().diagnostics + lifecycle::plan_only + config::load + a go-version probe; NO new core analysis (D-02)
-- [Phase 05]: [Phase 05-01]: doctor exit policy mirrors run_check (0 healthy / 1 actionable); informational unsupported-pattern WARNs are EXCLUDED from has_actionable_problem so doctor is never permanently red on the fixture (Pitfall 1); missing Go toolchain reported as a finding via .ok()->None not a crash (Pitfall 4)
-- [Phase 05]: [Phase 05-01]: scripts/bench.sh drives the real release binary on a mktemp -d scratch fixture copy (trap rm -rf EXIT), printing honest cold/warm-no-op/single-file-edit wall-clock numbers with no asserted thresholds (Pitfall 2/3); committed fixture never mutated
-- [Phase 05]: docs/demo.md + docs/evidence.md ship HARD-02/HARD-03: docs-only (zero code, zero new deps); demo verified-reproducible on a scratch fixture copy, evidence from a live make check (exit 0) — Demo is the headline source-edit -> updated OpenAPI + SDK review artifact; evidence is the milestone audit backing. Corrected the v1 requirement count off-by-one (37 -> 38), proving exact coverage.
+- [v2.0]: Each new language = a sidecar emitting the SAME JSON facts contract (`crates/gnr8-core/src/analyze/facts.rs`, `deny_unknown_fields`) + one new SDK `Target`; the Rust lowering → OpenAPI pipeline is reused, never forked. The router-agnostic IR is the narrow waist.
+- [v2.0]: Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing/executing user code (importing = executing = a security boundary). Static-only; unresolved → diagnostic, never a fallback (rule 3).
+- [v2.0]: TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar — the single documented rule-2 carve-out (the language's own reference compiler, zero-dependency, behind the JSON-facts boundary). Bright line: never read `@nestjs/swagger` / `zod` / `class-validator` (rule 1).
+- [v2.0]: Generated SDKs stay dependency-free (`PySdk` = stdlib `urllib` + `@dataclass`; `TsSdk` = built-in `fetch` + typed interfaces), like the v1.0 Go SDK's `net/http`.
+- [v1.0]: OpenAPI is an artifact, not the internal model; the graph is the source of truth; deterministic byte-identical output (carried forward, still in force).
 
 ### Pending Todos
 
@@ -109,22 +71,23 @@ None yet.
 
 ### Blockers/Concerns
 
-None yet.
+- [v2.0] Carried tech debt from v1.0 (not blocking, retire when touched): `goextract` path baked at compile time (relocatable install); `diagnostics::collect` is a redundant test-only seam.
 
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| Source languages | TypeScript, Python, and Rust source frontends | Deferred to v2+ | Initialization |
-| SDK targets | TypeScript, Python, and Rust SDK targets | Deferred to v2+ | Initialization |
+| Source frontends | Hono (TS), typed-Express/Fastify, Rust source | Deferred to v2+ (FUT-01..03) | v2.0 scoping |
+| Toolchain | stdlib-pure TypeScript extraction path (retire the `typescript` carve-out) | Deferred (FUT-04) | v2.0 scoping |
+| SDK targets | Rust SDK target; SDKs with third-party HTTP deps | Out of scope | v2.0 scoping |
 | Extension runtime | Dynamic plugins and macro-heavy APIs | Deferred until repeated pressure | Initialization |
 
 ## Session Continuity
 
-Last session: 2026-06-24T22:37:17.831Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-06-25 15:00
+Stopped at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
 Resume file: None
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Plan the first phase with `/gsd:plan-phase 1` (Language-Neutral IR + Facts Contract + Fixtures).

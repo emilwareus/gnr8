@@ -85,17 +85,43 @@ Explicitly excluded for v2.0. Documented to prevent scope creep.
 
 ## Traceability
 
-Populated during roadmap creation. Each requirement maps to exactly one phase.
+Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--reset-phase-numbers`).
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (filled by roadmapper) | — | Pending |
+| IR-01 | Phase 1 | Pending |
+| IR-02 | Phase 1 | Pending |
+| IR-03 | Phase 1 | Pending |
+| IR-04 | Phase 1 | Pending |
+| PYSRC-01 | Phase 2 | Pending |
+| PYSRC-02 | Phase 2 | Pending |
+| PYSRC-03 | Phase 2 | Pending |
+| PYSRC-04 | Phase 2 | Pending |
+| PYSRC-05 | Phase 2 | Pending |
+| PYSDK-01 | Phase 3 | Pending |
+| PYSDK-02 | Phase 3 | Pending |
+| PYSDK-03 | Phase 3 | Pending |
+| TSSRC-01 | Phase 4 | Pending |
+| TSSRC-02 | Phase 4 | Pending |
+| TSSRC-03 | Phase 4 | Pending |
+| TSSRC-04 | Phase 4 | Pending |
+| TSSDK-01 | Phase 5 | Pending |
+| TSSDK-02 | Phase 5 | Pending |
+| TSSDK-03 | Phase 5 | Pending |
+| XLANG-01 | Phase 6 | Pending |
+| XLANG-02 | Phase 6 | Pending |
+| XLANG-03 | Phase 6 | Pending |
+| XLANG-04 | Phase 6 | Pending |
+| XLANG-05 | Phase 6 | Pending |
 
 **Coverage:**
 - v1 (v2.0 milestone) requirements: 24 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 24 ⚠️
+- Mapped to phases: 24 ✓
+- Unmapped: 0 ✓
+
+**Per-phase counts:** Phase 1 = 4 (IR), Phase 2 = 5 (PYSRC), Phase 3 = 3 (PYSDK),
+Phase 4 = 4 (TSSRC), Phase 5 = 3 (TSSDK), Phase 6 = 5 (XLANG). 4+5+3+4+3+5 = 24.
 
 ---
 *Requirements defined: 2026-06-25*
-*Last updated: 2026-06-25 after initial definition*
+*Last updated: 2026-06-25 after roadmap creation (traceability populated)*
