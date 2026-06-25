@@ -119,7 +119,20 @@ Plans:
   2. The generated Python SDK imports and type-checks, and round-trips against the FastAPI fixture in a hermetic test (no third-party HTTP deps).
   3. A developer adds the Python SDK to a `.gnr8/` Pipeline via a `PySdk` `Target` built-in, and the output is byte-identical across repeated runs.
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 03-01-PLAN.md — pysdk/ module (bundle/emit/mod): exhaustive py_type incl. Union + inline-Enum (no `_=>`), @dataclass models (required-first ordering, 3.9-safe), urllib OpenerDirector client, typed ApiError; determinism [PYSDK-01]
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 03-02-PLAN.md — PySdk Target built-in (clone GoSdk: sdk_package reuse, ir.base_path, safe-name guard, output_anchors), prelude export, unconfigured-error test [PYSDK-03]
+
+**Wave 3** *(blocked on Waves 1-2)*
+
+- [ ] 03-03-PLAN.md — hermetic pysdk_compile test: build_graph(fastapi-bookstore) → generate → py_compile + import + stdlib http.server round-trip (2xx dataclass, 4xx typed ApiError) via injected OpenerDirector; skip-if python3 absent [PYSDK-02]
 
 ### Phase 4: TypeScript Source — `tsextract`
 
