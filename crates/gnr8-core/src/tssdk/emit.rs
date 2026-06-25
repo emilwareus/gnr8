@@ -80,7 +80,7 @@ pub(crate) fn camel(name: &str) -> String {
         } else {
             let mut chars = word.chars();
             if let Some(first) = chars.next() {
-                out.extend(first.to_ascii_uppercase().to_string().chars());
+                out.push(first.to_ascii_uppercase());
                 out.push_str(&chars.as_str().to_ascii_lowercase());
             }
         }
@@ -164,6 +164,12 @@ pub(crate) fn ts_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result
 
 /// Map a neutral [`Prim`] to its TypeScript type. There is a single numeric type (`number`), so integer
 /// width and float width are irrelevant; a byte string carries base64 on the wire as a `string`.
+///
+/// The arm-per-variant match is deliberate even though several arms share a body (Int/Float → `number`,
+/// String/Bytes → `string`): an exhaustive, one-arm-per-`Prim` match means a future `Prim` variant fails
+/// to compile here until its TS mapping is chosen (rule 3) — the same exhaustiveness discipline as
+/// `ts_type`. `match_same_arms` is allowed locally to preserve that property.
+#[allow(clippy::match_same_arms)]
 fn ts_primitive(prim: &Prim) -> &'static str {
     match prim {
         Prim::String => "string",
@@ -610,49 +616,99 @@ fn emit_operation(
     )
     .map_err(sink)?;
 
-    // Build the path: a template literal with each path param percent-escaped (V5). TS template literals
-    // have no backslash restriction, so no Python-style `safe=''` workaround is needed (Pitfall 6).
+    emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
+    emit_op_query(
+        out,
+        &query_params,
+        &required_query,
+        &required_query_idents,
+        &optional_query,
+        &optional_query_idents,
+    )?;
+    emit_op_dispatch(
+        out,
+        &op.method,
+        success_status,
+        body_model.is_some(),
+        return_model.as_deref(),
+    )?;
+    writeln!(out, "  }}").map_err(sink)?;
+    Ok(())
+}
+
+/// Emit the `let path = …` line for one operation: a template literal with each path param
+/// percent-escaped (V5). TS template literals have no backslash restriction, so no Python-style `safe=''`
+/// workaround is needed (Pitfall 6).
+fn emit_op_path(
+    out: &mut String,
+    abs: &str,
+    tokens: &[String],
+    path_params: &[&Param],
+    path_idents: &[String],
+) -> Result<(), CoreError> {
     if tokens.is_empty() {
         writeln!(out, "    let path = `{abs}`;").map_err(sink)?;
-    } else {
-        let mut tmpl = abs.clone();
-        for token in &tokens {
-            let ident = path_params
-                .iter()
-                .zip(path_idents.iter())
-                .find(|(pp, _)| &pp.name == token)
-                .map_or_else(|| camel(token), |(_, id)| id.clone());
-            let placeholder = format!("{{{token}}}");
-            let interp = format!("${{encodeURIComponent(String({ident}))}}");
-            tmpl = tmpl.replace(&placeholder, &interp);
-        }
-        writeln!(out, "    let path = `{tmpl}`;").map_err(sink)?;
+        return Ok(());
     }
+    let mut tmpl = abs.to_string();
+    for token in tokens {
+        let ident = path_params
+            .iter()
+            .zip(path_idents.iter())
+            .find(|(pp, _)| &pp.name == token)
+            .map_or_else(|| camel(token), |(_, id)| id.clone());
+        let placeholder = format!("{{{token}}}");
+        let interp = format!("${{encodeURIComponent(String({ident}))}}");
+        tmpl = tmpl.replace(&placeholder, &interp);
+    }
+    writeln!(out, "    let path = `{tmpl}`;").map_err(sink)?;
+    Ok(())
+}
 
-    // Query encoding (WR-01 analog): a REQUIRED query param is always appended (positional arg, no
-    // guard); an OPTIONAL one is appended only when defined. The wire key stays the ORIGINAL `p.name`.
-    if !query_params.is_empty() {
-        writeln!(out, "    const query = new URLSearchParams();").map_err(sink)?;
-        for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-            writeln!(out, "    query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
-        }
-        for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-            writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-            writeln!(out, "      query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
-            writeln!(out, "    }}").map_err(sink)?;
-        }
-        writeln!(out, "    const qs = query.toString();").map_err(sink)?;
-        writeln!(out, "    if (qs) {{").map_err(sink)?;
-        writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
+/// Emit the `URLSearchParams` query-building block for one operation (WR-01 analog): a REQUIRED query
+/// param is always appended (positional arg, no guard); an OPTIONAL one is appended only when defined.
+/// The wire key stays the ORIGINAL `p.name`.
+fn emit_op_query(
+    out: &mut String,
+    query_params: &[&Param],
+    required_query: &[&Param],
+    required_query_idents: &[String],
+    optional_query: &[&Param],
+    optional_query_idents: &[String],
+) -> Result<(), CoreError> {
+    if query_params.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "    const query = new URLSearchParams();").map_err(sink)?;
+    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        writeln!(out, "    query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+    }
+    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
+        writeln!(out, "      query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
+    writeln!(out, "    const qs = query.toString();").map_err(sink)?;
+    writeln!(out, "    if (qs) {{").map_err(sink)?;
+    writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    Ok(())
+}
 
-    // Dispatch: await fetch, compare the real success status, throw ApiError otherwise, decode on
-    // success. The request carries a JSON body only for body-bearing ops.
+/// Emit the fetch dispatch block: await fetch, compare the real success status, throw `ApiError`
+/// otherwise, cast the decoded JSON on success. The request carries a JSON body only for body-bearing
+/// ops.
+fn emit_op_dispatch(
+    out: &mut String,
+    method: &str,
+    success_status: u16,
+    has_body: bool,
+    return_model: Option<&str>,
+) -> Result<(), CoreError> {
     writeln!(out, "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{")
         .map_err(sink)?;
-    writeln!(out, "      method: \"{}\",", op.method).map_err(sink)?;
-    if body_model.is_some() {
+    writeln!(out, "      method: \"{method}\",").map_err(sink)?;
+    if has_body {
         writeln!(out, "      headers: {{ \"Content-Type\": \"application/json\" }},")
             .map_err(sink)?;
         writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
@@ -665,10 +721,9 @@ fn emit_operation(
     )
     .map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
-    if let Some(model) = &return_model {
+    if let Some(model) = return_model {
         writeln!(out, "    return (await res.json()) as models.{model};").map_err(sink)?;
     }
-    writeln!(out, "  }}").map_err(sink)?;
     Ok(())
 }
 
