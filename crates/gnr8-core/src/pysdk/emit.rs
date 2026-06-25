@@ -426,6 +426,7 @@ pub(crate) fn emit_client(_package: &str) -> String {
     "\
 from __future__ import annotations
 
+import dataclasses
 import json
 import urllib.error
 import urllib.parse
@@ -451,6 +452,11 @@ class Client:
         self._opener = opener or urllib.request.build_opener()
 
     def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
+        # A typed request-body model is a @dataclass, which json.dumps cannot serialize directly
+        # (TypeError) — marshal it to a dict first (dataclasses.asdict recurses into nested
+        # dataclasses). The single deterministic encode path; stdlib only (CLAUDE.md rule 2).
+        if body is not None and dataclasses.is_dataclass(body):
+            body = dataclasses.asdict(body)
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
         if data is not None:

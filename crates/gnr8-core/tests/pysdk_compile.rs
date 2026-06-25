@@ -230,9 +230,11 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 /// - `do_POST` is the `create_book` path (`/`): replies `201` with a `CreatedMessage`-shaped body.
 /// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with a typed-error body.
 ///
-/// The body passed to `create_book` is a plain dict (the generated `_do` does `json.dumps(body)`, which
-/// a `@dataclass` instance is NOT serializable by; the method's `body: Book` hint is a lazy annotation
-/// and unenforced at runtime, so a Book-shaped dict is the correct, stdlib-only payload).
+/// The body passed to `create_book` is an actual `Book` `@dataclass` instance (CR-01 regression
+/// coverage): the generated `_do` now marshals a dataclass via `dataclasses.asdict` before
+/// `json.dumps`, so the advertised typed happy path — construct the model, pass it to the method —
+/// must round-trip. (The prior driver sent a raw dict, which routed AROUND the broken signature and
+/// masked the `TypeError: Object of type Book is not JSON serializable` defect.)
 const ROUND_TRIP_DRIVER: &str = r#"import json
 import threading
 import urllib.request
@@ -272,19 +274,16 @@ def main():
         opener = urllib.request.build_opener()
         client = bookstore.Client(f"http://127.0.0.1:{port}", opener=opener)
 
-        # 2xx: create_book POSTs a Book-shaped dict body and decodes the 201 into a CreatedMessage
-        # @dataclass. (A dataclass instance is not json-serializable; the body hint is unenforced, so a
-        # dict is the correct stdlib payload.)
-        created = client.create_book(
-            {
-                "author": {"name": "Ada", "bio": None},
-                "format": "hardcover",
-                "id": 7,
-                "title": "Notes",
-                "rating": None,
-                "tags": [],
-            }
+        # 2xx: create_book is called with an ACTUAL Book @dataclass instance (CR-01) — the generated
+        # _do marshals it via dataclasses.asdict before json.dumps, exercising the typed request-body
+        # path the signature advertises. The 201 reply decodes into a CreatedMessage @dataclass.
+        book = bookstore.Book(
+            author=bookstore.Author(name="Ada", bio=None),
+            format=bookstore.BookFormat.HARDCOVER,
+            id=7,
+            title="Notes",
         )
+        created = client.create_book(book)
         assert isinstance(created, bookstore.CreatedMessage), type(created)
         assert created.id == 1, created.id
         assert created.message == "ok", created.message
