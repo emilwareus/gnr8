@@ -42,7 +42,7 @@ never forked. Every v1 invariant holds (one source per fact, zero OSS deps in `g
 paths, static-only extraction, deterministic byte-identical output).
 
 - [x] **Phase 1: Language-Neutral IR + Facts Contract + Fixtures** - Generalize the IR/`Type` model and the shared JSON facts contract to be type-system-neutral; stand up FastAPI/Flask/NestJS fixtures with red-by-design snapshots. No extraction yet. (completed 2026-06-25)
-- [ ] **Phase 2: Python Source — `pyextract`** - Static stdlib-`ast` sidecar (FastAPI full, Flask typed-envelope) with an owned cross-module symbol table; `FastApi`/`Flask` Source built-ins; reuse the Rust lowering → OpenAPI.
+- [x] **Phase 2: Python Source — `pyextract`** - Static stdlib-`ast` sidecar (FastAPI full, Flask typed-envelope) with an owned cross-module symbol table; `FastApi`/`Flask` Source built-ins; reuse the Rust lowering → OpenAPI. (completed 2026-06-25)
 - [ ] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in.
 - [ ] **Phase 4: TypeScript Source — `tsextract`** - NestJS recognizer on the `typescript` Compiler API with bright-line third-party-schema exclusions; `NestJs` Source built-in (the documented rule-2 carve-out).
 - [ ] **Phase 5: TypeScript Target — `TsSdk`** - Dependency-free `fetch`-based typed client; hermetic `tsc --noEmit` typecheck; `TsSdk` Target built-in.
@@ -106,7 +106,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3)*
 
-- [ ] 02-04-PLAN.md — Flask typed envelope (blueprint prefix, <int:> converter, method-derived status POST→201, typed DTOs, untyped→diagnostics); reconcile diagnostic/span lines (42/69/78); flip both Flask snapshots GREEN + determinism [PYSRC-02, PYSRC-04]
+- [x] 02-04-PLAN.md — Flask typed envelope (blueprint prefix, <int:> converter, method-derived status POST→201, typed DTOs, untyped→diagnostics); reconcile diagnostic/span lines (42/69/78); flip both Flask snapshots GREEN + determinism [PYSRC-02, PYSRC-04]
 
 ### Phase 3: Python Target — `PySdk`
 
@@ -176,7 +176,7 @@ dependencies.)
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
-| 2. Python Source — `pyextract` | v2.0 | 3/4 | In Progress|  |
+| 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 0/TBD | Not started | - |

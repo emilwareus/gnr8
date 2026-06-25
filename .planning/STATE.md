@@ -4,14 +4,14 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T17:22:17.520Z"
+last_updated: "2026-06-25T17:36:18.881Z"
 last_activity: 2026-06-25 -- Phase 02 execution started
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 7
-  completed_plans: 6
-  percent: 17
+  completed_plans: 7
+  percent: 33
 ---
 
 # Project State
@@ -30,7 +30,7 @@ Plan: 4 of 4
 Status: Executing Phase 02
 Last activity: 2026-06-25 -- Phase 02 execution started
 
-Progress: [█████████░] 86%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ Progress: [█████████░] 86%
 | Phase 02 P01 | 18 | 3 tasks | 7 files |
 | Phase 02 P02 | 22 | 3 tasks | 13 files |
 | Phase 02 P03 | 40 | 3 tasks | 14 files |
+| Phase 02 P04 | 35 | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -77,6 +78,7 @@ Recent decisions affecting current work:
 - [Phase ?]: [02-02] pyextract sidecar: static-only (ast.parse of file TEXT, never import/exec the target); an owned cross-module symbol table replaces go/types (rule 2 hand-rolled); unresolvable name -> UNRESOLVABLE sentinel -> diagnostic + omit (rule 3, never a guessed default).
 - [Phase ?]: [02-02] Literal[...] alias is inlined-only and never a standalone schema; only a Union alias (referenced by ref_id) becomes a schema. Python int->int64-signed, float->float64. Optional/|None is a FIELD nullable axis. Snapshot is authoritative.
 - [Phase ?]: [02-03] FastAPI route recognition: decorator + typed signature is the one source of every route fact; APIRouter(prefix=) recorded separately (never folded, rule 1); a Union alias is a valid named oneOf component. Both FastAPI snapshots green through real extraction, zero snapshot edits.
+- [Phase ?]: [02-04] Flask typed-envelope: @bp.route/methods= one route per method; Blueprint(url_prefix=) recorded separately (rule 1); <int:> converter -> int64 path param; status method-derived (typed POST->201, else 200) NEVER from a docstring (Q1); untyped request.json/args/return -> diagnostic + omit (rule 3, no fallback). FastAPI/Flask are parallel deterministic recognizers. Both Flask snapshots green via real extraction, zero edits; diagnostics at 42/69/78. Phase 02 complete.
 
 ### Pending Todos
 
@@ -97,7 +99,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T17:22:02.918Z
+Last session: 2026-06-25T17:35:40.471Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
