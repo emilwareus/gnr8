@@ -36,7 +36,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 
 ### TypeScript source extraction (TSSRC)
 
-- [ ] **TSSRC-01**: A developer can extract routes, params, and request/response DTOs from a **NestJS** service (`@nestjs/common` decorators + DTO classes) into the IR.
+- [x] **TSSRC-01**: A developer can extract routes, params, and request/response DTOs from a **NestJS** service (`@nestjs/common` decorators + DTO classes) into the IR.
 - [x] **TSSRC-02**: The TS sidecar uses the `typescript` Compiler API and derives every schema fact from the source's own types — never from `@nestjs/swagger`, `zod`, or `class-validator`.
 - [x] **TSSRC-03**: Unsupported or untyped surfaces produce **diagnostics**, never guessed facts (no fallback).
 - [x] **TSSRC-04**: A developer enables NestJS extraction from `.gnr8/` code via a `NestJs` `Source` built-in.
@@ -101,7 +101,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | PYSDK-01 | Phase 3 | Complete |
 | PYSDK-02 | Phase 3 | Complete |
 | PYSDK-03 | Phase 3 | Complete |
-| TSSRC-01 | Phase 4 | Pending |
+| TSSRC-01 | Phase 4 | Complete |
 | TSSRC-02 | Phase 4 | Complete |
 | TSSRC-03 | Phase 4 | Complete |
 | TSSRC-04 | Phase 4 | Complete |

@@ -23,7 +23,7 @@ Plans:
 
 **Wave 3** *(blocked on Waves 1-2)*
 
-- [ ] 04-03-PLAN.md — NestJS routes.js recognition (decorators, group-relative paths, method-derived status); reconcile fixture span lines; flip both nestjs snapshots GREEN (zero snapshot edits) + skip-guard + determinism twins + make check gate [TSSRC-01]
+- [x] 04-03-PLAN.md — NestJS routes.js recognition (decorators, group-relative paths, method-derived status); reconcile fixture span lines; flip both nestjs snapshots GREEN (zero snapshot edits) + skip-guard + determinism twins + make check gate [TSSRC-01]
 
 **UI hint**: yes
 

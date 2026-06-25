@@ -4,14 +4,14 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T22:39:15.023Z"
+last_updated: "2026-06-25T22:57:42.550Z"
 last_activity: 2026-06-25 -- Phase 04 execution started
 progress:
   total_phases: 2
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 3
-  completed_plans: 2
-  percent: 0
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -30,7 +30,7 @@ Plan: 3 of 3
 Status: Executing Phase 04
 Last activity: 2026-06-25 -- Phase 04 execution started
 
-Progress: [███████░░░] 67%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -65,6 +65,7 @@ Progress: [███████░░░] 67%
 | Phase 03 P03 | 35m | 2 tasks | 1 files |
 | Phase 04 P01 | 6m | 3 tasks | 10 files |
 | Phase 04 P02 | 8min | 2 tasks | 9 files |
+| Phase 04 P03 | 14min | 3 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -95,6 +96,8 @@ Recent decisions affecting current work:
 - [Phase 04]: [04-02] Open Q1 resolved empirically: the named-vs-inline enum discriminator is aliasSymbol on the FULL type BEFORE stripping null/undefined (NOT the residual). format keeps aliasSymbol -> named ref; sort?: SortOrder|null becomes a synthetic union whose aliasSymbol TS drops -> inline enum. One discriminator, one path (rule 3).
 - [Phase 04]: [04-02] tsextract type core: number->float64 (never int); strip undefined/null arms FIRST as the optional/nullable axes (never union members); collapse TS synthetic boolean true|false to a single bool; class->named ref; unresolvable->diagnostic+omit, never an any guess.
 - [Phase 04]: [04-02] schema collection: fixpoint Registry follows named refs through fields AND union arms (OutOfStockDto via the BookOrError union arm only); direct-root seeding excludes a class with a class-decorator or methods (the routing controller); a string-literal-union alias is a schema only when referenced (BookFormat via format; SortOrder not).
+- [Phase ?]: [04-03] NestJS route recognition: routes.js reads @nestjs/common routing decorators ONLY (rule 1); @Controller prefix recorded as provenance, NEVER folded into op paths; status method-derived (POST->201/else 200) with @HttpCode override (single rule, rule 3); routes seed the transitive schema collection. Both nestjs snapshots green via real extraction, zero edits. Phase 04 complete.
+- [Phase ?]: [04-03] named-vs-inline discriminator HARDENED to the syntactic annotation node (bare TypeReference->named ref; UnionType->inline); the 04-02 aliasSymbol-on-full-type rule failed fmt?: BookFormat (TS drops aliasSymbol once |undefined mixed in). One source (the author's annotation), one path, uniform for fields AND optional params.
 
 ### Pending Todos
 
@@ -115,7 +118,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T22:38:19.115Z
+Last session: 2026-06-25T22:57:00.559Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
