@@ -41,7 +41,7 @@ waist** — not just router-agnostic. Each new language ships as a stdlib-only s
 never forked. Every v1 invariant holds (one source per fact, zero OSS deps in `gnr8-core`, no fallback
 paths, static-only extraction, deterministic byte-identical output).
 
-- [ ] **Phase 1: Language-Neutral IR + Facts Contract + Fixtures** - Generalize the IR/`Type` model and the shared JSON facts contract to be type-system-neutral; stand up FastAPI/Flask/NestJS fixtures with red-by-design snapshots. No extraction yet.
+- [x] **Phase 1: Language-Neutral IR + Facts Contract + Fixtures** - Generalize the IR/`Type` model and the shared JSON facts contract to be type-system-neutral; stand up FastAPI/Flask/NestJS fixtures with red-by-design snapshots. No extraction yet. (completed 2026-06-25)
 - [ ] **Phase 2: Python Source — `pyextract`** - Static stdlib-`ast` sidecar (FastAPI full, Flask typed-envelope) with an owned cross-module symbol table; `FastApi`/`Flask` Source built-ins; reuse the Rust lowering → OpenAPI.
 - [ ] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in.
 - [ ] **Phase 4: TypeScript Source — `tsextract`** - NestJS recognizer on the `typescript` Compiler API with bright-line third-party-schema exclusions; `NestJs` Source built-in (the documented rule-2 carve-out).
@@ -75,7 +75,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 01-03-PLAN.md — FastAPI/Flask/NestJS fixtures + red-by-design graph/OpenAPI snapshots, kept visible but out of the green gate [IR-04]
+- [x] 01-03-PLAN.md — FastAPI/Flask/NestJS fixtures + red-by-design graph/OpenAPI snapshots, kept visible but out of the green gate [IR-04]
 
 ### Phase 2: Python Source — `pyextract`
 
@@ -158,7 +158,7 @@ dependencies.)
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 2/3 | In Progress|  |
+| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 2. Python Source — `pyextract` | v2.0 | 0/TBD | Not started | - |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |

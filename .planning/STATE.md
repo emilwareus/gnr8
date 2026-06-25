@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
-stopped_at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
-last_updated: "2026-06-25T14:45:36.856Z"
+stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
+last_updated: "2026-06-25T15:47:50.567Z"
 last_activity: 2026-06-25 -- Phase 01 execution started
 progress:
   total_phases: 6
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 3
-  completed_plans: 1
-  percent: 0
+  completed_plans: 3
+  percent: 17
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-25)
 ## Current Position
 
 Phase: 01 (Language-Neutral IR + Facts Contract + Fixtures) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 01
 Last activity: 2026-06-25 -- Phase 01 execution started
 
-Progress: [███░░░░░░░] 33%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -53,6 +53,7 @@ Progress: [███░░░░░░░] 33%
 
 *Updated after each plan completion. v1.0 velocity (14 plans, ~10min avg) archived in .planning/milestones/v1.0-*.*
 | Phase 01 P01 | 23 | 3 tasks | 8 files |
+| Phase 01 P03 | 38 | 3 tasks | 23 files |
 
 ## Accumulated Context
 
@@ -69,6 +70,7 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-01] Neutral Type enum: adjacently-tagged ({type,of}); Prim internally-tagged; Type::Any = empty struct variant for buffered deny_unknown_fields safety. IR re-exports the facts vocabulary (one definition, zero drift).
 - [Phase ?]: [01-01] optional and nullable are independent parallel bool flags; all four combinations representable. Type::Ext omitted (no extension runtime this phase).
 - [Phase ?]: [01-01] lower/ and gosdk/ left intentionally non-compiling against the new enum (Plan 01-02 compile-error signal; no _ => shims); the Go side is fully green.
+- [Phase ?]: 01-03: red-by-design multi-language fixtures gated via #[ignore]; six intended-green graph+OpenAPI snapshots flip green in Phases 2/4 with zero edits
 
 ### Pending Todos
 
@@ -89,8 +91,8 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T14:45:13.209Z
-Stopped at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
+Last session: 2026-06-25T15:47:50.557Z
+Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
 ## Operator Next Steps
