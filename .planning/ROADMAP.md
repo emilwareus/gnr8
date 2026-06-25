@@ -94,7 +94,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 02-01-PLAN.md — Rust host seam: PythonToolchainMissing + run_pyextract driver + single deterministic build_graph/collect language dispatch + FastApi/Flask Source built-ins [PYSRC-05]
+- [x] 02-01-PLAN.md — Rust host seam: PythonToolchainMissing + run_pyextract driver + single deterministic build_graph/collect language dispatch + FastApi/Flask Source built-ins [PYSRC-05]
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -176,7 +176,7 @@ dependencies.)
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
-| 2. Python Source — `pyextract` | v2.0 | 0/TBD | Not started | - |
+| 2. Python Source — `pyextract` | v2.0 | 1/4 | In Progress|  |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 0/TBD | Not started | - |
