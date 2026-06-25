@@ -64,9 +64,9 @@ fn to_openapi_is_byte_identical_across_two_runs() {
     // Build the graph twice AND lower twice — proving both the upstream graph and the lowering are
     // deterministic end-to-end (idempotent OpenAPI generation, RESEARCH Pitfall 4 / TARGET-API §5.6).
     let security = fixture_security();
-    let a = gnr8_core::lower::to_openapi(&first, "/goal", &security)
+    let a = gnr8_core::lower::to_openapi(&first, "goalservice", "/goal", &security)
         .expect("first to_openapi must succeed");
-    let b = gnr8_core::lower::to_openapi(&second, "/goal", &security)
+    let b = gnr8_core::lower::to_openapi(&second, "goalservice", "/goal", &security)
         .expect("second to_openapi must succeed");
 
     assert_eq!(

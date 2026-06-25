@@ -512,7 +512,8 @@ fn build_outputs(
     exclude_output_paths(&mut graph, config);
     apply_naming(&mut graph, &config.naming)?;
 
-    let openapi = crate::lower::to_openapi(&graph, &config.base_path, &config.security)?;
+    let openapi =
+        crate::lower::to_openapi(&graph, &config.title, &config.base_path, &config.security)?;
     // The SDK package name is derived from `output.go_module` (the single source of truth) — the last
     // path segment sanitized to a valid Go identifier; never a fixture-name default (CLAUDE.md rule 3).
     let sdk_package = config.output.sdk_package()?;

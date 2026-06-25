@@ -62,6 +62,7 @@ const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 /// panics and never `unwrap`s (RUST-04 / T-03-01-01).
 pub fn to_openapi(
     graph: &ApiGraph,
+    title: &str,
     base_path: &str,
     security: &SecurityConfig,
 ) -> Result<String, crate::CoreError> {
@@ -79,7 +80,7 @@ pub fn to_openapi(
     let doc = OpenApiDoc {
         openapi: "3.1.0",
         info: Info {
-            title: "goalservice".to_string(),
+            title: title.to_string(),
             version: "0.1.0".to_string(),
             description: None,
         },
@@ -576,7 +577,7 @@ mod tests {
 
     #[test]
     fn paths_are_keyed_absolutely_under_goal() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         assert!(yaml.contains("'/goal/':"), "{yaml}");
         assert!(yaml.contains("'/goal/list':"), "{yaml}");
         assert!(yaml.contains("'/goal/{uuid}':"), "{yaml}");
@@ -585,7 +586,7 @@ mod tests {
 
     #[test]
     fn put_and_delete_coexist_on_one_path() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         // Both methods must render under the single /goal/{uuid} path item.
         let uuid_block = yaml
             .split("'/goal/{uuid}':")
@@ -597,7 +598,7 @@ mod tests {
 
     #[test]
     fn operation_ids_are_handler_symbols() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         // operationIds are the handler-symbol-derived ids — no annotation override (e.g. updateGoal,
         // not goalUuidPut).
         assert!(yaml.contains("operationId: createGoal"), "{yaml}");
@@ -615,7 +616,7 @@ mod tests {
 
     #[test]
     fn query_params_are_plain_string_not_required_no_enum() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         // The aggregation query param lowers to a bare string, not required, with no enum.
         let list_block = yaml.split("'/goal/list':").nth(1).expect("list path");
         let list_block = list_block
@@ -637,7 +638,7 @@ mod tests {
         graph.operations[0].request_body = Some(crate::graph::SchemaRef {
             ref_id: "internal/dto.DoesNotExist".to_string(),
         });
-        let err = to_openapi(&graph, "/goal", &security_config()).unwrap_err();
+        let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -649,7 +650,7 @@ mod tests {
         let mut graph = sample_graph();
         // Corrupt a field's schema kind to an unrepresentable value.
         graph.schemas[1].fields[0].schema.kind = "tuple".to_string();
-        let err = to_openapi(&graph, "/goal", &security_config()).unwrap_err();
+        let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -658,7 +659,7 @@ mod tests {
 
     #[test]
     fn api_key_security_is_emitted_from_config_top_level_and_in_components() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         assert!(yaml.contains("security:"), "top-level security:\n{yaml}");
         assert!(yaml.contains("- ApiKeyAuth: []"), "{yaml}");
         assert!(yaml.contains("securitySchemes:"), "{yaml}");
@@ -671,7 +672,13 @@ mod tests {
     fn no_security_config_emits_no_security() {
         // With an empty security config the document carries no security — proving security is
         // ENTIRELY config-driven, never derived from the graph (CLAUDE.md rule 4).
-        let yaml = to_openapi(&sample_graph(), "/goal", &SecurityConfig::default()).unwrap();
+        let yaml = to_openapi(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SecurityConfig::default(),
+        )
+        .unwrap();
         assert!(
             !yaml.contains("ApiKeyAuth"),
             "no scheme without config:\n{yaml}"
@@ -689,7 +696,7 @@ mod tests {
                 name: "Authorization".to_string(),
             }],
         };
-        let err = to_openapi(&sample_graph(), "/goal", &config).unwrap_err();
+        let err = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -698,7 +705,7 @@ mod tests {
 
     #[test]
     fn free_form_map_field_lowers_to_additional_properties_true() {
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         assert!(
             yaml.contains("additionalProperties: true"),
             "free-form map must lower to additionalProperties: true:\n{yaml}"
@@ -709,7 +716,7 @@ mod tests {
     fn code_defined_enum_is_preserved() {
         // A code-defined Go enum (TargetDirection, from go/types) must still render as a string enum —
         // it comes from CODE, not annotations (CLAUDE.md rule on keeping code-defined enums).
-        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         let td = yaml
             .split("TargetDirection:")
             .nth(1)
@@ -725,15 +732,15 @@ mod tests {
         let graph = sample_graph();
         // The sample carries a diagnostic; lowering must still succeed (diagnostics are advisory).
         assert!(!graph.diagnostics.is_empty());
-        assert!(to_openapi(&graph, "/goal", &security_config()).is_ok());
+        assert!(to_openapi(&graph, "goalservice", "/goal", &security_config()).is_ok());
     }
 
     #[test]
     fn to_openapi_is_byte_identical_across_two_runs() {
         let graph = sample_graph();
         assert_eq!(
-            to_openapi(&graph, "/goal", &security_config()).unwrap(),
-            to_openapi(&graph, "/goal", &security_config()).unwrap()
+            to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap(),
+            to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap()
         );
     }
 }

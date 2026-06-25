@@ -54,6 +54,11 @@ pub struct Config {
     /// root-mounted service) when omitted.
     #[serde(default = "default_base_path")]
     pub base_path: String,
+    /// The OpenAPI document title (`info.title`) — API-author metadata the typed Go source does not
+    /// carry, so it is declared HERE by the user configuring our engine (CLAUDE.md rule 4), the single
+    /// place lowering takes it from. Defaults to `"API"` when omitted.
+    #[serde(default = "default_title")]
+    pub title: String,
     /// Output artifact paths + Go module path for the generated SDK.
     pub output: OutputConfig,
     /// Optional operation/type name remaps (the one customization knob built in the PoC).
@@ -71,6 +76,14 @@ pub struct Config {
 /// the owned `String`.
 fn default_base_path() -> String {
     "/".to_string()
+}
+
+/// The default OpenAPI title (`"API"`) used when `title` is omitted.
+///
+/// A function rather than a const because `#[serde(default = "...")]` requires a callable producing
+/// the owned `String`.
+fn default_title() -> String {
+    "API".to_string()
 }
 
 /// The security configuration: the user-declared schemes that secure the generated API.

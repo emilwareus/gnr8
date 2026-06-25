@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: goalservice
+  title: Bookstore API
   version: 0.1.0
 security:
   - ApiKeyAuth: []

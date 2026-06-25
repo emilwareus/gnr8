@@ -35,7 +35,7 @@ fn fixture_security() -> gnr8_core::config::SecurityConfig {
 fn openapi_matches_expected_for_goalservice() {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed for the fixture");
-    let openapi = gnr8_core::lower::to_openapi(&graph, "/goal", &fixture_security())
+    let openapi = gnr8_core::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
         .expect("lower::to_openapi must succeed for the fixture");
     insta::assert_snapshot!("goalservice_openapi", openapi);
 }

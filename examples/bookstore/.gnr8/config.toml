@@ -5,6 +5,7 @@ inputs = ["."] # analyze this directory (the plain Gin service)
 # group is mounted at /books, but the analyzer records routes group-relative and
 # cannot see the prefix, so it is declared here and joined during generation.
 base_path = "/books"
+title = "Bookstore API"
 
 [output]
 openapi   = "generated/openapi.yaml" # OpenAPI 3.1 artifact (committed)

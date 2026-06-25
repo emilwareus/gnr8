@@ -646,7 +646,7 @@ fn naming_overrides_apply() {
         .insert("updateGoal".to_string(), "RenamedUpdateGoal".to_string());
 
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a valid override");
-    let yaml = gnr8_core::lower::to_openapi(&graph, "/goal", &fixture_security())
+    let yaml = gnr8_core::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
         .expect("to_openapi after naming override");
 
     assert!(
@@ -666,7 +666,7 @@ fn naming_overrides_apply() {
         .insert("doesNotExist".to_string(), "Whatever".to_string());
     lifecycle::apply_naming(&mut graph2, &noop_naming).expect("an unmatched key is a no-op");
     assert!(
-        gnr8_core::lower::to_openapi(&graph2, "/goal", &fixture_security()).is_ok(),
+        gnr8_core::lower::to_openapi(&graph2, "goalservice", "/goal", &fixture_security()).is_ok(),
         "an unmatched naming key must be a silent no-op"
     );
 }
@@ -691,7 +691,7 @@ fn naming_type_rename_updates_refs_no_dangling() {
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a referenced rename");
 
     // to_openapi MUST succeed — a dangling $ref would raise CoreError::Lowering.
-    let yaml = gnr8_core::lower::to_openapi(&graph, "/goal", &fixture_security())
+    let yaml = gnr8_core::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
         .expect("to_openapi must succeed after a referenced-type rename (no dangling $ref)");
 
     // The new name is in components.schemas AND in the referencing operation's $ref.
