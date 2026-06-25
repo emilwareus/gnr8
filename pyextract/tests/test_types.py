@@ -95,6 +95,79 @@ class ContainerTests(unittest.TestCase):
         )
 
 
+class MappingArityTests(unittest.TestCase):
+    """CR-01 regression: a dict/Dict without exactly two args must diagnose + omit,
+    NEVER fabricate a {string: any} map (rule 3)."""
+
+    def test_single_arg_dict_diagnoses_and_omits(self):
+        t, diags = _map("dict[str]")
+        self.assertIsNone(t)
+        items = diags.items()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["severity"], "WARN")
+        self.assertIn("exactly two type args", items[0]["message"])
+        # rule 3: NEVER the fabricated string -> any default.
+        self.assertNotEqual(
+            t,
+            {
+                "type": "map",
+                "of": {
+                    "key": {"type": "primitive", "of": {"prim": "string"}},
+                    "value": {"type": "any", "of": {}},
+                },
+            },
+        )
+
+    def test_three_arg_dict_diagnoses_and_omits(self):
+        t, diags = _map("dict[str, int, bool]")
+        self.assertIsNone(t)
+        items = diags.items()
+        self.assertEqual(len(items), 1)
+        self.assertIn("exactly two type args", items[0]["message"])
+
+
+class ForwardRefTests(unittest.TestCase):
+    """CR-02 regression: a string forward reference (``field: "Author"``) must be
+    re-parsed and resolved via the symbol table, not silently dropped."""
+
+    def test_string_forward_ref_resolves_to_named(self):
+        modules = [
+            _FakeModule(
+                "app.models",
+                "from pydantic import BaseModel\nclass Author(BaseModel):\n    name: str\n",
+            )
+        ]
+        t, diags = _map("'Author'", module="app.models", modules=modules)
+        self.assertEqual(t, {"type": "named", "of": "app.models.Author"})
+        self.assertEqual(diags.items(), [])
+
+    def test_string_forward_ref_to_primitive(self):
+        t, diags = _map("'int'")
+        self.assertEqual(
+            t, {"type": "primitive", "of": {"prim": "int", "bits": 64, "signed": True}}
+        )
+        self.assertEqual(diags.items(), [])
+
+    def test_string_forward_ref_unresolvable_still_diagnoses(self):
+        modules = [_FakeModule("app.models", "class Author:\n    name: str\n")]
+        t, diags = _map("'Mystery'", module="app.models", modules=modules)
+        self.assertIsNone(t)
+        self.assertTrue(diags.items())
+
+    def test_nested_string_forward_ref_in_list(self):
+        modules = [
+            _FakeModule(
+                "app.models",
+                "from pydantic import BaseModel\nclass Author(BaseModel):\n    name: str\n",
+            )
+        ]
+        t, diags = _map("list['Author']", module="app.models", modules=modules)
+        self.assertEqual(
+            t, {"type": "array", "of": {"type": "named", "of": "app.models.Author"}}
+        )
+        self.assertEqual(diags.items(), [])
+
+
 class EnumAndUnionTests(unittest.TestCase):
     def test_literal_is_inline_sorted_enum(self):
         t, _ = _map("Literal['desc', 'asc']")
