@@ -132,5 +132,43 @@ class FastAPIKwOnlyParamTests(unittest.TestCase):
         self.assertFalse(params["c"]["required"])
 
 
+class FlaskBodylessMethodTests(unittest.TestCase):
+    """WR-04: a GET/HEAD/DELETE handler must never derive a request body fact even
+    if it reads request.json (semantically a body-less method)."""
+
+    SRC = (
+        "from app.dto import OrderInput\n"
+        "def handler() -> int:\n"
+        "    order: OrderInput = OrderInput(**request.json)\n"
+        "    return 1\n"
+    )
+
+    DTO = "class OrderInput:\n    x: int\n"
+
+    def _run_multi(self, method):
+        modules = [
+            _FakeModule("app.routes", self.SRC),
+            _FakeModule("app.dto", self.DTO),
+        ]
+        func = _func(self.SRC)
+        table = SymbolTable(modules)
+        diags = Diagnostics()
+        return routes._flask_body_and_params(
+            func, method, "/", "app.routes", modules[0].abs_path, table, diags
+        )
+
+    def test_post_derives_body(self):
+        _params, body = self._run_multi("POST")
+        self.assertEqual(body, {"ref_id": "app.dto.OrderInput"})
+
+    def test_get_omits_body(self):
+        _params, body = self._run_multi("GET")
+        self.assertIsNone(body)
+
+    def test_delete_omits_body(self):
+        _params, body = self._run_multi("DELETE")
+        self.assertIsNone(body)
+
+
 if __name__ == "__main__":
     unittest.main()
