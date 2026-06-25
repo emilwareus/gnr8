@@ -89,7 +89,24 @@ Plans:
   3. Unresolvable or untyped surfaces (untyped `request.json`, dynamic prefixes, foreign types) produce diagnostics, never guessed facts — there is no fallback path.
   4. A developer enables Python extraction from `.gnr8/` code via `FastApi` / `Flask` `Source` built-ins, and the FastAPI fixture's red snapshot turns green through the reused Rust pipeline.
 
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 02-01-PLAN.md — Rust host seam: PythonToolchainMissing + run_pyextract driver + single deterministic build_graph/collect language dispatch + FastApi/Flask Source built-ins [PYSRC-05]
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 02-02-PLAN.md — pyextract sidecar core: stdlib-ast loader, OWNED cross-module symbol table, annotation→neutral-Type mapper (four-axis fields), deterministic facts marshal; static-only, unittest golden harness [PYSRC-03]
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 02-03-PLAN.md — FastAPI recognition (routes/params/bodies/response_model/status_code, separate prefix); reconcile fixture span lines; flip both FastAPI snapshots GREEN (zero snapshot edits) + determinism [PYSRC-01]
+
+**Wave 4** *(blocked on Wave 3)*
+
+- [ ] 02-04-PLAN.md — Flask typed envelope (blueprint prefix, <int:> converter, method-derived status POST→201, typed DTOs, untyped→diagnostics); reconcile diagnostic/span lines (42/69/78); flip both Flask snapshots GREEN + determinism [PYSRC-02, PYSRC-04]
 
 ### Phase 3: Python Target — `PySdk`
 
