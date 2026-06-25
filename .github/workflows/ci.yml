@@ -14,8 +14,8 @@
 #   * go-fixture (BLOCKING)     go build/vet of the standalone Gin fixture module (Pitfall 5)
 #   * goextract  (BLOCKING)     go build/vet/test of the standalone goextract helper module
 #
-# Third-party actions are pinned to major-version tags from well-known publishers (actions/*, dtolnay,
-# Swatinem) per the threat register (T-03-02). GitHub Actions sets CI=true, so insta runs in
+# Third-party actions are pinned to major-version tags from well-known publishers (actions/*,
+# dtolnay, Swatinem) per the threat register (T-03-02). GitHub Actions sets CI=true, so insta runs in
 # INSTA_UPDATE=no mode — a missing/mismatched snapshot is a hard failure, never an auto-accept (FIX-04).
 
 name: ci
@@ -35,11 +35,11 @@ jobs:
     name: gates (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
       - uses: Swatinem/rust-cache@v2
@@ -67,8 +67,8 @@ jobs:
     name: go-fixture (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
       - name: go build + vet
@@ -81,8 +81,8 @@ jobs:
     name: goextract (blocking)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.26'
       - name: go build + vet + test
