@@ -263,11 +263,83 @@ fn emit_enum_class(out: &mut String, name: &str, members: &[String]) -> Result<(
         writeln!(out, "    pass").map_err(sink)?;
         return Ok(());
     }
+    // Generate collision-free, identifier-safe member names deterministically (CR-03): two wire values
+    // that normalize to the same SCREAMING_SNAKE form would emit a duplicate class key (TypeError at
+    // import), and an empty/leading-digit normalization is an invalid identifier. The member's wire
+    // `value` string is NEVER changed — only the Python member NAME is sanitized + disambiguated. The
+    // `used` list preserves first-seen (graph) order, so the suffix assignment is deterministic.
+    let mut used: Vec<String> = Vec::with_capacity(members.len());
     for value in members {
-        let member = screaming_snake(value);
+        let base = enum_member_ident(value);
+        // Disambiguate on collision by appending `_2`, `_3`, ... (the first occurrence keeps the base).
+        let mut member = base.clone();
+        let mut n = 2u32;
+        while used.contains(&member) {
+            member = format!("{base}_{n}");
+            n += 1;
+        }
+        used.push(member.clone());
         writeln!(out, "    {member} = \"{value}\"").map_err(sink)?;
     }
     Ok(())
+}
+
+/// Map an enum wire value to a SAFE, non-empty Python member identifier (CR-03).
+///
+/// `screaming_snake` can produce an empty string (`""`, punctuation-only) or a leading-digit form
+/// (`"1"` → `1`), both invalid identifiers. This guards both: an empty normalization becomes a stable
+/// placeholder `MEMBER`, and a leading-digit form is prefixed with `_`. Collision disambiguation is the
+/// caller's concern (so the two transforms compose deterministically).
+fn enum_member_ident(value: &str) -> String {
+    let screamed = screaming_snake(value);
+    if screamed.is_empty() {
+        // No word characters at all (empty or pure punctuation) — emit a stable placeholder; the caller
+        // disambiguates repeats (`MEMBER`, `MEMBER_2`, ...). The wire value stays intact.
+        "MEMBER".to_string()
+    } else if screamed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("_{screamed}")
+    } else {
+        screamed
+    }
+}
+
+/// Resolve a [`Type::Named`] ref to the schema it points at (used to decide nested-decode strategy).
+fn resolve_named<'g>(schema: &Type, graph: &'g ApiGraph) -> Option<&'g crate::graph::Schema> {
+    match schema {
+        Type::Named(ref_id) => graph.schemas.iter().find(|s| &s.id == ref_id),
+        _ => None,
+    }
+}
+
+/// Build the Python expression that decodes a single from-dict value `v` into a field's advertised type.
+///
+/// `v` is the bound raw JSON value for this field. The decode is RECURSIVE for nested dataclasses
+/// (CR-04 #2): a named object-schema field becomes `Model.from_dict(v)`, a list-of-named-object becomes
+/// a comprehension, and every other shape (scalar, enum value, union, map, Any) passes through unchanged
+/// (the str-enum mixin accepts the raw value; a union/map has no single concrete constructor). One
+/// deterministic mapping per field type, no fallback (rule 3).
+fn decode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> String {
+    match schema {
+        // A named ref to an OBJECT schema → recurse via its from_dict; a named enum (str mixin) or any
+        // other named alias passes the raw value through.
+        Type::Named(_) => match resolve_named(schema, graph) {
+            Some(target) if matches!(target.body, Type::Object(_)) => {
+                format!("{}.from_dict({value_var})", target.name)
+            }
+            _ => value_var.to_string(),
+        },
+        // A list whose items are a named object schema → decode each element recursively.
+        Type::Array(items) => match resolve_named(items, graph) {
+            Some(target) if matches!(target.body, Type::Object(_)) => format!(
+                "[{}.from_dict(_item) for _item in {value_var}]",
+                target.name
+            ),
+            _ => value_var.to_string(),
+        },
+        // Scalars, well-known, maps, Any, inline enums/unions, inline objects: pass through. A union has
+        // no single constructor; an inline enum value is already the wire string.
+        _ => value_var.to_string(),
+    }
 }
 
 /// Emit a `@dataclass` for an object schema, partitioning fields required-first / optional-last.
