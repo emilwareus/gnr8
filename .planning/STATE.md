@@ -3,12 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: planning
-last_updated: "2026-06-25T15:00:00.000Z"
-last_activity: 2026-06-25
+stopped_at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
+last_updated: "2026-06-25T14:17:43.195Z"
+last_activity: 2026-06-25 — v2.0 roadmap created (6 phases, 24/24 requirements mapped); phase numbers reset to start at 1
 progress:
   total_phases: 6
   completed_phases: 0
-  total_plans: 0
+  total_plans: 3
   completed_plans: 0
   percent: 0
 ---

@@ -12,6 +12,7 @@
 ## Phases
 
 **Phase Numbering:**
+
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
@@ -50,74 +51,100 @@ paths, static-only extraction, deterministic byte-identical output).
 ## Phase Details
 
 ### Phase 1: Language-Neutral IR + Facts Contract + Fixtures
+
 **Goal**: Generalize the `ApiGraph` IR and the shared JSON facts contract from "router-agnostic" to fully "type-system-neutral", and stand up the multi-language fixture+snapshot harness, so that every later sidecar has a single neutral target and a red-by-design acceptance contract to turn green.
 **Depends on**: Nothing (first phase)
 **Requirements**: IR-01, IR-02, IR-03, IR-04
 **Success Criteria** (what must be TRUE):
+
   1. The IR + JSON facts contract express the cross-language type vocabulary (objects, arrays, enums, optional/nullable, unions) with no Go/Gin/FastAPI/Nest terms leaking into the IR.
   2. The Rust host deserializes the shared facts contract strictly (`#[serde(deny_unknown_fields)]`); OpenAPI lowering + SDK generation consume the IR with no per-language branches.
   3. FastAPI, Flask, and NestJS fixture services exist and encode the v2.0 acceptance cases.
   4. Red-by-design snapshots for each fixture are committed and visibly failing before any extraction lands.
+
 **Plans**: 3 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 01-01-PLAN.md — Neutral Type enum + facts contract (facts.rs serde + facts.go json tags + graph IR) in lockstep; optional/nullable axes [IR-01, IR-02]
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 01-02-PLAN.md — Consumers: lower/ + gosdk/ exhaustive Type match (no per-language branch), fix optional/nullable + 3.1 nullable rendering, re-accept Go snapshots green [IR-03]
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 01-03-PLAN.md — FastAPI/Flask/NestJS fixtures + red-by-design graph/OpenAPI snapshots, kept visible but out of the green gate [IR-04]
 
 ### Phase 2: Python Source — `pyextract`
+
 **Goal**: A developer can turn a real FastAPI service (full) and a Flask service (typed envelope) into the neutral IR via a static `pyextract` sidecar that never imports or executes the target code, so the existing Rust lowering produces OpenAPI 3.1 for Python services unchanged.
 **Depends on**: Phase 1
 **Requirements**: PYSRC-01, PYSRC-02, PYSRC-03, PYSRC-04, PYSRC-05
 **Success Criteria** (what must be TRUE):
+
   1. A developer can extract routes, path/query params, request bodies (Pydantic/`@dataclass`), response models, and status codes from a FastAPI service into the IR, and routes + blueprint/`APIRouter` prefixes + opt-in typed DTOs from a Flask service.
   2. The sidecar resolves types statically using stdlib `ast` + an owned cross-module symbol table, and never imports or executes the target code.
   3. Unresolvable or untyped surfaces (untyped `request.json`, dynamic prefixes, foreign types) produce diagnostics, never guessed facts — there is no fallback path.
   4. A developer enables Python extraction from `.gnr8/` code via `FastApi` / `Flask` `Source` built-ins, and the FastAPI fixture's red snapshot turns green through the reused Rust pipeline.
+
 **Plans**: TBD
 
 ### Phase 3: Python Target — `PySdk`
+
 **Goal**: A developer can generate a dependency-free Python SDK from the neutral IR and prove it works against the live FastAPI fixture, establishing the second SDK target as a pure IR→string twin of the Go SDK.
 **Depends on**: Phase 1 (IR/Target seam); Phase 2 (FastAPI fixture facts for the end-to-end test)
 **Requirements**: PYSDK-01, PYSDK-02, PYSDK-03
 **Success Criteria** (what must be TRUE):
+
   1. A developer can generate a dependency-free Python SDK from the IR (stdlib `urllib`, `@dataclass` models, a typed `ApiError`, an injectable `OpenerDirector`).
   2. The generated Python SDK imports and type-checks, and round-trips against the FastAPI fixture in a hermetic test (no third-party HTTP deps).
   3. A developer adds the Python SDK to a `.gnr8/` Pipeline via a `PySdk` `Target` built-in, and the output is byte-identical across repeated runs.
+
 **Plans**: TBD
 
 ### Phase 4: TypeScript Source — `tsextract`
+
 **Goal**: A developer can turn a real NestJS service into the neutral IR via a `tsextract` sidecar built on the `typescript` Compiler API, deriving every schema fact from the source's own TS types and never from third-party annotation/validation tools, so the reused Rust pipeline produces OpenAPI 3.1 for NestJS services.
 **Depends on**: Phase 1
 **Requirements**: TSSRC-01, TSSRC-02, TSSRC-03, TSSRC-04
 **Success Criteria** (what must be TRUE):
+
   1. A developer can extract routes, params, and request/response DTOs from a NestJS service (`@nestjs/common` decorators + DTO classes) into the IR.
   2. The sidecar derives every schema fact from the source's own TS types via the `typescript` Compiler API — never from `@nestjs/swagger`, `zod`, or `class-validator` (bright-line exclusion enforced).
   3. Unsupported or untyped surfaces produce diagnostics, never guessed facts — there is no fallback path; extraction is static only (the target TS is never executed).
   4. A developer enables NestJS extraction from `.gnr8/` code via a `NestJs` `Source` built-in, and the NestJS fixture's red snapshot turns green through the reused Rust pipeline.
+
 **Plans**: TBD
 **UI hint**: yes
 
 ### Phase 5: TypeScript Target — `TsSdk`
+
 **Goal**: A developer can generate a dependency-free TypeScript SDK from the neutral IR and prove it type-checks, completing the fourth language path (NestJS source → TS SDK) as a pure IR→string twin.
 **Depends on**: Phase 1 (IR/Target seam); Phase 4 (NestJS fixture facts for the end-to-end test)
 **Requirements**: TSSDK-01, TSSDK-02, TSSDK-03
 **Success Criteria** (what must be TRUE):
+
   1. A developer can generate a dependency-free TypeScript SDK from the IR (built-in `fetch`, typed `interface` models + string-literal-union enums, a typed `ApiError`, a configurable `Client`).
   2. The generated TS SDK type-checks under `tsc --noEmit` in a hermetic test, with zero runtime dependencies (no axios).
   3. A developer adds the TS SDK to a `.gnr8/` Pipeline via a `TsSdk` `Target` built-in, and the output is byte-identical across repeated runs.
+
 **Plans**: TBD
 **UI hint**: yes
 
 ### Phase 6: Cross-Language Hardening + Examples + Docs
+
 **Goal**: A developer can drive complete FastAPI and NestJS projects end-to-end from a `.gnr8/` lifecycle with real committed output, trust an honest per-language supported-envelope, and rely on `doctor`/`check`/`watch` parity and cross-language determinism — with the `typescript` rule-2 carve-out recorded.
 **Depends on**: Phases 2, 3, 4, 5
 **Requirements**: XLANG-01, XLANG-02, XLANG-03, XLANG-04, XLANG-05
 **Success Criteria** (what must be TRUE):
+
   1. A developer drives a FastAPI service end-to-end (`gnr8 generate` from a `.gnr8/` lifecycle) → OpenAPI 3.1 + a Python SDK, and a NestJS service end-to-end → OpenAPI 3.1 + a TS SDK, each with real committed example output.
   2. `docs/USAGE.md` documents the honest per-language supported envelope (FastAPI full; Flask typed-only; NestJS class DTOs) with limits stated.
   3. `gnr8 doctor` / `check` / `watch` work across all supported language sidecars (toolchain detection, drift, loop-safety).
   4. Every sidecar is stdlib-only in its language (Python `ast`; TS = `typescript` only); `gnr8-core` takes zero OSS deps; all output is deterministic and byte-identical — and the `typescript` carve-out is recorded in PROJECT.md/CLAUDE.md.
+
 **Plans**: TBD
 
 ## Progress
