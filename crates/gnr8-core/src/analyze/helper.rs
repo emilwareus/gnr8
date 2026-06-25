@@ -37,6 +37,16 @@ pub(crate) fn pyextract_dir() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
 
+/// The directory of the `tsextract` Node sidecar (it HOLDS `index.js` + `node_modules`), resolved
+/// relative to this crate's manifest dir (single source of truth for the path). The invocation is
+/// `node index.js <target_dir>`, so the subprocess runs from inside `tsextract/` — exactly the
+/// goextract analog one level down (`<root>/tsextract`), NOT the repo root used by [`pyextract_dir`]
+/// (which runs `python3 -m pyextract`). Carries the v1 compile-time-path debt forward without
+/// deepening it (CONTEXT decision; RESEARCH A6).
+pub(crate) fn tsextract_dir() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tsextract"))
+}
+
 /// Resolve `target_dir` to a CANONICAL absolute path.
 ///
 /// Two reasons (both load-bearing for correctness + determinism, GRAPH-02):
@@ -140,13 +150,57 @@ fn run_pyextract_with(py_bin: &str, target_dir: &str) -> Result<facts::GoFacts, 
     Ok(parsed)
 }
 
+/// Run the `tsextract` Node helper against `target_dir` and return the parsed facts.
+///
+/// The TypeScript twin of [`run_goextract`]/[`run_pyextract`]: spawns `node index.js <target_dir>`
+/// from [`tsextract_dir`] (the dir that holds `index.js` + `node_modules`), capturing
+/// stdout/stderr/exit status, and deserializes stdout into the SAME neutral [`facts::GoFacts`] DTO
+/// (the contract is language-agnostic; the `Go` in the type name is historical). Every failure mode
+/// maps to a typed [`CoreError`] and is propagated with `?` — never a panic (RUST-04 / T-04-02).
+///
+/// # Errors
+///
+/// - [`CoreError::TypeScriptToolchainMissing`] if the `node` binary cannot be spawned.
+/// - [`CoreError::HelperExit`] if the helper exits non-zero (carries stderr).
+/// - [`CoreError::FactsParse`] if stdout is not the expected JSON facts document.
+pub(crate) fn run_tsextract(target_dir: &str) -> Result<facts::GoFacts, CoreError> {
+    run_tsextract_with("node", target_dir)
+}
+
+/// Inner driver parameterized on the Node binary name so tests can force a missing binary
+/// (toolchain-missing path) without mutating the process `PATH` — mirrors [`run_pyextract_with`].
+fn run_tsextract_with(node_bin: &str, target_dir: &str) -> Result<facts::GoFacts, CoreError> {
+    let output = Command::new(node_bin)
+        // `index.js` and the target dir are DISCRETE args (no shell, no interpolation of
+        // `target_dir` into a single string) — threat T-04-01, mirroring the goextract control.
+        .args(["index.js", target_dir])
+        .current_dir(tsextract_dir())
+        .output()
+        .map_err(|source| CoreError::TypeScriptToolchainMissing { source })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(CoreError::HelperExit {
+            code: output.status.code(),
+            stderr,
+        });
+    }
+
+    let parsed: facts::GoFacts = serde_json::from_slice(&output.stdout)
+        .map_err(|source| CoreError::FactsParse { source })?;
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5);
     // scope the allow so the workspace-wide RUST-04 deny stays intact for prod code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{goextract_dir, pyextract_dir, run_goextract_with, run_pyextract_with};
+    use super::{
+        goextract_dir, pyextract_dir, run_goextract_with, run_pyextract_with, run_tsextract_with,
+        tsextract_dir,
+    };
     use crate::CoreError;
 
     mod goextract_dir {
@@ -186,6 +240,47 @@ mod tests {
                 !py_root.ends_with("goextract"),
                 "pyextract_dir must be the repo root, not the goextract dir: {py_root:?}"
             );
+        }
+    }
+
+    mod tsextract_dir {
+        use super::{goextract_dir, tsextract_dir};
+
+        #[test]
+        fn resolves_a_sibling_of_goextract_ending_in_tsextract() {
+            // `tsextract_dir` points one level down at `<root>/tsextract` (the dir holding
+            // `index.js` + `node_modules`), exactly like `goextract_dir` points at `<root>/goextract`
+            // — they are siblings. Compare lexically (the dir need not exist yet for this assertion).
+            let ts_dir = tsextract_dir();
+            assert!(
+                ts_dir.ends_with("tsextract"),
+                "expected the resolved dir to end in 'tsextract', got {ts_dir:?}"
+            );
+            assert_eq!(
+                ts_dir.parent(),
+                goextract_dir().parent(),
+                "tsextract_dir and goextract_dir must be siblings under the repo root"
+            );
+        }
+    }
+
+    mod run_tsextract {
+        use super::{run_tsextract_with, CoreError};
+
+        #[test]
+        fn returns_typescript_toolchain_missing_when_binary_absent() {
+            // A binary name that cannot exist on PATH forces the spawn to fail with an io::Error
+            // -> TypeScriptToolchainMissing, NOT a panic (T-04-02). Forced via the `_with` split so
+            // we never mutate the process PATH.
+            let result =
+                run_tsextract_with("gnr8-nonexistent-node-binary-xyz", "/some/target/dir");
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, CoreError::TypeScriptToolchainMissing { .. }),
+                "expected TypeScriptToolchainMissing, got {err:?}"
+            );
+            // Display must render without panic and mention the toolchain.
+            assert!(err.to_string().contains("TypeScript toolchain"));
         }
     }
 

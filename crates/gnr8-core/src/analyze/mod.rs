@@ -22,71 +22,92 @@ pub(crate) enum Lang {
     Go,
     /// A Python package/app — routes to [`helper::run_pyextract`].
     Python,
+    /// A TypeScript project — routes to [`helper::run_tsextract`].
+    TypeScript,
 }
 
 /// Classify the language of a resolved target directory by ONE deterministic file scan.
 ///
 /// This is a single classification, never a fallback chain (CLAUDE.md rule 3 / RESEARCH Pitfall 1):
-/// we walk the tree once, recording whether any Go marker (`go.mod` or `*.go`) and/or any Python
-/// marker (`*.py`) is present, then decide from those two booleans. We do NOT "try goextract, and on
-/// failure try pyextract".
+/// we walk the tree once, recording whether any Go marker (`go.mod` or `*.go`), Python marker
+/// (`*.py`), and/or TypeScript marker (`tsconfig.json` or `*.ts`) is present, then make ONE decision
+/// by counting how many languages are present. We do NOT "try goextract, and on failure try
+/// pyextract/tsextract".
 ///
-/// Decision (deterministic, documented order):
-/// - both markers present → a typed [`crate::CoreError::Config`] naming BOTH languages (WR-05): a
-///   mixed tree is genuinely ambiguous, so we surface it and let the user scope the source's `inputs`
-///   to a single-language subdir rather than silently pick one and extract the wrong (or nothing)
-///   from the other. This is still one decision, not a fallback.
-/// - only Python markers → [`Lang::Python`].
-/// - only Go markers → [`Lang::Go`].
-/// - neither (empty / non-existent / unrecognized) → a typed [`crate::CoreError::Config`], never a
-///   guessed language (T-02-04-py).
+/// Decision (deterministic — a single count over the three marker booleans):
+/// - exactly one language present → that [`Lang`].
+/// - more than one present → a typed [`crate::CoreError::Config`] naming the ambiguity (WR-05): a
+///   mixed tree is genuinely ambiguous, so we surface it and let the user scope the source's
+///   `inputs` to a single-language subdir rather than silently pick one and extract the wrong (or
+///   nothing) from the others. This is still one decision, not a fallback.
+/// - none present (empty / non-existent / unrecognized) → a typed [`crate::CoreError::Config`],
+///   never a guessed language (T-02-04-py).
 ///
 /// # Errors
 ///
-/// [`crate::CoreError::Config`] if the target holds BOTH Go and Python source (ambiguous) or no
-/// recognizable Go or Python source.
+/// [`crate::CoreError::Config`] if the target holds MORE THAN ONE of Go/Python/TypeScript source
+/// (ambiguous) or no recognizable Go, Python, or TypeScript source.
 pub(crate) fn detect_language(target_dir: &str) -> Result<Lang, crate::CoreError> {
     let mut has_go = false;
     let mut has_python = false;
+    let mut has_ts = false;
     scan_markers(
         std::path::Path::new(target_dir),
         &mut has_go,
         &mut has_python,
+        &mut has_ts,
     );
 
-    // ONE decision from the two booleans — documented order, no fallback (rule 3).
-    match (has_go, has_python) {
-        (true, true) => Err(crate::CoreError::Config {
+    // ONE decision by COUNTING the present languages — no fallback chain, no try-A-then-B (rule 3).
+    let present = usize::from(has_go) + usize::from(has_python) + usize::from(has_ts);
+    match present {
+        1 => {
+            // Exactly one marker set; pick it directly. The booleans are mutually exclusive here.
+            if has_go {
+                Ok(Lang::Go)
+            } else if has_python {
+                Ok(Lang::Python)
+            } else {
+                Ok(Lang::TypeScript)
+            }
+        }
+        0 => Err(crate::CoreError::Config {
             message: format!(
-                "ambiguous source language of {target_dir:?}: found BOTH Go (go.mod/*.go) and \
-                 Python (*.py) source — scope the source's inputs to a single-language subdir so \
-                 the correct sidecar runs (gnr8 will not guess per-file)"
+                "cannot determine source language of {target_dir:?}: no Go (go.mod/*.go), Python \
+                 (*.py), or TypeScript (tsconfig.json/*.ts) source found — point the source at a \
+                 Go module, a Python app dir, or a TypeScript project"
             ),
         }),
-        (true, false) => Ok(Lang::Go),
-        (false, true) => Ok(Lang::Python),
-        (false, false) => Err(crate::CoreError::Config {
+        _ => Err(crate::CoreError::Config {
             message: format!(
-                "cannot determine source language of {target_dir:?}: no Go (go.mod/*.go) or \
-                 Python (*.py) source found — point the source at a Go module or a Python app dir"
+                "ambiguous source language of {target_dir:?}: found multiple languages among Go \
+                 (go.mod/*.go), Python (*.py), and TypeScript (tsconfig.json/*.ts) — scope the \
+                 source's inputs to a single-language subdir so the correct sidecar runs (gnr8 \
+                 will not guess per-file)"
             ),
         }),
     }
 }
 
-/// Recursively record Go (`go.mod`/`*.go`) and Python (`*.py`) marker presence under `dir`.
+/// Recursively record Go (`go.mod`/`*.go`), Python (`*.py`), and TypeScript (`tsconfig.json`/`*.ts`)
+/// marker presence under `dir`.
 ///
 /// A single tree walk feeding the one [`detect_language`] decision; a directory that cannot be read
 /// (permission, non-existent) simply contributes no markers — the caller turns "no markers" into a
 /// typed `Config` error, so a bad path is a typed error, not a panic (RUST-04).
-fn scan_markers(dir: &std::path::Path, has_go: &mut bool, has_python: &mut bool) {
+fn scan_markers(
+    dir: &std::path::Path,
+    has_go: &mut bool,
+    has_python: &mut bool,
+    has_ts: &mut bool,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_markers(&path, has_go, has_python);
+            scan_markers(&path, has_go, has_python, has_ts);
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -94,14 +115,17 @@ fn scan_markers(dir: &std::path::Path, has_go: &mut bool, has_python: &mut bool)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
-        // Case-insensitive extension comparison (mirrors `sdk::builtins::is_go_file`); `go.mod` is a
-        // fixed file name, not an extension match.
+        // Case-insensitive extension comparison (mirrors `sdk::builtins::is_go_file`); `go.mod` and
+        // `tsconfig.json` are fixed file names, not extension matches. The TS marker MUST include
+        // `*.ts` — the nestjs fixture has NO tsconfig but HAS `*.ts` files (RESEARCH Pitfall 7).
         if name == "go.mod" || ext.eq_ignore_ascii_case("go") {
             *has_go = true;
         } else if ext.eq_ignore_ascii_case("py") {
             *has_python = true;
+        } else if name == "tsconfig.json" || ext.eq_ignore_ascii_case("ts") {
+            *has_ts = true;
         }
-        // Early exit is unnecessary (the trees are small) and would complicate determinism; both
+        // Early exit is unnecessary (the trees are small) and would complicate determinism; the
         // booleans are monotonic so a full walk is correct and order-independent.
     }
 }
@@ -118,8 +142,8 @@ fn scan_markers(dir: &std::path::Path, has_go: &mut bool, has_python: &mut bool)
 /// # Errors
 ///
 /// - [`crate::CoreError::Config`] if the target's language cannot be determined (empty/ambiguous).
-/// - [`crate::CoreError::GoToolchainMissing`] / [`crate::CoreError::PythonToolchainMissing`] if the
-///   selected toolchain cannot be spawned.
+/// - [`crate::CoreError::GoToolchainMissing`] / [`crate::CoreError::PythonToolchainMissing`] /
+///   [`crate::CoreError::TypeScriptToolchainMissing`] if the selected toolchain cannot be spawned.
 /// - [`crate::CoreError::HelperExit`] if the sidecar exits non-zero.
 /// - [`crate::CoreError::FactsParse`] if the sidecar's stdout is not the expected JSON.
 pub fn build_graph(fixture_dir: &str) -> Result<crate::graph::ApiGraph, crate::CoreError> {
@@ -129,6 +153,7 @@ pub fn build_graph(fixture_dir: &str) -> Result<crate::graph::ApiGraph, crate::C
     let facts = match detect_language(&target)? {
         Lang::Python => helper::run_pyextract(&target)?,
         Lang::Go => helper::run_goextract(&target)?,
+        Lang::TypeScript => helper::run_tsextract(&target)?,
     };
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
@@ -148,6 +173,10 @@ mod tests {
     );
     const GOALSERVICE_FIXTURE_DIR: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
+    const NESTJS_FIXTURE_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/nestjs-bookstore"
+    );
 
     /// `build_graph` against a non-existent fixture dir must return a typed `CoreError` — never a
     /// panic, never `NotYetImplemented`. With language dispatch (02-01) a non-existent dir now
@@ -164,6 +193,7 @@ mod tests {
                 CoreError::Config { .. }
                     | CoreError::GoToolchainMissing { .. }
                     | CoreError::PythonToolchainMissing { .. }
+                    | CoreError::TypeScriptToolchainMissing { .. }
                     | CoreError::HelperExit { .. }
                     | CoreError::FactsParse { .. }
             ),
@@ -176,12 +206,13 @@ mod tests {
         );
     }
 
-    /// The single deterministic detector classifies the `FastAPI` fixture (a `*.py` tree) as Python and
-    /// the goalservice fixture (a `go.mod`/`*.go` module) as Go — the one decision `build_graph`/
-    /// `collect` route on (rule 3). Uses the same `CARGO_MANIFEST_DIR`-relative fixture-path style as
-    /// the snapshot tests so it does not depend on the process cwd.
+    /// The single deterministic detector classifies the `FastAPI` fixture (a `*.py` tree) as Python,
+    /// the goalservice fixture (a `go.mod`/`*.go` module) as Go, and the nestjs-bookstore fixture (a
+    /// `*.ts` tree with NO tsconfig — RESEARCH Pitfall 7) as TypeScript — the one decision
+    /// `build_graph`/`collect` route on (rule 3). Uses the same `CARGO_MANIFEST_DIR`-relative
+    /// fixture-path style as the snapshot tests so it does not depend on the process cwd.
     #[test]
-    fn detect_language_classifies_python_and_go_fixtures() {
+    fn detect_language_classifies_python_go_and_typescript_fixtures() {
         assert_eq!(
             detect_language(FASTAPI_FIXTURE_DIR).unwrap(),
             Lang::Python,
@@ -191,6 +222,11 @@ mod tests {
             detect_language(GOALSERVICE_FIXTURE_DIR).unwrap(),
             Lang::Go,
             "the goalservice fixture is a Go module"
+        );
+        assert_eq!(
+            detect_language(NESTJS_FIXTURE_DIR).unwrap(),
+            Lang::TypeScript,
+            "the nestjs-bookstore fixture is a *.ts tree (no tsconfig — *.ts marker is required)"
         );
     }
 
@@ -236,6 +272,30 @@ mod tests {
         assert!(
             matches!(&result, Err(CoreError::Config { message }) if message.contains("ambiguous")),
             "a mixed Go/Python tree must be a typed Config error naming the ambiguity, got {result:?}"
+        );
+    }
+
+    /// A tree carrying BOTH a `*.go` and a `*.ts` marker is ambiguous and must be a typed `Config`
+    /// error naming the multi-language ambiguity — never a silent pick of one. Mirrors the WR-05
+    /// mixed-Go/Python test, extended to the three-language classifier (a third marker now exists).
+    #[test]
+    fn detect_language_rejects_a_mixed_go_typescript_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-detect-mixed-ts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.go"), b"package main\n").unwrap();
+        std::fs::write(dir.join("app.ts"), b"export const x = 1;\n").unwrap();
+        let result = detect_language(&dir.to_string_lossy());
+        // Clean up before asserting so a failure does not leak the temp dir.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CoreError::Config { message }) if message.contains("ambiguous")),
+            "a mixed Go/TS tree must be a typed Config error naming the ambiguity, got {result:?}"
         );
     }
 }

@@ -48,6 +48,20 @@ pub enum CoreError {
         source: std::io::Error,
     },
 
+    /// The TypeScript/Node toolchain could not be spawned (e.g. `node` is not installed or not on
+    /// `PATH`).
+    ///
+    /// Wraps the [`std::io::Error`] from spawning the `tsextract` subprocess so the cause is
+    /// preserved without panicking (RUST-04 / T-04-02). The TypeScript twin of
+    /// [`Self::PythonToolchainMissing`] / [`Self::GoToolchainMissing`]; the three are kept distinct so
+    /// a caller can tell which sidecar's toolchain is absent.
+    #[error("TypeScript toolchain not available (is `node` installed and on PATH?): {source}")]
+    TypeScriptToolchainMissing {
+        /// The underlying spawn error from [`std::process::Command::output`].
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The `goextract` helper ran but exited with a non-zero status.
     ///
     /// Carries the exit `code` (absent if the process was signal-terminated) and the captured
@@ -214,6 +228,16 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("Python toolchain not available"), "{msg}");
+            assert!(msg.contains("no such file"), "{msg}");
+        }
+
+        #[test]
+        fn typescript_toolchain_missing_renders_with_source() {
+            let err = CoreError::TypeScriptToolchainMissing {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("TypeScript toolchain not available"), "{msg}");
             assert!(msg.contains("no such file"), "{msg}");
         }
 
