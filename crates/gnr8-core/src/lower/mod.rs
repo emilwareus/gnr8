@@ -782,7 +782,10 @@ mod tests {
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         // After `from_facts` sorts schemas by id, schemas[1] is `CreateGoalInput`; its mutated union
         // body renders a oneOf component with a $ref member and a typed member. Bound the block.
-        let block = yaml.split("CreateGoalInput:").nth(1).expect("union component block");
+        let block = yaml
+            .split("CreateGoalInput:")
+            .nth(1)
+            .expect("union component block");
         let block = block.split("GoalResponse:").next().unwrap_or(block);
         assert!(
             block.contains("oneOf:"),

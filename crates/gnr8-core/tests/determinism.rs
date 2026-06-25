@@ -18,6 +18,13 @@
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
+/// The `FastAPI` (Python) fixture — the determinism twin proves the pyextract sidecar path is
+/// byte-identical across runs, exactly like the Go helper path.
+const FASTAPI_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/fastapi-bookstore"
+);
+
 /// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4): one
 /// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so the contract
 /// tests supply it here to drive lowering (graph-owned `SecurityScheme`s).
@@ -93,5 +100,52 @@ fn sdk_generate_is_byte_identical_across_two_runs() {
     assert_eq!(
         a, b,
         "two sdk::generate runs over unchanged source must be byte-identical (idempotent SDK gen)"
+    );
+}
+
+#[test]
+fn fastapi_build_graph_is_byte_identical_across_two_runs() {
+    // Skip gracefully if the python3 toolchain is absent so the test never fails for a missing dep.
+    let Ok(first) = gnr8_core::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
+        eprintln!(
+            "skipping FastAPI determinism test: python3 toolchain unavailable for {FASTAPI_FIXTURE_DIR}"
+        );
+        return;
+    };
+    let second = gnr8_core::analyze::build_graph(FASTAPI_FIXTURE_DIR)
+        .expect("second FastAPI build_graph run must also succeed");
+
+    let a = serde_json::to_string(&first).expect("serialize first FastAPI graph");
+    let b = serde_json::to_string(&second).expect("serialize second FastAPI graph");
+
+    assert_eq!(
+        a, b,
+        "two pyextract build_graph runs over unchanged source must serialize byte-identically (GRAPH-02)"
+    );
+}
+
+#[test]
+fn fastapi_to_openapi_is_byte_identical_across_two_runs() {
+    // Skip gracefully if the python3 toolchain is absent.
+    let Ok(first) = gnr8_core::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
+        eprintln!(
+            "skipping FastAPI OpenAPI determinism test: python3 toolchain unavailable for {FASTAPI_FIXTURE_DIR}"
+        );
+        return;
+    };
+    let second = gnr8_core::analyze::build_graph(FASTAPI_FIXTURE_DIR)
+        .expect("second FastAPI build_graph run must also succeed");
+
+    // Build twice AND lower twice — proving both the upstream graph and the reused lowering are
+    // deterministic end-to-end for the Python path (idempotent OpenAPI generation).
+    let security = fixture_security();
+    let a = gnr8_core::lower::to_openapi(&first, "bookstore", "/books", &security)
+        .expect("first FastAPI to_openapi must succeed");
+    let b = gnr8_core::lower::to_openapi(&second, "bookstore", "/books", &security)
+        .expect("second FastAPI to_openapi must succeed");
+
+    assert_eq!(
+        a, b,
+        "two FastAPI to_openapi runs over unchanged source must be byte-identical (idempotent lowering)"
     );
 }

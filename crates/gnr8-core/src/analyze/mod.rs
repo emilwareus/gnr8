@@ -46,7 +46,11 @@ pub(crate) enum Lang {
 pub(crate) fn detect_language(target_dir: &str) -> Result<Lang, crate::CoreError> {
     let mut has_go = false;
     let mut has_python = false;
-    scan_markers(std::path::Path::new(target_dir), &mut has_go, &mut has_python);
+    scan_markers(
+        std::path::Path::new(target_dir),
+        &mut has_go,
+        &mut has_python,
+    );
 
     // ONE decision from the two booleans — documented order, no fallback (rule 3).
     match (has_go, has_python) {
@@ -129,8 +133,10 @@ mod tests {
     use super::{detect_language, Lang};
     use crate::CoreError;
 
-    const FASTAPI_FIXTURE_DIR: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/fastapi-bookstore");
+    const FASTAPI_FIXTURE_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/fastapi-bookstore"
+    );
     const GOALSERVICE_FIXTURE_DIR: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 

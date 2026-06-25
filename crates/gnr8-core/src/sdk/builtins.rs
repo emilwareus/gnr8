@@ -655,10 +655,7 @@ mod tests {
             "FastApi with many inputs must be a Config error"
         );
         assert!(
-            matches!(
-                Flask::new().load(&cx),
-                Err(crate::CoreError::Config { .. })
-            ),
+            matches!(Flask::new().load(&cx), Err(crate::CoreError::Config { .. })),
             "Flask with no inputs must be a Config error"
         );
         assert!(

@@ -1,17 +1,12 @@
-//! RED-BY-DESIGN contract test (IR-04): the INTENDED OpenAPI 3.1 document lowered from the FastAPI
-//! bookstore fixture.
+//! Contract test (IR-04): the OpenAPI 3.1 document lowered from the FastAPI bookstore fixture — GREEN.
 //!
-//! This test is intentionally RED in Phase 1: there is NO `pyextract` sidecar yet, so
-//! `analyze::build_graph` cannot produce a graph for a Python service and the `.expect()` below
-//! panics honestly before lowering ever runs. The committed
-//! `snapshots/snapshot_fastapi_openapi__fastapi_openapi.snap` is authored BY HAND to the INTENDED
-//! neutral OpenAPI the Phase-2 extractor MUST produce (objects, arrays, string enums, `oneOf` unions,
-//! `type: [T, "null"]` nullability) — the acceptance contract that flips this test green with ZERO
-//! snapshot edits when `pyextract` lands.
+//! Plan 02-03 landed FastAPI route recognition, so `analyze::build_graph` produces the real graph and
+//! the reused `lower::to_openapi` pipeline lowers it (objects, arrays, string enums, `oneOf` unions —
+//! including a union-bodied NAMED component, `type: [T, "null"]` nullability) into the COMMITTED
+//! `snapshots/snapshot_fastapi_openapi__fastapi_openapi.snap` byte-for-byte with ZERO snapshot edits.
+//! `CI=true` keeps insta in `INSTA_UPDATE=no`, so a mismatch hard-fails — it never auto-accepts.
 //!
-//! It is marked `#[ignore]` (red-by-design) so `cargo test`/`make check` SKIP it while it stays
-//! visible and runnable on demand:
-//!   `cargo test -p gnr8-core --test snapshot_fastapi_openapi -- --ignored`  (FAILS at the .expect()).
+//! Requires the python3 toolchain (build_graph invokes `python3 -m pyextract`).
 
 // Tests legitimately use unwrap/expect; scoped allow keeps RUST-04 intact for production code.
 // `doc_markdown` is allowed too: these test-target doc comments are prose that names many
@@ -37,11 +32,11 @@ fn fixture_security() -> Vec<gnr8_core::graph::SecurityScheme> {
 }
 
 #[test]
-#[ignore = "red-by-design: pyextract lands in Phase 2; intended-green snapshot is the acceptance contract"]
 fn openapi_matches_expected_for_fastapi() {
-    // RED BY DESIGN (Phase 1): no pyextract yet — build_graph panics before lowering runs.
+    // 02-03: build_graph runs pyextract, then the reused lowering produces the OpenAPI document the
+    // committed .snap locks (byte-identical against the reconciled fixture).
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
-        .expect("pyextract lands in Phase 2 — intentionally red until then");
+        .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
     let openapi = gnr8_core::lower::to_openapi(&graph, "bookstore", "/books", &fixture_security())
         .expect("lower::to_openapi must succeed");
     insta::assert_snapshot!("fastapi_openapi", openapi);

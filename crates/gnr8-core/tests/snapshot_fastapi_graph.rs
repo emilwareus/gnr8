@@ -1,16 +1,13 @@
-//! RED-BY-DESIGN contract test (IR-04): the INTENDED neutral API graph for the FastAPI bookstore
-//! fixture.
+//! Contract test (IR-04): the neutral API graph for the FastAPI bookstore fixture — now GREEN.
 //!
-//! This test is intentionally RED in Phase 1: there is NO `pyextract` sidecar yet, so
-//! `analyze::build_graph` cannot produce a graph for a Python service and the `.expect()` below
-//! panics honestly. The committed `snapshots/snapshot_fastapi_graph__fastapi_graph.snap` is authored
-//! BY HAND to the INTENDED neutral graph the Phase-2 extractor MUST produce — it is the acceptance
-//! contract that flips this test green with ZERO snapshot edits the moment `pyextract` lands.
+//! Plan 02-03 landed FastAPI route recognition in `pyextract`, so `analyze::build_graph` (Python
+//! dispatch → `run_pyextract`) produces the real router-agnostic graph for the bookstore service and
+//! this test asserts it against the COMMITTED `snapshots/snapshot_fastapi_graph__fastapi_graph.snap`.
+//! That snapshot was authored BY HAND to the intended neutral graph and the extractor + reconciled
+//! fixture reproduce it byte-for-byte with ZERO snapshot edits. `CI=true` keeps insta in
+//! `INSTA_UPDATE=no`, so a mismatch hard-fails — it never auto-accepts.
 //!
-//! Because it is red by design it is marked `#[ignore]` so `cargo test`/`make check` SKIP it (the
-//! green gate stays green) while it remains visible and runnable on demand:
-//!   `cargo test -p gnr8-core --test snapshot_fastapi_graph -- --ignored`  (FAILS at the .expect()).
-//! `CI=true` keeps insta in `INSTA_UPDATE=no`, so the committed snapshot never auto-flips green.
+//! Requires the python3 toolchain (the test invokes the helper via `python3 -m pyextract`).
 
 // Tests legitimately use unwrap/expect; scope the allow to this test target so the workspace-wide
 // RUST-04 deny stays intact for production code (Pitfall 2).
@@ -25,11 +22,10 @@ const FIXTURE_DIR: &str = concat!(
 );
 
 #[test]
-#[ignore = "red-by-design: pyextract lands in Phase 2; intended-green snapshot is the acceptance contract"]
 fn graph_matches_expected_for_fastapi() {
-    // RED BY DESIGN (Phase 1): no pyextract yet, so build_graph cannot produce this graph.
-    // The committed .snap encodes the INTENDED neutral graph the Phase-2 extractor must produce.
+    // 02-03: build_graph runs the pyextract helper and returns the real router-agnostic graph; the
+    // committed .snap locks its reviewed YAML shape (byte-identical against the reconciled fixture).
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
-        .expect("pyextract lands in Phase 2 — intentionally red until then");
+        .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
     insta::assert_yaml_snapshot!("fastapi_graph", graph);
 }
