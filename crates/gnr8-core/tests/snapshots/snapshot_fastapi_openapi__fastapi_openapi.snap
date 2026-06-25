@@ -1,0 +1,178 @@
+---
+source: crates/gnr8-core/tests/snapshot_fastapi_openapi.rs
+expression: openapi
+---
+openapi: 3.1.0
+info:
+  title: bookstore
+  version: 0.1.0
+security:
+  - ApiKeyAuth: []
+paths:
+  '/books/':
+    get:
+      operationId: list_books
+      parameters:
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: genre
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: sort
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListBooksResponse'
+    post:
+      operationId: create_book
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Book'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedMessage'
+  '/books/{book_id}':
+    get:
+      operationId: get_book
+      parameters:
+      - name: book_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      - name: fmt
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/BookFormat'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookOrError'
+    put:
+      operationId: update_book
+      parameters:
+      - name: book_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookFilters'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedMessage'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    Author:
+      type: object
+      required: [bio, name]
+      properties:
+        bio:
+          type: [string, null]
+        name:
+          type: string
+    Book:
+      type: object
+      required: [author, format, id, title]
+      properties:
+        author:
+          $ref: '#/components/schemas/Author'
+        format:
+          $ref: '#/components/schemas/BookFormat'
+        id:
+          type: integer
+        rating:
+          oneOf:
+          - type: integer
+          - type: number
+          - type: null
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+    BookFilters:
+      type: object
+      required: [genre, published]
+      properties:
+        genre:
+          type: string
+        in_stock:
+          type: boolean
+        published:
+          type: [integer, null]
+        sort:
+          oneOf:
+          - type: string
+            enum: [asc, desc]
+          - type: null
+    BookFormat:
+      type: string
+      enum: [hardcover, paperback]
+    BookOrError:
+      oneOf:
+      - $ref: '#/components/schemas/Book'
+      - $ref: '#/components/schemas/OutOfStock'
+    CreatedMessage:
+      type: object
+      required: [id, message]
+      properties:
+        id:
+          type: integer
+        message:
+          type: string
+    ListBooksResponse:
+      type: object
+      required: [books, next_cursor, total]
+      properties:
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/Book'
+        next_cursor:
+          type: [string, null]
+        total:
+          type: integer
+    OutOfStock:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
