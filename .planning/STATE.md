@@ -4,13 +4,13 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T16:49:32.437Z"
+last_updated: "2026-06-25T17:02:30.398Z"
 last_activity: 2026-06-25 -- Phase 02 execution started
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 7
-  completed_plans: 4
+  completed_plans: 5
   percent: 17
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-25)
 ## Current Position
 
 Phase: 02 (Python Source — pyextract) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Executing Phase 02
 Last activity: 2026-06-25 -- Phase 02 execution started
 
-Progress: [██████░░░░] 57%
+Progress: [███████░░░] 71%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [██████░░░░] 57%
 | Phase 01 P01 | 23 | 3 tasks | 8 files |
 | Phase 01 P03 | 38 | 3 tasks | 23 files |
 | Phase 02 P01 | 18 | 3 tasks | 7 files |
+| Phase 02 P02 | 22 | 3 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -72,6 +73,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-01] optional and nullable are independent parallel bool flags; all four combinations representable. Type::Ext omitted (no extension runtime this phase).
 - [Phase ?]: [01-01] lower/ and gosdk/ left intentionally non-compiling against the new enum (Plan 01-02 compile-error signal; no _ => shims); the Go side is fully green.
 - [Phase ?]: 01-03: red-by-design multi-language fixtures gated via #[ignore]; six intended-green graph+OpenAPI snapshots flip green in Phases 2/4 with zero edits
+- [Phase ?]: [02-02] pyextract sidecar: static-only (ast.parse of file TEXT, never import/exec the target); an owned cross-module symbol table replaces go/types (rule 2 hand-rolled); unresolvable name -> UNRESOLVABLE sentinel -> diagnostic + omit (rule 3, never a guessed default).
+- [Phase ?]: [02-02] Literal[...] alias is inlined-only and never a standalone schema; only a Union alias (referenced by ref_id) becomes a schema. Python int->int64-signed, float->float64. Optional/|None is a FIELD nullable axis. Snapshot is authoritative.
 
 ### Pending Todos
 
@@ -92,7 +95,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T16:49:32.429Z
+Last session: 2026-06-25T17:02:22.976Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 

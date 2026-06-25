@@ -24,7 +24,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 
 - [ ] **PYSRC-01**: A developer can extract routes, path/query params, request bodies (Pydantic/`@dataclass`), response models, and status codes from a **FastAPI** service into the IR.
 - [ ] **PYSRC-02**: A developer can extract routes (including blueprint/`APIRouter` prefixes) and opt-in typed DTOs/returns from a **Flask** service into the IR.
-- [ ] **PYSRC-03**: The Python sidecar resolves types **statically** via stdlib `ast` + an owned cross-module symbol table, and never imports/executes the target code.
+- [x] **PYSRC-03**: The Python sidecar resolves types **statically** via stdlib `ast` + an owned cross-module symbol table, and never imports/executes the target code.
 - [ ] **PYSRC-04**: Unresolvable or untyped surfaces (untyped `request.json`, dynamic prefixes, foreign types) produce **diagnostics**, never guessed facts (no fallback).
 - [x] **PYSRC-05**: A developer enables Python extraction from `.gnr8/` code via `FastApi` / `Flask` `Source` built-ins.
 
@@ -95,7 +95,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | IR-04 | Phase 1 | Complete |
 | PYSRC-01 | Phase 2 | Pending |
 | PYSRC-02 | Phase 2 | Pending |
-| PYSRC-03 | Phase 2 | Pending |
+| PYSRC-03 | Phase 2 | Complete |
 | PYSRC-04 | Phase 2 | Pending |
 | PYSRC-05 | Phase 2 | Complete |
 | PYSDK-01 | Phase 3 | Pending |

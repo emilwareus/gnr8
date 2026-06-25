@@ -98,7 +98,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 02-02-PLAN.md — pyextract sidecar core: stdlib-ast loader, OWNED cross-module symbol table, annotation→neutral-Type mapper (four-axis fields), deterministic facts marshal; static-only, unittest golden harness [PYSRC-03]
+- [x] 02-02-PLAN.md — pyextract sidecar core: stdlib-ast loader, OWNED cross-module symbol table, annotation→neutral-Type mapper (four-axis fields), deterministic facts marshal; static-only, unittest golden harness [PYSRC-03]
 
 **Wave 3** *(blocked on Wave 2)*
 
@@ -176,7 +176,7 @@ dependencies.)
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
-| 2. Python Source — `pyextract` | v2.0 | 1/4 | In Progress|  |
+| 2. Python Source — `pyextract` | v2.0 | 2/4 | In Progress|  |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 0/TBD | Not started | - |
