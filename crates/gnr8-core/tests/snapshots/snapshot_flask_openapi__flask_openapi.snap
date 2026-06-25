@@ -94,8 +94,9 @@ components:
           type: [string, null]
         discount:
           oneOf:
-          - type: integer
-          - type: number
+          - oneOf:
+            - type: integer
+            - type: number
           - type: null
         note:
           type: [string, null]

@@ -119,8 +119,9 @@ components:
           type: integer
         rating:
           oneOf:
-          - type: integer
-          - type: number
+          - oneOf:
+            - type: integer
+            - type: number
           - type: null
         tags:
           type: array
@@ -139,10 +140,8 @@ components:
         published:
           type: [integer, null]
         sort:
-          oneOf:
-          - type: string
-            enum: [asc, desc]
-          - type: null
+          type: [string, null]
+          enum: [asc, desc]
     BookFormat:
       type: string
       enum: [hardcover, paperback]
