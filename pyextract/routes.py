@@ -468,15 +468,24 @@ def _flask_body_and_params(
                 continue
             # Typed query param: an annotated local reading request.args.get(...).
             if _is_request_args_get(value):
+                # rule 3: a query param with no usable name is not a fact we can
+                # emit — an empty "name" is an invalid OpenAPI parameter. Diagnose
+                # + skip rather than fabricate "".
+                if not isinstance(stmt.target, ast.Name):
+                    diags.warn(
+                        "typed query param on {} {} has a non-name target; param "
+                        "omitted (no fallback)".format(method, path),
+                        abs_path,
+                        getattr(stmt, "lineno", 0),
+                    )
+                    continue
                 schema, _nullable = types.map_field_annotation(
                     annotation, in_module, table, diags
                 )
                 if schema is not None:
                     params.append(
                         {
-                            "name": stmt.target.id
-                            if isinstance(stmt.target, ast.Name)
-                            else "",
+                            "name": stmt.target.id,
                             "location": "query",
                             "required": False,
                             "schema": schema,
