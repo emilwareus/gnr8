@@ -86,12 +86,24 @@ def _flatten_bitor(node):
 
 
 def _literal_members(node):
-    """Return sorted string members of a ``Literal[...]`` subscript."""
+    """Return ``(sorted_string_members, faithful)`` for a ``Literal[...]`` subscript.
+
+    ``faithful`` is False if any member is non-string (e.g. ``Literal[1, 2]`` or
+    ``Literal[MyEnum.X]``) — the neutral enum vocabulary only represents string
+    members, so a non-string literal cannot be faithfully encoded (rule 3: the
+    caller must diagnose + omit rather than emit a lossy/empty enum).
+    """
     members = []
-    for arg in _subscript_args(node):
+    faithful = True
+    args = _subscript_args(node)
+    for arg in args:
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             members.append(arg.value)
-    return sorted(members)
+        else:
+            faithful = False
+    if not args:
+        faithful = False
+    return sorted(members), faithful
 
 
 def map_annotation(node, in_module, table, diags):
@@ -239,7 +251,18 @@ def _map_subscript(node, in_module, table, diags):
         return {"type": "map", "of": {"key": key, "value": value}}
 
     if simple == "Literal":
-        return {"type": "enum", "of": _literal_members(node)}
+        members, faithful = _literal_members(node)
+        if not faithful or not members:
+            # rule 3: a Literal with non-string or no members cannot be encoded as
+            # a string enum — diagnose + omit, never a lossy/empty enum.
+            diags.warn(
+                "unsupported Literal annotation: {} has non-string or no members; "
+                "fact omitted (no fallback)".format(base),
+                _file_of(table, in_module),
+                getattr(node, "lineno", 0),
+            )
+            return None
+        return {"type": "enum", "of": members}
 
     if simple == "Union":
         return _map_union(_subscript_args(node), in_module, table, diags)

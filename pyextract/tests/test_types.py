@@ -133,6 +133,29 @@ class EnumAndUnionTests(unittest.TestCase):
         )
 
 
+class LiteralFaithfulnessTests(unittest.TestCase):
+    """WR-02 regression: a Literal with non-string or no members must diagnose +
+    omit, never a lossy/empty string enum (rule 3)."""
+
+    def test_all_string_literal_still_works(self):
+        t, diags = _map("Literal['a', 'b']")
+        self.assertEqual(t, {"type": "enum", "of": ["a", "b"]})
+        self.assertEqual(diags.items(), [])
+
+    def test_all_int_literal_diagnoses_and_omits(self):
+        t, diags = _map("Literal[1, 2]")
+        self.assertIsNone(t)
+        self.assertNotEqual(t, {"type": "enum", "of": []})
+        items = diags.items()
+        self.assertEqual(len(items), 1)
+        self.assertIn("non-string or no members", items[0]["message"])
+
+    def test_mixed_literal_diagnoses_and_omits(self):
+        t, diags = _map("Literal[1, 'a']")
+        self.assertIsNone(t)
+        self.assertTrue(diags.items())
+
+
 class OptionalNullableTests(unittest.TestCase):
     def test_optional_unwraps_and_signals_nullable(self):
         node = _ann("Optional[str]")
