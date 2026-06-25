@@ -67,7 +67,7 @@ paths, static-only extraction, deterministic byte-identical output).
 Plans:
 **Wave 1**
 
-- [ ] 01-01-PLAN.md — Neutral Type enum + facts contract (facts.rs serde + facts.go json tags + graph IR) in lockstep; optional/nullable axes [IR-01, IR-02]
+- [x] 01-01-PLAN.md — Neutral Type enum + facts contract (facts.rs serde + facts.go json tags + graph IR) in lockstep; optional/nullable axes [IR-01, IR-02]
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -158,7 +158,7 @@ dependencies.)
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 0/TBD | Not started | - |
+| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 1/3 | In Progress|  |
 | 2. Python Source — `pyextract` | v2.0 | 0/TBD | Not started | - |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |

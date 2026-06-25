@@ -15,8 +15,8 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 
 ### Language-neutral core (IR)
 
-- [ ] **IR-01**: The IR + JSON facts contract express the cross-language type vocabulary (objects, arrays, enums, optional/nullable, unions) without Go-specific assumptions.
-- [ ] **IR-02**: Every language sidecar emits one shared JSON facts contract the Rust host deserializes strictly (`deny_unknown_fields`); no language terms leak into the IR.
+- [x] **IR-01**: The IR + JSON facts contract express the cross-language type vocabulary (objects, arrays, enums, optional/nullable, unions) without Go-specific assumptions.
+- [x] **IR-02**: Every language sidecar emits one shared JSON facts contract the Rust host deserializes strictly (`deny_unknown_fields`); no language terms leak into the IR.
 - [ ] **IR-03**: OpenAPI lowering + SDK generation consume the IR unchanged across all supported languages (no per-language branches in lowering).
 - [ ] **IR-04**: Multi-language fixture services (FastAPI, Flask, NestJS) encode the v2.0 acceptance cases, with red-by-design snapshots in place before extraction lands.
 
@@ -89,8 +89,8 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| IR-01 | Phase 1 | Pending |
-| IR-02 | Phase 1 | Pending |
+| IR-01 | Phase 1 | Complete |
+| IR-02 | Phase 1 | Complete |
 | IR-03 | Phase 1 | Pending |
 | IR-04 | Phase 1 | Pending |
 | PYSRC-01 | Phase 2 | Pending |

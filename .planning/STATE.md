@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: planning
+status: executing
 stopped_at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
-last_updated: "2026-06-25T14:17:43.195Z"
-last_activity: 2026-06-25 — v2.0 roadmap created (6 phases, 24/24 requirements mapped); phase numbers reset to start at 1
+last_updated: "2026-06-25T14:45:36.856Z"
+last_activity: 2026-06-25 -- Phase 01 execution started
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 3
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-25)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 1 — Language-Neutral IR + Facts Contract + Fixtures
+**Current focus:** Phase 01 — Language-Neutral IR + Facts Contract + Fixtures
 
 ## Current Position
 
-Phase: 1 of 6 (Language-Neutral IR + Facts Contract + Fixtures)
-Plan: — (roadmap created; phase not yet planned)
-Status: Ready to plan
-Last activity: 2026-06-25 — v2.0 roadmap created (6 phases, 24/24 requirements mapped); phase numbers reset to start at 1
+Phase: 01 (Language-Neutral IR + Facts Contract + Fixtures) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 01
+Last activity: 2026-06-25 -- Phase 01 execution started
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
 
@@ -52,6 +52,7 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: N/A
 
 *Updated after each plan completion. v1.0 velocity (14 plans, ~10min avg) archived in .planning/milestones/v1.0-*.*
+| Phase 01 P01 | 23 | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -65,6 +66,9 @@ Recent decisions affecting current work:
 - [v2.0]: TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar — the single documented rule-2 carve-out (the language's own reference compiler, zero-dependency, behind the JSON-facts boundary). Bright line: never read `@nestjs/swagger` / `zod` / `class-validator` (rule 1).
 - [v2.0]: Generated SDKs stay dependency-free (`PySdk` = stdlib `urllib` + `@dataclass`; `TsSdk` = built-in `fetch` + typed interfaces), like the v1.0 Go SDK's `net/http`.
 - [v1.0]: OpenAPI is an artifact, not the internal model; the graph is the source of truth; deterministic byte-identical output (carried forward, still in force).
+- [Phase ?]: [01-01] Neutral Type enum: adjacently-tagged ({type,of}); Prim internally-tagged; Type::Any = empty struct variant for buffered deny_unknown_fields safety. IR re-exports the facts vocabulary (one definition, zero drift).
+- [Phase ?]: [01-01] optional and nullable are independent parallel bool flags; all four combinations representable. Type::Ext omitted (no extension runtime this phase).
+- [Phase ?]: [01-01] lower/ and gosdk/ left intentionally non-compiling against the new enum (Plan 01-02 compile-error signal; no _ => shims); the Go side is fully green.
 
 ### Pending Todos
 
@@ -85,7 +89,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25 15:00
+Last session: 2026-06-25T14:45:13.209Z
 Stopped at: Created v2.0 ROADMAP.md (6 phases) + populated REQUIREMENTS.md traceability (24/24)
 Resume file: None
 
