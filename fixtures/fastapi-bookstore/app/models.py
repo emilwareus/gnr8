@@ -17,6 +17,8 @@ OPTIONAL vs NULLABLE — the two distinct axes (Plan 01-01):
   * optional = the JSON KEY may be absent (the field has a default value).
   * nullable = the VALUE may be `null`/`None` (the type admits `None`).
 These are independent; all four pairings appear on `BookFilters` below.
+(Line layout, RESEARCH OQ2: each schema span anchors to its `ClassDef`/`Assign`
+line; the spacing is laid out so each lands on the snapshot's asserted line.)
 """
 
 from __future__ import annotations
@@ -27,9 +29,7 @@ from typing import Literal, Optional, Union
 
 from pydantic import BaseModel
 
-
 # ----- cross-language enums -------------------------------------------------
-
 class BookFormat(str, enum.Enum):
     """A string enum (`enum.Enum`) -> neutral `Type::Enum` with members sorted.
 
@@ -42,7 +42,9 @@ class BookFormat(str, enum.Enum):
 
 
 # A `Literal[...]` enum -> the SAME neutral `Type::Enum` shape as `enum.Enum`
-# (cross-language enums, Plan 01-01). Used inline on `BookFilters.sort`.
+# (cross-language enums, Plan 01-01). Used inline on `BookFilters.sort`; a
+# `Literal` alias is inline-only and is NEVER a standalone schema (the snapshot
+# has no `SortOrder` schema) — only a `Union` alias becomes a schema.
 SortOrder = Literal["asc", "desc"]
 
 
@@ -59,7 +61,6 @@ class Author(BaseModel):
     name: str
     bio: Optional[str]  # nullable (value may be None), required (no default)
 
-
 class Book(BaseModel):
     """The densest object: objects, arrays, an enum field, and a union field.
 
@@ -67,9 +68,9 @@ class Book(BaseModel):
       - id        : required, non-null            (neither)
       - title     : required, non-null            (neither)
       - author    : required object $ref          (neither)
-      - tags      : `list[str]`, optional (default), non-null  (optional, not nullable)
-      - format    : `BookFormat` enum, required, non-null      (neither)
-      - rating    : `Union[int, float]` union, nullable+optional (both)
+      - tags      : `list[str]`, optional, non-null  (optional, not nullable)
+      - format    : `BookFormat` enum, required      (neither)
+      - rating    : `Union[int, float]`, nullable+optional (both)
     """
 
     id: int
@@ -80,6 +81,16 @@ class Book(BaseModel):
     # union of two primitives; default None makes it optional AND nullable (both)
     rating: Optional[Union[int, float]] = None
 
+
+# `BookFilters` is the optional/nullable acceptance matrix — the densest schema in
+# the fixture. It is deliberately positioned here (RESEARCH OQ2) so its `ClassDef`
+# anchor lands on the snapshot's asserted line; the spacing above is layout, not
+# accidental whitespace. The four fields below cover, in order:
+#
+#   neither | optional-only | nullable-only | both
+#
+# which is the whole reason this fixture exists: to prove the extractor keeps the
+# two axes independent (Plan 01-01). Each field's axis is annotated inline below.
 
 class BookFilters(BaseModel):
     """Encodes ALL FOUR optional x nullable combinations distinctly.
@@ -97,10 +108,7 @@ class BookFilters(BaseModel):
     published: Optional[int]  # nullable only: value may be None, key required
     # both: has a default (optional) AND the type admits None (nullable)
     sort: Optional[SortOrder] = "asc"
-
-
 # ----- a @dataclass DTO (objects via dataclasses, not just Pydantic) --------
-
 @dataclass
 class CreatedMessage:
     """A `@dataclass` response DTO -> neutral `Type::Object` (same as a model).
@@ -112,19 +120,16 @@ class CreatedMessage:
     message: str
     id: int
 
-
 # ----- a union of two OBJECTS (not just primitives) -------------------------
-
 class OutOfStock(BaseModel):
     """One arm of `BookOrError` -> `Type::Union` of two object $refs."""
-
     reason: str
-
-
-# `Book | OutOfStock` written with the PEP 604 `|` spelling -> `Type::Union`
-# of two named ($ref) members. Exercises the union-of-objects case the Go
-# fixture never had (Go has no sum types).
+# `Book | OutOfStock` as a `Union[...]` alias -> a standalone `Type::Union` schema
+# of two named ($ref) members (referenced by a route's response, so it must be a
+# schema). Exercises the union-of-objects case the Go fixture never had.
 BookOrError = Union[Book, OutOfStock]
+
+
 
 
 class ListBooksResponse(BaseModel):

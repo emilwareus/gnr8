@@ -290,8 +290,8 @@ fn build_component_schemas(
         .collect()
 }
 
-/// Lower one named graph [`Schema`] (an [`Type::Object`] or [`Type::Enum`] body) into a
-/// [`SchemaObject`]. A named schema's body is a neutral [`Type`]; only `Object`/`Enum` are valid
+/// Lower one named graph [`Schema`] (an [`Type::Object`], [`Type::Enum`], or [`Type::Union`] body) into
+/// a [`SchemaObject`]. A named schema's body is a neutral [`Type`]; `Object`/`Enum`/`Union` are valid
 /// component bodies, every other variant is an explicit typed error (a named schema is never a bare
 /// scalar/array/ref). The match is exhaustive — no `_ =>`/`other =>` arm — so a future [`Type`] variant
 /// fails to compile here until it is handled (T-03).
@@ -310,14 +310,19 @@ fn lower_named_schema(
             })
         }
         Type::Object(fields) => lower_object(fields, ref_to_name),
-        // A named component is always a struct/class (Object) or a string enum (Enum). Any other
-        // neutral type as a *named* body is a contract error — an explicit arm, not a catch-all (T-03).
+        // A sum type (e.g. a Python `Union[A, B]` / `A | B` alias) is a legitimate NAMED component:
+        // it lowers to the 3.1 `oneOf` of its lowered variants (the same shape `lower_schema_type`
+        // produces inline), so a route can `$ref` it as a response/body. Languages without sum types
+        // (Go) simply never emit a union-bodied named schema, so this arm is inert for them.
+        Type::Union(_) => lower_schema_type(&schema.body, ref_to_name),
+        // A named component is otherwise a struct/class (Object), a string enum (Enum), or a union
+        // (above). Any other neutral type as a *named* body is a contract error — an explicit arm, not
+        // a catch-all (T-03).
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
         | Type::Map { .. }
         | Type::Named(_)
-        | Type::Union(_)
         | Type::Any {} => Err(crate::CoreError::Lowering {
             message: format!(
                 "named schema '{}' has a non-object/non-enum body that cannot be a component",
@@ -760,6 +765,33 @@ mod tests {
             panic!("expected Lowering, got {err:?}");
         };
         assert!(message.contains("non-object/non-enum body"), "{message}");
+    }
+
+    #[test]
+    fn named_schema_with_union_body_lowers_to_a_one_of_component() {
+        use crate::graph::Type;
+        // A union-bodied NAMED schema (e.g. a Python `Union[A, B]` alias referenced by a route) is a
+        // legitimate component: it lowers to the 3.1 `oneOf` of its lowered variants so a route can
+        // `$ref` it. Languages without sum types simply never produce this body (the Go fixture never
+        // exercises this arm).
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Union(vec![
+            Type::Named("internal/dto.CommandMessage".to_string()),
+            Type::Primitive(crate::graph::Prim::String),
+        ]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        // After `from_facts` sorts schemas by id, schemas[1] is `CreateGoalInput`; its mutated union
+        // body renders a oneOf component with a $ref member and a typed member. Bound the block.
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("union component block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(
+            block.contains("oneOf:"),
+            "a union-bodied named schema must render a oneOf component:\n{block}"
+        );
+        assert!(
+            block.contains("$ref: '#/components/schemas/CommandMessage'"),
+            "the oneOf must reference the named variant:\n{block}"
+        );
     }
 
     #[test]

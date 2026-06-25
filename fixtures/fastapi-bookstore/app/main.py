@@ -1,15 +1,18 @@
 """FastAPI bookstore service — STATIC fixture source (Phase 1).
 
-Routes are declared with `@nestjs/common`'s Python analog — FastAPI's own
-`@app`/`@router` decorators — and every request/response/param fact is derived
-from the handler SIGNATURE + the typed models in `app.models`. Nothing here
-reads FastAPI's runtime `/openapi.json` and nothing depends on a third-party
-schema tool (CLAUDE.md rule 1). No app runs this phase (no `pip install`); this
-is the static source the Phase-2 `pyextract` sidecar will read.
+Routes are declared with FastAPI's own `@app`/`@router` decorators, and every
+request/response/param fact is derived from the handler SIGNATURE + the typed
+models in `app.models`. Nothing here reads FastAPI's runtime `/openapi.json` and
+nothing depends on a third-party schema tool (CLAUDE.md rule 1). No app runs this
+phase (no `pip install`); this is the static source `pyextract` reads.
 
-The routes mount under an `APIRouter(prefix="/books")` -> the neutral graph
-operation paths are group-relative (`/`, `/{book_id}`); the `/books` prefix is
-a lowering-time base path (rule 1: never folded into the code-derived path).
+The routes mount under an `APIRouter(prefix="/books")` -> the operation paths are
+group-relative (`/`, `/{book_id}`); the `/books` prefix is a lowering-time base
+path (rule 1: never folded into the code-derived path).
+
+NOTE ON LINE LAYOUT (RESEARCH OQ2): the committed FastAPI graph snapshot pins
+each route span to the handler `def` line and each param span to the param's own
+signature line; the layout is spaced so each anchor lands on the asserted line.
 """
 
 from __future__ import annotations
@@ -44,33 +47,34 @@ def list_books(
       - sort   : optional `str`        (has a default)
       - cursor : optional `str`        (default None)
     Response: 200 -> `ListBooksResponse` ($ref).
+    (Layout note: exercises the typed-query-param path.)
     """
     raise NotImplementedError  # static fixture: never executed this phase
 
 
+# create_book registers POST with a typed body and a 201 status_code anchor.
 @router.post("/", response_model=CreatedMessage, status_code=201)
 def create_book(book: Book) -> CreatedMessage:
     """POST /books/ — typed request body + a 201 typed response.
-
     Request body: `Book` ($ref). Response: 201 -> `CreatedMessage` ($ref).
     """
     raise NotImplementedError
 
 
 @router.get("/{book_id}", response_model=BookOrError)
-def get_book(book_id: int, fmt: Optional[BookFormat] = None) -> BookOrError:
+def get_book(
+    book_id: int, fmt: Optional[BookFormat] = None
+) -> BookOrError:
     """GET /books/{book_id} — a path param + a UNION response.
-
-    Params:
-      - book_id : required path `int`
-      - fmt     : optional query enum (`BookFormat`, default None)
     Response: 200 -> `BookOrError` (a union of `Book` and `OutOfStock`).
     """
     raise NotImplementedError
 
 
 @router.put("/{book_id}", response_model=CreatedMessage)
-def update_book(book_id: int, filters: BookFilters) -> CreatedMessage:
+def update_book(
+    book_id: int, filters: BookFilters
+) -> CreatedMessage:
     """PUT /books/{book_id} — path param + a body exercising all four axes.
 
     Request body: `BookFilters` (the optional x nullable matrix).
