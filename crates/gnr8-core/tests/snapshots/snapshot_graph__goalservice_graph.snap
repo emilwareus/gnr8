@@ -38,8 +38,8 @@ operations:
           additional_properties: ~
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 59
-          end_line: 59
+          start_line: 47
+          end_line: 47
       - name: cursor
         location: query
         required: false
@@ -51,8 +51,8 @@ operations:
           additional_properties: ~
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 57
-          end_line: 57
+          start_line: 45
+          end_line: 45
       - name: page_size
         location: query
         required: false
@@ -64,8 +64,8 @@ operations:
           additional_properties: ~
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 58
-          end_line: 58
+          start_line: 46
+          end_line: 46
     request_body: ~
     responses:
       - status: 200
@@ -91,8 +91,8 @@ operations:
           additional_properties: ~
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 119
-          end_line: 119
+          start_line: 92
+          end_line: 92
     request_body: ~
     responses:
       - status: 200
@@ -121,8 +121,8 @@ operations:
           additional_properties: ~
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 94
-          end_line: 94
+          start_line: 67
+          end_line: 67
     request_body:
       ref_id: internal/common/dto.UpdateGoalInput
     responses:
@@ -623,12 +623,12 @@ diagnostics:
   - severity: WARN
     message: "untyped query param 'cursor' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 57
+    line: 45
   - severity: WARN
     message: "untyped query param 'page_size' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 58
+    line: 46
   - severity: WARN
     message: "untyped query param 'aggregation' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 59
+    line: 47

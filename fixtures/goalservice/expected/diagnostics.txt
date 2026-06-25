@@ -11,4 +11,4 @@ WARN  float64 -> float32 narrowing: field GoalResponse.TargetValue (*float64) lo
 WARN  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1)
 WARN  untyped query param 'cursor' on GET /goal/list: read via c.Query with no binding struct and no annotation type beyond string; param type/required-ness under-specified (TARGET-API.md §5.4)
 WARN  untyped query param 'page_size' on GET /goal/list: read via c.Query with no binding struct; type inferred as string only (TARGET-API.md §5.4)
-WARN  untyped query param 'aggregation' on GET /goal/list: closed value set recovered only from the swaggo Enums(count,sum,avg,min,max) annotation, not from code (TARGET-API.md §5.4)
+WARN  untyped query param 'aggregation' on GET /goal/list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)

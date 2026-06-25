@@ -47,10 +47,10 @@ route facts** — method, path template, params, request type, and response type
 Gin internals. This seam (D-03) lets chi / echo / net-http be added later without reshaping the
 graph. No Gin-specific assumptions are baked into the graph types.
 
-Extraction is **code-first, not comment-first**: API facts are inferred primarily from route
-registration, handler binding, and struct tags. Swaggo-style comment annotations are read only as an
-**escape hatch** to fill gaps the code cannot express, and to drive diagnostics when both code and
-annotations are silent.
+Extraction is **code-first**: API facts are derived from route registration, handler binding, and
+struct tags — the code is the single source of truth. Facts the typed source genuinely cannot express
+(security schemes, the mount/base path, the document title) are declared in the engine config, never
+inferred. Where neither the code nor the config can supply a fact, lowering emits a diagnostic.
 
 ### 2.2 OpenAPI target version — 3.1.0
 
@@ -61,11 +61,10 @@ scope.
 
 ### 2.3 Go SDK shape
 
-The generated Go SDK is a single SDK package shaped as idiomatic Go (D-05) — **not** the verbose
-openapi-generator builder pattern:
+The generated Go SDK is a single SDK package shaped as idiomatic Go (D-05):
 
 - A **`Client`** constructed with **functional options** (base URL + a custom `*http.Client`).
-- **Tag-grouped typed operation methods**, with `context.Context` as the first argument.
+- **Typed operation methods**, with `context.Context` as the first argument.
 - Generated **request / response model structs**.
 - JSON encode / decode of bodies.
 - A **typed API error**.

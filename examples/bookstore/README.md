@@ -1,8 +1,7 @@
 # bookstore — a gnr8 example
 
-Point gnr8 at a plain Gin service (no annotations) and get an **OpenAPI 3.1**
-document plus a **Go SDK**. Everything is derived from the Go code itself — there
-is not a single swaggo `// @` comment anywhere in this example.
+Point gnr8 at a plain Gin service and get an **OpenAPI 3.1** document plus a
+**Go SDK** — every fact is derived from the Go code itself.
 
 ```
 examples/bookstore/

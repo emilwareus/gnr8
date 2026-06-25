@@ -1,6 +1,5 @@
-// Command bookstore is a tiny, annotation-free Gin service that gnr8 reads to
-// generate an OpenAPI 3.1 document and a Go SDK. There is not a single swaggo
-// `// @` comment anywhere — gnr8 derives every fact from the Go code itself
+// Command bookstore is a tiny Gin service that gnr8 reads to generate an OpenAPI
+// 3.1 document and a Go SDK. gnr8 derives every fact from the Go code itself
 // (routes, request/response types, status codes, the Genre enum) and takes the
 // base path + security scheme from .gnr8/config.toml.
 package main

@@ -12,7 +12,7 @@ import (
 
 // createGoal handles POST /goal/.
 //
-// This handler is FULLY code-inferable — no annotation block is required:
+// This handler is fully code-inferable:
 //   - request body type = dto.CreateGoalInput (from ShouldBindJSON(&input))
 //   - success           = 201 dto.CommandMessageWithUUID (c.JSON(StatusCreated, ...))
 //   - error             = 400 dto.HttpError              (c.JSON(StatusBadRequest, ...))
@@ -37,26 +37,14 @@ func (h HttpServer) createGoal(c *gin.Context) {
 
 // listGoals handles GET /goal/list.
 //
-// Query params are read loosely via c.Query (no binding struct), so the swaggo
-// annotation block below is the escape hatch that supplies their type, required
-// flag, docs, and — for aggregation — an inline closed value set (Enums(...)).
-// The untyped c.Query("cursor") read is the "param type unknown" diagnostic
-// trigger (TARGET-API.md §5.4).
+// Query params are read loosely via c.Query (no binding struct), so their type
+// and required-ness aren't expressible in the code. The untyped c.Query reads
+// are the "param type unknown" diagnostic trigger (TARGET-API.md §5.4).
 //
-// @Summary      List goals
-// @Description  List goals with cursor pagination and an aggregation selector
-// @Tags         Goals
-// @Produce      json
-// @Param        cursor      query string false "Cursor UUID for pagination"
-// @Param        page_size   query string false "Page size"
-// @Param        aggregation query string true  "Aggregation" Enums(count,sum,avg,min,max)
-// @Success      200 {object} dto.ListGoalsOutput "Goals page"
-// @Security     ApiKeyAuth
-// @Router       /list [get]
 func (h HttpServer) listGoals(c *gin.Context) {
 	cursor := c.Query("cursor")           // untyped query param -> diagnostic trigger
 	pageSize := c.Query("page_size")      // untyped query param
-	aggregation := c.Query("aggregation") // closed value set via annotation Enums(...)
+	aggregation := c.Query("aggregation") // untyped query param
 
 	// The values are only echoed into the response shape; no real query runs.
 	_ = cursor
@@ -72,24 +60,9 @@ func (h HttpServer) listGoals(c *gin.Context) {
 
 // updateGoal handles PUT /goal/{uuid}.
 //
-// This handler carries the FULL swaggo annotation block (TARGET-API.md §3.3): a
-// path param, a body param, multiple success/failure responses, and an explicit
-// security requirement. It exercises c.Param (path param) and ShouldBindJSON
-// (request body) so both code-inference and annotation paths have facts.
+// This handler exercises c.Param (path param) and ShouldBindJSON (request body)
+// and returns multiple success/failure status codes — all derived from the code.
 //
-// @Summary      Update goal
-// @Description  Update a goal including workflow links
-// @Tags         Goals
-// @Accept       json
-// @Produce      json
-// @Param        uuid  path     string              true  "Goal UUID"
-// @Param        body  body     dto.UpdateGoalInput true  "Goal fields to update"
-// @Success      200   {object} dto.CommandMessage  "Goal updated"
-// @Failure      400   {object} dto.HttpError        "Invalid input"
-// @Failure      404   {object} dto.HttpError        "Goal not found"
-// @ID           goalUuidPut
-// @Router       /{uuid} [put]
-// @Security     ApiKeyAuth
 func (h HttpServer) updateGoal(c *gin.Context) {
 	id := c.Param("uuid") // path param :uuid -> {uuid}
 	if _, err := uuid.Parse(id); err != nil {
