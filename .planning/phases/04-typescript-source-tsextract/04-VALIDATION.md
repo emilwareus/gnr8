@@ -41,9 +41,9 @@ created: 2026-06-25
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 04-W0 | 0x | 0 | TSSRC-04 | T-static-exec | Lang::TypeScript 3-arm dispatch in build_graph + diagnostics::collect; run_tsextract driver; TS-toolchain-missing typed error; NestJs Source built-in | unit | `cargo test -p gnr8-core` | ❌ W0 | ⬜ pending |
-| 04-W1 | 1x | 1 | TSSRC-02, TSSRC-03 | T-static-exec, T-brightline | tsextract on the `typescript` Compiler API; facts from source's own TS types ONLY (never swagger/zod/class-validator); never executes target; unresolved→diagnostic | unit | `node tsextract/<entry> fixtures/nestjs-bookstore` (+ rust facts round-trip) | ❌ W0 | ⬜ pending |
-| 04-W2 | 2x | 2 | TSSRC-01 | — | NestJS routes/params/request+response DTOs → neutral facts; method-derived status; 2 NestJS snapshots GREEN | snapshot | `cargo test -p gnr8-core --test snapshot_nestjs_graph --test snapshot_nestjs_openapi` | ✅ | ⬜ pending |
+| 04-01 | 01 | 1 | TSSRC-04 | T-static-exec | Lang::TypeScript 3-arm dispatch in build_graph + diagnostics::collect; run_tsextract driver; TS-toolchain-missing typed error; NestJs Source built-in | unit | `cargo test -p gnr8-core` | ❌ W0 | ⬜ pending |
+| 04-02 | 02 | 2 | TSSRC-02, TSSRC-03 | T-static-exec, T-brightline | tsextract on the `typescript` Compiler API; facts from source's own TS types ONLY (never swagger/zod/class-validator); never executes target; unresolved→diagnostic | unit | `node tsextract/<entry> fixtures/nestjs-bookstore` (+ rust facts round-trip) | ❌ W0 | ⬜ pending |
+| 04-03 | 03 | 3 | TSSRC-01 | — | NestJS routes/params/request+response DTOs → neutral facts; method-derived status; 2 NestJS snapshots GREEN | snapshot | `cargo test -p gnr8-core --test snapshot_nestjs_graph --test snapshot_nestjs_openapi` | ✅ | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
