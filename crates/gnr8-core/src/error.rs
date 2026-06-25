@@ -35,6 +35,19 @@ pub enum CoreError {
         source: std::io::Error,
     },
 
+    /// The Python toolchain could not be spawned (e.g. `python3` is not installed or not on `PATH`).
+    ///
+    /// Wraps the [`std::io::Error`] from spawning the `pyextract` subprocess so the cause is
+    /// preserved without panicking (RUST-04 / T-02-02-py). The Python twin of
+    /// [`Self::GoToolchainMissing`]; the two are kept distinct so a caller can tell which sidecar's
+    /// toolchain is absent.
+    #[error("Python toolchain not available (is `python3` installed and on PATH?): {source}")]
+    PythonToolchainMissing {
+        /// The underlying spawn error from [`std::process::Command::output`].
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The `goextract` helper ran but exited with a non-zero status.
     ///
     /// Carries the exit `code` (absent if the process was signal-terminated) and the captured
@@ -191,6 +204,16 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("Go toolchain not available"), "{msg}");
+            assert!(msg.contains("no such file"), "{msg}");
+        }
+
+        #[test]
+        fn python_toolchain_missing_renders_with_source() {
+            let err = CoreError::PythonToolchainMissing {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Python toolchain not available"), "{msg}");
             assert!(msg.contains("no such file"), "{msg}");
         }
 
