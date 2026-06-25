@@ -169,11 +169,14 @@ class FixtureEndToEndTests(unittest.TestCase):
             ],
         )
 
-    def test_routes_empty_until_plan_03(self):
-        # Route recognition lands in Plan 03 (FastAPI) / Plan 04 (Flask). Until then
-        # the contract emits an empty routes array; this is expected, not a defect.
+    def test_routes_recognized_for_fastapi(self):
+        # Plan 03 lands FastAPI route recognition: the four bookstore routes appear
+        # (detailed shapes are asserted in test_routes.py / test_fastapi_golden.py).
         doc = json.loads(self._run())
-        self.assertEqual(doc["routes"], [])
+        ids = sorted(r["operation_id"] for r in doc["routes"])
+        self.assertEqual(
+            ids, ["create_book", "get_book", "list_books", "update_book"]
+        )
 
     def test_type_and_axis_shapes_match_snapshot(self):
         doc = json.loads(self._run())

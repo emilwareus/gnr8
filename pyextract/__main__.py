@@ -14,7 +14,7 @@ this plan) -> assemble -> marshal``.
 import os
 import sys
 
-from pyextract import facts, load
+from pyextract import facts, load, routes as routes_mod
 from pyextract.diagnostics import Diagnostics
 from pyextract.schemas import build_schemas
 from pyextract.symtab import SymbolTable
@@ -36,8 +36,10 @@ def run(target_dir):
     schemas = build_schemas(modules, symtab, diags)
 
     module = os.path.basename(target_dir)
-    # Routes land in Plan 03 (FastAPI) / Plan 04 (Flask); empty here by design.
-    routes = []
+    # FastAPI route recognition (Plan 03). Flask lands in Plan 04. The recognizer
+    # emits nothing for a tree with no router/app bindings, so a non-FastAPI tree
+    # yields an empty routes list deterministically (no fallback).
+    routes = routes_mod.recognize_fastapi(modules, symtab, diags)
 
     doc = facts.build_doc(module, routes, schemas, diags.items())
     return facts.marshal(doc)
