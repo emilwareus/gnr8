@@ -204,7 +204,15 @@ def _map_subscript(node, in_module, table, diags):
     if simple in ("dict", "Dict", "Mapping", "MutableMapping"):
         args = _subscript_args(node)
         if len(args) != 2:
-            return {"type": "map", "of": {"key": _prim("string"), "value": {"type": "any", "of": {}}}}
+            # rule 3: a bare/malformed mapping cannot yield a deterministic
+            # key/value fact — diagnose + OMIT, never default to string -> any.
+            diags.warn(
+                "unsupported mapping annotation: {} needs exactly two type args; "
+                "fact omitted (no fallback)".format(base),
+                _file_of(table, in_module),
+                getattr(node, "lineno", 0),
+            )
+            return None
         key = _map(args[0], in_module, table, diags)
         value = _map(args[1], in_module, table, diags)
         if key is None or value is None:
