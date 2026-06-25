@@ -182,6 +182,21 @@ def _map(node, in_module, table, diags):
     if isinstance(node, (ast.Name, ast.Attribute)):
         return _map_named(node, name, in_module, table, diags)
 
+    # String forward reference (`field: "Author"`) — the source's OWN construct for
+    # breaking import cycles (PEP 484). Parse the quoted text statically (ast only;
+    # never exec/eval/import) and resolve it through the SAME single path as any
+    # other annotation. This is not a fallback: a string annotation has exactly one
+    # deterministic meaning (its parsed expression), so we map it directly. Only if
+    # the re-parsed node is itself unresolvable does the normal diagnostic fire.
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            parsed = ast.parse(node.value, mode="eval").body
+        except SyntaxError:
+            parsed = None
+        if parsed is not None:
+            ast.copy_location(parsed, node)
+            return _map(parsed, in_module, table, diags)
+
     diags.warn(
         "unsupported type annotation: {}".format(_describe(node)),
         _file_of(table, in_module),
