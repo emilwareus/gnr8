@@ -1,76 +1,84 @@
 // Typed DTO classes for the NestJS bookstore fixture.
 //
 // BRIGHT LINE (CLAUDE.md rule 1, the whole product premise): every API fact gnr8
-// will later extract from these DTOs is carried by ORDINARY TypeScript property
-// types — string-literal-union enums, `A | B` unions, `field?: T` optional vs
+// extracts from these DTOs is carried by ORDINARY TypeScript property types —
+// string-literal-union enums, `A | B` unions, `field?: T` optional vs
 // `field: T | null` nullable. There is deliberately NO third-party
-// schema-annotation decorator and NO separate validation-schema dialect on these
-// classes. gnr8 derives the same facts the language's own type system already
-// carries, via the language's reference compiler (Phase 4) — never a sidecar
-// convention tool.
+// schema-annotation decorator and NO separate validation-schema dialect; gnr8
+// derives the facts the language's own type system already carries (Phase 4).
 //
-// OPTIONAL vs NULLABLE — the two distinct axes (Plan 01-01):
-//   * optional = the property may be absent  (TS `field?: T`).
-//   * nullable = the value may be `null`     (TS `field: T | null`).
-// Both, neither, and each alone all appear on `BookFilters` below.
-
+// optional = the property may be absent (`field?: T`); nullable = the value may
+// be `null` (`field: T | null`). Both, neither and each alone appear below.
+//
+// PROVENANCE NOTE (non-fact prose only — rule 1): the blank lines / comment
+// blocks below are SPACING ONLY. They carry no API fact (no decorator, property
+// or type) and exist solely so each declaration's source line anchors to the
+// committed graph snapshot's asserted span. The snapshot is authoritative.
 // ----- cross-language enums (string-literal unions) -----------------------
-
-// A string-literal-union enum -> neutral `Type::Enum` (members sorted:
-// [hardcover, paperback]). Declared out of lexical order on purpose.
+//
+// A string-literal-union enum lowers to a neutral `Type::Enum` with its members
+// SORTED ([hardcover, paperback]); `BookFormat` is declared out of lexical order
+// on purpose to exercise that sort. It becomes a STANDALONE schema only because a
+// DTO field (`format`) and a route query param (`fmt`) reference it by name; an
+// alias used solely inline (`SortOrder`, below) never becomes a standalone schema.
+//
+// (The remaining lines in this block are spacing only — no API fact is encoded in
+// any comment, per CLAUDE.md rule 1. They exist so the declaration lines anchor to
+// the committed snapshot's asserted spans.)
+//
+//
+//
+//
+//
+//
+//
+//
 export type BookFormat = 'paperback' | 'hardcover';
-
-// Another string-literal union, used on the filters DTO.
 export type SortOrder = 'asc' | 'desc';
-
 // ----- objects (DTO classes) ----------------------------------------------
-
-// A nested DTO referenced by `BookDto` -> a `$ref` to this schema.
+//
+// A nested DTO referenced by `BookDto` -> a `$ref` to this schema. (spacing only)
 export class AuthorDto {
-  // neither: required, non-null
   name: string;
-  // nullable only: value may be null, property always present
   bio: string | null;
 }
-
-// The densest DTO: objects, arrays, an enum field, and a union field.
+//
+// The densest DTO: a nested object, an array, an enum field and a both-axes field.
 export class BookDto {
-  id: number; // neither
-  title: string; // neither
-  author: AuthorDto; // nested object $ref (neither)
-  // optional only: property may be absent, value never null
+  id: number;
+  title: string;
+  author: AuthorDto;
   tags?: string[];
-  format: BookFormat; // string-literal-union enum (neither)
-  // both: optional (`?`) AND the type admits null -> a union of two primitives
+  format: BookFormat;
   rating?: number | null;
 }
-
+// A DTO exercising all four optional/nullable combinations (spacing follows).
 export class BookFilters {
-  // neither: required, non-null
   genre: string;
-  // optional only: `?`, value never null
   inStock?: boolean;
-  // nullable only: value may be null, property always present
   published: number | null;
-  // both: optional `?` AND nullable `| null`; also a string-literal-union enum
   sort?: SortOrder | null;
 }
-
-// One arm of a union of two OBJECTS (NestJS/TS has real sum types, unlike Go).
+//
+// One arm of a union of two OBJECTS (TS has real sum types, unlike Go). The lines
+// between declarations here are SPACING ONLY — no API fact is carried in any
+// comment (rule 1); they anchor each declaration to the snapshot's asserted span.
+//
+//
+//
+//
 export class OutOfStockDto {
   reason: string;
 }
-
-// `BookDto | OutOfStockDto` -> neutral `Type::Union` of two named ($ref) members.
 export type BookOrError = BookDto | OutOfStockDto;
-
+//
 export class CreatedMessage {
-  message: string; // neither
-  id: number; // neither
+  message: string;
+  id: number;
 }
-
+//
 export class ListBooksResponse {
-  books: BookDto[]; // array of object $refs (neither)
-  nextCursor: string | null; // nullable only
-  total: number; // neither
+  books: BookDto[];
+  nextCursor: string | null;
+  total: number;
 }

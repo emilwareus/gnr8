@@ -52,6 +52,35 @@ function _declOf(sym) {
   return { decl: decl, file: decl.getSourceFile().fileName, name: sym.getName() };
 }
 
+// Return the type-alias Symbol named by a declaration's SYNTACTIC type
+// annotation, or null. Only a bare `TypeReference` (e.g. `format: BookFormat`,
+// `fmt?: BookFormat`) whose target symbol is a type-alias counts; a union /
+// primitive / array / inline annotation returns null (it is mapped from the
+// resolved residual instead). This is the single discriminator for named-vs-inline
+// (it survives `?` / `| null` because it reads what the author wrote, not the
+// resolved type whose aliasSymbol TS drops once a null/undefined arm is present).
+function _annotationAliasSymbol(node, checker) {
+  const anno = node.type;
+  if (!anno || !ts.isTypeReferenceNode(anno)) {
+    return null;
+  }
+  let sym = checker.getSymbolAtLocation(anno.typeName);
+  if (!sym) {
+    return null;
+  }
+  // A type-alias used through an `import { X }` resolves to an alias symbol; follow
+  // it to the underlying declaration's symbol.
+  if (sym.flags & ts.SymbolFlags.Alias && checker.getAliasedSymbol) {
+    sym = checker.getAliasedSymbol(sym);
+  }
+  const decls = sym.getDeclarations ? sym.getDeclarations() : sym.declarations;
+  const decl = decls && decls[0];
+  if (decl && ts.isTypeAliasDeclaration(decl)) {
+    return sym;
+  }
+  return null;
+}
+
 // Map the resolved TS Type of `node` to a neutral Type, splitting out the
 // optional/nullable axes. Returns `{ schema, optional, nullable }` where `schema`
 // is the neutral Type dict, or `null` (with a diagnostic recorded) when the type
@@ -64,9 +93,18 @@ function mapType(loaded, node, diags, registry) {
   const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
   const file = load.relFile(loaded.targetDir, sf.fileName);
 
-  // Capture the alias on the FULL type BEFORE stripping — the named-vs-inline
-  // discriminator. When `| null`/`| undefined` is mixed in, TS drops this.
-  const fullAlias = full.aliasSymbol || null;
+  // THE named-vs-inline discriminator (Open Question 1), derived from the SINGLE
+  // source that is reliable across every optional/nullable combination: the
+  // SYNTACTIC annotation node the author wrote (rule 3, one path). When the
+  // annotation is a bare `TypeReference` to a type-alias (`format: BookFormat`,
+  // `fmt?: BookFormat`), the author named a type -> a named ref + its schema. When
+  // the annotation is a union expression (`sort?: SortOrder | null`), the alias is
+  // a member of a union the author wrote inline -> after stripping null/undefined
+  // the residual literal union inlines as an enum. The resolved `aliasSymbol` is
+  // NOT usable here: TS drops it whenever `| null`/`| undefined` is mixed in, so
+  // `fmt?: BookFormat` (which MUST be a named ref) would lose it — only the
+  // annotation node distinguishes `fmt?` (TypeReference) from `sort?` (UnionType).
+  const fullAlias = _annotationAliasSymbol(node, checker);
 
   // Strip the optional (undefined) and nullable (null) arms to compute the axes.
   let optional = false;
