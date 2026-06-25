@@ -121,7 +121,11 @@ def _strip_optional(node):
         "Optional",
         "typing.Optional",
     ):
-        return node.slice, True
+        # Route through _subscript_args so a 3.8-style ast.Index wrapper is
+        # normalized identically to every other subscript site (WR-01); otherwise
+        # downstream _map would see an ast.Index and drop the field.
+        args = _subscript_args(node)
+        return (args[0] if args else node), True
     # Union[..., None] -> drop the None arm, set nullable; keep the rest.
     if isinstance(node, ast.Subscript) and _subscript_value(node) in (
         "Union",
