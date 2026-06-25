@@ -31,6 +31,9 @@ _ROUTER_CTORS = frozenset({"FastAPI", "APIRouter"})
 #: The constructor names that bind a Flask route-registering instance (rule 1, by NAME).
 _FLASK_CTORS = frozenset({"Flask", "Blueprint"})
 
+#: HTTP methods that carry no request body — a request.json read here is never a body fact.
+_BODYLESS_METHODS = frozenset({"GET", "HEAD", "DELETE"})
+
 
 def _span(abs_path, node):
     line = getattr(node, "lineno", 0)
@@ -447,6 +450,10 @@ def _flask_body_and_params(
     """
     params = []
     request_body = None
+    # A bodyless HTTP method (GET/HEAD/DELETE) has no request body by definition; a
+    # request.json read in such a handler is a code smell, never an emitted body
+    # fact (WR-04). The method is a code fact (the decorator's methods=[...]).
+    allows_body = method not in _BODYLESS_METHODS
 
     for stmt in func.body:
         if isinstance(stmt, ast.AnnAssign):
@@ -456,7 +463,7 @@ def _flask_body_and_params(
             # value reads request.json (directly or via T(**request.json)).
             body_ref = _resolves_to_class(annotation, in_module, table)
             if body_ref is not None and _reads_request_json(value):
-                if request_body is None:
+                if allows_body and request_body is None:
                     request_body = {"ref_id": body_ref}
                 continue
             # Typed query param: an annotated local reading request.args.get(...).
