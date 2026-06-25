@@ -13,6 +13,7 @@ this plan) -> assemble -> marshal``.
 
 import os
 import sys
+import traceback
 
 from pyextract import facts, load, routes as routes_mod
 from pyextract.diagnostics import Diagnostics
@@ -58,7 +59,12 @@ def main(argv):
         sys.stdout.write(run(target_dir))
         sys.stdout.write("\n")
     except Exception as exc:  # noqa: BLE001 — surface ANY failure to stderr, exit 1
+        # Emit the one-line identity AND the full traceback to stderr so a genuine
+        # internal bug (an unhandled AST shape -> AttributeError/KeyError) is
+        # diagnosable, not masked as a clean tool diagnostic (WR-07). stdout stays
+        # reserved for facts JSON; the non-zero exit still maps to HelperExit.
         sys.stderr.write("pyextract: {}\n".format(exc))
+        sys.stderr.write(traceback.format_exc())
         return 1
     return 0
 
