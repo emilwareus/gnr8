@@ -513,7 +513,10 @@ fn build_outputs(
     apply_naming(&mut graph, &config.naming)?;
 
     let openapi = crate::lower::to_openapi(&graph, &config.base_path, &config.security)?;
-    let bundle = crate::sdk::generate(&graph, &config.base_path)?;
+    // The SDK package name is derived from `output.go_module` (the single source of truth) — the last
+    // path segment sanitized to a valid Go identifier; never a fixture-name default (CLAUDE.md rule 3).
+    let sdk_package = config.output.sdk_package()?;
+    let bundle = crate::sdk::generate(&graph, &sdk_package, &config.base_path)?;
 
     let mut outputs: Vec<(String, Vec<u8>, String)> = Vec::new();
     outputs.push((

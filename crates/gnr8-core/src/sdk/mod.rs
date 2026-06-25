@@ -1,10 +1,11 @@
 //! Go SDK generation seam (Phase 3): generates a Go SDK from the API graph.
 //!
 //! [`generate`] turns the Phase-2 [`crate::graph::ApiGraph`] into a single deterministic, `gofmt`-clean
-//! Go SDK bundle String (D-06): one functional-options `client.go`, one typed `errors.go`, one
-//! operations file named after the package (`<package>.go`), and one `models.go`. Tags were ann
-//! annotation fact and have been removed (CLAUDE.md rules 1 & 3), so the SDK is a single operations
-//! surface rather than per-tag files. Each file is emitted by [`emit`]
+//! Go SDK bundle String (D-06): one functional-options `client.go`, one typed `errors.go`, one generic
+//! `operations.go` resource surface, and one `models.go`. Tags were an annotation fact and have been
+//! removed (CLAUDE.md rules 1 & 3), so the SDK is a single operations surface rather than per-tag files.
+//! The package name is supplied by the caller (derived from `output.go_module`, the single source of
+//! truth — see [`crate::config::OutputConfig::sdk_package`]). Each file is emitted by [`emit`]
 //! (`format!`-based, no template engine — D-05), normalized through the real `gofmt` ([`gofmt`]), and
 //! framed into an [`bundle::SdkBundle`] with stable file markers. The pipeline is byte-identical across
 //! runs and never panics (RUST-04); [`write_to_dir`] materializes the same framing for 03-03's compile
@@ -19,14 +20,15 @@ use bundle::{SdkBundle, SdkFile};
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///
-/// Emits `client.go` (functional-options `Client`), `errors.go` (typed `APIError`), one operations
-/// file named after the package (`<package>.go`, `context.Context`-first methods on `*Client`), and
-/// `models.go` (request/response structs + enum newtypes), pipes each through `gofmt`, and frames them
-/// into a single [`bundle::SdkBundle`] String. Generating twice over the same graph is byte-identical
-/// (T-03-02-03).
+/// Emits `client.go` (functional-options `Client`), `errors.go` (typed `APIError`), one generic
+/// `operations.go` (`context.Context`-first methods on `*Client`), and `models.go` (request/response
+/// structs + enum newtypes), pipes each through `gofmt`, and frames them into a single
+/// [`bundle::SdkBundle`] String. Generating twice over the same graph is byte-identical (T-03-02-03).
 ///
-/// `base_path` is the API base/mount path joined to each operation's group-relative path in the
-/// emitted request URLs — the SAME single source of truth (the user's `gnr8` config) the `OpenAPI`
+/// `package` is the SDK's Go package name — derived from `output.go_module` (the single source of
+/// truth) via [`crate::config::OutputConfig::sdk_package`]; it appears in every file's `package`
+/// clause. `base_path` is the API base/mount path joined to each operation's group-relative path in
+/// the emitted request URLs — the SAME single source of truth (the user's `gnr8` config) the `OpenAPI`
 /// lowering takes it from (CLAUDE.md rules 3 & 4), so the SDK and the spec agree on the prefix.
 ///
 /// # Errors
@@ -34,26 +36,29 @@ use bundle::{SdkBundle, SdkFile};
 /// Returns [`crate::CoreError::SdkGen`] for an un-representable graph fact (dangling `$ref`, unknown
 /// `kind`), [`crate::CoreError::GoFmt`] if `gofmt` rejects emitted Go, or
 /// [`crate::CoreError::GoToolchainMissing`] if `gofmt` cannot be spawned.
-pub fn generate(graph: &ApiGraph, base_path: &str) -> Result<String, crate::CoreError> {
+pub fn generate(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+) -> Result<String, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
 
     // Fixed leading files (sorted: client.go before errors.go).
-    files.push(go_file("client.go", &emit::emit_client())?);
-    files.push(go_file("errors.go", &emit::emit_errors())?);
+    files.push(go_file("client.go", &emit::emit_client(package))?);
+    files.push(go_file("errors.go", &emit::emit_errors(package))?);
 
-    // All operations go into a single operations file named after the package. Tags were ann
+    // All operations go into a single generic `operations.go` resource surface. Tags were an
     // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
-    // the SDK is a single resource surface (`goalservice.go`).
+    // the file name is generic (not the package/fixture name) so it never overfits to one service.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let file_name = format!("{}.go", emit::PACKAGE.to_ascii_lowercase());
-    let raw = emit::emit_operations(graph, emit::PACKAGE, base_path, &ops)?;
-    files.push(go_file(&file_name, &raw)?);
+    let raw = emit::emit_operations(graph, package, base_path, &ops)?;
+    files.push(go_file("operations.go", &raw)?);
 
     // Trailing models.go.
-    files.push(go_file("models.go", &emit::emit_models(graph)?)?);
+    files.push(go_file("models.go", &emit::emit_models(graph, package)?)?);
 
-    // The bundle's fixed sorted order is established by push order above (client, errors, <tags>,
-    // models) — exactly the D-06 frame order the snapshot locks.
+    // The bundle's fixed sorted order is established by push order above (client, errors,
+    // operations, models) — exactly the D-06 frame order the snapshot locks.
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -238,11 +243,11 @@ mod tests {
             eprintln!("skipping generate test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph(), "/goal").unwrap();
+        let out = generate(&sample_graph(), "goalservice", "/goal").unwrap();
         for marker in [
             "// ==== gnr8:file client.go ====",
             "// ==== gnr8:file errors.go ====",
-            "// ==== gnr8:file goalservice.go ====",
+            "// ==== gnr8:file operations.go ====",
             "// ==== gnr8:file models.go ====",
         ] {
             assert!(out.contains(marker), "missing {marker}:\n{out}");
@@ -257,8 +262,8 @@ mod tests {
         }
         let graph = sample_graph();
         assert_eq!(
-            generate(&graph, "/goal").unwrap(),
-            generate(&graph, "/goal").unwrap(),
+            generate(&graph, "goalservice", "/goal").unwrap(),
+            generate(&graph, "goalservice", "/goal").unwrap(),
             "two generate runs must be byte-identical"
         );
     }
@@ -269,7 +274,7 @@ mod tests {
             eprintln!("skipping models test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph(), "/goal").unwrap();
+        let out = generate(&sample_graph(), "goalservice", "/goal").unwrap();
         for ty in [
             "type CreateGoalInput struct",
             "type UpdateGoalInput struct",
@@ -286,7 +291,7 @@ mod tests {
             eprintln!("skipping ops test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph(), "/goal").unwrap();
+        let out = generate(&sample_graph(), "goalservice", "/goal").unwrap();
         assert!(
             out.contains("func (c *Client) CreateGoal(ctx context.Context"),
             "CreateGoal must take ctx first:\n{out}"

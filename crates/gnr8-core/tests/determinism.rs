@@ -87,9 +87,9 @@ fn sdk_generate_is_byte_identical_across_two_runs() {
 
     // Build the graph twice AND generate twice — proving the SDK emission (gofmt'd, file-marker-framed)
     // is byte-identical end-to-end (idempotent SDK generation).
-    let a = gnr8_core::sdk::generate(&first, "/goal")
+    let a = gnr8_core::sdk::generate(&first, "goalservice", "/goal")
         .expect("first sdk::generate must succeed (requires gofmt)");
-    let b = gnr8_core::sdk::generate(&second, "/goal")
+    let b = gnr8_core::sdk::generate(&second, "goalservice", "/goal")
         .expect("second sdk::generate must succeed (requires gofmt)");
 
     assert_eq!(

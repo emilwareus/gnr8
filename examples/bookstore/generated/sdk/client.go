@@ -1,11 +1,11 @@
-package goalservice
+package sdk
 
 import (
 	"net/http"
 	"time"
 )
 
-// Client is the goalservice SDK entrypoint. Tag-grouped operation methods hang
+// Client is the sdk SDK entrypoint. Tag-grouped operation methods hang
 // off this type; it is constructed with functional options.
 type Client struct {
 	baseURL    string

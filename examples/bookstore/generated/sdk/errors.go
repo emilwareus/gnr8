@@ -1,4 +1,4 @@
-package goalservice
+package sdk
 
 import "fmt"
 
@@ -13,7 +13,7 @@ type APIError struct {
 
 // Error implements the error interface.
 func (e *APIError) Error() string {
-	return fmt.Sprintf("goalservice: %d %s (%s)", e.StatusCode, e.Message, e.Slug)
+	return fmt.Sprintf("sdk: %d %s (%s)", e.StatusCode, e.Message, e.Slug)
 }
 
 // IsNotFound reports whether the error is a 404.

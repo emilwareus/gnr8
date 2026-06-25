@@ -1,4 +1,4 @@
-package goalservice
+package sdk
 
 import (
 	"bytes"

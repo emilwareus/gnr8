@@ -66,7 +66,7 @@ func (e *APIError) Error() string {
 func (e *APIError) IsNotFound() bool {
 	return e.StatusCode == 404
 }
-// ==== gnr8:file goalservice.go ====
+// ==== gnr8:file operations.go ====
 package goalservice
 
 import (

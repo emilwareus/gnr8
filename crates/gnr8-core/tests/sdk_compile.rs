@@ -76,7 +76,7 @@ fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError> {
 }
 
 /// The package clause from a written SDK file is the source of truth for the smoke test's package
-/// (the generated SDK package is `goalservice`, but read it rather than hardcode it).
+/// (the generated SDK package is `goalservice` for this fixture, but read it rather than hardcode it).
 fn package_clause(dir: &Path) -> String {
     let models = std::fs::read_to_string(dir.join("models.go")).expect("read models.go");
     for line in models.lines() {
@@ -97,7 +97,7 @@ fn write_go_mod(dir: &Path) {
 fn materialize_sdk() -> PathBuf {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let bundle = gnr8_core::sdk::generate(&graph, "/goal")
+    let bundle = gnr8_core::sdk::generate(&graph, "goalservice", "/goal")
         .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir("ok");
     gnr8_core::sdk::write_to_dir(&bundle, &dir)
@@ -117,12 +117,12 @@ fn generated_sdk_go_builds_clean() {
     let dir = materialize_sdk();
 
     // The four production SDK files plus the hermetic go.mod exist; smoke_test.go is added below. The
-    // operations file is named after the package (`goalservice.go`) — there are no per-tag files since
-    // tags were a doc-comment-annotation fact and have been removed (CLAUDE.md rules 1 & 3).
+    // operations file is the generic `operations.go` — there are no per-tag files since tags were a
+    // doc-comment-annotation fact and have been removed (CLAUDE.md rules 1 & 3).
     for name in [
         "client.go",
         "errors.go",
-        "goalservice.go",
+        "operations.go",
         "models.go",
         "go.mod",
     ] {

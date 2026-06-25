@@ -14,8 +14,8 @@
 //!
 //! The marker never appears in `gofmt`'d Go (RESEARCH Code Examples), so [`parse`] can split the bundle
 //! back into `(name, contents)` pairs — the SAME framing `write_to_dir` uses to materialize files
-//! (single source of truth). File order is FIXED + sorted (`client.go`, `errors.go`, one `<tag>.go` per
-//! sorted tag, then `models.go`), and `to_string` is byte-identical across runs (determinism, T-03-02-03).
+//! (single source of truth). File order is FIXED + sorted (`client.go`, `errors.go`, `operations.go`,
+//! then `models.go`), and `to_string` is byte-identical across runs (determinism, T-03-02-03).
 
 /// One generated Go file: its on-disk name (e.g. `client.go`) and its `gofmt`'d contents.
 #[derive(Debug, Clone)]
@@ -109,20 +109,19 @@ mod tests {
             files: vec![
                 SdkFile {
                     name: "client.go".to_string(),
-                    contents: "package goalservice\n\nfunc NewClient() {}\n".to_string(),
+                    contents: "package sdk\n\nfunc NewClient() {}\n".to_string(),
                 },
                 SdkFile {
                     name: "errors.go".to_string(),
-                    contents: "package goalservice\n\ntype APIError struct{}\n".to_string(),
+                    contents: "package sdk\n\ntype APIError struct{}\n".to_string(),
                 },
                 SdkFile {
-                    name: "goals.go".to_string(),
-                    contents: "package goalservice\n\nfunc (c *Client) CreateGoal() {}\n"
-                        .to_string(),
+                    name: "operations.go".to_string(),
+                    contents: "package sdk\n\nfunc (c *Client) CreateGoal() {}\n".to_string(),
                 },
                 SdkFile {
                     name: "models.go".to_string(),
-                    contents: "package goalservice\n\ntype CreateGoalInput struct{}\n".to_string(),
+                    contents: "package sdk\n\ntype CreateGoalInput struct{}\n".to_string(),
                 },
             ],
         }
@@ -134,7 +133,7 @@ mod tests {
         let text = bundle.to_string();
 
         // Each file is framed by its marker, in the fixed order.
-        let order: Vec<_> = ["client.go", "errors.go", "goals.go", "models.go"]
+        let order: Vec<_> = ["client.go", "errors.go", "operations.go", "models.go"]
             .iter()
             .map(|n| text.find(&format!("// ==== gnr8:file {n} ====")).unwrap())
             .collect();

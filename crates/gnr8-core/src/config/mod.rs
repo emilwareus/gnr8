@@ -116,6 +116,47 @@ pub struct OutputConfig {
     pub go_module: String,
 }
 
+impl OutputConfig {
+    /// Derive the generated SDK's Go package name from `go_module` — the **single source of truth**.
+    ///
+    /// The package name is a pure, deterministic transform of one config value (CLAUDE.md rule 3): the
+    /// LAST path segment of `go_module`, sanitized to a valid Go package identifier. Sanitization keeps
+    /// ASCII letters/digits and lower-cases them, dropping every separator (`-`, `.`, `/`, `_`, …); a
+    /// leading non-letter is then trimmed so the identifier always starts with a letter. Examples:
+    /// `example.com/bookstore/sdk` → `sdk`; `example.com/acme/gnr8sdk` → `gnr8sdk`;
+    /// `github.com/acme/svc/goalservice` → `goalservice`.
+    ///
+    /// This is NOT a fallback: there is exactly one path. The only branch is input validation of that
+    /// single source — a `go_module` whose last segment yields no valid identifier (empty, or only
+    /// separators/digits) is a typed [`CoreError::Config`] rather than a silent second source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] if `go_module`'s last segment cannot form a valid Go package
+    /// identifier (no ASCII letter to anchor it).
+    pub fn sdk_package(&self) -> Result<String, CoreError> {
+        let last = self.go_module.rsplit('/').next().unwrap_or("");
+        // Keep ASCII alphanumerics (lower-cased); drop every separator. A Go package identifier must
+        // begin with a letter, so trim any leading run of digits that survives.
+        let kept: String = last
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let pkg = kept.trim_start_matches(|c: char| c.is_ascii_digit());
+        if pkg.is_empty() {
+            return Err(CoreError::Config {
+                message: format!(
+                    "output.go_module {:?} has no last path segment that forms a valid Go package \
+                     identifier (need at least one ASCII letter, e.g. \"example.com/acme/sdk\")",
+                    self.go_module
+                ),
+            });
+        }
+        Ok(pkg.to_string())
+    }
+}
+
 /// Optional name remaps applied to generated operations/types. `BTreeMap` keeps the maps sorted so
 /// downstream use stays deterministic (mirrors the graph's sorted-collection policy, GRAPH-02).
 #[derive(Debug, Default, serde::Deserialize)]
@@ -218,5 +259,69 @@ mod tests {
             parse(&src).is_err(),
             "an unknown security-scheme key must be rejected by deny_unknown_fields"
         );
+    }
+
+    /// Build an `OutputConfig` whose `go_module` is `module`, for `sdk_package` derivation tests.
+    fn output_with_module(module: &str) -> super::OutputConfig {
+        let src = format!(
+            "inputs = [\".\"]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = {module:?}\n"
+        );
+        parse(&src).unwrap().output
+    }
+
+    #[test]
+    fn sdk_package_is_the_sanitized_last_segment_of_go_module() {
+        // The package is the LAST path segment, lower-cased, with separators dropped.
+        assert_eq!(
+            output_with_module("example.com/bookstore/sdk")
+                .sdk_package()
+                .unwrap(),
+            "sdk"
+        );
+        assert_eq!(
+            output_with_module("example.com/acme/gnr8sdk")
+                .sdk_package()
+                .unwrap(),
+            "gnr8sdk"
+        );
+        assert_eq!(
+            output_with_module("github.com/acme/svc/goalservice")
+                .sdk_package()
+                .unwrap(),
+            "goalservice"
+        );
+        // A single (unslashed) segment is itself the package.
+        assert_eq!(output_with_module("mysdk").sdk_package().unwrap(), "mysdk");
+        // Separators inside the last segment are dropped, and casing is normalized.
+        assert_eq!(
+            output_with_module("example.com/My-API.v2")
+                .sdk_package()
+                .unwrap(),
+            "myapiv2"
+        );
+        // A leading digit run is trimmed so the identifier starts with a letter.
+        assert_eq!(
+            output_with_module("example.com/2sdk")
+                .sdk_package()
+                .unwrap(),
+            "sdk"
+        );
+    }
+
+    #[test]
+    fn sdk_package_rejects_a_segment_with_no_letter() {
+        // Input validation of the single source (not a fallback): a last segment that yields no valid
+        // Go identifier (empty / only separators / only digits) is a typed Config error.
+        for module in [
+            "example.com/sdk/", // trailing slash → empty last segment
+            "example.com/__",   // only separators
+            "example.com/123",  // only digits → no letter anchor
+            "",                 // empty go_module
+        ] {
+            assert!(
+                output_with_module(module).sdk_package().is_err(),
+                "go_module {module:?} must be rejected (no valid package identifier)"
+            );
+        }
     }
 }

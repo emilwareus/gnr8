@@ -1,16 +1,16 @@
 //! `format!`-based Go SDK emitters (D-05: no template engine; small internal templating only).
 //!
 //! Each emitter turns the router-agnostic [`crate::graph::ApiGraph`] into one idiomatic Go source file
-//! matching the `fixtures/goalservice/expected/sdk/{client,models,errors,<tag>}.go` shape:
+//! matching the `fixtures/goalservice/expected/sdk/{client,models,errors,operations}.go` shape:
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
 //!   json tags carry `,omitempty` for optional fields, types follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
-//! - [`emit_operations`] — one file per tag: tag-grouped typed methods on `*Client`, `context.Context`
-//!   first, path params as positional string args, a params struct for query-bearing ops, a typed body
-//!   input; each method marshals the body, builds the request, sets `X-API-Key`, decodes 2xx into the
-//!   success model and non-2xx into an [`APIError`].
+//! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
+//!   `context.Context` first, path params as positional string args, a params struct for query-bearing
+//!   ops, a typed body input; each method marshals the body, builds the request, sets `X-API-Key`,
+//!   decodes 2xx into the success model and non-2xx into an [`APIError`].
 //! - [`emit_errors`]   — the typed `APIError` (`StatusCode`/`Message`/`Slug`/`Hints`) + `Error()` +
 //!   `IsNotFound()`.
 //!
@@ -25,9 +25,6 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Schema, SchemaType};
 use crate::CoreError;
-
-/// The fixed Go package name for the generated SDK (matches the fixture's `package goalservice`).
-pub(crate) const PACKAGE: &str = "goalservice";
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
 ///
@@ -206,10 +203,12 @@ fn field_needs_time(schema: &SchemaType) -> bool {
 /// Schemas are consumed in the graph's id-sorted order; fields in their json-name-sorted order — both
 /// already guaranteed by the graph (GRAPH-02), so the output is deterministic without re-sorting here.
 ///
+/// `package` is the SDK package name (derived from config, the single source) used in the file frame.
+///
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if any field's schema cannot be mapped to a Go type.
-pub(crate) fn emit_models(graph: &ApiGraph) -> Result<String, CoreError> {
+pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
 
@@ -241,7 +240,7 @@ pub(crate) fn emit_models(graph: &ApiGraph) -> Result<String, CoreError> {
     }
 
     let imports = if needs_time { vec!["time"] } else { Vec::new() };
-    Ok(file(&imports, &body))
+    Ok(file(package, &imports, &body))
 }
 
 /// Emit a single object struct: one exported field per graph field with its Go type and json tag.
@@ -278,69 +277,78 @@ fn emit_enum(body: &mut String, schema: &Schema) -> Result<(), CoreError> {
 
 /// Emit `client.go`: the functional-options `Client` + `Option` + `WithHTTPClient`/`WithAPIKey`/`NewClient`.
 ///
-/// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout).
-pub(crate) fn emit_client() -> String {
-    let body = "\
-// Client is the goalservice SDK entrypoint. Tag-grouped operation methods hang
+/// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
+/// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
+/// hard-coded fixture name.
+pub(crate) fn emit_client(package: &str) -> String {
+    let body = format!(
+        "\
+// Client is the {package} SDK entrypoint. Tag-grouped operation methods hang
 // off this type; it is constructed with functional options.
-type Client struct {
+type Client struct {{
 baseURL string
 httpClient *http.Client
 apiKey string
-}
+}}
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
 
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
-func WithHTTPClient(hc *http.Client) Option {
-return func(c *Client) { c.httpClient = hc }
-}
+func WithHTTPClient(hc *http.Client) Option {{
+return func(c *Client) {{ c.httpClient = hc }}
+}}
 
 // WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
-func WithAPIKey(key string) Option {
-return func(c *Client) { c.apiKey = key }
-}
+func WithAPIKey(key string) Option {{
+return func(c *Client) {{ c.apiKey = key }}
+}}
 
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
-func NewClient(baseURL string, opts ...Option) *Client {
-c := &Client{
+func NewClient(baseURL string, opts ...Option) *Client {{
+c := &Client{{
 baseURL: baseURL,
-httpClient: &http.Client{Timeout: 30 * time.Second},
-}
-for _, opt := range opts {
+httpClient: &http.Client{{Timeout: 30 * time.Second}},
+}}
+for _, opt := range opts {{
 opt(c)
-}
+}}
 return c
-}
-";
-    file(&["net/http", "time"], body)
+}}
+"
+    );
+    file(package, &["net/http", "time"], &body)
 }
 
 /// Emit `errors.go`: the typed `APIError` (status + decoded body) + `Error()` + `IsNotFound()`.
-pub(crate) fn emit_errors() -> String {
-    let body = "\
+///
+/// The `Error()` string is prefixed with the SDK `package` (derived from config, the single source) so
+/// the message names the actual SDK rather than a hard-coded fixture name.
+pub(crate) fn emit_errors(package: &str) -> String {
+    let body = format!(
+        "\
 // APIError is returned by operation methods on non-2xx responses. It exposes the
 // HTTP status and the decoded error body (message/slug/hints).
-type APIError struct {
+type APIError struct {{
 StatusCode int
 Message string
 Slug string
 Hints []string
-}
+}}
 
 // Error implements the error interface.
-func (e *APIError) Error() string {
-return fmt.Sprintf(\"goalservice: %d %s (%s)\", e.StatusCode, e.Message, e.Slug)
-}
+func (e *APIError) Error() string {{
+return fmt.Sprintf(\"{package}: %d %s (%s)\", e.StatusCode, e.Message, e.Slug)
+}}
 
 // IsNotFound reports whether the error is a 404.
-func (e *APIError) IsNotFound() bool {
+func (e *APIError) IsNotFound() bool {{
 return e.StatusCode == 404
-}
-";
-    file(&["fmt"], body)
+}}
+"
+    );
+    file(package, &["fmt"], &body)
 }
 
 /// The success status + (optional) model of an operation's first 2xx response.
@@ -467,21 +475,23 @@ fn join_path(base_path: &str, path: &str) -> String {
     }
 }
 
-/// Emit one operations file for `tag`: tag-grouped, ctx-first typed methods on `*Client`.
+/// Emit the single `operations.go` resource surface: ctx-first typed methods on `*Client`.
 ///
-/// `ops` are the operations assigned to this tag, in graph order. Each method:
+/// `ops` are all of the graph's operations, in graph order. Each method:
 /// - takes `ctx context.Context` first, then path params as positional `string` args, then a generated
 ///   `<Method>Params` struct for query-bearing ops, then a typed body input;
 /// - marshals the body with `encoding/json`, builds the request to `baseURL + <absolute path>`, sets
 ///   `X-API-Key` when the client's apiKey is non-empty, and decodes a 2xx body into the success model
 ///   or a non-2xx body into an [`APIError`].
 ///
+/// `package` is the SDK package name (derived from config, the single source) used in the file frame.
+///
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] on a dangling body/response `$ref` for any op in the group.
 pub(crate) fn emit_operations(
     graph: &ApiGraph,
-    tag: &str,
+    package: &str,
     base_path: &str,
     ops: &[&Operation],
 ) -> Result<String, CoreError> {
@@ -506,8 +516,7 @@ pub(crate) fn emit_operations(
     {
         imports.push("net/url");
     }
-    let _ = tag; // the tag names the FILE (handled by the bundle), not the imports.
-    Ok(file(&imports, &body))
+    Ok(file(package, &imports, &body))
 }
 
 /// Emit a single operation method, including its `<Method>Params` struct when the op has query params.
@@ -920,16 +929,17 @@ fn lower_camel(name: &str) -> String {
     out
 }
 
-/// Frame a Go file: `package <PACKAGE>`, a computed import block, then the body.
+/// Frame a Go file: `package <package>`, a computed import block, then the body.
 ///
-/// Imports are sorted + de-duplicated (a `BTreeSet`) so the block is deterministic and `gofmt`-stable.
+/// `package` is the SDK package name, derived from `output.go_module` (the single source of truth);
+/// imports are sorted + de-duplicated (a `BTreeSet`) so the block is deterministic and `gofmt`-stable.
 /// A single import emits the one-line form; multiple imports emit the parenthesized block — `gofmt`
 /// canonicalizes either, so this is just to keep the pre-format text tidy.
-fn file(imports: &[&str], body: &str) -> String {
+fn file(package: &str, imports: &[&str], body: &str) -> String {
     // `write!` into a String is infallible in practice; the trait is fallible, so swallow the unit
     // error with `let _ =` rather than `unwrap` (RUST-04) — there is no failure mode to surface.
     let mut out = String::new();
-    let _ = writeln!(out, "package {PACKAGE}");
+    let _ = writeln!(out, "package {package}");
     let set: BTreeSet<&str> = imports.iter().copied().collect();
     if !set.is_empty() {
         out.push('\n');
@@ -1295,7 +1305,7 @@ mod tests {
 
         #[test]
         fn optional_field_is_pointer_with_omitempty_required_is_plain() {
-            let out = emit_models(&sample_graph()).unwrap();
+            let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // Optional number → *float32 + omitempty.
             assert!(
                 out.contains("TargetValue *float32 `json:\"targetValue,omitempty\"`"),
@@ -1310,7 +1320,7 @@ mod tests {
 
         #[test]
         fn enum_emits_newtype_and_sorted_const_block() {
-            let out = emit_models(&sample_graph()).unwrap();
+            let out = emit_models(&sample_graph(), "goalservice").unwrap();
             assert!(out.contains("type TargetDirection string"), "{out}");
             assert!(
                 out.contains("TargetDirectionGte TargetDirection = \"gte\""),
@@ -1328,7 +1338,7 @@ mod tests {
 
         #[test]
         fn maps_uuid_to_string_datetime_to_time_and_array_of_uuid_to_string_slice() {
-            let out = emit_models(&sample_graph()).unwrap();
+            let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // uuid → string.
             assert!(out.contains("UUID string `json:\"uuid\"`"), "{out}");
             // date-time → time.Time.
@@ -1350,14 +1360,14 @@ mod tests {
 
         #[test]
         fn imports_time_only_when_a_time_field_exists() {
-            let out = emit_models(&sample_graph()).unwrap();
+            let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // GoalResponse.createdAt is a date-time, so `time` must be imported.
             assert!(out.contains("import \"time\""), "{out}");
         }
 
         #[test]
         fn nested_ref_uses_referenced_model_name() {
-            let out = emit_models(&sample_graph()).unwrap();
+            let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // analyticsQuery (ref, required) → the referenced struct's Go name, no pointer.
             assert!(
                 out.contains("AnalyticsQuery GoalAnalyticsQuery `json:\"analyticsQuery\"`"),
@@ -1384,7 +1394,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "createGoal")
                 .collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
@@ -1401,7 +1411,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(out.contains("type ListGoalsParams struct"), "{out}");
             assert!(
                 out.contains("Aggregation string"),
@@ -1423,7 +1433,7 @@ mod tests {
         fn ops_file_imports_the_request_plumbing_set() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             for imp in ["bytes", "context", "encoding/json", "fmt", "net/http"] {
                 assert!(
                     out.contains(&format!("\"{imp}\"")),
@@ -1439,7 +1449,7 @@ mod tests {
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
@@ -1460,7 +1470,7 @@ mod tests {
             // struct exposing exactly the fields APIError consumes, so it always compiles.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr struct {"),
                 "absent error model must decode into an anonymous struct:\n{out}"
@@ -1479,7 +1489,7 @@ mod tests {
             // import `net/url`. The local URL var is `reqURL` to avoid shadowing the `url` package.
             let graph = super::path_param_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"
@@ -1498,7 +1508,7 @@ mod tests {
             // param set) must be a typed SdkGen error, not a silent `%!s(MISSING)` at runtime.
             let graph = super::mismatched_path_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "Goals", "/goal", &ops).unwrap_err();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("do not match its path params"),
@@ -1513,7 +1523,7 @@ mod tests {
             // file must import `strconv`. The all-string fixture stays unaffected (no strconv import).
             let graph = super::typed_query_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"page\", strconv.FormatInt(params.Page, 10))"),
                 "required int64 query param must be strconv.FormatInt:\n{out}"
@@ -1538,7 +1548,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"aggregation\", params.Aggregation)"),
                 "string query param must pass through unconverted:\n{out}"
@@ -1556,7 +1566,7 @@ mod tests {
             // 201 success as an error). The method also returns an empty `struct{}` (no body model).
             let graph = super::body_less_success_graph(201);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 201 {"),
                 "body-less 201 must compare against 201:\n{out}"
@@ -1576,7 +1586,7 @@ mod tests {
             // WR-01: a body-less `204 No Content` must likewise compare against 204.
             let graph = super::body_less_success_graph(204);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 204 {"),
                 "body-less 204 must compare against 204:\n{out}"
@@ -1589,7 +1599,7 @@ mod tests {
             // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             // The synthetic error model in error_model_graph declares message + slug only.
             assert!(out.contains("Message: apiErr.Message,"), "{out}");
             assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
@@ -1605,7 +1615,7 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client();
+            let out = emit_client("goalservice");
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -1622,7 +1632,7 @@ mod tests {
 
         #[test]
         fn errors_emit_apierror_with_error_method() {
-            let out = emit_errors();
+            let out = emit_errors("goalservice");
             assert!(out.contains("type APIError struct"), "{out}");
             assert!(out.contains("StatusCode int"), "{out}");
             assert!(out.contains("func (e *APIError) Error() string"), "{out}");
