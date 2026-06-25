@@ -25,12 +25,16 @@ use bundle::{SdkBundle, SdkFile};
 /// into a single [`bundle::SdkBundle`] String. Generating twice over the same graph is byte-identical
 /// (T-03-02-03).
 ///
+/// `base_path` is the API base/mount path joined to each operation's group-relative path in the
+/// emitted request URLs — the SAME single source of truth (the user's `gnr8` config) the `OpenAPI`
+/// lowering takes it from (CLAUDE.md rules 3 & 4), so the SDK and the spec agree on the prefix.
+///
 /// # Errors
 ///
 /// Returns [`crate::CoreError::SdkGen`] for an un-representable graph fact (dangling `$ref`, unknown
 /// `kind`), [`crate::CoreError::GoFmt`] if `gofmt` rejects emitted Go, or
 /// [`crate::CoreError::GoToolchainMissing`] if `gofmt` cannot be spawned.
-pub fn generate(graph: &ApiGraph) -> Result<String, crate::CoreError> {
+pub fn generate(graph: &ApiGraph, base_path: &str) -> Result<String, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
 
     // Fixed leading files (sorted: client.go before errors.go).
@@ -42,7 +46,7 @@ pub fn generate(graph: &ApiGraph) -> Result<String, crate::CoreError> {
     // the SDK is a single resource surface (`goalservice.go`).
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     let file_name = format!("{}.go", emit::PACKAGE.to_ascii_lowercase());
-    let raw = emit::emit_operations(graph, emit::PACKAGE, &ops)?;
+    let raw = emit::emit_operations(graph, emit::PACKAGE, base_path, &ops)?;
     files.push(go_file(&file_name, &raw)?);
 
     // Trailing models.go.
@@ -234,7 +238,7 @@ mod tests {
             eprintln!("skipping generate test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph()).unwrap();
+        let out = generate(&sample_graph(), "/goal").unwrap();
         for marker in [
             "// ==== gnr8:file client.go ====",
             "// ==== gnr8:file errors.go ====",
@@ -253,8 +257,8 @@ mod tests {
         }
         let graph = sample_graph();
         assert_eq!(
-            generate(&graph).unwrap(),
-            generate(&graph).unwrap(),
+            generate(&graph, "/goal").unwrap(),
+            generate(&graph, "/goal").unwrap(),
             "two generate runs must be byte-identical"
         );
     }
@@ -265,7 +269,7 @@ mod tests {
             eprintln!("skipping models test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph()).unwrap();
+        let out = generate(&sample_graph(), "/goal").unwrap();
         for ty in [
             "type CreateGoalInput struct",
             "type UpdateGoalInput struct",
@@ -282,7 +286,7 @@ mod tests {
             eprintln!("skipping ops test: gofmt unavailable");
             return;
         }
-        let out = generate(&sample_graph()).unwrap();
+        let out = generate(&sample_graph(), "/goal").unwrap();
         assert!(
             out.contains("func (c *Client) CreateGoal(ctx context.Context"),
             "CreateGoal must take ctx first:\n{out}"

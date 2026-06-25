@@ -97,8 +97,8 @@ fn write_go_mod(dir: &Path) {
 fn materialize_sdk() -> PathBuf {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let bundle =
-        gnr8_core::sdk::generate(&graph).expect("sdk::generate must succeed (requires gofmt)");
+    let bundle = gnr8_core::sdk::generate(&graph, "/goal")
+        .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir("ok");
     gnr8_core::sdk::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");

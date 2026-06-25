@@ -48,6 +48,11 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # documented v2 direction (ADV-02) and is deliberately NOT a knob here.
 inputs = [\".\"]                              # Go source dir(s) to analyze (project-relative)
 
+# base_path is the SINGLE SOURCE OF TRUTH for the API base/mount path joined to every operation
+# path. The graph stores group-relative paths and cannot see the Gin group prefix (often a runtime
+# value: Group(\"/\" + basePath)), so you declare it here. Defaults to \"/\" when omitted.
+base_path = \"/\"
+
 [output]
 openapi   = \"openapi.yaml\"                  # OpenAPI artifact path (project-relative)
 sdk_dir   = \"sdk\"                           # generated Go SDK directory

@@ -64,9 +64,10 @@ fn to_openapi_is_byte_identical_across_two_runs() {
     // Build the graph twice AND lower twice — proving both the upstream graph and the lowering are
     // deterministic end-to-end (idempotent OpenAPI generation, RESEARCH Pitfall 4 / TARGET-API §5.6).
     let security = fixture_security();
-    let a = gnr8_core::lower::to_openapi(&first, &security).expect("first to_openapi must succeed");
-    let b =
-        gnr8_core::lower::to_openapi(&second, &security).expect("second to_openapi must succeed");
+    let a = gnr8_core::lower::to_openapi(&first, "/goal", &security)
+        .expect("first to_openapi must succeed");
+    let b = gnr8_core::lower::to_openapi(&second, "/goal", &security)
+        .expect("second to_openapi must succeed");
 
     assert_eq!(
         a, b,
@@ -86,9 +87,9 @@ fn sdk_generate_is_byte_identical_across_two_runs() {
 
     // Build the graph twice AND generate twice — proving the SDK emission (gofmt'd, file-marker-framed)
     // is byte-identical end-to-end (idempotent SDK generation).
-    let a = gnr8_core::sdk::generate(&first)
+    let a = gnr8_core::sdk::generate(&first, "/goal")
         .expect("first sdk::generate must succeed (requires gofmt)");
-    let b = gnr8_core::sdk::generate(&second)
+    let b = gnr8_core::sdk::generate(&second, "/goal")
         .expect("second sdk::generate must succeed (requires gofmt)");
 
     assert_eq!(

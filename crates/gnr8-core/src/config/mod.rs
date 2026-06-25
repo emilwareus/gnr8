@@ -8,6 +8,7 @@
 //! module models ONLY the documented knobs the PoC actually reads statically:
 //!
 //! - `inputs` — Go source dir(s) to analyze,
+//! - `base_path` — the API base/mount path (see below),
 //! - `output.openapi` / `output.sdk_dir` / `output.go_module` — artifact paths + Go module path,
 //! - `naming.operations` / `naming.types` — operation/type name remaps,
 //! - `security.schemes` — the API security schemes (see below).
@@ -42,6 +43,17 @@ use crate::CoreError;
 pub struct Config {
     /// Go source input directory(ies) to analyze, relative to the project root (e.g. `["."]`).
     pub inputs: Vec<String>,
+    /// The API base/mount path joined to every group-relative operation path — the **single source
+    /// of truth** for the service prefix (CLAUDE.md rules 3 & 4).
+    ///
+    /// The graph stores group-relative paths (`/`, `/list`, `/{uuid}`) and carries no service prefix:
+    /// the real prefix is the Gin group argument (`Group("/" + basePath)`), often a *runtime* value
+    /// the analyzer cannot constant-fold. Rather than scrape or guess it (and rather than read a
+    /// literal with a config fall-back — forbidden by rule 3), it is declared HERE, by the user
+    /// configuring our engine, and is the only place lowering takes it from. Defaults to `"/"` (a
+    /// root-mounted service) when omitted.
+    #[serde(default = "default_base_path")]
+    pub base_path: String,
     /// Output artifact paths + Go module path for the generated SDK.
     pub output: OutputConfig,
     /// Optional operation/type name remaps (the one customization knob built in the PoC).
@@ -51,6 +63,14 @@ pub struct Config {
     /// requirement and `components.securitySchemes`. Defaults to no schemes when omitted.
     #[serde(default)]
     pub security: SecurityConfig,
+}
+
+/// The default API base path (`"/"`, a root-mounted service) used when `base_path` is omitted.
+///
+/// A function rather than a const because `#[serde(default = "...")]` requires a callable producing
+/// the owned `String`.
+fn default_base_path() -> String {
+    "/".to_string()
 }
 
 /// The security configuration: the user-declared schemes that secure the generated API.
@@ -147,6 +167,23 @@ mod tests {
     use super::parse;
 
     const BASE: &str = "inputs = [\".\"]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/svc/sdk\"\n";
+
+    #[test]
+    fn base_path_defaults_to_root_when_omitted() {
+        let config = parse(BASE).unwrap();
+        assert_eq!(
+            config.base_path, "/",
+            "base_path must default to \"/\" (a root-mounted service) when omitted"
+        );
+    }
+
+    #[test]
+    fn parses_an_explicit_base_path() {
+        // base_path is a top-level key, so it must precede the [output] table.
+        let src = "inputs = [\".\"]\nbase_path = \"/books\"\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/svc/sdk\"\n";
+        let config = parse(src).unwrap();
+        assert_eq!(config.base_path, "/books");
+    }
 
     #[test]
     fn security_defaults_to_no_schemes_when_omitted() {

@@ -454,16 +454,16 @@ fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, Cor
     Ok(Some(model.name.clone()))
 }
 
-/// The absolute base path joined to each operation's group-relative path (mirrors lowering Pitfall 1).
-const BASE_PATH: &str = "/goal";
-
-/// Join the service base prefix with a group-relative operation path (slash-collapsed).
-fn join_path(path: &str) -> String {
+/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). `base_path` is
+/// the user's `gnr8` config value — the single source of truth for the service prefix shared with the
+/// `OpenAPI` lowering (CLAUDE.md rules 3 & 4) — so the SDK URLs and the spec paths agree.
+fn join_path(base_path: &str, path: &str) -> String {
+    let base = base_path.trim_end_matches('/');
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
-        format!("{BASE_PATH}/")
+        format!("{base}/")
     } else {
-        format!("{BASE_PATH}/{trimmed}")
+        format!("{base}/{trimmed}")
     }
 }
 
@@ -482,6 +482,7 @@ fn join_path(path: &str) -> String {
 pub(crate) fn emit_operations(
     graph: &ApiGraph,
     tag: &str,
+    base_path: &str,
     ops: &[&Operation],
 ) -> Result<String, CoreError> {
     let mut body = String::new();
@@ -491,7 +492,7 @@ pub(crate) fn emit_operations(
             writeln!(body).map_err(sink)?;
         }
         first = false;
-        emit_operation(&mut body, op, graph)?;
+        emit_operation(&mut body, op, graph, base_path)?;
     }
     // Operation methods always touch context/net-http/encoding-json/bytes/fmt (request build + decode).
     // WR-02: non-string query params additionally need `strconv`/`time` to URL-encode; `file` sorts +
@@ -510,7 +511,12 @@ pub(crate) fn emit_operations(
 }
 
 /// Emit a single operation method, including its `<Method>Params` struct when the op has query params.
-fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result<(), CoreError> {
+fn emit_operation(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    base_path: &str,
+) -> Result<(), CoreError> {
     let method_name = exported(&op.handler);
     let path_params: Vec<&str> = op
         .params
@@ -555,7 +561,7 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
         body,
         "// {method_name} -> {} {}",
         op.method,
-        join_path(&op.path)
+        join_path(base_path, &op.path)
     )
     .map_err(sink)?;
     writeln!(
@@ -572,6 +578,7 @@ fn emit_operation(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result
         body,
         op,
         graph,
+        base_path,
         &path_params,
         &query_params,
         has_body,
@@ -592,6 +599,7 @@ fn emit_request_dispatch(
     body: &mut String,
     op: &Operation,
     graph: &ApiGraph,
+    base_path: &str,
     path_params: &[&str],
     query_params: &[&crate::graph::Param],
     has_body: bool,
@@ -608,7 +616,7 @@ fn emit_request_dispatch(
     }
 
     // URL construction: baseURL + absolute path with path params interpolated.
-    emit_url(body, op, path_params)?;
+    emit_url(body, op, base_path, path_params)?;
 
     // Request build.
     let body_arg = if has_body { "reqBody" } else { "nil" };
@@ -816,8 +824,13 @@ fn path_tokens(path: &str) -> Vec<String> {
 ///
 /// WR-04: each interpolated path value is wrapped in `url.PathEscape(...)` so a value containing
 /// `/`, `?`, `#`, `%`, or `..` can never restructure the request URL.
-fn emit_url(body: &mut String, op: &Operation, path_params: &[&str]) -> Result<(), CoreError> {
-    let abs = join_path(&op.path);
+fn emit_url(
+    body: &mut String,
+    op: &Operation,
+    base_path: &str,
+    path_params: &[&str],
+) -> Result<(), CoreError> {
+    let abs = join_path(base_path, &op.path);
     let tokens = path_tokens(&abs);
 
     // WR-03: the templated tokens must be exactly the declared path params (order-independent set
@@ -1371,7 +1384,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "createGoal")
                 .collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
@@ -1388,7 +1401,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(out.contains("type ListGoalsParams struct"), "{out}");
             assert!(
                 out.contains("Aggregation string"),
@@ -1410,7 +1423,7 @@ mod tests {
         fn ops_file_imports_the_request_plumbing_set() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             for imp in ["bytes", "context", "encoding/json", "fmt", "net/http"] {
                 assert!(
                     out.contains(&format!("\"{imp}\"")),
@@ -1426,7 +1439,7 @@ mod tests {
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
@@ -1447,7 +1460,7 @@ mod tests {
             // struct exposing exactly the fields APIError consumes, so it always compiles.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr struct {"),
                 "absent error model must decode into an anonymous struct:\n{out}"
@@ -1466,7 +1479,7 @@ mod tests {
             // import `net/url`. The local URL var is `reqURL` to avoid shadowing the `url` package.
             let graph = super::path_param_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"
@@ -1485,7 +1498,7 @@ mod tests {
             // param set) must be a typed SdkGen error, not a silent `%!s(MISSING)` at runtime.
             let graph = super::mismatched_path_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "Goals", &ops).unwrap_err();
+            let err = emit_operations(&graph, "Goals", "/goal", &ops).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("do not match its path params"),
@@ -1500,7 +1513,7 @@ mod tests {
             // file must import `strconv`. The all-string fixture stays unaffected (no strconv import).
             let graph = super::typed_query_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"page\", strconv.FormatInt(params.Page, 10))"),
                 "required int64 query param must be strconv.FormatInt:\n{out}"
@@ -1525,7 +1538,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"aggregation\", params.Aggregation)"),
                 "string query param must pass through unconverted:\n{out}"
@@ -1543,7 +1556,7 @@ mod tests {
             // 201 success as an error). The method also returns an empty `struct{}` (no body model).
             let graph = super::body_less_success_graph(201);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 201 {"),
                 "body-less 201 must compare against 201:\n{out}"
@@ -1563,7 +1576,7 @@ mod tests {
             // WR-01: a body-less `204 No Content` must likewise compare against 204.
             let graph = super::body_less_success_graph(204);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 204 {"),
                 "body-less 204 must compare against 204:\n{out}"
@@ -1576,7 +1589,7 @@ mod tests {
             // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "Goals", &ops).unwrap();
+            let out = emit_operations(&graph, "Goals", "/goal", &ops).unwrap();
             // The synthetic error model in error_model_graph declares message + slug only.
             assert!(out.contains("Message: apiErr.Message,"), "{out}");
             assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
@@ -1663,9 +1676,11 @@ mod tests {
 
         #[test]
         fn join_path_prefixes_the_service_base() {
-            assert_eq!(join_path("/"), "/goal/");
-            assert_eq!(join_path("/list"), "/goal/list");
-            assert_eq!(join_path("/{uuid}"), "/goal/{uuid}");
+            assert_eq!(join_path("/goal", "/"), "/goal/");
+            assert_eq!(join_path("/goal", "/list"), "/goal/list");
+            assert_eq!(join_path("/goal", "/{uuid}"), "/goal/{uuid}");
+            // A trailing slash on the base is collapsed, never doubled (mirrors lowering::join_base).
+            assert_eq!(join_path("/goal/", "/list"), "/goal/list");
         }
     }
 }

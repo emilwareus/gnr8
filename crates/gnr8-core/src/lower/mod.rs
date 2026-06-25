@@ -5,16 +5,16 @@
 //! re-analysis — D-02): it builds a [`model::OpenApiDoc`] from the [`crate::graph::ApiGraph`] and
 //! serializes it with the deterministic key-ordered writer in [`yaml`].
 //!
-//! ## Resolved Open Question A3 — the absolute `/goal` base-path prefix
+//! ## Resolved Open Question A3 — the absolute base-path prefix (from config)
 //!
 //! The Phase-2 graph stores **group-relative** operation paths (`/`, `/list`, `/{uuid}`) and carries
 //! NO explicit service base path; 02-03 deferred joining the dynamic `"/" + basePath` prefix to
-//! Phase-3 lowering (see `graph::Operation::path`). Per RESEARCH recommendation (a) — lower from a
-//! known constant for the single-group `PoC` rather than reshaping the Phase-2 graph (which would be
-//! an out-of-scope Phase-2 change) — this module defines a private [`BASE_PATH`] and joins it to each
-//! operation's group-relative path with slash-collapse, yielding `/goal/`, `/goal/list`,
-//! `/goal/{uuid}` (never `/goal//list` and never a dropped prefix). A multi-group generalization is
-//! deferred (D-02).
+//! Phase-3 lowering (see `graph::Operation::path`). That prefix is the Gin group argument — often a
+//! *runtime* value the analyzer cannot constant-fold — so it is NOT scraped: it is the user's
+//! `config.base_path` (the single source of truth; CLAUDE.md rules 3 & 4), threaded into
+//! [`to_openapi`] and joined to each operation's group-relative path with slash-collapse. With
+//! `base_path = "/goal"` this yields `/goal/`, `/goal/list`, `/goal/{uuid}` (never `/goal//list` and
+//! never a dropped prefix). A multi-group generalization is deferred (D-02).
 //!
 //! ## Diagnostics (OAPI-03)
 //!
@@ -36,13 +36,6 @@ use model::{
 };
 use std::collections::BTreeMap;
 
-/// The absolute service base-path prefix joined to every group-relative operation path (Open Q A3).
-///
-/// The fixture is a single route group mounted at `/goal`; the graph cannot constant-fold the dynamic
-/// `basePath` prefix, so lowering supplies it deterministically here. See the module doc for the full
-/// rationale.
-const BASE_PATH: &str = "/goal";
-
 /// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
 const SUPPORTED_API_KEY_LOCATION: &str = "header";
 
@@ -52,9 +45,10 @@ const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document (serialized YAML).
 ///
 /// A pure graph→typed-doc transform (D-02): builds a [`model::OpenApiDoc`] and serializes it via the
-/// deterministic [`yaml::write`] writer. Operation paths are joined with the absolute [`BASE_PATH`]
-/// prefix (Open Q A3); every schema `$ref` is resolved against `graph.schemas` to its bare component
-/// name. The `security` requirement and `components.securitySchemes` are built ENTIRELY from
+/// deterministic [`yaml::write`] writer. Operation paths are joined with the `base_path` prefix taken
+/// from the user's `gnr8` config (Open Q A3 — the single source of truth for the service prefix,
+/// CLAUDE.md rules 3 & 4); every schema `$ref` is resolved against `graph.schemas` to its bare
+/// component name. The `security` requirement and `components.securitySchemes` are built ENTIRELY from
 /// `security` (the user's `gnr8` config) — the single source of truth for security (`CLAUDE.md` rule
 /// 4); the graph carries no security facts. The `PoC` policy applies every configured scheme to all
 /// operations (top-level `security`).
@@ -66,7 +60,11 @@ const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 /// [`crate::graph::SchemaType`] `kind` — or when a configured security scheme uses an unsupported
 /// `kind`/`location` (so a misconfiguration is a clear error, never a silently dropped scheme). Never
 /// panics and never `unwrap`s (RUST-04 / T-03-01-01).
-pub fn to_openapi(graph: &ApiGraph, security: &SecurityConfig) -> Result<String, crate::CoreError> {
+pub fn to_openapi(
+    graph: &ApiGraph,
+    base_path: &str,
+    security: &SecurityConfig,
+) -> Result<String, crate::CoreError> {
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
         .schemas
@@ -74,7 +72,7 @@ pub fn to_openapi(graph: &ApiGraph, security: &SecurityConfig) -> Result<String,
         .map(|schema| (schema.id.as_str(), schema.name.as_str()))
         .collect();
 
-    let paths = build_paths(graph, &ref_to_name)?;
+    let paths = build_paths(graph, base_path, &ref_to_name)?;
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
     let security = build_security(security)?;
 
@@ -159,13 +157,14 @@ fn build_security(config: &SecurityConfig) -> Result<LoweredSecurity, crate::Cor
 /// `/goal/{uuid}` coexist), preserving graph order and keying paths in first-seen (sorted) order.
 fn build_paths(
     graph: &ApiGraph,
+    base_path: &str,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<Vec<(String, PathItem)>, crate::CoreError> {
     // The graph sorts operations by (path, method); joining the base path preserves that order, so a
     // simple ordered accumulator keeps the output deterministic without re-sorting.
     let mut paths: Vec<(String, PathItem)> = Vec::new();
     for op in &graph.operations {
-        let abs_path = join_base(BASE_PATH, &op.path);
+        let abs_path = join_base(base_path, &op.path);
         let operation = lower_operation(op, ref_to_name)?;
         // Find the existing path-item index (the graph's (path, method) sort keeps same-path
         // operations adjacent, so this stays deterministic), else append a fresh one.
@@ -393,9 +392,9 @@ fn resolve_ref(
     }
 }
 
-/// Join the absolute [`BASE_PATH`] prefix with a group-relative operation path, collapsing the seam
-/// slash: `/goal` + `/` → `/goal/`, `/goal` + `/list` → `/goal/list`, `/goal` + `/{uuid}` →
-/// `/goal/{uuid}` (never `/goal//list`, never a dropped prefix). Open Q A3.
+/// Join the `base_path` prefix with a group-relative operation path, collapsing the seam slash:
+/// `/goal` + `/` → `/goal/`, `/goal` + `/list` → `/goal/list`, `/goal` + `/{uuid}` → `/goal/{uuid}`
+/// (never `/goal//list`, never a dropped prefix). Open Q A3.
 fn join_base(base: &str, relative: &str) -> String {
     let base = base.trim_end_matches('/');
     if relative == "/" {
@@ -577,7 +576,7 @@ mod tests {
 
     #[test]
     fn paths_are_keyed_absolutely_under_goal() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         assert!(yaml.contains("'/goal/':"), "{yaml}");
         assert!(yaml.contains("'/goal/list':"), "{yaml}");
         assert!(yaml.contains("'/goal/{uuid}':"), "{yaml}");
@@ -586,7 +585,7 @@ mod tests {
 
     #[test]
     fn put_and_delete_coexist_on_one_path() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         // Both methods must render under the single /goal/{uuid} path item.
         let uuid_block = yaml
             .split("'/goal/{uuid}':")
@@ -598,7 +597,7 @@ mod tests {
 
     #[test]
     fn operation_ids_are_handler_symbols() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         // operationIds are the handler-symbol-derived ids — no annotation override (e.g. updateGoal,
         // not goalUuidPut).
         assert!(yaml.contains("operationId: createGoal"), "{yaml}");
@@ -616,7 +615,7 @@ mod tests {
 
     #[test]
     fn query_params_are_plain_string_not_required_no_enum() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         // The aggregation query param lowers to a bare string, not required, with no enum.
         let list_block = yaml.split("'/goal/list':").nth(1).expect("list path");
         let list_block = list_block
@@ -638,7 +637,7 @@ mod tests {
         graph.operations[0].request_body = Some(crate::graph::SchemaRef {
             ref_id: "internal/dto.DoesNotExist".to_string(),
         });
-        let err = to_openapi(&graph, &security_config()).unwrap_err();
+        let err = to_openapi(&graph, "/goal", &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -650,7 +649,7 @@ mod tests {
         let mut graph = sample_graph();
         // Corrupt a field's schema kind to an unrepresentable value.
         graph.schemas[1].fields[0].schema.kind = "tuple".to_string();
-        let err = to_openapi(&graph, &security_config()).unwrap_err();
+        let err = to_openapi(&graph, "/goal", &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -659,7 +658,7 @@ mod tests {
 
     #[test]
     fn api_key_security_is_emitted_from_config_top_level_and_in_components() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         assert!(yaml.contains("security:"), "top-level security:\n{yaml}");
         assert!(yaml.contains("- ApiKeyAuth: []"), "{yaml}");
         assert!(yaml.contains("securitySchemes:"), "{yaml}");
@@ -672,7 +671,7 @@ mod tests {
     fn no_security_config_emits_no_security() {
         // With an empty security config the document carries no security — proving security is
         // ENTIRELY config-driven, never derived from the graph (CLAUDE.md rule 4).
-        let yaml = to_openapi(&sample_graph(), &SecurityConfig::default()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &SecurityConfig::default()).unwrap();
         assert!(
             !yaml.contains("ApiKeyAuth"),
             "no scheme without config:\n{yaml}"
@@ -690,7 +689,7 @@ mod tests {
                 name: "Authorization".to_string(),
             }],
         };
-        let err = to_openapi(&sample_graph(), &config).unwrap_err();
+        let err = to_openapi(&sample_graph(), "/goal", &config).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -699,7 +698,7 @@ mod tests {
 
     #[test]
     fn free_form_map_field_lowers_to_additional_properties_true() {
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         assert!(
             yaml.contains("additionalProperties: true"),
             "free-form map must lower to additionalProperties: true:\n{yaml}"
@@ -710,7 +709,7 @@ mod tests {
     fn code_defined_enum_is_preserved() {
         // A code-defined Go enum (TargetDirection, from go/types) must still render as a string enum —
         // it comes from CODE, not annotations (CLAUDE.md rule on keeping code-defined enums).
-        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let yaml = to_openapi(&sample_graph(), "/goal", &security_config()).unwrap();
         let td = yaml
             .split("TargetDirection:")
             .nth(1)
@@ -726,15 +725,15 @@ mod tests {
         let graph = sample_graph();
         // The sample carries a diagnostic; lowering must still succeed (diagnostics are advisory).
         assert!(!graph.diagnostics.is_empty());
-        assert!(to_openapi(&graph, &security_config()).is_ok());
+        assert!(to_openapi(&graph, "/goal", &security_config()).is_ok());
     }
 
     #[test]
     fn to_openapi_is_byte_identical_across_two_runs() {
         let graph = sample_graph();
         assert_eq!(
-            to_openapi(&graph, &security_config()).unwrap(),
-            to_openapi(&graph, &security_config()).unwrap()
+            to_openapi(&graph, "/goal", &security_config()).unwrap(),
+            to_openapi(&graph, "/goal", &security_config()).unwrap()
         );
     }
 }
