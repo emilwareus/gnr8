@@ -272,8 +272,7 @@ mod tests {
             // A binary name that cannot exist on PATH forces the spawn to fail with an io::Error
             // -> TypeScriptToolchainMissing, NOT a panic (T-04-02). Forced via the `_with` split so
             // we never mutate the process PATH.
-            let result =
-                run_tsextract_with("gnr8-nonexistent-node-binary-xyz", "/some/target/dir");
+            let result = run_tsextract_with("gnr8-nonexistent-node-binary-xyz", "/some/target/dir");
             let err = result.unwrap_err();
             assert!(
                 matches!(err, CoreError::TypeScriptToolchainMissing { .. }),

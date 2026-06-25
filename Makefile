@@ -55,6 +55,7 @@ gates:
 	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
 	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test sdk_pipeline --test lifecycle
+	cargo test -p gnr8-core --test snapshot_nestjs_graph --test snapshot_nestjs_openapi
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
@@ -65,16 +66,13 @@ fixture-build:
 goextract-build:
 	cd goextract && go build ./... && go vet ./... && go test ./...
 
-# Show the red-by-design multi-language acceptance contract ON DEMAND (Phase 1 / v2.0). These six
-# `#[ignore]`d snapshots are the intended-green graph + OpenAPI for the FastAPI/Flask/NestJS fixtures;
-# they fail honestly at the `.expect()` until pyextract (Phase 2) / tsextract (Phase 4) land. They are
-# NOT part of `make check`/`gates` — this target exists so reviewers can SEE the honest red. The `-`
-# prefix lets the recipe report the failures without aborting the make invocation.
+# Historical red-by-design target (Phase 1 / v2.0). The six multi-language acceptance snapshots
+# (FastAPI/Flask/NestJS graph + OpenAPI) were `#[ignore]`d red-by-design until their extractors
+# landed; ALL SIX are GREEN now (pyextract — Phase 2; tsextract — Phase 4 / Plan 04-03) and run in the
+# blocking `gates:` set, so nothing remains `#[ignore]`d here. This target is kept as a no-op marker
+# of where the honest-red contract used to live; the `-` prefix keeps it non-aborting.
 red:
-	-cargo test -p gnr8-core \
-		--test snapshot_fastapi_graph --test snapshot_fastapi_openapi \
-		--test snapshot_flask_graph --test snapshot_flask_openapi \
-		--test snapshot_nestjs_graph --test snapshot_nestjs_openapi -- --ignored
+	@echo "no red-by-design acceptance snapshots remain — all six are GREEN in the gates target"
 
 # Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
 # multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.

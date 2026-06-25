@@ -13,10 +13,22 @@
 
 // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow to
 // this test target so the workspace-wide RUST-04 deny stays intact for production code (Pitfall 2).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `doc_markdown` is allowed too: these test-target doc comments name many proper nouns (NestJS,
+// FastAPI, OpenAPI, ...) where backtick-per-noun hurts readability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+mod nestjs_toolchain;
 
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
+
+/// The NestJS (TypeScript) fixture — the determinism twin proves the tsextract sidecar path
+/// (route recognition + transitive schema collection) is byte-identical across runs, exactly like
+/// the Go + Python helper paths.
+const NESTJS_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/nestjs-bookstore"
+);
 
 /// The `FastAPI` (Python) fixture — the determinism twin proves the pyextract sidecar path is
 /// byte-identical across runs, exactly like the Go helper path.
@@ -201,5 +213,57 @@ fn flask_to_openapi_is_byte_identical_across_two_runs() {
     assert_eq!(
         a, b,
         "two Flask to_openapi runs over unchanged source must be byte-identical (idempotent lowering)"
+    );
+}
+
+#[test]
+fn nestjs_build_graph_is_byte_identical_across_two_runs() {
+    // Skip gracefully if the node/typescript toolchain is absent so the test never fails for a
+    // missing dependency (mirrors the go/python skips above).
+    if !nestjs_toolchain::available() {
+        eprintln!(
+            "skipping NestJS determinism test: node/typescript toolchain unavailable for {NESTJS_FIXTURE_DIR}"
+        );
+        return;
+    }
+    let first = gnr8_core::analyze::build_graph(NESTJS_FIXTURE_DIR)
+        .expect("first NestJS build_graph run must succeed (requires node + vendored typescript)");
+    let second = gnr8_core::analyze::build_graph(NESTJS_FIXTURE_DIR)
+        .expect("second NestJS build_graph run must also succeed");
+
+    let a = serde_json::to_string(&first).expect("serialize first NestJS graph");
+    let b = serde_json::to_string(&second).expect("serialize second NestJS graph");
+
+    assert_eq!(
+        a, b,
+        "two tsextract build_graph runs over unchanged source must serialize byte-identically (GRAPH-02)"
+    );
+}
+
+#[test]
+fn nestjs_to_openapi_is_byte_identical_across_two_runs() {
+    // Skip gracefully if the node/typescript toolchain is absent.
+    if !nestjs_toolchain::available() {
+        eprintln!(
+            "skipping NestJS OpenAPI determinism test: node/typescript toolchain unavailable for {NESTJS_FIXTURE_DIR}"
+        );
+        return;
+    }
+    let first = gnr8_core::analyze::build_graph(NESTJS_FIXTURE_DIR)
+        .expect("first NestJS build_graph run must succeed (requires node + vendored typescript)");
+    let second = gnr8_core::analyze::build_graph(NESTJS_FIXTURE_DIR)
+        .expect("second NestJS build_graph run must also succeed");
+
+    // Build twice AND lower twice — proving both the upstream graph and the reused lowering are
+    // deterministic end-to-end for the TypeScript path (idempotent OpenAPI generation).
+    let security = fixture_security();
+    let a = gnr8_core::lower::to_openapi(&first, "bookstore", "/books", &security)
+        .expect("first NestJS to_openapi must succeed");
+    let b = gnr8_core::lower::to_openapi(&second, "bookstore", "/books", &security)
+        .expect("second NestJS to_openapi must succeed");
+
+    assert_eq!(
+        a, b,
+        "two NestJS to_openapi runs over unchanged source must be byte-identical (idempotent lowering)"
     );
 }
