@@ -134,6 +134,12 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
 /// Emit the `responses` map keyed by quoted status code.
 fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth: usize) {
     let pad = INDENT.repeat(depth);
+    // The `responses` object is REQUIRED in OpenAPI; a response-less operation renders the explicit
+    // empty map `{}` (valid, deterministic) — NEVER a bare `responses:` line, which is a YAML null.
+    if responses.is_empty() {
+        let _ = writeln!(out, "{pad}responses: {{}}");
+        return;
+    }
     let _ = writeln!(out, "{pad}responses:");
     for (status, resp) in responses {
         // Status codes are quoted strings in OpenAPI YAML (`'201'`).
