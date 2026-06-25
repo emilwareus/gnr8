@@ -356,7 +356,19 @@ fn graph_matches_expected_for_fastapi_fixture() {
 
 **Note:** A5 is verified (MEDIUM→HIGH via official OpenAPI migration docs). A1–A4 are scoping assumptions the planner/discuss should confirm.
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All four resolved at plan time (Phase 1 plans 01-01..01-03). Resolutions recorded inline below.
+
+**RESOLVED (Q1 — serde): DEFERRED.** Plans hold the conservative floor — no new OSS, no extended
+serde surface; full owned-JSON for the recursive `Type` enum is a separate gated task, not
+critical-path (01-01 Task 1 action).
+**RESOLVED (Q2 — optional vs nullable): parallel `bool` flags.** Mirror the existing
+`required`/`optional` pair with a distinct `nullable` axis (locked in 01-01 Task 1 + must_haves).
+**RESOLVED (Q3 — fixture realism): static, type-rich source only.** No pip/npm installs; runnable
+round-trip is a Phase 2/3 concern (01-03 Task 1).
+**RESOLVED (Q4 — snapshot granularity): graph + OpenAPI per fixture.** SDK snapshots belong to the
+SDK phases (01-03 delivers both graph and OpenAPI red-by-design snapshots).
 
 1. **Should serde be removed from the facts/graph path THIS phase, or deferred?**
    - What we know: CONTEXT says "prefer replacing serde where reasonable; at minimum do not add new OSS." serde/serde_json are rule-2 debt.
