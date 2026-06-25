@@ -102,7 +102,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 02-03-PLAN.md — FastAPI recognition (routes/params/bodies/response_model/status_code, separate prefix); reconcile fixture span lines; flip both FastAPI snapshots GREEN (zero snapshot edits) + determinism [PYSRC-01]
+- [x] 02-03-PLAN.md — FastAPI recognition (routes/params/bodies/response_model/status_code, separate prefix); reconcile fixture span lines; flip both FastAPI snapshots GREEN (zero snapshot edits) + determinism [PYSRC-01]
 
 **Wave 4** *(blocked on Wave 3)*
 
@@ -176,7 +176,7 @@ dependencies.)
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
-| 2. Python Source — `pyextract` | v2.0 | 2/4 | In Progress|  |
+| 2. Python Source — `pyextract` | v2.0 | 3/4 | In Progress|  |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 0/TBD | Not started | - |
