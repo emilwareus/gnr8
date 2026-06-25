@@ -10,6 +10,8 @@ edits, and tells you what it can't represent and why. It owns the whole pipeline
 > Status: **proof of concept (v1.0).** Today it supports **Go + Gin, one route group per service**, end
 > to end. It is deliberately narrow and deliberately self-reliant — see [Status & limits](#status--limits).
 
+> **Full reference (CLI, config, type mapping, errors, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
+
 ---
 
 ## Why I built it
@@ -161,6 +163,7 @@ being retired — see [`CLAUDE.md`](CLAUDE.md).
 | `goextract/` | the Go helper that reads Gin source via `go/types` |
 | `examples/bookstore/` | a runnable, annotation-free example + its real generated output |
 | `fixtures/goalservice/` | the test fixture (a realistic Gin service) driving the contract tests |
+| `docs/USAGE.md` | **full reference** — CLI, config schema, patterns, type mapping, errors, recipes |
 | `docs/` | `demo.md` (walkthrough), `evidence.md` (what's verified) |
 
 Build & verify: `make check` (format, lint, tests) · `make gates` (the full contract suite).
