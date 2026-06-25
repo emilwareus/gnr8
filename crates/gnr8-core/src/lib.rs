@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod pysdk;
 pub mod runner;
 pub mod sdk;
+pub mod tssdk;
 pub mod workspace;
 
 /// Convenience re-export of the code-as-config composition surface (the four traits, `Pipeline`,
