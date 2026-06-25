@@ -91,7 +91,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 |-------------|-------|--------|
 | IR-01 | Phase 1 | Complete |
 | IR-02 | Phase 1 | Complete |
-| IR-03 | Phase 1 | Pending |
+| IR-03 | Phase 1 | Complete |
 | IR-04 | Phase 1 | Complete |
 | PYSRC-01 | Phase 2 | Pending |
 | PYSRC-02 | Phase 2 | Pending |
