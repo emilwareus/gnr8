@@ -69,9 +69,12 @@ mod tests {
 
     #[test]
     fn build_graph_no_longer_returns_not_yet_implemented() {
-        // 02-03 implemented build_graph: it now runs the goextract helper rather than returning the
-        // NotYetImplemented stub. Against a bad target it surfaces a typed subprocess error (toolchain
-        // missing / helper exit / parse) — never NotYetImplemented and never a panic (GO-06).
+        // build_graph is implemented: it detects the target language and runs the matching sidecar
+        // rather than returning the NotYetImplemented stub. With language dispatch (02-01) a
+        // non-existent target classifies as ambiguous (no Go/Python markers) and surfaces `Config`
+        // BEFORE any spawn; a real-but-bad target would surface `HelperExit`/`FactsParse`, and a
+        // missing toolchain `GoToolchainMissing`/`PythonToolchainMissing`. Never NotYetImplemented,
+        // never a panic (GO-06 / rule 3).
         let result = crate::analyze::build_graph("/gnr8-nonexistent-target-dir-xyz");
         let err = result.unwrap_err();
         assert!(
@@ -81,11 +84,13 @@ mod tests {
         assert!(
             matches!(
                 err,
-                CoreError::GoToolchainMissing { .. }
+                CoreError::Config { .. }
+                    | CoreError::GoToolchainMissing { .. }
+                    | CoreError::PythonToolchainMissing { .. }
                     | CoreError::HelperExit { .. }
                     | CoreError::FactsParse { .. }
             ),
-            "expected a typed subprocess error, got {err:?}"
+            "expected a typed dispatch/subprocess error, got {err:?}"
         );
     }
 }

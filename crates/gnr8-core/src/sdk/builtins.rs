@@ -81,6 +81,124 @@ impl Source for GoGin {
     }
 }
 
+/// The FastAPI (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
+/// driver), exactly like [`GoGin`] wraps goextract.
+///
+/// `inputs` are project-relative source directories; for now exactly ONE is supported, and a
+/// different count is a clear typed error rather than a silent first-wins. The single input is
+/// resolved against [`Cx::project_root`]. This Source does NOT pick the language — it calls the SAME
+/// [`crate::analyze::build_graph`], which detects Python by scanning the target (CLAUDE.md rule 3):
+/// one deterministic path per fact, never a per-Source extraction fork.
+#[derive(Debug, Default, Clone)]
+pub struct FastApi {
+    inputs: Vec<String>,
+}
+
+impl FastApi {
+    /// A FastAPI source with no inputs yet (configure with [`FastApi::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for FastApi {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        // Exactly one input dir for now: reject zero or many with a clear typed error rather than
+        // silently analyzing the first (mirrors GoGin).
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "FastApi source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "FastApi source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        // Resolve against the project root so a relative input analyzes the PROJECT, not the process
+        // cwd. The SAME build_graph the Go source calls — language dispatch is by target detection.
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
+/// The Flask (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
+/// driver), a verbatim twin of [`FastApi`]/[`GoGin`] differing only in the error proper noun.
+///
+/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
+/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
+/// target, never from which Source was used (CLAUDE.md rule 3).
+#[derive(Debug, Default, Clone)]
+pub struct Flask {
+    inputs: Vec<String>,
+}
+
+impl Flask {
+    /// A Flask source with no inputs yet (configure with [`Flask::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for Flask {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "Flask source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "Flask source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------------
@@ -460,8 +578,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApplySecurity, Cx, GoSdk, Header, OpenApi31, PostProcess, SetBasePath,
-        SetTitle, Target, Transform,
+        sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, OpenApi31, PostProcess,
+        SetBasePath, SetTitle, Source, Target, Transform,
     };
     use crate::graph::ApiGraph;
     use crate::sdk::Artifacts;
@@ -515,6 +633,41 @@ mod tests {
                 .generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
+    }
+
+    #[test]
+    fn python_sources_error_when_unconfigured() {
+        // Both Python sources reject zero inputs and many inputs with a typed Config error, exactly
+        // like GoGin — the single-input guard is identical; only the proper noun differs.
+        let cx = cx();
+        assert!(
+            matches!(
+                FastApi::new().load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "FastApi with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                FastApi::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "FastApi with many inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                Flask::new().load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "Flask with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                Flask::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "Flask with many inputs must be a Config error"
+        );
     }
 
     #[test]
