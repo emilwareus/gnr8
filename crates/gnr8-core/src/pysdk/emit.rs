@@ -98,6 +98,37 @@ pub(crate) fn screaming_snake(value: &str) -> String {
         .join("_")
 }
 
+/// The fixed set of Python reserved words that may NOT be used as bare identifiers.
+///
+/// Sourced from Python's `keyword.kwlist` (a FIXED set baked into the emitter — never shelled out,
+/// CLAUDE.md rule 2). A field/param/local whose name lands on this list emits invalid Python, so
+/// [`safe_ident`] suffixes a trailing `_` to produce a valid, deterministic identifier.
+const PY_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while",
+    "with", "yield",
+];
+
+/// Reserved argument names a generated method already binds (`self`/`body`), which a path/query param
+/// must not collide with (it would produce a `SyntaxError: duplicate argument` — WR-03).
+const RESERVED_ARGS: &[&str] = &["self", "body"];
+
+/// Make a snake/identifier-form string a SAFE Python identifier, deterministically.
+///
+/// A Python keyword (`from`/`class`/`id`-is-fine/`type`-is-fine but `import`/`def`/...) or a name that
+/// starts with a digit is invalid as a bare identifier. This suffixes a single trailing `_` in that
+/// case (a stable, collision-resistant transform). The WIRE name (JSON key / query key) is NEVER passed
+/// through this — only the *Python identifier* is renamed; callers keep the original `p.name`/`json_name`
+/// for the on-the-wire key (CR-02). One deterministic path, no fallback (rule 3).
+pub(crate) fn safe_ident(s: &str) -> String {
+    if PY_KEYWORDS.contains(&s) || s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("{s}_")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Map a neutral graph [`Type`] to its Python type hint, resolving named refs to model names.
 ///
 /// ALL Python-specific type mapping lives HERE (per-target mapping, IR-03). The match over [`Type`] is
@@ -359,22 +390,74 @@ fn emit_dataclass(
     writeln!(out, "@dataclass").map_err(sink)?;
     writeln!(out, "class {name}:").map_err(sink)?;
     if fields.is_empty() {
-        writeln!(out, "    pass").map_err(sink)?;
+        // An empty dataclass still needs a forward-compatible from_dict so the decode site is uniform.
+        writeln!(out, "    @classmethod").map_err(sink)?;
+        writeln!(
+            out,
+            "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+        )
+        .map_err(sink)?;
+        writeln!(out, "        return cls()").map_err(sink)?;
         return Ok(());
     }
     // Partition preserving each group's (already-sorted) relative order: required (no default) first,
     // optional (defaulted) last — so defaulted fields are contiguous at the end (PITFALL 1).
     let (required, optional): (Vec<&Field>, Vec<&Field>) = fields.iter().partition(|f| !f.optional);
     for field in required {
+        // The Python attribute name is keyword/digit-safe (CR-02); the wire key (`json_name`) is
+        // preserved verbatim — only a keyword/leading-digit name is renamed, and the from-dict decode
+        // (CR-04) maps the original JSON key onto the (possibly renamed) attribute by position.
+        let ident = safe_ident(&field.json_name);
         let hint = py_type(&field.schema, field.nullable, graph)?;
-        writeln!(out, "    {}: {hint}", field.json_name).map_err(sink)?;
+        writeln!(out, "    {ident}: {hint}").map_err(sink)?;
     }
     for field in optional {
-        let hint = py_type(&field.schema, field.nullable, graph)?;
+        let ident = safe_ident(&field.json_name);
         // An optional field (the key may be absent) defaults to None so the class imports and a caller
-        // may omit it. The type hint already carries Optional[..] when the value is also nullable.
-        writeln!(out, "    {}: {hint} = None", field.json_name).map_err(sink)?;
+        // may omit it. Widen the hint to Optional[..] for the defaulted form so `= None` is not a
+        // type-lie against a non-nullable value type (WR-02): the `optional` (key-absent) axis is
+        // modeled in the hint, not only the default. A nullable field is already Optional[..]; wrapping
+        // an already-Optional hint again is avoided by py_type carrying nullable, so only widen when the
+        // value is not itself nullable.
+        let hint = py_type(&field.schema, field.nullable, graph)?;
+        let defaulted_hint = if field.nullable {
+            hint
+        } else {
+            format!("Optional[{hint}]")
+        };
+        writeln!(out, "    {ident}: {defaulted_hint} = None").map_err(sink)?;
     }
+
+    // A forward-compatible from_dict (CR-04): construct only from declared fields (ignore-unknown — a
+    // newer server adding a response key no longer crashes the SDK), bind each by its ORIGINAL wire key
+    // (json_name), and decode nested dataclasses recursively. Required fields read with `_data["key"]`
+    // (a missing required key is a real protocol error → KeyError); optional fields use `.get` so an
+    // absent key keeps the None default.
+    writeln!(out, "    @classmethod").map_err(sink)?;
+    writeln!(
+        out,
+        "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+    )
+    .map_err(sink)?;
+    writeln!(out, "        return cls(").map_err(sink)?;
+    for field in fields {
+        let ident = safe_ident(&field.json_name);
+        let wire = &field.json_name;
+        if field.optional {
+            // Optional: only decode when present (and non-null), else keep the None default. The
+            // conditional expression evaluates the decode lazily so a nested model still recurses.
+            let decoded_present = decode_expr(&field.schema, graph, &format!("_data[\"{wire}\"]"));
+            writeln!(
+                out,
+                "            {ident}=({decoded_present}) if \"{wire}\" in _data and _data[\"{wire}\"] is not None else None,"
+            )
+            .map_err(sink)?;
+        } else {
+            let decoded = decode_expr(&field.schema, graph, &format!("_data[\"{wire}\"]"));
+            writeln!(out, "            {ident}={decoded},").map_err(sink)?;
+        }
+    }
+    writeln!(out, "        )").map_err(sink)?;
     Ok(())
 }
 
@@ -605,6 +688,82 @@ pub(crate) fn emit_operations(
     Ok(out)
 }
 
+/// The keyword/digit-safe, collision-checked Python identifiers for one operation's arguments.
+///
+/// Each `*_idents` vector aligns positionally with its params vector. Path params and required query
+/// params are positional (no default); optional query params keep `= None` (WR-01 ordering).
+struct ResolvedArgs<'op> {
+    path_idents: Vec<String>,
+    required_query: Vec<&'op Param>,
+    required_query_idents: Vec<String>,
+    optional_query: Vec<&'op Param>,
+    optional_query_idents: Vec<String>,
+}
+
+/// Resolve + collision-check every operation argument's Python identifier (CR-02 / WR-03 / WR-01).
+///
+/// Each identifier is keyword/digit-safe ([`safe_ident`]); the set is tracked as it grows so a collision
+/// (two params whose safe identifier matches, or a param colliding with the bound `self`/`body`) is a
+/// typed [`CoreError::SdkGen`] rather than a `SyntaxError: duplicate argument`. Query params are split
+/// required-first (positional) / optional-last (`= None`) so all non-defaulted args precede defaulted
+/// ones (valid Python). One deterministic pass, no fallback (rule 3).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on an argument-identifier collision.
+fn resolve_op_args<'op>(
+    op: &Operation,
+    path_params: &[&'op Param],
+    query_params: &[&'op Param],
+    has_body: bool,
+) -> Result<ResolvedArgs<'op>, CoreError> {
+    // Seed the reserved set: `self` always; `body` additionally when a typed body is bound (a param
+    // named `body` is otherwise allowed since nothing binds it).
+    let mut used_args: Vec<String> = RESERVED_ARGS.iter().map(|s| (*s).to_string()).collect();
+    if !has_body {
+        used_args.retain(|a| a != "body");
+    }
+    let mut reserve = |name: &str| -> Result<String, CoreError> {
+        let ident = safe_ident(&snake(name));
+        if used_args.contains(&ident) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter whose Python identifier '{ident}' collides \
+                     with another argument (self/body or another param)",
+                    op.id
+                ),
+            });
+        }
+        used_args.push(ident.clone());
+        Ok(ident)
+    };
+
+    let mut path_idents: Vec<String> = Vec::with_capacity(path_params.len());
+    for p in path_params {
+        path_idents.push(reserve(&p.name)?);
+    }
+    // Required query params are positional (WR-01: a required query param MUST be supplied); optional
+    // ones keep the `= None` default.
+    let (required_query, optional_query): (Vec<&Param>, Vec<&Param>) =
+        query_params.iter().copied().partition(|p| p.required);
+    let mut required_query_idents: Vec<String> = Vec::with_capacity(required_query.len());
+    for p in &required_query {
+        required_query_idents.push(reserve(&p.name)?);
+    }
+    let mut optional_query_idents: Vec<String> = Vec::with_capacity(optional_query.len());
+    for p in &optional_query {
+        optional_query_idents.push(reserve(&p.name)?);
+    }
+
+    Ok(ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    })
+}
+
 /// Emit a single operation method (4-space indented as a `Client` method body).
 fn emit_operation(
     out: &mut String,
@@ -640,16 +799,26 @@ fn emit_operation(
     let return_model = success.as_ref().and_then(|(_, m)| m.clone());
     let return_hint = return_model.clone().unwrap_or_else(|| "Any".to_string());
 
-    // Signature: self, path params (positional), body (typed), then optional query params (= None).
+    // Resolve every emitted argument's keyword/digit-safe Python identifier ONCE, collision-checked
+    // against `self`/`body` and each other (CR-02 / WR-03 / WR-01 ordering); see [`resolve_op_args`].
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    // Signature: self, path params (positional), body (typed), required query (positional), then
+    // optional query params (= None). All non-defaulted args precede defaulted ones (valid Python).
     let mut args: Vec<String> = vec!["self".to_string()];
-    for p in &path_params {
-        args.push(snake(&p.name));
-    }
+    args.extend(path_idents.iter().cloned());
     if let Some(model) = &body_model {
         args.push(format!("body: {model}"));
     }
-    for p in &query_params {
-        args.push(format!("{}=None", snake(&p.name)));
+    args.extend(required_query_idents.iter().cloned());
+    for ident in &optional_query_idents {
+        args.push(format!("{ident}=None"));
     }
 
     writeln!(
@@ -659,30 +828,44 @@ fn emit_operation(
     )
     .map_err(sink)?;
 
-    // Build the path: f-string interpolation with each path param percent-escaped (V5).
+    // Build the path: f-string interpolation with each path param percent-escaped (V5). The token order
+    // matches path_params order (set-equality was already asserted), so path_idents aligns by position.
     if tokens.is_empty() {
         writeln!(out, "        path = \"{abs}\"").map_err(sink)?;
     } else {
         let mut fstring = abs.clone();
         for token in &tokens {
+            // The f-string interpolates the SAFE local identifier (WR-04), but the {token} placeholder
+            // in the path template is the original wire token. Tokens and path params are set-equal (not
+            // necessarily same order), so resolve this token's identifier by matching the path-param
+            // whose name equals the token (path_idents[i] corresponds to path_params[i]).
+            let ident = path_params
+                .iter()
+                .zip(path_idents.iter())
+                .find(|(pp, _)| &pp.name == token)
+                .map_or_else(|| safe_ident(&snake(token)), |(_, id)| id.clone());
             let placeholder = format!("{{{token}}}");
             // `safe=''` uses SINGLE quotes inside the double-quoted f-string: a backslash in an
             // f-string expression part is a `SyntaxError` on Python 3.9-3.11 ("f-string expression
             // part cannot include a backslash"), so escaped double-quotes (`safe=\"\"`) would not
             // compile. Single quotes need no escape and are valid on every Python 3.x (PYSDK-02).
-            let escaped = format!("{{urllib.parse.quote(str({}), safe='')}}", snake(token));
+            let escaped = format!("{{urllib.parse.quote(str({ident}), safe='')}}");
             fstring = fstring.replace(&placeholder, &escaped);
         }
         writeln!(out, "        path = f\"{fstring}\"").map_err(sink)?;
     }
 
-    // Query encoding: collect present (non-None) optional params, urlencode, append to the path.
+    // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
+    // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
+    // the wire key stays the ORIGINAL `p.name`.
     if !query_params.is_empty() {
         writeln!(out, "        _query = {{}}").map_err(sink)?;
-        for p in &query_params {
-            let arg = snake(&p.name);
-            writeln!(out, "        if {arg} is not None:").map_err(sink)?;
-            writeln!(out, "            _query[\"{}\"] = {arg}", p.name).map_err(sink)?;
+        for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
+            writeln!(out, "        _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
+        }
+        for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+            writeln!(out, "        if {ident} is not None:").map_err(sink)?;
+            writeln!(out, "            _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
         }
         writeln!(out, "        if _query:").map_err(sink)?;
         writeln!(
@@ -707,8 +890,10 @@ fn emit_operation(
     writeln!(out, "        if _status != {success_status}:").map_err(sink)?;
     writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
     if let Some(model) = &return_model {
+        // Decode via the generated from_dict (CR-04): forward-compatible (ignores unknown response
+        // keys) and recursive into nested dataclasses, rather than the fragile `Model(**_data)`.
         writeln!(out, "        _data = json.loads(_raw) if _raw else {{}}").map_err(sink)?;
-        writeln!(out, "        return {model}(**_data)").map_err(sink)?;
+        writeln!(out, "        return {model}.from_dict(_data)").map_err(sink)?;
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
     }
@@ -1031,10 +1216,11 @@ mod tests {
                 out.contains("    genre: str\n"),
                 "required has no default:\n{out}"
             );
-            // optional non-nullable bool → defaulted, hint NOT Optional.
+            // optional non-nullable bool → defaulted AND widened to Optional[bool] so `= None` is not a
+            // type-lie against the non-nullable value type (WR-02): the key-absent axis lives in the hint.
             assert!(
-                out.contains("    in_stock: bool = None\n"),
-                "optional field must default to None:\n{out}"
+                out.contains("    in_stock: Optional[bool] = None\n"),
+                "optional non-nullable field must be Optional[..] defaulted (WR-02):\n{out}"
             );
             // required-but-nullable → Optional hint, NO default (it is required/present).
             assert!(
@@ -1046,10 +1232,11 @@ mod tests {
         #[test]
         fn inline_enum_and_union_fields_use_literal_and_union_hints() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
-            // BookFilters.sort inline enum → Literal, defaulted (optional).
+            // BookFilters.sort inline enum, optional + non-nullable → widened to Optional[Literal[..]]
+            // for the defaulted form (WR-02): `= None` is no longer a type-lie against the bare Literal.
             assert!(
-                out.contains("    sort: Literal[\"asc\", \"desc\"] = None"),
-                "inline enum field must be a defaulted Literal:\n{out}"
+                out.contains("    sort: Optional[Literal[\"asc\", \"desc\"]] = None"),
+                "optional inline enum field must be Optional[Literal[..]] defaulted (WR-02):\n{out}"
             );
             // Book.rating inline union, optional+nullable → Optional[Union[..]] = None.
             assert!(
@@ -1192,7 +1379,11 @@ mod tests {
                 "compares real 201:\n{out}"
             );
             assert!(out.contains("self._raise(_status, _raw)"), "{out}");
-            assert!(out.contains("return CreatedMessage(**_data)"), "{out}");
+            // Typed return decodes via the forward-compatible recursive from_dict (CR-04).
+            assert!(
+                out.contains("return CreatedMessage.from_dict(_data)"),
+                "{out}"
+            );
             assert!(
                 out.contains("self._do(\"POST\", path, body=body)"),
                 "body op passes body to _do:\n{out}"
@@ -1305,6 +1496,236 @@ mod tests {
             assert!(out.contains("    Book,"), "{out}");
             assert!(out.contains("    CreatedMessage,"), "{out}");
             assert!(out.contains("\"Client\","), "{out}");
+        }
+    }
+
+    /// Regression locks for the four BLOCKERs (CR-01..04) + the hardened warnings (WR-01/02/03/05),
+    /// each on an input shape the bookstore fixture does NOT exercise.
+    mod regressions {
+        use super::super::safe_ident;
+        use super::{emit_models, emit_operations, ApiGraph, Operation};
+
+        fn graph_from(facts: &[u8]) -> ApiGraph {
+            let facts = serde_json::from_slice(facts).unwrap();
+            ApiGraph::from_facts(facts, "/root")
+        }
+
+        // CR-02: a field/param named after a Python keyword must emit a SAFE identifier, never the bare
+        // keyword (which is a SyntaxError), while the WIRE key stays the original keyword.
+        #[test]
+        fn cr02_reserved_word_field_emits_safe_identifier_keeping_wire_key() {
+            assert_eq!(safe_ident("from"), "from_");
+            assert_eq!(safe_ident("class"), "class_");
+            assert_eq!(safe_ident("import"), "import_");
+            // a leading-digit name is also unsafe as an identifier.
+            assert_eq!(safe_ident("2fast"), "2fast_");
+            // a non-keyword (e.g. `id`, `type`) is left untouched (they are builtins, not keywords).
+            assert_eq!(safe_ident("id"), "id");
+            assert_eq!(safe_ident("type"), "type");
+
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "app.models.Reserved", "name": "Reserved",
+                  "body": { "type": "object", "of": [
+                    { "json_name": "from", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null },
+                    { "json_name": "class", "required": false, "optional": true, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null }
+                  ] },
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+              ],
+              "diagnostics": [] }"#;
+            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            // the Python attribute is sanitized ...
+            assert!(
+                out.contains("    from_: str"),
+                "keyword field renamed:\n{out}"
+            );
+            assert!(
+                out.contains("    class_: Optional[str] = None"),
+                "keyword optional field renamed + widened:\n{out}"
+            );
+            // ... but the from_dict binds the ORIGINAL wire key.
+            assert!(
+                out.contains("from_=_data[\"from\"]"),
+                "wire key preserved:\n{out}"
+            );
+            assert!(
+                out.contains("class_=(_data[\"class\"]) if \"class\" in _data"),
+                "optional wire key preserved:\n{out}"
+            );
+        }
+
+        // CR-03: two wire values normalizing to the same SCREAMING_SNAKE form must emit DISTINCT,
+        // collision-free member names (no duplicate class key → no import-time TypeError), with the
+        // wire values intact; an empty / numeric value must still produce a valid identifier.
+        #[test]
+        fn cr03_enum_member_collisions_disambiguate_and_unsafe_values_are_guarded() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "app.models.Status", "name": "Status",
+                  "body": { "type": "enum", "of": ["out-of-stock", "out_of_stock", "", "1"] },
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+              ],
+              "diagnostics": [] }"#;
+            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            // first collision keeps the base, the second is suffixed — both wire values intact.
+            assert!(out.contains("    OUT_OF_STOCK = \"out-of-stock\""), "{out}");
+            assert!(
+                out.contains("    OUT_OF_STOCK_2 = \"out_of_stock\""),
+                "{out}"
+            );
+            // empty value → a stable placeholder identifier; numeric → leading-underscore.
+            assert!(
+                out.contains("    MEMBER = \"\""),
+                "empty value guarded:\n{out}"
+            );
+            assert!(
+                out.contains("    _1 = \"1\""),
+                "numeric value guarded:\n{out}"
+            );
+            // no duplicate identifier is emitted.
+            assert_eq!(
+                out.matches("OUT_OF_STOCK = ").count(),
+                1,
+                "the base member appears exactly once:\n{out}"
+            );
+        }
+
+        // CR-04: a typed return decodes via a from_dict that (1) ignores unknown server keys and
+        // (2) recurses into nested dataclass fields, rather than the fragile Model(**_data).
+        #[test]
+        fn cr04_from_dict_is_forward_compatible_and_recurses_into_nested_models() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "app.models.Inner", "name": "Inner",
+                  "body": { "type": "object", "of": [
+                    { "json_name": "v", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null }
+                  ] },
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } },
+                { "id": "app.models.Outer", "name": "Outer",
+                  "body": { "type": "object", "of": [
+                    { "json_name": "inner", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "named", "of": "app.models.Inner" },
+                      "description": null, "example": null },
+                    { "json_name": "items", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "array", "of": { "type": "named", "of": "app.models.Inner" } },
+                      "description": null, "example": null }
+                  ] },
+                  "span": { "file": "/root/m.py", "start_line": 2, "end_line": 2 } }
+              ],
+              "diagnostics": [] }"#;
+            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            // a from_dict classmethod is emitted; nested object field recurses; nested array maps.
+            assert!(
+                out.contains("def from_dict(cls, _data: Dict[str, Any])"),
+                "{out}"
+            );
+            assert!(
+                out.contains("inner=Inner.from_dict(_data[\"inner\"])"),
+                "nested recurse:\n{out}"
+            );
+            assert!(
+                out.contains("items=[Inner.from_dict(_item) for _item in _data[\"items\"]]"),
+                "nested array recurse:\n{out}"
+            );
+            // ignore-unknown: construction is keyword-by-declared-field, so an extra server key is never
+            // forwarded to the constructor (no `**_data`).
+            assert!(
+                !out.contains("(**_data)"),
+                "must not splat the raw dict:\n{out}"
+            );
+        }
+
+        // WR-01: a REQUIRED query param is a positional arg always written to _query (no None guard);
+        // WR-03: two params whose Python identifier collides is a typed SdkGen error, not a SyntaxError.
+        #[test]
+        fn wr01_required_query_param_is_positional_and_always_sent() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/search", "handler": "search",
+                  "operation_id": "search",
+                  "params": [
+                    { "name": "q", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } },
+                    { "name": "page", "location": "query", "required": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [], "diagnostics": [] }"#;
+            let g = graph_from(facts);
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
+            // required `q` is positional (no `=None`), optional `page` keeps the default.
+            assert!(
+                out.contains("def search(self, q, page=None) -> Any:"),
+                "{out}"
+            );
+            // required `q` is unconditionally written; optional `page` is guarded.
+            assert!(
+                out.contains("        _query[\"q\"] = q"),
+                "required always sent:\n{out}"
+            );
+            assert!(
+                out.contains("        if page is not None:"),
+                "optional guarded:\n{out}"
+            );
+        }
+
+        #[test]
+        fn wr03_param_identifier_collision_is_a_typed_error() {
+            // a query param literally named `self` collides with the bound receiver → typed error.
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/x", "handler": "x",
+                  "operation_id": "x",
+                  "params": [
+                    { "name": "self", "location": "query", "required": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [], "diagnostics": [] }"#;
+            let g = graph_from(facts);
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            assert!(err.to_string().contains("collides"), "{err}");
+        }
+
+        // WR-05: two distinct schema ids sharing a Python name is a typed error (no silent shadowing).
+        #[test]
+        fn wr05_duplicate_schema_name_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "a.Book", "name": "Book",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } },
+                { "id": "b.Book", "name": "Book",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/m.py", "start_line": 2, "end_line": 2 } }
+              ],
+              "diagnostics": [] }"#;
+            let g = graph_from(facts);
+            let err = emit_models(&g, "pkg").unwrap_err();
+            assert!(err.to_string().contains("share the Python name"), "{err}");
         }
     }
 }
