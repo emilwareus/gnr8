@@ -31,11 +31,9 @@ operations:
         location: query
         required: false
         schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
+          type: primitive
+          of:
+            prim: string
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 47
@@ -44,11 +42,9 @@ operations:
         location: query
         required: false
         schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
+          type: primitive
+          of:
+            prim: string
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 45
@@ -57,11 +53,9 @@ operations:
         location: query
         required: false
         schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
+          type: primitive
+          of:
+            prim: string
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 46
@@ -84,11 +78,9 @@ operations:
         location: path
         required: true
         schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
+          type: primitive
+          of:
+            prim: string
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 92
@@ -114,11 +106,9 @@ operations:
         location: path
         required: true
         schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
+          type: primitive
+          of:
+            prim: string
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 67
@@ -139,466 +129,416 @@ operations:
 schemas:
   - id: internal/common/dto.CommandMessage
     name: CommandMessage
-    kind: object
-    fields:
-      - json_name: message
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: message
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/common.go
       start_line: 25
       end_line: 25
   - id: internal/common/dto.CommandMessageWithUUID
     name: CommandMessageWithUUID
-    kind: object
-    fields:
-      - json_name: message
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: uuid
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: uuid
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: message
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: uuid
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: well_known
+            of: uuid
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/common.go
       start_line: 32
       end_line: 32
   - id: internal/common/dto.CreateGoalInput
     name: CreateGoalInput
-    kind: object
-    fields:
-      - json_name: analyticsQuery
-        required: true
-        optional: false
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.GoalAnalyticsQuery
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: description
-        required: false
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Longer explanation
-        example: ~
-      - json_name: name
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Short human-readable goal name
-        example: ~
-      - json_name: targetDirection
-        required: false
-        optional: true
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.TargetDirection
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: targetValue
-        required: false
-        optional: true
-        schema:
-          kind: number
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: workflowChainIds
-        required: false
-        optional: true
-        schema:
-          kind: array
-          format: ~
-          items:
-            kind: string
-            format: uuid
-            items: ~
-            ref_id: ~
-            additional_properties: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: analyticsQuery
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: internal/common/dto.GoalAnalyticsQuery
+          description: ~
+          example: ~
+        - json_name: description
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: Longer explanation
+          example: ~
+        - json_name: name
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: Short human-readable goal name
+          example: ~
+        - json_name: targetDirection
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: named
+            of: internal/common/dto.TargetDirection
+          description: ~
+          example: ~
+        - json_name: targetValue
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: float
+              bits: 32
+          description: ~
+          example: ~
+        - json_name: workflowChainIds
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: well_known
+              of: uuid
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/goal.go
       start_line: 28
       end_line: 28
   - id: internal/common/dto.GoalAnalyticsQuery
     name: GoalAnalyticsQuery
-    kind: object
-    fields:
-      - json_name: includePast
-        required: false
-        optional: true
-        schema:
-          kind: boolean
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Whether to include historical data points
-        example: ~
-      - json_name: metric
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Analytics metric to evaluate
-        example: ~
-      - json_name: windowDays
-        required: false
-        optional: false
-        schema:
-          kind: integer
-          format: int64
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Rolling window size in days
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: includePast
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: bool
+          description: Whether to include historical data points
+          example: ~
+        - json_name: metric
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: Analytics metric to evaluate
+          example: ~
+        - json_name: windowDays
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: Rolling window size in days
+          example: ~
     provenance:
       file: internal/common/dto/goal.go
       start_line: 11
       end_line: 11
   - id: internal/common/dto.GoalResponse
     name: GoalResponse
-    kind: object
-    fields:
-      - json_name: analyticsQuery
-        required: false
-        optional: false
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.GoalAnalyticsQuery
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: createdAt
-        required: false
-        optional: false
-        schema:
-          kind: string
-          format: date-time
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: description
-        required: false
-        optional: true
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: metadata
-        required: false
-        optional: true
-        schema:
-          kind: object
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: true
-        description: ~
-        example: ~
-      - json_name: name
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: targetDirection
-        required: false
-        optional: true
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.TargetDirection
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: targetValue
-        required: false
-        optional: true
-        schema:
-          kind: number
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: uuid
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: uuid
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: analyticsQuery
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: internal/common/dto.GoalAnalyticsQuery
+          description: ~
+          example: ~
+        - json_name: createdAt
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: well_known
+            of: date_time
+          description: ~
+          example: ~
+        - json_name: description
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: metadata
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: any
+            of: {}
+          description: ~
+          example: ~
+        - json_name: name
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: targetDirection
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: named
+            of: internal/common/dto.TargetDirection
+          description: ~
+          example: ~
+        - json_name: targetValue
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: float
+              bits: 32
+          description: ~
+          example: ~
+        - json_name: uuid
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: well_known
+            of: uuid
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/goal.go
       start_line: 52
       end_line: 52
   - id: internal/common/dto.HttpError
     name: HttpError
-    kind: object
-    fields:
-      - json_name: hints
-        required: false
-        optional: true
-        schema:
-          kind: array
-          format: ~
-          items:
-            kind: string
-            format: ~
-            items: ~
-            ref_id: ~
-            additional_properties: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: "hint 1,hint 2"
-      - json_name: message
-        required: true
-        optional: false
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: error message
-      - json_name: slug
-        required: false
-        optional: true
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: error-slug
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: hints
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: primitive
+              of:
+                prim: string
+          description: ~
+          example: "hint 1,hint 2"
+        - json_name: message
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: error message
+        - json_name: slug
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: error-slug
     provenance:
       file: internal/common/dto/common.go
       start_line: 18
       end_line: 18
   - id: internal/common/dto.ListGoalsOutput
     name: ListGoalsOutput
-    kind: object
-    fields:
-      - json_name: goals
-        required: false
-        optional: false
-        schema:
-          kind: array
-          format: ~
-          items:
-            kind: ref
-            format: ~
-            items: ~
-            ref_id: internal/common/dto.GoalResponse
-            additional_properties: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: nextCursor
-        required: false
-        optional: true
-        schema:
-          kind: string
-          format: uuid
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: pageSize
-        required: false
-        optional: false
-        schema:
-          kind: integer
-          format: int64
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: total
-        required: false
-        optional: false
-        schema:
-          kind: integer
-          format: int64
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: goals
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: named
+              of: internal/common/dto.GoalResponse
+          description: ~
+          example: ~
+        - json_name: nextCursor
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: well_known
+            of: uuid
+          description: ~
+          example: ~
+        - json_name: pageSize
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: total
+          required: false
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/goal.go
       start_line: 67
       end_line: 67
   - id: internal/common/dto.TargetDirection
     name: TargetDirection
-    kind: enum
-    fields: []
-    enum_values:
-      - gte
-      - lte
+    body:
+      type: enum
+      of:
+        - gte
+        - lte
     provenance:
       file: internal/common/dto/common.go
       start_line: 39
       end_line: 39
   - id: internal/common/dto.UpdateGoalInput
     name: UpdateGoalInput
-    kind: object
-    fields:
-      - json_name: analyticsQuery
-        required: false
-        optional: true
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.GoalAnalyticsQuery
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: description
-        required: false
-        optional: true
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Updated explanation
-        example: ~
-      - json_name: name
-        required: false
-        optional: true
-        schema:
-          kind: string
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: Updated goal name
-        example: ~
-      - json_name: targetDirection
-        required: false
-        optional: true
-        schema:
-          kind: ref
-          format: ~
-          items: ~
-          ref_id: internal/common/dto.TargetDirection
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: targetValue
-        required: false
-        optional: true
-        schema:
-          kind: number
-          format: ~
-          items: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-      - json_name: workflowChainIds
-        required: false
-        optional: true
-        schema:
-          kind: array
-          format: ~
-          items:
-            kind: string
-            format: uuid
-            items: ~
-            ref_id: ~
-            additional_properties: ~
-          ref_id: ~
-          additional_properties: ~
-        description: ~
-        example: ~
-    enum_values: []
+    body:
+      type: object
+      of:
+        - json_name: analyticsQuery
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: named
+            of: internal/common/dto.GoalAnalyticsQuery
+          description: ~
+          example: ~
+        - json_name: description
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: Updated explanation
+          example: ~
+        - json_name: name
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: Updated goal name
+          example: ~
+        - json_name: targetDirection
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: named
+            of: internal/common/dto.TargetDirection
+          description: ~
+          example: ~
+        - json_name: targetValue
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: float
+              bits: 32
+          description: ~
+          example: ~
+        - json_name: workflowChainIds
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: well_known
+              of: uuid
+          description: ~
+          example: ~
     provenance:
       file: internal/common/dto/goal.go
       start_line: 39

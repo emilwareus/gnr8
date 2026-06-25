@@ -263,7 +263,7 @@ type CreateGoalInput struct {
 }
 
 type GoalAnalyticsQuery struct {
-	IncludePast *bool  `json:"includePast,omitempty"`
+	IncludePast bool   `json:"includePast,omitempty"`
 	Metric      string `json:"metric"`
 	WindowDays  int64  `json:"windowDays"`
 }
