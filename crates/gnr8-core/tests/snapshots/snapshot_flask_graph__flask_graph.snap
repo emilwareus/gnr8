@@ -1,0 +1,286 @@
+---
+source: crates/gnr8-core/tests/snapshot_flask_graph.rs
+expression: graph
+---
+module: flask-bookstore
+operations:
+  - id: list_orders
+    method: GET
+    path: /
+    handler: list_orders
+    params:
+      - name: status
+        location: query
+        required: false
+        schema:
+          type: primitive
+          of:
+            prim: string
+        provenance:
+          file: app/routes.py
+          start_line: 41
+          end_line: 41
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: app.dto.OrderConfirmation
+    provenance:
+      file: app/routes.py
+      start_line: 31
+      end_line: 31
+  - id: create_order
+    method: POST
+    path: /
+    handler: create_order
+    params: []
+    request_body:
+      ref_id: app.dto.OrderInput
+    responses:
+      - status: 201
+        body:
+          ref_id: app.dto.OrderConfirmation
+    provenance:
+      file: app/routes.py
+      start_line: 48
+      end_line: 48
+  - id: create_order_raw
+    method: POST
+    path: /raw
+    handler: create_order_raw
+    params: []
+    request_body: ~
+    responses: []
+    provenance:
+      file: app/routes.py
+      start_line: 69
+      end_line: 69
+  - id: get_order
+    method: GET
+    path: "/{order_id}"
+    handler: get_order
+    params:
+      - name: order_id
+        location: path
+        required: true
+        schema:
+          type: primitive
+          of:
+            prim: int
+            bits: 64
+            signed: true
+        provenance:
+          file: app/routes.py
+          start_line: 59
+          end_line: 59
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: app.dto.OrderConfirmation
+    provenance:
+      file: app/routes.py
+      start_line: 59
+      end_line: 59
+schemas:
+  - id: app.dto.Availability
+    name: Availability
+    body:
+      type: enum
+      of:
+        - in_stock
+        - out_of_stock
+    provenance:
+      file: app/dto.py
+      start_line: 31
+      end_line: 31
+  - id: app.dto.OrderConfirmation
+    name: OrderConfirmation
+    body:
+      type: object
+      of:
+        - json_name: availability
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: app.dto.Availability
+          description: ~
+          example: ~
+        - json_name: lines
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: named
+              of: app.dto.Price
+          description: ~
+          example: ~
+        - json_name: message
+          required: true
+          optional: false
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: order_id
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+    provenance:
+      file: app/dto.py
+      start_line: 96
+      end_line: 96
+  - id: app.dto.OrderInput
+    name: OrderInput
+    body:
+      type: object
+      of:
+        - json_name: book_id
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: coupon
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: discount
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: union
+            of:
+              - type: primitive
+                of:
+                  prim: int
+                  bits: 64
+                  signed: true
+              - type: primitive
+                of:
+                  prim: float
+                  bits: 64
+          description: ~
+          example: ~
+        - json_name: note
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: price
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: app.dto.Price
+          description: ~
+          example: ~
+        - json_name: quantity
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: tags
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: primitive
+              of:
+                prim: string
+          description: ~
+          example: ~
+    provenance:
+      file: app/dto.py
+      start_line: 60
+      end_line: 60
+  - id: app.dto.Price
+    name: Price
+    body:
+      type: object
+      of:
+        - json_name: amount
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: float
+              bits: 64
+          description: ~
+          example: ~
+        - json_name: currency
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: enum
+            of:
+              - eur
+              - usd
+          description: ~
+          example: ~
+    provenance:
+      file: app/dto.py
+      start_line: 49
+      end_line: 49
+diagnostics:
+  - severity: WARN
+    message: "untyped request body on POST /raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
+    file: app/routes.py
+    line: 78
+  - severity: WARN
+    message: "untyped query param 'q' on GET /: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
+    file: app/routes.py
+    line: 42
+  - severity: WARN
+    message: "untyped response on POST /raw: handler has no return annotation; response shape under-specified, no schema inferred"
+    file: app/routes.py
+    line: 69
+base_path: /
+title: API
+security: []
