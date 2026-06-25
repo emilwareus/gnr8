@@ -1,6 +1,7 @@
 package handlers_test
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -96,8 +97,16 @@ func TestPathParamForUUIDHandlers(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: missing path param 'uuid': %+v", h, cf.Params)
 		}
-		if p.Location != "path" || !p.Required || p.Schema.Kind != "string" {
-			t.Errorf("%s uuid: want path/required/string, got loc=%s req=%v kind=%s", h, p.Location, p.Required, p.Schema.Kind)
+		// The neutral param type for a path string is a string primitive. Compare the
+		// marshaled wire form (the local var `facts` shadows the package here).
+		gotSchema, err := json.Marshal(p.Schema)
+		if err != nil {
+			t.Fatalf("%s uuid: marshal schema: %v", h, err)
+		}
+		const wantSchema = `{"type":"primitive","of":{"prim":"string"}}`
+		if p.Location != "path" || !p.Required || string(gotSchema) != wantSchema {
+			t.Errorf("%s uuid: want path/required/%s, got loc=%s req=%v schema=%s",
+				h, wantSchema, p.Location, p.Required, gotSchema)
 		}
 	}
 }

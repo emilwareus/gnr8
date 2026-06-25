@@ -73,12 +73,10 @@ func schemaFor(
 		span := spanOf(fset, named.Obj().Pos())
 		fields := extractFields(named.Obj().Name(), under, modulePath, fset, diags)
 		return facts.SchemaFact{
-			ID:         schemaID(named, modulePath),
-			Name:       named.Obj().Name(),
-			Kind:       "object",
-			Fields:     fields,
-			EnumValues: []string{},
-			Span:       span,
+			ID:   schemaID(named, modulePath),
+			Name: named.Obj().Name(),
+			Body: facts.ObjectType(fields),
+			Span: span,
 		}, true
 	case *gotypes.Basic:
 		if under.Kind() != gotypes.String {
@@ -89,12 +87,10 @@ func schemaFor(
 			return facts.SchemaFact{}, false
 		}
 		return facts.SchemaFact{
-			ID:         schemaID(named, modulePath),
-			Name:       named.Obj().Name(),
-			Kind:       "enum",
-			Fields:     []facts.FieldFact{},
-			EnumValues: values,
-			Span:       spanOf(fset, named.Obj().Pos()),
+			ID:   schemaID(named, modulePath),
+			Name: named.Obj().Name(),
+			Body: facts.EnumType(values),
+			Span: spanOf(fset, named.Obj().Pos()),
 		}, true
 	default:
 		return facts.SchemaFact{}, false
@@ -141,12 +137,17 @@ func extractFields(
 		}
 		schema := mapType(f.Type(), ctx)
 		required := strings.Contains(tag.Get("binding"), "required")
+		// The two independent axes: optional = the key may be absent (a pointer or
+		// `,omitempty`); nullable = the value may be explicitly null (a pointer can
+		// hold nil). A non-pointer `,omitempty` field is optional-but-not-nullable.
 		optional := isPointer(f.Type()) || omitempty
+		nullable := isPointer(f.Type())
 
 		fields = append(fields, facts.FieldFact{
 			JSONName:    jsonName,
 			Required:    required,
 			Optional:    optional,
+			Nullable:    nullable,
 			Schema:      schema,
 			Description: optString(tag.Get("description")),
 			Example:     optString(tag.Get("example")),
@@ -169,31 +170,29 @@ type mapCtx struct {
 	diags        *diag.Accumulator
 }
 
-// mapType implements the Go-type -> SchemaType kind switch incl. well-known types
-// and the float64 / free-form-map diagnostics (RESEARCH Pattern 6).
-func mapType(t gotypes.Type, ctx mapCtx) facts.SchemaType {
+// mapType lowers a Go type into the neutral facts.Type vocabulary, incl. well-known
+// types and the float64 / free-form-map diagnostics (RESEARCH Pattern 6).
+func mapType(t gotypes.Type, ctx mapCtx) facts.Type {
 	switch u := gotypes.Unalias(t).(type) {
 	case *gotypes.Pointer:
-		// Optionality is recorded on the field; the schema describes the elem.
+		// Nullability/optionality are recorded on the field; the type describes the elem.
 		return mapType(u.Elem(), ctx)
 	case *gotypes.Slice:
-		items := mapType(u.Elem(), ctx)
-		return facts.SchemaType{Kind: "array", Items: &items}
+		return facts.ArrayType(mapType(u.Elem(), ctx))
 	case *gotypes.Map:
-		// map[string]T -> object additionalProperties; warn on free-form maps.
+		// map[string]T -> a free-form value; warn on free-form maps.
 		ctx.diags.FreeFormMap(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
-		yes := true
-		return facts.SchemaType{Kind: "object", AdditionalProperties: &yes}
+		return facts.AnyType()
 	case *gotypes.Named:
 		return mapNamed(u, ctx)
 	case *gotypes.Basic:
 		return mapBasic(u, ctx)
 	default:
-		return facts.SchemaType{Kind: "object"}
+		return facts.AnyType()
 	}
 }
 
-func mapNamed(u *gotypes.Named, ctx mapCtx) facts.SchemaType {
+func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 	obj := u.Obj()
 	pkgPath := ""
 	if obj.Pkg() != nil {
@@ -201,33 +200,32 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.SchemaType {
 	}
 	switch {
 	case pkgPath == uuidPkgPath && obj.Name() == "UUID":
-		return facts.SchemaType{Kind: "string", Format: optString("uuid")}
+		return facts.WellKnownType(facts.WellKnownUUID)
 	case pkgPath == timePkgPath && obj.Name() == "Time":
-		return facts.SchemaType{Kind: "string", Format: optString("date-time")}
+		return facts.WellKnownType(facts.WellKnownDateTime)
 	}
 	// A named string (with or without a const set) refs its own schema; the enum
 	// values are resolved by the enum SchemaFact (see Extract). A non-string named
-	// type is a struct ref ($ref). Both are stable, package-qualified ids.
-	id := schemaID(u, ctx.modulePath)
-	return facts.SchemaType{Kind: "ref", RefID: &id}
+	// type is a struct ref. Both are stable, package-qualified ids.
+	return facts.NamedType(schemaID(u, ctx.modulePath))
 }
 
-func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.SchemaType {
+func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.Type {
 	switch u.Kind() {
 	case gotypes.Bool:
-		return facts.SchemaType{Kind: "boolean"}
+		return facts.PrimitiveType(facts.BoolPrim())
 	case gotypes.String:
-		return facts.SchemaType{Kind: "string"}
+		return facts.PrimitiveType(facts.StringPrim())
 	case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64,
 		gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
-		return facts.SchemaType{Kind: "integer", Format: optString("int64")}
+		return facts.PrimitiveType(facts.IntPrim(64, true))
 	case gotypes.Float32, gotypes.Float64:
 		// float64 -> float32 narrowing warning (TARGET-API.md §5.2). Report the
 		// field identity, the DECLARED type (e.g. "*float64"), and its position.
 		ctx.diags.Floatf(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
-		return facts.SchemaType{Kind: "number"}
+		return facts.PrimitiveType(facts.FloatPrim(32))
 	default:
-		return facts.SchemaType{Kind: "string"}
+		return facts.PrimitiveType(facts.StringPrim())
 	}
 }
 
