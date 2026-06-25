@@ -886,6 +886,87 @@ mod tests {
     }
 
     #[test]
+    fn nullable_union_field_lowers_to_nested_oneof_with_null() {
+        use crate::graph::{Field, Prim, Type};
+        // A NULLABLE union: `lower_schema_type` already returns a non-empty `one_of` for the union, so
+        // the nullable wrap hits the `!one_of.is_empty()` branch and produces a NESTED `oneOf`
+        // (`oneOf: [ <union oneOf>, {type: null} ]`) — the deterministic shape the writer renders. This
+        // locks the contract CR-01's fixture snapshots must encode.
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "rating".to_string(),
+            required: true,
+            optional: false,
+            nullable: true,
+            schema: Type::Union(vec![
+                Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                }),
+                Type::Primitive(Prim::Float { bits: 64 }),
+            ]),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        // Byte-exact nested form (a union member nested under the outer nullable oneOf).
+        assert!(
+            block.contains(
+                "rating:\n          oneOf:\n          - oneOf:\n            - type: integer\n            - type: number\n          - type: null\n"
+            ),
+            "nullable union must render as a NESTED oneOf with a null member:\n{block}"
+        );
+    }
+
+    #[test]
+    fn nullable_enum_field_lowers_to_type_array_with_enum() {
+        use crate::graph::{Field, Type};
+        // A NULLABLE enum: an enum lowers to `type: string` + `enum` (neither `$ref` nor `one_of`), so
+        // the nullable wrap falls through to the `nullable: true, ..lowered` branch and renders the 3.1
+        // type-array form `type: [string, null]` alongside the `enum` keys (valid JSON-Schema-2020-12).
+        // This locks the contract CR-02's fixture snapshots must encode.
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "sort".to_string(),
+            required: false,
+            optional: false,
+            nullable: true,
+            schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(
+            block.contains("sort:\n          type: [string, null]\n          enum: [asc, desc]\n"),
+            "nullable enum must render the 3.1 type-array form with enum keys:\n{block}"
+        );
+    }
+
+    #[test]
+    fn response_less_operation_renders_empty_responses_map() {
+        use crate::graph::Operation;
+        // An operation with NO responses must render a valid, deterministic `responses: {}` (the empty
+        // OpenAPI responses object) — never a bare `responses:` (a YAML null, which is invalid OpenAPI).
+        // Locks CR-03's writer fix.
+        let mut graph = sample_graph();
+        let op: &mut Operation = &mut graph.operations[0];
+        op.responses.clear();
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        assert!(
+            yaml.contains("responses: {}"),
+            "a response-less operation must render `responses: {{}}`:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("responses:\n      content"),
+            "must not emit a bare null responses:\n{yaml}"
+        );
+    }
+
+    #[test]
     fn well_known_uuid_field_lowers_to_string_with_uuid_format() {
         // A WellKnown(Uuid) field lowers NEUTRALLY to `type: string` + `format: uuid` — no language
         // type name leaks into lowering (IR-03).
