@@ -1,0 +1,40 @@
+package goalservice
+
+import (
+	"net/http"
+	"time"
+)
+
+// Client is the goalservice SDK entrypoint. Tag-grouped operation methods hang
+// off this type; it is constructed with functional options.
+type Client struct {
+	baseURL    string
+	httpClient *http.Client
+	apiKey     string
+}
+
+// Option mutates a Client during construction (functional-options pattern).
+type Option func(*Client)
+
+// WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
+func WithAPIKey(key string) Option {
+	return func(c *Client) { c.apiKey = key }
+}
+
+// NewClient builds a Client for the given base URL, applying any options. A
+// sensible default *http.Client is used unless WithHTTPClient overrides it.
+func NewClient(baseURL string, opts ...Option) *Client {
+	c := &Client{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}

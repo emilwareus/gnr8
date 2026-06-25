@@ -1,0 +1,200 @@
+openapi: 3.1.0
+info:
+  title: goalservice
+  version: 0.1.0
+security:
+  - ApiKeyAuth: []
+paths:
+  '/books/':
+    get:
+      operationId: listBooks
+      parameters:
+      - name: genre
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookList'
+    post:
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookRequest'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400':
+          description: Response 400
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  '/books/{id}':
+    get:
+      operationId: getBook
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '404':
+          description: Response 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      operationId: updateBook
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBookRequest'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '404':
+          description: Response 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      operationId: deleteBook
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    Book:
+      type: object
+      properties:
+        author:
+          type: string
+        genre:
+          $ref: '#/components/schemas/Genre'
+        id:
+          type: string
+        price:
+          type: number
+        publishedAt:
+          type: string
+          format: date-time
+        publisher:
+          $ref: '#/components/schemas/Publisher'
+        subtitle:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+    BookList:
+      type: object
+      properties:
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/Book'
+    CreateBookRequest:
+      type: object
+      required: [author, genre, title]
+      properties:
+        author:
+          type: string
+        genre:
+          $ref: '#/components/schemas/Genre'
+        price:
+          type: number
+        publisher:
+          $ref: '#/components/schemas/Publisher'
+        subtitle:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    Genre:
+      type: string
+      enum: [fiction, mystery, nonfiction, romance, scifi]
+    Publisher:
+      type: object
+      properties:
+        country:
+          type: string
+        name:
+          type: string
+    UpdateBookRequest:
+      type: object
+      properties:
+        author:
+          type: string
+        genre:
+          $ref: '#/components/schemas/Genre'
+        price:
+          type: number
+        subtitle:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string

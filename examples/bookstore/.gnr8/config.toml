@@ -1,0 +1,21 @@
+# gnr8 configuration for the bookstore example.
+inputs = ["."] # analyze this directory (the plain Gin service)
+
+# base_path is the SINGLE SOURCE OF TRUTH for the API base/mount path. The Gin
+# group is mounted at /books, but the analyzer records routes group-relative and
+# cannot see the prefix, so it is declared here and joined during generation.
+base_path = "/books"
+
+[output]
+openapi   = "generated/openapi.yaml" # OpenAPI 3.1 artifact (committed)
+sdk_dir   = "generated/sdk"          # generated Go SDK (committed)
+go_module = "example.com/bookstore/sdk"
+
+# Security lives in middleware, not in handler signatures, so gnr8 never scrapes
+# it — you declare it here and it is the only source for the generated security
+# requirement + components.securitySchemes. This shows the config-driven path.
+[[security.schemes]]
+id       = "ApiKeyAuth"
+kind     = "apiKey"
+location = "header"
+name     = "X-API-Key"
