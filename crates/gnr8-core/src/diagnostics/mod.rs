@@ -23,8 +23,8 @@ use crate::analyze::{facts::DiagnosticFact, helper, Lang};
 /// # Errors
 ///
 /// - [`crate::CoreError::Config`] if the target's language cannot be determined (empty/ambiguous).
-/// - [`crate::CoreError::GoToolchainMissing`] / [`crate::CoreError::PythonToolchainMissing`] if the
-///   selected toolchain cannot be spawned.
+/// - [`crate::CoreError::GoToolchainMissing`] / [`crate::CoreError::PythonToolchainMissing`] /
+///   [`crate::CoreError::TypeScriptToolchainMissing`] if the selected toolchain cannot be spawned.
 /// - [`crate::CoreError::HelperExit`] if the sidecar exits non-zero.
 /// - [`crate::CoreError::FactsParse`] if the sidecar's stdout is not the expected JSON.
 pub fn collect(fixture_dir: &str) -> Result<String, crate::CoreError> {
@@ -37,6 +37,7 @@ pub fn collect(fixture_dir: &str) -> Result<String, crate::CoreError> {
     let facts = match crate::analyze::detect_language(&target)? {
         Lang::Python => helper::run_pyextract(&target)?,
         Lang::Go => helper::run_goextract(&target)?,
+        Lang::TypeScript => helper::run_tsextract(&target)?,
     };
     Ok(render(facts.diagnostics, &target))
 }
