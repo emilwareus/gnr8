@@ -32,9 +32,10 @@ pub(crate) enum Lang {
 /// failure try pyextract".
 ///
 /// Decision (deterministic, documented order):
-/// - both markers present → [`Lang::Go`] (defensive only; the fixtures are single-language, and a
-///   mixed tree is ambiguous — we pick Go first as the established/default sidecar rather than guess
-///   per-file). This is one decision, not a fallback.
+/// - both markers present → a typed [`crate::CoreError::Config`] naming BOTH languages (WR-05): a
+///   mixed tree is genuinely ambiguous, so we surface it and let the user scope the source's `inputs`
+///   to a single-language subdir rather than silently pick one and extract the wrong (or nothing)
+///   from the other. This is still one decision, not a fallback.
 /// - only Python markers → [`Lang::Python`].
 /// - only Go markers → [`Lang::Go`].
 /// - neither (empty / non-existent / unrecognized) → a typed [`crate::CoreError::Config`], never a
@@ -42,7 +43,8 @@ pub(crate) enum Lang {
 ///
 /// # Errors
 ///
-/// [`crate::CoreError::Config`] if the target holds no recognizable Go or Python source.
+/// [`crate::CoreError::Config`] if the target holds BOTH Go and Python source (ambiguous) or no
+/// recognizable Go or Python source.
 pub(crate) fn detect_language(target_dir: &str) -> Result<Lang, crate::CoreError> {
     let mut has_go = false;
     let mut has_python = false;
@@ -54,7 +56,14 @@ pub(crate) fn detect_language(target_dir: &str) -> Result<Lang, crate::CoreError
 
     // ONE decision from the two booleans — documented order, no fallback (rule 3).
     match (has_go, has_python) {
-        (true, _) => Ok(Lang::Go),
+        (true, true) => Err(crate::CoreError::Config {
+            message: format!(
+                "ambiguous source language of {target_dir:?}: found BOTH Go (go.mod/*.go) and \
+                 Python (*.py) source — scope the source's inputs to a single-language subdir so \
+                 the correct sidecar runs (gnr8 will not guess per-file)"
+            ),
+        }),
+        (true, false) => Ok(Lang::Go),
         (false, true) => Ok(Lang::Python),
         (false, false) => Err(crate::CoreError::Config {
             message: format!(
@@ -203,6 +212,30 @@ mod tests {
         assert!(
             matches!(result, Err(CoreError::Config { .. })),
             "an empty target must be a typed Config error, got {result:?}"
+        );
+    }
+
+    /// WR-05 regression: a tree carrying BOTH a `*.go` and a `*.py` marker is ambiguous and must be a
+    /// typed `Config` error naming both languages — never a silent pick of Go. A freshly-created temp
+    /// dir with one of each marker exercises the `(true, true)` arm.
+    #[test]
+    fn detect_language_rejects_a_mixed_go_python_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-detect-mixed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.go"), b"package main\n").unwrap();
+        std::fs::write(dir.join("app.py"), b"x = 1\n").unwrap();
+        let result = detect_language(&dir.to_string_lossy());
+        // Clean up before asserting so a failure does not leak the temp dir.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&result, Err(CoreError::Config { message }) if message.contains("ambiguous")),
+            "a mixed Go/Python tree must be a typed Config error naming the ambiguity, got {result:?}"
         );
     }
 }
