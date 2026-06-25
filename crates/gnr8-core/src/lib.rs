@@ -6,14 +6,20 @@ pub mod error;
 pub use error::CoreError;
 
 pub mod analyze;
-pub mod config;
 pub mod diagnostics;
+pub mod gosdk;
 pub mod graph;
 pub mod lifecycle;
 pub mod lower;
 pub mod manifest;
+pub mod runner;
 pub mod sdk;
 pub mod workspace;
+
+/// Convenience re-export of the code-as-config composition surface (the four traits, `Pipeline`,
+/// `Cx`, `Artifacts`, every built-in, and `SecurityScheme`). The user's `.gnr8` lifecycle imports
+/// `use gnr8_core::sdk::prelude::*;` (or this alias) and composes a [`sdk::Pipeline`].
+pub use sdk::prelude;
 
 /// Stub used by Phase-1 CLI arms and unimplemented seams.
 ///

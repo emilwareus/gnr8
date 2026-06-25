@@ -1,80 +1,61 @@
-//! The `.gnr8/` workspace lifecycle: idempotent `init` scaffold + the checked-in/ignored split
+//! The `.gnr8/` workspace lifecycle: idempotent `init` scaffold of the MANDATORY code-as-config crate
 //! (WS-01, WS-02, D-01, D-02).
 //!
-//! `init` creates a project-local `.gnr8/` directory holding the checked-in PoC config
-//! (`config.toml`) and an auto-written `.gnr8/.gitignore` that ignores the git-ignored lifecycle
-//! subtree (`cache/`). The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at user-configured
-//! project paths (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
+//! `gnr8 init` creates a project-local `.gnr8/` directory holding a small Rust **binary crate** that
+//! depends on `gnr8-core` and drives the generation lifecycle. THIS CRATE IS THE CONFIG — there is no
+//! TOML (`docs/code-as-config.md`). gnr8 does not run without it: every other command requires it and
+//! errors with "run `gnr8 init`" when it is absent. `init` writes three files (each only if absent):
 //!
-//! Idempotency (D-01): every workspace file is written *only if absent*. Re-running `init` over an
-//! edited `config.toml` preserves the user's edits byte-for-byte and reports the file as `skipped`,
-//! never an error and never an overwrite. The write-if-absent guarantee uses
-//! `OpenOptions::create_new(true)`, which atomically fails with [`std::io::ErrorKind::AlreadyExists`]
-//! if the file appears between the check and the write (TOCTOU-safe, threat T-04-01-01) — no path is
-//! derived from user input (the `.gnr8/` subtree is fixed), so there is no traversal surface.
+//! - `.gnr8/Cargo.toml` — a standalone-workspace crate (`name = "<dir>-gnr8-gen"`, edition 2021,
+//!   `publish = false`, an empty `[workspace]` table so it builds independently via `--manifest-path`,
+//!   and a `gnr8-core` dependency).
+//! - `.gnr8/src/main.rs` — the default pipeline, in code; the user edits this to adapt parsing +
+//!   generation.
+//! - `.gnr8/.gitignore` — ignores the git-ignored lifecycle subtree (`target/`, `cache/`).
+//!
+//! The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at the paths the pipeline's targets
+//! declare (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
+//!
+//! ## The `gnr8-core` dependency: path (in-repo) vs version (published)
+//!
+//! `gnr8-core` is not published yet. When `init` runs INSIDE the gnr8 repo (detected by walking up for
+//! `crates/gnr8-core`), it emits a `path = "…/crates/gnr8-core"` dependency so the example + integration
+//! tests build against the in-repo crate. Outside the repo it emits `gnr8-core = "0.1"` with a TODO
+//! comment (publishing is a later milestone). This is the ONLY branch, and it is a presence check of a
+//! single fact (are we in the repo?), not a fallback between two ways to derive the same value.
+//!
+//! Idempotency (D-01): every workspace file is written *only if absent*, via
+//! `OpenOptions::create_new(true)` — atomically failing with [`std::io::ErrorKind::AlreadyExists`] if
+//! the file appears between the check and the write (TOCTOU-safe, threat T-04-01-01). Re-running `init`
+//! over an edited `src/main.rs` preserves the user's edits byte-for-byte and reports the file as
+//! `skipped`. The `.gnr8/` subtree is fixed (no path is derived from user input), so there is no
+//! traversal surface; the only user-derived value is the sanitized crate name written INTO Cargo.toml.
 
-// These docs are user-facing prose dense with proper nouns/acronyms (PoC, OpenAPI, TOCTOU, ...);
-// backticking them would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4, mirrors
-// the scoped allow in gnr8/src/cli.rs).
+// These docs are user-facing prose dense with proper nouns/acronyms (PoC, OpenAPI, TOCTOU, Cargo, ...);
+// backticking them would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4, mirrors the
+// scoped allow in gnr8/src/cli.rs).
 #![allow(clippy::doc_markdown)]
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::CoreError;
 
 /// The exact body `init` writes to `.gnr8/.gitignore` (WS-02 / D-01).
 ///
-/// The `.gitignore` lives *inside* `.gnr8/`, so its patterns are relative to `.gnr8/`. A leading
-/// slash anchors `/cache/` to this directory: it hides the ownership manifest + any future cache
-/// while keeping `config.toml` and the `.gitignore` itself checked in. This realizes the
-/// "automatic checked-in / git-ignored split" with a single file. Generated outputs
-/// (`openapi.yaml`, `sdk/`) live OUTSIDE `.gnr8/` (D-02) and are intentionally committed.
+/// The `.gitignore` lives *inside* `.gnr8/`, so its patterns are relative to `.gnr8/`. Leading slashes
+/// anchor `/target/` and `/cache/` to this directory: they hide the Rust build output of the generation
+/// crate and the ownership-manifest cache while keeping `Cargo.toml`, `src/`, and the `.gitignore`
+/// itself checked in. Generated outputs (`openapi.yaml`, `sdk/`) live OUTSIDE `.gnr8/` (D-02) and are
+/// intentionally committed.
 pub const GITIGNORE_BODY: &str = "\
-# gnr8 lifecycle state — regenerated, do not commit.
+# gnr8 generation crate build output + lifecycle state — regenerated, do not commit.
+/target/
 /cache/
 ";
 
-/// The default `config.toml` body `init` writes (checked in, WS-03 / D-03).
-///
-/// This TOML surface is an explicit **PoC code-as-config stand-in**, NOT the long-term UX: PROJECT
-/// scopes the real customization ("through code") to v2 (ADV-02). The body carries only the
-/// documented knobs — source inputs, OpenAPI/SDK output paths + Go module path, and optional
-/// commented-out naming overrides — and round-trips through [`crate::config::parse`] (the
-/// `deny_unknown_fields` config parser accepts exactly these keys).
-pub const DEFAULT_CONFIG_TOML: &str = "\
-# gnr8 PoC configuration — a code-as-config STAND-IN, not the long-term UX (see docs / D-03).
-# Programmatic (\"through code\") customization of routing recognition / transport / emitters is a
-# documented v2 direction (ADV-02) and is deliberately NOT a knob here.
-inputs = [\".\"]                              # Go source dir(s) to analyze (project-relative)
-
-# base_path is the SINGLE SOURCE OF TRUTH for the API base/mount path joined to every operation
-# path. The graph stores group-relative paths and cannot see the Gin group prefix (often a runtime
-# value: Group(\"/\" + basePath)), so you declare it here. Defaults to \"/\" when omitted.
-base_path = \"/\"
-
-[output]
-openapi   = \"openapi.yaml\"                  # OpenAPI artifact path (project-relative)
-sdk_dir   = \"sdk\"                           # generated Go SDK directory
-go_module = \"example.com/yourservice/sdk\"   # Go module path for the generated SDK
-
-# [naming.operations]                        # optional: remap operation ids, e.g.
-# goalUuidPut = \"UpdateGoal\"
-# [naming.types]                             # optional: remap generated type names, e.g.
-# CreateGoalInput = \"NewGoal\"
-
-# [security] — the SINGLE SOURCE OF TRUTH for the generated security requirement +
-# components.securitySchemes. Auth lives in middleware, not typed source, so gnr8 NEVER scrapes it;
-# you declare it here. Each listed scheme applies to all operations (PoC policy). Example:
-# [[security.schemes]]
-# id       = \"ApiKeyAuth\"
-# kind     = \"apiKey\"
-# location = \"header\"
-# name     = \"X-API-Key\"
-";
-
 /// The outcome of [`init`], so the CLI can report created vs already-present files without
-/// re-reading disk. Paths are relative to the project root (e.g. `.gnr8/config.toml`).
+/// re-reading disk. Paths are relative to the project root (e.g. `.gnr8/Cargo.toml`).
 #[derive(Debug, Default)]
 pub struct InitOutcome {
     /// Relative paths newly written by this `init` invocation.
@@ -83,32 +64,196 @@ pub struct InitOutcome {
     pub skipped: Vec<String>,
 }
 
-/// Scaffold the `.gnr8/` workspace idempotently under `root`.
+/// Scaffold the mandatory `.gnr8/` code-as-config crate idempotently under `root`.
 ///
-/// Creates `.gnr8/cache/` (mkdir -p is idempotent by nature), then writes `.gnr8/config.toml` and
-/// `.gnr8/.gitignore` *only if absent*. An already-initialized workspace is a successful no-op
+/// Creates `.gnr8/src/` (mkdir -p is idempotent), then writes `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`,
+/// and `.gnr8/.gitignore` *only if absent*. An already-initialized workspace is a successful no-op
 /// (files recorded in [`InitOutcome::skipped`]), never an error and never an overwrite (D-01).
+///
+/// The crate name is `<dirname>-gnr8-gen` where `<dirname>` is `root`'s final component sanitized to a
+/// valid Cargo package name; the `gnr8-core` dependency is a path dep when `root` is inside the gnr8
+/// repo and a version dep otherwise (see the module docs).
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Workspace`] if `.gnr8/cache/` cannot be created or a workspace file cannot
-/// be written for any reason other than already existing. No production panic (RUST-04).
+/// Returns [`CoreError::Workspace`] if `.gnr8/src/` cannot be created or a workspace file cannot be
+/// written for any reason other than already existing. No production panic (RUST-04).
 pub fn init(root: &Path) -> Result<InitOutcome, CoreError> {
     let gnr8 = root.join(".gnr8");
-    let cache = gnr8.join("cache");
-    std::fs::create_dir_all(&cache).map_err(|e| CoreError::Workspace {
-        message: format!("failed to create {}: {e}", cache.display()),
+    let src = gnr8.join("src");
+    std::fs::create_dir_all(&src).map_err(|e| CoreError::Workspace {
+        message: format!("failed to create {}: {e}", src.display()),
     })?;
 
+    let crate_name = crate_name_for(root);
+    let core_dep = core_dependency_line(root);
+    let cargo_toml = cargo_toml_body(&crate_name, &core_dep);
+
     let mut outcome = InitOutcome::default();
-    write_if_absent(
-        root,
-        &gnr8.join("config.toml"),
-        DEFAULT_CONFIG_TOML,
-        &mut outcome,
-    )?;
+    write_if_absent(root, &gnr8.join("Cargo.toml"), &cargo_toml, &mut outcome)?;
+    write_if_absent(root, &src.join("main.rs"), MAIN_RS_BODY, &mut outcome)?;
     write_if_absent(root, &gnr8.join(".gitignore"), GITIGNORE_BODY, &mut outcome)?;
     Ok(outcome)
+}
+
+/// The scaffolded `.gnr8/src/main.rs` — the default generation lifecycle, in code (D-03).
+///
+/// This file IS the config: it composes a [`crate::sdk::Pipeline`] equivalent to the old default TOML
+/// (one Go+Gin source, a root base path, an `API` title, an OpenAPI 3.1 target, a Go SDK target, and
+/// the generated-header post-process) and hands it to [`crate::runner::run`]. The user edits it to
+/// adapt parsing + generation; `gnr8 generate` compiles and runs it.
+pub const MAIN_RS_BODY: &str = r#"//! This file IS your gnr8 configuration — edit it to adapt parsing + generation.
+//! `gnr8 generate` compiles and runs it.
+//!
+//! It is an ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 runner. The
+//! runner parses argv (`__emit` / `__inspect`) and prints a JSON bundle on stdout; the `gnr8` host
+//! runs this crate for you, then owns writing the files (ownership manifest, no-op skip, edit
+//! protection). Adapting = ordinary Rust: change an argument, add a `.transform(...)`, write your own
+//! `Source`/`Target`/`Transform`, or wrap a built-in.
+
+use gnr8_core::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8_core::runner::run(
+        Pipeline::new()
+            .source(GoGin::new().inputs(["."]))
+            .transform(SetBasePath::new("/"))
+            .transform(SetTitle::new("API"))
+            // .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
+            // .transform(RenameOperation::new("listGoals", "List"))
+            .target(OpenApi31::new().to("openapi.yaml"))
+            .target(GoSdk::new().module("example.com/yourservice/sdk").to("sdk"))
+            .post(Header::generated()),
+    )
+}
+"#;
+
+/// Build the `.gnr8/Cargo.toml` body for `crate_name` with the given `gnr8-core` `dependency` line.
+///
+/// A standalone-workspace crate (the empty `[workspace]` table makes it its own workspace root so it
+/// builds independently via `cargo run --manifest-path .gnr8/Cargo.toml`), `publish = false` (it is a
+/// project-local tool, never published), edition 2021 (matches the gnr8-core workspace).
+fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
+    format!(
+        "# gnr8 generation crate — this crate IS your config (edit src/main.rs). Built + run by `gnr8`.\n\
+         [package]\n\
+         name = \"{crate_name}\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"2021\"\n\
+         publish = false\n\
+         \n\
+         [dependencies]\n\
+         {dependency}\n\
+         \n\
+         # Empty [workspace] table → this crate is its own workspace root, so `gnr8` can build it\n\
+         # standalone via `cargo run --manifest-path .gnr8/Cargo.toml` regardless of any parent workspace.\n\
+         [workspace]\n"
+    )
+}
+
+/// The `gnr8-core` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
+///
+/// In-repo (a `crates/gnr8-core` exists at or above `root`) ⇒ a `path` dep pointing at it (the only
+/// form that works until `gnr8-core` is published). Otherwise ⇒ a version dep with a TODO comment.
+/// This is a single presence check, not a dual-source fallback (CLAUDE.md rule 3): the path is computed
+/// from one fact (the located in-repo crate), and when that fact is absent the published form is used.
+fn core_dependency_line(root: &Path) -> String {
+    match locate_in_repo_core(root) {
+        Some(rel) => format!("gnr8-core = {{ path = {rel:?} }}"),
+        None => {
+            "gnr8-core = \"0.1\"  # TODO: gnr8-core is not published yet — set the real version once it is"
+                .to_string()
+        }
+    }
+}
+
+/// Locate an in-repo `crates/gnr8-core` directory at or above `root`, returning the path RELATIVE to
+/// `<root>/.gnr8/` (where the scaffolded Cargo.toml lives) so the emitted `path = "…"` resolves
+/// correctly from the generation crate. Returns `None` when `root` is not inside the gnr8 repo.
+///
+/// Walks up from `root` checking each ancestor for `crates/gnr8-core`; on a hit, computes the relative
+/// path from `<root>/.gnr8/` to that crate. A relativization failure (e.g. different drive prefixes on
+/// Windows) degrades to `None` (⇒ the version dep), never a panic.
+fn locate_in_repo_core(root: &Path) -> Option<String> {
+    let manifest_anchor = root.join(".gnr8");
+    let mut current: Option<&Path> = Some(root);
+    while let Some(dir) = current {
+        let candidate = dir.join("crates").join("gnr8-core");
+        if candidate.join("Cargo.toml").is_file() {
+            return relative_path_str(&manifest_anchor, &candidate);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// Compute a relative path string FROM `from` TO `to` using `..` segments, so the emitted Cargo `path`
+/// dep is portable (not an absolute machine path). Returns `None` if no relative path can be formed.
+///
+/// Both inputs are treated as directories. The implementation finds the common prefix, emits one `..`
+/// per remaining `from` component, then appends the remaining `to` components — all with forward slashes
+/// (Cargo accepts `/` on every platform). No filesystem access, no canonicalization (the anchor `.gnr8`
+/// may not exist yet at scaffold time), so it is pure and deterministic.
+fn relative_path_str(from: &Path, to: &Path) -> Option<String> {
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+
+    // The common leading prefix length.
+    let common = from_components
+        .iter()
+        .zip(to_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // If there is no shared root component at all, a relative path is meaningless (e.g. different
+    // Windows prefixes) → signal None so the caller falls back to the version dep.
+    if common == 0 {
+        return None;
+    }
+
+    let ups = from_components.len() - common;
+    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), ups).collect();
+    for component in &to_components[common..] {
+        parts.push(component.as_os_str().to_string_lossy().into_owned());
+    }
+    if parts.is_empty() {
+        // `to` is `from` itself — represent as the current dir.
+        return Some(".".to_string());
+    }
+    Some(parts.join("/"))
+}
+
+/// Derive the scaffolded crate name `<dirname>-gnr8-gen` from `root`'s final path component, sanitized
+/// to a valid Cargo package name (lowercase ASCII alphanumerics + `-`/`_`, leading non-letter trimmed).
+///
+/// A Cargo package name must be non-empty and start with an alphanumeric; we keep ASCII letters/digits
+/// (lower-cased) and `-`/`_`, replacing every other character (including `.`) with `-`, then trim
+/// leading separators. If the component sanitizes to empty (or `root` has no final component, e.g. it is
+/// the filesystem root), a stable fallback (`"gnr8-gen"`) is used so the name is always valid.
+fn crate_name_for(root: &Path) -> String {
+    let raw = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else if c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Trim leading separators so the name starts with an alphanumeric (Cargo requirement).
+    let trimmed = sanitized.trim_start_matches(['-', '_']);
+    if trimmed.is_empty() {
+        "gnr8-gen".to_string()
+    } else {
+        format!("{trimmed}-gnr8-gen")
+    }
 }
 
 /// Write `body` to `path` only if it does not already exist; record the relative path in
@@ -149,10 +294,62 @@ fn write_if_absent(
 /// Render `path` relative to `root` for reporting; fall back to the full path if it is not a
 /// descendant of `root` (defensive — `init` only ever passes paths under `root`).
 fn relative(root: &Path, path: &Path) -> String {
-    // Both arms already hold a `&Path`; `Path::to_path_buf` avoids the redundant `PathBuf::from`
-    // round-trip the success arm previously did (IN-03 — cosmetic, behavior unchanged).
     path.strip_prefix(root)
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
         .display()
         .to_string()
+}
+
+/// The path to a project's mandatory generation-crate manifest (`<root>/.gnr8/Cargo.toml`).
+///
+/// The host requires this to exist before running the child; a missing one is the "run `gnr8 init`"
+/// error. Exposed so the binary's child-run helper resolves the manifest the same way `init` writes it.
+#[must_use]
+pub fn manifest_path(root: &Path) -> PathBuf {
+    root.join(".gnr8").join("Cargo.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4); scope the allow to the
+    // test module so the workspace-wide RUST-04 deny stays intact for production code.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{crate_name_for, relative_path_str};
+    use std::path::Path;
+
+    #[test]
+    fn crate_name_sanitizes_dir_to_valid_cargo_name() {
+        assert_eq!(
+            crate_name_for(Path::new("/x/bookstore")),
+            "bookstore-gnr8-gen"
+        );
+        // Dots and uppercase are normalized.
+        assert_eq!(
+            crate_name_for(Path::new("/x/My.Service.v2")),
+            "my-service-v2-gnr8-gen"
+        );
+        // Leading separators are trimmed so the name starts with an alphanumeric.
+        assert_eq!(crate_name_for(Path::new("/x/_weird")), "weird-gnr8-gen");
+        // A component that sanitizes to empty falls back to the stable default.
+        assert_eq!(crate_name_for(Path::new("/x/---")), "gnr8-gen");
+    }
+
+    #[test]
+    fn relative_path_str_emits_dotdot_segments() {
+        // From `<root>/.gnr8` up to a sibling `crates/gnr8-core` two levels above root.
+        let from = Path::new("/repo/examples/bookstore/.gnr8");
+        let to = Path::new("/repo/crates/gnr8-core");
+        assert_eq!(
+            relative_path_str(from, to).unwrap(),
+            "../../../crates/gnr8-core"
+        );
+    }
+
+    #[test]
+    fn relative_path_str_handles_no_common_root() {
+        // No shared prefix (different absolute roots) → None (caller falls back to the version dep).
+        // On unix every absolute path shares the RootDir component, so use clearly-disjoint relatives.
+        assert!(relative_path_str(Path::new("a/b"), Path::new("c/d")).is_none());
+    }
 }

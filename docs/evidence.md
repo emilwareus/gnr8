@@ -85,14 +85,14 @@ count note above: the REQUIREMENTS.md checklist contains 38 IDs; the "37" headli
 | **OAPI-01** | 3 | `crates/gnr8-core/src/lower/mod.rs` (`to_openapi`) + `crates/gnr8-core/tests/snapshot_openapi.rs` |
 | **OAPI-02** | 3 | `crates/gnr8-core/src/lower/` (info, paths, operations, params, bodies, responses, component schemas) |
 | **OAPI-03** | 3 | `crates/gnr8-core/src/lower/` diagnostics (e.g. free-form map → `additionalProperties: true`) |
-| **SDK-01** | 3 | `crates/gnr8-core/src/sdk/emit/` → generated `sdk/client.go` (base URL + `WithHTTPClient`) |
-| **SDK-02** | 3 | `crates/gnr8-core/src/sdk/emit/` → generated `sdk/goals.go` (ctx-first typed operation methods) |
-| **SDK-03** | 3 | `crates/gnr8-core/src/sdk/emit/` → generated `sdk/models.go` (request/response models + enums) |
+| **SDK-01** | 3 | `crates/gnr8-core/src/gosdk/emit.rs` → generated `sdk/client.go` (base URL + `WithHTTPClient`) |
+| **SDK-02** | 3 | `crates/gnr8-core/src/gosdk/emit.rs` → generated `sdk/goals.go` (ctx-first typed operation methods) |
+| **SDK-03** | 3 | `crates/gnr8-core/src/gosdk/emit.rs` → generated `sdk/models.go` (request/response models + enums) |
 | **SDK-04** | 3 | generated `sdk/errors.go` (typed `*APIError`) + JSON encode/decode in `sdk/goals.go` |
 | **SDK-05** | 3 | `crates/gnr8-core/tests/sdk_compile.rs` (hermetic `go build` + `httptest` smoke) |
-| **WS-01** | 4 | `crates/gnr8-core/src/workspace/mod.rs` (`init` scaffolds `.gnr8/` config + cache) |
-| **WS-02** | 4 | `crates/gnr8-core/src/workspace/mod.rs` (`GITIGNORE_BODY` splits checked-in `config.toml` from ignored `/cache/`) |
-| **WS-03** | 4 | `crates/gnr8-core/src/config/mod.rs` (typed `Config`: inputs/outputs/go-module/naming knobs, `deny_unknown_fields`) |
+| **WS-01** | 4 | `crates/gnr8-core/src/workspace/mod.rs` (`init` scaffolds the `.gnr8/` Rust crate: `Cargo.toml` + `src/main.rs` + `.gitignore`) |
+| **WS-02** | 4 | `crates/gnr8-core/src/workspace/mod.rs` (`GITIGNORE_BODY` splits the checked-in crate from the ignored `/target/`+`/cache/`) |
+| **WS-03** | 4 | `crates/gnr8-core/src/sdk/` (the code-as-config `Pipeline` + `Source`/`Transform`/`Target`/`PostProcess` traits + built-ins — config is code, no TOML) |
 | **WS-04** | 4 | `crates/gnr8-core/src/manifest/mod.rs` (blake3 ownership manifest) + `lifecycle::plan_writes` (no silent clobber) |
 | **WATCH-01** | 4 | `crates/gnr8-core/src/lifecycle/mod.rs` (`plan_writes` no-op skip) + `tests/lifecycle.rs::noop_second_run_writes_nothing` |
 | **WATCH-02** | 4 | `crates/gnr8/src/watch.rs` (debounced FS events, output-path drop / loop-safety) + `watch::tests` |

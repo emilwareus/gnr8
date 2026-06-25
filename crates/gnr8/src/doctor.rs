@@ -1,54 +1,50 @@
-//! `gnr8 doctor` — the read-only health aggregator (HARD-01 / D-01, D-02).
+//! `gnr8 doctor` — the health aggregator (HARD-01 / D-01, D-02).
 //!
 //! This module owns the PURE report shape + grouping + exit-policy decision + human/JSON render. It
-//! performs NO I/O and NO analysis: [`DoctorReport::assemble`] takes already-collected facts (the four
-//! lifecycle booleans, the structured analysis `diagnostics`, and the dry-run drift `WritePlan`) and
-//! groups them into a serializable report. The impure half — probing `.gnr8/`, loading config, probing
-//! the Go toolchain, and calling `build_graph`/`plan_only` — lives in `main::run_doctor`, mirroring the
-//! `run_check` shell-vs-decision split. Keeping `assemble` pure makes the entire exit-policy truth table
-//! (Pitfall 1 — informational WARNs must NOT force a non-zero exit) unit-testable without a filesystem
-//! or the Go toolchain.
+//! performs NO I/O: [`DoctorReport::assemble`] takes already-collected facts (the lifecycle booleans,
+//! the pipeline's structured `diagnostics`, and the dry-run drift `WritePlan`) and groups them into a
+//! serializable report. The impure half — probing `.gnr8/`, probing the Go toolchain, and RUNNING the
+//! user's `.gnr8/` pipeline (the child) to harvest its diagnostics + compute drift — lives in
+//! `main::run_doctor`, mirroring the `run_check` shell-vs-decision split. Keeping `assemble` pure makes
+//! the entire exit-policy truth table (Pitfall 1 — informational WARNs must NOT force a non-zero exit)
+//! unit-testable without a filesystem, a toolchain, or a child process.
 //!
 //! ## Exit policy (Pitfall 1 / HARD-01)
 //!
 //! [`DoctorReport::has_actionable_problem`] is `true` iff a lifecycle/staleness problem exists:
-//! `.gnr8/` missing, config invalid, Go toolchain absent, inputs overlap outputs, or any output is
-//! stale (`Write`) / drifted (`UserEdited`). The analysis `diagnostics` (the fixture's 7 known
+//! `.gnr8/` missing, the Go toolchain absent, the pipeline failed to run, or any output is stale
+//! (`Write`) / drifted (`UserEdited`). The pipeline's analysis `diagnostics` (e.g. the fixture's known
 //! unsupported-pattern WARNs) are INFORMATIONAL and are deliberately EXCLUDED — they explain "what I
-//! can't represent and why" and must never make `doctor` permanently red on the demo subject. This
-//! mirrors `run_check`, which exits non-zero only on `has_drift()`, not on clean-but-present outputs.
+//! can't represent and why" and must never make `doctor` permanently red. This mirrors `run_check`,
+//! which exits non-zero only on `has_drift()`, not on clean-but-present outputs.
 
-// User-facing prose dense with proper nouns/acronyms (OpenAPI, TOML, PoC, `.gnr8/`, ...); backticking
-// them would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4; mirrors the scoped allow
-// in cli.rs / watch.rs / config/mod.rs).
+// User-facing prose dense with proper nouns/acronyms (OpenAPI, PoC, `.gnr8/`, ...); backticking them
+// would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4; mirrors the scoped allow in
+// cli.rs / watch.rs).
 #![allow(clippy::doc_markdown)]
 
 use std::fmt::Write as _;
 
-use gnr8_core::config::Config;
 use gnr8_core::graph::Diagnostic;
 use gnr8_core::lifecycle::{WriteAction, WritePlan};
-use gnr8_core::CoreError;
 
-/// The four read-only lifecycle facts `doctor` reports (each is an ACTIONABLE problem when false /
-/// true respectively). Collected by `run_doctor` and handed to [`DoctorReport::assemble`].
+/// The read-only lifecycle facts `doctor` reports (each is an ACTIONABLE problem when false). Collected
+/// by `run_doctor` and handed to [`DoctorReport::assemble`].
 ///
-/// These four flags ARE the documented `lifecycle` JSON sub-object (RESEARCH `doctor --json` shape):
-/// each is an independent boolean health fact a CI gate reads by name, not a state machine — so the
+/// These flags ARE the documented `lifecycle` JSON sub-object (RESEARCH `doctor --json` shape): each is
+/// an independent boolean health fact a CI gate reads by name, not a state machine — so the
 /// `struct_excessive_bools` lint is allowed locally rather than collapsing them into enums and breaking
 /// the published field set.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct LifecycleHealth {
-    /// Whether the project-local `.gnr8/` workspace exists (run `gnr8 init` if not).
+    /// Whether the project-local `.gnr8/` generation crate exists (run `gnr8 init` if not).
     pub(crate) initialized: bool,
-    /// Whether `.gnr8/config.toml` loaded + parsed cleanly (`config::load` returned `Ok`).
-    pub(crate) config_valid: bool,
     /// Whether the Go toolchain is present (a `go version` probe spawned successfully).
     pub(crate) go_toolchain: bool,
-    /// Whether any configured input dir overlaps a configured output path (gnr8 would analyze its own
-    /// generated SDK) — an actionable misconfiguration.
-    pub(crate) inputs_overlap_outputs: bool,
+    /// Whether the user's `.gnr8/` pipeline RAN (compiled + emitted a bundle). False ⇒ a compile error
+    /// in the pipeline, a missing toolchain it needs, or a missing `.gnr8/` — all actionable.
+    pub(crate) pipeline_runs: bool,
 }
 
 /// The stale/drifted/clean partition of the dry-run [`WritePlan`] (mirrors `run_check`'s partition).
@@ -60,15 +56,6 @@ pub(crate) struct OutputHealth {
     pub(crate) drifted: Vec<String>,
     /// Output paths byte-identical to the generated output (`WriteAction::Unchanged`) — clean.
     pub(crate) unchanged: Vec<String>,
-    /// Whether the drift dry-run could NOT be computed even though config + Go toolchain were present
-    /// (e.g. a multi-input config `generate` would reject, or a source build/parse error). This is a
-    /// DISTINCT state from "no drift" (every output `Unchanged`): the empty stale/drifted/unchanged
-    /// lists below would otherwise render as a clean "all outputs up to date", masking that `doctor`
-    /// could not actually verify staleness. It is ACTIONABLE — the user should know drift is unverified
-    /// and run `gnr8 check`/`gnr8 generate` for the real error (WR-01). When config is invalid or the
-    /// toolchain is absent, drift is also unavailable, but THAT is already carried by the lifecycle
-    /// findings, so this flag stays `false` then to avoid double-counting.
-    pub(crate) drift_unknown: bool,
 }
 
 /// One analysis diagnostic enriched with a short, human explanation of WHY it is flagged and HOW to
@@ -106,11 +93,11 @@ pub(crate) struct DoctorSummary {
 pub(crate) struct DoctorReport {
     /// The top-level CI signal: `true` iff no actionable problem exists.
     pub(crate) healthy: bool,
-    /// The four lifecycle facts (init / config / Go toolchain / input-output overlap).
+    /// The lifecycle facts (init / Go toolchain / pipeline runs).
     pub(crate) lifecycle: LifecycleHealth,
-    /// The stale/drifted/clean output partition (empty when drift was unavailable).
+    /// The stale/drifted/clean output partition (empty when the pipeline did not run).
     pub(crate) outputs: OutputHealth,
-    /// The informational analysis diagnostics (the 7 known unsupported patterns on the fixture).
+    /// The informational analysis diagnostics (the unsupported patterns the pipeline reported).
     pub(crate) diagnostics: Vec<DoctorDiagnostic>,
     /// The informational-vs-actionable header counts.
     pub(crate) summary: DoctorSummary,
@@ -144,7 +131,7 @@ fn explain(message: &str) -> (String, String) {
         (
             "an unsupported source pattern the analyzer cannot fully represent (expected PoC limitation)"
                 .to_string(),
-            "see the diagnostic message and TARGET-API.md for the supported alternative".to_string(),
+            "see the diagnostic message and the SDK docs for the supported alternative".to_string(),
         )
     }
 }
@@ -153,43 +140,36 @@ impl DoctorReport {
     /// Build a grouped [`DoctorReport`] from already-collected facts (PURE — no I/O, no analysis).
     ///
     /// - `initialized` — `.gnr8/` exists.
-    /// - `config` — the `config::load` result (an `Err` is the "config invalid/missing" finding; the
-    ///   `Ok` value is unused here — it is read by the caller to harvest diagnostics/drift).
     /// - `go_present` — the Go-toolchain probe result.
-    /// - `inputs_overlap_outputs` — a configured input overlaps a configured output path.
-    /// - `diagnostics` — the structured analysis diagnostics, or `None` when unavailable (no config /
-    ///   no Go toolchain / analysis errored — degrades gracefully, never a crash).
-    /// - `drift_computable` — whether a drift dry-run was ATTEMPTABLE (config valid AND Go present). It
-    ///   separates "we tried and got a clean plan" (`drift = Some`) from "we tried but the analysis/plan
-    ///   failed" (`drift_computable && drift = None`) — the latter is the WR-01 uncomputable-drift state,
-    ///   surfaced as `outputs.drift_unknown` rather than a false-healthy "all up to date".
-    /// - `drift` — the dry-run [`WritePlan`], or `None` when unavailable (same graceful absence).
+    /// - `pipeline_ran` — the user's `.gnr8/` pipeline compiled + emitted a bundle.
+    /// - `diagnostics` — the pipeline's structured analysis diagnostics, or `None` when the pipeline did
+    ///   not run (degrades gracefully, never a crash).
+    /// - `drift` — the dry-run [`WritePlan`] computed from the pipeline's artifacts, or `None` when the
+    ///   pipeline did not run (the `pipeline_runs = false` finding carries the verdict then).
     ///
     /// The `WritePlan` is partitioned into stale (`Write`) / drifted (`UserEdited`) / clean
     /// (`Unchanged`), and each `Diagnostic` is enriched with a why/fix explanation.
     //
     // Each bool here is an INDEPENDENT collected health fact the impure `run_doctor` shell hands in by
-    // name (mirrors the `struct_excessive_bools` allow on `LifecycleHealth`); collapsing them into a
-    // flags struct would just move the same four fields and obscure the call site, so allow the lint
+    // name (mirrors the `struct_excessive_bools` allow on `LifecycleHealth`); allow the param-bools lint
     // locally rather than restructure (skill ch.2.4).
     #[allow(clippy::fn_params_excessive_bools)]
     pub(crate) fn assemble(
         initialized: bool,
-        config: &Result<Config, CoreError>,
         go_present: bool,
-        inputs_overlap_outputs: bool,
+        pipeline_ran: bool,
         diagnostics: Option<Vec<Diagnostic>>,
-        drift_computable: bool,
         drift: Option<&WritePlan>,
     ) -> Self {
         let lifecycle = LifecycleHealth {
             initialized,
-            config_valid: config.is_ok(),
             go_toolchain: go_present,
-            inputs_overlap_outputs,
+            pipeline_runs: pipeline_ran,
         };
 
-        // Partition the dry-run plan exactly as `run_check` does (stale / drifted / clean).
+        // Partition the dry-run plan exactly as `run_check` does (stale / drifted / clean). When the
+        // pipeline did not run, the partition stays empty and the `pipeline_runs = false` finding (not a
+        // false-healthy "all up to date") carries the actionable verdict.
         let mut outputs = OutputHealth::default();
         if let Some(plan) = drift {
             for file in &plan.files {
@@ -199,15 +179,10 @@ impl DoctorReport {
                     WriteAction::Unchanged => outputs.unchanged.push(file.path.clone()),
                 }
             }
-        } else if drift_computable {
-            // Config + toolchain were present, so drift SHOULD have been computable, but the dry-run
-            // failed (multi-input rejection, source build/parse error, ...). Mark it unknown so the
-            // empty partition above never renders as a clean "all outputs up to date" (WR-01).
-            outputs.drift_unknown = true;
         }
 
         // Enrich each informational analysis diagnostic with a short why/fix (D-02 — explain, not
-        // re-analyze). `None` (analysis unavailable) yields an empty list, not an error.
+        // re-analyze). `None` (pipeline did not run) yields an empty list, not an error.
         let diagnostics: Vec<DoctorDiagnostic> = diagnostics
             .unwrap_or_default()
             .into_iter()
@@ -253,18 +228,10 @@ impl DoctorReport {
         if !self.lifecycle.initialized {
             count += 1;
         }
-        if !self.lifecycle.config_valid {
-            count += 1;
-        }
         if !self.lifecycle.go_toolchain {
             count += 1;
         }
-        if self.lifecycle.inputs_overlap_outputs {
-            count += 1;
-        }
-        // An uncomputable drift (config + toolchain present, but the dry-run failed) is actionable:
-        // `doctor` could not verify staleness, so it must NOT pass as healthy (WR-01).
-        if self.outputs.drift_unknown {
+        if !self.lifecycle.pipeline_runs {
             count += 1;
         }
         count += self.outputs.stale.len();
@@ -273,16 +240,14 @@ impl DoctorReport {
     }
 
     /// Whether `doctor` should exit non-zero: `true` iff an ACTIONABLE lifecycle/staleness problem
-    /// exists. The informational analysis `diagnostics` are EXCLUDED so the fixture's 7 expected WARNs
-    /// never make `doctor` permanently red (Pitfall 1 / the exit-code contract in RESEARCH). Mirrors
-    /// `run_check`'s `has_drift()`-only exit policy.
+    /// exists. The informational analysis `diagnostics` are EXCLUDED so the expected unsupported-pattern
+    /// WARNs never make `doctor` permanently red (Pitfall 1 / the exit-code contract in RESEARCH).
+    /// Mirrors `run_check`'s `has_drift()`-only exit policy.
     #[must_use]
     pub(crate) fn has_actionable_problem(&self) -> bool {
         !self.lifecycle.initialized
-            || !self.lifecycle.config_valid
             || !self.lifecycle.go_toolchain
-            || self.lifecycle.inputs_overlap_outputs
-            || self.outputs.drift_unknown
+            || !self.lifecycle.pipeline_runs
             || !self.outputs.stale.is_empty()
             || !self.outputs.drifted.is_empty()
     }
@@ -299,13 +264,8 @@ impl DoctorReport {
         let _ = writeln!(out, "LIFECYCLE");
         let _ = writeln!(
             out,
-            "  .gnr8/ workspace:    {}",
+            "  .gnr8/ crate:        {}",
             ok_or(self.lifecycle.initialized, "missing — run `gnr8 init`")
-        );
-        let _ = writeln!(
-            out,
-            "  config.toml:         {}",
-            ok_or(self.lifecycle.config_valid, "invalid or missing")
         );
         let _ = writeln!(
             out,
@@ -317,11 +277,10 @@ impl DoctorReport {
         );
         let _ = writeln!(
             out,
-            "  inputs vs outputs:   {}",
-            // overlap is the PROBLEM condition, so invert for the ok_or helper.
+            "  pipeline runs:       {}",
             ok_or(
-                !self.lifecycle.inputs_overlap_outputs,
-                "a configured input overlaps an output path"
+                self.lifecycle.pipeline_runs,
+                "FAILED — `gnr8 generate` for the compile/run error"
             )
         );
 
@@ -342,12 +301,11 @@ impl DoctorReport {
                 "  drifted:  {path} (hand-edited; differs from generated)"
             );
         }
-        if self.outputs.drift_unknown {
-            // Distinct from "up to date": the drift dry-run failed despite config + toolchain being
-            // present, so staleness is UNVERIFIED — never imply healthy here (WR-01).
+        if !self.lifecycle.pipeline_runs {
+            // The pipeline did not run, so staleness is UNVERIFIED — never imply healthy here.
             let _ = writeln!(
                 out,
-                "  drift: UNKNOWN — could not compute (run `gnr8 check` / `gnr8 generate` for the error)"
+                "  drift: UNKNOWN — the pipeline did not run (see the LIFECYCLE finding)"
             );
         } else if self.outputs.stale.is_empty() && self.outputs.drifted.is_empty() {
             let _ = writeln!(out, "  (all outputs up to date)");
@@ -409,33 +367,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::DoctorReport;
-    use gnr8_core::config::Config;
     use gnr8_core::graph::Diagnostic;
     use gnr8_core::lifecycle::{PlannedFile, WriteAction, WritePlan};
-    use gnr8_core::CoreError;
     use std::collections::HashSet;
 
-    /// A valid loaded config (the `Ok` arm of the `config::load` result `assemble` takes).
-    fn ok_config() -> Result<Config, CoreError> {
-        gnr8_core::config::parse(
-            r#"
-inputs = ["."]
-[output]
-openapi = "openapi.yaml"
-sdk_dir = "sdk"
-go_module = "example.com/svc/sdk"
-"#,
-        )
-    }
-
-    /// The `Err` arm (a missing/invalid config finding).
-    fn err_config() -> Result<Config, CoreError> {
-        Err(CoreError::Config {
-            message: "missing config".to_string(),
-        })
-    }
-
-    /// One informational analysis WARN (the kind the fixture emits 7 of).
+    /// One informational analysis WARN (the kind the fixture emits several of).
     fn warn_diag(message: &str) -> Diagnostic {
         Diagnostic {
             severity: "WARN".to_string(),
@@ -454,7 +390,7 @@ go_module = "example.com/svc/sdk"
                 action,
                 new_bytes: b"x".to_vec(),
                 new_hash: "h".to_string(),
-                source: "openapi".to_string(),
+                source: "generated".to_string(),
             }],
         }
     }
@@ -465,7 +401,7 @@ go_module = "example.com/svc/sdk"
     }
 
     /// Exit-policy (Pitfall 1): a report whose ONLY findings are analysis WARNs is NOT actionable —
-    /// the fixture's 7 informational WARNs must NOT make doctor red (exit 0).
+    /// the informational WARNs must NOT make doctor red (exit 0).
     #[test]
     fn informational_diagnostics_alone_are_not_actionable() {
         let diags = vec![
@@ -474,12 +410,10 @@ go_module = "example.com/svc/sdk"
             warn_diag("untyped query param 'cursor' on GET /goal/list ..."),
         ];
         let report = DoctorReport::assemble(
-            true,         // initialized
-            &ok_config(), // config valid
-            true,         // go present
-            false,        // no input/output overlap
-            Some(diags),  // 3 informational WARNs
-            true,         // drift was computable
+            true, // initialized
+            true, // go present
+            true, // pipeline ran
+            Some(diags),
             Some(&clean_plan()),
         );
         assert!(
@@ -494,70 +428,49 @@ go_module = "example.com/svc/sdk"
     /// Exit-policy: `.gnr8/` missing (initialized=false) is actionable.
     #[test]
     fn missing_init_is_actionable() {
-        let report = DoctorReport::assemble(false, &ok_config(), true, false, None, false, None);
+        let report = DoctorReport::assemble(false, true, false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.healthy);
-    }
-
-    /// Exit-policy: an invalid/missing config is actionable.
-    #[test]
-    fn invalid_config_is_actionable() {
-        let report = DoctorReport::assemble(true, &err_config(), true, false, None, false, None);
-        assert!(report.has_actionable_problem());
-        assert!(!report.lifecycle.config_valid);
     }
 
     /// Exit-policy: a missing Go toolchain is actionable (and reported, not a crash).
     #[test]
     fn missing_go_toolchain_is_actionable() {
-        let report = DoctorReport::assemble(true, &ok_config(), false, false, None, false, None);
+        let report = DoctorReport::assemble(true, false, true, None, Some(&clean_plan()));
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.go_toolchain);
     }
 
-    /// Exit-policy: a configured input overlapping an output is actionable.
+    /// Exit-policy: a pipeline that failed to run is actionable, and drift renders UNKNOWN (never a
+    /// false-healthy "up to date").
     #[test]
-    fn input_output_overlap_is_actionable() {
-        let report = DoctorReport::assemble(
-            true,
-            &ok_config(),
-            true,
-            true,
-            None,
-            true,
-            Some(&clean_plan()),
-        );
+    fn pipeline_failure_is_actionable_and_drift_unknown() {
+        let report = DoctorReport::assemble(true, true, false, None, None);
         assert!(report.has_actionable_problem());
-        assert!(report.lifecycle.inputs_overlap_outputs);
+        assert!(!report.lifecycle.pipeline_runs);
+        let text = report.render_human();
+        assert!(
+            !text.contains("all outputs up to date"),
+            "a failed pipeline must NOT render as clean:\n{text}"
+        );
+        assert!(
+            text.contains("drift: UNKNOWN"),
+            "a failed pipeline must render a distinct drift-unknown finding:\n{text}"
+        );
     }
 
     /// Exit-policy: any stale (`Write`) output is actionable; all-Unchanged is clean.
     #[test]
     fn stale_output_is_actionable_clean_is_not() {
-        let stale = DoctorReport::assemble(
-            true,
-            &ok_config(),
-            true,
-            false,
-            None,
-            true,
-            Some(&plan_with(WriteAction::Write)),
-        );
+        let stale =
+            DoctorReport::assemble(true, true, true, None, Some(&plan_with(WriteAction::Write)));
         assert!(
             stale.has_actionable_problem(),
             "a stale Write output is actionable"
         );
         assert_eq!(stale.outputs.stale.len(), 1);
 
-        let clean = DoctorReport::assemble(
-            true,
-            &ok_config(),
-            true,
-            false,
-            None,
-            true,
-            Some(&clean_plan()),
-        );
+        let clean = DoctorReport::assemble(true, true, true, None, Some(&clean_plan()));
         assert!(
             !clean.has_actionable_problem(),
             "an all-Unchanged plan with no other problems is healthy"
@@ -570,78 +483,13 @@ go_module = "example.com/svc/sdk"
     fn drifted_output_is_actionable() {
         let report = DoctorReport::assemble(
             true,
-            &ok_config(),
             true,
-            false,
+            true,
             None,
-            true,
             Some(&plan_with(WriteAction::UserEdited)),
         );
         assert!(report.has_actionable_problem());
         assert_eq!(report.outputs.drifted.len(), 1);
-    }
-
-    /// WR-01: when config IS valid and the Go toolchain IS present but the drift dry-run could not be
-    /// computed (`drift_computable = true`, `drift = None` — e.g. a multi-input config `generate` would
-    /// reject, or a source build/parse error), `doctor` must NOT report a clean healthy project. The
-    /// empty stale/drifted/unchanged partition must surface as `drift_unknown` (actionable, `!healthy`)
-    /// and render a DISTINCT "could not compute" line — never the false-reassuring "all outputs up to
-    /// date".
-    #[test]
-    fn uncomputable_drift_is_actionable_not_healthy() {
-        let report = DoctorReport::assemble(
-            true,         // initialized
-            &ok_config(), // config valid
-            true,         // go present — so drift SHOULD have been computable
-            false,        // no overlap
-            None,         // diagnostics also unavailable
-            true,         // drift_computable: a compute WAS attempted
-            None,         // ...but it failed → drift unavailable
-        );
-
-        assert!(
-            report.outputs.drift_unknown,
-            "an uncomputable drift (computable but None) must be flagged drift_unknown (WR-01)"
-        );
-        assert!(
-            report.has_actionable_problem(),
-            "uncomputable drift must be actionable — doctor could not verify staleness (WR-01)"
-        );
-        assert!(
-            !report.healthy,
-            "a project whose drift could not be computed is NOT healthy"
-        );
-        assert!(
-            report.summary.actionable_problems >= 1,
-            "the uncomputable drift must contribute to the actionable count"
-        );
-
-        // The human render must NOT imply the project is up to date, and must say so explicitly.
-        let text = report.render_human();
-        assert!(
-            !text.contains("all outputs up to date"),
-            "uncomputable drift must NOT render as a clean 'all outputs up to date':\n{text}"
-        );
-        assert!(
-            text.contains("drift: UNKNOWN") || text.contains("could not compute"),
-            "uncomputable drift must render a distinct 'could not compute' finding:\n{text}"
-        );
-    }
-
-    /// WR-01 boundary: when config is INVALID (or the toolchain is absent), drift is also unavailable,
-    /// but that is ALREADY carried by the lifecycle finding — so `drift_computable = false` and the
-    /// uncomputable-drift flag must stay OFF (no double-counting, no spurious extra finding).
-    #[test]
-    fn unavailable_drift_from_bad_config_does_not_set_drift_unknown() {
-        let report = DoctorReport::assemble(true, &err_config(), true, false, None, false, None);
-        assert!(
-            !report.outputs.drift_unknown,
-            "drift unavailability from an invalid config must NOT set drift_unknown (the config \
-             finding carries it) — avoids double-counting (WR-01)"
-        );
-        // Still actionable (the invalid config), but for the config reason, not a drift_unknown one.
-        assert!(report.has_actionable_problem());
-        assert!(!report.lifecycle.config_valid);
     }
 
     /// `--json` field-set stability (mirrors watch.rs `latency_report_json_field_set`): the serialized
@@ -650,11 +498,9 @@ go_module = "example.com/svc/sdk"
     fn doctor_json_field_set() {
         let report = DoctorReport::assemble(
             true,
-            &ok_config(),
             true,
-            false,
+            true,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
-            true,
             Some(&clean_plan()),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -668,38 +514,29 @@ go_module = "example.com/svc/sdk"
             .collect();
         assert_eq!(keys, expected, "doctor --json field set drifted");
 
-        // `healthy` is a bool and equals the inverse of the exit policy.
         assert_eq!(
             obj["healthy"],
             serde_json::json!(!report.has_actionable_problem())
         );
         assert_eq!(obj["healthy"], serde_json::json!(true));
 
-        // The lifecycle sub-object exposes the four documented facts.
+        // The lifecycle sub-object exposes the documented facts.
         let lifecycle = obj["lifecycle"].as_object().expect("lifecycle object");
         let lkeys: HashSet<&str> = lifecycle.keys().map(String::as_str).collect();
-        let lexpected: HashSet<&str> = [
-            "initialized",
-            "config_valid",
-            "go_toolchain",
-            "inputs_overlap_outputs",
-        ]
-        .into_iter()
-        .collect();
+        let lexpected: HashSet<&str> = ["initialized", "go_toolchain", "pipeline_runs"]
+            .into_iter()
+            .collect();
         assert_eq!(lkeys, lexpected, "lifecycle --json field set drifted");
     }
 
     /// `render_human` emits the three group headers and a trailing verdict line.
     #[test]
     fn render_human_has_group_headers_and_verdict() {
-        // A healthy report.
         let healthy = DoctorReport::assemble(
             true,
-            &ok_config(),
             true,
-            false,
+            true,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
-            true,
             Some(&clean_plan()),
         );
         let text = healthy.render_human();
@@ -718,9 +555,7 @@ go_module = "example.com/svc/sdk"
         );
         assert!(text.contains("healthy"), "missing healthy verdict:\n{text}");
 
-        // An unhealthy report names actionable problems in the verdict.
-        let unhealthy =
-            DoctorReport::assemble(false, &err_config(), false, false, None, false, None);
+        let unhealthy = DoctorReport::assemble(false, false, false, None, None);
         let text = unhealthy.render_human();
         assert!(
             text.contains("actionable problem"),

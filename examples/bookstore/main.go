@@ -1,7 +1,7 @@
 // Command bookstore is a tiny Gin service that gnr8 reads to generate an OpenAPI
 // 3.1 document and a Go SDK. gnr8 derives every fact from the Go code itself
 // (routes, request/response types, status codes, the Genre enum) and takes the
-// base path + security scheme from .gnr8/config.toml.
+// base path + security scheme from the .gnr8/ Rust lifecycle (code, not config).
 package main
 
 import (
@@ -17,7 +17,7 @@ func main() {
 }
 
 // registerRoutes mounts the ONE supported route group at /books. gnr8 records the
-// routes group-relative; the /books prefix comes from config.base_path.
+// routes group-relative; the /books prefix is set in .gnr8/src/main.rs (SetBasePath).
 func registerRoutes(r *gin.Engine) {
 	books := r.Group("/books")
 	{

@@ -69,16 +69,19 @@ The generated Go SDK is a single SDK package shaped as idiomatic Go (D-05):
 - JSON encode / decode of bodies.
 - A **typed API error**.
 
-### 2.4 `.gnr8/` layout (documented now, implemented Phase 4)
+### 2.4 `.gnr8/` layout (now implemented)
 
 The `.gnr8/` project-local workspace is split into two lifecycles (D-06):
 
-- A **checked-in code-as-config** customization directory (code is the configuration; YAML / TOML /
-  JSON is not the main customization surface).
-- A **git-ignored cache / output lifecycle** directory.
+- A **checked-in code-as-config** directory — a small Rust **binary crate** (`Cargo.toml` + `src/main.rs`)
+  that depends on `gnr8-core` and drives generation. **Code is the configuration; there is no TOML / YAML
+  / JSON config file.** `gnr8 init` scaffolds it and `gnr8 generate` compiles + runs it.
+- A **git-ignored cache / output lifecycle** subtree (`.gnr8/target/`, `.gnr8/cache/`).
 
-The detailed customization surface and the code-as-config language are **deferred to Phase 4**. Phase
-1 records only the intended split so the contract is stable.
+The customization surface is the `gnr8_core::sdk` API: a `Pipeline` of `Source` / `Transform` / `Target` /
+`PostProcess` stages, with built-ins for the common cases and user-implemented traits for the rest. See
+[`code-as-config.md`](code-as-config.md) and [`extensibility.md`](extensibility.md) for the full design,
+and `docs/USAGE.md` for the reference.
 
 ---
 

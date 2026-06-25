@@ -2,8 +2,8 @@
 //! round-trip (the phase's hardest acceptance bar — a string snapshot can look correct yet not compile,
 //! RESEARCH Pitfall 3).
 //!
-//! The test (1) builds the graph from the goalservice fixture, (2) generates the SDK via `sdk::generate`
-//! and materializes it through `sdk::write_to_dir` into a UNIQUE temp subdir under
+//! The test (1) builds the graph from the goalservice fixture, (2) generates the SDK via `gosdk::generate`
+//! and materializes it through `gosdk::write_to_dir` into a UNIQUE temp subdir under
 //! `std::env::temp_dir()` (the zero-dependency `std` path — no `tempfile` crate, threat T-03-03-SC),
 //! (3) writes a generated `go.mod` with `module gnr8sdktest` + `go 1.26` and ZERO `require`s so the
 //! build is hermetic and never reaches the module proxy (RESEARCH Pitfall 5 — GOPROXY=off-safe), then
@@ -97,10 +97,10 @@ fn write_go_mod(dir: &Path) {
 fn materialize_sdk() -> PathBuf {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let bundle = gnr8_core::sdk::generate(&graph, "goalservice", "/goal")
+    let bundle = gnr8_core::gosdk::generate(&graph, "goalservice", "/goal")
         .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir("ok");
-    gnr8_core::sdk::write_to_dir(&bundle, &dir)
+    gnr8_core::gosdk::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");
     write_go_mod(&dir);
     dir

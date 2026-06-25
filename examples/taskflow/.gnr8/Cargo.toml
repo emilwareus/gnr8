@@ -1,0 +1,10 @@
+[package]
+name = "taskflow-gnr8-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gnr8-core = { path = "../../../crates/gnr8-core" }
+
+[workspace]

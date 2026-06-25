@@ -5,16 +5,17 @@
 //! re-analysis — D-02): it builds a [`model::OpenApiDoc`] from the [`crate::graph::ApiGraph`] and
 //! serializes it with the deterministic key-ordered writer in [`yaml`].
 //!
-//! ## Resolved Open Question A3 — the absolute base-path prefix (from config)
+//! ## Resolved Open Question A3 — the absolute base-path prefix (from code-as-config)
 //!
 //! The Phase-2 graph stores **group-relative** operation paths (`/`, `/list`, `/{uuid}`) and carries
 //! NO explicit service base path; 02-03 deferred joining the dynamic `"/" + basePath` prefix to
 //! Phase-3 lowering (see `graph::Operation::path`). That prefix is the Gin group argument — often a
-//! *runtime* value the analyzer cannot constant-fold — so it is NOT scraped: it is the user's
-//! `config.base_path` (the single source of truth; CLAUDE.md rules 3 & 4), threaded into
-//! [`to_openapi`] and joined to each operation's group-relative path with slash-collapse. With
-//! `base_path = "/goal"` this yields `/goal/`, `/goal/list`, `/goal/{uuid}` (never `/goal//list` and
-//! never a dropped prefix). A multi-group generalization is deferred (D-02).
+//! *runtime* value the analyzer cannot constant-fold — so it is NOT scraped: it is the graph's
+//! `base_path` (the single source of truth; CLAUDE.md rules 3 & 4), set by a `SetBasePath` transform in
+//! the user's `.gnr8/` pipeline and threaded into [`to_openapi`], joined to each operation's
+//! group-relative path with slash-collapse. With `base_path = "/goal"` this yields `/goal/`,
+//! `/goal/list`, `/goal/{uuid}` (never `/goal//list` and never a dropped prefix). A multi-group
+//! generalization is deferred (D-02).
 //!
 //! ## Diagnostics (OAPI-03)
 //!
@@ -28,8 +29,9 @@
 mod model;
 mod yaml;
 
-use crate::config::SecurityConfig;
-use crate::graph::{ApiGraph, Operation as GraphOp, Schema, SchemaType};
+use crate::graph::{
+    ApiGraph, Operation as GraphOp, Schema, SchemaType, SecurityScheme as GraphSecurityScheme,
+};
 use model::{
     Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
     SchemaObject, SecurityRequirement, SecurityScheme,
@@ -45,26 +47,26 @@ const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document (serialized YAML).
 ///
 /// A pure graph→typed-doc transform (D-02): builds a [`model::OpenApiDoc`] and serializes it via the
-/// deterministic [`yaml::write`] writer. Operation paths are joined with the `base_path` prefix taken
-/// from the user's `gnr8` config (Open Q A3 — the single source of truth for the service prefix,
-/// CLAUDE.md rules 3 & 4); every schema `$ref` is resolved against `graph.schemas` to its bare
+/// deterministic [`yaml::write`] writer. Operation paths are joined with the `base_path` prefix (Open Q
+/// A3 — the single source of truth for the service prefix, set by a `SetBasePath` transform, CLAUDE.md
+/// rules 3 & 4); every schema `$ref` is resolved against `graph.schemas` to its bare
 /// component name. The `security` requirement and `components.securitySchemes` are built ENTIRELY from
-/// `security` (the user's `gnr8` config) — the single source of truth for security (`CLAUDE.md` rule
-/// 4); the graph carries no security facts. The `PoC` policy applies every configured scheme to all
-/// operations (top-level `security`).
+/// `security` (the [`crate::graph::SecurityScheme`]s an `ApplySecurity` transform set on the graph) —
+/// the single source of truth for security (`CLAUDE.md` rule 4); the graph carries no security facts
+/// otherwise. The `PoC` policy applies every scheme to all operations (top-level `security`).
 ///
 /// # Errors
 ///
 /// Returns [`crate::CoreError::Lowering`] when a graph fact cannot be represented — a dangling `$ref`
 /// (a `request_body`/`response.body` whose `ref_id` is not among `graph.schemas`) or an unknown
-/// [`crate::graph::SchemaType`] `kind` — or when a configured security scheme uses an unsupported
-/// `kind`/`location` (so a misconfiguration is a clear error, never a silently dropped scheme). Never
-/// panics and never `unwrap`s (RUST-04 / T-03-01-01).
+/// [`crate::graph::SchemaType`] `kind` — or when a security scheme uses an unsupported `kind`/`location`
+/// (so a misconfiguration is a clear error, never a silently dropped scheme). Never panics and never
+/// `unwrap`s (RUST-04 / T-03-01-01).
 pub fn to_openapi(
     graph: &ApiGraph,
     title: &str,
     base_path: &str,
-    security: &SecurityConfig,
+    security: &[GraphSecurityScheme],
 ) -> Result<String, crate::CoreError> {
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
@@ -96,26 +98,28 @@ pub fn to_openapi(
 }
 
 /// The lowered security: the top-level `security` requirements and the `components.securitySchemes`,
-/// both built from config. Bundled into one struct so the [`build_security`] return type stays simple.
+/// both built from the graph's schemes. Bundled into one struct so the [`build_security`] return type
+/// stays simple.
 struct LoweredSecurity {
-    /// Top-level `security` requirements (one per configured scheme, sorted by id).
+    /// Top-level `security` requirements (one per scheme, sorted by id).
     requirements: Vec<SecurityRequirement>,
     /// `components.securitySchemes` entries, keyed by scheme id, sorted by id.
     schemes: Vec<(String, SecurityScheme)>,
 }
 
-/// Build the top-level `security` requirements + `components.securitySchemes` from the user's config
-/// (the single source of truth for security — CLAUDE.md rule 4). The `PoC` `apply_to_all` policy adds
-/// every configured scheme to the top-level requirement, sorted by scheme id for determinism.
+/// Build the top-level `security` requirements + `components.securitySchemes` from the graph's
+/// [`crate::graph::SecurityScheme`]s (the single source of truth for security — CLAUDE.md rule 4, set
+/// by an `ApplySecurity` transform). The `PoC` `apply_to_all` policy adds every scheme to the top-level
+/// requirement, sorted by scheme id for determinism.
 ///
 /// # Errors
 ///
 /// Returns [`crate::CoreError::Lowering`] for a scheme whose `kind`/`location` the `PoC` does not
-/// support, so an unsupported config is a clear error rather than a silently dropped scheme.
-fn build_security(config: &SecurityConfig) -> Result<LoweredSecurity, crate::CoreError> {
-    // Sort by scheme id so the emitted requirement + schemes are deterministic regardless of config
+/// support, so an unsupported scheme is a clear error rather than a silently dropped one.
+fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, crate::CoreError> {
+    // Sort by scheme id so the emitted requirement + schemes are deterministic regardless of input
     // order (GRAPH-02), and reject a duplicate id rather than silently collapsing one.
-    let mut schemes: Vec<&crate::config::SecurityScheme> = config.schemes.iter().collect();
+    let mut schemes: Vec<&GraphSecurityScheme> = security.iter().collect();
     schemes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut requirements = Vec::with_capacity(schemes.len());
@@ -132,7 +136,10 @@ fn build_security(config: &SecurityConfig) -> Result<LoweredSecurity, crate::Cor
         }
         if components.iter().any(|(id, _)| id == &scheme.id) {
             return Err(crate::CoreError::Lowering {
-                message: format!("duplicate security scheme id '{}' in config", scheme.id),
+                message: format!(
+                    "duplicate security scheme id '{}' (an ApplySecurity transform added it twice)",
+                    scheme.id
+                ),
             });
         }
         requirements.push(SecurityRequirement {
@@ -418,20 +425,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{join_base, to_openapi};
-    use crate::config::{SecurityConfig, SecurityScheme};
-    use crate::graph::ApiGraph;
+    use crate::graph::{ApiGraph, SecurityScheme};
 
-    /// The fixture's security config (the SINGLE source of truth for security — CLAUDE.md rule 4):
-    /// one `ApiKeyAuth` / `X-API-Key` scheme applied to all operations.
-    fn security_config() -> SecurityConfig {
-        SecurityConfig {
-            schemes: vec![SecurityScheme {
-                id: "ApiKeyAuth".to_string(),
-                kind: "apiKey".to_string(),
-                location: "header".to_string(),
-                name: "X-API-Key".to_string(),
-            }],
-        }
+    /// The fixture's security schemes (the SINGLE source of truth for security — CLAUDE.md rule 4):
+    /// one `ApiKeyAuth` / `X-API-Key` scheme applied to all operations. Graph-owned `SecurityScheme`s,
+    /// as an `ApplySecurity` transform would set them.
+    fn security_config() -> Vec<SecurityScheme> {
+        vec![SecurityScheme {
+            id: "ApiKeyAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "X-API-Key".to_string(),
+        }]
     }
 
     /// A facts document covering the cases the mapper must handle (code-first shape — no annotation
@@ -672,13 +677,7 @@ mod tests {
     fn no_security_config_emits_no_security() {
         // With an empty security config the document carries no security — proving security is
         // ENTIRELY config-driven, never derived from the graph (CLAUDE.md rule 4).
-        let yaml = to_openapi(
-            &sample_graph(),
-            "goalservice",
-            "/goal",
-            &SecurityConfig::default(),
-        )
-        .unwrap();
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &[]).unwrap();
         assert!(
             !yaml.contains("ApiKeyAuth"),
             "no scheme without config:\n{yaml}"
@@ -688,14 +687,12 @@ mod tests {
 
     #[test]
     fn unsupported_security_scheme_kind_returns_lowering_error() {
-        let config = SecurityConfig {
-            schemes: vec![SecurityScheme {
-                id: "OAuth".to_string(),
-                kind: "oauth2".to_string(),
-                location: "header".to_string(),
-                name: "Authorization".to_string(),
-            }],
-        };
+        let config = vec![SecurityScheme {
+            id: "OAuth".to_string(),
+            kind: "oauth2".to_string(),
+            location: "header".to_string(),
+            name: "Authorization".to_string(),
+        }];
         let err = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");

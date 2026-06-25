@@ -2,7 +2,8 @@
 //! content-hashing primitive the lifecycle uses for no-op detection (WS-04, D-04, D-05).
 //!
 //! The manifest maps each generated output path → the blake3 content hash gnr8 last wrote there,
-//! with a `source` provenance tag (`"openapi"` | `"sdk"`). It is persisted as
+//! with a `source` provenance tag (currently always `"generated"` — the host owns all artifacts
+//! uniformly post-pivot). It is persisted as
 //! `.gnr8/cache/manifest.json` (git-ignored), with `files` sorted by path so the JSON is a
 //! deterministic, reviewable diff (mirrors the graph's sorted-collection policy, GRAPH-02).
 //!
@@ -25,7 +26,7 @@
 
 // These docs are user-facing prose dense with proper nouns/acronyms (blake3, DefaultHasher, DoS,
 // JSON, ...); backticking them all would hurt readability. Allow `doc_markdown` module-wide
-// (skill ch.2.4, mirrors the scoped allow in config/mod.rs and workspace/mod.rs).
+// (skill ch.2.4, mirrors the scoped allow in workspace/mod.rs).
 #![allow(clippy::doc_markdown)]
 
 use std::path::Path;
@@ -47,14 +48,15 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 }
 
 /// One generated file's ownership record: its project-relative path, the blake3 content hash gnr8
-/// last wrote there, and a `source` provenance tag (`"openapi"` | `"sdk"`).
+/// last wrote there, and a `source` provenance tag (currently always `"generated"`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestEntry {
     /// The project-relative output path (e.g. `"sdk/client.go"`, `"openapi.yaml"`).
     pub path: String,
     /// The blake3 hex digest of the bytes gnr8 last wrote to `path`.
     pub hash: String,
-    /// Generator provenance: `"openapi"` or `"sdk"` (lets `doctor`/diagnostics attribute a file).
+    /// Generator provenance tag. The host writes a single `"generated"` tag for every artifact (it
+    /// owns the child's whole bundle uniformly); reserved for future per-target attribution.
     pub source: String,
 }
 

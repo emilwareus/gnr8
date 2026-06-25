@@ -22,7 +22,16 @@ use crate::analyze::facts::{
 /// The router-agnostic API graph extracted from one analyzed Go module (D-07).
 ///
 /// All collections are sorted by a stable key so serialization is deterministic (GRAPH-02).
-#[derive(Debug, Default, serde::Serialize)]
+///
+/// ## Generation metadata (set by transforms, read by targets)
+///
+/// `base_path`, `title`, and `security` are **not** extracted from the source — they are facts the
+/// typed Go code cannot express (the Gin group prefix is often a runtime value; the title is author
+/// metadata; auth lives in middleware, not handler signatures, CLAUDE.md rule 4). They live on the
+/// graph as plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads,
+/// then passes to the existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`] functions.
+/// They default to a root-mounted, untitled, unsecured API so a bare `build_graph` graph still lowers.
+#[derive(Debug, serde::Serialize)]
 pub struct ApiGraph {
     /// The module path of the analyzed target (e.g. `github.com/acme/svc`).
     pub module: String,
@@ -32,6 +41,60 @@ pub struct ApiGraph {
     pub schemas: Vec<Schema>,
     /// Analysis diagnostics (lossy/unsupported patterns), sorted by `(file, line)`.
     pub diagnostics: Vec<Diagnostic>,
+    /// The API base/mount path joined to every group-relative operation path — set by a transform
+    /// (`SetBasePath`), read by targets. Defaults to `"/"` (a root-mounted service).
+    pub base_path: String,
+    /// The `OpenAPI` document title (`info.title`) — set by a transform (`SetTitle`), read by targets.
+    /// Defaults to `"API"`.
+    pub title: String,
+    /// The API security schemes — set by a transform (`ApplySecurity`), read by targets. The single
+    /// source of truth for the generated `security` requirement + `components.securitySchemes`
+    /// (CLAUDE.md rule 4). Defaults to empty (no security).
+    pub security: Vec<SecurityScheme>,
+}
+
+/// The default API base path (`"/"`, a root-mounted service) used when no transform sets one.
+fn default_base_path() -> String {
+    "/".to_string()
+}
+
+/// The default `OpenAPI` title (`"API"`) used when no transform sets one.
+fn default_title() -> String {
+    "API".to_string()
+}
+
+impl Default for ApiGraph {
+    /// An empty graph with the metadata defaults (`base_path = "/"`, `title = "API"`, no security).
+    fn default() -> Self {
+        Self {
+            module: String::new(),
+            operations: Vec::new(),
+            schemas: Vec::new(),
+            diagnostics: Vec::new(),
+            base_path: default_base_path(),
+            title: default_title(),
+            security: Vec::new(),
+        }
+    }
+}
+
+/// One declared security scheme — graph-owned generation metadata (CLAUDE.md rule 4).
+///
+/// Security cannot be derived from typed Go source (auth lives in middleware), so it is supplied by
+/// the user configuring our engine — an `ApplySecurity` transform pushes one of these onto
+/// [`ApiGraph::security`], and the `OpenAPI` target reads them. This is the public, framework-facing
+/// home for the scheme shape (re-exported via [`crate::sdk::prelude`]); the lowering layer maps it
+/// into the emitted `components.securitySchemes` entry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SecurityScheme {
+    /// The `OpenAPI` scheme id (the key under `components.securitySchemes`, e.g. `"ApiKeyAuth"`).
+    pub id: String,
+    /// The scheme kind (e.g. `"apiKey"`).
+    pub kind: String,
+    /// Where the credential is read from (e.g. `"header"`).
+    pub location: String,
+    /// The credential name (for an `apiKey`/`header` scheme, the header name, e.g. `"X-API-Key"`).
+    pub name: String,
 }
 
 /// One HTTP operation: a method + path template plus its inferred params/body/responses (D-07).
@@ -146,7 +209,10 @@ pub struct SchemaRef {
 }
 
 /// One diagnostic (lossy/unsupported pattern) with a source location (D-10).
-#[derive(Debug, serde::Serialize)]
+///
+/// Derives `Deserialize` as well as `Serialize` so it survives the host↔child JSON boundary inside
+/// an [`crate::runner::ArtifactBundle`] (the host deserializes the child's emitted bundle).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     /// Severity, `"WARN"` or `"ERROR"`.
     pub severity: String,
@@ -225,6 +291,11 @@ impl ApiGraph {
             operations,
             schemas,
             diagnostics,
+            // Generation metadata is not extracted from source — it starts at the defaults and is
+            // set by transforms (SetBasePath / SetTitle / ApplySecurity) before targets read it.
+            base_path: default_base_path(),
+            title: default_title(),
+            security: Vec::new(),
         }
     }
 }
@@ -532,6 +603,21 @@ mod tests {
         }
         // Diagnostic file paths are relativized too.
         assert_eq!(graph.diagnostics[0].file, "goal.go");
+    }
+
+    #[test]
+    fn generation_metadata_starts_at_defaults() {
+        // base_path/title/security are generation metadata, not extracted facts: a freshly built
+        // graph carries the defaults (root-mounted, untitled, unsecured) until a transform sets them.
+        let graph = ApiGraph::from_facts(sample_facts(), "/root");
+        assert_eq!(graph.base_path, "/");
+        assert_eq!(graph.title, "API");
+        assert!(graph.security.is_empty());
+        // The Default impl agrees with the from_facts seeding.
+        let empty = ApiGraph::default();
+        assert_eq!(empty.base_path, "/");
+        assert_eq!(empty.title, "API");
+        assert!(empty.security.is_empty());
     }
 
     #[test]

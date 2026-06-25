@@ -11,11 +11,10 @@ workspace = true
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
-# serde_json deserializes the goextract JSON facts (analyze::facts) and is the source
-# error type for CoreError::FactsParse. Pinned via [workspace.dependencies] (1.0).
+# serde_json deserializes the goextract JSON facts (analyze::facts), serializes the artifact bundle
+# the runner emits / the host parses, and is the source error type for CoreError::FactsParse. Pinned
+# via [workspace.dependencies] (1.0).
 serde_json = { workspace = true }
-# toml parses the checked-in .gnr8/config.toml PoC config surface (config::parse, 04-01).
-toml = { workspace = true }
 # blake3 hashes generated outputs for the ownership manifest + no-op detection (manifest/
 # lifecycle, 04-02). Pinned via [workspace.dependencies] (1.8); a stable, collision-resistant
 # content fingerprint (NOT std DefaultHasher, which is not stable across toolchains — RESEARCH

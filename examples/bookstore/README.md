@@ -5,10 +5,12 @@ Point gnr8 at a plain Gin service and get an **OpenAPI 3.1** document plus a
 
 ```
 examples/bookstore/
-├── main.go            # Gin server: one /books route group + handlers
-├── models.go          # DTOs + the Genre enum
-├── .gnr8/config.toml  # base_path, output paths, security scheme
-└── generated/         # committed output of `gnr8 generate`
+├── main.go              # Gin server: one /books route group + handlers
+├── models.go            # DTOs + the Genre enum
+├── .gnr8/
+│   ├── Cargo.toml       # a tiny binary crate that depends on gnr8-core
+│   └── src/main.rs      # THE CONFIG (in code): base path, title, security, output paths
+└── generated/           # committed output of `gnr8 generate`
     ├── openapi.yaml
     └── sdk/*.go
 ```
@@ -56,6 +58,28 @@ const (
 )
 ```
 
+## The config is code: `.gnr8/src/main.rs`
+
+There is no `config.toml`. The base path, title, security scheme, and output
+paths are all method calls in a small Rust `Pipeline` that gnr8 compiles + runs:
+
+```rust
+use gnr8_core::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8_core::runner::run(
+        Pipeline::new()
+            .source(GoGin::new().inputs(["."]))                 // analyze this Go module
+            .transform(SetBasePath::new("/books"))              // mount path (a runtime value in Gin)
+            .transform(SetTitle::new("Bookstore API"))          // OpenAPI info.title
+            .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key")) // auth (lives in middleware)
+            .target(OpenApi31::new().to("generated/openapi.yaml"))
+            .target(GoSdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))
+            .post(Header::generated()),                         // "DO NOT EDIT" banner on every .go
+    )
+}
+```
+
 ## The command
 
 From this directory:
@@ -64,8 +88,8 @@ From this directory:
 gnr8 generate
 ```
 
-That writes `generated/openapi.yaml` and `generated/sdk/*.go`. Running it again
-over unchanged source is a byte-identical no-op.
+That compiles + runs `.gnr8/`, then writes `generated/openapi.yaml` and
+`generated/sdk/*.go`. Running it again over unchanged source is a byte-identical no-op.
 
 ## The output
 
@@ -122,10 +146,12 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
   codes, and parameters all come from the Go AST and types — never comments.
 - **Code-defined `Genre` enum.** gnr8 reads the `const` set straight from
   `go/types` and emits an OpenAPI string enum.
-- **Security from config.** Auth lives in middleware, not handler signatures, so
-  gnr8 never scrapes it. The `X-API-Key` scheme is declared in
-  `.gnr8/config.toml` — the single source of truth — and flows into both the
-  OpenAPI `securitySchemes` and the SDK's header.
-- **Base path from config.** The Gin group prefix is often a runtime value the
-  analyzer can't see, so `base_path = "/books"` is declared in config and joined
-  to every path in both the spec and the SDK.
+- **Security from config (code).** Auth lives in middleware, not handler
+  signatures, so gnr8 never scrapes it. The `X-API-Key` scheme is set by
+  `ApplySecurity::api_key(...)` in `.gnr8/src/main.rs` — the single source of
+  truth — and flows into both the OpenAPI `securitySchemes` and the SDK's header.
+- **Base path from config (code).** The Gin group prefix is often a runtime value
+  the analyzer can't see, so `SetBasePath::new("/books")` declares it in code, and
+  it is joined to every path in both the spec and the SDK.
+- **No TOML.** `.gnr8/src/main.rs` is the entire configuration surface — built-in
+  stages composed as code. `gnr8 generate` compiles and runs it.

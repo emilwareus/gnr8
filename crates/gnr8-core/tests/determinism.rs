@@ -7,7 +7,7 @@
 //! ⇒ identical output (RESEARCH Pitfall 4 / TARGET-API §5.6 idempotent generation). It complements the
 //! per-rule unit tests in `graph::tests` and the locked `snapshot_*` snapshots.
 //!
-//! Requires the Go toolchain (the tests invoke the helper via `go run`, and `sdk::generate` pipes each
+//! Requires the Go toolchain (the tests invoke the helper via `go run`, and `gosdk::generate` pipes each
 //! file through `gofmt`). They skip gracefully — return early rather than failing — if the toolchain is
 //! unavailable, but on dev + CI (go 1.26) they run.
 
@@ -18,18 +18,16 @@
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
-/// The fixture's security config — the single source of truth for security (CLAUDE.md rule 4): one
+/// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4): one
 /// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so the contract
-/// tests supply it here to drive lowering.
-fn fixture_security() -> gnr8_core::config::SecurityConfig {
-    gnr8_core::config::SecurityConfig {
-        schemes: vec![gnr8_core::config::SecurityScheme {
-            id: "ApiKeyAuth".to_string(),
-            kind: "apiKey".to_string(),
-            location: "header".to_string(),
-            name: "X-API-Key".to_string(),
-        }],
-    }
+/// tests supply it here to drive lowering (graph-owned `SecurityScheme`s).
+fn fixture_security() -> Vec<gnr8_core::graph::SecurityScheme> {
+    vec![gnr8_core::graph::SecurityScheme {
+        id: "ApiKeyAuth".to_string(),
+        kind: "apiKey".to_string(),
+        location: "header".to_string(),
+        name: "X-API-Key".to_string(),
+    }]
 }
 
 #[test]
@@ -87,9 +85,9 @@ fn sdk_generate_is_byte_identical_across_two_runs() {
 
     // Build the graph twice AND generate twice — proving the SDK emission (gofmt'd, file-marker-framed)
     // is byte-identical end-to-end (idempotent SDK generation).
-    let a = gnr8_core::sdk::generate(&first, "goalservice", "/goal")
+    let a = gnr8_core::gosdk::generate(&first, "goalservice", "/goal")
         .expect("first sdk::generate must succeed (requires gofmt)");
-    let b = gnr8_core::sdk::generate(&second, "goalservice", "/goal")
+    let b = gnr8_core::gosdk::generate(&second, "goalservice", "/goal")
         .expect("second sdk::generate must succeed (requires gofmt)");
 
     assert_eq!(

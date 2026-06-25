@@ -119,16 +119,17 @@ pub enum CoreError {
         message: String,
     },
 
-    /// A `.gnr8/config.toml` could not be read or parsed into the typed [`crate::config::Config`]
-    /// (Phase 4 / WS-03, D-03).
+    /// A configuration fact the user's `.gnr8/` pipeline (code-as-config) expressed is invalid or
+    /// internally inconsistent.
     ///
-    /// Raised by [`crate::config::parse`]/[`crate::config::load`] for a missing/unreadable config
-    /// file or malformed/typo'd TOML. `#[serde(deny_unknown_fields)]` makes an unrecognized key a
-    /// clean typed error here rather than a silent mis-generation (V5 / T-04-01-02, T-04-01-03).
-    /// Carries the owned `message`; never a panic.
+    /// Configuration is now CODE, not TOML — there is no config file to parse. This variant covers the
+    /// pipeline-level "your composition cannot proceed" cases that surface from the SDK seams: a source
+    /// with no (or several) input dirs, a target missing its output path/module, or a naming-override
+    /// rename that would collide/collapse/chain (which would silently mis-generate, so it fails loud
+    /// here instead). Carries the owned `message`; never a panic.
     #[error("config error: {message}")]
     Config {
-        /// Human-readable failure detail (the toml parse error or an actionable hint).
+        /// Human-readable failure detail (the offending pipeline value or an actionable hint).
         message: String,
     },
 
@@ -153,6 +154,20 @@ pub enum CoreError {
     #[error("io error: {message}")]
     Io {
         /// Human-readable failure detail naming the offending operation/path.
+        message: String,
+    },
+
+    /// Running the user's `.gnr8/` generation crate (the code-as-config child process) failed.
+    ///
+    /// The host runs the child via `cargo run --manifest-path .gnr8/Cargo.toml -- <subcommand>`; this
+    /// variant carries a categorized, actionable message for the failure modes that surface there: the
+    /// `.gnr8/` workspace is missing (run `gnr8 init`), `cargo` is not installed, the user's pipeline
+    /// code does not compile, or the child exited non-zero / emitted output the host cannot parse. The
+    /// child's own stderr is folded into `message` so the user sees the compiler/runtime error directly.
+    /// Never a panic (RUST-04).
+    #[error("{message}")]
+    ChildRun {
+        /// The categorized, actionable failure detail (including the child's stderr where relevant).
         message: String,
     },
 }
@@ -249,7 +264,7 @@ mod tests {
         #[test]
         fn workspace_renders_with_message() {
             let err = CoreError::Workspace {
-                message: "failed to write /tmp/proj/.gnr8/config.toml: permission denied"
+                message: "failed to write /tmp/proj/.gnr8/src/main.rs: permission denied"
                     .to_string(),
             };
             let msg = err.to_string();

@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info:
+  title: Taskflow API
+  version: 0.1.0
+security:
+  - ApiKeyAuth: []
+paths:
+  '/tasks/':
+    get:
+      operationId: listTasks
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskList'
+    post:
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          description: Response 400
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  '/tasks/{id}':
+    get:
+      operationId: getTask
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Response 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      operationId: updateTask
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTaskRequest'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Response 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      operationId: deleteTask
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    Assignee:
+      type: object
+      properties:
+        email:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+    CreateTaskRequest:
+      type: object
+      required: [status, title]
+      properties:
+        assignee:
+          $ref: '#/components/schemas/Assignee'
+        dueAt:
+          type: string
+          format: date-time
+        labels:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+        priority:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/Status'
+        title:
+          type: string
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    Status:
+      type: string
+      enum: [done, in_progress, open]
+    Task:
+      type: object
+      properties:
+        assignee:
+          $ref: '#/components/schemas/Assignee'
+        dueAt:
+          type: string
+          format: date-time
+        id:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+        priority:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/Status'
+        title:
+          type: string
+    TaskList:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+    UpdateTaskRequest:
+      type: object
+      properties:
+        labels:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+        priority:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/Status'
+        title:
+          type: string

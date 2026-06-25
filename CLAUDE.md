@@ -45,13 +45,21 @@ comes from the user's config (rule 4) — it is never "filled in" by a fallback.
 ## 4. What the source can't express comes from user code-as-config — never from scraping
 
 Some facts are genuinely not present in typed source (e.g. security schemes — auth lives in middleware,
-not handler signatures). Those are provided by **the user configuring our engine** (ideally in code they
-write to drive gnr8), **not** by scraping another tool's annotations or output. Examples that MUST come
-from config, not inference:
+not handler signatures). Those are provided by **the user configuring our engine in code they write to
+drive gnr8** (the `.gnr8/` crate, below), **not** by scraping another tool's annotations or output.
+Examples that MUST come from config, not inference:
 - security schemes and which operations they apply to
 - any cross-cutting metadata the handler/types don't carry
 
 The config surface is part of *our* product. Other tools' annotations are not.
+
+**The config surface is code, never a data file.** Configuration is a Rust **binary crate** at `.gnr8/`
+that depends on `gnr8-core` and composes a `Pipeline` of `Source`/`Transform`/`Target`/`PostProcess`
+stages. There is **no TOML/YAML/JSON config file** — every setting is a method call, and anything the
+built-ins can't express is ordinary Rust the user writes (a custom stage). `gnr8 init` **always**
+scaffolds this crate; the tool does not run without it — adapting that code *is* the product. Extension
+is **compile-time** (the host `cargo run`s the user's crate, which links `gnr8-core`); there is no
+dynamic plugin runtime, FFI, or macro-heavy config DSL.
 
 ---
 
@@ -63,9 +71,10 @@ This codebase was bootstrapped before these rules were locked. The following **v
 - **Go (`goextract/`):** `golang.org/x/tools/go/packages` (+ `golang.org/x/mod`, `golang.org/x/sync`).
   Target: load/typecheck Go using **stdlib only** (`go/parser`, `go/types`, `go/token`, `go/importer`,
   `go/build`) — own the package/module resolution ourselves.
-- **Rust (`crates/`):** `serde`, `serde_json`, `clap`, `thiserror`, `anyhow`, `toml`, `blake3`,
+- **Rust (`crates/`):** `serde`, `serde_json`, `clap`, `thiserror`, `anyhow`, `blake3`,
   `notify-debouncer-full`, `ctrlc`, `insta` (dev). Target: hand-rolled JSON/YAML, arg parsing, error
-  types, config parsing, hashing, file-watching, and snapshot testing — in-repo.
+  types, hashing, file-watching, and snapshot testing — in-repo. (`toml` is already gone — config is
+  code now, not a data file; see rule 4.)
 
 When you touch a file that uses one of these, prefer replacing the usage with owned code over extending
 it. Never add a new one.
@@ -75,7 +84,8 @@ it. Never add a new one.
 ## Other standing constraints (from PROJECT.md, still in force)
 
 - Internal API graph is the source of truth; OpenAPI/SDK are **artifacts** generated from it.
-- Code-first extraction; the user's engine config is the only escape hatch (see rule 4).
-- No dynamic plugin runtime, no macro-heavy config API, no graph database.
+- Code-first extraction; the user's engine config — the `.gnr8/` Rust crate, never a data file — is the
+  only escape hatch (see rule 4).
+- No dynamic plugin runtime, no macro-heavy config API, no graph database; extension is compile-time only.
 - Typed library errors; no production `unwrap`/`expect`/`panic`; deterministic, sorted output
   (identical input ⇒ byte-identical output).

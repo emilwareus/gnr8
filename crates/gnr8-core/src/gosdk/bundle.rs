@@ -1,6 +1,6 @@
 //! The multi-file SDK bundle and its deterministic file-marker framing (D-06).
 //!
-//! `sdk::generate` returns a single `String` so the `snapshot_sdk` contract test can lock the whole SDK
+//! `gosdk::generate` returns a single `String` so the `snapshot_sdk` contract test can lock the whole SDK
 //! in one reviewable artifact. To keep that String unambiguous and round-trippable, each generated Go
 //! file is framed by a stable, greppable marker line:
 //!

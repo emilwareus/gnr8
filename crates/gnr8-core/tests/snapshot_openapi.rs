@@ -17,18 +17,17 @@
 /// The Go Gin fixture authored in Plan 01-02, resolved relative to this crate's manifest dir.
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
-/// The fixture's security config — the single source of truth for security (CLAUDE.md rule 4): one
+/// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4): one
 /// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so this contract
-/// test supplies it to drive lowering, and the snapshot still carries `ApiKeyAuth` from CONFIG.
-fn fixture_security() -> gnr8_core::config::SecurityConfig {
-    gnr8_core::config::SecurityConfig {
-        schemes: vec![gnr8_core::config::SecurityScheme {
-            id: "ApiKeyAuth".to_string(),
-            kind: "apiKey".to_string(),
-            location: "header".to_string(),
-            name: "X-API-Key".to_string(),
-        }],
-    }
+/// test supplies it to drive lowering (graph-owned `SecurityScheme`s, as an `ApplySecurity` transform
+/// would set them), and the snapshot still carries `ApiKeyAuth` from code-as-config.
+fn fixture_security() -> Vec<gnr8_core::graph::SecurityScheme> {
+    vec![gnr8_core::graph::SecurityScheme {
+        id: "ApiKeyAuth".to_string(),
+        kind: "apiKey".to_string(),
+        location: "header".to_string(),
+        name: "X-API-Key".to_string(),
+    }]
 }
 
 #[test]

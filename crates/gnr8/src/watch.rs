@@ -7,27 +7,30 @@
 //! - The PURE decision — [`is_trigger_path`] / [`batch_should_regenerate`] — answers "should this
 //!   changed path trigger a regeneration?" with NO watcher and NO I/O, so the loop-safety guarantee
 //!   (WATCH-02) is proven by fast, non-flaky unit tests rather than timing-dependent integration runs.
-//! - The thin I/O SHELL — [`run`] — owns the `notify-debouncer-full` debouncer, the source-dir-only
-//!   watch (the primary loop defense), the `Instant` latency timing, and the std `AtomicBool` Ctrl-C
-//!   shutdown. It never panics: a `notify` error is logged and the loop continues (RESEARCH Pitfall 1,
-//!   threat T-04-03-03).
+//! - The thin I/O SHELL — [`run`] — owns the `notify-debouncer-full` debouncer, the recursive
+//!   project-root watch, the `Instant` latency timing, and the std `AtomicBool` Ctrl-C shutdown. It
+//!   never panics: a `notify` error is logged and the loop continues (RESEARCH Pitfall 1).
 //!
-//! ## Loop safety (WATCH-02, threat T-04-03-01)
+//! ## What triggers a regeneration
 //!
-//! `notify` has NO built-in "ignore my own writes". gnr8's two-layer defense:
+//! Config is now CODE in `.gnr8/src/`, so watch covers BOTH the project's Go sources AND the pipeline
+//! crate itself:
 //!
-//! 1. **watch SOURCE dirs only**, never the configured output dirs (primary — `run` only calls
-//!    `debouncer.watch` on `config.inputs`);
-//! 2. **drop output-path events** in the pure filter (belt-and-braces — a user may configure outputs
-//!    *inside* a watched source tree, RESEARCH Pitfall 6).
+//! 1. a `*.go` source edit anywhere under the project root that is NOT under `.gnr8/` and NOT a
+//!    manifest-recorded gnr8 output (a real API change), OR
+//! 2. a `*.rs` edit under `.gnr8/src/` (the user changed the pipeline — recompile + re-run it).
 //!
-//! A debounced batch triggers a regeneration only if it contains at least one `*.go` source path that
-//! is NOT under any output path. gnr8's own writes (the OpenAPI file + every SDK file) are output paths,
-//! so they are filtered out and never re-trigger — the watch loop cannot loop.
+//! ## Loop safety (WATCH-02)
+//!
+//! `notify` has NO built-in "ignore my own writes". gnr8's defense: drop every event whose path is one
+//! of gnr8's OWN generated outputs (the manifest-recorded paths) or lives under `.gnr8/target` /
+//! `.gnr8/cache` (the generation crate's build output + lifecycle state). A debounced batch triggers a
+//! regeneration only if it contains at least one qualifying source/pipeline edit — gnr8's own writes are
+//! filtered out, so the watch loop cannot loop.
 
-// These module/item docs are dense with proper nouns/acronyms (OpenAPI, FSEvents, SDK, Ctrl-C, ...);
+// These module/item docs are dense with proper nouns/acronyms (OpenAPI, FSEvents, Ctrl-C, ...);
 // backticking them would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4; mirrors the
-// scoped allow in gnr8/src/cli.rs + gnr8-core/src/config/mod.rs).
+// scoped allow in gnr8/src/cli.rs).
 #![allow(clippy::doc_markdown)]
 
 use std::collections::HashSet;
@@ -38,23 +41,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use gnr8_core::config::Config;
-use gnr8_core::lifecycle::{self, GenerateOutcome};
+use gnr8_core::lifecycle::GenerateOutcome;
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+
+use crate::child;
 
 /// One regeneration's latency + counts — the `--json` shape for WATCH-03.
 ///
 /// `scenario` is one of `"cold"` / `"single-file-edit"` / `"multi-file-edit"`; `millis` is the
-/// wall-clock duration of the `regenerate` call; `written`/`unchanged` are the per-bucket counts. The
-/// label is derived from the distinct trigger count, so a coalesced multi-file batch is NOT mislabeled
-/// `single-file-edit` (WR-03). The same struct renders both the human line and (under `--json`) a
-/// machine-readable record.
+/// wall-clock duration of the regeneration; `written`/`unchanged` are the per-bucket counts. The same
+/// struct renders both the human line and (under `--json`) a machine-readable record.
 #[derive(Debug, serde::Serialize)]
 struct LatencyReport {
     /// Which WATCH-03 scenario this measurement is: `cold` | `single-file-edit` | `multi-file-edit`.
     scenario: String,
-    /// Wall-clock milliseconds the `regenerate` call took (`Instant::elapsed`).
+    /// Wall-clock milliseconds the regeneration took (`Instant::elapsed`).
     millis: u128,
     /// Number of files written this regeneration.
     written: usize,
@@ -84,43 +86,52 @@ impl LatencyReport {
 
 /// Whether a single changed path should TRIGGER a regeneration (PURE — no watcher, no I/O).
 ///
-/// `true` only when the path is a `*.go` source file that is NOT under any configured output path.
-/// An output-path event (gnr8's own write) returns `false` — the loop-safety core of WATCH-02. A
-/// non-`.go` file (e.g. `README.md`) returns `false`. This is unit-tested directly without a watcher.
+/// `true` when EITHER the path is a `*.go` source file that is NOT a gnr8 output and NOT under `.gnr8/`
+/// (a real API change), OR it is a `*.rs` file under `gnr8_src` (the pipeline crate's source — the user
+/// edited the config). `output_set` holds gnr8's own outputs + the `.gnr8/target`/`.gnr8/cache` dirs;
+/// anything under one of those is gnr8's own write and returns `false` — the loop-safety core of
+/// WATCH-02. Unit-tested directly without a watcher.
 #[must_use]
-fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
-    // Layer 2 of loop defense: drop anything under (or equal to) a configured output path so gnr8's
-    // OWN writes never trigger regeneration, even if outputs sit inside a watched source tree.
+fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>, gnr8_src: &Path) -> bool {
+    // A pipeline-source edit (`.gnr8/src/**.rs`) always triggers — recompile + re-run the pipeline.
+    if path.starts_with(gnr8_src) && path.extension().is_some_and(|ext| ext == "rs") {
+        return true;
+    }
+    // Otherwise: drop gnr8's own writes (outputs + the generation crate's build/cache dirs).
     if is_under_any_output(path, output_set) {
         return false;
     }
-    // Only supported Go source edits drive work.
+    // Only Go source edits outside `.gnr8/` drive an API-change regeneration.
     path.extension().is_some_and(|ext| ext == "go")
 }
 
 /// Whether a debounced BATCH of changed paths should trigger a regeneration (PURE).
 ///
-/// `true` if ANY path is a trigger ([`is_trigger_path`]). A mixed batch containing both an output-path
-/// event and a source `*.go` event triggers — the source edit wins, the output write is ignored.
+/// `true` if ANY path is a trigger ([`is_trigger_path`]).
 #[must_use]
-fn batch_should_regenerate(paths: &[PathBuf], output_set: &HashSet<PathBuf>) -> bool {
-    paths.iter().any(|p| is_trigger_path(p, output_set))
+fn batch_should_regenerate(
+    paths: &[PathBuf],
+    output_set: &HashSet<PathBuf>,
+    gnr8_src: &Path,
+) -> bool {
+    paths
+        .iter()
+        .any(|p| is_trigger_path(p, output_set, gnr8_src))
 }
 
 /// Count the DISTINCT trigger paths in a debounced batch (PURE) — the input to the WATCH-03 scenario
 /// label so the `--json` record does not over-claim `single-file-edit` for a multi-file batch (WR-03).
 #[must_use]
-fn count_trigger_paths(paths: &[PathBuf], output_set: &HashSet<PathBuf>) -> usize {
+fn count_trigger_paths(paths: &[PathBuf], output_set: &HashSet<PathBuf>, gnr8_src: &Path) -> usize {
     paths
         .iter()
-        .filter(|p| is_trigger_path(p, output_set))
+        .filter(|p| is_trigger_path(p, output_set, gnr8_src))
         .collect::<HashSet<_>>()
         .len()
 }
 
-/// Derive the WATCH-03 scenario label from the number of distinct source files that triggered the
-/// regeneration (WR-03). Exactly one ⇒ `single-file-edit`; more (a multi-file edit or coalesced burst)
-/// ⇒ `multi-file-edit`, so downstream latency tooling never reads a coalesced batch as a single edit.
+/// Derive the WATCH-03 scenario label from the number of distinct files that triggered the
+/// regeneration (WR-03). Exactly one ⇒ `single-file-edit`; more ⇒ `multi-file-edit`.
 #[must_use]
 fn scenario_for_trigger_count(triggers: usize) -> &'static str {
     if triggers <= 1 {
@@ -142,22 +153,13 @@ fn is_under_any_output(path: &Path, output_set: &HashSet<PathBuf>) -> bool {
 /// This MATTERS for loop safety: on macOS, `notify`/FSEvents reports the CANONICAL path
 /// (`/private/var/...`) while a project root under `std::env::temp_dir()` is the non-canonical
 /// `/var/...`. Without canonicalizing BOTH the output set and each incoming event path, a `starts_with`
-/// comparison silently fails and gnr8's own writes would re-trigger regeneration (a WATCH-02 loop). We
-/// canonicalize once when building the output set and once per event before the pure filter runs.
-///
-/// A DELETE/RENAME event names a leaf that no longer exists, so `canonicalize` fails on the full path
-/// (WR-01). Plain fallback-to-raw then leaves a non-canonical `/var/.../sdk/client.go` that does NOT
-/// match the canonical `/private/.../sdk` in the output set, so a delete/rename of one of gnr8's OWN
-/// outputs would slip the filter and fire a spurious regen. To close that, when the leaf is gone we
-/// canonicalize the nearest EXISTING ancestor and re-append the missing tail, so a just-deleted output
-/// still resolves UNDER the canonical output dir and stays filtered — covering delete/rename event
-/// kinds too, not only create/modify.
+/// comparison silently fails. A DELETE/RENAME event names a leaf that no longer exists, so the full-path
+/// `canonicalize` fails; we then canonicalize the nearest EXISTING ancestor and re-append the missing
+/// tail, so a just-deleted output still resolves UNDER the canonical output dir and stays filtered.
 fn canonicalize_or_keep(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }
-    // The leaf is gone (delete/rename): walk up to the nearest existing ancestor, canonicalize it,
-    // then re-append the components below it so the result is still under the canonical output dir.
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut current = path;
     while let (Some(parent), Some(name)) = (current.parent(), current.file_name()) {
@@ -174,26 +176,21 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Build the absolute, CANONICALIZED output-path set the filter drops: the configured OpenAPI file, the
-/// SDK dir, and every path the manifest records as gnr8-owned. Resolved against `project_root` and
-/// canonicalized so the comparison matches the canonical paths `notify` reports (macOS `/private/...`
-/// vs `/...`). Missing/corrupt manifest degrades to the config-derived set (loop safety never depends
-/// on a readable manifest).
-fn build_output_set(project_root: &Path, config: &Config) -> HashSet<PathBuf> {
+/// Build the absolute, CANONICALIZED set of paths the filter drops as gnr8's OWN writes: the
+/// `.gnr8/target` + `.gnr8/cache` dirs (the generation crate's build output + lifecycle state) and
+/// every path the manifest records as gnr8-owned (the exact files gnr8 last wrote). Resolved against
+/// `project_root` and canonicalized so the comparison matches the canonical paths `notify` reports
+/// (macOS `/private/...` vs `/...`). A missing/corrupt manifest degrades to just the two dirs (loop
+/// safety never depends on a readable manifest).
+fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
     let mut set: HashSet<PathBuf> = HashSet::new();
-    // The two configured output anchors (D-02): the OpenAPI artifact + the whole SDK directory. The
-    // SDK dir is added as a prefix so EVERY generated SDK file under it is filtered with one entry.
-    set.insert(canonicalize_or_keep(
-        &project_root.join(&config.output.openapi),
-    ));
-    set.insert(canonicalize_or_keep(
-        &project_root.join(config.output.sdk_dir.trim_end_matches('/')),
-    ));
+    let gnr8 = project_root.join(".gnr8");
+    set.insert(canonicalize_or_keep(&gnr8.join("target")));
+    set.insert(canonicalize_or_keep(&gnr8.join("cache")));
 
-    // Belt-and-braces: also fold in every manifest-recorded path (the exact files gnr8 last wrote).
-    // The manifest lives under `.gnr8/`; absent/corrupt → empty default (no panic), so loop safety
-    // still holds via the config anchors above.
-    if let Ok(manifest) = gnr8_core::manifest::load(&project_root.join(".gnr8")) {
+    // Fold in every manifest-recorded output path (the exact files gnr8 last wrote). The manifest lives
+    // under `.gnr8/`; absent/corrupt → the two dirs above still hold the loop-safety floor (no panic).
+    if let Ok(manifest) = gnr8_core::manifest::load(&gnr8) {
         for entry in &manifest.files {
             set.insert(canonicalize_or_keep(&project_root.join(&entry.path)));
         }
@@ -203,79 +200,55 @@ fn build_output_set(project_root: &Path, config: &Config) -> HashSet<PathBuf> {
 
 /// Run the debounced, loop-safe watch loop until Ctrl-C (the I/O shell — WATCH-02 / WATCH-03).
 ///
-/// Watches the configured SOURCE input dir(s) recursively (NEVER the output dirs — the primary loop
-/// defense), debounces bursts into a single coalesced signal, and on each signal times a
-/// [`lifecycle::regenerate`] call, printing a latency line (human, or a [`LatencyReport`] under `json`).
-/// A `notify` error in a batch is logged to stderr and the loop CONTINUES — it never panics
-/// (T-04-03-03).
+/// Watches the project root recursively, debounces bursts into a single coalesced signal, and on each
+/// qualifying signal times one regeneration (run the child pipeline → write), printing a latency line
+/// (human, or a [`LatencyReport`] under `json`). A `notify` error in a batch is logged to stderr and the
+/// loop CONTINUES — it never panics.
 ///
-/// ## Shutdown (W4 / A5 — `AtomicBool` stop flag set by a Ctrl-C handler)
+/// ## Shutdown (`AtomicBool` stop flag set by a Ctrl-C handler)
 ///
 /// The foreground loop runs while a shared `AtomicBool` is false and observes it via `recv_timeout`
 /// ticks; it also exits on the debouncer's mpsc channel disconnect. A `ctrlc::set_handler` flips the
-/// flag on SIGINT (the loop wakes on the next tick and returns `Ok(())` cleanly, dropping the debouncer
-/// so the watcher stops — no orphan, no panic).
-///
-/// The pure-std approach (rely on the OS default SIGINT disposition) was tried first per A5/W4 and
-/// proved INSUFFICIENT: the macOS FSEvents backend's run loop suppresses the default disposition, so an
-/// interactive Ctrl-C did NOT terminate the process. `unsafe_code = "forbid"` rules out a hand-rolled
-/// signal handler, so the RESEARCH-sanctioned fallback (`ctrlc`, pre-approved in the legitimacy audit)
-/// is used — the choice is documented in the SUMMARY. The handler only flips an `AtomicBool`; the flag
-/// is NOT tied to stdin, so `gnr8 watch` runs fine backgrounded / in a pipe.
+/// flag on SIGINT. The pure-std approach proved insufficient (the macOS FSEvents run loop suppresses the
+/// default SIGINT disposition), so the RESEARCH-sanctioned `ctrlc` fallback is used; the handler only
+/// flips an `AtomicBool`, so `gnr8 watch` runs fine backgrounded / in a pipe.
 ///
 /// # Errors
 ///
 /// Returns an error if the Ctrl-C handler cannot be installed, the debouncer cannot be created, or the
-/// source dir cannot be watched. Per-batch `regenerate` errors are logged and the loop continues (a
-/// transient pipeline error must not kill a long-running watch).
-pub(crate) fn run(
-    project_root: &Path,
-    config: &Config,
-    debounce: Duration,
-    json: bool,
-) -> anyhow::Result<()> {
-    let output_set = build_output_set(project_root, config);
+/// project root cannot be watched. Per-batch regeneration errors are logged and the loop continues.
+pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow::Result<()> {
+    let output_set = build_output_set(project_root);
+    let gnr8_src = canonicalize_or_keep(&project_root.join(".gnr8").join("src"));
 
-    // The coalesced "a source file changed → regenerate" channel. The debouncer callback (a separate
-    // thread) sends the count of DISTINCT source files that triggered (WR-03 — so the scenario label
-    // can distinguish a single-file edit from a multi-file/coalesced batch); the main loop receives.
-    // A single debounced batch sends at most one signal.
+    // The coalesced "a source/pipeline file changed → regenerate" channel. The debouncer callback (a
+    // separate thread) sends the count of DISTINCT files that triggered (WR-03); the main loop receives.
     let (tx, rx) = mpsc::channel::<usize>();
 
-    // The in-process shutdown flag (W4): the receive loop runs while it is false and observes it via
-    // recv_timeout ticks. Set by the Ctrl-C handler (below) and on channel disconnect. NOT tied to
-    // stdin, so a backgrounded / piped `gnr8 watch` runs fine.
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = Arc::clone(&stop);
-        // Flip the flag on SIGINT so the foreground loop exits cleanly (W4 / A5 fallback — the default
-        // disposition is suppressed by the FSEvents run loop). The handler does the minimum: a single
-        // atomic store, no allocation/I-O.
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
             .context("failed to install the Ctrl-C handler")?;
     }
 
     let filter_set = output_set.clone();
+    let filter_src = gnr8_src.clone();
     let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
         match result {
             Ok(events) => {
-                // Flatten every changed path in the debounced batch, CANONICALIZE each (so it matches
-                // the canonicalized output set — macOS `/private/...` vs `/...`, the loop-safety fix),
-                // then apply the PURE filter. A batch that touches only output paths (gnr8's own writes)
-                // sends NOTHING → loop-safe.
+                // Flatten + CANONICALIZE every changed path in the batch (so it matches the canonicalized
+                // output set), then apply the PURE filter. A batch touching only gnr8's own writes sends
+                // NOTHING → loop-safe.
                 let paths: Vec<PathBuf> = events
                     .iter()
                     .flat_map(|ev| ev.paths.iter())
                     .map(|p| canonicalize_or_keep(p))
                     .collect();
-                if batch_should_regenerate(&paths, &filter_set) {
-                    // Coalesce: one signal per qualifying batch, carrying the distinct trigger count
-                    // (WR-03) so the scenario label can tell a single-file edit from a multi-file
-                    // batch. A closed receiver (loop exiting) is a benign send error — ignore it.
-                    let _ = tx.send(count_trigger_paths(&paths, &filter_set));
+                if batch_should_regenerate(&paths, &filter_set, &filter_src) {
+                    let _ = tx.send(count_trigger_paths(&paths, &filter_set, &filter_src));
                 }
             }
-            // A watcher error must NOT kill the loop (T-04-03-03): log and keep watching.
             Err(errors) => {
                 for err in errors {
                     eprintln!("watch: notify error (continuing): {err}");
@@ -285,60 +258,55 @@ pub(crate) fn run(
     })
     .context("failed to create the file-system debouncer")?;
 
-    // Watch the configured SOURCE dirs only — NEVER output dirs (primary loop defense, WATCH-02). At
-    // least one input is guaranteed by config validation in `regenerate`; watch each that exists.
-    for input in &config.inputs {
-        let dir = project_root.join(input);
-        debouncer
-            .watch(&dir, RecursiveMode::Recursive)
-            .with_context(|| format!("failed to watch source dir {}", dir.display()))?;
-    }
+    // Watch the WHOLE project root recursively — the Go sources and `.gnr8/src/` both live under it; the
+    // pure filter (not the watch scope) is what excludes gnr8's own writes, so a single recursive watch
+    // is correct and simple. (`.gnr8/target` churns during a child build but is filtered out.)
+    debouncer
+        .watch(project_root, RecursiveMode::Recursive)
+        .with_context(|| format!("failed to watch project root {}", project_root.display()))?;
 
-    // The receive loop. recv_timeout wakes periodically so the stop flag is observed promptly even when
-    // no events arrive. On a signal: time one regeneration and print the latency line.
     let poll = Duration::from_millis(200);
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(poll) {
             Ok(first) => {
-                // Drain any extra signals that piled up so a burst of debounced batches collapses into
-                // a single regeneration (further coalescing on top of the debouncer), summing the
-                // distinct trigger counts so a coalesced burst is labeled multi-file, not single (WR-03).
+                // Drain any extra signals that piled up so a burst collapses into a single regeneration,
+                // summing distinct trigger counts so a coalesced burst is labeled multi-file (WR-03).
                 let mut triggers = first;
                 while let Ok(more) = rx.try_recv() {
                     triggers += more;
                 }
-                regenerate_and_report(
-                    scenario_for_trigger_count(triggers),
-                    project_root,
-                    config,
-                    json,
-                );
+                regenerate_and_report(scenario_for_trigger_count(triggers), project_root, json);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {} // tick — re-check the stop flag.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The debouncer's sender was dropped → no more events can arrive → exit cleanly.
                 stop.store(true, Ordering::Relaxed);
             }
         }
     }
 
-    // Dropping `debouncer` here stops the watcher thread cleanly (no orphaned watcher, T-04-03 lifecycle).
     drop(debouncer);
-    // A human status line only; under `--json` the stream stays pure latency records (no stray text).
     if !json {
         println!("watch: stopped.");
     }
     Ok(())
 }
 
-/// Time one [`lifecycle::regenerate`] and print its latency line (human or `--json`). A regeneration
-/// error is logged to stderr and the loop continues (a transient pipeline failure must not kill watch).
-fn regenerate_and_report(scenario: &str, project_root: &Path, config: &Config, json: bool) {
+/// Run the child pipeline once and apply the write machinery, returning the [`GenerateOutcome`].
+///
+/// The single regeneration path shared by the cold run and each watch tick: `child::run_child(__emit)`
+/// then `lifecycle::regenerate`. Errors propagate as a typed `CoreError` for the caller to log/surface.
+fn regenerate_once(project_root: &Path) -> Result<GenerateOutcome, gnr8_core::CoreError> {
+    let bundle = child::run_child(project_root, "__emit")?;
+    gnr8_core::lifecycle::regenerate(project_root, &bundle.artifacts, false)
+}
+
+/// Time one regeneration and print its latency line (human or `--json`). A regeneration error is logged
+/// to stderr and the loop continues (a transient pipeline failure must not kill a long-running watch).
+fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool) {
     let t0 = Instant::now();
-    match lifecycle::regenerate(project_root, config, false) {
+    match regenerate_once(project_root) {
         Ok(outcome) => {
             let elapsed = t0.elapsed();
-            // Surface protected (user-edited) files so the "no silent clobber" guarantee stays visible.
             for path in &outcome.skipped {
                 eprintln!(
                     "warning: {path} was hand-edited since gnr8 last wrote it — skipped (use `gnr8 generate --force` to overwrite)"
@@ -368,16 +336,12 @@ fn print_report(report: &LatencyReport, json: bool) {
 ///
 /// # Errors
 ///
-/// Propagates a `regenerate` error (e.g. missing Go toolchain) so startup fails loudly via the anyhow
-/// boundary rather than entering a watch loop with stale/absent outputs.
-pub(crate) fn cold_regenerate(
-    project_root: &Path,
-    config: &Config,
-    json: bool,
-) -> anyhow::Result<()> {
+/// Propagates a regeneration error (missing `.gnr8/`, a pipeline compile/run error, a missing Go
+/// toolchain) so startup fails loudly via the anyhow boundary rather than entering a watch loop with
+/// stale/absent outputs.
+pub(crate) fn cold_regenerate(project_root: &Path, json: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    let outcome = lifecycle::regenerate(project_root, config, false)
-        .context("initial (cold) regeneration failed")?;
+    let outcome = regenerate_once(project_root).context("initial (cold) regeneration failed")?;
     let elapsed = t0.elapsed();
     for path in &outcome.skipped {
         eprintln!(
@@ -400,80 +364,119 @@ mod tests {
         is_under_any_output, scenario_for_trigger_count, GenerateOutcome, LatencyReport,
     };
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    /// The output set used across the pure-filter tests: an OpenAPI file + the SDK directory.
+    /// The output set used across the pure-filter tests: gnr8's own outputs + the `.gnr8` build dirs.
     fn output_set() -> HashSet<PathBuf> {
         let mut set = HashSet::new();
         set.insert(PathBuf::from("/proj/openapi.yaml"));
         set.insert(PathBuf::from("/proj/sdk")); // a directory prefix — every file under it is filtered.
+        set.insert(PathBuf::from("/proj/.gnr8/target"));
+        set.insert(PathBuf::from("/proj/.gnr8/cache"));
         set
+    }
+
+    /// The `.gnr8/src` anchor for the pipeline-source trigger.
+    fn gnr8_src() -> PathBuf {
+        PathBuf::from("/proj/.gnr8/src")
     }
 
     #[test]
     fn output_paths_filtered() {
         let out = output_set();
-        // The OpenAPI artifact itself (an exact output path) is gnr8's own write → NOT a trigger.
-        assert!(!is_trigger_path(&PathBuf::from("/proj/openapi.yaml"), &out));
-        // A generated SDK file UNDER the sdk dir is gnr8's own write → NOT a trigger (loop-safe), even
-        // though it ends in `.go`.
+        let src = gnr8_src();
+        // gnr8's own writes are NOT triggers, even the .go SDK files.
         assert!(!is_trigger_path(
-            &PathBuf::from("/proj/sdk/client.go"),
-            &out
+            &PathBuf::from("/proj/openapi.yaml"),
+            &out,
+            &src
         ));
         assert!(!is_trigger_path(
-            &PathBuf::from("/proj/sdk/models.go"),
-            &out
+            &PathBuf::from("/proj/sdk/client.go"),
+            &out,
+            &src
+        ));
+        // The generation crate's build output churns during a child build but must NOT trigger.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/.gnr8/target/debug/foo"),
+            &out,
+            &src
         ));
     }
 
     #[test]
     fn go_source_triggers() {
         let out = output_set();
+        let src = gnr8_src();
         // A `.go` source edit OUTSIDE the output paths → a trigger.
         assert!(is_trigger_path(
             &PathBuf::from("/proj/handlers/goal.go"),
-            &out
+            &out,
+            &src
         ));
-        assert!(is_trigger_path(&PathBuf::from("/proj/main.go"), &out));
+        assert!(is_trigger_path(&PathBuf::from("/proj/main.go"), &out, &src));
+    }
+
+    #[test]
+    fn pipeline_source_triggers() {
+        let out = output_set();
+        let src = gnr8_src();
+        // Editing the pipeline crate's Rust source must trigger a recompile + re-run.
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/.gnr8/src/main.rs"),
+            &out,
+            &src
+        ));
+        // A non-.rs file under .gnr8/src is not a trigger.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/.gnr8/src/notes.txt"),
+            &out,
+            &src
+        ));
     }
 
     #[test]
     fn non_go_ignored() {
         let out = output_set();
-        // A non-`.go` source-tree edit (docs, config) → NOT a trigger.
-        assert!(!is_trigger_path(&PathBuf::from("/proj/README.md"), &out));
-        assert!(!is_trigger_path(&PathBuf::from("/proj/go.mod"), &out));
-        // No extension at all → NOT a trigger.
-        assert!(!is_trigger_path(&PathBuf::from("/proj/Makefile"), &out));
+        let src = gnr8_src();
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/README.md"),
+            &out,
+            &src
+        ));
+        assert!(!is_trigger_path(&PathBuf::from("/proj/go.mod"), &out, &src));
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/Makefile"),
+            &out,
+            &src
+        ));
     }
 
     #[test]
     fn source_wins_over_output() {
         let out = output_set();
-        // A debounced batch containing BOTH gnr8's own output write AND a real source edit triggers:
-        // the source edit wins; the output write is ignored (loop-safe).
+        let src = gnr8_src();
+        // A batch with gnr8's own writes AND a real source edit triggers (the source edit wins).
         let batch = vec![
-            PathBuf::from("/proj/sdk/client.go"), // gnr8's own write — dropped.
-            PathBuf::from("/proj/openapi.yaml"),  // gnr8's own write — dropped.
-            PathBuf::from("/proj/handlers/goal.go"), // a real source edit — wins.
+            PathBuf::from("/proj/sdk/client.go"),
+            PathBuf::from("/proj/openapi.yaml"),
+            PathBuf::from("/proj/handlers/goal.go"),
         ];
-        assert!(batch_should_regenerate(&batch, &out));
+        assert!(batch_should_regenerate(&batch, &out, &src));
 
         // A batch of ONLY output writes must NOT trigger (the no-loop guarantee).
         let only_outputs = vec![
             PathBuf::from("/proj/sdk/client.go"),
             PathBuf::from("/proj/sdk/models.go"),
             PathBuf::from("/proj/openapi.yaml"),
+            PathBuf::from("/proj/.gnr8/target/debug/gen"),
         ];
-        assert!(!batch_should_regenerate(&only_outputs, &out));
+        assert!(!batch_should_regenerate(&only_outputs, &out, &src));
     }
 
     #[test]
     fn latency_report_json_field_set() {
-        // The `--json` latency record must expose exactly the documented WATCH-03 field set so Phase
-        // 5's benchmark tooling can rely on it (plan-check INFO-01).
         let outcome = GenerateOutcome {
             written: vec!["openapi.yaml".to_string(), "sdk/client.go".to_string()],
             unchanged: vec!["sdk/models.go".to_string()],
@@ -486,7 +489,6 @@ mod tests {
             .as_object()
             .expect("latency report serializes to a JSON object");
 
-        // Exactly these four keys, no more, no fewer.
         let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
         let expected: HashSet<&str> = ["scenario", "millis", "written", "unchanged"]
             .into_iter()
@@ -499,43 +501,37 @@ mod tests {
         assert_eq!(obj["unchanged"], serde_json::json!(1));
     }
 
-    /// WR-03: the scenario label is derived from the distinct trigger count — one source file →
-    /// `single-file-edit`, more (a multi-file edit or coalesced burst) → `multi-file-edit`, so the
-    /// machine-readable latency record never claims `single-file-edit` for a multi-file batch.
     #[test]
     fn scenario_label_distinguishes_single_from_multi_file_batches() {
         let out = output_set();
+        let src = gnr8_src();
 
-        // One trigger path (plus an ignored output write) → single.
         let one = vec![
             PathBuf::from("/proj/handlers/goal.go"),
-            PathBuf::from("/proj/sdk/client.go"), // output write — not a trigger.
+            PathBuf::from("/proj/sdk/client.go"),
         ];
-        assert_eq!(count_trigger_paths(&one, &out), 1);
+        assert_eq!(count_trigger_paths(&one, &out, &src), 1);
         assert_eq!(
-            scenario_for_trigger_count(count_trigger_paths(&one, &out)),
+            scenario_for_trigger_count(count_trigger_paths(&one, &out, &src)),
             "single-file-edit"
         );
 
-        // Two distinct source edits → multi.
         let two = vec![
             PathBuf::from("/proj/handlers/goal.go"),
             PathBuf::from("/proj/handlers/user.go"),
         ];
-        assert_eq!(count_trigger_paths(&two, &out), 2);
+        assert_eq!(count_trigger_paths(&two, &out, &src), 2);
         assert_eq!(
-            scenario_for_trigger_count(count_trigger_paths(&two, &out)),
+            scenario_for_trigger_count(count_trigger_paths(&two, &out, &src)),
             "multi-file-edit"
         );
 
-        // A duplicate path counts once (debouncers can report the same path twice).
         let dup = vec![
             PathBuf::from("/proj/handlers/goal.go"),
             PathBuf::from("/proj/handlers/goal.go"),
         ];
-        assert_eq!(count_trigger_paths(&dup, &out), 1);
+        assert_eq!(count_trigger_paths(&dup, &out, &src), 1);
 
-        // A degenerate 0 count still yields a valid (single) label rather than panicking.
         assert_eq!(scenario_for_trigger_count(0), "single-file-edit");
     }
 
@@ -545,7 +541,6 @@ mod tests {
     /// the canonical form differs (`/private/var/...` vs `/var/...`).
     #[test]
     fn deleted_output_event_still_resolves_under_canonical_output_dir() {
-        // A hermetic temp output dir (PID + nanos, no user input — mirrors the test discipline).
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -554,28 +549,32 @@ mod tests {
         let sdk_dir = root.join("sdk");
         std::fs::create_dir_all(&sdk_dir).expect("create sdk dir");
 
-        // Build the output set exactly as the watcher does: canonicalize the SDK dir once.
         let mut output_set = HashSet::new();
         output_set.insert(canonicalize_or_keep(&sdk_dir));
+        let src = root.join(".gnr8").join("src");
 
-        // gnr8 writes then DELETES a generated file (the WR-01 case). The leaf no longer exists.
         let generated = sdk_dir.join("client.go");
         std::fs::write(&generated, b"package sdk\n").expect("write generated file");
         std::fs::remove_file(&generated).expect("delete generated file");
         assert!(!generated.exists(), "the leaf must be gone (delete event)");
 
-        // The per-event canonicalization of the now-deleted leaf must still land under the canonical
-        // SDK dir, so the filter treats it as gnr8's own output and does NOT trigger a regen.
         let event_path = canonicalize_or_keep(&generated);
         assert!(
             is_under_any_output(&event_path, &output_set),
             "a deleted output leaf must still resolve under the canonical output dir; got {event_path:?}"
         );
         assert!(
-            !is_trigger_path(&event_path, &output_set),
+            !is_trigger_path(&event_path, &output_set, &src),
             "a delete event for gnr8's own output must NOT trigger a regeneration (WR-01)"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A small sanity assertion that the `Path` import is exercised (the `gnr8_src` anchor is a `&Path`).
+    #[test]
+    fn gnr8_src_anchor_is_a_path() {
+        let p: &Path = &gnr8_src();
+        assert!(p.ends_with("src"));
     }
 }

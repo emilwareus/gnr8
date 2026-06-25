@@ -43,10 +43,11 @@ internal API model   ── language- & router-agnostic: methods, paths, params,
 ```
 
 The first supported frontend reads **Go + Gin** via `go/types`. A native engine builds a deterministic
-model (identical input → byte-identical output) and generates the OpenAPI document and the SDK. A
-project-local **`.gnr8/`** workspace tracks what it generated (so it never overwrites your edits),
-regenerates only what changed, can watch for source edits, and a `doctor` command reports anything it
-couldn't represent.
+model (identical input → byte-identical output) and generates the OpenAPI document and the SDK. The
+generation lifecycle is **a Rust crate at `.gnr8/`** — `gnr8 init` scaffolds it, and `gnr8 generate`
+compiles and runs it, so adapting how your code is parsed and generated is just editing code. That same
+`.gnr8/` workspace tracks what it generated (so it never overwrites your edits), regenerates only what
+changed, can watch for source edits, and a `doctor` command reports anything it couldn't represent.
 
 ---
 
@@ -79,8 +80,31 @@ type Book struct {
 Run it:
 
 ```bash
-gnr8 init        # scaffold the .gnr8/ workspace
-gnr8 generate    # write openapi.yaml + the client SDK
+gnr8 init        # scaffold the .gnr8/ Rust crate (this is your config)
+```
+
+`gnr8 init` writes `.gnr8/src/main.rs` — the lifecycle, in code. Edit the `Pipeline` to say how your
+API is parsed and generated (no TOML, no flags file):
+
+```rust
+use gnr8_core::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8_core::runner::run(
+        Pipeline::new()
+            .source(GoGin::new().inputs(["."]))
+            .transform(SetBasePath::new("/books"))
+            .transform(SetTitle::new("Bookstore API"))
+            .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
+            .target(OpenApi31::new().to("generated/openapi.yaml"))
+            .target(GoSdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))
+            .post(Header::generated()),
+    )
+}
+```
+
+```bash
+gnr8 generate    # compile + run .gnr8/, write openapi.yaml + the client SDK
 ```
 
 Out comes OpenAPI 3.1:
@@ -126,11 +150,15 @@ cd examples/bookstore
 SDK; the `.gnr8/` lifecycle (`init` / `generate` / `check` / `watch` / `doctor`), incremental
 regeneration, and edit-protection.
 
+**Configuration is code.** `gnr8 init` scaffolds a small Rust crate at `.gnr8/` that drives the
+lifecycle — there is **no TOML/YAML config file**. You (or an agent) edit `.gnr8/src/main.rs`: it builds
+a `Pipeline` of a source, transforms, targets, and post-processors, and `gnr8 generate` compiles and
+runs it. Built-ins cover the common cases (`GoGin`, `SetBasePath`/`SetTitle`/`ApplySecurity`,
+`OpenApi31`, `GoSdk`); anything else is ordinary Rust — implement a trait and add it to the pipeline.
+
 **By design, additive:** the internal model is language- and router-agnostic, so additional source
-frameworks and SDK targets extend it rather than reshape it. The deeper configuration-as-code surface
-(adapting the lifecycle by extending the framework in code) is the direction it's being built toward;
-today a small config drives the knobs that aren't expressible in the source (mount/base path, title,
-security).
+frameworks and SDK targets extend it rather than reshape it — a new source or target is a Rust type that
+implements one trait and composes into the same pipeline.
 
 ---
 
@@ -150,7 +178,8 @@ security).
 | `crates/gnr8-core/` | the engine: model, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
 | `crates/gnr8/` | the `gnr8` CLI (`init`, `generate`, `check`, `inspect`, `watch`, `doctor`) |
 | `goextract/` | the Go frontend that reads Gin source via `go/types` |
-| `examples/bookstore/` | a runnable example + its real generated output |
+| `examples/bookstore/` | a runnable example + its real generated output (the basic `.gnr8/` lifecycle) |
+| `examples/taskflow/` | a richer example: a custom `Transform` + a custom `Target` (writes `API.md`) in `.gnr8/` |
 | `fixtures/goalservice/` | the test fixture (a realistic Gin service) driving the contract tests |
 | `docs/USAGE.md` | full reference: CLI, config, patterns, type mapping, recipes |
 | `docs/` | `demo.md` (walkthrough), `evidence.md` (what's verified) |

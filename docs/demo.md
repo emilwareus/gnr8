@@ -54,7 +54,7 @@ cd "$WORK/svc"
 ```
 
 `$WORK/svc` is now a standalone Go module (it has its own `go.mod`), which is exactly what the
-default `gnr8` config expects.
+default `gnr8` lifecycle expects (`GoGin::new().inputs(["."])` analyzes the current module).
 
 ## 4. Initialize the workspace
 
@@ -63,29 +63,36 @@ default `gnr8` config expects.
 ```
 
 ```text
-initialized .gnr8/ (created: .gnr8/config.toml, .gnr8/.gitignore)
+initialized .gnr8/ (created: .gnr8/Cargo.toml, .gnr8/src/main.rs, .gnr8/.gitignore)
 ```
 
-`init` scaffolds a project-local `.gnr8/` workspace. The default `config.toml` it writes carries the
-documented knobs — note `inputs = ["."]` (analyze the current module) and the output paths:
+`init` scaffolds a project-local `.gnr8/` **Rust crate** — this crate IS the config (there is no TOML).
+The default `src/main.rs` it writes composes a `Pipeline`: one Go+Gin source, a root base path, an
+`API` title, an OpenAPI 3.1 target, a Go SDK target, and the generated-header post-process:
 
 ```bash
-cat .gnr8/config.toml
+cat .gnr8/src/main.rs
 ```
 
-```toml
-# gnr8 PoC configuration — a code-as-config STAND-IN, not the long-term UX (see docs / D-03).
-# Programmatic ("through code") customization of routing recognition / transport / emitters is a
-# documented v2 direction (ADV-02) and is deliberately NOT a knob here.
-inputs = ["."]                              # Go source dir(s) to analyze (project-relative)
+```rust
+use gnr8_core::sdk::prelude::*;
 
-[output]
-openapi   = "openapi.yaml"                  # OpenAPI artifact path (project-relative)
-sdk_dir   = "sdk"                           # generated Go SDK directory
-go_module = "example.com/yourservice/sdk"   # Go module path for the generated SDK
+fn main() -> std::process::ExitCode {
+    gnr8_core::runner::run(
+        Pipeline::new()
+            .source(GoGin::new().inputs(["."]))
+            .transform(SetBasePath::new("/"))
+            .transform(SetTitle::new("API"))
+            .target(OpenApi31::new().to("openapi.yaml"))
+            .target(GoSdk::new().module("example.com/yourservice/sdk").to("sdk"))
+            .post(Header::generated()),
+    )
+}
 ```
 
-(`init` is idempotent: re-running it preserves any edits and reports the files as already present.)
+You adapt generation by editing this file (change an argument, add a `.transform(...)`, write your own
+`Source`/`Target`). (`init` is idempotent: re-running it preserves your edits and reports the files as
+already present.)
 
 ## 5. First generate (cold)
 
@@ -231,10 +238,9 @@ any stale/drifted output). Informational unsupported-pattern WARNs do **not** ma
 
 ```text
 LIFECYCLE
-  .gnr8/ workspace:    OK
-  config.toml:         OK
+  .gnr8/ crate:        OK
   Go toolchain:        OK
-  inputs vs outputs:   OK
+  pipeline runs:       OK
 
 OUTPUTS (0 stale, 0 drifted, 5 unchanged)
   (all outputs up to date)
@@ -258,7 +264,7 @@ healthy — 0 actionable problems (20 informational diagnostic(s))
 ```
 
 > **Why 20 informational diagnostics, not 7?** The scratch copy contains *both* the committed
-> `expected/sdk/*.go` golden files *and* the freshly generated `sdk/*.go`. With `inputs = ["."]`,
+> `expected/sdk/*.go` golden files *and* the freshly generated `sdk/*.go`. With `GoGin::new().inputs(["."])`,
 > `gnr8` faithfully analyzes the whole module and reports the extra "duplicate handler name" WARNs
 > (one per SDK symbol that now exists in two trees). This is correct read-only behavior — the verdict
 > stays **healthy / exit 0** because all of them are informational. A real project (without a
