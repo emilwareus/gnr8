@@ -335,7 +335,7 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, OpenApi31, RenameOperation,
+        ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, OpenApi31, PySdk, RenameOperation,
         RenameType, SetBasePath, SetTitle,
     };
     pub use super::{Artifact, Artifacts, Cx, Pipeline, PostProcess, Source, Target, Transform};

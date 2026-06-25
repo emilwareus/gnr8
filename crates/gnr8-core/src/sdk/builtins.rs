@@ -728,6 +728,16 @@ mod tests {
                 .generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
+        assert!(matches!(
+            PySdk::new().generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+        assert!(matches!(
+            PySdk::new()
+                .module("x.com/sdk")
+                .generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
     }
 
     #[test]
