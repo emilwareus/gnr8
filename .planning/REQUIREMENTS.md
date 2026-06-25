@@ -32,7 +32,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 
 - [x] **PYSDK-01**: A developer can generate a **dependency-free** Python SDK from the IR (stdlib `urllib`, `@dataclass` models, a typed `ApiError`, an injectable opener).
 - [ ] **PYSDK-02**: The generated Python SDK imports/type-checks and round-trips against the FastAPI fixture in a hermetic test.
-- [ ] **PYSDK-03**: A developer adds the Python SDK to a `.gnr8/` Pipeline via a `PySdk` `Target` built-in; output is deterministic (byte-identical across runs).
+- [x] **PYSDK-03**: A developer adds the Python SDK to a `.gnr8/` Pipeline via a `PySdk` `Target` built-in; output is deterministic (byte-identical across runs).
 
 ### TypeScript source extraction (TSSRC)
 
@@ -100,7 +100,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | PYSRC-05 | Phase 2 | Complete |
 | PYSDK-01 | Phase 3 | Complete |
 | PYSDK-02 | Phase 3 | Pending |
-| PYSDK-03 | Phase 3 | Pending |
+| PYSDK-03 | Phase 3 | Complete |
 | TSSRC-01 | Phase 4 | Pending |
 | TSSRC-02 | Phase 4 | Pending |
 | TSSRC-03 | Phase 4 | Pending |

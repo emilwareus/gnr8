@@ -4,13 +4,13 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T21:00:12.281Z"
+last_updated: "2026-06-25T21:05:46.332Z"
 last_activity: 2026-06-25 -- Phase 03 execution started
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 10
-  completed_plans: 8
+  completed_plans: 9
   percent: 33
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-25)
 ## Current Position
 
 Phase: 03 (Python Target — PySdk) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 03
 Last activity: 2026-06-25 -- Phase 03 execution started
 
-Progress: [████████░░] 80%
+Progress: [█████████░] 90%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [████████░░] 80%
 | Phase 02 P03 | 40 | 3 tasks | 14 files |
 | Phase 02 P04 | 35 | 3 tasks | 10 files |
 | Phase 03 P01 | 20m | 3 tasks | 4 files |
+| Phase 03 P02 | 10m | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -82,6 +83,7 @@ Recent decisions affecting current work:
 - [Phase ?]: [02-03] FastAPI route recognition: decorator + typed signature is the one source of every route fact; APIRouter(prefix=) recorded separately (never folded, rule 1); a Union alias is a valid named oneOf component. Both FastAPI snapshots green through real extraction, zero snapshot edits.
 - [Phase ?]: [02-04] Flask typed-envelope: @bp.route/methods= one route per method; Blueprint(url_prefix=) recorded separately (rule 1); <int:> converter -> int64 path param; status method-derived (typed POST->201, else 200) NEVER from a docstring (Q1); untyped request.json/args/return -> diagnostic + omit (rule 3, no fallback). FastAPI/Flask are parallel deterministic recognizers. Both Flask snapshots green via real extraction, zero edits; diagnostics at 42/69/78. Phase 02 complete.
 - [Phase ?]: [03-01] pysdk emit: exhaustive py_type (NO _=>) maps Union->Union[...], inline Enum->Literal[...], named non-object body->type alias (BookOrError=Union[Book,OutOfStock]) — cases the Go target rejects; inline Object stays a typed SdkGen error (parity). @dataclass fields partitioned required-first (3.9-safe; kw_only is 3.10+). Dependency-free urllib Client + injectable OpenerDirector; from __future__ import annotations + fixed typing header. Zero new crates; emitted SDK py_compiles+imports on 3.9.25.
+- [Phase 03]: PySdk Target is a verbatim structural clone of GoSdk reusing sdk_package + ir.base_path as the single source of truth; no new CoreError variant, no second name derivation
 
 ### Pending Todos
 
@@ -102,7 +104,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T20:59:38.625Z
+Last session: 2026-06-25T21:04:59.817Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
