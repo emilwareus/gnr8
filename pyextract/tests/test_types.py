@@ -156,6 +156,17 @@ class LiteralFaithfulnessTests(unittest.TestCase):
         self.assertTrue(diags.items())
 
 
+class DegenerateUnionTests(unittest.TestCase):
+    """WR-03 regression: a union with no non-None arms must diagnose + omit, never
+    an empty oneOf (rule 3)."""
+
+    def test_union_of_only_none_diagnoses_and_omits(self):
+        t, diags = _map("Union[None]")
+        self.assertIsNone(t)
+        self.assertNotEqual(t, {"type": "union", "of": []})
+        self.assertTrue(diags.items())
+
+
 class OptionalNullableTests(unittest.TestCase):
     def test_optional_unwraps_and_signals_nullable(self):
         node = _ann("Optional[str]")

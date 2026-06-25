@@ -294,6 +294,16 @@ def _map_union(arg_nodes, in_module, table, diags):
         if mapped is None:
             return None
         members.append(mapped)
+    if not members:
+        # rule 3: a degenerate union with no non-None arms (e.g. ``Union[None]``)
+        # is an invalid/empty oneOf — diagnose + omit, never an empty union.
+        diags.warn(
+            "degenerate union annotation: no non-None members; fact omitted "
+            "(no fallback)",
+            _file_of(table, in_module),
+            getattr(arg_nodes[0], "lineno", 0) if arg_nodes else 0,
+        )
+        return None
     return {"type": "union", "of": members}
 
 
