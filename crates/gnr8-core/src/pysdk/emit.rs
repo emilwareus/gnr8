@@ -115,7 +115,11 @@ pub(crate) fn screaming_snake(value: &str) -> String {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] on a dangling `Named` ref or an inline [`Type::Object`].
-pub(crate) fn py_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
+pub(crate) fn py_type(
+    schema: &Type,
+    nullable: bool,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
     let base = match schema {
         Type::Primitive(prim) => py_primitive(prim).to_string(),
         // Every well-known scalar carries on the wire as a string in this dependency-free SDK (a
@@ -214,8 +218,15 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             | Type::Named(_)
             | Type::Union(_)
             | Type::Any {} => {
+                // A module-level alias assignment is evaluated EAGERLY at import time (unlike a
+                // @dataclass annotation, which `from __future__ import annotations` keeps lazy). The
+                // schemas are id-sorted, so an alias may reference a class defined LATER in the file
+                // (e.g. `BookOrError = Union[Book, OutOfStock]` precedes `OutOfStock`) — an eager RHS
+                // raises `NameError` at import. Emit the RHS as a PEP-484 string forward reference so
+                // the assignment binds a plain `str` (importable, re-exportable) without evaluating any
+                // forward name. The value stays a valid type alias in annotation position (PYSDK-02).
                 let alias = py_type(&schema.body, false, graph)?;
-                writeln!(out, "{} = {alias}", schema.name).map_err(sink)?;
+                writeln!(out, "{} = \"{alias}\"", schema.name).map_err(sink)?;
             }
         }
     }
@@ -262,8 +273,7 @@ fn emit_dataclass(
     }
     // Partition preserving each group's (already-sorted) relative order: required (no default) first,
     // optional (defaulted) last — so defaulted fields are contiguous at the end (PITFALL 1).
-    let (required, optional): (Vec<&Field>, Vec<&Field>) =
-        fields.iter().partition(|f| !f.optional);
+    let (required, optional): (Vec<&Field>, Vec<&Field>) = fields.iter().partition(|f| !f.optional);
     for field in required {
         let hint = py_type(&field.schema, field.nullable, graph)?;
         writeln!(out, "    {}: {hint}", field.json_name).map_err(sink)?;
@@ -401,7 +411,10 @@ fn join_path(base_path: &str, path: &str) -> String {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<(u16, Option<String>)>, CoreError> {
+fn success_of(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<Option<(u16, Option<String>)>, CoreError> {
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
             let model = match &resp.body {
@@ -542,7 +555,12 @@ fn emit_operation(
         args.push(format!("{}=None", snake(&p.name)));
     }
 
-    writeln!(out, "    def {method_name}({}) -> {return_hint}:", args.join(", ")).map_err(sink)?;
+    writeln!(
+        out,
+        "    def {method_name}({}) -> {return_hint}:",
+        args.join(", ")
+    )
+    .map_err(sink)?;
 
     // Build the path: f-string interpolation with each path param percent-escaped (V5).
     if tokens.is_empty() {
@@ -551,8 +569,11 @@ fn emit_operation(
         let mut fstring = abs.clone();
         for token in &tokens {
             let placeholder = format!("{{{token}}}");
-            let escaped =
-                format!("{{urllib.parse.quote(str({}), safe=\\\"\\\")}}", snake(token));
+            // `safe=''` uses SINGLE quotes inside the double-quoted f-string: a backslash in an
+            // f-string expression part is a `SyntaxError` on Python 3.9-3.11 ("f-string expression
+            // part cannot include a backslash"), so escaped double-quotes (`safe=\"\"`) would not
+            // compile. Single quotes need no escape and are valid on every Python 3.x (PYSDK-02).
+            let escaped = format!("{{urllib.parse.quote(str({}), safe='')}}", snake(token));
             fstring = fstring.replace(&placeholder, &escaped);
         }
         writeln!(out, "        path = f\"{fstring}\"").map_err(sink)?;
@@ -633,8 +654,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        emit_client, emit_errors, emit_init, emit_models, emit_operations, py_type, screaming_snake,
-        snake,
+        emit_client, emit_errors, emit_init, emit_models, emit_operations, py_type,
+        screaming_snake, snake,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
 
@@ -809,7 +830,10 @@ mod tests {
             // BookFilters.sort-shaped inline enum: go_type errors; Python emits Literal in graph order.
             let g = ApiGraph::default();
             let sort = Type::Enum(vec!["asc".to_string(), "desc".to_string()]);
-            assert_eq!(py_type(&sort, false, &g).unwrap(), "Literal[\"asc\", \"desc\"]");
+            assert_eq!(
+                py_type(&sort, false, &g).unwrap(),
+                "Literal[\"asc\", \"desc\"]"
+            );
         }
 
         #[test]
@@ -817,21 +841,14 @@ mod tests {
             let g = sample_graph();
             let named = Type::Named("app.models.BookFormat".to_string());
             assert_eq!(py_type(&named, false, &g).unwrap(), "BookFormat");
-            assert_eq!(
-                py_type(&named, true, &g).unwrap(),
-                "Optional[BookFormat]"
-            );
+            assert_eq!(py_type(&named, true, &g).unwrap(), "Optional[BookFormat]");
         }
 
         #[test]
         fn named_union_resolves_each_variant_to_its_class_name() {
             // BookOrError = Union[Book, OutOfStock].
             let g = sample_graph();
-            let body = g
-                .schemas
-                .iter()
-                .find(|s| s.name == "BookOrError")
-                .unwrap();
+            let body = g.schemas.iter().find(|s| s.name == "BookOrError").unwrap();
             assert_eq!(
                 py_type(&body.body, false, &g).unwrap(),
                 "Union[Book, OutOfStock]"
@@ -857,7 +874,8 @@ mod tests {
             let obj = Type::Object(vec![]);
             let err = py_type(&obj, false, &g).unwrap_err();
             assert!(
-                err.to_string().contains("inline object type is unsupported"),
+                err.to_string()
+                    .contains("inline object type is unsupported"),
                 "{err}"
             );
         }
@@ -912,7 +930,10 @@ mod tests {
         fn optional_fields_get_a_none_default_required_do_not() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             // required (no default).
-            assert!(out.contains("    genre: str\n"), "required has no default:\n{out}");
+            assert!(
+                out.contains("    genre: str\n"),
+                "required has no default:\n{out}"
+            );
             // optional non-nullable bool → defaulted, hint NOT Optional.
             assert!(
                 out.contains("    in_stock: bool = None\n"),
@@ -1069,7 +1090,10 @@ mod tests {
                 "snake method, typed body, typed return:\n{out}"
             );
             // success status is the real 201, not a default 200.
-            assert!(out.contains("if _status != 201:"), "compares real 201:\n{out}");
+            assert!(
+                out.contains("if _status != 201:"),
+                "compares real 201:\n{out}"
+            );
             assert!(out.contains("self._raise(_status, _raw)"), "{out}");
             assert!(out.contains("return CreatedMessage(**_data)"), "{out}");
             assert!(
@@ -1084,18 +1108,24 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
             assert!(
                 out.contains(
-                    "path = f\"/books/{urllib.parse.quote(str(book_id), safe=\\\"\\\")}\""
+                    "path = f\"/books/{urllib.parse.quote(str(book_id), safe='')}\""
                 ),
-                "path param must be percent-escaped (V5):\n{out}"
+                "path param must be percent-escaped (V5) with a backslash-free f-string (PYSDK-02):\n{out}"
             );
-            assert!(out.contains("def get_book(self, book_id) -> Book:"), "{out}");
+            assert!(
+                out.contains("def get_book(self, book_id) -> Book:"),
+                "{out}"
+            );
         }
 
         #[test]
         fn query_op_encodes_present_params_and_has_no_body() {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
-            assert!(out.contains("def list_books(self, cursor=None) -> Any:"), "{out}");
+            assert!(
+                out.contains("def list_books(self, cursor=None) -> Any:"),
+                "{out}"
+            );
             assert!(out.contains("if cursor is not None:"), "{out}");
             assert!(out.contains("_query[\"cursor\"] = cursor"), "{out}");
             assert!(
@@ -1103,8 +1133,14 @@ mod tests {
                 "{out}"
             );
             // body-less success returns the raw decode (None when empty).
-            assert!(out.contains("return json.loads(_raw) if _raw else None"), "{out}");
-            assert!(!out.contains(", body=body"), "query op has no body arg:\n{out}");
+            assert!(
+                out.contains("return json.loads(_raw) if _raw else None"),
+                "{out}"
+            );
+            assert!(
+                !out.contains(", body=body"),
+                "query op has no body arg:\n{out}"
+            );
         }
 
         #[test]

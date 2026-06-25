@@ -765,7 +765,10 @@ mod tests {
 
         // The trimmed output dir is the loop-safety anchor (so the pipeline never re-ingests the
         // generated *.py); an unconfigured target anchors nothing.
-        assert_eq!(target.output_anchors(), vec!["generated/sdk-py".to_string()]);
+        assert_eq!(
+            target.output_anchors(),
+            vec!["generated/sdk-py".to_string()]
+        );
         assert!(PySdk::new().output_anchors().is_empty());
 
         // Two fresh runs over the same IR yield byte-identical Artifacts (T-03-02-05).

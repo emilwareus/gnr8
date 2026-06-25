@@ -226,7 +226,10 @@ mod tests {
         );
         // The marker line must never appear inside a materialized file's contents.
         for (_, contents) in &files {
-            assert!(!contents.contains("// ==== gnr8:file"), "marker leaked into a file");
+            assert!(
+                !contents.contains("// ==== gnr8:file"),
+                "marker leaked into a file"
+            );
         }
     }
 
