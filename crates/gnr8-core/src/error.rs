@@ -62,8 +62,9 @@ pub enum CoreError {
     ///
     /// Raised for forward-incompatible or malformed graph facts that the lowering layer cannot
     /// represent — e.g. a dangling `$ref` (a `request_body`/`response.body` whose `ref_id` is not
-    /// among `graph.schemas`) or an unknown [`crate::graph::SchemaType`] `kind`. The `message`
-    /// names the offending id so the failure is diagnosable without a panic (RUST-04 / V5, T-03-01-01).
+    /// among `graph.schemas`) or a neutral [`crate::graph::Type`] the `OpenAPI` target cannot
+    /// represent. The `message` names the offending id so the failure is diagnosable without a panic
+    /// (RUST-04 / V5, T-03-01-01).
     #[error("lowering failed: {message}")]
     Lowering {
         /// Human-readable failure detail naming the offending id.

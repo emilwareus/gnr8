@@ -294,8 +294,8 @@ pub struct NamingOverrides {
 /// - Each `operation.id` present in `naming.operations` is remapped to its new value (the operationId
 ///   the OpenAPI/SDK output uses).
 /// - Each schema matched by `naming.types` (by `id` OR bare `name`) is renamed: BOTH its `id` and
-///   `name` become the new value, AND **every** `SchemaRef.ref_id` / field `SchemaType.ref_id` that
-///   pointed at the old id is rewritten to the new value. This is MANDATORY (PLAN-CHECK W2): a
+///   `name` become the new value, AND **every** `SchemaRef.ref_id` / neutral [`crate::graph::Type::Named`]
+///   that pointed at the old id is rewritten to the new value. This is MANDATORY (PLAN-CHECK W2): a
 ///   referenced type renamed without updating its $refs would dangle and make `to_openapi` fail with
 ///   `CoreError::Lowering`. By keeping `id == name == new value` and rewriting every ref, the
 ///   component key, the resolved `$ref` name, and the references all stay consistent.
@@ -407,9 +407,7 @@ pub fn apply_naming(
             }
         }
         for schema in &mut graph.schemas {
-            for field in &mut schema.fields {
-                rewrite_schema_type_ref(&mut field.schema, old_id, new_name);
-            }
+            rewrite_schema_type_ref(&mut schema.body, old_id, new_name);
         }
         for op in &mut graph.operations {
             if let Some(body) = op.request_body.as_mut() {
@@ -432,16 +430,35 @@ pub fn apply_naming(
     Ok(())
 }
 
-/// Rewrite a `ref`-kind [`crate::graph::SchemaType`]'s `ref_id` (recursing into array `items`) from
-/// `old_id` to `new_id`, so a renamed schema's references stay valid (PLAN-CHECK W2).
-fn rewrite_schema_type_ref(schema: &mut crate::graph::SchemaType, old_id: &str, new_id: &str) {
-    if let Some(ref_id) = schema.ref_id.as_mut() {
-        if ref_id == old_id {
-            *ref_id = new_id.to_string();
+/// Rewrite every [`crate::graph::Type::Named`] reference equal to `old_id` to `new_id`, recursing
+/// through every type-bearing variant of the neutral [`crate::graph::Type`], so a renamed schema's
+/// references stay valid (PLAN-CHECK W2). The match is exhaustive — no `_ =>` arm — so a future
+/// [`crate::graph::Type`] variant fails to compile here until its recursion is handled (T-03).
+fn rewrite_schema_type_ref(ty: &mut crate::graph::Type, old_id: &str, new_id: &str) {
+    use crate::graph::Type;
+    match ty {
+        Type::Named(ref_id) => {
+            if ref_id == old_id {
+                *ref_id = new_id.to_string();
+            }
         }
-    }
-    if let Some(items) = schema.items.as_mut() {
-        rewrite_schema_type_ref(items, old_id, new_id);
+        Type::Array(inner) => rewrite_schema_type_ref(inner, old_id, new_id),
+        Type::Map { key, value } => {
+            rewrite_schema_type_ref(key, old_id, new_id);
+            rewrite_schema_type_ref(value, old_id, new_id);
+        }
+        Type::Object(fields) => {
+            for field in fields.iter_mut() {
+                rewrite_schema_type_ref(&mut field.schema, old_id, new_id);
+            }
+        }
+        Type::Union(variants) => {
+            for variant in variants.iter_mut() {
+                rewrite_schema_type_ref(variant, old_id, new_id);
+            }
+        }
+        // Variants that carry no nested schema id: nothing to rewrite.
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) | Type::Any {} => {}
     }
 }
 

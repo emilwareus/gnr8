@@ -30,7 +30,8 @@ mod model;
 mod yaml;
 
 use crate::graph::{
-    ApiGraph, Operation as GraphOp, Schema, SchemaType, SecurityScheme as GraphSecurityScheme,
+    ApiGraph, Field, Operation as GraphOp, Prim, Schema, SecurityScheme as GraphSecurityScheme,
+    Type, WellKnown,
 };
 use model::{
     Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
@@ -58,10 +59,10 @@ const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 /// # Errors
 ///
 /// Returns [`crate::CoreError::Lowering`] when a graph fact cannot be represented — a dangling `$ref`
-/// (a `request_body`/`response.body` whose `ref_id` is not among `graph.schemas`) or an unknown
-/// [`crate::graph::SchemaType`] `kind` — or when a security scheme uses an unsupported `kind`/`location`
-/// (so a misconfiguration is a clear error, never a silently dropped scheme). Never panics and never
-/// `unwrap`s (RUST-04 / T-03-01-01).
+/// (a `request_body`/`response.body` whose `ref_id` is not among `graph.schemas`) or a neutral
+/// [`crate::graph::Type`] the `OpenAPI` target cannot express — or when a security scheme uses an
+/// unsupported `kind`/`location` (so a misconfiguration is a clear error, never a silently dropped
+/// scheme). Never panics and never `unwrap`s (RUST-04 / T-03-01-01).
 pub fn to_openapi(
     graph: &ApiGraph,
     title: &str,
@@ -289,14 +290,18 @@ fn build_component_schemas(
         .collect()
 }
 
-/// Lower one named graph [`Schema`] (object or enum) into a [`SchemaObject`].
+/// Lower one named graph [`Schema`] (an [`Type::Object`] or [`Type::Enum`] body) into a
+/// [`SchemaObject`]. A named schema's body is a neutral [`Type`]; only `Object`/`Enum` are valid
+/// component bodies, every other variant is an explicit typed error (a named schema is never a bare
+/// scalar/array/ref). The match is exhaustive — no `_ =>`/`other =>` arm — so a future [`Type`] variant
+/// fails to compile here until it is handled (T-03).
 fn lower_named_schema(
     schema: &Schema,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<SchemaObject, crate::CoreError> {
-    match schema.kind.as_str() {
-        "enum" => {
-            let mut enum_values = schema.enum_values.clone();
+    match &schema.body {
+        Type::Enum(members) => {
+            let mut enum_values = members.clone();
             enum_values.sort();
             Ok(SchemaObject {
                 type_name: Some("string".to_string()),
@@ -304,85 +309,181 @@ fn lower_named_schema(
                 ..SchemaObject::default()
             })
         }
-        "object" => {
-            let mut required: Vec<String> = schema
-                .fields
-                .iter()
-                .filter(|field| field.required)
-                .map(|field| field.json_name.clone())
-                .collect();
-            required.sort();
-            let mut properties: Vec<(String, SchemaObject)> = schema
-                .fields
-                .iter()
-                .map(|field| {
-                    let mut prop = lower_schema_type(&field.schema, ref_to_name)?;
-                    // Attach a field description when the graph carries one and the schema is not a
-                    // bare $ref (a $ref node ignores sibling keys per JSON Schema).
-                    if prop.schema_ref.is_none() {
-                        if let Some(desc) = &field.description {
-                            prop.description = Some(desc.clone());
-                        }
-                    }
-                    Ok((field.json_name.clone(), prop))
-                })
-                .collect::<Result<Vec<_>, crate::CoreError>>()?;
-            properties.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(SchemaObject {
-                type_name: Some("object".to_string()),
-                required,
-                properties,
-                ..SchemaObject::default()
-            })
-        }
-        other => Err(crate::CoreError::Lowering {
-            message: format!("unknown schema kind '{other}' for schema '{}'", schema.id),
+        Type::Object(fields) => lower_object(fields, ref_to_name),
+        // A named component is always a struct/class (Object) or a string enum (Enum). Any other
+        // neutral type as a *named* body is a contract error — an explicit arm, not a catch-all (T-03).
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => Err(crate::CoreError::Lowering {
+            message: format!(
+                "named schema '{}' has a non-object/non-enum body that cannot be a component",
+                schema.id
+            ),
         }),
     }
 }
 
-/// Map a graph [`SchemaType`] to a [`SchemaObject`]. A `ref` kind resolves to a bare-name `$ref`;
-/// an unknown kind is a typed error (T-03-01-01).
-fn lower_schema_type(
-    schema: &SchemaType,
+/// Lower an object's fields into an `object` [`SchemaObject`] with a sorted `required` list and sorted
+/// properties. Optionality is the `required`-omission axis (a field is `required` iff `field.required`);
+/// nullability is rendered independently on each property's schema (the 3.1 `[T,"null"]` array form).
+fn lower_object(
+    fields: &[Field],
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<SchemaObject, crate::CoreError> {
-    match schema.kind.as_str() {
-        "ref" => {
-            let Some(ref_id) = &schema.ref_id else {
-                return Err(crate::CoreError::Lowering {
-                    message: "ref schema is missing a ref_id".to_string(),
-                });
-            };
-            Ok(SchemaObject::reference(resolve_ref(ref_id, ref_to_name)?))
-        }
-        "array" => {
-            let Some(items) = &schema.items else {
-                return Err(crate::CoreError::Lowering {
-                    message: "array schema is missing an items type".to_string(),
-                });
-            };
-            Ok(SchemaObject {
-                type_name: Some("array".to_string()),
-                items: Some(Box::new(lower_schema_type(items, ref_to_name)?)),
-                ..SchemaObject::default()
-            })
-        }
-        "object" => {
-            // A bare `object` in the graph is a free-form map (additional_properties == Some(true));
-            // it lowers to additionalProperties: true (the OAPI-03 representational decision).
-            Ok(SchemaObject {
-                type_name: Some("object".to_string()),
-                additional_properties: schema.additional_properties,
-                ..SchemaObject::default()
-            })
-        }
-        "string" | "integer" | "number" | "boolean" => {
-            Ok(SchemaObject::primitive(&schema.kind, schema.format.clone()))
-        }
-        other => Err(crate::CoreError::Lowering {
-            message: format!("unknown SchemaType kind '{other}'"),
+    let mut required: Vec<String> = fields
+        .iter()
+        .filter(|field| field.required)
+        .map(|field| field.json_name.clone())
+        .collect();
+    required.sort();
+    let mut properties: Vec<(String, SchemaObject)> = fields
+        .iter()
+        .map(|field| {
+            // The NULLABLE axis (independent of optional) renders on the property schema.
+            let mut prop = lower_field_schema(&field.schema, field.nullable, ref_to_name)?;
+            // Attach a field description when the graph carries one and the schema is not a bare $ref
+            // / oneOf (a $ref node ignores sibling keys per JSON Schema).
+            if prop.schema_ref.is_none() && prop.one_of.is_empty() {
+                if let Some(desc) = &field.description {
+                    prop.description = Some(desc.clone());
+                }
+            }
+            Ok((field.json_name.clone(), prop))
+        })
+        .collect::<Result<Vec<_>, crate::CoreError>>()?;
+    properties.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(SchemaObject {
+        type_name: Some("object".to_string()),
+        required,
+        properties,
+        ..SchemaObject::default()
+    })
+}
+
+/// Lower a field's neutral [`Type`] applying the field's `nullable` axis: a nullable scalar/array/map
+/// renders as the 3.1 `type: ["<type>", "null"]` array form; a nullable `$ref` renders as the
+/// `oneOf: [ {$ref}, {type: "null"} ]` form (a `$ref` cannot carry a sibling `type`). A non-nullable
+/// field is the plain lowered schema.
+fn lower_field_schema(
+    ty: &Type,
+    nullable: bool,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<SchemaObject, crate::CoreError> {
+    let lowered = lower_schema_type(ty, ref_to_name)?;
+    if !nullable {
+        return Ok(lowered);
+    }
+    // A bare `$ref` (or an already-composed `oneOf`) cannot carry a sibling `type` key — wrap it in a
+    // `oneOf` with an explicit null schema (the 3.1 / JSON-Schema-2020-12 nullable-reference form).
+    if lowered.schema_ref.is_some() || !lowered.one_of.is_empty() {
+        return Ok(SchemaObject {
+            one_of: vec![lowered, null_schema()],
+            ..SchemaObject::default()
+        });
+    }
+    // A typed schema renders the array form via the `nullable` flag (the writer emits `[T, "null"]`).
+    Ok(SchemaObject {
+        nullable: true,
+        ..lowered
+    })
+}
+
+/// The bare `{ type: "null" }` schema (the null member of a nullable `oneOf`).
+fn null_schema() -> SchemaObject {
+    SchemaObject {
+        type_name: Some("null".to_string()),
+        ..SchemaObject::default()
+    }
+}
+
+/// Map a neutral graph [`Type`] to a [`SchemaObject`], NEUTRALLY — no Go (or any language) type name
+/// appears here; lowering emits only `OpenAPI`/`JSON Schema` primitive names from the neutral type
+/// (IR-03). The match is exhaustive (no `_ =>`/`other =>` arm) so a new [`Type`] variant fails to
+/// compile here until handled (T-03). Nullability is NOT applied here — it is a field-position axis
+/// applied by [`lower_field_schema`].
+fn lower_schema_type(
+    ty: &Type,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<SchemaObject, crate::CoreError> {
+    match ty {
+        Type::Primitive(prim) => Ok(SchemaObject::primitive(openapi_primitive(prim), None)),
+        // A well-known scalar lowers to its canonical `string` + `format` (uuid, date-time, ...). The
+        // format string is the neutral wire token, never a language type name (IR-03).
+        Type::WellKnown(well_known) => Ok(SchemaObject::primitive(
+            "string",
+            Some(openapi_format(well_known).to_string()),
+        )),
+        Type::Array(items) => Ok(SchemaObject {
+            type_name: Some("array".to_string()),
+            items: Some(Box::new(lower_schema_type(items, ref_to_name)?)),
+            ..SchemaObject::default()
         }),
+        // A keyed map lowers to an object whose additionalProperties is the lowered value schema.
+        Type::Map { value, .. } => Ok(SchemaObject {
+            type_name: Some("object".to_string()),
+            items: None,
+            additional_properties_schema: Some(Box::new(lower_schema_type(value, ref_to_name)?)),
+            ..SchemaObject::default()
+        }),
+        Type::Named(ref_id) => Ok(SchemaObject::reference(resolve_ref(ref_id, ref_to_name)?)),
+        // An inline (anonymous) object lowers to a full object schema with its own properties.
+        Type::Object(fields) => lower_object(fields, ref_to_name),
+        Type::Enum(members) => {
+            let mut enum_values = members.clone();
+            enum_values.sort();
+            Ok(SchemaObject {
+                type_name: Some("string".to_string()),
+                enum_values,
+                ..SchemaObject::default()
+            })
+        }
+        // A sum type lowers to the 3.1 `oneOf` of its lowered variants.
+        Type::Union(variants) => {
+            let one_of = variants
+                .iter()
+                .map(|variant| lower_schema_type(variant, ref_to_name))
+                .collect::<Result<Vec<_>, crate::CoreError>>()?;
+            Ok(SchemaObject {
+                one_of,
+                ..SchemaObject::default()
+            })
+        }
+        // A free-form value lowers to `additionalProperties: true` (the OAPI-03 representational
+        // decision for an untyped map).
+        Type::Any {} => Ok(SchemaObject {
+            type_name: Some("object".to_string()),
+            additional_properties: Some(true),
+            ..SchemaObject::default()
+        }),
+    }
+}
+
+/// Map a neutral [`Prim`] to its `OpenAPI`/`JSON Schema` primitive type name (neutral — no language
+/// type name; the width/sign of an integer or float is a *target* concern, not a spec primitive).
+fn openapi_primitive(prim: &Prim) -> &'static str {
+    match prim {
+        Prim::String | Prim::Bytes => "string",
+        Prim::Bool => "boolean",
+        Prim::Int { .. } => "integer",
+        Prim::Float { .. } => "number",
+    }
+}
+
+/// Map a neutral [`WellKnown`] to its canonical `OpenAPI`/`JSON Schema` `format` token (the neutral
+/// wire form, e.g. `uuid`, `date-time`); these are spec format strings, never language type names.
+fn openapi_format(well_known: &WellKnown) -> &'static str {
+    match well_known {
+        WellKnown::Uuid => "uuid",
+        WellKnown::DateTime => "date-time",
+        WellKnown::Date => "date",
+        WellKnown::Duration => "duration",
+        WellKnown::Decimal => "decimal",
+        WellKnown::Email => "email",
+        WellKnown::Uri => "uri",
     }
 }
 
@@ -461,7 +562,7 @@ mod tests {
           "params": [
             {
               "name": "aggregation", "location": "query", "required": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 }
             }
           ],
@@ -477,7 +578,7 @@ mod tests {
           "params": [
             {
               "name": "uuid", "location": "path", "required": true,
-              "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "well_known", "of": "uuid" },
               "span": { "file": "/root/h.go", "start_line": 3, "end_line": 3 }
             }
           ],
@@ -493,7 +594,7 @@ mod tests {
           "params": [
             {
               "name": "uuid", "location": "path", "required": true,
-              "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "well_known", "of": "uuid" },
               "span": { "file": "/root/h.go", "start_line": 4, "end_line": 4 }
             }
           ],
@@ -506,54 +607,51 @@ mod tests {
       ],
       "schemas": [
         {
-          "id": "internal/dto.CreateGoalInput", "name": "CreateGoalInput", "kind": "object",
-          "fields": [
+          "id": "internal/dto.CreateGoalInput", "name": "CreateGoalInput",
+          "body": { "type": "object", "of": [
             {
-              "json_name": "name", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": "Goal name", "example": null
             },
             {
-              "json_name": "metadata", "required": false, "optional": true,
-              "schema": { "kind": "object", "format": null, "items": null, "ref_id": null, "additional_properties": true },
+              "json_name": "metadata", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "any", "of": {} },
               "description": null, "example": null
             },
             {
-              "json_name": "uuid", "required": false, "optional": true,
-              "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "json_name": "uuid", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "well_known", "of": "uuid" },
               "description": null, "example": null
             }
-          ],
-          "enum_values": [],
+          ] },
           "span": { "file": "/root/dto.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "internal/dto.CommandMessage", "name": "CommandMessage", "kind": "object",
-          "fields": [
+          "id": "internal/dto.CommandMessage", "name": "CommandMessage",
+          "body": { "type": "object", "of": [
             {
-              "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null
             }
-          ],
-          "enum_values": [],
+          ] },
           "span": { "file": "/root/dto.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "internal/dto.GoalResponse", "name": "GoalResponse", "kind": "object",
-          "fields": [
+          "id": "internal/dto.GoalResponse", "name": "GoalResponse",
+          "body": { "type": "object", "of": [
             {
-              "json_name": "direction", "required": false, "optional": true,
-              "schema": { "kind": "ref", "format": null, "items": null, "ref_id": "internal/dto.TargetDirection", "additional_properties": null },
+              "json_name": "direction", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "named", "of": "internal/dto.TargetDirection" },
               "description": null, "example": null
             }
-          ],
-          "enum_values": [],
+          ] },
           "span": { "file": "/root/dto.go", "start_line": 3, "end_line": 3 }
         },
         {
-          "id": "internal/dto.TargetDirection", "name": "TargetDirection", "kind": "enum",
-          "fields": [], "enum_values": ["lte", "gte"],
+          "id": "internal/dto.TargetDirection", "name": "TargetDirection",
+          "body": { "type": "enum", "of": ["lte", "gte"] },
           "span": { "file": "/root/dto.go", "start_line": 4, "end_line": 4 }
         }
       ],
@@ -651,15 +749,151 @@ mod tests {
     }
 
     #[test]
-    fn unknown_schema_type_kind_returns_lowering_error() {
+    fn named_schema_with_non_object_body_returns_lowering_error() {
+        use crate::graph::Type;
         let mut graph = sample_graph();
-        // Corrupt a field's schema kind to an unrepresentable value.
-        graph.schemas[1].fields[0].schema.kind = "tuple".to_string();
+        // A named component whose body is a bare array (not Object/Enum) cannot be a component schema:
+        // an EXPLICIT typed error arm, not a swallowed catch-all (T-03).
+        graph.schemas[1].body = Type::Array(Box::new(Type::Primitive(crate::graph::Prim::String)));
         let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
-        assert!(message.contains("tuple"), "{message}");
+        assert!(
+            message.contains("non-object/non-enum body"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn nullable_field_renders_type_array_and_stays_in_required() {
+        use crate::graph::{Field, Type};
+        // A nullable-but-NOT-optional field: it appears in `required` (optionality axis) AND its type
+        // is the 3.1 `["string", "null"]` array form (nullability axis) — the two are independent.
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "label".to_string(),
+            required: true,
+            optional: false,
+            nullable: true,
+            schema: Type::Primitive(crate::graph::Prim::String),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(
+            block.contains("type: [string, null]"),
+            "nullable field must render the 3.1 type array form:\n{block}"
+        );
+        assert!(
+            block.contains("required: [label]"),
+            "a nullable-not-optional field must still be in required:\n{block}"
+        );
+    }
+
+    #[test]
+    fn optional_not_nullable_field_is_scalar_and_omitted_from_required() {
+        use crate::graph::{Field, Type};
+        // An optional-but-NOT-nullable field: omitted from `required` (optionality), but its type is a
+        // PLAIN scalar (no `["T","null"]`), proving optionality does not leak into the type.
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "note".to_string(),
+            required: false,
+            optional: true,
+            nullable: false,
+            schema: Type::Primitive(crate::graph::Prim::String),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        // `note`'s schema is a plain `type: string` (not an array form).
+        assert!(
+            block.contains("note:") && block.contains("type: string"),
+            "optional-not-nullable field must be a plain scalar:\n{block}"
+        );
+        assert!(
+            !block.contains("type: [string, null]"),
+            "optional alone must NOT produce the null array form:\n{block}"
+        );
+        // `required:` is omitted entirely (no required fields).
+        let block_until_next = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(
+            !block_until_next.contains("required:"),
+            "an optional-only field must be omitted from required:\n{block_until_next}"
+        );
+    }
+
+    #[test]
+    fn nullable_ref_field_renders_oneof_with_null() {
+        use crate::graph::{Field, Type};
+        // A nullable `$ref` cannot carry a sibling `type`; it renders as `oneOf: [{$ref}, {type:null}]`.
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "direction".to_string(),
+            required: false,
+            optional: false,
+            nullable: true,
+            schema: Type::Named("internal/dto.TargetDirection".to_string()),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("oneOf:"), "nullable $ref must use oneOf:\n{block}");
+        assert!(
+            block.contains("$ref: '#/components/schemas/TargetDirection'"),
+            "{block}"
+        );
+        assert!(block.contains("type: null"), "{block}");
+    }
+
+    #[test]
+    fn union_field_lowers_to_oneof_of_variants() {
+        use crate::graph::{Field, Prim, Type};
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "either".to_string(),
+            required: true,
+            optional: false,
+            nullable: false,
+            schema: Type::Union(vec![
+                Type::Primitive(Prim::String),
+                Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                }),
+            ]),
+            description: None,
+            example: None,
+        }]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("oneOf:"), "union must lower to oneOf:\n{block}");
+        assert!(
+            block.contains("- type: string") && block.contains("- type: integer"),
+            "oneOf must carry each lowered variant:\n{block}"
+        );
+    }
+
+    #[test]
+    fn well_known_uuid_field_lowers_to_string_with_uuid_format() {
+        // A WellKnown(Uuid) field lowers NEUTRALLY to `type: string` + `format: uuid` — no language
+        // type name leaks into lowering (IR-03).
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml
+            .split("CreateGoalInput:")
+            .nth(1)
+            .expect("CreateGoalInput schema");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("uuid:"), "{block}");
+        assert!(block.contains("format: uuid"), "{block}");
     }
 
     #[test]

@@ -135,12 +135,17 @@ pub(crate) struct SecurityScheme {
 
 /// A `JSON-Schema-2020-12` schema object (the `OpenAPI` 3.1 schema subset this `PoC` emits).
 ///
-/// Optionality is expressed purely by omission from [`Self::required`] — there is NO `nullable` key
-/// and NO `type: [T, "null"]` array form in 3.1 (RESEARCH Pattern 2).
+/// `OpenAPI` 3.1 aligns with `JSON Schema 2020-12`, which dropped the 3.0-era `nullable` keyword.
+/// Nullability is rendered as the **type array form** `type: ["<type>", "null"]` (set
+/// [`Self::nullable`]); for a bare `$ref` node — where sibling keys are ignored — nullability is the
+/// `oneOf: [ {$ref}, {type: "null"} ]` form (set [`Self::one_of`]). Optionality and nullability are
+/// **independent** axes: optionality is expressed by omission from the owning object's
+/// [`Self::required`] list, nullability by the type array (or `oneOf`) above. A field can be optional,
+/// nullable, both, or neither.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub(crate) struct SchemaObject {
     /// The primitive/composite type name (`string`, `integer`, `number`, `boolean`, `array`,
-    /// `object`); `None` when the schema is a bare `$ref`.
+    /// `object`); `None` when the schema is a bare `$ref` or a `oneOf` composition.
     pub type_name: Option<String>,
     /// Format hint (`uuid`, `date-time`, `int64`), emitted alongside `type` when present.
     pub format: Option<String>,
@@ -157,8 +162,18 @@ pub(crate) struct SchemaObject {
     pub items: Option<Box<SchemaObject>>,
     /// `Some(true)` for a free-form map (`map[string]any` → `additionalProperties: true`).
     pub additional_properties: Option<bool>,
+    /// A typed `additionalProperties` value schema for a keyed map (`Map { value, .. }`); takes
+    /// precedence over [`Self::additional_properties`] when set (a typed map vs. a free-form one).
+    pub additional_properties_schema: Option<Box<SchemaObject>>,
     /// A JSON-pointer `$ref` to a component schema (bare name, e.g. `CreateGoalInput`).
     pub schema_ref: Option<String>,
+    /// The variant schemas of a `oneOf` composition (a [`crate::graph::Type::Union`], or the
+    /// nullable-`$ref` form `[ {$ref}, {type: "null"} ]`); empty otherwise.
+    pub one_of: Vec<SchemaObject>,
+    /// Whether the value may be explicitly `null`. When set, the writer renders `type` as the 3.1
+    /// array form `["<type_name>", "null"]` instead of the scalar `type: <type_name>`. Independent of
+    /// the owning object's `required` list (which carries the optionality axis).
+    pub nullable: bool,
 }
 
 impl SchemaObject {

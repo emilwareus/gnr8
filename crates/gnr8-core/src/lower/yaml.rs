@@ -5,10 +5,12 @@
 //! is used: `serde_yaml` is deprecated/absent (RESEARCH Alternatives), and byte-exact key ordering is
 //! required to reconcile with `fixtures/goalservice/expected/openapi.yaml`.
 //!
-//! `OpenAPI` 3.1 specifics enforced here (RESEARCH Pattern 2): `openapi: 3.1.0`; NO `nullable` key and
-//! NO `type: [T, "null"]` array form (optionality is required-omission only); `$ref` is JSON-pointer
-//! form `'#/components/schemas/Name'` and QUOTED; `additionalProperties: true` for free-form maps;
-//! `format` is emitted alongside `type`. Indentation is two-space block style.
+//! `OpenAPI` 3.1 specifics enforced here: `openapi: 3.1.0`; nullability is the `JSON Schema 2020-12`
+//! **type array form** `type: ["T", "null"]` (3.1 dropped the 3.0-era `nullable` keyword), or, for a
+//! bare `$ref` node, the `oneOf: [ {$ref}, {type: "null"} ]` form; optionality is independent and is
+//! expressed by omission from the owning object's `required` list. `$ref` is JSON-pointer form
+//! `'#/components/schemas/Name'` and QUOTED; `additionalProperties: true` for free-form maps; `format`
+//! is emitted alongside `type`. Indentation is two-space block style.
 //!
 //! The writer is total: it returns a [`String`] and never fails (a programming-error empty `$ref` is
 //! surfaced as a typed [`crate::CoreError`] by [`super::to_openapi`], not here).
@@ -183,16 +185,39 @@ fn write_security_scheme(out: &mut String, name: &str, scheme: &SecurityScheme) 
 }
 
 /// Emit a [`SchemaObject`] body with keys in fixed order: `type`, `format`, `description`, `enum`,
-/// `required`, `properties`, `items`, `additionalProperties`, `$ref`.
+/// `required`, `properties`, `items`, `additionalProperties`, `oneOf`, `$ref`.
+///
+/// Nullability is rendered as the 3.1 type array form `type: ["<type>", "null"]` when
+/// [`SchemaObject::nullable`] is set; a `oneOf` composition (a union, or the nullable-`$ref` form) is
+/// emitted as a block sequence of variant schemas.
 fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     let pad = INDENT.repeat(depth);
-    // A bare `$ref` schema emits ONLY the `$ref` key (a `$ref` sibling-keys-are-ignored rule).
+    // A bare `$ref` schema emits ONLY the `$ref` key (a `$ref` sibling-keys-are-ignored rule). A
+    // nullable `$ref` is carried as a `oneOf` (handled below), never as a sibling key beside `$ref`.
     if let Some(schema_ref) = &schema.schema_ref {
         let _ = writeln!(out, "{pad}$ref: {}", ref_pointer(schema_ref));
         return;
     }
+    // A `oneOf` composition (union / nullable-$ref) emits the variant sequence and nothing else.
+    if !schema.one_of.is_empty() {
+        let _ = writeln!(out, "{pad}oneOf:");
+        for variant in &schema.one_of {
+            // `- ` opens each variant; the first key of the variant goes on the dash line.
+            write_schema_seq_item(out, variant, depth);
+        }
+        return;
+    }
     if let Some(type_name) = &schema.type_name {
-        let _ = writeln!(out, "{pad}type: {type_name}");
+        // 3.1 nullability: render `type: ["<type>", "null"]` instead of the scalar form.
+        if schema.nullable {
+            let _ = writeln!(
+                out,
+                "{pad}type: {}",
+                flow_seq(&[type_name.clone(), "null".to_string()])
+            );
+        } else {
+            let _ = writeln!(out, "{pad}type: {type_name}");
+        }
     }
     if let Some(format) = &schema.format {
         let _ = writeln!(out, "{pad}format: {format}");
@@ -217,9 +242,31 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
         let _ = writeln!(out, "{pad}items:");
         write_schema(out, items, depth + 1);
     }
-    // NEVER emit `nullable`; free-form maps emit `additionalProperties: true` only.
-    if schema.additional_properties == Some(true) {
+    if let Some(value_schema) = &schema.additional_properties_schema {
+        // A typed map: `additionalProperties:` carries the value schema on indented lines.
+        let _ = writeln!(out, "{pad}additionalProperties:");
+        write_schema(out, value_schema, depth + 1);
+    } else if schema.additional_properties == Some(true) {
         let _ = writeln!(out, "{pad}additionalProperties: true");
+    }
+}
+
+/// Emit one block-sequence item (`- ...`) for a `oneOf` variant. A bare-`$ref` or type-only variant is
+/// compact (`- $ref: ...` / `- type: null`); a richer variant places its body on indented lines under
+/// the dash.
+fn write_schema_seq_item(out: &mut String, schema: &SchemaObject, depth: usize) {
+    let pad = INDENT.repeat(depth);
+    // Render the variant body into its own buffer (indented one level deeper), then re-flow the first
+    // line onto the `- ` dash so the sequence is canonical block-style YAML.
+    let mut buf = String::new();
+    write_schema(&mut buf, schema, depth + 1);
+    let mut lines = buf.lines();
+    if let Some(first) = lines.next() {
+        let first_trimmed = first.trim_start();
+        let _ = writeln!(out, "{pad}- {first_trimmed}");
+        for rest in lines {
+            let _ = writeln!(out, "{rest}");
+        }
     }
 }
 
