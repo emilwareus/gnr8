@@ -1,0 +1,15 @@
+{
+  "name": "tsextract",
+  "version": "0.1.0",
+  "private": true,
+  "description": "gnr8 TypeScript source sidecar: turns a NestJS service into the neutral JSON facts contract via the TypeScript Compiler API. Sole dependency is typescript (the documented CLAUDE.md rule-2 carve-out). Never executes the target; never reads swagger/zod/class-validator (rule 1).",
+  "bin": {
+    "tsextract": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "typescript": "5.9.3"
+  }
+}

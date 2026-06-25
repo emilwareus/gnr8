@@ -199,6 +199,64 @@ impl Source for Flask {
     }
 }
 
+/// The NestJS (TypeScript) source: wraps [`crate::analyze::build_graph`] (the tsextract subprocess
+/// driver), a verbatim twin of [`FastApi`]/[`Flask`]/[`GoGin`] differing only in the error proper
+/// noun.
+///
+/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
+/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
+/// TARGET (the `*.ts` tree), never from which Source was used (CLAUDE.md rule 3/4): there is no
+/// per-Source extraction fork.
+#[derive(Debug, Default, Clone)]
+pub struct NestJs {
+    inputs: Vec<String>,
+}
+
+impl NestJs {
+    /// A NestJS source with no inputs yet (configure with [`NestJs::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for NestJs {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "NestJs source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "NestJs source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------------
@@ -673,8 +731,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, OpenApi31, PostProcess,
-        PySdk, SetBasePath, SetTitle, Source, Target, Transform,
+        sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
+        PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform,
     };
     use crate::graph::ApiGraph;
     use crate::sdk::Artifacts;
@@ -816,6 +874,28 @@ mod tests {
                 Err(crate::CoreError::Config { .. })
             ),
             "Flask with many inputs must be a Config error"
+        );
+    }
+
+    #[test]
+    fn nestjs_source_errors_when_unconfigured() {
+        // The TypeScript source rejects zero inputs and many inputs with a typed Config error,
+        // exactly like the Python/Go sources — the single-input guard is identical; only the proper
+        // noun differs. It calls the SAME build_graph (language detected from the target, rule 3/4).
+        let cx = cx();
+        assert!(
+            matches!(
+                NestJs::new().load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "NestJs with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                NestJs::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "NestJs with many inputs must be a Config error"
         );
     }
 

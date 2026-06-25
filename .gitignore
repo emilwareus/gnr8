@@ -35,6 +35,15 @@ target
 __pycache__/
 *.pyc
 
+# Node sidecar dependencies.
+# VENDORING DECISION (04-01, Option A — hermetic): the tsextract sidecar's SOLE dependency
+# (`typescript`, the documented rule-2 carve-out — zero transitive deps, ~23M) is COMMITTED so tests
+# run offline with no `npm ci` step, mirroring the Go test's offline ethos. Ignore node_modules
+# everywhere by default, then NEGATE for tsextract/ so the vendored typescript stays tracked.
+node_modules/
+!tsextract/node_modules/
+!tsextract/node_modules/**
+
 # GSD transient state / sensitive auth-capture inbox — never commit
 .planning/HANDOFF.json
 .planning/.pending-auth-captures.*
