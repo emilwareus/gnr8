@@ -759,10 +759,7 @@ mod tests {
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
-        assert!(
-            message.contains("non-object/non-enum body"),
-            "{message}"
-        );
+        assert!(message.contains("non-object/non-enum body"), "{message}");
     }
 
     #[test]
@@ -845,7 +842,10 @@ mod tests {
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
         let block = block.split("GoalResponse:").next().unwrap_or(block);
-        assert!(block.contains("oneOf:"), "nullable $ref must use oneOf:\n{block}");
+        assert!(
+            block.contains("oneOf:"),
+            "nullable $ref must use oneOf:\n{block}"
+        );
         assert!(
             block.contains("$ref: '#/components/schemas/TargetDirection'"),
             "{block}"
@@ -875,7 +875,10 @@ mod tests {
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
         let block = block.split("GoalResponse:").next().unwrap_or(block);
-        assert!(block.contains("oneOf:"), "union must lower to oneOf:\n{block}");
+        assert!(
+            block.contains("oneOf:"),
+            "union must lower to oneOf:\n{block}"
+        );
         assert!(
             block.contains("- type: string") && block.contains("- type: integer"),
             "oneOf must carry each lowered variant:\n{block}"

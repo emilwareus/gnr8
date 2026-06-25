@@ -14,10 +14,15 @@
 //!   `cargo test -p gnr8-core --test snapshot_fastapi_openapi -- --ignored`  (FAILS at the .expect()).
 
 // Tests legitimately use unwrap/expect; scoped allow keeps RUST-04 intact for production code.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `doc_markdown` is allowed too: these test-target doc comments are prose that names many
+// proper nouns (FastAPI, OpenAPI, pyextract, ...) where backtick-per-noun hurts readability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 /// The static FastAPI bookstore fixture, resolved relative to this crate's manifest dir.
-const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/fastapi-bookstore");
+const FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/fastapi-bookstore"
+);
 
 /// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4):
 /// security is SUPPLIED by code-as-config, never scraped from the source. One `ApiKeyAuth` /

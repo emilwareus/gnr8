@@ -11,10 +11,15 @@
 //!   `cargo test -p gnr8-core --test snapshot_nestjs_openapi -- --ignored`  (FAILS at the .expect()).
 
 // Tests legitimately use unwrap/expect; scoped allow keeps RUST-04 intact for production code.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `doc_markdown` is allowed too: these test-target doc comments are prose that names many
+// proper nouns (NestJS, OpenAPI, tsextract, ...) where backtick-per-noun hurts readability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 /// The static NestJS bookstore fixture, resolved relative to this crate's manifest dir.
-const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/nestjs-bookstore");
+const FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/nestjs-bookstore"
+);
 
 /// The fixture's security schemes — code-as-config (CLAUDE.md rule 4); security is supplied, never
 /// scraped. One `ApiKeyAuth` / `X-API-Key` scheme.

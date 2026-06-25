@@ -14,10 +14,15 @@
 
 // Tests legitimately use unwrap/expect; scope the allow to this test target so the workspace-wide
 // RUST-04 deny stays intact for production code (Pitfall 2).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `doc_markdown` is allowed too: these test-target doc comments are prose that names many
+// proper nouns (FastAPI, OpenAPI, pyextract, ...) where backtick-per-noun hurts readability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 /// The static FastAPI bookstore fixture, resolved relative to this crate's manifest dir.
-const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/fastapi-bookstore");
+const FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/fastapi-bookstore"
+);
 
 #[test]
 #[ignore = "red-by-design: pyextract lands in Phase 2; intended-green snapshot is the acceptance contract"]

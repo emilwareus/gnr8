@@ -329,7 +329,6 @@ mod tests {
         use super::SAMPLE;
         use crate::analyze::facts::{GoFacts, Prim, Type, WellKnown};
 
-
         #[test]
         fn deserializes_sample_facts_without_error() {
             let facts: GoFacts = serde_json::from_slice(SAMPLE).unwrap();
@@ -417,7 +416,10 @@ mod tests {
                     assert!(matches!(variants[0], Type::Primitive(Prim::String)));
                     assert!(matches!(
                         variants[1],
-                        Type::Primitive(Prim::Int { bits: 64, signed: true })
+                        Type::Primitive(Prim::Int {
+                            bits: 64,
+                            signed: true
+                        })
                     ));
                 }
                 other => panic!("expected union, got {other:?}"),
@@ -647,5 +649,4 @@ mod tests {
             );
         }
     }
-
 }

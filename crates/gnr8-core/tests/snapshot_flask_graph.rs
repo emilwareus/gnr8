@@ -12,10 +12,15 @@
 //!   `cargo test -p gnr8-core --test snapshot_flask_graph -- --ignored`  (FAILS at the .expect()).
 
 // Tests legitimately use unwrap/expect; scoped allow keeps RUST-04 intact for production code.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// `doc_markdown` is allowed too: these test-target doc comments are prose that names many
+// proper nouns (Flask, OpenAPI, pyextract, ...) where backtick-per-noun hurts readability.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
 /// The static Flask bookstore fixture, resolved relative to this crate's manifest dir.
-const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/flask-bookstore");
+const FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/flask-bookstore"
+);
 
 #[test]
 #[ignore = "red-by-design: pyextract lands in Phase 2; intended-green snapshot is the acceptance contract"]

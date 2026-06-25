@@ -367,9 +367,7 @@ fn normalize_type(ty: Type) -> Type {
             members.sort();
             Type::Enum(members)
         }
-        Type::Union(variants) => {
-            Type::Union(variants.into_iter().map(normalize_type).collect())
-        }
+        Type::Union(variants) => Type::Union(variants.into_iter().map(normalize_type).collect()),
         Type::Any {} => Type::Any {},
     }
 }

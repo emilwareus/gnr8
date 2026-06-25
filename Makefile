@@ -3,13 +3,22 @@
 # `make check` is the full LOCAL gate and mirrors CI. It runs fmt-check, clippy
 # (--locked, -D warnings), the test suite, and the Go fixture build/vet.
 #
-# As of Phase 3 (D-07) the red-by-design era is OVER: all four contract tests
-# (snapshot_graph/diagnostics/openapi/sdk) are GREEN, and `make gates` now runs them as the
-# blocking set alongside determinism + the new sdk_compile test (temp dir + zero-require go.mod +
-# go build + httptest smoke, SDK-05). The standalone `contract` target is retired — there are no
-# longer any red-by-design failures to isolate. `make gates` mirrors the blocking CI `gates` job.
+# The Go contract tests (snapshot_graph/diagnostics/openapi/sdk) are GREEN, and `make gates` runs
+# them as the blocking set alongside determinism + the sdk_compile test (temp dir + zero-require
+# go.mod + go build + httptest smoke, SDK-05).
+#
+# Milestone v2.0 (Phase 1) reintroduces a CONTROLLED red-by-design set: the multi-language
+# acceptance contract. Three static fixture services — fastapi-bookstore, flask-bookstore,
+# nestjs-bookstore — ship with six intended-green snapshot tests
+# (snapshot_{fastapi,flask,nestjs}_{graph,openapi}) that are RED by design today: no py/ts extractor
+# exists yet, so build_graph panics honestly at the test's `.expect()`. These six are marked
+# `#[ignore]` so `cargo test` (the `test:` target) SKIPS them and the green gate stays green; they
+# are NEVER in the blocking `gates:` list. They remain visible and runnable on demand via
+# `make red` (or `cargo test -p gnr8-core --test snapshot_fastapi_graph -- --ignored`, etc.), where
+# they fail honestly. They flip green with ZERO snapshot edits when pyextract (Phase 2) and
+# tsextract (Phase 4) land. `make gates` mirrors the blocking CI `gates` job.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build check all
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all
 
 # Auto-format the workspace in place.
 fmt:
@@ -23,7 +32,8 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
-# Full test suite — every test is now green (the red-by-design era ended in Phase 3).
+# Full test suite. The six multi-language acceptance snapshots are `#[ignore]`d (red-by-design,
+# Phase 1 / Milestone v2.0), so this run SKIPS them and stays green; run them on demand via `make red`.
 test:
 	cargo test --all-features
 
@@ -52,7 +62,19 @@ fixture-build:
 goextract-build:
 	cd goextract && go build ./... && go vet ./... && go test ./...
 
-# Full local gate, mirrors CI. The whole suite is green now (no red-by-design failures remain).
+# Show the red-by-design multi-language acceptance contract ON DEMAND (Phase 1 / v2.0). These six
+# `#[ignore]`d snapshots are the intended-green graph + OpenAPI for the FastAPI/Flask/NestJS fixtures;
+# they fail honestly at the `.expect()` until pyextract (Phase 2) / tsextract (Phase 4) land. They are
+# NOT part of `make check`/`gates` — this target exists so reviewers can SEE the honest red. The `-`
+# prefix lets the recipe report the failures without aborting the make invocation.
+red:
+	-cargo test -p gnr8-core \
+		--test snapshot_fastapi_graph --test snapshot_fastapi_openapi \
+		--test snapshot_flask_graph --test snapshot_flask_openapi \
+		--test snapshot_nestjs_graph --test snapshot_nestjs_openapi -- --ignored
+
+# Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
+# multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.
 check: fmt-check clippy test fixture-build goextract-build
 
 all: check
