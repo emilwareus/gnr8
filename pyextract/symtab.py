@@ -67,10 +67,11 @@ UNRESOLVABLE = _Unresolvable()
 class _ModuleIndex:
     """The per-module index of classes, aliases, and imports."""
 
-    __slots__ = ("dotted", "classes", "aliases", "imports")
+    __slots__ = ("dotted", "abs_path", "classes", "aliases", "imports")
 
-    def __init__(self, dotted):
+    def __init__(self, dotted, abs_path):
         self.dotted = dotted
+        self.abs_path = abs_path
         self.classes = {}
         self.aliases = {}
         self.imports = {}
@@ -99,7 +100,7 @@ class SymbolTable:
 
     @staticmethod
     def _build_index(module):
-        idx = _ModuleIndex(module.dotted)
+        idx = _ModuleIndex(module.dotted, getattr(module, "abs_path", ""))
         for stmt in module.tree.body:
             if isinstance(stmt, ast.ClassDef):
                 idx.classes[stmt.name] = stmt
