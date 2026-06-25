@@ -270,10 +270,6 @@ schemas:
       end_line: 49
 diagnostics:
   - severity: WARN
-    message: "untyped request body on POST /raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
-    file: app/routes.py
-    line: 78
-  - severity: WARN
     message: "untyped query param 'q' on GET /: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
     file: app/routes.py
     line: 42
@@ -281,6 +277,10 @@ diagnostics:
     message: "untyped response on POST /raw: handler has no return annotation; response shape under-specified, no schema inferred"
     file: app/routes.py
     line: 69
+  - severity: WARN
+    message: "untyped request body on POST /raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
+    file: app/routes.py
+    line: 78
 base_path: /
 title: API
 security: []
