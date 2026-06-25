@@ -8,11 +8,12 @@
 // non-zero exit to `HelperExit` and unparsable stdout to `FactsParse` — so the contract is strict:
 // stdout is the facts JSON and nothing else.
 //
-// 04-02 plugs the real extractor CORE into this entrypoint: the loader builds a
+// 04-02 plugged the real extractor CORE into this entrypoint: the loader builds a
 // `ts.Program` + `TypeChecker` over the target's `*.ts` (static-only — rule 1/3, never
 // executed), and the schema builder collects the DTO classes/aliases into neutral
-// SchemaFacts. Route recognition (the @Controller/@Get walk) lands in 04-03, so `routes`
-// stays `[]` this wave; the 2 NestJS snapshots remain red until then.
+// SchemaFacts. 04-03 adds NestJS route recognition (the @Controller/@Get/@Param walk):
+// the recognizer seeds the schema registry with every DTO referenced from a route
+// param/body/response, so the transitive schema collection follows the ROUTE roots.
 
 const path = require("path");
 const fs = require("fs");
@@ -20,7 +21,8 @@ const fs = require("fs");
 const load = require("./load");
 const facts = require("./facts");
 const { Diagnostics } = require("./diagnostics");
-const { buildSchemas } = require("./schemas");
+const { buildSchemas, Registry } = require("./schemas");
+const { recognizeNestController } = require("./routes");
 
 // Build the neutral facts document for `targetDir`.
 //
@@ -33,10 +35,17 @@ function run(targetDir) {
   const diags = new Diagnostics();
   const loaded = load.load(targetDir, diags);
 
-  const schemas = buildSchemas(loaded, diags);
+  // Recognize routes FIRST, seeding a shared registry with every DTO referenced
+  // from a route param/body/response (the W2 transitive collection roots). The
+  // schema builder then drains that registry (plus the direct DTO roots) to a
+  // fixpoint, so a type reachable only via a route (and onward through its
+  // fields/union arms) is still emitted.
+  const registry = new Registry();
+  const routes = recognizeNestController(loaded, diags, registry);
+
+  const schemas = buildSchemas(loaded, diags, registry);
 
   const module = path.basename(targetDir);
-  const routes = []; // NestJS route recognition lands in 04-03.
 
   const doc = facts.buildDoc(module, routes, schemas, diags.items());
   return facts.marshal(doc);

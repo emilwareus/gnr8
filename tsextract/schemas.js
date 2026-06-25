@@ -60,11 +60,21 @@ class Registry {
 }
 
 // Build the full sorted-by-id list of SchemaFact objects for a loaded program.
-function buildSchemas(loaded, diags) {
-  const registry = new Registry();
+//
+// `registry` may be PRE-SEEDED by the route recognizer (04-03): every DTO
+// referenced from a route param/body/response is enqueued there first, so the
+// fixpoint collects exactly the transitively-reachable set. When omitted, a fresh
+// registry is used and seeded from the direct DTO roots below. Either way the
+// direct-root seeding runs too (a class/alias declared in the target is a root),
+// and the two converge to the same closure.
+function buildSchemas(loaded, diags, registry) {
+  if (!registry) {
+    registry = new Registry();
+  }
 
   // Seed roots: every exported DTO class + every union-bearing alias declared in
-  // the target. (Direct roots this wave; routes seed in 04-03.)
+  // the target. Combined with any route-seeded refs already in the registry, the
+  // fixpoint follows named refs through fields AND union arms to closure.
   _seedRoots(loaded, registry);
 
   const facts = [];
