@@ -58,7 +58,12 @@ paths, static-only extraction, deterministic byte-identical output).
   2. The Rust host deserializes the shared facts contract strictly (`#[serde(deny_unknown_fields)]`); OpenAPI lowering + SDK generation consume the IR with no per-language branches.
   3. FastAPI, Flask, and NestJS fixture services exist and encode the v2.0 acceptance cases.
   4. Red-by-design snapshots for each fixture are committed and visibly failing before any extraction lands.
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Neutral Type enum + facts contract (facts.rs serde + facts.go json tags + graph IR) in lockstep; optional/nullable axes [IR-01, IR-02]
+- [ ] 01-02-PLAN.md — Consumers: lower/ + gosdk/ exhaustive Type match (no per-language branch), fix optional/nullable + 3.1 nullable rendering, re-accept Go snapshots green [IR-03]
+- [ ] 01-03-PLAN.md — FastAPI/Flask/NestJS fixtures + red-by-design graph/OpenAPI snapshots, kept visible but out of the green gate [IR-04]
 
 ### Phase 2: Python Source — `pyextract`
 **Goal**: A developer can turn a real FastAPI service (full) and a Flask service (typed envelope) into the neutral IR via a static `pyextract` sidecar that never imports or executes the target code, so the existing Rust lowering produces OpenAPI 3.1 for Python services unchanged.
