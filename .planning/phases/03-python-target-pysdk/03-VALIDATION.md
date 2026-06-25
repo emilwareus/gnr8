@@ -39,7 +39,7 @@ created: 2026-06-25
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
 | 03-W1 | 1x | 1 | PYSDK-01 | — | `pysdk/` emit/bundle: stdlib-urllib client, @dataclass models (required-first ordering), typed ApiError, exhaustive Type match incl. Union/inline-Enum (no `_=>`); 3.9-safe annotations | unit | `cargo test -p gnr8-core` | ❌ W0 | ⬜ pending |
-| 03-W2 | 2x | 2 | PYSDK-03 | — | `PySdk` Target built-in drives the Pipeline; byte-identical deterministic output | unit | `cargo test -p gnr8-core --test sdk_pipeline` | ✅ | ⬜ pending |
+| 03-W2 | 2x | 2 | PYSDK-03 | — | `PySdk` Target built-in drives the Pipeline; byte-identical deterministic output | unit | `cargo test -p gnr8-core builtins` | ✅ | ⬜ pending |
 | 03-W3 | 3x | 3 | PYSDK-02 | T-sdk-hermetic | Generated SDK compiles + imports + round-trips against stdlib http.server (2xx dataclass, 4xx typed ApiError); no third-party HTTP dep | integration | `cargo test -p gnr8-core --test pysdk_compile` | ✅ | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
