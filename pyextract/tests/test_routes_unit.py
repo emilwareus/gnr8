@@ -88,5 +88,49 @@ class FlaskQueryParamTargetTests(unittest.TestCase):
         self.assertEqual(len(diags.items()), 1)
 
 
+class FastAPIKwOnlyParamTests(unittest.TestCase):
+    """WR-06: keyword-only params (after ``*``) are common in FastAPI handlers and
+    must NOT be silently dropped; required-ness comes from ``kw_defaults``. Also
+    positional-only params (before ``/``) must count in default alignment."""
+
+    def _params(self, source, path="/"):
+        func = _func(source)
+        module = _FakeModule("app.main", source)
+        table = SymbolTable([module])
+        diags = Diagnostics()
+        params, _body = routes._build_params(
+            func, path, "app.main", module.abs_path, table, diags
+        )
+        return {p["name"]: p for p in params}, diags
+
+    def test_keyword_only_param_is_emitted(self):
+        src = (
+            "def handler(*, genre: str, sort: str = 'asc'):\n"
+            "    pass\n"
+        )
+        params, _diags = self._params(src)
+        # Both kwonly params must appear (not dropped).
+        self.assertIn("genre", params)
+        self.assertIn("sort", params)
+        # genre has no kw_default -> required; sort has one -> not required.
+        self.assertTrue(params["genre"]["required"])
+        self.assertFalse(params["sort"]["required"])
+        self.assertEqual(params["genre"]["location"], "query")
+
+    def test_positional_only_default_alignment(self):
+        # def f(a, b, /, c='x') — posonlyargs a,b; args c with one END-aligned default.
+        src = (
+            "def handler(a: str, b: int, /, c: str = 'x'):\n"
+            "    pass\n"
+        )
+        params, _diags = self._params(src)
+        self.assertIn("a", params)
+        self.assertIn("b", params)
+        self.assertIn("c", params)
+        self.assertTrue(params["a"]["required"])
+        self.assertTrue(params["b"]["required"])
+        self.assertFalse(params["c"]["required"])
+
+
 if __name__ == "__main__":
     unittest.main()

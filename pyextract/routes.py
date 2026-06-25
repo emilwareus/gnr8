@@ -119,13 +119,24 @@ def _path_param_names(path):
     return names
 
 
-def _has_default(args, index):
-    """Whether the positional arg at ``index`` carries a default value.
+def _positional_args(args):
+    """The full positional arg list in source order: posonlyargs THEN args.
 
-    Python aligns defaults to the END of the positional args: a function with N
-    positional args and D defaults gives the last D args their defaults.
+    ``args.defaults`` aligns to the END of this combined list, so positional-only
+    params (``def f(a, b, /, ...)``) must be counted here or the default-alignment
+    math is off-by-len(posonlyargs) (WR-06).
     """
-    total = len(args.args)
+    return list(getattr(args, "posonlyargs", [])) + list(args.args)
+
+
+def _has_default(args, index):
+    """Whether the positional arg at ``index`` (into ``_positional_args``) has a default.
+
+    Python aligns defaults to the END of the combined positional list
+    (posonlyargs + args): N positional args with D defaults give the last D their
+    defaults.
+    """
+    total = len(_positional_args(args))
     num_defaults = len(args.defaults)
     return index >= total - num_defaults
 
@@ -187,7 +198,9 @@ def _build_params(func, path, in_module, abs_path, table, diags):
     params = []
     request_body = None
     path_names = _path_param_names(path)
-    pos = func.args.args
+
+    # Positional + positional-only params: defaults END-align over the combined list.
+    pos = _positional_args(func.args)
     for index, arg in enumerate(pos):
         annotation = arg.annotation
         if annotation is None:
@@ -209,6 +222,42 @@ def _build_params(func, path, in_module, abs_path, table, diags):
             required = True
         else:
             required = not _has_default(func.args, index)
+        params.append(
+            {
+                "name": arg.arg,
+                "location": "path" if in_path else "query",
+                "required": required,
+                "schema": schema,
+                "span": _span(abs_path, arg),
+            }
+        )
+
+    # Keyword-only params (after ``*``): FastAPI commonly uses these for query
+    # params. They are NOT in ``args.args``, so without this loop they would be
+    # silently dropped (WR-06). Required-ness is per-slot: ``kw_defaults[i] is
+    # None`` means no default (required). A kwonly param is never a path param.
+    kwonly = func.args.kwonlyargs
+    kw_defaults = func.args.kw_defaults
+    for index, arg in enumerate(kwonly):
+        annotation = arg.annotation
+        if annotation is None:
+            continue
+        body_ref = _resolves_to_class(annotation, in_module, table)
+        if body_ref is not None and arg.arg not in path_names:
+            if request_body is None:
+                request_body = {"ref_id": body_ref}
+            continue
+        in_path = arg.arg in path_names
+        schema, _nullable = types.map_field_annotation(
+            annotation, in_module, table, diags
+        )
+        if schema is None:
+            continue
+        if in_path:
+            required = True
+        else:
+            has_default = index < len(kw_defaults) and kw_defaults[index] is not None
+            required = not has_default
         params.append(
             {
                 "name": arg.arg,
