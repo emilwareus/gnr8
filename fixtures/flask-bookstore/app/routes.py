@@ -5,15 +5,17 @@ the operation paths in the neutral graph are group-relative (`/`, `/<int:order_i
 and the `/orders` prefix is a lowering-time base path (rule 1: never folded into
 the code-derived path). Path params use Flask's `<int:order_id>` converter.
 
-The HONEST envelope (PYSRC-02):
-  - Typed handlers that build/return a typed `@dataclass` DTO and read a typed DTO
-    request body ARE fully code-inferable -> facts.
-  - The genuinely UNTYPED spots (a raw `request.json` read, a stringly-typed
-    `request.args.get(...)` query with no annotation) are NOT facts; the Phase-2
-    extractor must emit a DIAGNOSTIC for them, never guess (rule 3). They are
-    marked `# UNTYPED -> diagnostic in Phase 2` below.
+The HONEST envelope (PYSRC-02): typed handlers -> facts; raw `request.json` /
+unannotated `request.args.get(...)` -> a DIAGNOSTIC, never a guess (rule 3).
 
 No app runs this phase (no `pip install`); this is the static source pyextract reads.
+
+The blank lines / comments below carry NO API fact (rule 1): they exist only to land
+each AST anchor on the line the committed snapshot asserts — every fact still derives
+purely from the decorator Call, the typed signature, and the annotated body reads.
+This is the honest second-class envelope: Flask bodies are plain `request.json`
+unless the author opts in to a typed DTO, so the genuinely untyped spots become
+diagnostics (the limit is visible in `create_order_raw` below).
 """
 
 from __future__ import annotations
@@ -32,7 +34,9 @@ def list_orders() -> OrderConfirmation:
     Query params:
       - status : read via the framework's typed query helper (typed) -> a fact.
       - q      : raw stringly-typed read with no annotation -> UNTYPED, diagnostic.
-    Response: 200 -> `OrderConfirmation` ($ref).
+
+    Response: 200 -> `OrderConfirmation` ($ref). The status is method-derived
+    (GET -> 200), a code fact; the docstring is never read for it (rule 1).
     """
     status: str = request.args.get("status", "in_stock")  # typed query -> fact
     q = request.args.get("q")  # UNTYPED -> diagnostic in Phase 2 (no annotation)
@@ -44,8 +48,7 @@ def list_orders() -> OrderConfirmation:
 def create_order() -> OrderConfirmation:
     """POST /orders/ — a typed request DTO body + a typed response.
 
-    Request body: `OrderInput` (the optional x nullable matrix + a union).
-    Response: 201 -> `OrderConfirmation` ($ref).
+    Body: `OrderInput`; status method-derived (POST -> 201), a code fact (OQ1).
     """
     order: OrderInput = OrderInput(**request.json)  # typed DTO body -> fact
     _ = order
@@ -68,8 +71,9 @@ def create_order_raw():
 
     The body is read straight from `request.json` with NO typed DTO and NO return
     annotation, so neither the request body nor the response is a fact: the
-    Phase-2 extractor must emit a DIAGNOSTIC (rule 3, no guessing). This route
-    exists to prove the honest-envelope LIMIT is visible in the fixture.
+    Phase-2 extractor must emit a DIAGNOSTIC (rule 3, no guessing). The extra
+    non-fact prose here (rule 1) only positions the `request.json` read on the
+    snapshot's asserted line; it encodes nothing about the API surface itself.
     """
     payload = request.json  # UNTYPED -> diagnostic in Phase 2 (no DTO)
     _ = payload

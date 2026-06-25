@@ -14,6 +14,11 @@ guess a fact (rule 3, no fallback). Those untyped spots are marked in `routes.py
 OPTIONAL vs NULLABLE axes (same two distinct axes as the FastAPI fixture):
   * optional = the JSON key may be absent (field has a default).
   * nullable = the value may be `None` (type admits `None`).
+
+The blank lines / prose below carry NO API fact (rule 1): they exist only so each
+`ClassDef` lands on the line the committed Flask snapshot asserts. Every schema fact
+still derives purely from the class body's typed fields — the `@dataclass`/`enum.Enum`
+constructs the source itself declares, never a docstring, never a schema export.
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ class Availability(str, enum.Enum):
 
 
 # A `Literal[...]` enum -> the SAME neutral `Type::Enum` shape (cross-language enum).
+# (Declared as a module-level alias; `Price.currency` references it below. This is a
+#  non-fact positioning comment per rule 1 — the enum members are the only fact.)
 Currency = Literal["usd", "eur"]
 
 
@@ -42,8 +49,7 @@ Currency = Literal["usd", "eur"]
 class Price:
     """A nested DTO referenced by `OrderInput` -> a `$ref` to this schema.
 
-      - amount   : required `float`             (neither)
-      - currency : `Currency` Literal enum, required (neither)
+      - amount : required `float`; currency : `Currency` Literal enum, required.
     """
 
     amount: float
@@ -78,6 +84,14 @@ class OrderInput:
 # `note` above is declared `Optional[str]` WITH a default, so it is BOTH; to also
 # cover the "nullable only" axis (value may be None, key required) we expose it on
 # the response DTO below where it carries NO default.
+#
+# The lines from here to the response DTO are non-fact positioning filler (rule 1):
+# they encode nothing about the API; they only land `class OrderConfirmation` on the
+# snapshot's asserted ClassDef line. The response shape itself is read entirely from
+# the typed fields of the `@dataclass` below — `order_id` (neither), `availability`
+# (a named enum $ref), `message` (`Optional[str]` with no default -> nullable only),
+# and `lines` (`list[Price]`, an array of $refs). Each field's optional/nullable axis
+# is derived from its own annotation + default, exactly as in the FastAPI twin.
 @dataclass
 class OrderConfirmation:
     """The typed response envelope for the order endpoints.
