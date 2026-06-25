@@ -43,7 +43,7 @@ paths, static-only extraction, deterministic byte-identical output).
 
 - [x] **Phase 1: Language-Neutral IR + Facts Contract + Fixtures** - Generalize the IR/`Type` model and the shared JSON facts contract to be type-system-neutral; stand up FastAPI/Flask/NestJS fixtures with red-by-design snapshots. No extraction yet. (completed 2026-06-25)
 - [x] **Phase 2: Python Source — `pyextract`** - Static stdlib-`ast` sidecar (FastAPI full, Flask typed-envelope) with an owned cross-module symbol table; `FastApi`/`Flask` Source built-ins; reuse the Rust lowering → OpenAPI. (completed 2026-06-25)
-- [ ] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in.
+- [x] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in. (completed 2026-06-25)
 - [ ] **Phase 4: TypeScript Source — `tsextract`** - NestJS recognizer on the `typescript` Compiler API with bright-line third-party-schema exclusions; `NestJs` Source built-in (the documented rule-2 carve-out).
 - [ ] **Phase 5: TypeScript Target — `TsSdk`** - Dependency-free `fetch`-based typed client; hermetic `tsc --noEmit` typecheck; `TsSdk` Target built-in.
 - [ ] **Phase 6: Cross-Language Hardening + Examples + Docs** - FastAPI + NestJS `.gnr8/` example lifecycles with real committed output; per-language envelope tables in `docs/USAGE.md`; doctor/check/watch parity; cross-language determinism; record the `typescript` carve-out.
@@ -132,7 +132,7 @@ Plans:
 
 **Wave 3** *(blocked on Waves 1-2)*
 
-- [ ] 03-03-PLAN.md — hermetic pysdk_compile test: build_graph(fastapi-bookstore) → generate → py_compile + import + stdlib http.server round-trip (2xx dataclass, 4xx typed ApiError) via injected OpenerDirector; skip-if python3 absent [PYSDK-02]
+- [x] 03-03-PLAN.md — hermetic pysdk_compile test: build_graph(fastapi-bookstore) → generate → py_compile + import + stdlib http.server round-trip (2xx dataclass, 4xx typed ApiError) via injected OpenerDirector; skip-if python3 absent [PYSDK-02]
 
 ### Phase 4: TypeScript Source — `tsextract`
 
@@ -190,7 +190,7 @@ dependencies.)
 |-------|-----------|----------------|--------|-----------|
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
-| 3. Python Target — `PySdk` | v2.0 | 2/3 | In Progress|  |
+| 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 0/TBD | Not started | - |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |

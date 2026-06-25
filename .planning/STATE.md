@@ -4,14 +4,14 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T21:05:46.332Z"
+last_updated: "2026-06-25T21:15:52.606Z"
 last_activity: 2026-06-25 -- Phase 03 execution started
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 10
-  completed_plans: 9
-  percent: 33
+  completed_plans: 10
+  percent: 50
 ---
 
 # Project State
@@ -30,7 +30,7 @@ Plan: 3 of 3
 Status: Executing Phase 03
 Last activity: 2026-06-25 -- Phase 03 execution started
 
-Progress: [█████████░] 90%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Progress: [█████████░] 90%
 | Phase 02 P04 | 35 | 3 tasks | 10 files |
 | Phase 03 P01 | 20m | 3 tasks | 4 files |
 | Phase 03 P02 | 10m | 2 tasks | 3 files |
+| Phase 03 P03 | 35m | 2 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -84,6 +85,8 @@ Recent decisions affecting current work:
 - [Phase ?]: [02-04] Flask typed-envelope: @bp.route/methods= one route per method; Blueprint(url_prefix=) recorded separately (rule 1); <int:> converter -> int64 path param; status method-derived (typed POST->201, else 200) NEVER from a docstring (Q1); untyped request.json/args/return -> diagnostic + omit (rule 3, no fallback). FastAPI/Flask are parallel deterministic recognizers. Both Flask snapshots green via real extraction, zero edits; diagnostics at 42/69/78. Phase 02 complete.
 - [Phase ?]: [03-01] pysdk emit: exhaustive py_type (NO _=>) maps Union->Union[...], inline Enum->Literal[...], named non-object body->type alias (BookOrError=Union[Book,OutOfStock]) — cases the Go target rejects; inline Object stays a typed SdkGen error (parity). @dataclass fields partitioned required-first (3.9-safe; kw_only is 3.10+). Dependency-free urllib Client + injectable OpenerDirector; from __future__ import annotations + fixed typing header. Zero new crates; emitted SDK py_compiles+imports on 3.9.25.
 - [Phase 03]: PySdk Target is a verbatim structural clone of GoSdk reusing sdk_package + ir.base_path as the single source of truth; no new CoreError variant, no second name derivation
+- [Phase 03]: pysdk templated-path f-string emits safe='' (single quotes) — escaped double quotes are a Python 3.9-3.11 SyntaxError — Caught by the new py_compile gate; string-only unit tests missed it
+- [Phase 03]: pysdk named type alias emits a PEP-484 string forward reference (Name = "Union[...]") — Eager module-level alias assignment NameErrored on a later-defined class at import; caught by the import gate
 
 ### Pending Todos
 
@@ -104,7 +107,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T21:04:59.817Z
+Last session: 2026-06-25T21:15:12.804Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
