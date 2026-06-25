@@ -25,7 +25,7 @@
 
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Prim, Type};
+use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -80,24 +80,7 @@ fn split_words(name: &str) -> Vec<String> {
     words
 }
 
-/// Convert an identifier to CamelCase (Python class name): `book_format` → `BookFormat`.
-///
-/// Used for the rare case a Python class name must be derived from a json identifier. Graph schema
-/// `.name`s are already PascalCase symbols and are used verbatim; this exists for symmetry with the Go
-/// twin's `exported` and for deriving class-shaped names where needed.
-pub(crate) fn class_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for word in split_words(name) {
-        let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(&chars.as_str().to_ascii_lowercase());
-        }
-    }
-    out
-}
-
-/// Convert an identifier to snake_case (Python method/attribute name): `createBook` → `create_book`.
+/// Convert an identifier to `snake_case` (Python method/attribute name): `createBook` → `create_book`.
 pub(crate) fn snake(name: &str) -> String {
     split_words(name)
         .iter()
@@ -106,7 +89,7 @@ pub(crate) fn snake(name: &str) -> String {
         .join("_")
 }
 
-/// Convert an enum member value to a SCREAMING_SNAKE identifier: `out-of-stock` → `OUT_OF_STOCK`.
+/// Convert an enum member value to a `SCREAMING_SNAKE` identifier: `out-of-stock` → `OUT_OF_STOCK`.
 pub(crate) fn screaming_snake(value: &str) -> String {
     split_words(value)
         .iter()
@@ -242,7 +225,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
 /// Emit a named enum class: `class {name}(str, enum.Enum)` with `MEMBER = "value"` lines.
 ///
 /// Members are emitted in graph order (already lexically sorted, GRAPH-02). The member identifier is the
-/// SCREAMING_SNAKE form of the value; the value itself is the wire string.
+/// `SCREAMING_SNAKE` form of the value; the value itself is the wire string.
 fn emit_enum_class(out: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
     writeln!(out, "class {name}(str, enum.Enum):").map_err(sink)?;
     if members.is_empty() {
@@ -294,14 +277,366 @@ fn emit_dataclass(
     Ok(())
 }
 
+/// Emit `errors.py`: the typed `ApiError(Exception)` with status/message/slug/hints + `is_not_found()`.
+///
+/// `package` is unused in the body (no package clause in Python) but kept for call-site symmetry with
+/// the Go twin's `emit_errors`. The `from __future__ import annotations` header keeps annotations lazy.
+pub(crate) fn emit_errors(_package: &str) -> String {
+    "\
+from __future__ import annotations
+
+from typing import Any, List, Optional
+
+
+class ApiError(Exception):
+    \"\"\"Raised by operation methods on a non-success response.
+
+    Carries the HTTP status and the decoded error body (message/slug/hints).
+    \"\"\"
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str = \"\",
+        slug: str = \"\",
+        hints: Optional[List[Any]] = None,
+    ) -> None:
+        super().__init__(f\"{status_code} {message} ({slug})\")
+        self.status_code = status_code
+        self.message = message
+        self.slug = slug
+        self.hints = hints if hints is not None else []
+
+    def is_not_found(self) -> bool:
+        return self.status_code == 404
+"
+    .to_string()
+}
+
+/// Emit `client.py`: the dependency-free `Client` backed by an injectable `urllib` `OpenerDirector`.
+///
+/// The operation methods (one per graph operation) are appended to this same file by [`emit_operations`]
+/// and re-frame into `client.py`. The `Client` holds a `base_url`, an optional `api_key`, and an
+/// `OpenerDirector` defaulting to `urllib.request.build_opener()` — the swappable transport seam the
+/// hermetic test injects (RESEARCH Pattern 3). `_do` builds a `urllib.request.Request`, sets the
+/// `Content-Type`/`X-API-Key` headers, opens via the injected opener, and catches
+/// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
+pub(crate) fn emit_client(_package: &str) -> String {
+    "\
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Optional
+
+from .errors import ApiError
+from .models import *  # noqa: F401,F403  (re-export models for return-type annotations)
+
+
+class Client:
+    \"\"\"Dependency-free SDK client over urllib (no requests/httpx).\"\"\"
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_key: Optional[str] = None,
+        opener: Optional[urllib.request.OpenerDirector] = None,
+    ) -> None:
+        self._base_url = base_url.rstrip(\"/\")
+        self._api_key = api_key
+        self._opener = opener or urllib.request.build_opener()
+
+    def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
+        data = json.dumps(body).encode(\"utf-8\") if body is not None else None
+        req = urllib.request.Request(self._base_url + path, data=data, method=method)
+        if data is not None:
+            req.add_header(\"Content-Type\", \"application/json\")
+        if self._api_key:
+            req.add_header(\"X-API-Key\", self._api_key)
+        try:
+            with self._opener.open(req) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    @staticmethod
+    def _raise(status: int, raw: bytes) -> None:
+        try:
+            decoded = json.loads(raw) if raw else {}
+        except ValueError:
+            decoded = {}
+        if not isinstance(decoded, dict):
+            decoded = {}
+        raise ApiError(
+            status,
+            decoded.get(\"message\", \"\"),
+            decoded.get(\"slug\", \"\"),
+            decoded.get(\"hints\"),
+        )
+"
+    .to_string()
+}
+
+/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). Twin of
+/// `gosdk::emit::join_path` — the SAME single source of truth (`ir.base_path`) the `OpenAPI` lowering uses.
+fn join_path(base_path: &str, path: &str) -> String {
+    let base = base_path.trim_end_matches('/');
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        format!("{base}/")
+    } else {
+        format!("{base}/{trimmed}")
+    }
+}
+
+/// Resolve an operation's primary success (lowest 2xx) response status + model name.
+///
+/// Returns the first 2xx response's status regardless of whether it carries a body; the model is `Some`
+/// only when that response has a typed body. An operation with no 2xx response yields `None`. Twin of
+/// `gosdk::emit::success_of`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
+fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<(u16, Option<String>)>, CoreError> {
+    for resp in &op.responses {
+        if (200..300).contains(&resp.status) {
+            let model = match &resp.body {
+                Some(body) => {
+                    let model = graph
+                        .schemas
+                        .iter()
+                        .find(|s| s.id == body.ref_id)
+                        .ok_or_else(|| CoreError::SdkGen {
+                            message: format!(
+                                "operation '{}' success response references dangling $ref '{}'",
+                                op.id, body.ref_id
+                            ),
+                        })?;
+                    Some(model.name.clone())
+                }
+                None => None,
+            };
+            return Ok(Some((resp.status, model)));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve an operation's request-body model name, if it has a typed body. Twin of
+/// `gosdk::emit::body_model_of`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
+fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
+    let Some(body) = &op.request_body else {
+        return Ok(None);
+    };
+    let model = graph
+        .schemas
+        .iter()
+        .find(|s| s.id == body.ref_id)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "operation '{}' request body references dangling $ref '{}'",
+                op.id, body.ref_id
+            ),
+        })?;
+    Ok(Some(model.name.clone()))
+}
+
+/// Extract the `{token}` placeholder names from a path template, in first-seen order. Twin of
+/// `gosdk::emit::path_tokens`.
+fn path_tokens(path: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            tokens.push(after[..close].to_string());
+            rest = &after[close + 1..];
+        } else {
+            break;
+        }
+    }
+    tokens
+}
+
+/// Emit `client.py`'s operation methods (appended to the client file by [`generate`]).
+///
+/// `ops` are all of the graph's operations, in graph order. Each method:
+/// - takes `self`, then path params as positional args, then a typed `body` arg for body-bearing ops,
+///   then optional query params (each defaulting to `None`);
+/// - interpolates each path param through `urllib.parse.quote(str(value), safe="")` (V5 path-injection
+///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
+///   present optional params; joins `base_path` + `op.path`;
+/// - calls `self._do`, and on a status != the operation's real success status raises `ApiError` via
+///   `self._raise`; on success decodes JSON into the response dataclass (or returns the raw dict).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on a dangling body/response `$ref`, or a path whose templated tokens do
+/// not match its declared path params.
+pub(crate) fn emit_operations(
+    graph: &ApiGraph,
+    _package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+) -> Result<String, CoreError> {
+    let mut out = String::new();
+    for op in ops {
+        out.push('\n');
+        emit_operation(&mut out, op, graph, base_path)?;
+    }
+    Ok(out)
+}
+
+/// Emit a single operation method (4-space indented as a `Client` method body).
+fn emit_operation(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    base_path: &str,
+) -> Result<(), CoreError> {
+    let method_name = snake(&op.handler);
+    let abs = join_path(base_path, &op.path);
+    let tokens = path_tokens(&abs);
+
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+
+    // The templated path tokens must be exactly the declared path params (set equality), so neither a
+    // dangling token (a KeyError at runtime) nor an unused arg can slip through (twin of WR-03).
+    let mut token_set: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    token_set.sort_unstable();
+    let mut param_set: Vec<&str> = path_params.iter().map(|p| p.name.as_str()).collect();
+    param_set.sort_unstable();
+    if token_set != param_set {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
+                op.id, abs, tokens, param_set
+            ),
+        });
+    }
+
+    let body_model = body_model_of(op, graph)?;
+    let success = success_of(op, graph)?;
+    let success_status = success.as_ref().map_or(200, |(s, _)| *s);
+    let return_model = success.as_ref().and_then(|(_, m)| m.clone());
+    let return_hint = return_model.clone().unwrap_or_else(|| "Any".to_string());
+
+    // Signature: self, path params (positional), body (typed), then optional query params (= None).
+    let mut args: Vec<String> = vec!["self".to_string()];
+    for p in &path_params {
+        args.push(snake(&p.name));
+    }
+    if let Some(model) = &body_model {
+        args.push(format!("body: {model}"));
+    }
+    for p in &query_params {
+        args.push(format!("{}=None", snake(&p.name)));
+    }
+
+    writeln!(out, "    def {method_name}({}) -> {return_hint}:", args.join(", ")).map_err(sink)?;
+
+    // Build the path: f-string interpolation with each path param percent-escaped (V5).
+    if tokens.is_empty() {
+        writeln!(out, "        path = \"{abs}\"").map_err(sink)?;
+    } else {
+        let mut fstring = abs.clone();
+        for token in &tokens {
+            let placeholder = format!("{{{token}}}");
+            let escaped =
+                format!("{{urllib.parse.quote(str({}), safe=\\\"\\\")}}", snake(token));
+            fstring = fstring.replace(&placeholder, &escaped);
+        }
+        writeln!(out, "        path = f\"{fstring}\"").map_err(sink)?;
+    }
+
+    // Query encoding: collect present (non-None) optional params, urlencode, append to the path.
+    if !query_params.is_empty() {
+        writeln!(out, "        _query = {{}}").map_err(sink)?;
+        for p in &query_params {
+            let arg = snake(&p.name);
+            writeln!(out, "        if {arg} is not None:").map_err(sink)?;
+            writeln!(out, "            _query[\"{}\"] = {arg}", p.name).map_err(sink)?;
+        }
+        writeln!(out, "        if _query:").map_err(sink)?;
+        writeln!(
+            out,
+            "            path = path + \"?\" + urllib.parse.urlencode(_query)"
+        )
+        .map_err(sink)?;
+    }
+
+    // Dispatch: call _do, compare the real success status, raise ApiError otherwise, decode on success.
+    let body_arg = if body_model.is_some() {
+        ", body=body"
+    } else {
+        ""
+    };
+    writeln!(
+        out,
+        "        _status, _raw = self._do(\"{}\", path{body_arg})",
+        op.method
+    )
+    .map_err(sink)?;
+    writeln!(out, "        if _status != {success_status}:").map_err(sink)?;
+    writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
+    if let Some(model) = &return_model {
+        writeln!(out, "        _data = json.loads(_raw) if _raw else {{}}").map_err(sink)?;
+        writeln!(out, "        return {model}(**_data)").map_err(sink)?;
+    } else {
+        writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
+    }
+    Ok(())
+}
+
+/// Emit `__init__.py`: re-export `Client`, `ApiError`, and every model/enum class so `import <pkg>`
+/// exposes the whole surface. Class names are emitted in graph order (deterministic). Twin of the Go
+/// twin's single-package surface (Go has no `__init__`, so this is Python-specific but deterministic).
+pub(crate) fn emit_init(graph: &ApiGraph, _package: &str) -> String {
+    let mut out = String::new();
+    out.push_str("from __future__ import annotations\n\n");
+    out.push_str("from .client import Client\n");
+    out.push_str("from .errors import ApiError\n");
+
+    // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
+    let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
+    if !names.is_empty() {
+        out.push_str("from .models import (\n");
+        for name in &names {
+            let _ = writeln!(out, "    {name},");
+        }
+        out.push_str(")\n");
+    }
+
+    out.push_str("\n__all__ = [\n");
+    out.push_str("    \"Client\",\n");
+    out.push_str("    \"ApiError\",\n");
+    for name in &names {
+        let _ = writeln!(out, "    \"{name}\",");
+    }
+    out.push_str("]\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so
     // the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{class_name, emit_models, py_type, screaming_snake, snake};
-    use crate::graph::{ApiGraph, Prim, Type};
+    use super::{
+        emit_client, emit_errors, emit_init, emit_models, emit_operations, py_type, screaming_snake,
+        snake,
+    };
+    use crate::graph::{ApiGraph, Operation, Prim, Type};
 
     /// A facts document covering the FastApi-bookstore shapes that diverge from the Go target: a named
     /// enum (`BookFormat`), a named union (`BookOrError`), an inline union field (`Book.rating:
@@ -388,11 +723,10 @@ mod tests {
     }
 
     mod casing {
-        use super::{class_name, screaming_snake, snake};
+        use super::{screaming_snake, snake};
 
         #[test]
         fn helpers_produce_python_casings() {
-            assert_eq!(class_name("book_format"), "BookFormat");
             assert_eq!(snake("createBook"), "create_book");
             assert_eq!(snake("listBooks"), "list_books");
             assert_eq!(screaming_snake("hardcover"), "HARDCOVER");
@@ -629,6 +963,215 @@ mod tests {
                 emit_models(&g, "bookstore").unwrap(),
                 "emit_models must be deterministic"
             );
+        }
+    }
+
+    /// A facts document with three operations: a body POST returning a model, a templated-path GET with
+    /// a path param, and a query-bearing GET — enough to exercise path escaping, query encoding, body
+    /// marshalling, success-status comparison, and the typed return decode.
+    const OPS_SAMPLE: &[u8] = br#"{
+      "module": "app",
+      "routes": [
+        {
+          "method": "POST", "path": "/books", "handler": "createBook",
+          "operation_id": "createBook", "params": [],
+          "request_body": { "ref_id": "app.models.Book" },
+          "responses": [
+            { "status": 201, "body": { "ref_id": "app.models.CreatedMessage" } },
+            { "status": 409, "body": { "ref_id": "app.models.OutOfStock" } }
+          ],
+          "span": { "file": "/root/main.py", "start_line": 1, "end_line": 1 }
+        },
+        {
+          "method": "GET", "path": "/books/{book_id}", "handler": "getBook",
+          "operation_id": "getBook",
+          "params": [
+            { "name": "book_id", "location": "path", "required": true,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+              "span": { "file": "/root/main.py", "start_line": 2, "end_line": 2 } }
+          ],
+          "request_body": null,
+          "responses": [ { "status": 200, "body": { "ref_id": "app.models.Book" } } ],
+          "span": { "file": "/root/main.py", "start_line": 2, "end_line": 2 }
+        },
+        {
+          "method": "GET", "path": "/list", "handler": "listBooks",
+          "operation_id": "listBooks",
+          "params": [
+            { "name": "cursor", "location": "query", "required": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "span": { "file": "/root/main.py", "start_line": 3, "end_line": 3 } }
+          ],
+          "request_body": null,
+          "responses": [ { "status": 200, "body": null } ],
+          "span": { "file": "/root/main.py", "start_line": 3, "end_line": 3 }
+        }
+      ],
+      "schemas": [
+        {
+          "id": "app.models.Book", "name": "Book",
+          "body": { "type": "object", "of": [
+            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 }
+        },
+        {
+          "id": "app.models.CreatedMessage", "name": "CreatedMessage",
+          "body": { "type": "object", "of": [
+            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+              "description": null, "example": null },
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.py", "start_line": 2, "end_line": 2 }
+        },
+        {
+          "id": "app.models.OutOfStock", "name": "OutOfStock",
+          "body": { "type": "object", "of": [
+            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.py", "start_line": 3, "end_line": 3 }
+        }
+      ],
+      "diagnostics": []
+    }"#;
+
+    fn ops_graph() -> ApiGraph {
+        let facts = serde_json::from_slice(OPS_SAMPLE).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    mod operations {
+        use super::{emit_operations, ops_graph, Operation};
+
+        fn ops_for<'g>(graph: &'g ApiGraph, handler: &str) -> Vec<&'g Operation> {
+            graph
+                .operations
+                .iter()
+                .filter(|o| o.handler == handler)
+                .collect()
+        }
+
+        use super::ApiGraph;
+
+        #[test]
+        fn body_op_has_snake_method_typed_body_and_typed_return() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("def create_book(self, body: Book) -> CreatedMessage:"),
+                "snake method, typed body, typed return:\n{out}"
+            );
+            // success status is the real 201, not a default 200.
+            assert!(out.contains("if _status != 201:"), "compares real 201:\n{out}");
+            assert!(out.contains("self._raise(_status, _raw)"), "{out}");
+            assert!(out.contains("return CreatedMessage(**_data)"), "{out}");
+            assert!(
+                out.contains("self._do(\"POST\", path, body=body)"),
+                "body op passes body to _do:\n{out}"
+            );
+        }
+
+        #[test]
+        fn templated_path_escapes_each_param_with_urllib_quote() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
+            assert!(
+                out.contains(
+                    "path = f\"/books/{urllib.parse.quote(str(book_id), safe=\\\"\\\")}\""
+                ),
+                "path param must be percent-escaped (V5):\n{out}"
+            );
+            assert!(out.contains("def get_book(self, book_id) -> Book:"), "{out}");
+        }
+
+        #[test]
+        fn query_op_encodes_present_params_and_has_no_body() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(out.contains("def list_books(self, cursor=None) -> Any:"), "{out}");
+            assert!(out.contains("if cursor is not None:"), "{out}");
+            assert!(out.contains("_query[\"cursor\"] = cursor"), "{out}");
+            assert!(
+                out.contains("path = path + \"?\" + urllib.parse.urlencode(_query)"),
+                "{out}"
+            );
+            // body-less success returns the raw decode (None when empty).
+            assert!(out.contains("return json.loads(_raw) if _raw else None"), "{out}");
+            assert!(!out.contains(", body=body"), "query op has no body arg:\n{out}");
+        }
+
+        #[test]
+        fn mismatched_path_token_and_param_is_a_typed_error() {
+            // A path templating {book_id} but a path param named {id} is a typed SdkGen error (WR-03).
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/books/{book_id}", "handler": "getBook",
+                  "operation_id": "getBook",
+                  "params": [
+                    { "name": "id", "location": "path", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
+            assert!(
+                err.to_string().contains("do not match its path params"),
+                "{err}"
+            );
+        }
+    }
+
+    mod client_errors_init {
+        use super::{emit_client, emit_errors, emit_init, ops_graph};
+
+        #[test]
+        fn client_has_injectable_opener_and_no_third_party_imports() {
+            let out = emit_client("bookstore");
+            assert!(
+                out.contains("opener: Optional[urllib.request.OpenerDirector] = None"),
+                "{out}"
+            );
+            assert!(out.contains("urllib.request.build_opener()"), "{out}");
+            assert!(out.contains("except urllib.error.HTTPError as e:"), "{out}");
+            // no third-party HTTP libs (PYSDK-01).
+            assert!(!out.contains("import requests"), "{out}");
+            assert!(!out.contains("import httpx"), "{out}");
+        }
+
+        #[test]
+        fn errors_define_typed_apierror_with_is_not_found() {
+            let out = emit_errors("bookstore");
+            assert!(out.contains("class ApiError(Exception):"), "{out}");
+            assert!(out.contains("self.status_code = status_code"), "{out}");
+            assert!(out.contains("def is_not_found(self) -> bool:"), "{out}");
+            assert!(out.contains("return self.status_code == 404"), "{out}");
+        }
+
+        #[test]
+        fn init_reexports_client_apierror_and_every_model() {
+            let out = emit_init(&ops_graph(), "bookstore");
+            assert!(out.contains("from .client import Client"), "{out}");
+            assert!(out.contains("from .errors import ApiError"), "{out}");
+            assert!(out.contains("    Book,"), "{out}");
+            assert!(out.contains("    CreatedMessage,"), "{out}");
+            assert!(out.contains("\"Client\","), "{out}");
         }
     }
 }
