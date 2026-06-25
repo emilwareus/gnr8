@@ -1,0 +1,96 @@
+# gnr8 CI — RUST-03 quality gates + Go fixture compile + the full (now all-green) contract suite.
+#
+# As of Phase 3 (D-07), all FOUR contract snapshots are GREEN and BLOCKING — the red-by-design era is
+# over. lower::to_openapi (03-01) and sdk::generate (03-02) are implemented and their snapshots
+# reviewed/accepted, so snapshot_openapi + snapshot_sdk join snapshot_graph + snapshot_diagnostics in
+# the blocking `gates` job, alongside the new sdk_compile test (03-03) that materializes the SDK to a
+# hermetic stdlib-only temp module and runs `go build ./...` + an httptest smoke (SDK-05). The former
+# non-blocking `contract` (continue-on-error) job is RETIRED — no continue-on-error remains in this file.
+#
+#   * gates      (BLOCKING)     fmt-check + clippy(-D warnings, --locked) + the full green test set:
+#                               lib + bin + snapshot_graph/diagnostics/openapi/sdk + determinism +
+#                               sdk_compile. These invoke the goextract helper via `go run` and pipe
+#                               generated Go through `gofmt`/`go build`, so the job sets up the Go toolchain.
+#   * go-fixture (BLOCKING)     go build/vet of the standalone Gin fixture module (Pitfall 5)
+#   * goextract  (BLOCKING)     go build/vet/test of the standalone goextract helper module
+#
+# Third-party actions are pinned to major-version tags from well-known publishers (actions/*,
+# dtolnay, Swatinem) per the threat register (T-03-02). GitHub Actions sets CI=true, so insta runs in
+# INSTA_UPDATE=no mode — a missing/mismatched snapshot is a hard failure, never an auto-accept (FIX-04).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # BLOCKING — the RUST-03 gate. Runs the full green test set, now including ALL FOUR contract
+  # snapshots (graph/diagnostics/openapi/sdk) plus the sdk_compile go-build/httptest gate (03-03).
+  # These invoke the goextract helper via `go run`, pipe generated Go through `gofmt`, and run
+  # `go build`/`go test` on the materialized SDK, so the job sets up the Go toolchain (mirrors the
+  # go-fixture/goextract jobs).
+  gates:
+    name: gates (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      # The full green suite: lib + bin unit/parse tests (incl. the pure `watch::tests` loop-safety
+      # filter tests AND the host→child→write `generate_e2e` integration test in `cargo test -p gnr8`)
+      # PLUS all four contract snapshots (snapshot_graph/diagnostics/openapi/sdk) PLUS determinism + the
+      # sdk_compile test (temp dir + zero-require go.mod + go build + httptest smoke, SDK-05) + the
+      # `sdk_pipeline` SDK-framework integration test + the `lifecycle` suite (manifest round-trip + the
+      # pure plan_writes truth table over synthetic Artifacts + the `.gnr8/` crate scaffold +
+      # naming-override $ref rewrites). `generate_e2e` cargo-compiles + runs the scaffolded child crate,
+      # so cargo (already present) + Go are exercised. The timing-tolerant watch_smoke is `#[ignore]`d
+      # (FS-event flakiness) and is deliberately NOT run in CI. CI=true → insta runs INSTA_UPDATE=no, so
+      # a snapshot mismatch hard-fails (FIX-04), never auto-accepts.
+      - name: test (lib + bin + e2e + all four contract tests + sdk_compile + sdk_pipeline + lifecycle)
+        run: |
+          cargo test -p gnr8-core --lib
+          cargo test -p gnr8
+          cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test sdk_pipeline --test lifecycle
+
+  # BLOCKING — the Go fixture is a separate module cargo never compiles; gate it so it can't rot.
+  go-fixture:
+    name: go-fixture (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: go build + vet
+        run: cd fixtures/goalservice && go build ./... && go vet ./...
+
+  # BLOCKING — the goextract helper is a separate module cargo never compiles; gate it.
+  # CGO_ENABLED=0 keeps the build pure-Go (no C toolchain dependency, Pitfall 3). First build
+  # fetches golang.org/x/tools from the module proxy (go.sum committed for reproducibility).
+  goextract:
+    name: goextract (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: go build + vet + test
+        env:
+          CGO_ENABLED: '0'
+        run: cd goextract && go build ./... && go vet ./... && go test ./...
+
+  # The non-blocking `contract` job (continue-on-error) that ran the red-by-design
+  # snapshot_openapi + snapshot_sdk tests has been RETIRED in Phase 3 (D-07): both snapshots are now
+  # green and run as BLOCKING in the `gates` job above. No `continue-on-error` remains in this file.

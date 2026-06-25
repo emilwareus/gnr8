@@ -19,3 +19,18 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# insta snapshot leftovers (pending/unreviewed snapshots — never commit these)
+*.snap.new
+*.pending-snap
+
+# IMPORTANT: Cargo.lock MUST stay committed.
+# gnr8 is a binary project, so the lockfile is required for reproducible builds and
+# for `cargo clippy --locked` in CI (RUST-03 / D-16). Do NOT add a Cargo.lock ignore line.
+
+# scratch / external test copies (not committed)
+.tmp/
+
+# GSD transient state / sensitive auth-capture inbox — never commit
+.planning/HANDOFF.json
+.planning/.pending-auth-captures.*

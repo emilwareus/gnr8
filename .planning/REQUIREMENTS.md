@@ -1,182 +1,127 @@
-# Requirements: gnr8
+# Requirements: gnr8 — Milestone v2.0 (Multi-language: TypeScript & Python)
 
-**Defined:** 2026-06-24
-**Core Value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
+**Defined:** 2026-06-25
+**Core Value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with
+code-based customization and minimal duplicated API descriptions.
+
+Milestone goal: code-first **parsing + dependency-free SDK generation** for **Python (FastAPI +
+Flask)** and **TypeScript (NestJS)**, proving the `ApiGraph` IR is a true language-neutral narrow
+waist. Design brief: `docs/milestone-v2-multi-language.md`. Invariants unchanged (CLAUDE.md): one
+source per fact, no OSS deps in `gnr8-core`, no fallback paths, deterministic byte-identical output.
 
 ## v1 Requirements
 
-### PoC Contract
+Requirements for this milestone. Each maps to exactly one roadmap phase.
 
-- [ ] **POC-01**: The PoC scope is locked to Go source, OpenAPI output, and Go SDK output.
-- [ ] **POC-02**: The first supported router set, OpenAPI target version, Go SDK shape, and `.gnr8/` layout are documented before implementation expands.
-- [ ] **POC-03**: Explicit non-goals prevent dynamic plugins, macro-heavy APIs, graph databases, full framework coverage, and multi-language implementation from entering the PoC.
+### Language-neutral core (IR)
 
-### Rust Foundation
+- [ ] **IR-01**: The IR + JSON facts contract express the cross-language type vocabulary (objects, arrays, enums, optional/nullable, unions) without Go-specific assumptions.
+- [ ] **IR-02**: Every language sidecar emits one shared JSON facts contract the Rust host deserializes strictly (`deny_unknown_fields`); no language terms leak into the IR.
+- [ ] **IR-03**: OpenAPI lowering + SDK generation consume the IR unchanged across all supported languages (no per-language branches in lowering).
+- [ ] **IR-04**: Multi-language fixture services (FastAPI, Flask, NestJS) encode the v2.0 acceptance cases, with red-by-design snapshots in place before extraction lands.
 
-- [ ] **RUST-01**: The repo has a minimal Rust workspace with a thin CLI binary and library modules.
-- [ ] **RUST-02**: The CLI exposes initial `init`, `generate`, `watch`, `check`, `inspect`, and `doctor` command surfaces, even if early commands are skeletal.
-- [ ] **RUST-03**: The codebase passes `cargo fmt`, `cargo test`, and clippy with warnings denied.
-- [ ] **RUST-04**: Library code uses typed errors and avoids production `unwrap` or `expect` paths.
+### Python source extraction (PYSRC)
 
-### Fixtures And Validation
+- [ ] **PYSRC-01**: A developer can extract routes, path/query params, request bodies (Pydantic/`@dataclass`), response models, and status codes from a **FastAPI** service into the IR.
+- [ ] **PYSRC-02**: A developer can extract routes (including blueprint/`APIRouter` prefixes) and opt-in typed DTOs/returns from a **Flask** service into the IR.
+- [ ] **PYSRC-03**: The Python sidecar resolves types **statically** via stdlib `ast` + an owned cross-module symbol table, and never imports/executes the target code.
+- [ ] **PYSRC-04**: Unresolvable or untyped surfaces (untyped `request.json`, dynamic prefixes, foreign types) produce **diagnostics**, never guessed facts (no fallback).
+- [ ] **PYSRC-05**: A developer enables Python extraction from `.gnr8/` code via `FastApi` / `Flask` `Source` built-ins.
 
-- [ ] **FIX-01**: Realistic Go service fixtures exist for the selected router patterns.
-- [ ] **FIX-02**: Fixtures cover path parameters, request bodies, response bodies, JSON tags, optional fields, package boundaries, and at least one unsupported pattern.
-- [ ] **FIX-03**: Snapshot tests cover graph reports, OpenAPI output, Go SDK output, and diagnostics.
-- [ ] **FIX-04**: Fixture tests fail clearly before unsupported behavior is implemented.
+### Python SDK target (PYSDK)
 
-### Go Analysis
+- [ ] **PYSDK-01**: A developer can generate a **dependency-free** Python SDK from the IR (stdlib `urllib`, `@dataclass` models, a typed `ApiError`, an injectable opener).
+- [ ] **PYSDK-02**: The generated Python SDK imports/type-checks and round-trips against the FastAPI fixture in a hermetic test.
+- [ ] **PYSDK-03**: A developer adds the Python SDK to a `.gnr8/` Pipeline via a `PySdk` `Target` built-in; output is deterministic (byte-identical across runs).
 
-- [ ] **GO-01**: The analyzer discovers Go packages and source files for configured inputs.
-- [ ] **GO-02**: The analyzer extracts structs, fields, JSON tags, source spans, and basic schema facts.
-- [ ] **GO-03**: The analyzer maps common Go types, including primitives, pointers, slices, maps, named structs, aliases, and `time.Time`.
-- [ ] **GO-04**: The analyzer recognizes the selected router call patterns and extracts method, path, router family, handler symbol, and source span.
-- [ ] **GO-05**: The analyzer infers request and response schemas for supported typed handler patterns.
-- [ ] **GO-06**: Unsupported or uncertain inference produces diagnostics instead of panics or silent omissions.
+### TypeScript source extraction (TSSRC)
 
-### API Graph And Inspectability
+- [ ] **TSSRC-01**: A developer can extract routes, params, and request/response DTOs from a **NestJS** service (`@nestjs/common` decorators + DTO classes) into the IR.
+- [ ] **TSSRC-02**: The TS sidecar uses the `typescript` Compiler API and derives every schema fact from the source's own types — never from `@nestjs/swagger`, `zod`, or `class-validator`.
+- [ ] **TSSRC-03**: Unsupported or untyped surfaces produce **diagnostics**, never guessed facts (no fallback).
+- [ ] **TSSRC-04**: A developer enables NestJS extraction from `.gnr8/` code via a `NestJs` `Source` built-in.
 
-- [ ] **GRAPH-01**: The internal graph models routes, operations, parameters, request bodies, responses, schemas, generated files, and source provenance.
-- [ ] **GRAPH-02**: Graph node IDs and generated outputs are stable across unchanged runs.
-- [ ] **GRAPH-03**: `inspect routes`, `inspect schemas`, and `inspect graph` explain inferred facts and diagnostics.
+### TypeScript SDK target (TSSDK)
 
-### OpenAPI Output
+- [ ] **TSSDK-01**: A developer can generate a **dependency-free** TypeScript SDK from the IR (built-in `fetch`, typed `interface` models + string-literal-union enums, a typed `ApiError`, a configurable `Client`).
+- [ ] **TSSDK-02**: The generated TS SDK type-checks (`tsc --noEmit`) in a hermetic test.
+- [ ] **TSSDK-03**: A developer adds the TS SDK to a `.gnr8/` Pipeline via a `TsSdk` `Target` built-in; output is deterministic.
 
-- [ ] **OAPI-01**: The OpenAPI writer emits a valid document for the fixture service.
-- [ ] **OAPI-02**: The document includes info, paths, operations, parameters, request bodies, responses, and component schemas.
-- [ ] **OAPI-03**: Lowering emits diagnostics when the selected OpenAPI target cannot represent a graph fact cleanly.
+### Cross-language hardening & examples (XLANG)
 
-### Go SDK Output
-
-- [ ] **SDK-01**: The Go SDK includes a usable client with base URL and custom `http.Client` support.
-- [ ] **SDK-02**: The SDK exposes typed methods for generated operations.
-- [ ] **SDK-03**: The SDK includes generated request and response models.
-- [ ] **SDK-04**: The SDK handles JSON encoding/decoding and typed API errors.
-- [ ] **SDK-05**: The generated SDK compiles and is exercised by fixture tests.
-
-### Workspace And Lifecycle
-
-- [ ] **WS-01**: `gnr8 init` scaffolds a project-local `.gnr8/` workspace with user-owned generator code.
-- [ ] **WS-02**: `.gnr8/` separates checked-in customization from ignored cache/output lifecycle files.
-- [ ] **WS-03**: Users can customize source inputs, routing recognition, OpenAPI output, SDK output, naming, and transport behavior through code.
-- [ ] **WS-04**: Generated-file ownership is tracked well enough to avoid clobbering user-owned files silently.
-
-### Speed And Watch Mode
-
-- [ ] **WATCH-01**: No-op generation avoids rewriting unchanged outputs.
-- [ ] **WATCH-02**: Watch mode reacts to source changes, debounces duplicate events, and avoids loops from generated files.
-- [ ] **WATCH-03**: The PoC reports cold generation, warm no-op, and single-file edit latency for fixture services.
-
-### Hardening And Demo
-
-- [ ] **HARD-01**: `doctor` or equivalent diagnostics summarize unsupported route patterns, stale outputs, and lifecycle issues.
-- [ ] **HARD-02**: A documented demo shows Go source changing, OpenAPI updating, and Go SDK output updating.
-- [ ] **HARD-03**: All PoC tests, snapshots, and Rust quality gates pass before the milestone is considered complete.
+- [ ] **XLANG-01**: A developer drives a **FastAPI** service end-to-end (`gnr8 generate`) → OpenAPI 3.1 + a Python SDK from a `.gnr8/` lifecycle, with real committed example output.
+- [ ] **XLANG-02**: A developer drives a **NestJS** service end-to-end → OpenAPI 3.1 + a TS SDK from a `.gnr8/` lifecycle, with real committed example output.
+- [ ] **XLANG-03**: `docs/USAGE.md` documents the honest per-language supported envelope (FastAPI full; Flask typed-only; NestJS class DTOs), with limits stated.
+- [ ] **XLANG-04**: `gnr8 doctor` / `check` / `watch` work across all supported language sidecars (toolchain detection, drift, loop-safety).
+- [ ] **XLANG-05**: Every sidecar is stdlib-only in its language (Python `ast`; TS = `typescript` only); `gnr8-core` takes zero OSS deps; all output is deterministic.
 
 ## v2 Requirements
 
-### Additional Source Frontends
+Deferred to a future release; tracked, not in this roadmap.
 
-- **TS-01**: Analyze TypeScript framework routes and DTO types.
-- **PY-01**: Analyze Python framework routes, type hints, and model definitions.
-- **RSRC-01**: Analyze Rust web framework routes and Serde schemas.
+### Source frontends
 
-### Additional SDK Targets
+- **FUT-01**: Hono (TypeScript) source extraction (chained RPC + inferred response types).
+- **FUT-02**: Typed-Express / Fastify-with-typed-schema source extraction, where a typed surface exists.
+- **FUT-03**: Rust source frontend + Rust SDK target.
 
-- **TSDK-01**: Generate an idiomatic TypeScript SDK.
-- **PYSDK-01**: Generate an idiomatic Python SDK.
-- **RSDK-01**: Generate an idiomatic Rust SDK.
+### Toolchain
 
-### Advanced Lifecycle
-
-- **ADV-01**: Add deeper graph invalidation or query-level caching if fixture benchmarks prove the need.
-- **ADV-02**: Add richer extension APIs after repeated router and SDK customization pressure.
-
-## User Stories
-
-- As a Go service developer, I can run one command and get OpenAPI plus a Go SDK generated from source code.
-- As a maintainer, I can save a Go file and see generated outputs update quickly without rerunning a fragmented toolchain manually.
-- As a framework-heavy team, I can customize extraction and SDK generation with code instead of maintaining YAML files or duplicated comment strings.
-- As a reviewer, I can inspect what `gnr8` inferred and why unsupported cases were skipped.
-
-## Acceptance Criteria
-
-- The PoC fixture produces a stable graph report, OpenAPI document, and compiling Go SDK.
-- A single supported route or struct edit updates only the affected generated outputs where practical.
-- Unsupported patterns produce actionable diagnostics with source locations.
-- The `.gnr8/` workspace contains editable code customization and keeps cache/output lifecycle files separate.
-
-## Definition of Done
-
-- All v1 requirements are mapped to roadmap phases.
-- Phase tests and fixture snapshots pass.
-- Rust formatting, tests, and clippy gates pass.
-- The demo workflow is documented and reproducible from a fresh checkout.
-- No implementation scope exceeds the Go-to-Go PoC without an explicit roadmap update.
+- **FUT-04**: A stdlib-pure TypeScript extraction path (would retire the `typescript` carve-out, if one ever becomes feasible).
 
 ## Out of Scope
 
+Explicitly excluded for v2.0. Documented to prevent scope creep.
+
 | Feature | Reason |
 |---------|--------|
-| Multi-language source implementation | Go must prove the graph model first. |
-| Multi-language SDK generation | The first Go SDK must be high quality before targets multiply. |
-| Dynamic plugin loading | Too much lifecycle and stability surface before repeated extension pressure exists. |
-| Macro-heavy configuration API | Plain Rust code should be tested first. |
-| Graph database | Stable IDs and typed structs are sufficient for the PoC. |
-| Full Go framework coverage | One or two router styles are enough to validate the loop. |
-| Full OpenAPI 3.2 coverage | Useful modern output matters before complete spec coverage. |
-| Arbitrary handler body interpretation | Static analysis should start with explicit supported patterns and diagnostics. |
-| Wrapping existing generators as the core | The product promise is an owned native pipeline. |
+| Express / Fastify / tRPC / ts-rest source | No typed request/response surface (Express/Fastify) or third-party-schema coupling — `zod` in tRPC/ts-rest is forbidden by rule 1. |
+| Reading `@nestjs/swagger`, `zod`, `class-validator`, `marshmallow` | Third-party annotation/validation tools — gnr8 derives facts from the language's own types (rule 1). |
+| Consuming FastAPI's runtime `/openapi.json` | Another tool's output (rule 1), and it requires running the app. gnr8 derives from source. |
+| Importing/executing the target Python/TS at analysis time | Security boundary — extraction is static only. |
+| Rust source frontend; non-(Go/Py/TS) SDK targets | Out of this milestone's scope (see Future). |
+| Hand-rolled Rust TS parser | Deferred unless the `typescript` carve-out is reversed (multi-month; see FUT-04). |
+| SDKs with third-party HTTP deps (axios / requests / httpx) | Generated SDKs stay dependency-free, like the Go SDK's stdlib `net/http`. |
 
 ## Traceability
 
+Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--reset-phase-numbers`).
+
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| POC-01 | Phase 1 | Pending |
-| POC-02 | Phase 1 | Pending |
-| POC-03 | Phase 1 | Pending |
-| RUST-01 | Phase 1 | Pending |
-| RUST-02 | Phase 1 | Pending |
-| RUST-03 | Phase 1 | Pending |
-| RUST-04 | Phase 1 | Pending |
-| FIX-01 | Phase 1 | Pending |
-| FIX-02 | Phase 1 | Pending |
-| FIX-03 | Phase 1 | Pending |
-| FIX-04 | Phase 1 | Pending |
-| GO-01 | Phase 2 | Pending |
-| GO-02 | Phase 2 | Pending |
-| GO-03 | Phase 2 | Pending |
-| GO-04 | Phase 2 | Pending |
-| GO-05 | Phase 2 | Pending |
-| GO-06 | Phase 2 | Pending |
-| GRAPH-01 | Phase 2 | Pending |
-| GRAPH-02 | Phase 2 | Pending |
-| GRAPH-03 | Phase 2 | Pending |
-| OAPI-01 | Phase 3 | Pending |
-| OAPI-02 | Phase 3 | Pending |
-| OAPI-03 | Phase 3 | Pending |
-| SDK-01 | Phase 3 | Pending |
-| SDK-02 | Phase 3 | Pending |
-| SDK-03 | Phase 3 | Pending |
-| SDK-04 | Phase 3 | Pending |
-| SDK-05 | Phase 3 | Pending |
-| WS-01 | Phase 4 | Pending |
-| WS-02 | Phase 4 | Pending |
-| WS-03 | Phase 4 | Pending |
-| WS-04 | Phase 4 | Pending |
-| WATCH-01 | Phase 4 | Pending |
-| WATCH-02 | Phase 4 | Pending |
-| WATCH-03 | Phase 4 | Pending |
-| HARD-01 | Phase 5 | Pending |
-| HARD-02 | Phase 5 | Pending |
-| HARD-03 | Phase 5 | Pending |
+| IR-01 | Phase 1 | Pending |
+| IR-02 | Phase 1 | Pending |
+| IR-03 | Phase 1 | Pending |
+| IR-04 | Phase 1 | Pending |
+| PYSRC-01 | Phase 2 | Pending |
+| PYSRC-02 | Phase 2 | Pending |
+| PYSRC-03 | Phase 2 | Pending |
+| PYSRC-04 | Phase 2 | Pending |
+| PYSRC-05 | Phase 2 | Pending |
+| PYSDK-01 | Phase 3 | Pending |
+| PYSDK-02 | Phase 3 | Pending |
+| PYSDK-03 | Phase 3 | Pending |
+| TSSRC-01 | Phase 4 | Pending |
+| TSSRC-02 | Phase 4 | Pending |
+| TSSRC-03 | Phase 4 | Pending |
+| TSSRC-04 | Phase 4 | Pending |
+| TSSDK-01 | Phase 5 | Pending |
+| TSSDK-02 | Phase 5 | Pending |
+| TSSDK-03 | Phase 5 | Pending |
+| XLANG-01 | Phase 6 | Pending |
+| XLANG-02 | Phase 6 | Pending |
+| XLANG-03 | Phase 6 | Pending |
+| XLANG-04 | Phase 6 | Pending |
+| XLANG-05 | Phase 6 | Pending |
 
 **Coverage:**
-- v1 requirements: 37 total
-- Mapped to phases: 37
-- Unmapped: 0
+- v1 (v2.0 milestone) requirements: 24 total
+- Mapped to phases: 24 ✓
+- Unmapped: 0 ✓
+
+**Per-phase counts:** Phase 1 = 4 (IR), Phase 2 = 5 (PYSRC), Phase 3 = 3 (PYSDK),
+Phase 4 = 4 (TSSRC), Phase 5 = 3 (TSSDK), Phase 6 = 5 (XLANG). 4+5+3+4+3+5 = 24.
 
 ---
-*Requirements defined: 2026-06-24*
-*Last updated: 2026-06-24 after GSD project initialization*
-
+*Requirements defined: 2026-06-25*
+*Last updated: 2026-06-25 after roadmap creation (traceability populated)*

@@ -1,0 +1,4 @@
+# Pin the toolchain channel so CI builds are reproducible.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

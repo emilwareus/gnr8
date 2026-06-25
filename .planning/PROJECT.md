@@ -10,22 +10,60 @@ The product is for developers who are frustrated by fragmented Swagger/OpenAPI a
 
 Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
 
+## Current Milestone: v2.0 Multi-language — TypeScript & Python (parse + generate)
+
+**Goal:** Code-first parsing **and** dependency-free SDK generation for **Python (FastAPI + Flask)** and
+**TypeScript (NestJS)**, proving the `ApiGraph` IR is a true language-neutral narrow waist — not just
+router-agnostic. New sources/targets ship as `.gnr8/` code-as-config built-ins. Every v1 invariant holds.
+
+**Target features:**
+- A language-neutral IR + JSON facts contract that lowers identically across Go / FastAPI / Flask / NestJS.
+- Python source: a stdlib-`ast` `pyextract` sidecar (FastAPI full; Flask typed-envelope), static-only.
+- Python SDK target: dependency-free (`urllib` + `@dataclass` + typed error).
+- TypeScript source: a `tsextract` sidecar on the `typescript` Compiler API (NestJS decorators + DTO classes).
+- TypeScript SDK target: dependency-free (built-in `fetch` + typed interfaces + typed error).
+- FastAPI + NestJS examples with `.gnr8/` lifecycles and real committed output.
+
+Design brief: `docs/milestone-v2-multi-language.md`.
+
 ## Requirements
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ Build a narrow Go source to Go SDK proof of concept before adding other languages. — v1.0
+- ✓ Own the native extraction, graph, OpenAPI lowering, and SDK generation pipeline instead of wrapping existing generators. — v1.0 (goextract → ApiGraph → lower/sdk, no wrapped generators)
+- ✓ Infer API facts from Go code structure and types; what the typed source can't express comes from `.gnr8/` config, never comments. — v1.0 (go/types code-first; no annotation parsing — config is the only escape hatch)
+- ✓ Keep OpenAPI as an output artifact rather than the internal model. — v1.0 (graph is source of truth; OpenAPI 3.1 serialized from it)
+- ✓ Provide a `.gnr8/` project-local workspace where code is configuration. — v1.0 (the `.gnr8/` Rust crate IS the config: a `Pipeline` of `Source`/`Transform`/`Target`/`PostProcess`; no data-file config)
+- ✓ Keep the first implementation simple: no dynamic plugin runtime, macro-heavy API, graph database, or multi-language implementation. — v1.0
+- ✓ Validate the PoC against realistic Go fixtures, not only toy examples. — v1.0 (Gin goalservice fixture derived from a real production service shape)
+- ✓ Follow Rust implementation guardrails from the vendored `rust-best-practices` skill. — v1.0 (thiserror/anyhow boundaries, no prod unwrap, clippy -D warnings)
 
 ### Active
 
-- [ ] Build a narrow Go source to Go SDK proof of concept before adding other languages.
-- [ ] Own the native extraction, graph, OpenAPI lowering, and SDK generation pipeline instead of wrapping existing generators.
-- [ ] Infer API facts primarily from Go code structure and types, using comments only as escape hatches.
-- [ ] Keep OpenAPI as an output artifact rather than the internal model.
-- [ ] Provide a `.gnr8/` project-local workspace where code is configuration.
-- [ ] Keep the first implementation simple: no dynamic plugin runtime, macro-heavy API, graph database, or multi-language implementation.
-- [ ] Validate the PoC against realistic Go fixtures, not only toy examples.
-- [ ] Follow Rust implementation guardrails from the vendored `rust-best-practices` skill.
+**v2.0 — Multi-language: TypeScript & Python (parse + generate).** Full, scoped requirements in
+`.planning/REQUIREMENTS.md`.
+
+- [ ] Language-neutral IR + facts contract proven across Go / Python / TypeScript (the narrow waist)
+- [ ] Python source extraction — FastAPI (full) + Flask (typed envelope), static stdlib-`ast` sidecar
+- [ ] Python SDK target — dependency-free (`urllib` + `@dataclass` + typed error)
+- [ ] TypeScript source extraction — NestJS, `typescript` Compiler API sidecar
+- [ ] TypeScript SDK target — dependency-free (built-in `fetch` + typed interfaces)
+- [ ] FastAPI + NestJS examples with `.gnr8/` lifecycles and real committed output
+
+## Current State
+
+**Shipped v1.0** (2026-06-24): a working Go → OpenAPI 3.1 → compiling Go SDK pipeline.
+~10.2K LOC Rust (`gnr8-core` lib + `gnr8` CLI) + ~3.5K LOC Go (`goextract` sidecar + fixtures), 14 plans / 38 requirements across 5 phases.
+
+- **Pipeline:** `goextract` (go/packages + go/types) → router-agnostic `ApiGraph` (stable IDs, deterministic) → `lower::to_openapi` + `sdk::generate` → `.gnr8/` lifecycle (blake3 ownership manifest, no-op detection, loop-safe watch) → `gnr8 doctor`.
+- **CLI:** `init`, `generate` (`--force`), `check`, `inspect routes|schemas|graph`, `watch`, `doctor` — all wired to the real pipeline; human tables + `--json`.
+- **Quality:** `make check` green (fmt, clippy `-D warnings`, all tests, 4 contract snapshots, hermetic SDK `go build` + httptest smoke, determinism, lifecycle/watch). Demo (`docs/demo.md`) and evidence (`docs/evidence.md`) reproducible.
+- **Known tech debt (v1.1+):** `goextract` path baked at compile time (relocatable install); `diagnostics::collect` is a redundant test-only seam.
+
+## Next Milestone Goals
+
+Candidate directions (not yet scoped): additional source frontends (TS/Python/Rust) + SDK targets; packaged/relocatable `goextract`; richer programmatic customization; deeper incremental graph invalidation if benchmarks justify it.
 
 ### Out of Scope
 
@@ -69,14 +107,17 @@ The core product bet is that a small Rust engine can own orchestration, graph ma
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | Stay in research before implementation | Premature scaffolding would freeze weak assumptions. | ✓ Good |
-| Own the native extraction and generation pipeline | The product promise is not to wrap fragmented infrastructure. | — Pending |
-| Code is configuration | YAML/TOML/JSON is not expressive enough for framework-specific generation and SDK customization. | — Pending |
-| Use comments only as escape hatches | Comment-driven API descriptions drift from source behavior. | — Pending |
-| `.gnr8/` is the likely project workspace | Mirrors the desired project-local code and lifecycle model. | — Pending |
-| OpenAPI is an artifact, not the internal model | SDK generation and diagnostics need source-level facts OpenAPI cannot preserve cleanly. | — Pending |
+| Own the native extraction and generation pipeline | The product promise is not to wrap fragmented infrastructure. | ✓ Good |
+| Code is configuration | YAML/TOML/JSON is not expressive enough for framework-specific generation and SDK customization. | ✓ Good (static knobs shipped; programmatic = v2) |
+| Use comments only as escape hatches | Comment-driven API descriptions drift from source behavior. | ✓ Good |
+| `.gnr8/` is the likely project workspace | Mirrors the desired project-local code and lifecycle model. | ✓ Good |
+| OpenAPI is an artifact, not the internal model | SDK generation and diagnostics need source-level facts OpenAPI cannot preserve cleanly. | ✓ Good |
 | Simpler is better until proven otherwise | Avoid overengineering before the product loop works. | ✓ Good |
-| Design for more source and target languages, but do not start multi-language | The core should not bake in Go-only assumptions, but Go must prove the model first. | — Pending |
-| Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | — Pending |
+| Design for more source and target languages, but do not start multi-language | The core should not bake in Go-only assumptions, but Go must prove the model first. | ✓ Good (v1.0 proved the model; v2.0 now adds TS + Python) |
+| v2.0: add TypeScript (NestJS) + Python (FastAPI/Flask) — parse + generate | The router-agnostic IR is the narrow waist; each new language is a sidecar emitting the same JSON facts + one new SDK `Target`. The whole Rust lowering/OpenAPI pipeline is reused. | — Pending |
+| Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing user code | `ast` is Python's stdlib (the `go/types` analog); importing user code = executing it (a security boundary). Static-only; unresolved types → diagnostic, never a fallback (rule 3). | — Pending |
+| TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar | TS has no stdlib type-checker; `typescript` is the language's own reference compiler (the `go/types` analog), zero-dependency, run behind the JSON facts boundary; generated SDKs stay dependency-free. Documented carve-out to rule 2. | ⚠️ Revisit (the single OSS-in-toolchain exception — revisit if a stdlib-pure TS path ever appears) |
+| Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | ✓ Good |
 
 ## Evolution
 
@@ -96,4 +137,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-24 after initialization*
+*Last updated: 2026-06-25 after starting milestone v2.0*

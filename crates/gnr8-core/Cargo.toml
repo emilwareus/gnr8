@@ -1,0 +1,27 @@
+[package]
+name = "gnr8-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+# serde_json deserializes the goextract JSON facts (analyze::facts), serializes the artifact bundle
+# the runner emits / the host parses, and is the source error type for CoreError::FactsParse. Pinned
+# via [workspace.dependencies] (1.0).
+serde_json = { workspace = true }
+# blake3 hashes generated outputs for the ownership manifest + no-op detection (manifest/
+# lifecycle, 04-02). Pinned via [workspace.dependencies] (1.8); a stable, collision-resistant
+# content fingerprint (NOT std DefaultHasher, which is not stable across toolchains — RESEARCH
+# Pitfall 4). First consumer is this plan's manifest module (PLAN-CHECK W1).
+blake3 = { workspace = true }
+# NOTE: the ergonomic binary-boundary error crate is intentionally absent here —
+# it lives only in the gnr8 binary (D-09). Library code uses thiserror typed errors.
+
+[dev-dependencies]
+insta = { workspace = true }
