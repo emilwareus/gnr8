@@ -95,6 +95,16 @@ function schemaId(targetDir, absPath, name) {
   return noExt + "." + name;
 }
 
+// Whether `absPath`'s declaration lives UNDER the target tree (not the TS lib,
+// not `node_modules`). The single deterministic boundary every registration site
+// shares (rule 3): a type whose declaration escapes the target is NOT a target
+// schema. Centralized here so the seed-root scan and every transitive
+// registration path apply the identical test (the seeders used to inline this).
+function underTarget(targetDir, absPath) {
+  const rel = relFile(targetDir, absPath);
+  return !rel.startsWith("..") && !rel.includes("node_modules");
+}
+
 // The 1-based line number for a node's start position (Pitfall 6: always pass
 // the SourceFile to `getStart`). Returns `{ file, start_line, end_line }` in the
 // neutral SourceSpan shape (single-line spans; the host relativizes the file).
@@ -108,4 +118,4 @@ function span(sf, node, targetDir) {
   };
 }
 
-module.exports = { Loaded, load, discover, relFile, schemaId, span, ts };
+module.exports = { Loaded, load, discover, relFile, schemaId, underTarget, span, ts };

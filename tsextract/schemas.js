@@ -104,7 +104,7 @@ function _seedRoots(loaded, registry) {
       continue;
     }
     // Only files under the target (exclude the TS lib + node_modules).
-    if (!_underTarget(loaded, sf.fileName)) {
+    if (!load.underTarget(loaded.targetDir, sf.fileName)) {
       continue;
     }
     sf.forEachChild((node) => {
@@ -153,11 +153,6 @@ function _isDtoClass(classDecl) {
   return !hasMethod;
 }
 
-function _underTarget(loaded, fileName) {
-  const rel = load.relFile(loaded.targetDir, fileName);
-  return !rel.startsWith("..") && !rel.includes("node_modules");
-}
-
 // Whether a type-alias resolves to a union whose arms are object (class) types
 // (e.g. `BookOrError = BookDto | OutOfStockDto`). A string-literal-union alias
 // (BookFormat/SortOrder) is NOT an object-union and is excluded here.
@@ -177,6 +172,32 @@ function _isObjectUnionAlias(loaded, aliasDecl) {
       a.symbol &&
       (ts.isClassDeclaration(_firstDecl(a.symbol)) ||
         ts.isInterfaceDeclaration(_firstDecl(a.symbol)))
+  );
+}
+
+// Whether a type-alias resolves to an all-string-literal union (e.g.
+// `BookFormat = 'paperback' | 'hardcover'`) — the second schema-bearing alias
+// shape `_buildAliasSchema` can produce (an `enum` body). A single string
+// literal (degenerate one-member union) counts too.
+function _isStringLiteralUnionAlias(loaded, aliasDecl) {
+  const checker = loaded.checker;
+  const t = checker.getTypeAtLocation(aliasDecl);
+  const arms = t.isUnion && t.isUnion() ? t.types : [t];
+  return arms.length >= 1 && arms.every((a) => a.flags & ts.TypeFlags.StringLiteral);
+}
+
+// THE single predicate for "is this alias schema-bearing" (rule 3 — one source
+// of truth shared by the registration site `types._registerAlias` and the
+// builder `_buildAliasSchema`). An alias is schema-bearing iff it is one of the
+// EXACT two shapes the builder can emit: an all-string-literal union (-> `enum`)
+// or an all-object union (-> `union`). Every other alias shape (alias-to-
+// primitive, numeric/mixed-literal union, mapped/`Record<>`, generic
+// instantiation) is NOT schema-bearing: the caller maps its residual inline,
+// never leaving a dangling named ref (CR-01).
+function isSchemaBearingAlias(loaded, aliasDecl) {
+  return (
+    _isStringLiteralUnionAlias(loaded, aliasDecl) ||
+    _isObjectUnionAlias(loaded, aliasDecl)
   );
 }
 
@@ -282,4 +303,4 @@ function _buildAliasSchema(loaded, entry, diags, registry) {
   };
 }
 
-module.exports = { buildSchemas, Registry };
+module.exports = { buildSchemas, Registry, isSchemaBearingAlias };

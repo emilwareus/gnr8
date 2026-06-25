@@ -235,6 +235,50 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
     return { type: "array", of: elem };
   }
 
+  // An index-signature / `Record<K,V>` object type -> the neutral `map` type
+  // (CR-03; `Type::Map { key, value }` exists in facts.rs). This MUST precede the
+  // class/interface branch: a `Record<string, T>` is a synthetic object type with
+  // a string index signature, not a named class. Only a STRING-keyed index maps
+  // to `map` (the wire key is a string); a non-string key cannot be statically
+  // represented as a deterministic key/value fact and is a diagnostic (rule 3),
+  // never a guess.
+  if (
+    flags & ts.TypeFlags.Object &&
+    checker.getIndexInfoOfType &&
+    !(checker.isArrayType && checker.isArrayType(t))
+  ) {
+    const stringIndex = checker.getIndexInfoOfType(t, ts.IndexKind.String);
+    const numberIndex = checker.getIndexInfoOfType(t, ts.IndexKind.Number);
+    if (stringIndex || numberIndex) {
+      if (!stringIndex) {
+        // A number-keyed index only — not a string wire key. Diagnose + omit.
+        diags.warn(
+          "unsupported index-signature type '" +
+            checker.typeToString(t) +
+            "': non-string key cannot be a deterministic map key; fact omitted (no fallback)",
+          file,
+          line
+        );
+        return null;
+      }
+      const value = _mapSingle(
+        loaded,
+        stringIndex.type,
+        diags,
+        registry,
+        file,
+        line
+      );
+      if (value === null) {
+        return null; // rule 3: unresolvable value type omits the whole fact
+      }
+      return {
+        type: "map",
+        of: { key: _prim("string"), value: value },
+      };
+    }
+  }
+
   // A class/interface object type -> a named ref + register the class schema.
   if (flags & ts.TypeFlags.Object && t.symbol) {
     const id = _registerClass(loaded, t.symbol, diags, registry, file, line);
@@ -261,12 +305,39 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
 
 // Register (for transitive collection) the schema for an aliasSymbol used as a
 // named ref, returning its schema id, or null if the alias is not schema-bearing
-// here (e.g. it resolves to something unmappable). Only aliases that resolve to a
-// string-literal union (enum schema) or an object union (union schema) are
-// schema-bearing; a bare re-binding is not.
-function _registerAlias(loaded, aliasSym, diags, registry, _file, _line) {
+// here. Registration agrees EXACTLY with what `_buildAliasSchema` can emit (CR-01,
+// rule 3 — one source of truth via `schemas.isSchemaBearingAlias`): only an
+// all-string-literal union (-> enum schema) or an all-object union (-> union
+// schema) become named refs. Every other alias shape (alias-to-primitive,
+// numeric/mixed-literal union, mapped/`Record<>`, generic instantiation) returns
+// null so the caller maps the residual inline — NEVER a dangling named ref.
+function _registerAlias(loaded, aliasSym, diags, registry, file, line) {
   const info = _declOf(aliasSym);
   if (!info || !ts.isTypeAliasDeclaration(info.decl)) {
+    return null;
+  }
+  // Only the two schema-bearing alias shapes become named refs (CR-01). A
+  // non-schema-bearing alias (alias-to-primitive, numeric/mixed union, mapped/
+  // `Record<>`, generic instantiation) returns null WITHOUT a diagnostic here:
+  // the caller falls through to map its residual inline (a `Record<>` becomes a
+  // `map` fact in `_mapSingle`, a primitive alias becomes that primitive), which
+  // is the correct deterministic mapping, not an omission.
+  const schemas = require("./schemas"); // lazy: break the schemas<->types cycle
+  if (!schemas.isSchemaBearingAlias(loaded, info.decl)) {
+    return null;
+  }
+  // A SCHEMA-BEARING alias whose declaration is outside the target tree (TS lib /
+  // node_modules) is NOT a target schema (CR-02): minting its id would embed a
+  // machine-absolute path (non-deterministic bytes) and dangle a ref. Diagnose +
+  // omit (rule 3) — never a node_modules-path schema id.
+  if (!load.underTarget(loaded.targetDir, info.file)) {
+    diags.warn(
+      "referenced type '" +
+        info.name +
+        "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
+      file,
+      line
+    );
     return null;
   }
   const id = load.schemaId(loaded.targetDir, info.file, info.name);
@@ -278,12 +349,25 @@ function _registerAlias(loaded, aliasSym, diags, registry, _file, _line) {
 
 // Register the schema for a class symbol used as a named ref, returning its
 // schema id, or null if the symbol has no class declaration.
-function _registerClass(loaded, sym, diags, registry, _file, _line) {
+function _registerClass(loaded, sym, diags, registry, file, line) {
   const info = _declOf(sym);
   if (!info) {
     return null;
   }
   if (!ts.isClassDeclaration(info.decl) && !ts.isInterfaceDeclaration(info.decl)) {
+    return null;
+  }
+  // A class/interface declared outside the target tree is NOT a target schema
+  // (CR-02): same machine-path / dangling-ref hazard as the alias path. Diagnose
+  // + omit (rule 3), never mint a node_modules-path schema id.
+  if (!load.underTarget(loaded.targetDir, info.file)) {
+    diags.warn(
+      "referenced type '" +
+        info.name +
+        "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
+      file,
+      line
+    );
     return null;
   }
   const id = load.schemaId(loaded.targetDir, info.file, info.name);
