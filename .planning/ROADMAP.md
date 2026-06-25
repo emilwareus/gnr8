@@ -15,7 +15,7 @@
 Plans:
 **Wave 1**
 
-- [ ] 04-01-PLAN.md — Rust host seam: Lang::TypeScript + 3-way detect_language + run_tsextract driver + 3-arm dispatch (build_graph + diagnostics::collect) + TypeScriptToolchainMissing + NestJs Source built-in; tsextract/ package skeleton (sole dep typescript) + vendoring decision [TSSRC-04]
+- [x] 04-01-PLAN.md — Rust host seam: Lang::TypeScript + 3-way detect_language + run_tsextract driver + 3-arm dispatch (build_graph + diagnostics::collect) + TypeScriptToolchainMissing + NestJs Source built-in; tsextract/ package skeleton (sole dep typescript) + vendoring decision [TSSRC-04]
 
 **Wave 2** *(blocked on Wave 1)*
 

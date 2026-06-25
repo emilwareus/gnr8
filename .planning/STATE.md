@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: planning
+status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-25T22:17:02.278Z"
-last_activity: 2026-06-25 -- Phase 04 planning complete
+last_updated: "2026-06-25T22:26:07.505Z"
+last_activity: 2026-06-25 -- Phase 04 execution started
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 3
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-25)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 4 — typescript source — `tsextract`
+**Current focus:** Phase 04 — TypeScript Source — tsextract
 
 ## Current Position
 
-Phase: 4
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-25 -- Phase 04 planning complete
+Phase: 04 (TypeScript Source — tsextract) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 04
+Last activity: 2026-06-25 -- Phase 04 execution started
 
-Progress: [██████████] 100%
+Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [██████████] 100%
 | Phase 03 P01 | 20m | 3 tasks | 4 files |
 | Phase 03 P02 | 10m | 2 tasks | 3 files |
 | Phase 03 P03 | 35m | 2 tasks | 1 files |
+| Phase 04 P01 | 6m | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,8 @@ Recent decisions affecting current work:
 - [Phase 03]: PySdk Target is a verbatim structural clone of GoSdk reusing sdk_package + ir.base_path as the single source of truth; no new CoreError variant, no second name derivation
 - [Phase 03]: pysdk templated-path f-string emits safe='' (single quotes) — escaped double quotes are a Python 3.9-3.11 SyntaxError — Caught by the new py_compile gate; string-only unit tests missed it
 - [Phase 03]: pysdk named type alias emits a PEP-484 string forward reference (Name = "Union[...]") — Eager module-level alias assignment NameErrored on a later-defined class at import; caught by the import gate
+- [Phase ?]: [04-01] Lang::TypeScript first-class: detect_language is a SINGLE count-based classification over {go,python,ts} markers (TS marker = tsconfig.json OR *.ts — *.ts REQUIRED, the nestjs fixture has no tsconfig); 0/>1 -> typed Config error (rule 3, no fallback). Both build_graph AND diagnostics::collect dispatch 3-arm with no _ =>. run_tsextract drives node index.js <target> with discrete args (T-04-01); TypeScriptToolchainMissing typed error. NestJs Source clones FastApi calling the SAME build_graph (lang from target, rule 3/4).
+- [Phase ?]: [04-01] tsextract sole dep = typescript pinned EXACT 5.9.3 (rule-2 carve-out; gnr8-core ZERO crates). VENDORING Option A (hermetic): committed tsextract/node_modules/typescript via .gitignore negation + committed package-lock.json (offline tests, no npm ci). index.js stub emits {module,routes,schemas,diagnostics} empty; real Compiler-API extractor lands 04-02/04-03, the 2 nestjs snapshots stay #[ignore] red until then.
 
 ### Pending Todos
 
@@ -108,7 +111,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-25T21:15:12.804Z
+Last session: 2026-06-25T22:24:59.570Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 

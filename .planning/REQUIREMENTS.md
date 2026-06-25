@@ -39,7 +39,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 - [ ] **TSSRC-01**: A developer can extract routes, params, and request/response DTOs from a **NestJS** service (`@nestjs/common` decorators + DTO classes) into the IR.
 - [ ] **TSSRC-02**: The TS sidecar uses the `typescript` Compiler API and derives every schema fact from the source's own types — never from `@nestjs/swagger`, `zod`, or `class-validator`.
 - [ ] **TSSRC-03**: Unsupported or untyped surfaces produce **diagnostics**, never guessed facts (no fallback).
-- [ ] **TSSRC-04**: A developer enables NestJS extraction from `.gnr8/` code via a `NestJs` `Source` built-in.
+- [x] **TSSRC-04**: A developer enables NestJS extraction from `.gnr8/` code via a `NestJs` `Source` built-in.
 
 ### TypeScript SDK target (TSSDK)
 
@@ -104,7 +104,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | TSSRC-01 | Phase 4 | Pending |
 | TSSRC-02 | Phase 4 | Pending |
 | TSSRC-03 | Phase 4 | Pending |
-| TSSRC-04 | Phase 4 | Pending |
+| TSSRC-04 | Phase 4 | Complete |
 | TSSDK-01 | Phase 5 | Pending |
 | TSSDK-02 | Phase 5 | Pending |
 | TSSDK-03 | Phase 5 | Pending |
