@@ -2,9 +2,9 @@
 //!
 //! 02-03 implemented the `analyze::build_graph` seam, so the `.expect()` now succeeds and the test
 //! asserts the real router-agnostic graph against the reviewed
-//! `snapshots/snapshot_graph__goalservice_graph.snap` (4 operations with stable ids — `goalUuidPut`
-//! from `@ID`, the others from the handler symbol — request/response schema refs, the `aggregation`
-//! enum, `secured=true`, relativized provenance spans, all 8 object schemas + the `TargetDirection`
+//! `snapshots/snapshot_graph__goalservice_graph.snap` (4 operations with stable ids — all the handler
+//! symbol, purely code-derived — request/response schema refs, the `aggregation`/`cursor`/`page_size`
+//! query params, relativized provenance spans, all object schemas + the code-defined `TargetDirection`
 //! enum). The snapshot was authored from REAL output and reviewed (not hand-written). CI runs insta
 //! in `INSTA_UPDATE=no` (`CI=true`), so a mismatch hard-fails — it never auto-accepts (FIX-04).
 //!

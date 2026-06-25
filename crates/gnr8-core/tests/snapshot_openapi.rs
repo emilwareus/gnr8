@@ -17,11 +17,25 @@
 /// The Go Gin fixture authored in Plan 01-02, resolved relative to this crate's manifest dir.
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
+/// The fixture's security config — the single source of truth for security (CLAUDE.md rule 4): one
+/// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so this contract
+/// test supplies it to drive lowering, and the snapshot still carries `ApiKeyAuth` from CONFIG.
+fn fixture_security() -> gnr8_core::config::SecurityConfig {
+    gnr8_core::config::SecurityConfig {
+        schemes: vec![gnr8_core::config::SecurityScheme {
+            id: "ApiKeyAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "X-API-Key".to_string(),
+        }],
+    }
+}
+
 #[test]
 fn openapi_matches_expected_for_goalservice() {
     let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 2 must implement analyze::build_graph; red-by-design until then");
-    let openapi = gnr8_core::lower::to_openapi(&graph)
-        .expect("Phase 3 must implement lower::to_openapi; red-by-design until then");
+        .expect("analyze::build_graph must succeed for the fixture");
+    let openapi = gnr8_core::lower::to_openapi(&graph, &fixture_security())
+        .expect("lower::to_openapi must succeed for the fixture");
     insta::assert_snapshot!("goalservice_openapi", openapi);
 }

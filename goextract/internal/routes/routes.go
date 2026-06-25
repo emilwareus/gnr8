@@ -18,8 +18,9 @@
 //
 // The group prefix is a non-constant `"/" + basePath`, so routes are recorded
 // group-relative with Gin `:param` normalized to OpenAPI `{param}`; the concrete
-// `/goal` prefix is supplied later from the swaggo `@Router` annotation (02-03).
-// No Gin terms leak into the emitted facts — only router-agnostic HTTP routes.
+// `/goal` prefix is supplied later by the Rust lowering layer (it is not scraped
+// from any annotation — CLAUDE.md rule 1). No Gin terms leak into the emitted
+// facts — only router-agnostic HTTP routes.
 package routes
 
 import (
@@ -47,8 +48,10 @@ var httpMethods = map[string]bool{
 }
 
 // Route is one recognized HTTP route plus the handler symbol and enclosing group,
-// so the handler analyzer (Task 2) can match a handler FuncDecl by symbol and the
-// annotation parser (Task 3) can attach doc-comment facts.
+// so the handler analyzer can match a handler FuncDecl by symbol. Secured records
+// whether the enclosing group carried a Use(middleware) call — pure code
+// recognition, NOT a security fact: security for the generated API comes from the
+// user's gnr8 config, never from the source (CLAUDE.md rule 4).
 type Route struct {
 	Method  string           // "POST"
 	Path    string           // group-relative, normalized: "/", "/list", "/{uuid}"
@@ -221,8 +224,6 @@ func normalizePath(p string) string { return NormalizePath(p) }
 
 // NormalizePath converts a Gin path template to the OpenAPI form: each `:param`
 // segment becomes `{param}` (Pitfall 5). Other segments pass through unchanged.
-// Exported so the annotation parser (Task 3) normalizes `@Router` paths the same
-// way the code recognizer normalizes registration paths.
 func NormalizePath(p string) string {
 	if !strings.Contains(p, ":") {
 		return p

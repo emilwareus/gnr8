@@ -9,7 +9,17 @@
 //!
 //! - `inputs` — Go source dir(s) to analyze,
 //! - `output.openapi` / `output.sdk_dir` / `output.go_module` — artifact paths + Go module path,
-//! - `naming.operations` / `naming.types` — operation/type name remaps.
+//! - `naming.operations` / `naming.types` — operation/type name remaps,
+//! - `security.schemes` — the API security schemes (see below).
+//!
+//! ## Security is config, never scraped (CLAUDE.md rules 1 & 4)
+//!
+//! Security schemes (API keys, etc.) live in the auth middleware, not in handler signatures or typed
+//! source — so the engine genuinely cannot derive them from code. They are therefore provided HERE, by
+//! the user configuring our engine, and are the **single source of truth** for the generated
+//! `security` requirement + `components.securitySchemes`. We never scrape them from another tool's
+//! annotations. The PoC policy is intentionally minimal: every listed scheme applies to ALL operations
+//! (a per-operation policy is a documented v2 direction).
 //!
 //! There is deliberately **no** plugin/seam field here: adding an empty stub would overclaim a
 //! capability that does not exist. The v2 extension seam is documented in prose, not faked in the
@@ -37,6 +47,41 @@ pub struct Config {
     /// Optional operation/type name remaps (the one customization knob built in the PoC).
     #[serde(default)]
     pub naming: NamingOverrides,
+    /// The API security configuration — the single source of truth for the generated `security`
+    /// requirement and `components.securitySchemes`. Defaults to no schemes when omitted.
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+/// The security configuration: the user-declared schemes that secure the generated API.
+///
+/// This is the code-as-config home for security (CLAUDE.md rule 4): the engine cannot derive auth
+/// from typed source, so the user declares it here and it is the ONLY source. The PoC policy applies
+/// every listed scheme to ALL operations (`apply_to_all`); a per-operation policy is a v2 direction.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// The declared security schemes, keyed by their OpenAPI scheme id (e.g. `ApiKeyAuth`). Each
+    /// scheme is emitted into `components.securitySchemes`; under the PoC `apply_to_all` policy each
+    /// is also added to the top-level `security` requirement.
+    #[serde(default)]
+    pub schemes: Vec<SecurityScheme>,
+}
+
+/// One declared security scheme. The PoC supports the `apiKey`-in-`header` shape the fixture uses;
+/// `kind`/`location` are validated at lowering time so an unsupported combination is a clear error
+/// rather than a silently dropped scheme.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityScheme {
+    /// The OpenAPI scheme id (the key under `components.securitySchemes`, e.g. `"ApiKeyAuth"`).
+    pub id: String,
+    /// The scheme kind. The PoC supports `"apiKey"`.
+    pub kind: String,
+    /// Where the credential is read from. The PoC supports `"header"`.
+    pub location: String,
+    /// The credential name (for an `apiKey`/`header` scheme, the header name, e.g. `"X-API-Key"`).
+    pub name: String,
 }
 
 /// Where generated artifacts are written + the Go module path for the SDK (project-relative).
@@ -91,4 +136,50 @@ pub fn load(gnr8_dir: &Path) -> Result<Config, CoreError> {
         ),
     })?;
     parse(&src)
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow to
+    // the test module so the workspace-wide RUST-04 deny stays intact for production code.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::parse;
+
+    const BASE: &str = "inputs = [\".\"]\n\n[output]\nopenapi = \"openapi.yaml\"\nsdk_dir = \"sdk\"\ngo_module = \"example.com/svc/sdk\"\n";
+
+    #[test]
+    fn security_defaults_to_no_schemes_when_omitted() {
+        let config = parse(BASE).unwrap();
+        assert!(
+            config.security.schemes.is_empty(),
+            "security must default to an empty scheme list when [security] is omitted"
+        );
+    }
+
+    #[test]
+    fn parses_an_api_key_security_scheme() {
+        let src = format!(
+            "{BASE}\n[[security.schemes]]\nid = \"ApiKeyAuth\"\nkind = \"apiKey\"\nlocation = \"header\"\nname = \"X-API-Key\"\n"
+        );
+        let config = parse(&src).unwrap();
+        assert_eq!(config.security.schemes.len(), 1);
+        let scheme = &config.security.schemes[0];
+        assert_eq!(scheme.id, "ApiKeyAuth");
+        assert_eq!(scheme.kind, "apiKey");
+        assert_eq!(scheme.location, "header");
+        assert_eq!(scheme.name, "X-API-Key");
+    }
+
+    #[test]
+    fn rejects_unknown_security_field() {
+        // deny_unknown_fields must reject a typo'd security scheme key.
+        let src = format!(
+            "{BASE}\n[[security.schemes]]\nid = \"ApiKeyAuth\"\nkind = \"apiKey\"\nlocation = \"header\"\nname = \"X-API-Key\"\nunexpected = true\n"
+        );
+        assert!(
+            parse(&src).is_err(),
+            "an unknown security-scheme key must be rejected by deny_unknown_fields"
+        );
+    }
 }

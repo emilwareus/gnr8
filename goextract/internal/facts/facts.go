@@ -23,48 +23,48 @@ type GoFacts struct {
 	Diagnostics []DiagnosticFact `json:"diagnostics"`
 }
 
-// RouteFact describes one HTTP route. 02-02 fills these from the Gin recognizer
-// (Task 1) + handler analysis (Task 2) + swaggo annotations (Task 3).
+// RouteFact describes one HTTP route, derived PURELY from Go code (the Gin
+// recognizer + handler-body analysis). There is exactly one code-derived source
+// per fact and no annotation/fallback path anywhere (CLAUDE.md rules 1 & 3):
 //
-// Path storage decision (02-02; RESEARCH Open Q1): the group prefix in the
-// fixture is `"/" + basePath` (a non-constant BinaryExpr) the helper cannot
-// constant-fold, so Path holds the CODE-derived, group-relative, normalized
-// template (`/`, `/list`, `/{uuid}`). RouterPath holds the authoritative
-// @Router annotation override (`/list`, `/{uuid}`) when present. Emitting both
-// lets 02-03 render the absolute `/goal/...` deterministically without this
-// plan guessing the dynamic prefix (router-agnostic facts only).
+//   - OperationID is the handler function/method symbol (e.g. `createGoal`).
+//   - Path is the code-derived, group-relative, normalized template (`/`,
+//     `/list`, `/{uuid}`). The dynamic group prefix (`"/" + basePath`) is a
+//     lowering concern on the Rust side, not a fact here.
+//   - RequestBody / Responses / Params come from the recognized gin-context
+//     calls in the handler body (see handlers.go).
+//
+// Security, summary, tags, router-path overrides, and param enum/required-from-
+// annotation are DELIBERATELY ABSENT: those were doc-comment-annotation facts.
+// Security now lives in the user's gnr8 config (CLAUDE.md rule 4); the rest are
+// simply gone.
 type RouteFact struct {
-	Method          string         `json:"method"`
-	Path            string         `json:"path"`
-	RouterPath      *string        `json:"router_path"`
-	Handler         string         `json:"handler"`
-	OperationID     *string        `json:"operation_id"`
-	Summary         *string        `json:"summary"`
-	Tags            []string       `json:"tags"`
-	Secured         bool           `json:"secured"`
-	SecuritySchemes []string       `json:"security_schemes"`
-	Params          []ParamFact    `json:"params"`
-	RequestBody     *TypeRef       `json:"request_body"`
-	Responses       []ResponseFact `json:"responses"`
-	Span            SourceSpan     `json:"span"`
+	Method      string         `json:"method"`
+	Path        string         `json:"path"`
+	Handler     string         `json:"handler"`
+	OperationID string         `json:"operation_id"`
+	Params      []ParamFact    `json:"params"`
+	RequestBody *TypeRef       `json:"request_body"`
+	Responses   []ResponseFact `json:"responses"`
+	Span        SourceSpan     `json:"span"`
 }
 
-// ParamFact describes a path or query parameter (filled by 02-02).
+// ParamFact describes a path or query parameter, derived purely from code. Path
+// params come from `:param` route segments / c.Param reads (required); query
+// params come from c.Query reads (type string, not required). There is no enum
+// or description — those were annotation-only and are gone.
 type ParamFact struct {
-	Name        string     `json:"name"`
-	Location    string     `json:"location"`
-	Required    bool       `json:"required"`
-	Schema      SchemaType `json:"schema"`
-	Description *string    `json:"description"`
-	EnumValues  []string   `json:"enum_values"`
-	Span        SourceSpan `json:"span"`
+	Name     string     `json:"name"`
+	Location string     `json:"location"`
+	Required bool       `json:"required"`
+	Schema   SchemaType `json:"schema"`
+	Span     SourceSpan `json:"span"`
 }
 
-// ResponseFact describes one response keyed by HTTP status (filled by 02-02).
+// ResponseFact describes one response keyed by HTTP status, from c.JSON(status, x).
 type ResponseFact struct {
-	Status      uint16   `json:"status"`
-	Body        *TypeRef `json:"body"`
-	Description *string  `json:"description"`
+	Status uint16   `json:"status"`
+	Body   *TypeRef `json:"body"`
 }
 
 // SchemaFact is one extracted named type: an object struct or a string enum.
@@ -125,7 +125,7 @@ type SourceSpan struct {
 //   - each schema's Fields by JsonName
 //   - each schema's EnumValues lexically
 //   - Diagnostics by (File, Line, Message)
-//   - Routes by (Path, Method) — empty this plan, but keep the discipline
+//   - Routes by (Path, Method)
 func Marshal(doc GoFacts, w io.Writer) error {
 	sortDoc(&doc)
 
@@ -172,8 +172,8 @@ func sortDoc(doc *GoFacts) {
 }
 
 // sortRoute stably orders every sub-slice of a route so two runs on unchanged
-// source are byte-identical (GRAPH-02): params by (name, location), each param's
-// enum values lexically, responses by status, and tags/security schemes lexically.
+// source are byte-identical (GRAPH-02): params by (name, location) and responses
+// by status.
 func sortRoute(r *RouteFact) {
 	sort.Slice(r.Params, func(a, b int) bool {
 		if r.Params[a].Name != r.Params[b].Name {
@@ -181,12 +181,7 @@ func sortRoute(r *RouteFact) {
 		}
 		return r.Params[a].Location < r.Params[b].Location
 	})
-	for i := range r.Params {
-		sort.Strings(r.Params[i].EnumValues)
-	}
 	sort.Slice(r.Responses, func(a, b int) bool {
 		return r.Responses[a].Status < r.Responses[b].Status
 	})
-	sort.Strings(r.Tags)
-	sort.Strings(r.SecuritySchemes)
 }

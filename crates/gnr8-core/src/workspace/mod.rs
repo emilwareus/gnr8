@@ -57,6 +57,15 @@ go_module = \"example.com/yourservice/sdk\"   # Go module path for the generated
 # goalUuidPut = \"UpdateGoal\"
 # [naming.types]                             # optional: remap generated type names, e.g.
 # CreateGoalInput = \"NewGoal\"
+
+# [security] — the SINGLE SOURCE OF TRUTH for the generated security requirement +
+# components.securitySchemes. Auth lives in middleware, not typed source, so gnr8 NEVER scrapes it;
+# you declare it here. Each listed scheme applies to all operations (PoC policy). Example:
+# [[security.schemes]]
+# id       = \"ApiKeyAuth\"
+# kind     = \"apiKey\"
+# location = \"header\"
+# name     = \"X-API-Key\"
 ";
 
 /// The outcome of [`init`], so the CLI can report created vs already-present files without

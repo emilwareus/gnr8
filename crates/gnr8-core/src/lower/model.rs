@@ -18,7 +18,8 @@ pub(crate) struct OpenApiDoc {
     pub openapi: &'static str,
     /// Document metadata (`title`, `version`, optional `description`).
     pub info: Info,
-    /// Top-level security requirements (e.g. `[{ApiKeyAuth: []}]`), empty when no operation is secured.
+    /// Top-level security requirements (e.g. `[{ApiKeyAuth: []}]`), built from the user's `gnr8` config;
+    /// empty when the config declares no schemes (`CLAUDE.md` rule 4 — security is config, not scraped).
     pub security: Vec<SecurityRequirement>,
     /// Path templates keyed absolutely (`/goal/`, `/goal/list`, `/goal/{uuid}`), in sorted order.
     pub paths: Vec<(String, PathItem)>,
@@ -61,17 +62,16 @@ pub(crate) struct PathItem {
 }
 
 /// One HTTP operation (an `operationId` + its params/body/responses).
+///
+/// There is no `summary`/`tags` here: those were doc-comment-annotation facts and have been removed
+/// (CLAUDE.md rules 1 & 3). The `operationId` is the handler-symbol-derived id from the graph.
 // `operation_id` mirrors the spec's `operationId` key; the field name intentionally echoes the
 // struct, so the field-name lint is silenced here rather than renamed away from the spec term.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Operation {
-    /// Operation summary, omitted when `None`.
-    pub summary: Option<String>,
     /// Stable, unique operation id (the graph operation id).
     pub operation_id: String,
-    /// Tags, in graph (sorted) order; omitted when empty.
-    pub tags: Vec<String>,
     /// Path + query parameters, in graph (name-sorted) order.
     pub parameters: Vec<Parameter>,
     /// The JSON request body, if the operation takes one.
@@ -80,7 +80,8 @@ pub(crate) struct Operation {
     pub responses: Vec<(String, ResponseObj)>,
 }
 
-/// One path or query parameter.
+/// One path or query parameter. Query params are type `string` and not required; path params are
+/// required. There is no description or enum — those were annotation facts and have been removed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Parameter {
     /// Parameter name.
@@ -89,9 +90,7 @@ pub(crate) struct Parameter {
     pub location: String,
     /// Whether the parameter is required (path params are always required).
     pub required: bool,
-    /// Optional human description, omitted when `None`.
-    pub description: Option<String>,
-    /// The parameter's schema (primitive, with optional `format`/`enum`).
+    /// The parameter's schema (primitive, with optional `format`).
     pub schema: SchemaObject,
 }
 
@@ -122,14 +121,15 @@ pub(crate) struct Components {
     pub schemas: Vec<(String, SchemaObject)>,
 }
 
-/// An API-key security scheme (`type: apiKey`, `in: header`, `name: <header>`).
+/// A security scheme, built from the user's `gnr8` config (the single source of truth for security —
+/// `CLAUDE.md` rule 4). The `PoC` emits the `apiKey`/`header` shape the fixture config declares.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SecurityScheme {
-    /// The scheme kind — always `"apiKey"` for this target.
-    pub kind: &'static str,
-    /// Where the key is read from — always `"header"` for this target.
-    pub location: &'static str,
-    /// The header name carrying the key (e.g. `X-API-Key`).
+    /// The scheme kind (e.g. `"apiKey"`), from config.
+    pub kind: String,
+    /// Where the key is read from (e.g. `"header"`), from config.
+    pub location: String,
+    /// The header name carrying the key (e.g. `X-API-Key`), from config.
     pub name: String,
 }
 

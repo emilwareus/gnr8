@@ -116,8 +116,16 @@ fn generated_sdk_go_builds_clean() {
     }
     let dir = materialize_sdk();
 
-    // The four production SDK files plus the hermetic go.mod exist; smoke_test.go is added below.
-    for name in ["client.go", "errors.go", "goals.go", "models.go", "go.mod"] {
+    // The four production SDK files plus the hermetic go.mod exist; smoke_test.go is added below. The
+    // operations file is named after the package (`goalservice.go`) — there are no per-tag files since
+    // tags were a doc-comment-annotation fact and have been removed (CLAUDE.md rules 1 & 3).
+    for name in [
+        "client.go",
+        "errors.go",
+        "goalservice.go",
+        "models.go",
+        "go.mod",
+    ] {
         assert!(
             dir.join(name).exists(),
             "expected {name} in {}",

@@ -15,8 +15,8 @@ pub(crate) mod helper;
 ///
 /// Runs the `goextract` helper against `fixture_dir` (via [`helper::run_goextract`]), deserializes
 /// the JSON facts, and maps them into the graph ([`crate::graph::ApiGraph::from_facts`]). Operation
-/// ids are stable (the `@ID` annotation else the handler symbol), schema ids are package-qualified,
-/// and every collection is sorted so two runs over unchanged source are byte-identical (GRAPH-02).
+/// ids are stable (the handler symbol, purely code-derived), schema ids are package-qualified, and
+/// every collection is sorted so two runs over unchanged source are byte-identical (GRAPH-02).
 ///
 /// # Errors
 ///

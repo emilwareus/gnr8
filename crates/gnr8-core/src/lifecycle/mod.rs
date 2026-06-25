@@ -512,7 +512,7 @@ fn build_outputs(
     exclude_output_paths(&mut graph, config);
     apply_naming(&mut graph, &config.naming)?;
 
-    let openapi = crate::lower::to_openapi(&graph)?;
+    let openapi = crate::lower::to_openapi(&graph, &config.security)?;
     let bundle = crate::sdk::generate(&graph)?;
 
     let mut outputs: Vec<(String, Vec<u8>, String)> = Vec::new();

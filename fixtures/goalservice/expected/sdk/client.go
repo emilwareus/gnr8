@@ -1,10 +1,3 @@
-// EXPECTED SDK SHAPE — acceptance target, not compiled; gnr8 must generate
-// equivalents in Phase 3 (D-05).
-//
-// This sketches the functional-options Client (CONTEXT D-05): a single SDK
-// package exposing a Client constructed via NewClient(baseURL, opts...), with a
-// base URL, a customizable *http.Client, and shared request plumbing. It is
-// illustrative — it is NOT part of the Go build and need not compile.
 package goalservice
 
 import (
@@ -12,8 +5,8 @@ import (
 	"time"
 )
 
-// Client is the goalservice SDK entrypoint. Tag-grouped operation methods (see
-// goals.go) hang off this type. Constructed with functional options.
+// Client is the goalservice SDK entrypoint. Tag-grouped operation methods hang
+// off this type; it is constructed with functional options.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -28,8 +21,7 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
 
-// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme
-// (the route group's auth middleware lowers to this requirement).
+// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
 }

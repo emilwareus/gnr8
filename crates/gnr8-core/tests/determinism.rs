@@ -18,6 +18,20 @@
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
+/// The fixture's security config — the single source of truth for security (CLAUDE.md rule 4): one
+/// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so the contract
+/// tests supply it here to drive lowering.
+fn fixture_security() -> gnr8_core::config::SecurityConfig {
+    gnr8_core::config::SecurityConfig {
+        schemes: vec![gnr8_core::config::SecurityScheme {
+            id: "ApiKeyAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "X-API-Key".to_string(),
+        }],
+    }
+}
+
 #[test]
 fn build_graph_is_byte_identical_across_two_runs() {
     // Skip gracefully if the Go toolchain is absent so the test never fails for a missing dependency.
@@ -49,8 +63,10 @@ fn to_openapi_is_byte_identical_across_two_runs() {
 
     // Build the graph twice AND lower twice — proving both the upstream graph and the lowering are
     // deterministic end-to-end (idempotent OpenAPI generation, RESEARCH Pitfall 4 / TARGET-API §5.6).
-    let a = gnr8_core::lower::to_openapi(&first).expect("first to_openapi must succeed");
-    let b = gnr8_core::lower::to_openapi(&second).expect("second to_openapi must succeed");
+    let security = fixture_security();
+    let a = gnr8_core::lower::to_openapi(&first, &security).expect("first to_openapi must succeed");
+    let b =
+        gnr8_core::lower::to_openapi(&second, &security).expect("second to_openapi must succeed");
 
     assert_eq!(
         a, b,

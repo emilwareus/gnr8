@@ -32,7 +32,7 @@ pub(crate) struct GoFacts {
     pub(crate) diagnostics: Vec<DiagnosticFact>,
 }
 
-/// One HTTP route. Filled by 02-02; defined here so the schema/type is stable.
+/// One HTTP route, derived PURELY from Go code by the helper (no annotation source).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RouteFact {
@@ -41,23 +41,10 @@ pub(crate) struct RouteFact {
     /// Code-derived, group-relative, normalized path template (`/`, `/list`,
     /// `/{uuid}`). The dynamic `"/" + basePath` group prefix is not folded here.
     pub(crate) path: String,
-    /// Authoritative `@Router` annotation path override (`/list`, `/{uuid}`),
-    /// when present. `None` for routes with no `@Router` annotation. 02-03 uses
-    /// this to render the absolute `/goal/...` path deterministically.
-    pub(crate) router_path: Option<String>,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub(crate) handler: String,
-    /// Operation id from an `@ID` annotation, else `None` (derived downstream).
-    pub(crate) operation_id: Option<String>,
-    /// Operation summary from an `@Summary` annotation, if present.
-    pub(crate) summary: Option<String>,
-    /// Tags from annotations.
-    pub(crate) tags: Vec<String>,
-    /// Whether the route's group carried an auth middleware (D-14).
-    pub(crate) secured: bool,
-    /// Named security schemes from `@Security` annotations (e.g. `ApiKeyAuth`),
-    /// sorted. Empty when the route has no annotated scheme.
-    pub(crate) security_schemes: Vec<String>,
+    /// Operation id, derived deterministically from the handler symbol in code.
+    pub(crate) operation_id: String,
     /// Path and query parameters.
     pub(crate) params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
@@ -68,7 +55,9 @@ pub(crate) struct RouteFact {
     pub(crate) span: SourceSpan,
 }
 
-/// One path or query parameter of a route (filled by 02-02).
+/// One path or query parameter of a route, derived purely from code. Path params
+/// are required; query params default to type `string` and not required. There is
+/// no description or enum — those were annotation-only and are gone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ParamFact {
@@ -80,15 +69,11 @@ pub(crate) struct ParamFact {
     pub(crate) required: bool,
     /// The parameter's primitive schema.
     pub(crate) schema: SchemaType,
-    /// Optional human description from an annotation.
-    pub(crate) description: Option<String>,
-    /// Closed value set, if recovered (e.g. from an `Enums(...)` annotation).
-    pub(crate) enum_values: Vec<String>,
     /// Source provenance for the parameter access.
     pub(crate) span: SourceSpan,
 }
 
-/// One response of a route keyed by HTTP status (filled by 02-02).
+/// One response of a route keyed by HTTP status (from `c.JSON(status, x)`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponseFact {
@@ -96,8 +81,6 @@ pub(crate) struct ResponseFact {
     pub(crate) status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub(crate) body: Option<TypeRef>,
-    /// Optional human description from an annotation.
-    pub(crate) description: Option<String>,
 }
 
 /// One extracted named type: an object struct or a string enum.
@@ -300,46 +283,40 @@ mod tests {
         }
     }
 
-    /// Round-trip a fully-populated route fact (the 02-02 shape) so the serde
-    /// mirror stays in lockstep with `goextract`'s route/handler/annotation output:
-    /// the new `router_path` + `security_schemes` fields, params with enum values,
-    /// and responses by numeric status.
+    /// Round-trip a fully-populated route fact (the code-first shape) so the serde
+    /// mirror stays in lockstep with `goextract`'s purely code-derived output: a
+    /// handler-derived `operation_id`, a path param, and responses by numeric
+    /// status. There is no `router_path`/`summary`/`tags`/`secured`/
+    /// `security_schemes` and no param `description`/`enum_values` — those were
+    /// annotation facts and have been removed (CLAUDE.md rules 1, 3 & 4).
     mod route_facts {
         use crate::analyze::facts::GoFacts;
 
         // Mirrors a real `go run . ../fixtures/goalservice` route entry for
-        // `PUT /goal/{uuid}` (annotation @ID/@Security/@Router merged onto code
-        // facts): operation_id from @ID, a secured route with the ApiKeyAuth
-        // scheme, the @Router override path, a path param, and 200/400/404.
+        // `PUT /{uuid}`: operation_id derived from the handler symbol, a code-read
+        // path param, a bound request body, and 200/400/404 from c.JSON.
         const ROUTE: &[u8] = br#"{
           "module": "github.com/acme/svc",
           "routes": [
             {
               "method": "PUT",
               "path": "/{uuid}",
-              "router_path": "/{uuid}",
               "handler": "updateGoal",
-              "operation_id": "goalUuidPut",
-              "summary": "Update goal",
-              "tags": ["Goals"],
-              "secured": true,
-              "security_schemes": ["ApiKeyAuth"],
+              "operation_id": "updateGoal",
               "params": [
                 {
                   "name": "uuid",
                   "location": "path",
                   "required": true,
                   "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-                  "description": "Goal UUID",
-                  "enum_values": [],
                   "span": { "file": "handlers.go", "start_line": 94, "end_line": 94 }
                 }
               ],
               "request_body": { "ref_id": "internal/common/dto.UpdateGoalInput" },
               "responses": [
-                { "status": 200, "body": { "ref_id": "internal/common/dto.CommandMessage" }, "description": "Goal updated" },
-                { "status": 400, "body": { "ref_id": "internal/common/dto.HttpError" }, "description": "Invalid input" },
-                { "status": 404, "body": { "ref_id": "internal/common/dto.HttpError" }, "description": "Goal not found" }
+                { "status": 200, "body": { "ref_id": "internal/common/dto.CommandMessage" } },
+                { "status": 400, "body": { "ref_id": "internal/common/dto.HttpError" } },
+                { "status": 404, "body": { "ref_id": "internal/common/dto.HttpError" } }
               ],
               "span": { "file": "http.go", "start_line": 57, "end_line": 57 }
             }
@@ -349,17 +326,16 @@ mod tests {
         }"#;
 
         #[test]
-        fn deserializes_populated_route_with_new_fields() {
+        fn deserializes_populated_route_with_code_first_fields() {
             let facts: GoFacts = serde_json::from_slice(ROUTE).unwrap();
             assert_eq!(facts.routes.len(), 1);
             let r = &facts.routes[0];
 
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/{uuid}");
-            assert_eq!(r.router_path.as_deref(), Some("/{uuid}"));
-            assert_eq!(r.operation_id.as_deref(), Some("goalUuidPut"));
-            assert!(r.secured);
-            assert_eq!(r.security_schemes, vec!["ApiKeyAuth"]);
+            // operation_id is the handler symbol — no annotation override.
+            assert_eq!(r.operation_id, "updateGoal");
+            assert_eq!(r.handler, "updateGoal");
 
             let body = r.request_body.as_ref().unwrap();
             assert!(body.ref_id.ends_with("dto.UpdateGoalInput"));
@@ -381,9 +357,8 @@ mod tests {
               "module": "x",
               "routes": [
                 {
-                  "method": "GET", "path": "/", "router_path": null, "handler": "h",
-                  "operation_id": null, "summary": null, "tags": [], "secured": false,
-                  "security_schemes": [], "params": [], "request_body": null,
+                  "method": "GET", "path": "/", "handler": "h",
+                  "operation_id": "h", "params": [], "request_body": null,
                   "responses": [], "span": { "file": "f", "start_line": 1, "end_line": 1 },
                   "unexpected_route_field": true
                 }
@@ -394,6 +369,29 @@ mod tests {
             assert!(
                 result.is_err(),
                 "deny_unknown_fields must reject an unexpected route key"
+            );
+        }
+
+        #[test]
+        fn rejects_removed_annotation_route_field() {
+            // The removed annotation fields (e.g. `security_schemes`) must now be
+            // rejected by deny_unknown_fields — proving they are gone for good.
+            let bad = br#"{
+              "module": "x",
+              "routes": [
+                {
+                  "method": "GET", "path": "/", "handler": "h",
+                  "operation_id": "h", "security_schemes": [], "params": [],
+                  "request_body": null, "responses": [],
+                  "span": { "file": "f", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let result: Result<GoFacts, _> = serde_json::from_slice(bad);
+            assert!(
+                result.is_err(),
+                "a removed annotation field (security_schemes) must be rejected"
             );
         }
     }

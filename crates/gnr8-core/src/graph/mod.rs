@@ -8,9 +8,9 @@
 //! Determinism (GRAPH-02 / D-08): every collection in the graph is a sorted [`Vec`] (operations by
 //! `(path, method)`, schemas by id, params by name, responses by status, fields by json name). The
 //! graph never serializes a [`std::collections::HashMap`], so two `build_graph` runs over unchanged
-//! source produce byte-identical output. Operation ids are stable: the `@ID` annotation when present
-//! (e.g. `goalUuidPut`), else the handler function symbol (e.g. `createGoal`) — both derived from
-//! source identity. Schema ids are the package-qualified type name the helper already emits.
+//! source produce byte-identical output. Operation ids are the handler function symbol (e.g.
+//! `createGoal`) — purely code-derived, with no annotation override (CLAUDE.md rules 1 & 3). Schema
+//! ids are the package-qualified type name the helper already emits.
 //!
 //! Provenance (D-07): every operation, param, and schema carries a [`SourceSpan`] (file + line range,
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
@@ -37,29 +37,22 @@ pub struct ApiGraph {
 /// One HTTP operation: a method + path template plus its inferred params/body/responses (D-07).
 ///
 /// Router-agnostic — there is deliberately no Gin handle here; only the recognized HTTP facts.
+/// Every field is derived PURELY from Go code (CLAUDE.md rules 1 & 3); there is no annotation
+/// carry-through (no summary, tags, router-path override, or security here — security comes from
+/// the user's gnr8 config at lowering time, rule 4).
 #[derive(Debug, serde::Serialize)]
 pub struct Operation {
-    /// Stable operation id: the `@ID` annotation when present, else the handler symbol (D-08).
+    /// Stable operation id, derived deterministically from the handler symbol (D-08).
     pub id: String,
     /// HTTP method, uppercase (e.g. `"POST"`).
     pub method: String,
     /// Code-derived, group-relative, normalized path template (`/`, `/list`, `/{uuid}`).
     ///
     /// The dynamic group prefix (`"/" + basePath` in the fixture) is NOT folded here; the absolute
-    /// `/goal/...` path is a Phase-3 lowering concern. `router_path` carries the `@Router` override.
+    /// `/goal/...` path is a lowering concern supplied by the Rust layer (never scraped, rule 1).
     pub path: String,
-    /// Authoritative `@Router` annotation path override (e.g. `/list`, `/{uuid}`), when present.
-    pub router_path: Option<String>,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub handler: String,
-    /// Operation summary from an `@Summary` annotation, if present.
-    pub summary: Option<String>,
-    /// Tags from annotations, sorted.
-    pub tags: Vec<String>,
-    /// Whether the route's group carried an auth middleware (D-14).
-    pub secured: bool,
-    /// Named security schemes from `@Security` annotations (e.g. `ApiKeyAuth`), sorted.
-    pub security_schemes: Vec<String>,
     /// Path and query parameters, sorted by name.
     pub params: Vec<Param>,
     /// The request body schema reference, if a typed body was inferred.
@@ -70,7 +63,9 @@ pub struct Operation {
     pub provenance: SourceSpan,
 }
 
-/// One path or query parameter of an operation.
+/// One path or query parameter of an operation, derived purely from code. Path params are required;
+/// query params default to type `string` and not required. There is no enum or description — those
+/// were annotation-only and have been removed (CLAUDE.md rules 1 & 3).
 #[derive(Debug, serde::Serialize)]
 pub struct Param {
     /// The parameter name (e.g. `"uuid"`, `"cursor"`).
@@ -81,23 +76,17 @@ pub struct Param {
     pub required: bool,
     /// The parameter's primitive schema.
     pub schema: SchemaType,
-    /// Closed value set, if recovered (e.g. from an `Enums(...)` annotation), sorted.
-    pub enum_values: Vec<String>,
-    /// Optional human description from an annotation.
-    pub description: Option<String>,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
 
-/// One response of an operation keyed by HTTP status.
+/// One response of an operation keyed by HTTP status (from `c.JSON(status, x)`).
 #[derive(Debug, serde::Serialize)]
 pub struct Response {
     /// The HTTP status code (e.g. `201`).
     pub status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub body: Option<SchemaRef>,
-    /// Optional human description from an annotation.
-    pub description: Option<String>,
 }
 
 /// One named schema: an object struct or a string enum.
@@ -186,7 +175,7 @@ pub struct SourceSpan {
 impl ApiGraph {
     /// Build the router-agnostic graph from the helper's [`GoFacts`].
     ///
-    /// Maps routes → [`Operation`]s (operation id = `@ID` else handler symbol, D-08), request/response
+    /// Maps routes → [`Operation`]s (operation id = handler symbol, D-08), request/response
     /// type refs → [`SchemaRef`]s, and schema facts → [`Schema`]s, with provenance on every node
     /// (D-07). `module_root` is the analyzed directory; every span/diagnostic file path is normalized
     /// relative to it so the serialized graph is portable and byte-stable across machines (GRAPH-02).
@@ -241,16 +230,11 @@ impl ApiGraph {
 }
 
 impl Operation {
-    /// Lower one [`RouteFact`] into an [`Operation`], deriving the stable id and sorting children.
+    /// Lower one [`RouteFact`] into an [`Operation`], carrying the code-derived id and sorting children.
     fn from_fact(route: RouteFact, root: &str) -> Self {
-        // Stable operation id (D-08): the @ID annotation when present (e.g. `goalUuidPut`), else the
-        // handler function symbol (e.g. `createGoal`) — both deterministic, both already in the facts.
-        let id = route.operation_id.unwrap_or_else(|| route.handler.clone());
-
-        let mut tags = route.tags;
-        tags.sort();
-        let mut security_schemes = route.security_schemes;
-        security_schemes.sort();
+        // Stable operation id (D-08): the handler-symbol-derived id the helper already emits — purely
+        // code-derived, deterministic, with no annotation override path (CLAUDE.md rules 1 & 3).
+        let id = route.operation_id;
 
         let mut params: Vec<Param> = route
             .params
@@ -270,12 +254,7 @@ impl Operation {
             id,
             method: route.method,
             path: route.path,
-            router_path: route.router_path,
             handler: route.handler,
-            summary: route.summary,
-            tags,
-            secured: route.secured,
-            security_schemes,
             params,
             request_body: route.request_body.map(SchemaRef::from_fact),
             responses,
@@ -286,15 +265,11 @@ impl Operation {
 
 impl Param {
     fn from_fact(param: ParamFact, root: &str) -> Self {
-        let mut enum_values = param.enum_values;
-        enum_values.sort();
         Self {
             name: param.name,
             location: param.location,
             required: param.required,
             schema: SchemaType::from_fact(param.schema),
-            enum_values,
-            description: param.description,
             provenance: relativize_span(&param.span, root),
         }
     }
@@ -305,7 +280,6 @@ impl Response {
         Self {
             status: response.status,
             body: response.body.map(SchemaRef::from_fact),
-            description: response.description,
         }
     }
 }
@@ -403,54 +377,42 @@ mod tests {
     use super::ApiGraph;
     use crate::analyze::facts::GoFacts;
 
-    /// A facts document mirroring real goextract output: two routes whose operation ids resolve
-    /// differently (one from `@ID`, one from the handler symbol), two unsorted schemas, one
-    /// diagnostic, and absolute span paths under a synthetic module root.
+    /// A facts document mirroring real goextract output: two routes whose operation ids are derived
+    /// from the handler symbol (no annotation source), two unsorted schemas, one diagnostic, and
+    /// absolute span paths under a synthetic module root.
     const SAMPLE: &[u8] = br#"{
       "module": "github.com/acme/svc",
       "routes": [
         {
           "method": "PUT",
           "path": "/{uuid}",
-          "router_path": "/{uuid}",
           "handler": "updateGoal",
-          "operation_id": "goalUuidPut",
-          "summary": "Update goal",
-          "tags": ["Goals"],
-          "secured": true,
-          "security_schemes": ["ApiKeyAuth"],
+          "operation_id": "updateGoal",
           "params": [
             {
               "name": "uuid",
               "location": "path",
               "required": true,
               "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-              "description": "Goal UUID",
-              "enum_values": [],
               "span": { "file": "/root/handlers.go", "start_line": 94, "end_line": 94 }
             }
           ],
           "request_body": { "ref_id": "internal/common/dto.UpdateGoalInput" },
           "responses": [
-            { "status": 400, "body": { "ref_id": "internal/common/dto.HttpError" }, "description": "bad" },
-            { "status": 200, "body": { "ref_id": "internal/common/dto.CommandMessage" }, "description": "ok" }
+            { "status": 400, "body": { "ref_id": "internal/common/dto.HttpError" } },
+            { "status": 200, "body": { "ref_id": "internal/common/dto.CommandMessage" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 57, "end_line": 57 }
         },
         {
           "method": "POST",
           "path": "/",
-          "router_path": null,
           "handler": "createGoal",
-          "operation_id": null,
-          "summary": null,
-          "tags": [],
-          "secured": true,
-          "security_schemes": [],
+          "operation_id": "createGoal",
           "params": [],
           "request_body": { "ref_id": "internal/common/dto.CreateGoalInput" },
           "responses": [
-            { "status": 201, "body": { "ref_id": "internal/common/dto.CommandMessageWithUUID" }, "description": null }
+            { "status": 201, "body": { "ref_id": "internal/common/dto.CommandMessageWithUUID" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 55, "end_line": 55 }
         }
@@ -509,21 +471,20 @@ mod tests {
     }
 
     #[test]
-    fn operation_id_prefers_annotation_else_handler_symbol() {
+    fn operation_id_is_the_handler_symbol() {
         let graph = ApiGraph::from_facts(sample_facts(), "/root");
         let put = graph
             .operations
             .iter()
             .find(|op| op.method == "PUT")
             .unwrap();
-        // @ID annotation wins.
-        assert_eq!(put.id, "goalUuidPut");
+        // The id is the handler symbol — there is no annotation override path.
+        assert_eq!(put.id, "updateGoal");
         let post = graph
             .operations
             .iter()
             .find(|op| op.method == "POST")
             .unwrap();
-        // No @ID → falls back to the handler symbol.
         assert_eq!(post.id, "createGoal");
     }
 

@@ -7,12 +7,7 @@ operations:
   - id: createGoal
     method: POST
     path: /
-    router_path: ~
     handler: createGoal
-    summary: ~
-    tags: []
-    secured: true
-    security_schemes: []
     params: []
     request_body:
       ref_id: internal/common/dto.CreateGoalInput
@@ -20,11 +15,9 @@ operations:
       - status: 201
         body:
           ref_id: internal/common/dto.CommandMessageWithUUID
-        description: ~
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
-        description: ~
     provenance:
       file: internal/goal/ports/http.go
       start_line: 55
@@ -32,31 +25,17 @@ operations:
   - id: listGoals
     method: GET
     path: /list
-    router_path: /list
     handler: listGoals
-    summary: List goals
-    tags:
-      - Goals
-    secured: true
-    security_schemes:
-      - ApiKeyAuth
     params:
       - name: aggregation
         location: query
-        required: true
+        required: false
         schema:
           kind: string
           format: ~
           items: ~
           ref_id: ~
           additional_properties: ~
-        enum_values:
-          - avg
-          - count
-          - max
-          - min
-          - sum
-        description: Aggregation
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 59
@@ -70,8 +49,6 @@ operations:
           items: ~
           ref_id: ~
           additional_properties: ~
-        enum_values: []
-        description: Cursor UUID for pagination
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 57
@@ -85,8 +62,6 @@ operations:
           items: ~
           ref_id: ~
           additional_properties: ~
-        enum_values: []
-        description: Page size
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 58
@@ -96,7 +71,6 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.ListGoalsOutput
-        description: Goals page
     provenance:
       file: internal/goal/ports/http.go
       start_line: 56
@@ -104,12 +78,7 @@ operations:
   - id: deleteGoal
     method: DELETE
     path: "/{uuid}"
-    router_path: ~
     handler: deleteGoal
-    summary: ~
-    tags: []
-    secured: true
-    security_schemes: []
     params:
       - name: uuid
         location: path
@@ -120,8 +89,6 @@ operations:
           items: ~
           ref_id: ~
           additional_properties: ~
-        enum_values: []
-        description: ~
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 119
@@ -131,26 +98,17 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.CommandMessage
-        description: ~
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
-        description: ~
     provenance:
       file: internal/goal/ports/http.go
       start_line: 58
       end_line: 58
-  - id: goalUuidPut
+  - id: updateGoal
     method: PUT
     path: "/{uuid}"
-    router_path: "/{uuid}"
     handler: updateGoal
-    summary: Update goal
-    tags:
-      - Goals
-    secured: true
-    security_schemes:
-      - ApiKeyAuth
     params:
       - name: uuid
         location: path
@@ -161,8 +119,6 @@ operations:
           items: ~
           ref_id: ~
           additional_properties: ~
-        enum_values: []
-        description: Goal UUID
         provenance:
           file: internal/goal/ports/handlers.go
           start_line: 94
@@ -173,15 +129,9 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.CommandMessage
-        description: Goal updated
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
-        description: Invalid input
-      - status: 404
-        body:
-          ref_id: internal/common/dto.HttpError
-        description: Goal not found
     provenance:
       file: internal/goal/ports/http.go
       start_line: 57

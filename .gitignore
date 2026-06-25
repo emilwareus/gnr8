@@ -27,3 +27,6 @@ target
 # IMPORTANT: Cargo.lock MUST stay committed.
 # gnr8 is a binary project, so the lockfile is required for reproducible builds and
 # for `cargo clippy --locked` in CI (RUST-03 / D-16). Do NOT add a Cargo.lock ignore line.
+
+# scratch / external test copies (not committed)
+.tmp/

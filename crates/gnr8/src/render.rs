@@ -14,7 +14,10 @@ use std::fmt::Write as _;
 
 use gnr8_core::graph::{ApiGraph, Operation, Schema};
 
-/// Render `inspect routes`: a METHOD/PATH/OPERATION/SECURED/REQUEST/RESPONSES table (or JSON).
+/// Render `inspect routes`: a METHOD/PATH/OPERATION/REQUEST/RESPONSES table (or JSON).
+///
+/// There is no SECURED column: security is not a graph fact — it comes from the user's gnr8 config
+/// (CLAUDE.md rule 4), so the code-derived route table never claims a per-operation security state.
 ///
 /// # Errors
 /// Returns the underlying [`serde_json::Error`] if `--json` serialization fails.
@@ -25,8 +28,8 @@ pub(crate) fn render_routes(graph: &ApiGraph, json: bool) -> Result<String, serd
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<7} {:<12} {:<12} {:<7} {:<32} RESPONSES",
-        "METHOD", "PATH", "OPERATION", "SECURED", "REQUEST"
+        "{:<7} {:<12} {:<12} {:<32} RESPONSES",
+        "METHOD", "PATH", "OPERATION", "REQUEST"
     );
     for op in &graph.operations {
         let request = op
@@ -41,13 +44,8 @@ pub(crate) fn render_routes(graph: &ApiGraph, json: bool) -> Result<String, serd
             .join(",");
         let _ = writeln!(
             out,
-            "{:<7} {:<12} {:<12} {:<7} {:<32} {}",
-            op.method,
-            op.path,
-            op.id,
-            if op.secured { "yes" } else { "no" },
-            request,
-            responses
+            "{:<7} {:<12} {:<12} {:<32} {}",
+            op.method, op.path, op.id, request, responses
         );
     }
     append_diagnostics(&mut out, graph);

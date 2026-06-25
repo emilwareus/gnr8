@@ -57,15 +57,16 @@ func run(targetDir string, w *os.File) error {
 
 	module := moduleOf(res)
 
-	// 02-02: recognize the Gin route table (Task 1), then enrich each route with
-	// handler-inferred request/response/param facts (Task 2) and swaggo
-	// annotation facts (Task 3). buildRoutes owns the wiring + the per-route
-	// diagnostics (untyped query params, dynamic responses).
+	// Recognize the Gin route table, then enrich each route with handler-inferred
+	// request/response/param facts. buildRoutes owns the wiring + the per-route
+	// diagnostics (untyped query params, dynamic responses). Every fact is derived
+	// PURELY from Go code — there is no annotation source and no fallback path
+	// (CLAUDE.md rules 1 & 3).
 	//
-	// The Analyzer carries the module prefix + swaggo selector->package map as
-	// per-invocation context (WR-03), so the analysis is reentrant rather than
-	// depending on process-global setup ordering. Building it also indexes the
-	// handlers, surfacing any duplicate-bare-name collisions as diagnostics (WR-02).
+	// The Analyzer carries the module prefix as per-invocation context (WR-03), so
+	// the analysis is reentrant rather than depending on process-global setup
+	// ordering. Building it also indexes the handlers, surfacing any duplicate-
+	// bare-name collisions as diagnostics (WR-02).
 	analyzer := handlers.NewAnalyzer(res, module, diags)
 	recognized := routes.Recognize(res)
 	routeFacts := buildRoutes(analyzer, recognized, diags)
@@ -82,36 +83,30 @@ func run(targetDir string, w *os.File) error {
 
 // buildRoutes maps each recognized Gin route to a router-agnostic RouteFact.
 //
-// 02-02 Task 1 emits the route table skeleton (method, group-relative normalized
-// path, handler, secured, span). Tasks 2 and 3 enrich each fact in place with
-// handler-inferred request/response/param facts and swaggo annotation facts; the
-// enrichment is layered here so the wiring order (code primary, annotation
-// escape-hatch) stays explicit.
+// Every fact has exactly ONE code-derived source (CLAUDE.md rules 1 & 3): the
+// method/path/handler come from the route recognizer, the operationId is the
+// handler symbol, and the request body / responses / params come from analyzing
+// the handler body. There is no annotation source and no fallback anywhere.
 func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *diag.Accumulator) []facts.RouteFact {
 	out := make([]facts.RouteFact, 0, len(recognized))
 	for _, r := range recognized {
 		rf := facts.RouteFact{
-			Method:          r.Method,
-			Path:            r.Path,
-			Handler:         r.Handler,
-			Tags:            []string{},
-			Secured:         r.Secured,
-			SecuritySchemes: []string{},
-			Params:          []facts.ParamFact{},
-			Responses:       []facts.ResponseFact{},
-			Span:            r.Span,
+			Method: r.Method,
+			Path:   r.Path,
+			// operationId is derived deterministically from the handler symbol in
+			// code (e.g. "createGoal", "updateGoal") — there is no override source.
+			Handler:     r.Handler,
+			OperationID: r.Handler,
+			Params:      []facts.ParamFact{},
+			Responses:   []facts.ResponseFact{},
+			Span:        r.Span,
 		}
 
-		// Task 2: code-inferred request/response/param facts (primary).
+		// Code-inferred request/response/param facts — the only source.
 		cf := analyzer.Analyze(r, diags)
 		rf.RequestBody = cf.RequestBody
 		rf.Responses = cf.Responses
 		rf.Params = cf.Params
-
-		// Task 3: swaggo annotation facts (escape hatch) fill gaps + add
-		// metadata (summary, tags, @ID, @Security, @Router, query enums,
-		// missing responses) without clobbering code-resolved facts.
-		handlers.MergeAnnotations(&rf, analyzer.ParseAnnotations(r.Handler))
 
 		out = append(out, rf)
 	}

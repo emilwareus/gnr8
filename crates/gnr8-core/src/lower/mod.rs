@@ -28,6 +28,7 @@
 mod model;
 mod yaml;
 
+use crate::config::SecurityConfig;
 use crate::graph::{ApiGraph, Operation as GraphOp, Schema, SchemaType};
 use model::{
     Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
@@ -42,25 +43,30 @@ use std::collections::BTreeMap;
 /// rationale.
 const BASE_PATH: &str = "/goal";
 
-/// The single API-key security scheme name the fixture annotates (`@Security ApiKeyAuth`).
-const API_KEY_SCHEME: &str = "ApiKeyAuth";
+/// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
+const SUPPORTED_API_KEY_LOCATION: &str = "header";
 
-/// The HTTP header the generated API-key scheme reads.
-const API_KEY_HEADER: &str = "X-API-Key";
+/// The only security scheme kind the `PoC` supports.
+const SUPPORTED_SCHEME_KIND: &str = "apiKey";
 
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document (serialized YAML).
 ///
 /// A pure graph→typed-doc transform (D-02): builds a [`model::OpenApiDoc`] and serializes it via the
 /// deterministic [`yaml::write`] writer. Operation paths are joined with the absolute [`BASE_PATH`]
 /// prefix (Open Q A3); every schema `$ref` is resolved against `graph.schemas` to its bare component
-/// name; security schemes are collected from the operations that carry them.
+/// name. The `security` requirement and `components.securitySchemes` are built ENTIRELY from
+/// `security` (the user's `gnr8` config) — the single source of truth for security (`CLAUDE.md` rule
+/// 4); the graph carries no security facts. The `PoC` policy applies every configured scheme to all
+/// operations (top-level `security`).
 ///
 /// # Errors
 ///
 /// Returns [`crate::CoreError::Lowering`] when a graph fact cannot be represented — a dangling `$ref`
 /// (a `request_body`/`response.body` whose `ref_id` is not among `graph.schemas`) or an unknown
-/// [`crate::graph::SchemaType`] `kind`. Never panics and never `unwrap`s (RUST-04 / T-03-01-01).
-pub fn to_openapi(graph: &ApiGraph) -> Result<String, crate::CoreError> {
+/// [`crate::graph::SchemaType`] `kind` — or when a configured security scheme uses an unsupported
+/// `kind`/`location` (so a misconfiguration is a clear error, never a silently dropped scheme). Never
+/// panics and never `unwrap`s (RUST-04 / T-03-01-01).
+pub fn to_openapi(graph: &ApiGraph, security: &SecurityConfig) -> Result<String, crate::CoreError> {
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
         .schemas
@@ -70,31 +76,7 @@ pub fn to_openapi(graph: &ApiGraph) -> Result<String, crate::CoreError> {
 
     let paths = build_paths(graph, &ref_to_name)?;
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
-    let any_secured = graph
-        .operations
-        .iter()
-        .any(|op| op.security_schemes.iter().any(|s| s == API_KEY_SCHEME));
-
-    let security = if any_secured {
-        vec![SecurityRequirement {
-            scheme: API_KEY_SCHEME.to_string(),
-            scopes: vec![],
-        }]
-    } else {
-        vec![]
-    };
-    let security_schemes = if any_secured {
-        vec![(
-            API_KEY_SCHEME.to_string(),
-            SecurityScheme {
-                kind: "apiKey",
-                location: "header",
-                name: API_KEY_HEADER.to_string(),
-            },
-        )]
-    } else {
-        vec![]
-    };
+    let security = build_security(security)?;
 
     let doc = OpenApiDoc {
         openapi: "3.1.0",
@@ -103,15 +85,74 @@ pub fn to_openapi(graph: &ApiGraph) -> Result<String, crate::CoreError> {
             version: "0.1.0".to_string(),
             description: None,
         },
-        security,
+        security: security.requirements,
         paths,
         components: Components {
-            security_schemes,
+            security_schemes: security.schemes,
             schemas,
         },
     };
 
     Ok(yaml::write(&doc))
+}
+
+/// The lowered security: the top-level `security` requirements and the `components.securitySchemes`,
+/// both built from config. Bundled into one struct so the [`build_security`] return type stays simple.
+struct LoweredSecurity {
+    /// Top-level `security` requirements (one per configured scheme, sorted by id).
+    requirements: Vec<SecurityRequirement>,
+    /// `components.securitySchemes` entries, keyed by scheme id, sorted by id.
+    schemes: Vec<(String, SecurityScheme)>,
+}
+
+/// Build the top-level `security` requirements + `components.securitySchemes` from the user's config
+/// (the single source of truth for security — CLAUDE.md rule 4). The `PoC` `apply_to_all` policy adds
+/// every configured scheme to the top-level requirement, sorted by scheme id for determinism.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Lowering`] for a scheme whose `kind`/`location` the `PoC` does not
+/// support, so an unsupported config is a clear error rather than a silently dropped scheme.
+fn build_security(config: &SecurityConfig) -> Result<LoweredSecurity, crate::CoreError> {
+    // Sort by scheme id so the emitted requirement + schemes are deterministic regardless of config
+    // order (GRAPH-02), and reject a duplicate id rather than silently collapsing one.
+    let mut schemes: Vec<&crate::config::SecurityScheme> = config.schemes.iter().collect();
+    schemes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut requirements = Vec::with_capacity(schemes.len());
+    let mut components = Vec::with_capacity(schemes.len());
+    for scheme in schemes {
+        if scheme.kind != SUPPORTED_SCHEME_KIND || scheme.location != SUPPORTED_API_KEY_LOCATION {
+            return Err(crate::CoreError::Lowering {
+                message: format!(
+                    "unsupported security scheme '{}': the PoC supports kind=\"{SUPPORTED_SCHEME_KIND}\" \
+                     in=\"{SUPPORTED_API_KEY_LOCATION}\" only (got kind=\"{}\" location=\"{}\")",
+                    scheme.id, scheme.kind, scheme.location
+                ),
+            });
+        }
+        if components.iter().any(|(id, _)| id == &scheme.id) {
+            return Err(crate::CoreError::Lowering {
+                message: format!("duplicate security scheme id '{}' in config", scheme.id),
+            });
+        }
+        requirements.push(SecurityRequirement {
+            scheme: scheme.id.clone(),
+            scopes: vec![],
+        });
+        components.push((
+            scheme.id.clone(),
+            SecurityScheme {
+                kind: scheme.kind.clone(),
+                location: scheme.location.clone(),
+                name: scheme.name.clone(),
+            },
+        ));
+    }
+    Ok(LoweredSecurity {
+        requirements,
+        schemes: components,
+    })
 }
 
 /// Group operations sharing an absolute path into one [`PathItem`] (so PUT + DELETE on
@@ -171,7 +212,11 @@ fn place_operation(
     Ok(())
 }
 
-/// Lower one graph [`GraphOp`] into a typed [`Operation`] (summary, id, tags, params, body, responses).
+/// Lower one graph [`GraphOp`] into a typed [`Operation`] (operationId, params, body, responses).
+///
+/// Query params lower to a bare `string` schema, never required, with no enum (those were annotation
+/// facts and are gone — CLAUDE.md rules 1 & 3). There is no summary/tags. Response descriptions use a
+/// stable default since the graph carries none.
 fn lower_operation(
     op: &GraphOp,
     ref_to_name: &BTreeMap<&str, &str>,
@@ -180,22 +225,11 @@ fn lower_operation(
         .params
         .iter()
         .map(|param| {
-            let schema = if param.enum_values.is_empty() {
-                lower_schema_type(&param.schema, ref_to_name)?
-            } else {
-                // Closed value set from an Enums(...) annotation → a string enum schema.
-                SchemaObject {
-                    type_name: Some("string".to_string()),
-                    enum_values: param.enum_values.clone(),
-                    ..SchemaObject::default()
-                }
-            };
             Ok(Parameter {
                 name: param.name.clone(),
                 location: param.location.clone(),
                 required: param.required,
-                description: param.description.clone(),
-                schema,
+                schema: lower_schema_type(&param.schema, ref_to_name)?,
             })
         })
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
@@ -216,14 +250,10 @@ fn lower_operation(
                 Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
                 None => None,
             };
-            let description = resp
-                .description
-                .clone()
-                .unwrap_or_else(|| default_response_description(resp.status));
             Ok((
                 resp.status.to_string(),
                 ResponseObj {
-                    description,
+                    description: default_response_description(resp.status),
                     schema_ref,
                 },
             ))
@@ -231,9 +261,7 @@ fn lower_operation(
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
     Ok(Operation {
-        summary: op.summary.clone(),
         operation_id: op.id.clone(),
-        tags: op.tags.clone(),
         parameters,
         request_body,
         responses,
@@ -390,75 +418,83 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{join_base, to_openapi};
+    use crate::config::{SecurityConfig, SecurityScheme};
     use crate::graph::ApiGraph;
 
-    /// A facts document covering the cases the mapper must handle: one secured POST under `/`, a GET
-    /// under `/list` with an enum query param, a PUT + DELETE coexisting under `/{uuid}`, an object
-    /// schema with a uuid field, a free-form-map field, an enum schema, and a diagnostic.
+    /// The fixture's security config (the SINGLE source of truth for security — CLAUDE.md rule 4):
+    /// one `ApiKeyAuth` / `X-API-Key` scheme applied to all operations.
+    fn security_config() -> SecurityConfig {
+        SecurityConfig {
+            schemes: vec![SecurityScheme {
+                id: "ApiKeyAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-API-Key".to_string(),
+            }],
+        }
+    }
+
+    /// A facts document covering the cases the mapper must handle (code-first shape — no annotation
+    /// facts): a POST under `/`, a GET under `/list` with two query params, a PUT + DELETE coexisting
+    /// under `/{uuid}`, an object schema with a uuid field, a free-form-map field, a code-defined enum
+    /// schema, and a diagnostic.
     const SAMPLE: &[u8] = br#"{
       "module": "github.com/acme/svc",
       "routes": [
         {
-          "method": "POST", "path": "/", "router_path": null, "handler": "createGoal",
-          "operation_id": null, "summary": null, "tags": [], "secured": true,
-          "security_schemes": ["ApiKeyAuth"], "params": [],
+          "method": "POST", "path": "/", "handler": "createGoal",
+          "operation_id": "createGoal", "params": [],
           "request_body": { "ref_id": "internal/dto.CreateGoalInput" },
           "responses": [
-            { "status": 201, "body": { "ref_id": "internal/dto.CommandMessage" }, "description": null }
+            { "status": 201, "body": { "ref_id": "internal/dto.CommandMessage" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
-          "operation_id": null, "summary": "List goals", "tags": ["Goals"], "secured": true,
-          "security_schemes": ["ApiKeyAuth"],
+          "method": "GET", "path": "/list", "handler": "listGoals",
+          "operation_id": "listGoals",
           "params": [
             {
-              "name": "aggregation", "location": "query", "required": true,
+              "name": "aggregation", "location": "query", "required": false,
               "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-              "description": "Aggregation", "enum_values": ["sum", "count"],
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 }
             }
           ],
           "request_body": null,
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.GoalResponse" }, "description": "Goals page" }
+            { "status": 200, "body": { "ref_id": "internal/dto.GoalResponse" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "method": "DELETE", "path": "/{uuid}", "router_path": null, "handler": "deleteGoal",
-          "operation_id": null, "summary": null, "tags": [], "secured": true,
-          "security_schemes": [],
+          "method": "DELETE", "path": "/{uuid}", "handler": "deleteGoal",
+          "operation_id": "deleteGoal",
           "params": [
             {
               "name": "uuid", "location": "path", "required": true,
               "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-              "description": null, "enum_values": [],
               "span": { "file": "/root/h.go", "start_line": 3, "end_line": 3 }
             }
           ],
           "request_body": null,
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" }, "description": null }
+            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 3, "end_line": 3 }
         },
         {
-          "method": "PUT", "path": "/{uuid}", "router_path": "/{uuid}", "handler": "updateGoal",
-          "operation_id": "goalUuidPut", "summary": "Update goal", "tags": ["Goals"], "secured": true,
-          "security_schemes": ["ApiKeyAuth"],
+          "method": "PUT", "path": "/{uuid}", "handler": "updateGoal",
+          "operation_id": "updateGoal",
           "params": [
             {
               "name": "uuid", "location": "path", "required": true,
               "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-              "description": "Goal UUID", "enum_values": [],
               "span": { "file": "/root/h.go", "start_line": 4, "end_line": 4 }
             }
           ],
           "request_body": { "ref_id": "internal/dto.CreateGoalInput" },
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" }, "description": "Goal updated" }
+            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 4, "end_line": 4 }
         }
@@ -541,7 +577,7 @@ mod tests {
 
     #[test]
     fn paths_are_keyed_absolutely_under_goal() {
-        let yaml = to_openapi(&sample_graph()).unwrap();
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
         assert!(yaml.contains("'/goal/':"), "{yaml}");
         assert!(yaml.contains("'/goal/list':"), "{yaml}");
         assert!(yaml.contains("'/goal/{uuid}':"), "{yaml}");
@@ -550,7 +586,7 @@ mod tests {
 
     #[test]
     fn put_and_delete_coexist_on_one_path() {
-        let yaml = to_openapi(&sample_graph()).unwrap();
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
         // Both methods must render under the single /goal/{uuid} path item.
         let uuid_block = yaml
             .split("'/goal/{uuid}':")
@@ -561,13 +597,48 @@ mod tests {
     }
 
     #[test]
+    fn operation_ids_are_handler_symbols() {
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        // operationIds are the handler-symbol-derived ids — no annotation override (e.g. updateGoal,
+        // not goalUuidPut).
+        assert!(yaml.contains("operationId: createGoal"), "{yaml}");
+        assert!(yaml.contains("operationId: updateGoal"), "{yaml}");
+        assert!(yaml.contains("operationId: deleteGoal"), "{yaml}");
+        assert!(yaml.contains("operationId: listGoals"), "{yaml}");
+        assert!(
+            !yaml.contains("goalUuidPut"),
+            "operation id is the handler symbol:\n{yaml}"
+        );
+        // No summary/tags survive (they were annotation facts).
+        assert!(!yaml.contains("summary:"), "no summary:\n{yaml}");
+        assert!(!yaml.contains("tags:"), "no tags:\n{yaml}");
+    }
+
+    #[test]
+    fn query_params_are_plain_string_not_required_no_enum() {
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        // The aggregation query param lowers to a bare string, not required, with no enum.
+        let list_block = yaml.split("'/goal/list':").nth(1).expect("list path");
+        let list_block = list_block
+            .split("'/goal/{uuid}':")
+            .next()
+            .unwrap_or(list_block);
+        assert!(list_block.contains("name: aggregation"), "{list_block}");
+        assert!(list_block.contains("required: false"), "{list_block}");
+        assert!(
+            !list_block.contains("enum:"),
+            "no enum on query param:\n{list_block}"
+        );
+    }
+
+    #[test]
     fn dangling_request_body_ref_returns_lowering_error() {
         let mut graph = sample_graph();
         // Point a request body at a ref_id that is not among the schemas.
         graph.operations[0].request_body = Some(crate::graph::SchemaRef {
             ref_id: "internal/dto.DoesNotExist".to_string(),
         });
-        let err = to_openapi(&graph).unwrap_err();
+        let err = to_openapi(&graph, &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -579,7 +650,7 @@ mod tests {
         let mut graph = sample_graph();
         // Corrupt a field's schema kind to an unrepresentable value.
         graph.schemas[1].fields[0].schema.kind = "tuple".to_string();
-        let err = to_openapi(&graph).unwrap_err();
+        let err = to_openapi(&graph, &security_config()).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {
             panic!("expected Lowering, got {err:?}");
         };
@@ -587,8 +658,8 @@ mod tests {
     }
 
     #[test]
-    fn api_key_security_is_emitted_top_level_and_in_components() {
-        let yaml = to_openapi(&sample_graph()).unwrap();
+    fn api_key_security_is_emitted_from_config_top_level_and_in_components() {
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
         assert!(yaml.contains("security:"), "top-level security:\n{yaml}");
         assert!(yaml.contains("- ApiKeyAuth: []"), "{yaml}");
         assert!(yaml.contains("securitySchemes:"), "{yaml}");
@@ -598,11 +669,55 @@ mod tests {
     }
 
     #[test]
+    fn no_security_config_emits_no_security() {
+        // With an empty security config the document carries no security — proving security is
+        // ENTIRELY config-driven, never derived from the graph (CLAUDE.md rule 4).
+        let yaml = to_openapi(&sample_graph(), &SecurityConfig::default()).unwrap();
+        assert!(
+            !yaml.contains("ApiKeyAuth"),
+            "no scheme without config:\n{yaml}"
+        );
+        assert!(!yaml.contains("securitySchemes:"), "{yaml}");
+    }
+
+    #[test]
+    fn unsupported_security_scheme_kind_returns_lowering_error() {
+        let config = SecurityConfig {
+            schemes: vec![SecurityScheme {
+                id: "OAuth".to_string(),
+                kind: "oauth2".to_string(),
+                location: "header".to_string(),
+                name: "Authorization".to_string(),
+            }],
+        };
+        let err = to_openapi(&sample_graph(), &config).unwrap_err();
+        let crate::CoreError::Lowering { message } = err else {
+            panic!("expected Lowering, got {err:?}");
+        };
+        assert!(message.contains("unsupported security scheme"), "{message}");
+    }
+
+    #[test]
     fn free_form_map_field_lowers_to_additional_properties_true() {
-        let yaml = to_openapi(&sample_graph()).unwrap();
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
         assert!(
             yaml.contains("additionalProperties: true"),
             "free-form map must lower to additionalProperties: true:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn code_defined_enum_is_preserved() {
+        // A code-defined Go enum (TargetDirection, from go/types) must still render as a string enum —
+        // it comes from CODE, not annotations (CLAUDE.md rule on keeping code-defined enums).
+        let yaml = to_openapi(&sample_graph(), &security_config()).unwrap();
+        let td = yaml
+            .split("TargetDirection:")
+            .nth(1)
+            .expect("TargetDirection schema");
+        assert!(
+            td.contains("enum: [gte, lte]"),
+            "code enum preserved:\n{td}"
         );
     }
 
@@ -611,12 +726,15 @@ mod tests {
         let graph = sample_graph();
         // The sample carries a diagnostic; lowering must still succeed (diagnostics are advisory).
         assert!(!graph.diagnostics.is_empty());
-        assert!(to_openapi(&graph).is_ok());
+        assert!(to_openapi(&graph, &security_config()).is_ok());
     }
 
     #[test]
     fn to_openapi_is_byte_identical_across_two_runs() {
         let graph = sample_graph();
-        assert_eq!(to_openapi(&graph).unwrap(), to_openapi(&graph).unwrap());
+        assert_eq!(
+            to_openapi(&graph, &security_config()).unwrap(),
+            to_openapi(&graph, &security_config()).unwrap()
+        );
     }
 }

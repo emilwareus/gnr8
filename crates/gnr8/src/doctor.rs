@@ -137,7 +137,7 @@ fn explain(message: &str) -> (String, String) {
         (
             "an untyped query parameter is recovered as a bare string; its type/required-ness is under-specified"
                 .to_string(),
-            "bind the parameter via a struct or a swaggo annotation to recover its real type"
+            "bind the parameter via a typed struct so the analyzer can recover its real type"
                 .to_string(),
         )
     } else {

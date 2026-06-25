@@ -32,8 +32,8 @@ import (
 )
 
 // CodeFacts is the code-inferred contract for one handler: the request body, the
-// responses keyed by status, and the params. Annotation facts (Task 3) merge on
-// top, code taking precedence.
+// responses keyed by status, and the params. This is the ONLY source of these
+// facts — there is no annotation/fallback path (CLAUDE.md rules 1 & 3).
 type CodeFacts struct {
 	RequestBody *facts.TypeRef
 	Responses   []facts.ResponseFact
@@ -94,29 +94,25 @@ func declPos(fn *ast.FuncDecl) token.Pos {
 // Built once from the loaded packages and reused for every route.
 type Index map[string]handlerDecl
 
-// Analyzer carries the per-invocation context the handler/annotation analysis
-// needs — the module prefix used to derive module-relative schema ids and the
-// swaggo selector->package map — alongside the handler Index. Threading this
-// state through a struct (instead of package-level globals) makes the helper
-// reentrant: two analyses over different modules in one process no longer clobber
-// each other's prefix/selector map (WR-03), and the setup ordering is enforced by
-// construction rather than by call discipline.
+// Analyzer carries the per-invocation context the handler analysis needs — the
+// module prefix used to derive module-relative schema ids — alongside the handler
+// Index. Threading this state through a struct (instead of package-level globals)
+// makes the helper reentrant: two analyses over different modules in one process
+// no longer clobber each other's prefix (WR-03), and the setup ordering is
+// enforced by construction rather than by call discipline.
 type Analyzer struct {
 	idx          Index
 	modulePrefix string
-	annPkgPaths  map[string]string
 }
 
 // NewAnalyzer builds an Analyzer from the loaded packages and the target module
 // path. The module prefix qualifies handler-inferred schema refs into the 02-01
-// module-relative format; the selector->package map is derived from the loaded
-// target packages so annotation `{object} dto.X` refs share that format. diags
-// receives any duplicate-handler-name collision warnings (WR-02).
+// module-relative format. diags receives any duplicate-handler-name collision
+// warnings (WR-02).
 func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Analyzer {
 	return &Analyzer{
 		idx:          BuildIndex(res, diags),
 		modulePrefix: module,
-		annPkgPaths:  AnnotationPackagesFromResult(res, module),
 	}
 }
 
@@ -175,16 +171,6 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 	return idx
 }
 
-// Doc returns the doc comment of the indexed handler (for the swaggo annotation
-// parser, Task 3), or nil when the handler or its doc is absent.
-func (i Index) Doc(handler string) *ast.CommentGroup {
-	h, ok := i[handler]
-	if !ok || h.decl == nil {
-		return nil
-	}
-	return h.decl.Doc
-}
-
 // Analyze infers the request/response/param facts for one route's handler. The
 // route carries the method + normalized path so untyped-query diagnostics can name
 // the operation. Unknown handlers (no matching decl) yield empty facts, not a
@@ -236,8 +222,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 
 // bindRequestType resolves ShouldBindJSON(&x) -> a TypeRef to the bound named type.
 // arg[0] must be &ident (an *ast.UnaryExpr with Op AND). When the type cannot be
-// resolved to a named type, returns ok=false (the annotation @Param body is the
-// fallback, applied in Task 3).
+// resolved to a named type, returns ok=false and the route simply has no request
+// body — there is no secondary source (CLAUDE.md rule 3).
 func (a *Analyzer) bindRequestType(info *gotypes.Info, call *ast.CallExpr) (*facts.TypeRef, bool) {
 	if len(call.Args) < 1 {
 		return nil, false
@@ -295,8 +281,7 @@ func (a *Analyzer) analyzeJSON(
 // before narrowing to uint16: a non-exact or out-of-range constant (e.g.
 // c.JSON(70000, x), which would otherwise wrap silently to 4464) returns
 // ok=false so the caller emits a dynamic-response diagnostic instead of emitting
-// a corrupted status (GO-06). This matches the guard parseResponse already
-// applies on the annotation path.
+// a corrupted status (GO-06).
 func statusOf(info *gotypes.Info, arg ast.Expr) (uint16, bool) {
 	tv, ok := info.Types[arg]
 	if ok && tv.Value != nil && tv.Value.Kind() == constant.Int {
@@ -372,31 +357,30 @@ func (a *Analyzer) qualifiedSchemaID(pkgPath, name string) string {
 
 func pathParam(name string, fset *token.FileSet, pos token.Pos) facts.ParamFact {
 	return facts.ParamFact{
-		Name:       name,
-		Location:   "path",
-		Required:   true,
-		Schema:     facts.SchemaType{Kind: "string"},
-		EnumValues: []string{},
-		Span:       spanOf(fset, pos),
+		Name:     name,
+		Location: "path",
+		Required: true,
+		Schema:   facts.SchemaType{Kind: "string"},
+		Span:     spanOf(fset, pos),
 	}
 }
 
+// queryParam builds a query parameter from a c.Query("name") read. Type defaults
+// to string and required defaults to false; there is no annotation source to
+// refine these (CLAUDE.md rules 1 & 3).
 func queryParam(name string, fset *token.FileSet, pos token.Pos) facts.ParamFact {
 	return facts.ParamFact{
-		Name:       name,
-		Location:   "query",
-		Required:   false, // under-specified from code; @Param may upgrade (Task 3).
-		Schema:     facts.SchemaType{Kind: "string"},
-		EnumValues: []string{},
-		Span:       spanOf(fset, pos),
+		Name:     name,
+		Location: "query",
+		Required: false,
+		Schema:   facts.SchemaType{Kind: "string"},
+		Span:     spanOf(fset, pos),
 	}
 }
 
-// untypedRouteLabel renders the operation label used in the untyped-query
-// diagnostic. The fixture's expected text is "GET /goal/list", so we prefer the
-// concrete annotation-resolved path when available; the route here is
-// group-relative, so 02-03 reconciles the exact prefix — the machine-stable
-// identity (param name + method + relative path) is preserved.
+// untypedRouteLabel renders the operation label (method + group-relative path)
+// used in the untyped-query diagnostic. The machine-stable identity (param name +
+// method + relative path) is preserved.
 func untypedRouteLabel(route routes.Route) string {
 	return route.Path
 }

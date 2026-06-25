@@ -381,6 +381,20 @@ fn go_available() -> bool {
             .is_ok()
 }
 
+/// The fixture's security config — the single source of truth for security (CLAUDE.md rule 4): one
+/// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from source, so lowering-based
+/// tests supply it here.
+fn fixture_security() -> gnr8_core::config::SecurityConfig {
+    gnr8_core::config::SecurityConfig {
+        schemes: vec![gnr8_core::config::SecurityScheme {
+            id: "ApiKeyAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "X-API-Key".to_string(),
+        }],
+    }
+}
+
 /// Find the action `plan_writes` assigned to `path` (test helper).
 fn action_for<'a>(plan: &'a lifecycle::WritePlan, path: &str) -> &'a WriteAction {
     &plan
@@ -626,20 +640,21 @@ fn naming_overrides_apply() {
     let mut graph = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
 
     let mut naming = gnr8_core::config::NamingOverrides::default();
-    // The fixture has a `goalUuidPut` operation (the @ID-annotated PUT).
+    // The fixture's PUT operation id is the handler symbol `updateGoal` (code-derived, no annotation).
     naming
         .operations
-        .insert("goalUuidPut".to_string(), "RenamedUpdateGoal".to_string());
+        .insert("updateGoal".to_string(), "RenamedUpdateGoal".to_string());
 
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a valid override");
-    let yaml = gnr8_core::lower::to_openapi(&graph).expect("to_openapi after naming override");
+    let yaml = gnr8_core::lower::to_openapi(&graph, &fixture_security())
+        .expect("to_openapi after naming override");
 
     assert!(
         yaml.contains("operationId: RenamedUpdateGoal"),
         "the remapped operation id must appear in the OpenAPI output:\n{yaml}"
     );
     assert!(
-        !yaml.contains("operationId: goalUuidPut"),
+        !yaml.contains("operationId: updateGoal"),
         "the old operation id must be gone:\n{yaml}"
     );
 
@@ -651,7 +666,7 @@ fn naming_overrides_apply() {
         .insert("doesNotExist".to_string(), "Whatever".to_string());
     lifecycle::apply_naming(&mut graph2, &noop_naming).expect("an unmatched key is a no-op");
     assert!(
-        gnr8_core::lower::to_openapi(&graph2).is_ok(),
+        gnr8_core::lower::to_openapi(&graph2, &fixture_security()).is_ok(),
         "an unmatched naming key must be a silent no-op"
     );
 }
@@ -676,7 +691,7 @@ fn naming_type_rename_updates_refs_no_dangling() {
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a referenced rename");
 
     // to_openapi MUST succeed — a dangling $ref would raise CoreError::Lowering.
-    let yaml = gnr8_core::lower::to_openapi(&graph)
+    let yaml = gnr8_core::lower::to_openapi(&graph, &fixture_security())
         .expect("to_openapi must succeed after a referenced-type rename (no dangling $ref)");
 
     // The new name is in components.schemas AND in the referencing operation's $ref.

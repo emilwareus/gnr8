@@ -956,32 +956,27 @@ mod tests {
       "module": "github.com/acme/svc",
       "routes": [
         {
-          "method": "POST", "path": "/", "router_path": null, "handler": "createGoal",
-          "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
-          "security_schemes": ["ApiKeyAuth"], "params": [],
+          "method": "POST", "path": "/", "handler": "createGoal",
+          "operation_id": "createGoal", "params": [],
           "request_body": { "ref_id": "dto.CreateGoalInput" },
           "responses": [
-            { "status": 201, "body": { "ref_id": "dto.CommandMessage" }, "description": null },
-            { "status": 400, "body": { "ref_id": "dto.HttpError" }, "description": null }
+            { "status": 201, "body": { "ref_id": "dto.CommandMessage" } },
+            { "status": 400, "body": { "ref_id": "dto.HttpError" } }
           ],
           "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
-          "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
-          "security_schemes": ["ApiKeyAuth"],
-          "params": [
+          "method": "GET", "path": "/list", "handler": "listGoals",
+          "operation_id": "listGoals", "params": [
             { "name": "aggregation", "location": "query", "required": true,
               "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-              "enum_values": ["count","sum"], "description": "agg",
               "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } },
             { "name": "cursor", "location": "query", "required": false,
               "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-              "enum_values": [], "description": "cur",
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
           ],
           "request_body": null,
-          "responses": [ { "status": 200, "body": { "ref_id": "dto.GoalResponse" }, "description": "ok" } ],
+          "responses": [ { "status": 200, "body": { "ref_id": "dto.GoalResponse" } } ],
           "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 }
         }
       ],
@@ -1072,13 +1067,12 @@ mod tests {
               "module": "github.com/acme/svc",
               "routes": [
                 {{
-                  "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
-                  "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
-                  "security_schemes": ["ApiKeyAuth"], "params": [],
+                  "method": "GET", "path": "/list", "handler": "listGoals",
+                  "operation_id": "listGoals", "params": [],
                   "request_body": null,
                   "responses": [
-                    {{ "status": 200, "body": {{ "ref_id": "dto.GoalResponse" }}, "description": "ok" }},
-                    {{ "status": 400, "body": {{ "ref_id": "dto.{error_name}" }}, "description": "bad" }}
+                    {{ "status": 200, "body": {{ "ref_id": "dto.GoalResponse" }} }},
+                    {{ "status": 400, "body": {{ "ref_id": "dto.{error_name}" }} }}
                   ],
                   "span": {{ "file": "/root/http.go", "start_line": 1, "end_line": 1 }}
                 }}
@@ -1120,17 +1114,14 @@ mod tests {
           "module": "github.com/acme/svc",
           "routes": [
             {
-              "method": "DELETE", "path": "/{uuid}", "router_path": "/{uuid}", "handler": "deleteGoal",
-              "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
-              "security_schemes": ["ApiKeyAuth"],
-              "params": [
+              "method": "DELETE", "path": "/{uuid}", "handler": "deleteGoal",
+              "operation_id": "deleteGoal", "params": [
                 { "name": "uuid", "location": "path", "required": true,
                   "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-                  "enum_values": [], "description": null,
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
               ],
               "request_body": null,
-              "responses": [ { "status": 200, "body": null, "description": "ok" } ],
+              "responses": [ { "status": 200, "body": null } ],
               "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
             }
           ],
@@ -1148,17 +1139,14 @@ mod tests {
           "module": "github.com/acme/svc",
           "routes": [
             {
-              "method": "DELETE", "path": "/{uuid}", "router_path": "/{uuid}", "handler": "deleteGoal",
-              "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
-              "security_schemes": ["ApiKeyAuth"],
-              "params": [
+              "method": "DELETE", "path": "/{uuid}", "handler": "deleteGoal",
+              "operation_id": "deleteGoal", "params": [
                 { "name": "id", "location": "path", "required": true,
                   "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-                  "enum_values": [], "description": null,
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
               ],
               "request_body": null,
-              "responses": [ { "status": 200, "body": null, "description": "ok" } ],
+              "responses": [ { "status": 200, "body": null } ],
               "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
             }
           ],
@@ -1177,21 +1165,17 @@ mod tests {
           "module": "github.com/acme/svc",
           "routes": [
             {
-              "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
-              "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
-              "security_schemes": ["ApiKeyAuth"],
-              "params": [
+              "method": "GET", "path": "/list", "handler": "listGoals",
+              "operation_id": "listGoals", "params": [
                 { "name": "page", "location": "query", "required": true,
                   "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
-                  "enum_values": [], "description": "page",
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } },
                 { "name": "active", "location": "query", "required": false,
                   "schema": { "kind": "boolean", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-                  "enum_values": [], "description": "active",
                   "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
               ],
               "request_body": null,
-              "responses": [ { "status": 200, "body": { "ref_id": "dto.GoalResponse" }, "description": "ok" } ],
+              "responses": [ { "status": 200, "body": { "ref_id": "dto.GoalResponse" } } ],
               "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
             }
           ],
@@ -1220,12 +1204,11 @@ mod tests {
               "module": "github.com/acme/svc",
               "routes": [
                 {{
-                  "method": "POST", "path": "/", "router_path": null, "handler": "createGoal",
-                  "operation_id": null, "summary": null, "tags": ["Goals"], "secured": true,
-                  "security_schemes": ["ApiKeyAuth"], "params": [],
+                  "method": "POST", "path": "/", "handler": "createGoal",
+                  "operation_id": "createGoal", "params": [],
                   "request_body": null,
                   "responses": [
-                    {{ "status": {status}, "body": null, "description": "created" }}
+                    {{ "status": {status}, "body": null }}
                   ],
                   "span": {{ "file": "/root/http.go", "start_line": 1, "end_line": 1 }}
                 }}
@@ -1245,12 +1228,11 @@ mod tests {
           "module": "github.com/acme/svc",
           "routes": [
             {
-              "method": "GET", "path": "/list", "router_path": "/list", "handler": "listGoals",
-              "operation_id": null, "summary": "List", "tags": ["Goals"], "secured": true,
-              "security_schemes": ["ApiKeyAuth"], "params": [],
+              "method": "GET", "path": "/list", "handler": "listGoals",
+              "operation_id": "listGoals", "params": [],
               "request_body": null,
               "responses": [
-                { "status": 200, "body": { "ref_id": "dto.GoalResponse" }, "description": "ok" }
+                { "status": 200, "body": { "ref_id": "dto.GoalResponse" } }
               ],
               "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
             }

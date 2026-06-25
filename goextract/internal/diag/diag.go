@@ -68,13 +68,13 @@ func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line u
 
 // DynamicResponse records the dynamic/unresolvable-response warning (D-05 / GO-06):
 // a c.JSON(...) whose status or body could not be resolved to a constant/named
-// type, so the response is diagnosed rather than guessed or silently dropped.
+// type. The response is diagnosed rather than guessed or silently dropped; there
+// is no secondary source to recover it from (CLAUDE.md rule 3).
 func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Severity: severityWarn,
 		Message: "dynamic response in handler " + handler + ": " + reason +
-			"; cannot infer a typed response from code — falling back to " +
-			"@Success/@Failure annotation (TARGET-API.md §5; D-05)",
+			"; cannot infer a typed response from code (TARGET-API.md §5; D-05)",
 		File: file,
 		Line: line,
 	})

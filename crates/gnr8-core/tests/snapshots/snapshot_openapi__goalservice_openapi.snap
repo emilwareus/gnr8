@@ -33,46 +33,37 @@ paths:
                 $ref: '#/components/schemas/HttpError'
   '/goal/list':
     get:
-      summary: List goals
       operationId: listGoals
-      tags: [Goals]
       parameters:
       - name: aggregation
         in: query
-        required: true
-        description: Aggregation
+        required: false
         schema:
           type: string
-          enum: [avg, count, max, min, sum]
       - name: cursor
         in: query
         required: false
-        description: Cursor UUID for pagination
         schema:
           type: string
       - name: page_size
         in: query
         required: false
-        description: Page size
         schema:
           type: string
       responses:
         '200':
-          description: Goals page
+          description: Response 200
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ListGoalsOutput'
   '/goal/{uuid}':
     put:
-      summary: Update goal
-      operationId: goalUuidPut
-      tags: [Goals]
+      operationId: updateGoal
       parameters:
       - name: uuid
         in: path
         required: true
-        description: Goal UUID
         schema:
           type: string
       requestBody:
@@ -83,19 +74,13 @@ paths:
               $ref: '#/components/schemas/UpdateGoalInput'
       responses:
         '200':
-          description: Goal updated
+          description: Response 200
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CommandMessage'
         '400':
-          description: Invalid input
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HttpError'
-        '404':
-          description: Goal not found
+          description: Response 400
           content:
             application/json:
               schema:

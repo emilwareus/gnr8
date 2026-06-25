@@ -84,17 +84,13 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
     }
 }
 
-/// Emit one operation's keys in fixed order: `summary`, `operationId`, `tags`, `parameters`,
-/// `requestBody`, `responses`.
+/// Emit one operation's keys in fixed order: `operationId`, `parameters`, `requestBody`, `responses`.
+///
+/// There is no `summary`/`tags` — those were annotation facts and have been removed (CLAUDE.md rules
+/// 1 & 3).
 fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     let pad = INDENT.repeat(depth);
-    if let Some(summary) = &op.summary {
-        let _ = writeln!(out, "{pad}summary: {}", scalar(summary));
-    }
     let _ = writeln!(out, "{pad}operationId: {}", scalar(&op.operation_id));
-    if !op.tags.is_empty() {
-        let _ = writeln!(out, "{pad}tags: {}", flow_seq(&op.tags));
-    }
     if !op.parameters.is_empty() {
         let _ = writeln!(out, "{pad}parameters:");
         for param in &op.parameters {
@@ -107,15 +103,13 @@ fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     write_responses(out, &op.responses, depth);
 }
 
-/// Emit one parameter list entry (`- name: .. / in: .. / required: .. / description: .. / schema: ..`).
+/// Emit one parameter list entry (`- name: .. / in: .. / required: .. / schema: ..`). There is no
+/// `description` — it was an annotation fact and has been removed (CLAUDE.md rules 1 & 3).
 fn write_parameter(out: &mut String, param: &Parameter, depth: usize) {
     let pad = INDENT.repeat(depth);
     let _ = writeln!(out, "{pad}- name: {}", scalar(&param.name));
     let _ = writeln!(out, "{pad}  in: {}", param.location);
     let _ = writeln!(out, "{pad}  required: {}", param.required);
-    if let Some(desc) = &param.description {
-        let _ = writeln!(out, "{pad}  description: {}", scalar(desc));
-    }
     let _ = writeln!(out, "{pad}  schema:");
     write_schema(out, &param.schema, depth + 2);
 }
@@ -293,9 +287,7 @@ mod tests {
     /// response, plus one component schema with a uuid-format field and a free-form-map field.
     fn sample_doc() -> OpenApiDoc {
         let post = Operation {
-            summary: Some("Create goal".to_string()),
             operation_id: "createGoal".to_string(),
-            tags: vec!["Goals".to_string()],
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
@@ -350,8 +342,8 @@ mod tests {
                 security_schemes: vec![(
                     "ApiKeyAuth".to_string(),
                     SecurityScheme {
-                        kind: "apiKey",
-                        location: "header",
+                        kind: "apiKey".to_string(),
+                        location: "header".to_string(),
                         name: "X-API-Key".to_string(),
                     },
                 )],
