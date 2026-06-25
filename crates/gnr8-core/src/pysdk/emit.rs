@@ -199,6 +199,25 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
     let mut out = String::new();
     out.push_str(MODELS_HEADER);
 
+    // Schema NAMES (not ids) become the Python top-level symbols (class/alias) and the __init__
+    // re-export surface. Two distinct ids that share a name would emit two `class Book` definitions
+    // (the second silently shadowing the first) and a duplicated re-export (WR-05). The graph does not
+    // guarantee name-uniqueness across ids, so reject a true collision with a typed error rather than
+    // emit silently-broken Python. One deterministic check; no fallback (rule 3).
+    let mut seen_names: Vec<&str> = Vec::with_capacity(graph.schemas.len());
+    for schema in &graph.schemas {
+        if seen_names.contains(&schema.name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "two schemas share the Python name '{}' (distinct ids map to one class) — the \
+                     SDK cannot emit two top-level `{}` symbols",
+                    schema.name, schema.name
+                ),
+            });
+        }
+        seen_names.push(schema.name.as_str());
+    }
+
     for schema in &graph.schemas {
         out.push('\n');
         match &schema.body {
