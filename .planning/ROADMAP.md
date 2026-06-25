@@ -19,7 +19,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 04-02-PLAN.md — tsextract extractor core: load.js (ts.Program + TypeChecker, static-only, synthesized strict options) + types.js (strip-axes, number→float64, named-vs-inline predicate) + schemas.js (transitive DTO collection) + facts.js marshal; golden + type tests [TSSRC-02, TSSRC-03]
+- [x] 04-02-PLAN.md — tsextract extractor core: load.js (ts.Program + TypeChecker, static-only, synthesized strict options) + types.js (strip-axes, number→float64, named-vs-inline predicate) + schemas.js (transitive DTO collection) + facts.js marshal; golden + type tests [TSSRC-02, TSSRC-03]
 
 **Wave 3** *(blocked on Waves 1-2)*
 
