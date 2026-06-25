@@ -1,0 +1,1346 @@
+//! `format!`-based TypeScript SDK emitters (D-05: no template engine; small internal templating only).
+//!
+//! Each emitter turns the router-agnostic [`crate::graph::ApiGraph`] into one idiomatic, dependency-free
+//! TypeScript source file. Like [`crate::pysdk::emit`] (and unlike [`crate::gosdk::emit`]) there is NO
+//! `gofmt`-style normalization step (the only stdlib TS formatter would be `tsc` itself, which does not
+//! reformat; `prettier` is third-party — CLAUDE.md rule 2): every emitter produces already-correct
+//! TypeScript directly.
+//!
+//! - [`emit_models`]   — one `export interface X` per object [`Schema`], one
+//!   `export type X = "a" | "b"` per named enum [`Schema`], and one `export type X = …` per named
+//!   union/alias [`Schema`]; TypeScript types follow [`ts_type`].
+//! - [`emit_client`]   — the injectable platform-`fetch`-backed `Client` (Task 2).
+//! - [`emit_errors`]   — the typed `ApiError extends Error` (Task 2).
+//! - [`emit_operations`] / [`emit_index`] — the per-operation methods + the re-export surface (Task 2).
+//!
+//! THE LOAD-BEARING DIVERGENCE from the Go twin lives in [`ts_type`]: where `go_type` returns an error
+//! for [`Type::Union`], inline [`Type::Enum`], and inline [`Type::Object`] (Go has no sum types and the
+//! Go target only emits named DTOs), TypeScript *can* express sum/inline types, so `ts_type` maps a
+//! union to `A | B` and an inline enum to a string-literal union `"a" | "b"`. The match over [`Type`]
+//! stays exhaustive — no `_ =>` arm — so a future IR variant fails to compile until handled (rule 3).
+//! Inline [`Type::Object`] keeps parity with the Go/Python targets: an EXPLICIT typed error arm.
+//!
+//! Determinism (TSSDK-03): every collection is consumed in the graph's already-sorted order, and each
+//! file's preamble is a FIXED string (TS interfaces and `fetch` need no computed import set, no
+//! [`std::collections::HashMap`] iteration). Every un-representable fact (a dangling `$ref`, an inline
+//! object) returns [`crate::CoreError::SdkGen`]; there is no production `unwrap`/`expect`/`panic`
+//! (RUST-04).
+
+use std::fmt::Write as _;
+
+use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::CoreError;
+
+/// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
+///
+/// `write!`/`writeln!` into a `String` is infallible in practice, but the `fmt::Write` trait is
+/// fallible; mapping the error keeps the path `unwrap`/`expect`-free (RUST-04).
+fn sink(err: std::fmt::Error) -> CoreError {
+    CoreError::SdkGen {
+        message: format!("failed to format TypeScript source: {err}"),
+    }
+}
+
+/// Split an identifier into words on `_`/`-`/space separators and lower→upper case boundaries.
+///
+/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `next_cursor` → `["next", "cursor"]`. The shared
+/// tokenizer behind every TypeScript casing helper (twin of `pysdk::emit::split_words`).
+fn split_words(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' || ch == ' ' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Convert an identifier to `camelCase` (TypeScript method/property name): `createBook` → `createBook`,
+/// `create_book` → `createBook`. The first word is lowercased; each subsequent word is capitalized.
+pub(crate) fn camel(name: &str) -> String {
+    let words = split_words(name);
+    let mut out = String::new();
+    for (i, word) in words.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&word.to_ascii_lowercase());
+        } else {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_ascii_uppercase().to_string().chars());
+                out.push_str(&chars.as_str().to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// Map a neutral graph [`Type`] to its TypeScript type, resolving named refs to model names.
+///
+/// ALL TypeScript-specific type mapping lives HERE (per-target mapping, IR-03). The match over [`Type`]
+/// is exhaustive — NO `_ =>` / `other =>` arm — so a future variant fails to compile until handled
+/// (rule 3).
+///
+/// This is the load-bearing divergence from `gosdk::emit::go_type`: a [`Type::Union`] becomes `A | B`
+/// and an inline [`Type::Enum`] becomes a string-literal union `"a" | "b"` (TypeScript has sum/literal
+/// types; the Go target rejected both). An inline [`Type::Object`] keeps parity with the Go/Python
+/// targets — a typed [`CoreError::SdkGen`] — because every object in the neutral IR is a named `$ref`.
+///
+/// `nullable` wraps the resulting type as `base | null` (the value may be explicitly `null`). The
+/// `optional` axis is NOT read here — it drives the field declaration's `?:` in [`emit_interface`], not
+/// the type (the two are distinct, independent axes).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on a dangling `Named` ref or an inline [`Type::Object`].
+pub(crate) fn ts_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
+    let base = match schema {
+        Type::Primitive(prim) => ts_primitive(prim).to_string(),
+        // Every well-known scalar carries on the wire as a string in this dependency-free SDK (a
+        // date-time is an RFC-3339 `string`; a uuid/email/uri is a `string`) — A7. No `Date` import.
+        Type::WellKnown(_) => "string".to_string(),
+        Type::Array(items) => format!("{}[]", ts_type(items, false, graph)?),
+        // A keyed map maps to the stricter typed `Record<string, V>` (Open Q1 resolution): the value
+        // type is preserved rather than widened to `unknown`.
+        Type::Map { value, .. } => format!("Record<string, {}>", ts_type(value, false, graph)?),
+        Type::Any {} => "unknown".to_string(),
+        Type::Named(ref_id) => {
+            let target = graph
+                .schemas
+                .iter()
+                .find(|s| &s.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
+                })?;
+            target.name.clone()
+        }
+        // An inline enum stays inline as a string-literal union (members in graph-sorted order) — the
+        // case the Go target rejects. A named enum (a top-level Schema body) is instead a `type` alias;
+        // see emit_models.
+        Type::Enum(members) => members
+            .iter()
+            .map(|m| format!("\"{m}\""))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        // A sum type becomes a native `A | B` union (the case the Go target rejects — Go has no sum
+        // types).
+        Type::Union(variants) => {
+            let mut parts: Vec<String> = Vec::with_capacity(variants.len());
+            for variant in variants {
+                parts.push(ts_type(variant, false, graph)?);
+            }
+            parts.join(" | ")
+        }
+        // An inline (anonymous) object is not emitted as a TypeScript type — every object in the IR is a
+        // named `$ref`. Keep parity with the Go/Python targets: an EXPLICIT typed error arm, NOT a
+        // catch-all (a future IR variant must fail to compile here, rule 3).
+        Type::Object(_) => {
+            return Err(CoreError::SdkGen {
+                message: "inline object type is unsupported by the TypeScript SDK target \
+                          (expected a named $ref)"
+                    .to_string(),
+            });
+        }
+    };
+    if nullable {
+        Ok(format!("{base} | null"))
+    } else {
+        Ok(base)
+    }
+}
+
+/// Map a neutral [`Prim`] to its TypeScript type. There is a single numeric type (`number`), so integer
+/// width and float width are irrelevant; a byte string carries base64 on the wire as a `string`.
+fn ts_primitive(prim: &Prim) -> &'static str {
+    match prim {
+        Prim::String => "string",
+        Prim::Bool => "boolean",
+        Prim::Int { .. } => "number",
+        Prim::Float { .. } => "number",
+        Prim::Bytes => "string",
+    }
+}
+
+/// Emit `models.ts`: one `export interface X` per object schema, one `export type X = "a" | "b"` per
+/// named enum, one `export type X = …` per named union/scalar/array alias.
+///
+/// Schemas are consumed in the graph's id-sorted order (determinism). A schema whose body is
+/// [`Type::Enum`] becomes a string-literal-union `type` alias; a [`Type::Object`] becomes an
+/// `interface`; every other named body (`Union`/`Array`/scalar/`Named`) becomes a plain `type` alias.
+/// Unlike the Python twin, TypeScript `type` aliases are order-independent, so there is NO forward-ref
+/// hack and NO fixed import header.
+///
+/// `package` is currently unused in the body (the file carries no package clause) but is kept in the
+/// signature to mirror the twin and the `generate` call site.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if a field's schema cannot be mapped or two schemas collide on a name.
+pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+    let mut out = String::new();
+
+    // Schema NAMES (not ids) become the TypeScript top-level symbols (interface/type) and the index.ts
+    // re-export surface. Two distinct ids that share a name would emit two `interface Book` definitions
+    // (a TS redeclaration error) and a duplicated re-export (WR-05). The graph does not guarantee
+    // name-uniqueness across ids, so reject a true collision with a typed error rather than emit
+    // silently-broken TypeScript. One deterministic check; no fallback (rule 3).
+    let mut seen_names: Vec<&str> = Vec::with_capacity(graph.schemas.len());
+    for schema in &graph.schemas {
+        if seen_names.contains(&schema.name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "two schemas share the TypeScript name '{}' (distinct ids map to one symbol) — \
+                     the SDK cannot emit two top-level `{}` declarations",
+                    schema.name, schema.name
+                ),
+            });
+        }
+        seen_names.push(schema.name.as_str());
+    }
+
+    for (i, schema) in graph.schemas.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &schema.body {
+            // A named enum (top-level Schema body) → a string-literal-union `type` alias. The twin of
+            // Python's `class X(str, enum.Enum)` and Go's `type X string`.
+            Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
+            // A named object → an `interface`.
+            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph)?,
+            // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
+            // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
+            // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
+            // the body exhaustively, so a named union/array/scalar alias emits a valid TS type. TS `type`
+            // aliases are order-free — NO PEP-484-style forward-ref hack is needed (RESEARCH Pitfall 6).
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Union(_)
+            | Type::Any {} => {
+                let alias = ts_type(&schema.body, false, graph)?;
+                writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Emit a named enum alias: `export type {name} = "a" | "b";` (members in graph order). The wire string
+/// IS the literal — there are no member identifiers to sanitize (TS string-literal unions have none), so
+/// the Python `SCREAMING_SNAKE`/keyword machinery has no analog here (RESEARCH Pitfall 6).
+fn emit_enum_alias(out: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
+    if members.is_empty() {
+        // An empty closed set has no inhabitants — `never` is the precise TS type.
+        writeln!(out, "export type {name} = never;").map_err(sink)?;
+        return Ok(());
+    }
+    let lits: Vec<String> = members.iter().map(|m| format!("\"{m}\"")).collect();
+    writeln!(out, "export type {name} = {};", lits.join(" | ")).map_err(sink)?;
+    Ok(())
+}
+
+/// Emit an `export interface` for an object schema, one field line per field in GRAPH ORDER.
+///
+/// Unlike the Python `@dataclass` twin there is NO required-first partition (TS `?:` is order-free —
+/// RESEARCH Pitfall 6) and NO runtime decoder: an `interface` is zero-runtime and `await res.json() as X`
+/// suffices (Assumption A1). The two independent axes are: `optional` → `?:` at the field site;
+/// `nullable` → `| null` inside [`ts_type`]. All four combinations are representable.
+fn emit_interface(
+    out: &mut String,
+    name: &str,
+    fields: &[Field],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    if fields.is_empty() {
+        // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
+        writeln!(out, "export interface {name} {{}}").map_err(sink)?;
+        return Ok(());
+    }
+    writeln!(out, "export interface {name} {{").map_err(sink)?;
+    for field in fields {
+        // The wire key (`json_name`) is the property name verbatim. A key that is not a plain
+        // identifier is still valid TS as a property name (TS accepts any string literal as a member),
+        // but the bookstore fixtures only carry identifier-safe keys; emit the key directly.
+        let hint = ts_type(&field.schema, field.nullable, graph)?;
+        let opt = if field.optional { "?" } else { "" };
+        writeln!(out, "  {}{opt}: {hint};", field.json_name).map_err(sink)?;
+    }
+    writeln!(out, "}}").map_err(sink)?;
+    Ok(())
+}
+
+/// Emit `errors.ts`: the typed `ApiError extends Error` carrying the HTTP status + decoded body, with an
+/// `isNotFound()` helper. `package` is unused in the body but kept for call-site symmetry with the twin.
+pub(crate) fn emit_errors(_package: &str) -> String {
+    "\
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: unknown,
+  ) {
+    super(`HTTP ${status}`);
+    this.name = \"ApiError\";
+  }
+
+  isNotFound(): boolean {
+    return this.status === 404;
+  }
+}
+"
+    .to_string()
+}
+
+/// Emit `client.ts`'s header + the dependency-free `Client` backed by the platform `fetch` global.
+///
+/// The operation methods (one per graph operation) are appended to this same file by [`emit_operations`]
+/// and re-frame into `client.ts`. The `Client` holds a normalized `baseUrl` and a `fetchFn` defaulting to
+/// the platform `fetch` — the swappable injectable transport seam (RESEARCH Pattern 3). No `axios` /
+/// `node-fetch` import; `typeof fetch` needs the DOM lib at typecheck time (handled by the test's
+/// `--lib es2022,dom`).
+pub(crate) fn emit_client(_package: &str) -> String {
+    "\
+import { ApiError } from \"./errors\";
+import * as models from \"./models\";
+
+export interface ClientOptions {
+  baseUrl: string;
+  fetch?: typeof fetch;
+}
+
+export class Client {
+  private readonly baseUrl: string;
+  private readonly fetchFn: typeof fetch;
+
+  constructor(opts: ClientOptions) {
+    this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
+    this.fetchFn = opts.fetch ?? fetch;
+  }
+"
+    .to_string()
+}
+
+/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). Twin of
+/// `pysdk::emit::join_path` — the SAME single source of truth (`ir.base_path`) the `OpenAPI` lowering
+/// uses.
+fn join_path(base_path: &str, path: &str) -> String {
+    let base = base_path.trim_end_matches('/');
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        format!("{base}/")
+    } else {
+        format!("{base}/{trimmed}")
+    }
+}
+
+/// Resolve an operation's primary success (lowest 2xx) response status + model name.
+///
+/// Returns the first 2xx response's status regardless of whether it carries a body; the model is `Some`
+/// only when that response has a typed body. An operation with no 2xx response yields `None`. Twin of
+/// `pysdk::emit::success_of`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
+fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<(u16, Option<String>)>, CoreError> {
+    for resp in &op.responses {
+        if (200..300).contains(&resp.status) {
+            let model = match &resp.body {
+                Some(body) => {
+                    let model = graph
+                        .schemas
+                        .iter()
+                        .find(|s| s.id == body.ref_id)
+                        .ok_or_else(|| CoreError::SdkGen {
+                            message: format!(
+                                "operation '{}' success response references dangling $ref '{}'",
+                                op.id, body.ref_id
+                            ),
+                        })?;
+                    Some(model.name.clone())
+                }
+                None => None,
+            };
+            return Ok(Some((resp.status, model)));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve an operation's request-body model name, if it has a typed body. Twin of
+/// `pysdk::emit::body_model_of`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
+fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
+    let Some(body) = &op.request_body else {
+        return Ok(None);
+    };
+    let model = graph
+        .schemas
+        .iter()
+        .find(|s| s.id == body.ref_id)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "operation '{}' request body references dangling $ref '{}'",
+                op.id, body.ref_id
+            ),
+        })?;
+    Ok(Some(model.name.clone()))
+}
+
+/// Extract the `{token}` placeholder names from a path template, in first-seen order. Twin of
+/// `pysdk::emit::path_tokens`.
+fn path_tokens(path: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            tokens.push(after[..close].to_string());
+            rest = &after[close + 1..];
+        } else {
+            break;
+        }
+    }
+    tokens
+}
+
+/// Emit `client.ts`'s operation methods (appended to the client file by [`generate`]).
+///
+/// `ops` are all of the graph's operations, in graph order. Each method:
+/// - takes path params as positional args, then a typed `body` arg for body-bearing ops, then required
+///   query params (positional), then optional query params (each defaulting to `undefined`);
+/// - interpolates each path param through `encodeURIComponent(String(value))` (V5 path-injection
+///   mitigation — twin of Go `url.PathEscape` / Python `urllib.quote(safe='')`); builds the query with a
+///   `URLSearchParams`; joins `base_path` + `op.path`;
+/// - `await`s `this.fetchFn`, throws `ApiError` on a status != the operation's real success status, and
+///   on success returns the JSON cast to the response interface (or `void`/`unknown`).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on a dangling body/response `$ref`, or a path whose templated tokens do
+/// not match its declared path params.
+pub(crate) fn emit_operations(
+    graph: &ApiGraph,
+    _package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+) -> Result<String, CoreError> {
+    let mut out = String::new();
+    for op in ops {
+        out.push('\n');
+        emit_operation(&mut out, op, graph, base_path)?;
+    }
+    // Close the `class Client {` opened by emit_client.
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// The collision-checked TypeScript identifiers for one operation's arguments.
+///
+/// Each `*_idents` vector aligns positionally with its params vector. Path params and required query
+/// params are positional (no default); optional query params take a `?: T` default.
+struct ResolvedArgs<'op> {
+    path_idents: Vec<String>,
+    required_query: Vec<&'op Param>,
+    required_query_idents: Vec<String>,
+    optional_query: Vec<&'op Param>,
+    optional_query_idents: Vec<String>,
+}
+
+/// Reserved argument name a generated method already binds (`body`), which a path/query param must not
+/// collide with (it would shadow the typed body argument — WR-03 analog).
+const RESERVED_ARGS: &[&str] = &["body"];
+
+/// Resolve + collision-check every operation argument's TypeScript identifier (WR-03 / WR-01 analog).
+///
+/// Each identifier is the `camelCase` form of the param name; the set is tracked as it grows so a
+/// collision (two params whose identifier matches, or a param colliding with the bound `body`) is a
+/// typed [`CoreError::SdkGen`] rather than a TS "duplicate parameter" error. Query params are split
+/// required-first (positional) / optional-last (`?: T`) so all non-defaulted args precede optional ones.
+/// One deterministic pass, no fallback (rule 3).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on an argument-identifier collision.
+fn resolve_op_args<'op>(
+    op: &Operation,
+    path_params: &[&'op Param],
+    query_params: &[&'op Param],
+    has_body: bool,
+) -> Result<ResolvedArgs<'op>, CoreError> {
+    let mut used_args: Vec<String> = if has_body {
+        RESERVED_ARGS.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut reserve = |name: &str| -> Result<String, CoreError> {
+        let ident = camel(name);
+        if used_args.contains(&ident) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter whose TypeScript identifier '{ident}' collides \
+                     with another argument (body or another param)",
+                    op.id
+                ),
+            });
+        }
+        used_args.push(ident.clone());
+        Ok(ident)
+    };
+
+    let mut path_idents: Vec<String> = Vec::with_capacity(path_params.len());
+    for p in path_params {
+        path_idents.push(reserve(&p.name)?);
+    }
+    // Required query params are positional (WR-01: a required query param MUST be supplied); optional
+    // ones take the `?: T` default.
+    let (required_query, optional_query): (Vec<&Param>, Vec<&Param>) =
+        query_params.iter().copied().partition(|p| p.required);
+    let mut required_query_idents: Vec<String> = Vec::with_capacity(required_query.len());
+    for p in &required_query {
+        required_query_idents.push(reserve(&p.name)?);
+    }
+    let mut optional_query_idents: Vec<String> = Vec::with_capacity(optional_query.len());
+    for p in &optional_query {
+        optional_query_idents.push(reserve(&p.name)?);
+    }
+
+    Ok(ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    })
+}
+
+/// Emit a single operation method (2-space indented as a `Client` method body).
+fn emit_operation(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    base_path: &str,
+) -> Result<(), CoreError> {
+    let method_name = camel(&op.handler);
+    let abs = join_path(base_path, &op.path);
+    let tokens = path_tokens(&abs);
+
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+
+    // The templated path tokens must be exactly the declared path params (set equality), so neither a
+    // dangling token nor an unused arg can slip through (twin of WR-03).
+    let mut token_set: Vec<&str> = tokens.iter().map(String::as_str).collect();
+    token_set.sort_unstable();
+    let mut param_set: Vec<&str> = path_params.iter().map(|p| p.name.as_str()).collect();
+    param_set.sort_unstable();
+    if token_set != param_set {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
+                op.id, abs, tokens, param_set
+            ),
+        });
+    }
+
+    let body_model = body_model_of(op, graph)?;
+    let success = success_of(op, graph)?;
+    let success_status = success.as_ref().map_or(200, |(s, _)| *s);
+    let return_model = success.as_ref().and_then(|(_, m)| m.clone());
+    // A typed body/response references a model symbol re-exported from ./models; reference it through the
+    // `models` namespace import so client.ts has no per-name import to compute (determinism).
+    let return_ty = return_model
+        .as_ref()
+        .map_or_else(|| "void".to_string(), |m| format!("models.{m}"));
+
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    // Signature: path params (positional), body (typed), required query (positional), then optional
+    // query params (`?: T`). All non-optional args precede optional ones (TS requirement).
+    let mut args: Vec<String> = Vec::new();
+    for (p, ident) in path_params.iter().zip(path_idents.iter()) {
+        let ty = ts_type(&p.schema, false, graph)?;
+        args.push(format!("{ident}: {ty}"));
+    }
+    if let Some(model) = &body_model {
+        args.push(format!("body: models.{model}"));
+    }
+    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        let ty = ts_type(&p.schema, false, graph)?;
+        args.push(format!("{ident}: {ty}"));
+    }
+    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        let ty = ts_type(&p.schema, false, graph)?;
+        args.push(format!("{ident}?: {ty}"));
+    }
+
+    let ret_promise = if return_model.is_some() {
+        format!("Promise<{return_ty}>")
+    } else {
+        "Promise<void>".to_string()
+    };
+    writeln!(
+        out,
+        "\n  async {method_name}({}): {ret_promise} {{",
+        args.join(", ")
+    )
+    .map_err(sink)?;
+
+    // Build the path: a template literal with each path param percent-escaped (V5). TS template literals
+    // have no backslash restriction, so no Python-style `safe=''` workaround is needed (Pitfall 6).
+    if tokens.is_empty() {
+        writeln!(out, "    let path = `{abs}`;").map_err(sink)?;
+    } else {
+        let mut tmpl = abs.clone();
+        for token in &tokens {
+            let ident = path_params
+                .iter()
+                .zip(path_idents.iter())
+                .find(|(pp, _)| &pp.name == token)
+                .map_or_else(|| camel(token), |(_, id)| id.clone());
+            let placeholder = format!("{{{token}}}");
+            let interp = format!("${{encodeURIComponent(String({ident}))}}");
+            tmpl = tmpl.replace(&placeholder, &interp);
+        }
+        writeln!(out, "    let path = `{tmpl}`;").map_err(sink)?;
+    }
+
+    // Query encoding (WR-01 analog): a REQUIRED query param is always appended (positional arg, no
+    // guard); an OPTIONAL one is appended only when defined. The wire key stays the ORIGINAL `p.name`.
+    if !query_params.is_empty() {
+        writeln!(out, "    const query = new URLSearchParams();").map_err(sink)?;
+        for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
+            writeln!(out, "    query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+        }
+        for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+            writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
+            writeln!(out, "      query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+        writeln!(out, "    const qs = query.toString();").map_err(sink)?;
+        writeln!(out, "    if (qs) {{").map_err(sink)?;
+        writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+
+    // Dispatch: await fetch, compare the real success status, throw ApiError otherwise, decode on
+    // success. The request carries a JSON body only for body-bearing ops.
+    writeln!(out, "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{")
+        .map_err(sink)?;
+    writeln!(out, "      method: \"{}\",", op.method).map_err(sink)?;
+    if body_model.is_some() {
+        writeln!(out, "      headers: {{ \"Content-Type\": \"application/json\" }},")
+            .map_err(sink)?;
+        writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
+    }
+    writeln!(out, "    }});").map_err(sink)?;
+    writeln!(out, "    if (res.status !== {success_status}) {{").map_err(sink)?;
+    writeln!(
+        out,
+        "      throw new ApiError(res.status, await res.json().catch(() => null));"
+    )
+    .map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    if let Some(model) = &return_model {
+        writeln!(out, "    return (await res.json()) as models.{model};").map_err(sink)?;
+    }
+    writeln!(out, "  }}").map_err(sink)?;
+    Ok(())
+}
+
+/// Emit `index.ts`: re-export `Client`, `ApiError`, and every named model/enum symbol so a consumer can
+/// `import { Client, Book } from "<pkg>"`. Symbols are emitted in graph order (deterministic). Twin of
+/// `pysdk::emit::emit_init`.
+pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> String {
+    let mut out = String::new();
+    out.push_str("export { Client } from \"./client\";\n");
+    out.push_str("export type { ClientOptions } from \"./client\";\n");
+    out.push_str("export { ApiError } from \"./errors\";\n");
+
+    // Every named schema becomes a top-level symbol in models.ts (interface or type) — re-export them
+    // all as types (interfaces and `type` aliases are type-only re-exports).
+    let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
+    if !names.is_empty() {
+        out.push_str("export type {\n");
+        for name in &names {
+            let _ = writeln!(out, "  {name},");
+        }
+        out.push_str("} from \"./models\";\n");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so
+    // the workspace-wide RUST-04 deny stays intact for production code.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{
+        camel, emit_client, emit_errors, emit_index, emit_models, emit_operations, ts_type,
+    };
+    use crate::graph::{ApiGraph, Operation, Prim, Type};
+
+    /// A facts document covering the bookstore shapes that diverge from the Go target: a named enum
+    /// (`BookFormat`), a named union (`BookOrError`), an inline union field (`Book.rating: number |
+    /// number`), an inline enum field (`BookFilters.sort: "asc" | "desc"`), plus required / optional /
+    /// nullable mixes to prove the two independent field axes.
+    const SAMPLE: &[u8] = br#"{
+      "module": "app",
+      "routes": [],
+      "schemas": [
+        {
+          "id": "app.models.Author", "name": "Author",
+          "body": { "type": "object", "of": [
+            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 }
+        },
+        {
+          "id": "app.models.Book", "name": "Book",
+          "body": { "type": "object", "of": [
+            { "json_name": "author", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "named", "of": "app.models.Author" },
+              "description": null, "example": null },
+            { "json_name": "rating", "required": false, "optional": true, "nullable": true,
+              "schema": { "type": "union", "of": [
+                { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                { "type": "primitive", "of": { "prim": "float", "bits": 64 } }
+              ] },
+              "description": null, "example": null },
+            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 }
+        },
+        {
+          "id": "app.models.BookFilters", "name": "BookFilters",
+          "body": { "type": "object", "of": [
+            { "json_name": "genre", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null },
+            { "json_name": "in_stock", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "bool" } },
+              "description": null, "example": null },
+            { "json_name": "published", "required": true, "optional": false, "nullable": true,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null },
+            { "json_name": "sort", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "enum", "of": ["asc", "desc"] },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 3, "end_line": 3 }
+        },
+        {
+          "id": "app.models.BookFormat", "name": "BookFormat",
+          "body": { "type": "enum", "of": ["hardcover", "paperback"] },
+          "span": { "file": "/root/m.ts", "start_line": 4, "end_line": 4 }
+        },
+        {
+          "id": "app.models.BookOrError", "name": "BookOrError",
+          "body": { "type": "union", "of": [
+            { "type": "named", "of": "app.models.Book" },
+            { "type": "named", "of": "app.models.OutOfStock" }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 5, "end_line": 5 }
+        },
+        {
+          "id": "app.models.OutOfStock", "name": "OutOfStock",
+          "body": { "type": "object", "of": [
+            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 6, "end_line": 6 }
+        }
+      ],
+      "diagnostics": []
+    }"#;
+
+    fn sample_graph() -> ApiGraph {
+        let facts = serde_json::from_slice(SAMPLE).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    mod casing {
+        use super::camel;
+
+        #[test]
+        fn helper_produces_typescript_camel_case() {
+            assert_eq!(camel("createBook"), "createBook");
+            assert_eq!(camel("list_books"), "listBooks");
+            assert_eq!(camel("get-book"), "getBook");
+            assert_eq!(camel("HTTPServer"), "httpserver");
+        }
+    }
+
+    mod type_mapping {
+        use super::{sample_graph, ts_type, ApiGraph, Prim, Type};
+
+        #[test]
+        fn primitives_and_wellknown_map_to_typescript_scalars() {
+            let g = ApiGraph::default();
+            assert_eq!(
+                ts_type(&Type::Primitive(Prim::String), false, &g).unwrap(),
+                "string"
+            );
+            assert_eq!(
+                ts_type(&Type::Primitive(Prim::Bool), false, &g).unwrap(),
+                "boolean"
+            );
+            assert_eq!(
+                ts_type(
+                    &Type::Primitive(Prim::Int {
+                        bits: 64,
+                        signed: true
+                    }),
+                    false,
+                    &g
+                )
+                .unwrap(),
+                "number"
+            );
+            assert_eq!(
+                ts_type(&Type::Primitive(Prim::Float { bits: 64 }), false, &g).unwrap(),
+                "number"
+            );
+            // a bytes primitive carries base64 as a string.
+            assert_eq!(
+                ts_type(&Type::Primitive(Prim::Bytes), false, &g).unwrap(),
+                "string"
+            );
+            // a date-time well-known carries as a string (A7).
+            assert_eq!(
+                ts_type(
+                    &Type::WellKnown(crate::graph::WellKnown::DateTime),
+                    false,
+                    &g
+                )
+                .unwrap(),
+                "string"
+            );
+        }
+
+        #[test]
+        fn nullable_wraps_the_type_with_pipe_null() {
+            let g = ApiGraph::default();
+            assert_eq!(
+                ts_type(&Type::Primitive(Prim::String), true, &g).unwrap(),
+                "string | null"
+            );
+        }
+
+        #[test]
+        fn inline_union_becomes_pipe_union_the_go_target_rejects() {
+            // Book.rating-shaped inline union: the case go_type errors on. TS emits number | number.
+            let g = ApiGraph::default();
+            let rating = Type::Union(vec![
+                Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                }),
+                Type::Primitive(Prim::Float { bits: 64 }),
+            ]);
+            assert_eq!(ts_type(&rating, false, &g).unwrap(), "number | number");
+            // nullable wraps the whole union.
+            assert_eq!(
+                ts_type(&rating, true, &g).unwrap(),
+                "number | number | null"
+            );
+        }
+
+        #[test]
+        fn inline_enum_becomes_string_literal_union_the_go_target_rejects() {
+            // BookFilters.sort-shaped inline enum: go_type errors; TS emits a literal union, graph order.
+            let g = ApiGraph::default();
+            let sort = Type::Enum(vec!["asc".to_string(), "desc".to_string()]);
+            assert_eq!(ts_type(&sort, false, &g).unwrap(), "\"asc\" | \"desc\"");
+        }
+
+        #[test]
+        fn named_ref_resolves_to_the_schema_name() {
+            let g = sample_graph();
+            let named = Type::Named("app.models.BookFormat".to_string());
+            assert_eq!(ts_type(&named, false, &g).unwrap(), "BookFormat");
+            assert_eq!(ts_type(&named, true, &g).unwrap(), "BookFormat | null");
+        }
+
+        #[test]
+        fn named_union_resolves_each_variant_to_its_symbol_name() {
+            // BookOrError = Book | OutOfStock.
+            let g = sample_graph();
+            let body = g.schemas.iter().find(|s| s.name == "BookOrError").unwrap();
+            assert_eq!(
+                ts_type(&body.body, false, &g).unwrap(),
+                "Book | OutOfStock"
+            );
+        }
+
+        #[test]
+        fn array_and_map_and_any_map_to_typescript_generics() {
+            let g = ApiGraph::default();
+            let arr = Type::Array(Box::new(Type::Primitive(Prim::String)));
+            assert_eq!(ts_type(&arr, false, &g).unwrap(), "string[]");
+            let map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::String)),
+                value: Box::new(Type::Primitive(Prim::Float { bits: 64 })),
+            };
+            // Open Q1: the typed Record<string, V> (value preserved, not widened to unknown).
+            assert_eq!(
+                ts_type(&map, false, &g).unwrap(),
+                "Record<string, number>"
+            );
+            assert_eq!(ts_type(&Type::Any {}, false, &g).unwrap(), "unknown");
+        }
+
+        #[test]
+        fn inline_object_is_a_typed_error_parity_with_go_and_python() {
+            let g = ApiGraph::default();
+            let obj = Type::Object(vec![]);
+            let err = ts_type(&obj, false, &g).unwrap_err();
+            assert!(
+                err.to_string().contains("inline object type is unsupported"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn dangling_named_ref_is_a_typed_error() {
+            let g = ApiGraph::default();
+            let err = ts_type(&Type::Named("dto.Nope".to_string()), false, &g).unwrap_err();
+            assert!(err.to_string().contains("dangling $ref"), "{err}");
+        }
+    }
+
+    mod models {
+        use super::{emit_models, sample_graph};
+
+        #[test]
+        fn named_enum_emits_string_literal_union_type_alias_in_graph_order() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(
+                out.contains("export type BookFormat = \"hardcover\" | \"paperback\";"),
+                "named enum must be a string-literal-union type alias in graph order:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_union_emits_a_plain_type_alias_no_forward_ref_hack() {
+            // BookOrError = Book | OutOfStock. TS type aliases are order-free — emit directly, NO
+            // PEP-484-style string forward reference (RESEARCH Pitfall 6).
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(
+                out.contains("export type BookOrError = Book | OutOfStock;"),
+                "named union must be a plain order-free type alias:\n{out}"
+            );
+            // the forward-ref hack (a quoted RHS) must NOT appear.
+            assert!(
+                !out.contains("export type BookOrError = \"Book"),
+                "no forward-ref string hack:\n{out}"
+            );
+        }
+
+        #[test]
+        fn object_emits_an_interface_with_the_two_independent_field_axes() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(out.contains("export interface BookFilters {"), "{out}");
+            // required, non-nullable.
+            assert!(out.contains("  genre: string;"), "required non-nullable:\n{out}");
+            // optional (`?:`), non-nullable.
+            assert!(
+                out.contains("  in_stock?: boolean;"),
+                "optional non-nullable `?:`:\n{out}"
+            );
+            // required, nullable (`| null`, no `?`).
+            assert!(
+                out.contains("  published: string | null;"),
+                "required nullable `| null`:\n{out}"
+            );
+            // optional inline enum field (`?:` + literal union).
+            assert!(
+                out.contains("  sort?: \"asc\" | \"desc\";"),
+                "optional inline enum field:\n{out}"
+            );
+        }
+
+        #[test]
+        fn object_emits_fields_in_graph_order_no_required_first_partition() {
+            // The graph sorts fields alphabetically: genre, in_stock, published, sort. TS `?:` is
+            // order-free, so the emitter must NOT reorder required-first (RESEARCH Pitfall 6).
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            let genre = out.find("  genre").unwrap();
+            let in_stock = out.find("  in_stock").unwrap();
+            let published = out.find("  published").unwrap();
+            let sort = out.find("  sort").unwrap();
+            assert!(
+                genre < in_stock && in_stock < published && published < sort,
+                "fields must be in graph order, not required-first:\n{out}"
+            );
+        }
+
+        #[test]
+        fn inline_union_field_uses_a_pipe_union_with_nullable() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            // Book.rating inline union, optional + nullable → `rating?: number | number | null;`.
+            assert!(
+                out.contains("  rating?: number | number | null;"),
+                "inline union field optional+nullable:\n{out}"
+            );
+        }
+
+        #[test]
+        fn generate_models_is_byte_identical_across_two_runs() {
+            let g = sample_graph();
+            assert_eq!(
+                emit_models(&g, "bookstore").unwrap(),
+                emit_models(&g, "bookstore").unwrap(),
+                "emit_models must be deterministic"
+            );
+        }
+    }
+
+    /// A facts document with three operations: a body POST returning a model, a templated-path GET with
+    /// a path param, and a query-bearing GET — enough to exercise path escaping, query encoding, body
+    /// marshalling, success-status comparison, and the typed return cast.
+    const OPS_SAMPLE: &[u8] = br#"{
+      "module": "app",
+      "routes": [
+        {
+          "method": "POST", "path": "/books", "handler": "createBook",
+          "operation_id": "createBook", "params": [],
+          "request_body": { "ref_id": "app.models.Book" },
+          "responses": [
+            { "status": 201, "body": { "ref_id": "app.models.CreatedMessage" } },
+            { "status": 409, "body": { "ref_id": "app.models.OutOfStock" } }
+          ],
+          "span": { "file": "/root/main.ts", "start_line": 1, "end_line": 1 }
+        },
+        {
+          "method": "GET", "path": "/books/{book_id}", "handler": "getBook",
+          "operation_id": "getBook",
+          "params": [
+            { "name": "book_id", "location": "path", "required": true,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+              "span": { "file": "/root/main.ts", "start_line": 2, "end_line": 2 } }
+          ],
+          "request_body": null,
+          "responses": [ { "status": 200, "body": { "ref_id": "app.models.Book" } } ],
+          "span": { "file": "/root/main.ts", "start_line": 2, "end_line": 2 }
+        },
+        {
+          "method": "GET", "path": "/list", "handler": "listBooks",
+          "operation_id": "listBooks",
+          "params": [
+            { "name": "cursor", "location": "query", "required": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "span": { "file": "/root/main.ts", "start_line": 3, "end_line": 3 } }
+          ],
+          "request_body": null,
+          "responses": [ { "status": 200, "body": null } ],
+          "span": { "file": "/root/main.ts", "start_line": 3, "end_line": 3 }
+        }
+      ],
+      "schemas": [
+        {
+          "id": "app.models.Book", "name": "Book",
+          "body": { "type": "object", "of": [
+            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 }
+        },
+        {
+          "id": "app.models.CreatedMessage", "name": "CreatedMessage",
+          "body": { "type": "object", "of": [
+            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+              "description": null, "example": null },
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 }
+        },
+        {
+          "id": "app.models.OutOfStock", "name": "OutOfStock",
+          "body": { "type": "object", "of": [
+            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
+              "description": null, "example": null }
+          ] },
+          "span": { "file": "/root/m.ts", "start_line": 3, "end_line": 3 }
+        }
+      ],
+      "diagnostics": []
+    }"#;
+
+    fn ops_graph() -> ApiGraph {
+        let facts = serde_json::from_slice(OPS_SAMPLE).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    mod operations {
+        use super::{emit_operations, ops_graph, ApiGraph, Operation};
+
+        fn ops_for<'g>(graph: &'g ApiGraph, handler: &str) -> Vec<&'g Operation> {
+            graph
+                .operations
+                .iter()
+                .filter(|o| o.handler == handler)
+                .collect()
+        }
+
+        #[test]
+        fn body_op_has_camel_method_typed_body_and_typed_return() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains(
+                    "async createBook(body: models.Book): Promise<models.CreatedMessage> {"
+                ),
+                "camel method, typed body, typed return:\n{out}"
+            );
+            // success status is the real 201, not a default 200.
+            assert!(
+                out.contains("if (res.status !== 201) {"),
+                "compares real 201:\n{out}"
+            );
+            assert!(
+                out.contains("throw new ApiError(res.status, await res.json().catch(() => null));"),
+                "{out}"
+            );
+            // typed return casts the decoded JSON to the response interface.
+            assert!(
+                out.contains("return (await res.json()) as models.CreatedMessage;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("body: JSON.stringify(body),"),
+                "body op serializes the body:\n{out}"
+            );
+            assert!(
+                out.contains("method: \"POST\","),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn templated_path_escapes_each_param_with_encode_uri_component() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
+            assert!(
+                out.contains("let path = `/books/${encodeURIComponent(String(bookId))}`;"),
+                "path param must be percent-escaped (V5) via a backslash-free template literal:\n{out}"
+            );
+            assert!(
+                out.contains("async getBook(bookId: number): Promise<models.Book> {"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn query_op_encodes_present_params_and_has_no_body() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("async listBooks(cursor?: string): Promise<void> {"),
+                "{out}"
+            );
+            assert!(out.contains("if (cursor !== undefined) {"), "{out}");
+            assert!(out.contains("query.set(\"cursor\", String(cursor));"), "{out}");
+            assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
+            // no body for a body-less op.
+            assert!(
+                !out.contains("JSON.stringify(body)"),
+                "query op has no body:\n{out}"
+            );
+        }
+
+        #[test]
+        fn mismatched_path_token_and_param_is_a_typed_error() {
+            // A path templating {book_id} but a path param named {id} is a typed SdkGen error (WR-03).
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/books/{book_id}", "handler": "getBook",
+                  "operation_id": "getBook",
+                  "params": [
+                    { "name": "id", "location": "path", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
+            assert!(
+                err.to_string().contains("do not match its path params"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn required_query_param_is_positional_and_always_sent() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/search", "handler": "search",
+                  "operation_id": "search",
+                  "params": [
+                    { "name": "q", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                    { "name": "page", "location": "query", "required": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
+            // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
+            assert!(
+                out.contains("async search(q: string, page?: string): Promise<void> {"),
+                "{out}"
+            );
+            // required `q` unconditionally set; optional `page` guarded.
+            assert!(out.contains("query.set(\"q\", String(q));"), "{out}");
+            assert!(out.contains("if (page !== undefined) {"), "{out}");
+        }
+
+        #[test]
+        fn param_identifier_collision_is_a_typed_error() {
+            // two query params whose camelCase identifier collides → typed error.
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/x", "handler": "x",
+                  "operation_id": "x",
+                  "params": [
+                    { "name": "foo_bar", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                    { "name": "fooBar", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            assert!(err.to_string().contains("collides"), "{err}");
+        }
+    }
+
+    mod client_errors_index {
+        use super::{emit_client, emit_errors, emit_index, ops_graph};
+
+        #[test]
+        fn client_uses_fetch_with_an_injectable_transport_and_no_third_party_imports() {
+            let out = emit_client("bookstore");
+            assert!(out.contains("fetch?: typeof fetch;"), "{out}");
+            assert!(out.contains("this.fetchFn = opts.fetch ?? fetch;"), "{out}");
+            assert!(out.contains("import { ApiError } from \"./errors\";"), "{out}");
+            // no third-party HTTP libs (TSSDK-01/02).
+            assert!(!out.contains("axios"), "{out}");
+            assert!(!out.contains("node-fetch"), "{out}");
+            assert!(!out.contains("@types"), "{out}");
+        }
+
+        #[test]
+        fn errors_define_typed_apierror_extends_error_with_is_not_found() {
+            let out = emit_errors("bookstore");
+            assert!(out.contains("export class ApiError extends Error {"), "{out}");
+            assert!(out.contains("public readonly status: number,"), "{out}");
+            assert!(out.contains("public readonly body: unknown,"), "{out}");
+            assert!(out.contains("isNotFound(): boolean {"), "{out}");
+            assert!(out.contains("return this.status === 404;"), "{out}");
+        }
+
+        #[test]
+        fn index_reexports_client_apierror_and_every_model() {
+            let out = emit_index(&ops_graph(), "bookstore");
+            assert!(out.contains("export { Client } from \"./client\";"), "{out}");
+            assert!(out.contains("export { ApiError } from \"./errors\";"), "{out}");
+            assert!(out.contains("  Book,"), "{out}");
+            assert!(out.contains("  CreatedMessage,"), "{out}");
+            assert!(out.contains("} from \"./models\";"), "{out}");
+        }
+    }
+
+    /// Regression locks for the WR-05 schema-name collision on a shape the fixtures do NOT exercise.
+    mod regressions {
+        use super::{emit_models, ApiGraph};
+
+        fn graph_from(facts: &[u8]) -> ApiGraph {
+            let facts = serde_json::from_slice(facts).unwrap();
+            ApiGraph::from_facts(facts, "/root")
+        }
+
+        // WR-05: two distinct schema ids sharing a TS name is a typed error (no silent redeclaration).
+        #[test]
+        fn wr05_duplicate_schema_name_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "a.Book", "name": "Book",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                { "id": "b.Book", "name": "Book",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+              ],
+              "diagnostics": [] }"#;
+            let g = graph_from(facts);
+            let err = emit_models(&g, "pkg").unwrap_err();
+            assert!(err.to_string().contains("share the TypeScript name"), "{err}");
+        }
+    }
+}
