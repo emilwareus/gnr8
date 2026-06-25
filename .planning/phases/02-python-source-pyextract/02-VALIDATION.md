@@ -2,7 +2,7 @@
 phase: 2
 slug: python-source-pyextract
 status: draft
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-06-25
 ---
@@ -81,4 +81,4 @@ created: 2026-06-25
 - [ ] Feedback latency < 150s
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-06-25
