@@ -1,64 +1,58 @@
 # gnr8
 
-**Point it at your Go API. Get an OpenAPI document and a working Go SDK — from the code itself, no annotations.**
+**One tool for the whole loop between your API code and OpenAPI + client SDKs — end to end, as a single native binary.**
 
-`gnr8` reads a real Go (Gin) service, builds an internal model of its routes and types, and generates
-a valid **OpenAPI 3.1** document and a **compiling Go SDK**. It re-generates on save, won't clobber your
-edits, and tells you what it can't represent and why. It owns the whole pipeline end to end — it does
-**not** wrap Swagger, swaggo, oapi-codegen, or openapi-generator.
+`gnr8` reads your service code, builds a language- and router-agnostic model of its API, and generates
+an **OpenAPI 3.1** document and a client **SDK** from it. The generation lifecycle is **configured in
+code**, so you — or an AI agent — can adapt exactly how it parses and generates for your project.
 
-> Status: **proof of concept (v1.0).** Today it supports **Go + Gin, one route group per service**, end
-> to end. It is deliberately narrow and deliberately self-reliant — see [Status & limits](#status--limits).
+> Status: **early.** The first supported frontend is **Go + Gin**, working end to end. The internal
+> model is general by design, so more source frameworks and SDK targets are additive, not rewrites.
 
-> **Full reference (CLI, config, type mapping, errors, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
+> **Full reference (CLI, config, type mapping, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
 
 ---
 
 ## Why I built it
 
-I was tired of the OpenAPI/SDK toolchain. Generating a spec and clients for a Go service usually means
-sprinkling hundreds of `// @swaggo` annotation comments that drift from the real code, gluing together
-three or four tools, and waiting on a slow regenerate loop that doesn't fit a save-and-see workflow. The
-annotations *are* a second source of truth, and second sources of truth rot.
-
-So gnr8 takes a different stance:
-
-- **The code is the source of truth.** Routes, request/response types, parameters and schemas come from
-  the Go source and its types — not from comments. Delete every annotation and the output is the same.
-- **Own the whole pipeline.** Extraction, the internal graph, OpenAPI lowering, SDK generation,
-  diagnostics, and the watch loop are all ours. We're a *replacement* for the fragmented toolchain, not
-  a consumer of it. (We're working toward depending on nothing but the language's standard library.)
-- **Anything the code genuinely can't express, you configure in your engine config — not by scraping
-  another tool.** (e.g. auth schemes live in middleware, not handler signatures, so you declare them.)
+- **One tool, both directions, end to end.** Generate OpenAPI from your code, and generate code (client
+  SDKs) from that — in one place, one pass, instead of stitching a chain of tools together.
+- **Fast.** A native binary with no warm-up.
+- **Incremental.** It regenerates only what actually changed — built for a save-and-see loop, not full
+  rebuilds.
+- **No runtime.** A single binary. No Docker, no JVM, nothing to stand up.
+- **Configured by code, not YAML — and built for AI agents.** The customization surface is *code*, not a
+  config file with a handful of human-friendly flags. The point isn't minimal-config "ease of use" for
+  humans; it's that an AI agent can write code to adapt the entire parse-and-generate lifecycle to your
+  project by extending the framework directly.
+- **Modern SDKs, easy to shape.** Generate SDKs that follow modern idioms for each target — and change
+  *how* they're generated through that same configuration-as-code model.
 
 ---
 
 ## How it works
 
 ```
-Go (Gin) source
-   │  go/types — read routes, handlers, structs, tags (code-first; no annotations)
+your API code
+   │  read the routes, handlers, and types directly — your code is the source of truth
    ▼
-Internal API graph   ── router-agnostic: methods, paths, params, request/response schemas, provenance
+internal API model   ── language- & router-agnostic: methods, paths, params, schemas, provenance
    │
-   ├─▶ OpenAPI 3.1 document   (lowered from the graph)
-   └─▶ Go SDK                 (Client + typed methods + models + typed errors; it compiles)
+   ├─▶ OpenAPI 3.1 document
+   └─▶ client SDK   (typed client + models + errors; it compiles)
 ```
 
-- A small **Go helper** loads and type-checks your module, recognizes the Gin route registration and
-  handler idioms (`Group`, `METHOD`, `ShouldBindJSON`, `c.Param`, `c.Query`, `c.JSON`), and emits stable
-  facts.
-- A **Rust engine** turns those facts into a deterministic internal graph, then lowers it to OpenAPI and
-  generates the SDK. Identical input ⇒ byte-identical output.
-- A project-local **`.gnr8/`** workspace holds your config; generation tracks what it wrote (so it never
-  silently overwrites a file you edited), skips unchanged files, and can watch for source edits.
-- `gnr8 doctor` aggregates what it couldn't represent (with `file:line`) so nothing fails silently.
+The first supported frontend reads **Go + Gin** via `go/types`. A native engine builds a deterministic
+model (identical input → byte-identical output) and generates the OpenAPI document and the SDK. A
+project-local **`.gnr8/`** workspace tracks what it generated (so it never overwrites your edits),
+regenerates only what changed, can watch for source edits, and a `doctor` command reports anything it
+couldn't represent.
 
 ---
 
 ## Quick look
 
-A plain Gin service — **no annotations** ([`examples/bookstore/`](examples/bookstore/)):
+A small Gin service (the first supported frontend) — [`examples/bookstore/`](examples/bookstore/):
 
 ```go
 func registerRoutes(r *gin.Engine) {
@@ -73,7 +67,7 @@ func registerRoutes(r *gin.Engine) {
 type Book struct {
     ID          string    `json:"id"`
     Title       string    `json:"title"`
-    Genre       Genre     `json:"genre"`              // code-defined enum → OpenAPI enum
+    Genre       Genre     `json:"genre"`              // a code-defined enum → OpenAPI enum
     Price       float64   `json:"price"`
     PublishedAt time.Time `json:"publishedAt"`
     Subtitle    *string   `json:"subtitle,omitempty"` // optional
@@ -85,8 +79,8 @@ type Book struct {
 Run it:
 
 ```bash
-gnr8 init        # scaffold .gnr8/ (config: inputs, base_path, output paths, security)
-gnr8 generate    # write openapi.yaml + the Go SDK
+gnr8 init        # scaffold the .gnr8/ workspace
+gnr8 generate    # write openapi.yaml + the client SDK
 ```
 
 Out comes OpenAPI 3.1:
@@ -102,7 +96,7 @@ paths:
         '200': { content: { application/json: { schema: { $ref: '#/components/schemas/BookList' } } } }
 ```
 
-…and a Go SDK you can call:
+…and an SDK you can call:
 
 ```go
 func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, error)
@@ -110,7 +104,7 @@ func (c *Client) GetBook(ctx context.Context, id string) (Book, error)
 ```
 
 The full input **and** the real generated output are committed in
-[`examples/bookstore/`](examples/bookstore/) — read [its README](examples/bookstore/README.md) for the
+[`examples/bookstore/`](examples/bookstore/) — see [its README](examples/bookstore/README.md) for the
 side-by-side.
 
 ---
@@ -126,31 +120,26 @@ cd examples/bookstore
 
 ---
 
-## Status & limits
+## Status
 
-**Works today:** Go + Gin, **one route group per service**, code-first → OpenAPI 3.1 + a compiling,
-test-exercised Go SDK; the `.gnr8/` lifecycle (`init` / `generate` / `check` / `watch` / `doctor`),
-no-op regeneration, and edit-protection.
+**Today:** Go + Gin, one route group per service, working end to end → OpenAPI 3.1 + a compiling client
+SDK; the `.gnr8/` lifecycle (`init` / `generate` / `check` / `watch` / `doctor`), incremental
+regeneration, and edit-protection.
 
-**Not yet (honest):**
-- **One route group per service.** Multi-group / multi-domain services (several base paths) aren't
-  supported yet — that's the next milestone.
-- **Gin + Go only.** The internal graph is router-agnostic by design, so other Go routers (and other
-  languages) are additive — but unbuilt.
-- Facts the source can't carry (security schemes, the mount/base path) come from `.gnr8/` config.
-
-**Self-reliance is a work in progress.** The product rule is to depend on nothing but the language
-standard library (and prefer our own code even over that). A few third-party libraries remain and are
-being retired — see [`CLAUDE.md`](CLAUDE.md).
+**By design, additive:** the internal model is language- and router-agnostic, so additional source
+frameworks and SDK targets extend it rather than reshape it. The deeper configuration-as-code surface
+(adapting the lifecycle by extending the framework in code) is the direction it's being built toward;
+today a small config drives the knobs that aren't expressible in the source (mount/base path, title,
+security).
 
 ---
 
 ## Principles (see [`CLAUDE.md`](CLAUDE.md))
 
-1. Never couple to another tool's conventions or formats (no swaggo, no openapi-generator).
-2. No third-party dependencies — standard library only, and prefer our own code.
-3. No fallback / dual control-flow paths — exactly one deterministic source per fact.
-4. What the source can't express comes from your engine config, never from scraping.
+1. Everything is derived from **your code and your config** — one deterministic source per fact.
+2. **Self-contained:** a single native binary, no runtime to install.
+3. **Deterministic:** identical input → byte-identical output.
+4. **Extensible in code:** adapt the lifecycle by extending the framework, not by toggling flags.
 
 ---
 
@@ -158,12 +147,12 @@ being retired — see [`CLAUDE.md`](CLAUDE.md).
 
 | Path | What |
 |------|------|
-| `crates/gnr8-core/` | the engine: graph, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
+| `crates/gnr8-core/` | the engine: model, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
 | `crates/gnr8/` | the `gnr8` CLI (`init`, `generate`, `check`, `inspect`, `watch`, `doctor`) |
-| `goextract/` | the Go helper that reads Gin source via `go/types` |
-| `examples/bookstore/` | a runnable, annotation-free example + its real generated output |
+| `goextract/` | the Go frontend that reads Gin source via `go/types` |
+| `examples/bookstore/` | a runnable example + its real generated output |
 | `fixtures/goalservice/` | the test fixture (a realistic Gin service) driving the contract tests |
-| `docs/USAGE.md` | **full reference** — CLI, config schema, patterns, type mapping, errors, recipes |
+| `docs/USAGE.md` | full reference — CLI, config, patterns, type mapping, recipes |
 | `docs/` | `demo.md` (walkthrough), `evidence.md` (what's verified) |
 
 Build & verify: `make check` (format, lint, tests) · `make gates` (the full contract suite).

@@ -12,9 +12,9 @@ and from **the user's own configuration of our engine** — never from another t
 comments, or formats.
 
 **FORBIDDEN — do not parse, infer from, detect, or depend on, in any way:**
-- swaggo / `swag` annotations (`// @Router`, `// @Param`, `// @Success`, `// @Security`, `// @ID`,
-  `// @Summary`, `Enums(...)`, etc.)
-- openapi-generator, oapi-codegen, or any other generator's templates/markers
+- any other tool's directive-style annotations embedded in code comments (e.g. `// @...`-style comment
+  directives that encode API facts)
+- any code generator's templates, markers, or sidecar formats
 - any other tool's comment dialect or sidecar format
 
 There must be **zero code anywhere in the repo that reads or understands another tool's convention.**
@@ -35,7 +35,7 @@ Before adding ANY dependency: the answer is no. There is no approval path that a
 ## 3. No fallback logic / no dual control-flow paths
 
 There must be **exactly one deterministic way** to derive each fact. **Forbidden patterns:**
-- "if the annotation is present use it, otherwise parse the code" (the swaggo mistake)
+- "if the annotation is present use it, otherwise parse the code" (the classic dual-source mistake)
 - "try strategy A; on failure fall back to strategy B"
 - any branch whose only purpose is to recover from a missing/secondary source
 
@@ -46,7 +46,8 @@ comes from the user's config (rule 4) — it is never "filled in" by a fallback.
 
 Some facts are genuinely not present in typed source (e.g. security schemes — auth lives in middleware,
 not handler signatures). Those are provided by **the user configuring our engine** (ideally in code they
-write to drive gnr8), **not** by scraping swaggo/etc. Examples that MUST come from config, not inference:
+write to drive gnr8), **not** by scraping another tool's annotations or output. Examples that MUST come
+from config, not inference:
 - security schemes and which operations they apply to
 - any cross-cutting metadata the handler/types don't carry
 

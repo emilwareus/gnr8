@@ -1,14 +1,13 @@
 # gnr8 — Reference (agent-oriented)
 
 Dense reference for operating and editing gnr8. Terse by design. Source of truth for behavior is the
-code; this matches it as of v1.0 + the post-v1.0 swaggo-removal/config refactors. Product invariants:
-[`../CLAUDE.md`](../CLAUDE.md) (no other-tool coupling, no third-party deps, no fallback/dual paths,
-config supplies what typed source can't).
+code; this matches the current build. Product invariants: [`../CLAUDE.md`](../CLAUDE.md) (one source per
+fact, no third-party deps, no fallback/dual paths, config supplies what typed source can't).
 
 ## What it is / isn't
 - Reads a **Go + Gin** service via `go/types`, builds a router-agnostic API graph, emits **OpenAPI 3.1**
-  + a **compiling Go SDK**. Code-first: it reads no annotations (swaggo etc.). Delete every `// @`
-  comment → identical output.
+  + a **compiling Go SDK**. Code-first: your code is the single source of truth for the API. Go + Gin is
+  the first supported frontend; the model is general by design.
 - **Envelope (hard limits today):** Go only; Gin only; **exactly ONE route group per service** (one
   base path). Multi-group/multi-domain services are NOT supported (paths collapse → error). Other Go
   routers extract zero routes.
@@ -93,7 +92,7 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | required field | struct tag `binding:"required"` | → schema `required`. |
 | optional field | pointer `*T` and/or `json:",omitempty"` | not in `required`. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
-| NOT read | swaggo `// @...`, security middleware, the group prefix string | security/base_path come from config. |
+| from config (not source) | security schemes, base/mount path, title | not expressible in typed source — declared in `.gnr8/` config. |
 
 ## Type mapping (Go → OpenAPI → generated SDK) — verified
 | Go | OpenAPI | SDK Go | Note |
