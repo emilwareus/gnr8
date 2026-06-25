@@ -80,6 +80,23 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 	})
 }
 
+// UnsupportedType records that a struct field's declared type has no faithful
+// neutral primitive (e.g. complex64/128, uintptr, an untyped constant kind), so
+// the extractor lowers it to free-form `any` rather than guessing a concrete
+// type (GO-06 / CLAUDE.md rule 3: diagnose, never fabricate). goType is the
+// rendered Go type. method/route identity here is the struct.field + declared
+// type, mirroring Floatf/FreeFormMap.
+func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityWarn,
+		Message: "unsupported field type: " + structName + "." + fieldName +
+			" (" + goType + ") has no neutral primitive; lowered to free-form any " +
+			"rather than guessing a concrete type (GO-06)",
+		File: file,
+		Line: line,
+	})
+}
+
 // Warn records a generic warning. Used for go/packages load errors (GO-06) and
 // any rule that does not have a dedicated helper.
 func (a *Accumulator) Warn(message, file string, line uint32) {

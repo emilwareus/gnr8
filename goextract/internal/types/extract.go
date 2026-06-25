@@ -9,7 +9,6 @@
 package types
 
 import (
-	"fmt"
 	"go/token"
 	gotypes "go/types"
 	"reflect"
@@ -216,16 +215,25 @@ func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.Type {
 		return facts.PrimitiveType(facts.BoolPrim())
 	case gotypes.String:
 		return facts.PrimitiveType(facts.StringPrim())
-	case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64,
-		gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
+	case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64:
 		return facts.PrimitiveType(facts.IntPrim(64, true))
+	case gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
+		// Carry the `signed` axis faithfully: an unsigned source type is NOT a
+		// signed int. The neutral Prim::Int { signed } exists precisely so a
+		// target can distinguish uint64 from int64 (one source of truth per fact).
+		return facts.PrimitiveType(facts.IntPrim(64, false))
 	case gotypes.Float32, gotypes.Float64:
 		// float64 -> float32 narrowing warning (TARGET-API.md §5.2). Report the
 		// field identity, the DECLARED type (e.g. "*float64"), and its position.
 		ctx.diags.Floatf(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
 		return facts.PrimitiveType(facts.FloatPrim(32))
 	default:
-		return facts.PrimitiveType(facts.StringPrim())
+		// An unsupported basic kind (complex64/128, uintptr, untyped constants,
+		// ...) has no faithful neutral primitive. Emit a diagnostic and fall back
+		// to the HONEST free-form `any` rather than fabricating a `string` fact
+		// with no evidence (GO-06 / CLAUDE.md rule 3: diagnose, never guess).
+		ctx.diags.UnsupportedType(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
+		return facts.AnyType()
 	}
 }
 
@@ -393,6 +401,9 @@ func optString(s string) *string {
 
 func typeString(t gotypes.Type) string {
 	// Render map[string]any as written; gotypes.TypeString renders interface{} as
-	// "any" under go 1.18+ aliasing rules. Keep it qualified-free for stability.
-	return fmt.Sprintf("%s", gotypes.TypeString(t, func(p *gotypes.Package) string { return p.Name() }))
+	// "any" under go 1.18+ aliasing rules (the normalization is done by TypeString
+	// itself). Keep it qualified-free for stability. Return the string directly —
+	// it is already a string, so wrapping it in fmt.Sprintf("%s", ...) is a no-op
+	// allocation that go vet's simplify (S1025) flags.
+	return gotypes.TypeString(t, func(p *gotypes.Package) string { return p.Name() })
 }
