@@ -132,30 +132,65 @@ function _neutralPath(raw) {
   return out.join("");
 }
 
-// Find the HTTP-verb decorator on a method, returning {name, method, path} or
-// null. The FIRST verb decorator wins (a method carries one routing verb).
-function _verbDecorator(methodDecl) {
+// Find the HTTP-verb decorator on a method, returning {method, path} or null.
+// The FIRST verb decorator wins (one neutral route per handler). A SECOND verb
+// decorator is not silently dropped (WR-03, rule 3): emit a WARN naming the extra
+// verb so the discarded route is surfaced, never vanished without a signal.
+function _verbDecorator(loaded, methodDecl, diags) {
+  let chosen = null;
   for (const dec of _decorators(methodDecl)) {
     const name = _decoratorName(dec);
     if (name && Object.prototype.hasOwnProperty.call(_VERB_MAP, name)) {
-      const raw = _decoratorStringArg(dec);
-      return {
-        method: _VERB_MAP[name],
-        // A verb decorator with no string arg defaults to the group root `/`.
-        path: _neutralPath(raw === null ? "/" : raw),
-      };
+      if (chosen === null) {
+        const raw = _decoratorStringArg(dec);
+        chosen = {
+          method: _VERB_MAP[name],
+          // A verb decorator with no string arg defaults to the group root `/`.
+          path: _neutralPath(raw === null ? "/" : raw),
+        };
+      } else {
+        const sf = methodDecl.getSourceFile();
+        const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+        diags.warn(
+          "method carries a second HTTP-verb decorator '@" +
+            name +
+            "'; only the first verb is recorded, the extra route is dropped (no fallback)",
+          load.relFile(loaded.targetDir, sf.fileName),
+          line
+        );
+      }
     }
   }
-  return null;
+  return chosen;
 }
 
-// Return the `@HttpCode(n)` override status if present on a method, else null.
-// This is the SINGLE override on the method-derived rule (rule 3) — never a
-// try-then-fallback chain.
-function _httpCodeOverride(methodDecl) {
+// Return the `@HttpCode(n)` override status if present and VALID on a method,
+// else null. This is the SINGLE override on the method-derived rule (rule 3) —
+// never a try-then-fallback chain. The host `ResponseFact.status` is a `u16`, so
+// a value outside the plausible HTTP range (100–599, which also excludes the
+// negatives `Number.isInteger` would otherwise pass) cannot be a valid status
+// (WR-05): diagnose it and return null — the deterministic method-derived status
+// then applies (the always-on default rule, not a recovery fallback).
+function _httpCodeOverride(loaded, methodDecl, diags) {
   for (const dec of _decorators(methodDecl)) {
     if (_decoratorName(dec) === "HttpCode") {
-      return _decoratorNumberArg(dec);
+      const n = _decoratorNumberArg(dec);
+      if (n === null) {
+        return null;
+      }
+      if (n >= 100 && n <= 599) {
+        return n;
+      }
+      const sf = methodDecl.getSourceFile();
+      const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+      diags.warn(
+        "@HttpCode(" +
+          n +
+          ") is outside the valid HTTP status range (100-599); override ignored (no fallback)",
+        load.relFile(loaded.targetDir, sf.fileName),
+        line
+      );
+      return null;
     }
   }
   return null;
@@ -245,6 +280,16 @@ function _buildParams(loaded, methodDecl, diags, registry) {
       if (mapped.schema !== null && mapped.schema.type === "named") {
         if (requestBody === null) {
           requestBody = { ref_id: mapped.schema.of };
+        } else {
+          // A SECOND @Body on the same handler is ambiguous; surface it rather
+          // than silently keeping the first (WR-04, rule 3).
+          const line =
+            sf.getLineAndCharacterOfPosition(paramDecl.getStart(sf)).line + 1;
+          diags.warn(
+            "handler has more than one @Body parameter; only the first is recorded, the extra body is dropped (no fallback)",
+            load.relFile(loaded.targetDir, sf.fileName),
+            line
+          );
         }
       } else if (mapped.schema !== null) {
         const line =
@@ -339,7 +384,7 @@ function recognizeNestController(loaded, diags, registry) {
         if (!ts.isMethodDeclaration(member) || !member.name) {
           continue;
         }
-        const verb = _verbDecorator(member);
+        const verb = _verbDecorator(loaded, member, diags);
         if (verb === null) {
           continue; // a method with no HTTP-verb decorator is not a route
         }
@@ -358,7 +403,7 @@ function recognizeNestController(loaded, diags, registry) {
         // an explicit @HttpCode(n). A single deterministic rule (rule 3) — the
         // override is read first, the method-default applied otherwise; never a
         // try-typed-then-fallback chain.
-        const override = _httpCodeOverride(member);
+        const override = _httpCodeOverride(loaded, member, diags);
         const status =
           override !== null ? override : verb.method === "POST" ? 201 : 200;
 
