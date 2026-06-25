@@ -145,7 +145,7 @@ mod tests {
           "operation_id": "updateGoal",
           "params": [
             { "name": "uuid", "location": "path", "required": true,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
           ],
           "request_body": { "ref_id": "dto.UpdateGoalInput" },
@@ -157,7 +157,7 @@ mod tests {
           "operation_id": "listGoals",
           "params": [
             { "name": "aggregation", "location": "query", "required": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
           ],
           "request_body": null,
@@ -167,57 +167,57 @@ mod tests {
       ],
       "schemas": [
         {
-          "id": "dto.CommandMessage", "name": "CommandMessage", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.CommandMessage", "name": "CommandMessage",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.CreateGoalInput", "name": "CreateGoalInput", "kind": "object",
-          "fields": [
-            { "json_name": "name", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
+          "body": { "type": "object", "of": [
+            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true,
-              "schema": { "kind": "ref", "format": null, "items": null, "ref_id": "dto.TargetDirection", "additional_properties": null },
+            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+              "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.HttpError", "name": "HttpError", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.HttpError", "name": "HttpError",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput", "kind": "object",
-          "fields": [
-            { "json_name": "total", "required": false, "optional": false,
-              "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput",
+          "body": { "type": "object", "of": [
+            { "json_name": "total", "required": false, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.TargetDirection", "name": "TargetDirection", "kind": "enum",
-          "fields": [], "enum_values": ["gte","lte"],
+          "id": "dto.TargetDirection", "name": "TargetDirection",
+          "body": { "type": "enum", "of": ["gte","lte"] },
           "span": { "file": "/root/c.go", "start_line": 3, "end_line": 3 }
         },
         {
-          "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput", "kind": "object",
-          "fields": [
-            { "json_name": "name", "required": false, "optional": true,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput",
+          "body": { "type": "object", "of": [
+            { "json_name": "name", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
         }
       ],
       "diagnostics": []
