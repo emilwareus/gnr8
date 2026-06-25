@@ -12,7 +12,7 @@
 //! relativizing the file path against the analyzed module so the output is portable + byte-stable.
 //! The `snapshot_diagnostics` test locks the exact final text.
 
-use crate::analyze::{facts::DiagnosticFact, helper};
+use crate::analyze::{facts::DiagnosticFact, helper, Lang};
 
 /// Collect diagnostics for a Go fixture/module directory and render them as canonical text (D-10).
 ///
@@ -22,15 +22,22 @@ use crate::analyze::{facts::DiagnosticFact, helper};
 ///
 /// # Errors
 ///
-/// Propagates the typed subprocess errors from [`helper::run_goextract`] — never a panic (GO-06):
-/// - [`crate::CoreError::GoToolchainMissing`] if `go` cannot be spawned.
-/// - [`crate::CoreError::HelperExit`] if the helper exits non-zero.
-/// - [`crate::CoreError::FactsParse`] if the helper's stdout is not the expected JSON.
+/// - [`crate::CoreError::Config`] if the target's language cannot be determined (empty/ambiguous).
+/// - [`crate::CoreError::GoToolchainMissing`] / [`crate::CoreError::PythonToolchainMissing`] if the
+///   selected toolchain cannot be spawned.
+/// - [`crate::CoreError::HelperExit`] if the sidecar exits non-zero.
+/// - [`crate::CoreError::FactsParse`] if the sidecar's stdout is not the expected JSON.
 pub fn collect(fixture_dir: &str) -> Result<String, crate::CoreError> {
     // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
-    // goextract dir) AND diagnostic file paths relativize against the same root the helper saw.
+    // sidecar dir) AND diagnostic file paths relativize against the same root the helper saw.
     let target = helper::resolve_target(fixture_dir);
-    let facts = helper::run_goextract(&target)?;
+    // The IDENTICAL single deterministic dispatch as `analyze::build_graph` — one detector, one
+    // path per language, never a fallback chain (CLAUDE.md rule 3). `render`/`relativize` below are
+    // language-agnostic and reused unchanged.
+    let facts = match crate::analyze::detect_language(&target)? {
+        Lang::Python => helper::run_pyextract(&target)?,
+        Lang::Go => helper::run_goextract(&target)?,
+    };
     Ok(render(facts.diagnostics, &target))
 }
 
