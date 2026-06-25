@@ -59,8 +59,7 @@ function _declOf(sym) {
 // resolved residual instead). This is the single discriminator for named-vs-inline
 // (it survives `?` / `| null` because it reads what the author wrote, not the
 // resolved type whose aliasSymbol TS drops once a null/undefined arm is present).
-function _annotationAliasSymbol(node, checker) {
-  const anno = node.type;
+function _annotationAliasSymbol(anno, checker) {
   if (!anno || !ts.isTypeReferenceNode(anno)) {
     return null;
   }
@@ -87,10 +86,36 @@ function _annotationAliasSymbol(node, checker) {
 // is unresolvable (rule 3). `registry`, when provided, accumulates referenced
 // schema-bearing declarations for transitive collection (see schemas.js).
 function mapType(loaded, node, diags, registry) {
+  // A property/parameter declaration: its resolved type is at the declaration
+  // node, and the author's annotation is `node.type` (the discriminator source).
+  const full = loaded.checker.getTypeAtLocation(node);
+  return _mapAnnotated(loaded, full, node.type, node, diags, registry);
+}
+
+// Map a METHOD's return type, routed through the SAME discriminator as fields and
+// params (WR-01, rule 3 — one named-vs-inline path). For a method declaration the
+// return annotation IS `methodDecl.type` (a TypeNode), and the resolved return
+// type is `getTypeAtLocation(methodDecl.type)` — NOT `getTypeAtLocation(methodDecl)`,
+// which would resolve to the method's function/signature type. Returns the same
+// `{ schema, optional, nullable }` shape as `mapType`.
+function mapReturnType(loaded, methodDecl, diags, registry) {
+  const anno = methodDecl.type;
+  if (!anno) {
+    return { schema: null, optional: false, nullable: false };
+  }
+  const full = loaded.checker.getTypeAtLocation(anno);
+  return _mapAnnotated(loaded, full, anno, anno, diags, registry);
+}
+
+// The shared core (rule 3 — ONE mapping path for fields, params, AND returns):
+// strip the optional/nullable axes off `full`, then map the residual. `anno` is
+// the author's syntactic type annotation node (the named-vs-inline discriminator
+// source — a bare `TypeReference` to a type-alias is a named ref; a union the
+// author wrote inline is mapped from the residual). `posNode` anchors diagnostics.
+function _mapAnnotated(loaded, full, anno, posNode, diags, registry) {
   const checker = loaded.checker;
-  const full = checker.getTypeAtLocation(node);
-  const sf = node.getSourceFile();
-  const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
+  const sf = posNode.getSourceFile();
+  const line = sf.getLineAndCharacterOfPosition(posNode.getStart(sf)).line + 1;
   const file = load.relFile(loaded.targetDir, sf.fileName);
 
   // THE named-vs-inline discriminator (Open Question 1), derived from the SINGLE
@@ -104,7 +129,7 @@ function mapType(loaded, node, diags, registry) {
   // NOT usable here: TS drops it whenever `| null`/`| undefined` is mixed in, so
   // `fmt?: BookFormat` (which MUST be a named ref) would lose it — only the
   // annotation node distinguishes `fmt?` (TypeReference) from `sort?` (UnionType).
-  const fullAlias = _annotationAliasSymbol(node, checker);
+  const fullAlias = _annotationAliasSymbol(anno, checker);
 
   // Strip the optional (undefined) and nullable (null) arms to compute the axes.
   let optional = false;
@@ -377,4 +402,4 @@ function _registerClass(loaded, sym, diags, registry, file, line) {
   return id;
 }
 
-module.exports = { mapType, _declOf, _arms };
+module.exports = { mapType, mapReturnType, _declOf, _arms };

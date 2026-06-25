@@ -184,6 +184,15 @@ function _paramKind(paramDecl) {
 // Resolve a method's return type to a schema ref id, registering the referenced
 // declaration for transitive collection. Returns the id or null (with a
 // diagnostic recorded) when the return type is not a named schema-bearing type.
+//
+// The return type is mapped through the SAME `types.mapType` discriminator every
+// field/param uses (WR-01, rule 3 — ONE named-vs-inline path): the method's
+// `type` annotation node carries the syntactic info `mapType` reads, so a
+// nullable named return (`getX(): BookOrError | null`) resolves identically to a
+// nullable named field, instead of the divergent `t.aliasSymbol` read that TS
+// drops on `| null`. `ResponseFact.body` is a `TypeRef` (a bare ref_id), so ONLY
+// a `named` result is representable; an array/union/map/primitive return is
+// diagnosed distinctly (WR-02) and the body omitted — never a guessed ref.
 function _responseRef(loaded, methodDecl, diags, registry) {
   if (!methodDecl.type) {
     return null;
@@ -191,49 +200,22 @@ function _responseRef(loaded, methodDecl, diags, registry) {
   const sf = methodDecl.getSourceFile();
   const file = load.relFile(loaded.targetDir, sf.fileName);
   const line = sf.getLineAndCharacterOfPosition(methodDecl.type.getStart(sf)).line + 1;
-  const checker = loaded.checker;
-  const t = checker.getTypeAtLocation(methodDecl.type);
 
-  // An object-union alias (e.g. `BookOrError`) carries its aliasSymbol -> its
-  // own union schema id. Register the alias for transitive collection.
-  if (t.aliasSymbol) {
-    const info = types._declOf(t.aliasSymbol);
-    if (info && ts.isTypeAliasDeclaration(info.decl)) {
-      const id = load.schemaId(loaded.targetDir, info.file, info.name);
-      if (registry) {
-        registry.add(id, {
-          kind: "alias",
-          decl: info.decl,
-          file: info.file,
-          name: info.name,
-        });
-      }
-      return id;
-    }
+  const mapped = types.mapReturnType(loaded, methodDecl, diags, registry);
+  if (mapped.schema === null) {
+    return null; // unresolvable type (mapReturnType already recorded the diagnostic)
+  }
+  if (mapped.schema.type === "named") {
+    return mapped.schema.of;
   }
 
-  // A class/interface return type -> its named schema id. Register the class.
-  if (t.flags & ts.TypeFlags.Object && t.symbol) {
-    const info = types._declOf(t.symbol);
-    if (
-      info &&
-      (ts.isClassDeclaration(info.decl) || ts.isInterfaceDeclaration(info.decl))
-    ) {
-      const id = load.schemaId(loaded.targetDir, info.file, info.name);
-      if (registry) {
-        registry.add(id, {
-          kind: "class",
-          decl: info.decl,
-          file: info.file,
-          name: info.name,
-        });
-      }
-      return id;
-    }
-  }
-
+  // A representable-but-not-as-a-TypeRef return shape (array/union/map/enum/
+  // primitive). `ResponseFact.body` can only carry a named ref_id, so distinguish
+  // this from a wholly unresolvable type (WR-02) and omit the body (rule 3).
   diags.warn(
-    "unsupported response type: not a named class/union schema; response body omitted (no fallback)",
+    "response type is a '" +
+      mapped.schema.type +
+      "', not a named schema; a response body can only be a named ref (TypeRef), so the body is omitted (no fallback)",
     file,
     line
   );
