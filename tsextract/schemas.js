@@ -206,6 +206,31 @@ function _firstDecl(sym) {
   return (decls && decls[0]) || {};
 }
 
+// Resolve the STATIC wire key of a property-name node (CR-04), or null when it
+// cannot be statically determined. An identifier (`foo`) -> its text; a quoted
+// (`'quoted-name'`) or numeric (`123`) name -> its UNQUOTED `.text`; a computed
+// name whose expression is a static string/numeric literal (`['k']`) -> that
+// literal's value. Any other computed name (`[KEY]`, an expression) -> null:
+// statically unresolvable, so the caller diagnoses + omits (rule 3), never a
+// guessed raw-source key.
+function _propertyKey(nameNode) {
+  if (
+    ts.isIdentifier(nameNode) ||
+    ts.isStringLiteralLike(nameNode) ||
+    ts.isNumericLiteral(nameNode)
+  ) {
+    return nameNode.text;
+  }
+  if (
+    ts.isComputedPropertyName(nameNode) &&
+    (ts.isStringLiteralLike(nameNode.expression) ||
+      ts.isNumericLiteral(nameNode.expression))
+  ) {
+    return nameNode.expression.text;
+  }
+  return null;
+}
+
 // Build one SchemaFact from a registry entry, or null if not schema-bearing.
 function _buildSchema(loaded, entry, diags, registry) {
   if (entry.kind === "class") {
@@ -225,7 +250,21 @@ function _buildClassSchema(loaded, entry, diags, registry) {
     if (!ts.isPropertyDeclaration(member) || !member.name) {
       continue;
     }
-    const jsonName = member.name.getText(sf);
+    // The wire key comes from the property-name NODE KIND, never from blindly
+    // stringifying the AST (CR-04): an identifier/string-literal/numeric-literal
+    // yields its (unquoted) text; a computed name whose expression is a static
+    // string/numeric literal yields that literal's value. Any other computed name
+    // (e.g. `[KEY]`) cannot be statically resolved -> diagnose + skip the field
+    // (rule 3), never a guessed raw-source key.
+    const jsonName = _propertyKey(member.name);
+    if (jsonName === null) {
+      diags.warn(
+        "computed property name cannot be statically resolved; field omitted (no fallback)",
+        load.relFile(loaded.targetDir, sf.fileName),
+        sf.getLineAndCharacterOfPosition(member.getStart(sf)).line + 1
+      );
+      continue;
+    }
     const mapped = types.mapType(loaded, member, diags, registry);
     if (mapped.schema === null) {
       continue; // rule 3: unresolvable field omitted (diagnostic already recorded)
