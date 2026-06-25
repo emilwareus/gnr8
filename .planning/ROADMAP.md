@@ -71,7 +71,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 01-02-PLAN.md — Consumers: lower/ + gosdk/ exhaustive Type match (no per-language branch), fix optional/nullable + 3.1 nullable rendering, re-accept Go snapshots green [IR-03]
+- [x] 01-02-PLAN.md — Consumers: lower/ + gosdk/ exhaustive Type match (no per-language branch), fix optional/nullable + 3.1 nullable rendering, re-accept Go snapshots green [IR-03]
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -158,7 +158,7 @@ dependencies.)
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 1/3 | In Progress|  |
+| 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 2/3 | In Progress|  |
 | 2. Python Source — `pyextract` | v2.0 | 0/TBD | Not started | - |
 | 3. Python Target — `PySdk` | v2.0 | 0/TBD | Not started | - |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
