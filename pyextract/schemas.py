@@ -176,26 +176,26 @@ def _build_class_schema(class_def, dotted, abs_path, table, diags):
 
 
 def _build_alias_schema(stmt, dotted, abs_path, table, diags):
-    """Build a SchemaFact for a top-level ``Name = <annotation>`` alias.
+    """Build a SchemaFact for a top-level ``Name = Union[...]`` / ``A | B`` alias.
 
-    Only ``Literal[...]`` (inline enum body) and ``Union[...]`` / ``A | B`` (union
-    body) aliases become schemas; a bare ``Foo = Bar`` re-binding is not a schema.
+    Only a UNION alias becomes a standalone schema (``BookOrError`` is referenced by
+    ``ref_id`` from a route, so it must exist as a named schema). A ``Literal[...]``
+    alias (``SortOrder``) is NEVER a standalone schema — it is only ever inlined where
+    used (``BookFilters.sort`` -> an inline ``enum`` body); the snapshot is the
+    authority and contains no ``SortOrder`` schema. A bare ``Foo = Bar`` re-binding is
+    likewise not a schema.
     """
     if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
         return None
     name = stmt.targets[0].id
     value = stmt.value
 
-    is_literal = (
-        isinstance(value, ast.Subscript)
-        and (types._subscript_value(value) or "").split(".")[-1] == "Literal"
-    )
     is_union = (
         isinstance(value, ast.Subscript)
         and (types._subscript_value(value) or "").split(".")[-1] == "Union"
     ) or (isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr))
 
-    if not (is_literal or is_union):
+    if not is_union:
         return None
 
     body = types.map_annotation(value, dotted, table, diags)
