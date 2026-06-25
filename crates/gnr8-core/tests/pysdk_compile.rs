@@ -219,3 +219,119 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }
+
+/// The hermetic round-trip driver: a stdlib-only Python program that stands up a fake backend, injects
+/// an `OpenerDirector` into the generated `Client`, and asserts a 2xx `@dataclass` round-trip plus a
+/// 4xx → typed `ApiError`. Written to a FILE and run by path (NEVER `-c "<interpolated data>"`, threat
+/// T-03-03-01 / V13). It uses ONLY the Python stdlib (`http.server`/`threading`/`json`/`urllib`) — no
+/// fastapi/uvicorn/requests/httpx/pytest, no `pip install` (CLAUDE.md rule 2, threat T-03-03-04).
+///
+/// Backend shape (matches the `FastAPI` fixture's committed graph):
+/// - `do_POST` is the `create_book` path (`/`): replies `201` with a `CreatedMessage`-shaped body.
+/// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with a typed-error body.
+///
+/// The body passed to `create_book` is a plain dict (the generated `_do` does `json.dumps(body)`, which
+/// a `@dataclass` instance is NOT serializable by; the method's `body: Book` hint is a lazy annotation
+/// and unenforced at runtime, so a Book-shaped dict is the correct, stdlib-only payload).
+const ROUND_TRIP_DRIVER: &str = r#"import json
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import bookstore
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):  # silence the default stderr request log
+        pass
+
+    def _send(self, code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # the create_book path (POST /): 201 -> CreatedMessage
+        length = int(self.headers.get("Content-Length", 0))
+        _ = self.rfile.read(length)  # drain the request body
+        self._send(201, {"message": "ok", "id": 1})
+
+    def do_GET(self):  # the get_book path (GET /{book_id}): 404 -> typed error body
+        self._send(404, {"message": "not found", "slug": "book_not_found"})
+
+
+def main():
+    # Bind an EPHEMERAL port (Pitfall 5) so parallel test runs never race a fixed port.
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        opener = urllib.request.build_opener()
+        client = bookstore.Client(f"http://127.0.0.1:{port}", opener=opener)
+
+        # 2xx: create_book POSTs a Book-shaped dict body and decodes the 201 into a CreatedMessage
+        # @dataclass. (A dataclass instance is not json-serializable; the body hint is unenforced, so a
+        # dict is the correct stdlib payload.)
+        created = client.create_book(
+            {
+                "author": {"name": "Ada", "bio": None},
+                "format": "hardcover",
+                "id": 7,
+                "title": "Notes",
+                "rating": None,
+                "tags": [],
+            }
+        )
+        assert isinstance(created, bookstore.CreatedMessage), type(created)
+        assert created.id == 1, created.id
+        assert created.message == "ok", created.message
+
+        # 4xx: get_book(999) hits the 404 path -> a typed ApiError (urllib raises HTTPError, which the
+        # generated _do catches and turns into a (404, body) pair -> _raise -> ApiError) (Pitfall 6).
+        try:
+            client.get_book(999)
+        except bookstore.ApiError as e:
+            assert e.status_code == 404, e.status_code
+            assert e.is_not_found(), "is_not_found() must be true for a 404"
+        else:
+            raise SystemExit("get_book(999) must raise ApiError on a 404")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
+/// PYSDK-02 (c): the generated SDK round-trips against a stdlib `http.server` via an injected
+/// `OpenerDirector` — a 2xx `@dataclass` decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
+/// is written to a file under the package PARENT and run by path so `import bookstore` resolves.
+#[test]
+fn generated_sdk_round_trips_against_stdlib_http_server() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let dir = materialize_sdk();
+
+    // The driver is a PROGRAM-FIXED .py written to a FILE next to the `bookstore/` package (NOT part of
+    // the SDK bundle — the bundle stays production-SDK-only, mirroring how the Go twin writes a separate
+    // smoke_test.go). Running it by path (never `-c`) keeps the harness clear of command injection (V13).
+    let driver = dir.join("round_trip_driver.py");
+    std::fs::write(&driver, ROUND_TRIP_DRIVER).expect("write round-trip driver");
+
+    let driver_str = driver.to_str().expect("utf-8 path");
+    // Current dir is the package parent (`dir`), so `import bookstore` resolves the `<dir>/bookstore/`
+    // package; an uncaught AssertionError/SystemExit in the driver exits non-zero -> a captured error.
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "the stdlib http.server round-trip driver must pass (2xx dataclass + 4xx ApiError): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}

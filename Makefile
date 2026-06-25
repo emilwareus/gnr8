@@ -40,8 +40,11 @@ test:
 # Blocking gate test set: green unit + CLI parse tests (incl. the pure `watch::tests` loop-safety
 # filter tests and the host→child→write `generate_e2e` integration test in `cargo test -p gnr8`), ALL
 # FOUR contract tests (snapshot_graph/diagnostics/openapi/sdk), determinism (graph + OpenAPI + SDK
-# byte-identical), sdk_compile (temp dir + zero-require go.mod + go build + httptest smoke, SDK-05), the
-# `sdk_pipeline` SDK-framework integration test, and the `lifecycle` suite (manifest round-trip + the
+# byte-identical), sdk_compile (temp dir + zero-require go.mod + go build + httptest smoke, SDK-05),
+# pysdk_compile (temp dir + bookstore package + py_compile + import + stdlib http.server round-trip:
+# 2xx dataclass + 4xx typed ApiError via an injected OpenerDirector, PYSDK-02 — actually RUNS here since
+# python3 is present), the `sdk_pipeline` SDK-framework integration test, and the `lifecycle` suite
+# (manifest round-trip + the
 # pure `plan_writes` truth table over synthetic Artifacts + the `.gnr8/` crate scaffold + the
 # naming-override $ref rewrites). These invoke the goextract helper via `go run`, pipe Go through
 # `gofmt`, run `go build`/`go test`, and (for `generate_e2e`) cargo-compile + run the scaffolded child
@@ -51,7 +54,7 @@ test:
 gates:
 	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
-	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test sdk_pipeline --test lifecycle
+	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test sdk_pipeline --test lifecycle
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
