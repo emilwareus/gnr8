@@ -36,10 +36,13 @@ def run(target_dir):
     schemas = build_schemas(modules, symtab, diags)
 
     module = os.path.basename(target_dir)
-    # FastAPI route recognition (Plan 03). Flask lands in Plan 04. The recognizer
-    # emits nothing for a tree with no router/app bindings, so a non-FastAPI tree
-    # yields an empty routes list deterministically (no fallback).
+    # Parallel deterministic recognizers (Plan 03 FastAPI + Plan 04 Flask). Each one
+    # keys off its OWN router-construct NAMES (rule 1): the FastAPI recognizer fires
+    # only on a tree with FastAPI()/APIRouter() bindings, the Flask recognizer only on
+    # Flask()/Blueprint() bindings. A tree of one shape yields an empty list from the
+    # other — detection by source shape, NOT a try-A-then-fall-back-to-B path (rule 3).
     routes = routes_mod.recognize_fastapi(modules, symtab, diags)
+    routes += routes_mod.recognize_flask(modules, symtab, diags)
 
     doc = facts.build_doc(module, routes, schemas, diags.items())
     return facts.marshal(doc)

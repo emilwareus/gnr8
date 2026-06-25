@@ -28,6 +28,9 @@ _HTTP_METHODS = frozenset(
 #: The constructor names that bind a route-registering instance (recognized by NAME, rule 1).
 _ROUTER_CTORS = frozenset({"FastAPI", "APIRouter"})
 
+#: The constructor names that bind a Flask route-registering instance (rule 1, by NAME).
+_FLASK_CTORS = frozenset({"Flask", "Blueprint"})
+
 
 def _span(abs_path, node):
     line = getattr(node, "lineno", 0)
@@ -288,3 +291,335 @@ def recognize_fastapi(modules, table, diags):
                 }
             )
     return routes
+
+
+# ---------------------------------------------------------------------------
+# Flask route recognition (the HONEST typed-envelope, Plan 04).
+#
+# A Flask route is a ``@<bp>.route("/path", methods=[...])`` decorator on a def
+# whose ``<bp>`` is a module-level ``Flask()`` / ``Blueprint()`` binding. Flask is
+# genuinely less typed than FastAPI: the request/response bodies are ordinary
+# ``request.json`` reads unless the author OPTS IN to a typed DTO. So the Flask
+# recognizer derives every fact from the SOURCE's own typed constructs (rule 1) and
+# emits a DIAGNOSTIC + OMITS the fact for every untyped surface (rule 3, no fallback):
+#   * a typed return annotation -> the response body $ref; status is METHOD-DERIVED
+#     (POST -> 201, else 200) — a code fact, NEVER read from the docstring.
+#   * a local annotated ``order: OrderInput = ...`` -> the request body $ref.
+#   * a local annotated ``status: str = request.args.get(...)`` -> a typed query param.
+#   * an UNTYPED ``request.json`` read / unannotated ``request.args.get(...)`` /
+#     missing return annotation -> a diagnostic, no fact.
+# The Flask ``url_prefix`` is recorded SEPARATELY and NEVER folded into the path (rule 1).
+# ---------------------------------------------------------------------------
+
+
+def _flask_bindings(module):
+    """Map each module-level Flask/Blueprint variable name -> its ``url_prefix`` string.
+
+    ``bp = Blueprint("orders", __name__, url_prefix="/orders")`` -> ``{"bp": "/orders"}``;
+    ``app = Flask(__name__)`` -> ``{"app": ""}``. The prefix is recorded for provenance
+    ONLY — it is never folded into a route path (rule 1; the snapshot base_path is ``/``).
+    """
+    bindings = {}
+    for stmt in module.tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        ctor = _ctor_name(stmt.value)
+        if ctor in _FLASK_CTORS:
+            prefix = _const_kwarg(stmt.value, "url_prefix") or ""
+            bindings[stmt.targets[0].id] = prefix
+    return bindings
+
+
+def _flask_route_decorator(func, bindings):
+    """Return the ``@<bp>.route(...)`` decorator Call registering ``func``, or None.
+
+    Recognizes ``@<name>.route(...)`` where ``<name>`` is a known Flask/Blueprint
+    binding. The HTTP method(s) live in the ``methods=[...]`` keyword (handled by the
+    caller), not in the attribute name (which is always ``route``).
+    """
+    for dec in func.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        attr = dec.func
+        if not isinstance(attr, ast.Attribute):
+            continue
+        if not isinstance(attr.value, ast.Name):
+            continue
+        if attr.value.id in bindings and attr.attr == "route":
+            return dec
+    return None
+
+
+def _flask_methods(call):
+    """Return the upper-cased HTTP methods from the ``methods=[...]`` keyword.
+
+    ``methods=["GET", "POST"]`` -> ``["GET", "POST"]`` (source order). Absent ->
+    Flask's documented default is GET; we read the SOURCE's own list and default to
+    ``["GET"]`` only when the keyword is wholly absent (a code fact, not a guess).
+    """
+    for kw in call.keywords:
+        if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+            out = []
+            for elt in kw.value.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    out.append(elt.value.upper())
+            return out
+    return ["GET"]
+
+
+def _flask_path(raw):
+    """Convert a Flask route path to the neutral group-relative path + path-param types.
+
+    ``"/<int:order_id>"`` -> ``("/{order_id}", {"order_id": <int64 schema>})`` (strip the
+    converter, brace the name, the ``int`` converter drives the param schema). ``"/<name>"``
+    (no converter) braces the name with no recorded type. A bare ``/`` stays ``/``.
+    """
+    out = []
+    converters = {}
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "<":
+            end = raw.find(">", i)
+            if end == -1:
+                out.append(ch)
+                i += 1
+                continue
+            inner = raw[i + 1 : end]
+            if ":" in inner:
+                conv, name = inner.split(":", 1)
+            else:
+                conv, name = "", inner
+            out.append("{" + name + "}")
+            if conv == "int":
+                converters[name] = {
+                    "type": "primitive",
+                    "of": {"prim": "int", "bits": 64, "signed": True},
+                }
+            i = end + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out), converters
+
+
+def _is_request_attr(node, attr):
+    """Whether ``node`` is the AST for ``request.<attr>`` (e.g. ``request.json``)."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "request"
+    )
+
+
+def _is_request_args_get(node):
+    """Whether ``node`` is a ``request.args.get(...)`` Call."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "get"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "args"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "request"
+    )
+
+
+def _flask_body_and_params(
+    func, method, path, in_module, abs_path, table, diags
+):
+    """Walk a Flask handler body for the typed/untyped request body + query params.
+
+    Returns ``(params, request_body)``. Each statement is inspected ONCE, top to
+    bottom (deterministic, single pass — no fallback):
+      * an annotated assign ``x: T = request.json``/``T(**request.json)`` whose ``T``
+        resolves to a class -> the request body $ref.
+      * an annotated assign ``x: str = request.args.get(...)`` -> a typed query param.
+      * a PLAIN assign reading ``request.json`` -> untyped-body diagnostic, no body.
+      * a PLAIN assign reading ``request.args.get(...)`` -> untyped-query diagnostic, no param.
+    ``method``/``path`` name the operation in the untyped diagnostics (a code fact:
+    the HTTP method and the code-derived path, never a docstring).
+    """
+    params = []
+    request_body = None
+
+    for stmt in func.body:
+        if isinstance(stmt, ast.AnnAssign):
+            annotation = stmt.annotation
+            value = stmt.value
+            # Typed request body: an annotated local whose type is a class and whose
+            # value reads request.json (directly or via T(**request.json)).
+            body_ref = _resolves_to_class(annotation, in_module, table)
+            if body_ref is not None and _reads_request_json(value):
+                if request_body is None:
+                    request_body = {"ref_id": body_ref}
+                continue
+            # Typed query param: an annotated local reading request.args.get(...).
+            if _is_request_args_get(value):
+                schema, _nullable = types.map_field_annotation(
+                    annotation, in_module, table, diags
+                )
+                if schema is not None:
+                    params.append(
+                        {
+                            "name": stmt.target.id
+                            if isinstance(stmt.target, ast.Name)
+                            else "",
+                            "location": "query",
+                            "required": False,
+                            "schema": schema,
+                            "span": _span(abs_path, stmt),
+                        }
+                    )
+                continue
+        elif isinstance(stmt, ast.Assign):
+            value = stmt.value
+            target_name = (
+                stmt.targets[0].id
+                if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
+                else ""
+            )
+            # Untyped request body: a plain assign reading request.json with no DTO.
+            if _reads_request_json(value):
+                diags.warn(
+                    "untyped request body on {} {}: read via request.json with no "
+                    "typed DTO; body shape under-specified, no schema "
+                    "inferred".format(method, path),
+                    abs_path,
+                    getattr(stmt, "lineno", 0),
+                )
+                continue
+            # Untyped query param: a plain assign reading request.args.get(...).
+            if _is_request_args_get(value):
+                diags.warn(
+                    "untyped query param '{}' on {} {}: read via request.args.get "
+                    "with no annotation; param type/required-ness under-specified, "
+                    "type inferred as string only".format(target_name, method, path),
+                    abs_path,
+                    getattr(stmt, "lineno", 0),
+                )
+                continue
+
+    return params, request_body
+
+
+def _reads_request_json(value):
+    """Whether an assign value reads ``request.json`` (directly or ``T(**request.json)``)."""
+    if value is None:
+        return False
+    if _is_request_attr(value, "json"):
+        return True
+    # T(**request.json) — a Call with a ** keyword whose value is request.json.
+    if isinstance(value, ast.Call):
+        for kw in value.keywords:
+            if kw.arg is None and _is_request_attr(kw.value, "json"):
+                return True
+    return False
+
+
+def recognize_flask(modules, table, diags):
+    """Recognize Flask routes across ``modules`` -> a list of RouteFact dicts.
+
+    For each module: index its Flask/Blueprint bindings (with their separately-recorded
+    ``url_prefix``), then walk every ``def``/``async def`` carrying an ``@<bp>.route(...)``
+    decorator and assemble ONE RouteFact PER method in its ``methods=[...]`` list. The
+    status is METHOD-DERIVED for a typed handler (POST -> 201, else 200); an untyped
+    handler (no resolvable return annotation) emits ``responses: []`` + a diagnostic.
+    """
+    routes = []
+    for module in sorted(modules, key=lambda m: m.dotted):
+        bindings = _flask_bindings(module)
+        if not bindings:
+            continue
+        abs_path = module.abs_path
+        for stmt in module.tree.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            decorator = _flask_route_decorator(stmt, bindings)
+            if decorator is None:
+                continue
+            raw_path = _route_path(decorator)
+            if raw_path is None:
+                diags.warn(
+                    "Flask route decorator has no constant path; route omitted "
+                    "(no fallback)",
+                    abs_path,
+                    getattr(stmt, "lineno", 0),
+                )
+                continue
+            path, path_converters = _flask_path(raw_path)
+            methods = _flask_methods(decorator)
+
+            # Path params (from the converters), independent of the method split.
+            path_params = []
+            for name in sorted(path_converters):
+                path_params.append(
+                    {
+                        "name": name,
+                        "location": "path",
+                        "required": True,
+                        "schema": path_converters[name],
+                        "span": _span(abs_path, stmt),
+                    }
+                )
+
+            # Response body: the return annotation (a typed class) drives the $ref;
+            # NO annotation -> untyped-response diagnostic + responses: [] (rule 3).
+            body_ref = None
+            if stmt.returns is not None:
+                body_ref = _resolves_to_class(stmt.returns, module.dotted, table)
+
+            for method in methods:
+                # Body/query facts are derived once per (method, handler): the body
+                # walk is identical across methods, but a diagnostic must anchor to the
+                # untyped node ONCE — so derive on the FIRST method only and reuse.
+                query_params, request_body = _flask_body_and_params(
+                    stmt,
+                    method,
+                    path,
+                    module.dotted,
+                    abs_path,
+                    table,
+                    diags if method == methods[0] else _NullDiags(),
+                )
+                if body_ref is not None:
+                    response = {
+                        "status": 201 if method == "POST" else 200,
+                        "body": {"ref_id": body_ref},
+                    }
+                    responses = [response]
+                else:
+                    if method == methods[0]:
+                        diags.warn(
+                            "untyped response on {} {}: handler has no return "
+                            "annotation; response shape under-specified, no schema "
+                            "inferred".format(method, path),
+                            abs_path,
+                            getattr(stmt, "lineno", 0),
+                        )
+                    responses = []
+                routes.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "handler": stmt.name,
+                        "operation_id": stmt.name,
+                        "params": path_params + query_params,
+                        "request_body": request_body,
+                        "responses": responses,
+                        "span": _span(abs_path, stmt),
+                    }
+                )
+    return routes
+
+
+class _NullDiags:
+    """A no-op diagnostics sink so a per-method re-walk never double-records a warning."""
+
+    def warn(self, *_args, **_kwargs):
+        return None
