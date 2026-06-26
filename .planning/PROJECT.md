@@ -10,9 +10,9 @@ The product is for developers who are frustrated by fragmented Swagger/OpenAPI a
 
 Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
 
-## Current Milestone: v2.0 Multi-language — TypeScript & Python (parse + generate)
+## Shipped Milestone: v2.0 Multi-language — TypeScript & Python (parse + generate) ✅ 2026-06-26
 
-**Goal:** Code-first parsing **and** dependency-free SDK generation for **Python (FastAPI + Flask)** and
+**Goal (achieved):** Code-first parsing **and** dependency-free SDK generation for **Python (FastAPI + Flask)** and
 **TypeScript (NestJS)**, proving the `ApiGraph` IR is a true language-neutral narrow waist — not just
 router-agnostic. New sources/targets ship as `.gnr8/` code-as-config built-ins. Every v1 invariant holds.
 
@@ -38,32 +38,51 @@ Design brief: `docs/milestone-v2-multi-language.md`.
 - ✓ Keep the first implementation simple: no dynamic plugin runtime, macro-heavy API, graph database, or multi-language implementation. — v1.0
 - ✓ Validate the PoC against realistic Go fixtures, not only toy examples. — v1.0 (Gin goalservice fixture derived from a real production service shape)
 - ✓ Follow Rust implementation guardrails from the vendored `rust-best-practices` skill. — v1.0 (thiserror/anyhow boundaries, no prod unwrap, clippy -D warnings)
+- ✓ Language-neutral IR + facts contract proven across Go / Python / TypeScript (the narrow waist). — v2.0 (closed neutral `Type` enum; same `build_graph`→`lower`→SDK with no per-language branch)
+- ✓ Python source extraction — FastAPI (full) + Flask (typed envelope), static stdlib-`ast` sidecar. — v2.0 (`pyextract`; owned cross-module symbol table; never imports/executes target)
+- ✓ Python SDK target — dependency-free (`urllib` + `@dataclass` + typed error). — v2.0 (`PySdk`; hermetic generate+run against the FastAPI fixture)
+- ✓ TypeScript source extraction — NestJS, `typescript` Compiler API sidecar. — v2.0 (`tsextract`; bright-line excludes @nestjs/swagger/zod/class-validator; static-only)
+- ✓ TypeScript SDK target — dependency-free (built-in `fetch` + typed interfaces). — v2.0 (`TsSdk`; hermetic `tsc --noEmit` typecheck)
+- ✓ FastAPI + NestJS examples with `.gnr8/` lifecycles and real committed output. — v2.0 (`examples/{fastapi,nestjs}-bookstore`; `make examples-check` cross-language determinism gate)
 
 ### Active
 
-**v2.0 — Multi-language: TypeScript & Python (parse + generate).** Full, scoped requirements in
-`.planning/REQUIREMENTS.md`.
-
-- [ ] Language-neutral IR + facts contract proven across Go / Python / TypeScript (the narrow waist)
-- [ ] Python source extraction — FastAPI (full) + Flask (typed envelope), static stdlib-`ast` sidecar
-- [ ] Python SDK target — dependency-free (`urllib` + `@dataclass` + typed error)
-- [ ] TypeScript source extraction — NestJS, `typescript` Compiler API sidecar
-- [ ] TypeScript SDK target — dependency-free (built-in `fetch` + typed interfaces)
-- [ ] FastAPI + NestJS examples with `.gnr8/` lifecycles and real committed output
+(None — v2.0 shipped. Next milestone defined via `/gsd:new-milestone`.)
 
 ## Current State
 
-**Shipped v1.0** (2026-06-24): a working Go → OpenAPI 3.1 → compiling Go SDK pipeline.
-~10.2K LOC Rust (`gnr8-core` lib + `gnr8` CLI) + ~3.5K LOC Go (`goextract` sidecar + fixtures), 14 plans / 38 requirements across 5 phases.
+**Shipped v2.0** (2026-06-26): the `ApiGraph` IR proven a true language-neutral narrow waist —
+code-first parsing **and** dependency-free SDK generation for **Go (Gin)**, **Python (FastAPI + Flask)**,
+and **TypeScript (NestJS)**. 6 phases / 19 plans / 43 tasks.
 
-- **Pipeline:** `goextract` (go/packages + go/types) → router-agnostic `ApiGraph` (stable IDs, deterministic) → `lower::to_openapi` + `sdk::generate` → `.gnr8/` lifecycle (blake3 ownership manifest, no-op detection, loop-safe watch) → `gnr8 doctor`.
-- **CLI:** `init`, `generate` (`--force`), `check`, `inspect routes|schemas|graph`, `watch`, `doctor` — all wired to the real pipeline; human tables + `--json`.
-- **Quality:** `make check` green (fmt, clippy `-D warnings`, all tests, 4 contract snapshots, hermetic SDK `go build` + httptest smoke, determinism, lifecycle/watch). Demo (`docs/demo.md`) and evidence (`docs/evidence.md`) reproducible.
-- **Known tech debt (v1.1+):** `goextract` path baked at compile time (relocatable install); `diagnostics::collect` is a redundant test-only seam.
+- **Pipeline (4 language paths):** a per-language static sidecar — `goextract` (`go/types`), `pyextract`
+  (stdlib `ast` + owned cross-module symbol table), `tsextract` (the user's own `typescript` Compiler API)
+  — each emits the SAME neutral JSON facts → `build_graph` (single deterministic `detect_language` dispatch)
+  → reused `lower::to_openapi` (OpenAPI 3.1, no per-language branch) + SDK targets (`GoSdk`/`PySdk`/`TsSdk`,
+  all dependency-free) → `.gnr8/` lifecycle (blake3 ownership, loop-safe watch) → `doctor`/`check`/`watch`
+  generalized to the source language.
+- **`.gnr8/` built-ins:** Sources `GoGin`/`FastApi`/`Flask`/`NestJs`; Targets `OpenApi31`/`GoSdk`/`PySdk`/`TsSdk`.
+- **Examples:** `examples/{bookstore(Go),fastapi-bookstore,nestjs-bookstore}` — real committed output,
+  byte-identical regen proven by the `make examples-check` cross-language determinism gate.
+- **Invariants held:** gnr8-core ships ZERO OSS (v2.0 added no new crate); each sidecar stdlib-only in its
+  language; `typescript` is a **required user toolchain** (resolved from the target project, never shipped)
+  — recorded in CLAUDE.md; one source of truth per fact; no fallback paths; deterministic byte-identical.
+- **Quality:** `make check` green (fmt, clippy `-D warnings`, all Rust tests, Python `unittest`, TS `tsc`
+  typecheck, 6 multi-language acceptance snapshots, hermetic SDK round-trips, cross-language determinism).
+- **Known tech debt (carried/deferred):** gnr8-core OSS known-debt (serde/serde_json/blake3/thiserror —
+  documented in CLAUDE.md, deferred by design); `goextract` `golang.org/x/tools` + compile-time path;
+  ROADMAP backlog 999.1/999.2 (TsSdk WR-02/WR-04 SDK hardening).
+
+**Shipped v1.0** (2026-06-24): the Go → OpenAPI 3.1 → compiling Go SDK PoC (~10.2K LOC Rust + ~3.5K LOC Go,
+14 plans / 5 phases). Full detail: `.planning/milestones/v1.0-*`.
 
 ## Next Milestone Goals
 
-Candidate directions (not yet scoped): additional source frontends (TS/Python/Rust) + SDK targets; packaged/relocatable `goextract`; richer programmatic customization; deeper incremental graph invalidation if benchmarks justify it.
+Candidate directions (not yet scoped, define via `/gsd:new-milestone`): retire the gnr8-core OSS known-debt
+(hand-rolled JSON/hashing, stdlib-only `goextract`); additional source frontends (Hono/typed-Express/Fastify,
+Rust) + a Rust SDK target (FUT-01..03); a stdlib-pure TypeScript extraction path that retires the `typescript`
+toolchain requirement (FUT-04); packaged/relocatable sidecars; the deferred TsSdk hardening (backlog 999.x);
+deeper incremental graph invalidation if benchmarks justify it.
 
 ### Out of Scope
 
@@ -114,8 +133,8 @@ The core product bet is that a small Rust engine can own orchestration, graph ma
 | OpenAPI is an artifact, not the internal model | SDK generation and diagnostics need source-level facts OpenAPI cannot preserve cleanly. | ✓ Good |
 | Simpler is better until proven otherwise | Avoid overengineering before the product loop works. | ✓ Good |
 | Design for more source and target languages, but do not start multi-language | The core should not bake in Go-only assumptions, but Go must prove the model first. | ✓ Good (v1.0 proved the model; v2.0 now adds TS + Python) |
-| v2.0: add TypeScript (NestJS) + Python (FastAPI/Flask) — parse + generate | The router-agnostic IR is the narrow waist; each new language is a sidecar emitting the same JSON facts + one new SDK `Target`. The whole Rust lowering/OpenAPI pipeline is reused. | — Pending |
-| Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing user code | `ast` is Python's stdlib (the `go/types` analog); importing user code = executing it (a security boundary). Static-only; unresolved types → diagnostic, never a fallback (rule 3). | — Pending |
+| v2.0: add TypeScript (NestJS) + Python (FastAPI/Flask) — parse + generate | The router-agnostic IR is the narrow waist; each new language is a sidecar emitting the same JSON facts + one new SDK `Target`. The whole Rust lowering/OpenAPI pipeline is reused. | ✓ Good — v2.0 (4 language paths green; one neutral facts contract, reused lowering, no per-language branch) |
+| Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing user code | `ast` is Python's stdlib (the `go/types` analog); importing user code = executing it (a security boundary). Static-only; unresolved types → diagnostic, never a fallback (rule 3). | ✓ Good — v2.0 (`pyextract` static-only; owned symbol table; unresolved→diagnostic, no fallback) |
 | TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar | TS has no stdlib type-checker; `typescript` is the language's own reference compiler (the `go/types` analog). It is a **required user toolchain, not a shipped/bundled/vendored dependency**: `tsextract` resolves the USER's own `typescript` from the target project (`tsextract/ts.js`) — exactly as `goextract` uses the user's `go` and `pyextract` uses `python3`. **gnr8 ships ZERO OSS** (gnr8-core takes no crates; nothing is vendored; the devDependency is gitignored and backs only gnr8's own tests). Rule 2 holds literally — this is a toolchain prerequisite, NOT a loosening. Bright line: facts come ONLY from the source's own TS types, never from `@nestjs/swagger`/`zod`/`class-validator` (rule 1); generated SDKs stay dependency-free. | ✓ Good (required user toolchain; gnr8 ships none. FUT-04 stdlib-pure TS path could remove even the prerequisite) |
 | Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | ✓ Good |
 
@@ -137,4 +156,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-25 after starting milestone v2.0*
+*Last updated: 2026-06-26 after shipping milestone v2.0*
