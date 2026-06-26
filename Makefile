@@ -18,7 +18,7 @@
 # they fail honestly. They flip green with ZERO snapshot edits when pyextract (Phase 2) and
 # tsextract (Phase 4) land. `make gates` mirrors the blocking CI `gates` job.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all tsextract-deps
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all tsextract-deps examples-check
 
 # Auto-format the workspace in place.
 fmt:
@@ -86,8 +86,28 @@ goextract-build:
 red:
 	@echo "no red-by-design acceptance snapshots remain — all six are GREEN in the gates target"
 
+# Cross-language byte-identical determinism gate (XLANG-05). Build the release `gnr8` binary ONCE,
+# then for each of the three end-to-end examples (Go / Python / TypeScript) `cd` in, run `gnr8
+# generate`, then `gnr8 check` — which DRY-RUNS the same write plan and exits NON-ZERO on any drift
+# (crates/gnr8/src/main.rs run_check). `gnr8 check` IS the regen-and-diff, so no bespoke compare
+# script is written (CLAUDE.md rule 2 / Don't-Hand-Roll). The committed `examples/*/generated/` bytes
+# are thereby asserted to equal a fresh `gnr8 generate` (T-06-04: hand-edited bytes fail the gate).
+#
+# `gnr8 generate` shells out to `cargo run` (the `.gnr8/` child crate) and the per-language sidecar
+# (`go` / `python3` / `node` + the dev-installed `typescript`), so those toolchains must be on PATH.
+# In this sandbox `go` is NOT on the default PATH (it lives under the relocatable install dir), so the
+# recipe prepends it; cargo/node/python3 are already on the PATH `make` inherits. The NestJS example
+# needs the dev `typescript` restored first (`tsextract-deps`), matching gnr8's own test suite.
+GNR8_BIN := target/release/gnr8
+GO_BIN := /home/vercel-sandbox/.local/go-install/go/bin
+examples-check: tsextract-deps
+	cargo build --release -p gnr8
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # TypeScript
+
 # Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
 # multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.
-check: fmt-check clippy tsextract-deps test fixture-build goextract-build
+check: fmt-check clippy tsextract-deps test fixture-build goextract-build examples-check
 
 all: check
