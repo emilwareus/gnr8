@@ -577,6 +577,18 @@ fn resolve_op_args<'op>(
     };
     let mut reserve = |name: &str| -> Result<String, CoreError> {
         let ident = camel(name);
+        // A param name that tokenizes to nothing (e.g. `"_"`, `"-"`, or empty) would emit `: T` with
+        // no binding name → invalid TS. Reject it with a typed error rather than emit broken code
+        // (WR-01). One deterministic check, no fallback (rule 3).
+        if ident.is_empty() {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter named '{name}' that yields an empty TypeScript \
+                     identifier (no usable binding name)",
+                    op.id
+                ),
+            });
+        }
         if used_args.contains(&ident) {
             return Err(CoreError::SdkGen {
                 message: format!(
@@ -1418,6 +1430,36 @@ mod tests {
             // required `q` unconditionally set; optional `page` guarded.
             assert!(out.contains("query.set(\"q\", String(q));"), "{out}");
             assert!(out.contains("if (page !== undefined) {"), "{out}");
+        }
+
+        #[test]
+        fn wr01_empty_camel_param_identifier_is_a_typed_error() {
+            // A param name that tokenizes to nothing (`"_"`) yields an empty camel identifier → would
+            // emit `: T` with no binding name. Reject with a typed error (WR-01).
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/x", "handler": "x",
+                  "operation_id": "x",
+                  "params": [
+                    { "name": "_", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            assert!(
+                err.to_string().contains("empty TypeScript identifier"),
+                "{err}"
+            );
         }
 
         #[test]
