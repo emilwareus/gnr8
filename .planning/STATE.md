@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: planning
+status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-26T01:06:42.565Z"
-last_activity: 2026-06-26 -- Phase 06 planning complete
+last_updated: "2026-06-26T05:38:51.542Z"
+last_activity: 2026-06-26 -- Phase 06 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 19
-  completed_plans: 16
+  completed_plans: 17
   percent: 83
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-25)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 6 — cross language hardening + examples + docs
+**Current focus:** Phase 06 — Cross-Language Hardening + Examples + Docs
 
 ## Current Position
 
-Phase: 6
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-06-26 -- Phase 06 planning complete
+Phase: 06 (Cross-Language Hardening + Examples + Docs) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 06
+Last activity: 2026-06-26 -- Phase 06 execution started
 
-Progress: [██████████] 100%
+Progress: [█████████░] 89%
 
 ## Performance Metrics
 
@@ -71,6 +71,7 @@ Progress: [██████████] 100%
 | Phase 05 P01 | 18min | 3 tasks | 4 files |
 | Phase 05 P02 | 9min | 2 tasks | 3 files |
 | Phase 05 P03 | 11min | 2 tasks | 3 files |
+| Phase 06 P01 | 7min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -105,6 +106,7 @@ Recent decisions affecting current work:
 - [Phase ?]: [04-03] named-vs-inline discriminator HARDENED to the syntactic annotation node (bare TypeReference->named ref; UnionType->inline); the 04-02 aliasSymbol-on-full-type rule failed fmt?: BookFormat (TS drops aliasSymbol once |undefined mixed in). One source (the author's annotation), one path, uniform for fields AND optional params.
 - [Phase 05]: [05-03] tssdk hermetic typecheck gate (tests/tssdk_compile.rs): generate -> write to a unique stdlib temp dir -> run the VENDORED tsc --noEmit --strict --lib es2022,dom (,dom is load-bearing: lib.dom.d.ts declares fetch) over the generated .ts (exit 0); discrete Command args + current_dir; banned-import grep; skip-if-toolchain-absent; two-run determinism. Wired into the explicit gates --test list.
 - [Phase 05]: [05-03] Rule-1 fix the gate caught: ts_type gained an ns namespace-prefix arg (one path, rule 3) — models.ts passes empty (bare), client.ts passes 'models.' so a named-enum/model PARAM resolves through the client's models import (fixed client.ts TS2304 Cannot find name BookFormat).
+- [Phase ?]: [06-01] doctor/watch follow the SOURCE language via one pub source_toolchain decision delegating to detect_language (rule 3, no fallback); LifecycleHealth.go_toolchain renamed to source_toolchain + a language field added; pinned --json field set updated in lockstep (T-06-03).
 
 ### Pending Todos
 
@@ -125,7 +127,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-26T00:15:00.312Z
+Last session: 2026-06-26T05:38:34.058Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 

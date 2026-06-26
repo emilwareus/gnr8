@@ -208,7 +208,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 06-01-PLAN.md — CLI parity: expose a pub source-toolchain API + generalize `doctor` probe & `watch` trigger off the single `detect_language` decision (+ pinned `--json` field-set update); `check` verified language-agnostic [XLANG-04]
+- [x] 06-01-PLAN.md — CLI parity: expose a pub source-toolchain API + generalize `doctor` probe & `watch` trigger off the single `detect_language` decision (+ pinned `--json` field-set update); `check` verified language-agnostic [XLANG-04]
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -234,4 +234,4 @@ dependencies.)
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
-| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |
+| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 1/3 | In Progress|  |
