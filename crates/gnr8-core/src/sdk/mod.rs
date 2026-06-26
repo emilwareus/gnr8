@@ -336,7 +336,7 @@ pub struct RunOutcome {
 pub mod prelude {
     pub use super::builtins::{
         ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, NestJs, OpenApi31, PySdk,
-        RenameOperation, RenameType, SetBasePath, SetTitle,
+        RenameOperation, RenameType, SetBasePath, SetTitle, TsSdk,
     };
     pub use super::{Artifact, Artifacts, Cx, Pipeline, PostProcess, Source, Target, Transform};
     pub use crate::graph::SecurityScheme;
