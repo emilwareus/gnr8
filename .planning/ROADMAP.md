@@ -45,7 +45,7 @@ paths, static-only extraction, deterministic byte-identical output).
 - [x] **Phase 2: Python Source — `pyextract`** - Static stdlib-`ast` sidecar (FastAPI full, Flask typed-envelope) with an owned cross-module symbol table; `FastApi`/`Flask` Source built-ins; reuse the Rust lowering → OpenAPI. (completed 2026-06-25)
 - [x] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in. (completed 2026-06-25)
 - [x] **Phase 4: TypeScript Source — `tsextract`** - NestJS recognizer on the `typescript` Compiler API with bright-line third-party-schema exclusions; `NestJs` Source built-in (the documented rule-2 carve-out). (completed 2026-06-25)
-- [ ] **Phase 5: TypeScript Target — `TsSdk`** - Dependency-free `fetch`-based typed client; hermetic `tsc --noEmit` typecheck; `TsSdk` Target built-in.
+- [x] **Phase 5: TypeScript Target — `TsSdk`** - Dependency-free `fetch`-based typed client; hermetic `tsc --noEmit` typecheck; `TsSdk` Target built-in. (completed 2026-06-26)
 - [ ] **Phase 6: Cross-Language Hardening + Examples + Docs** - FastAPI + NestJS `.gnr8/` example lifecycles with real committed output; per-language envelope tables in `docs/USAGE.md`; doctor/check/watch parity; cross-language determinism; record the `typescript` carve-out.
 
 ## Phase Details
@@ -187,7 +187,7 @@ Plans:
 
 **Wave 3** *(blocked on Waves 1-2)*
 
-- [ ] 05-03-PLAN.md — hermetic `tssdk_compile` test: build IR(nestjs-bookstore) → generate → `tsc --noEmit --strict --lib es2022,dom` exit 0 (vendored typescript) + banned-import grep + skip-if-toolchain-absent + `make check` gate [TSSDK-02]
+- [x] 05-03-PLAN.md — hermetic `tssdk_compile` test: build IR(nestjs-bookstore) → generate → `tsc --noEmit --strict --lib es2022,dom` exit 0 (vendored typescript) + banned-import grep + skip-if-toolchain-absent + `make check` gate [TSSDK-02]
 
 **UI hint**: yes
 
@@ -220,5 +220,5 @@ dependencies.)
 | 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
-| 5. TypeScript Target — `TsSdk` | v2.0 | 2/3 | In Progress|  |
+| 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |

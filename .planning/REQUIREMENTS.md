@@ -44,7 +44,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 ### TypeScript SDK target (TSSDK)
 
 - [x] **TSSDK-01**: A developer can generate a **dependency-free** TypeScript SDK from the IR (built-in `fetch`, typed `interface` models + string-literal-union enums, a typed `ApiError`, a configurable `Client`).
-- [ ] **TSSDK-02**: The generated TS SDK type-checks (`tsc --noEmit`) in a hermetic test.
+- [x] **TSSDK-02**: The generated TS SDK type-checks (`tsc --noEmit`) in a hermetic test.
 - [x] **TSSDK-03**: A developer adds the TS SDK to a `.gnr8/` Pipeline via a `TsSdk` `Target` built-in; output is deterministic.
 
 ### Cross-language hardening & examples (XLANG)
@@ -106,7 +106,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | TSSRC-03 | Phase 4 | Complete |
 | TSSRC-04 | Phase 4 | Complete |
 | TSSDK-01 | Phase 5 | Complete |
-| TSSDK-02 | Phase 5 | Pending |
+| TSSDK-02 | Phase 5 | Complete |
 | TSSDK-03 | Phase 5 | Complete |
 | XLANG-01 | Phase 6 | Pending |
 | XLANG-02 | Phase 6 | Pending |
