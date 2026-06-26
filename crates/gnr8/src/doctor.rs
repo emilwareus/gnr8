@@ -3,7 +3,7 @@
 //! This module owns the PURE report shape + grouping + exit-policy decision + human/JSON render. It
 //! performs NO I/O: [`DoctorReport::assemble`] takes already-collected facts (the lifecycle booleans,
 //! the pipeline's structured `diagnostics`, and the dry-run drift `WritePlan`) and groups them into a
-//! serializable report. The impure half — probing `.gnr8/`, probing the Go toolchain, and RUNNING the
+//! serializable report. The impure half — probing `.gnr8/`, probing the source-language toolchain, and RUNNING the
 //! user's `.gnr8/` pipeline (the child) to harvest its diagnostics + compute drift — lives in
 //! `main::run_doctor`, mirroring the `run_check` shell-vs-decision split. Keeping `assemble` pure makes
 //! the entire exit-policy truth table (Pitfall 1 — informational WARNs must NOT force a non-zero exit)
@@ -12,7 +12,7 @@
 //! ## Exit policy (Pitfall 1 / HARD-01)
 //!
 //! [`DoctorReport::has_actionable_problem`] is `true` iff a lifecycle/staleness problem exists:
-//! `.gnr8/` missing, the Go toolchain absent, the pipeline failed to run, or any output is stale
+//! `.gnr8/` missing, the source-language toolchain absent, the pipeline failed to run, or any output is stale
 //! (`Write`) / drifted (`UserEdited`). The pipeline's analysis `diagnostics` (e.g. the fixture's known
 //! unsupported-pattern WARNs) are INFORMATIONAL and are deliberately EXCLUDED — they explain "what I
 //! can't represent and why" and must never make `doctor` permanently red. This mirrors `run_check`,
@@ -40,8 +40,14 @@ use gnr8_core::lifecycle::{WriteAction, WritePlan};
 pub(crate) struct LifecycleHealth {
     /// Whether the project-local `.gnr8/` generation crate exists (run `gnr8 init` if not).
     pub(crate) initialized: bool,
-    /// Whether the Go toolchain is present (a `go version` probe spawned successfully).
-    pub(crate) go_toolchain: bool,
+    /// Whether the DETECTED source language's toolchain is present (a version probe of the language's
+    /// binary — `go`/`python3`/`node` — spawned successfully). Generalized from the old Go-only
+    /// boolean (XLANG-04): a FastAPI project probes `python3`, a NestJS project `node`.
+    pub(crate) source_toolchain: bool,
+    /// Which source language `doctor` detected and probed (`"go"`/`"python"`/`"typescript"`, or
+    /// `"unknown"` when the source dir is empty/ambiguous). Names WHICH toolchain `source_toolchain`
+    /// reflects so the report is honest about the multi-language choice (RESEARCH A6).
+    pub(crate) language: String,
     /// Whether the user's `.gnr8/` pipeline RAN (compiled + emitted a bundle). False ⇒ a compile error
     /// in the pipeline, a missing toolchain it needs, or a missing `.gnr8/` — all actionable.
     pub(crate) pipeline_runs: bool,
@@ -93,7 +99,7 @@ pub(crate) struct DoctorSummary {
 pub(crate) struct DoctorReport {
     /// The top-level CI signal: `true` iff no actionable problem exists.
     pub(crate) healthy: bool,
-    /// The lifecycle facts (init / Go toolchain / pipeline runs).
+    /// The lifecycle facts (init / source-language toolchain + language / pipeline runs).
     pub(crate) lifecycle: LifecycleHealth,
     /// The stale/drifted/clean output partition (empty when the pipeline did not run).
     pub(crate) outputs: OutputHealth,
@@ -140,7 +146,8 @@ impl DoctorReport {
     /// Build a grouped [`DoctorReport`] from already-collected facts (PURE — no I/O, no analysis).
     ///
     /// - `initialized` — `.gnr8/` exists.
-    /// - `go_present` — the Go-toolchain probe result.
+    /// - `source_present` — the DETECTED source language's toolchain probe result.
+    /// - `language` — the detected source language label (`"go"`/`"python"`/`"typescript"`/`"unknown"`).
     /// - `pipeline_ran` — the user's `.gnr8/` pipeline compiled + emitted a bundle.
     /// - `diagnostics` — the pipeline's structured analysis diagnostics, or `None` when the pipeline did
     ///   not run (degrades gracefully, never a crash).
@@ -156,14 +163,16 @@ impl DoctorReport {
     #[allow(clippy::fn_params_excessive_bools)]
     pub(crate) fn assemble(
         initialized: bool,
-        go_present: bool,
+        source_present: bool,
+        language: &str,
         pipeline_ran: bool,
         diagnostics: Option<Vec<Diagnostic>>,
         drift: Option<&WritePlan>,
     ) -> Self {
         let lifecycle = LifecycleHealth {
             initialized,
-            go_toolchain: go_present,
+            source_toolchain: source_present,
+            language: language.to_string(),
             pipeline_runs: pipeline_ran,
         };
 
@@ -228,7 +237,7 @@ impl DoctorReport {
         if !self.lifecycle.initialized {
             count += 1;
         }
-        if !self.lifecycle.go_toolchain {
+        if !self.lifecycle.source_toolchain {
             count += 1;
         }
         if !self.lifecycle.pipeline_runs {
@@ -246,7 +255,7 @@ impl DoctorReport {
     #[must_use]
     pub(crate) fn has_actionable_problem(&self) -> bool {
         !self.lifecycle.initialized
-            || !self.lifecycle.go_toolchain
+            || !self.lifecycle.source_toolchain
             || !self.lifecycle.pipeline_runs
             || !self.outputs.stale.is_empty()
             || !self.outputs.drifted.is_empty()
@@ -269,10 +278,11 @@ impl DoctorReport {
         );
         let _ = writeln!(
             out,
-            "  Go toolchain:        {}",
+            "  Source toolchain ({}): {}",
+            self.lifecycle.language,
             ok_or(
-                self.lifecycle.go_toolchain,
-                "NOT FOUND — install Go and ensure it is on PATH"
+                self.lifecycle.source_toolchain,
+                "NOT FOUND — install the source language's toolchain and ensure it is on PATH"
             )
         );
         let _ = writeln!(
@@ -411,7 +421,8 @@ mod tests {
         ];
         let report = DoctorReport::assemble(
             true, // initialized
-            true, // go present
+            true, // source toolchain present
+            "go", // detected source language
             true, // pipeline ran
             Some(diags),
             Some(&clean_plan()),
@@ -428,24 +439,49 @@ mod tests {
     /// Exit-policy: `.gnr8/` missing (initialized=false) is actionable.
     #[test]
     fn missing_init_is_actionable() {
-        let report = DoctorReport::assemble(false, true, false, None, None);
+        let report = DoctorReport::assemble(false, true, "go", false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.healthy);
     }
 
-    /// Exit-policy: a missing Go toolchain is actionable (and reported, not a crash).
+    /// Exit-policy: a missing source toolchain is actionable (and reported, not a crash).
     #[test]
-    fn missing_go_toolchain_is_actionable() {
-        let report = DoctorReport::assemble(true, false, true, None, Some(&clean_plan()));
+    fn missing_source_toolchain_is_actionable() {
+        let report = DoctorReport::assemble(true, false, "go", true, None, Some(&clean_plan()));
         assert!(report.has_actionable_problem());
-        assert!(!report.lifecycle.go_toolchain);
+        assert!(!report.lifecycle.source_toolchain);
+    }
+
+    /// The probed toolchain follows the detected source language: a Python source reports
+    /// `language == "python"` (and a TypeScript source `"typescript"`), so the report states WHICH
+    /// toolchain was probed (RESEARCH A6) rather than hardcoding Go. `assemble` is pure, so the language
+    /// label is threaded in by the impure `run_doctor` shell from the single `source_toolchain` decision.
+    #[test]
+    fn doctor_reports_the_detected_source_language() {
+        let py = DoctorReport::assemble(true, true, "python", true, None, Some(&clean_plan()));
+        assert_eq!(py.lifecycle.language, "python");
+        assert!(py.lifecycle.source_toolchain);
+        let text = py.render_human();
+        assert!(
+            text.contains("python"),
+            "the human report must name the probed language:\n{text}"
+        );
+
+        let ts = DoctorReport::assemble(true, true, "typescript", true, None, Some(&clean_plan()));
+        assert_eq!(ts.lifecycle.language, "typescript");
+
+        // An undetectable source surfaces as a finding (toolchain false + language "unknown"), not a crash.
+        let unknown =
+            DoctorReport::assemble(true, false, "unknown", true, None, Some(&clean_plan()));
+        assert_eq!(unknown.lifecycle.language, "unknown");
+        assert!(unknown.has_actionable_problem());
     }
 
     /// Exit-policy: a pipeline that failed to run is actionable, and drift renders UNKNOWN (never a
     /// false-healthy "up to date").
     #[test]
     fn pipeline_failure_is_actionable_and_drift_unknown() {
-        let report = DoctorReport::assemble(true, true, false, None, None);
+        let report = DoctorReport::assemble(true, true, "go", false, None, None);
         assert!(report.has_actionable_problem());
         assert!(!report.lifecycle.pipeline_runs);
         let text = report.render_human();
@@ -462,15 +498,21 @@ mod tests {
     /// Exit-policy: any stale (`Write`) output is actionable; all-Unchanged is clean.
     #[test]
     fn stale_output_is_actionable_clean_is_not() {
-        let stale =
-            DoctorReport::assemble(true, true, true, None, Some(&plan_with(WriteAction::Write)));
+        let stale = DoctorReport::assemble(
+            true,
+            true,
+            "go",
+            true,
+            None,
+            Some(&plan_with(WriteAction::Write)),
+        );
         assert!(
             stale.has_actionable_problem(),
             "a stale Write output is actionable"
         );
         assert_eq!(stale.outputs.stale.len(), 1);
 
-        let clean = DoctorReport::assemble(true, true, true, None, Some(&clean_plan()));
+        let clean = DoctorReport::assemble(true, true, "go", true, None, Some(&clean_plan()));
         assert!(
             !clean.has_actionable_problem(),
             "an all-Unchanged plan with no other problems is healthy"
@@ -484,6 +526,7 @@ mod tests {
         let report = DoctorReport::assemble(
             true,
             true,
+            "go",
             true,
             None,
             Some(&plan_with(WriteAction::UserEdited)),
@@ -499,6 +542,7 @@ mod tests {
         let report = DoctorReport::assemble(
             true,
             true,
+            "go",
             true,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
             Some(&clean_plan()),
@@ -520,13 +564,21 @@ mod tests {
         );
         assert_eq!(obj["healthy"], serde_json::json!(true));
 
-        // The lifecycle sub-object exposes the documented facts.
+        // The lifecycle sub-object exposes the documented facts. The old Go-only toolchain field was
+        // generalized to `source_toolchain` and a `language` field added (06-01 / XLANG-04) so the
+        // report states WHICH source-language toolchain it probed — this pin locks the new contract.
         let lifecycle = obj["lifecycle"].as_object().expect("lifecycle object");
         let lkeys: HashSet<&str> = lifecycle.keys().map(String::as_str).collect();
-        let lexpected: HashSet<&str> = ["initialized", "go_toolchain", "pipeline_runs"]
-            .into_iter()
-            .collect();
+        let lexpected: HashSet<&str> = [
+            "initialized",
+            "source_toolchain",
+            "language",
+            "pipeline_runs",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(lkeys, lexpected, "lifecycle --json field set drifted");
+        assert_eq!(lifecycle["language"], serde_json::json!("go"));
     }
 
     /// `render_human` emits the three group headers and a trailing verdict line.
@@ -535,6 +587,7 @@ mod tests {
         let healthy = DoctorReport::assemble(
             true,
             true,
+            "go",
             true,
             Some(vec![warn_diag("free-form map ... map[string]any ...")]),
             Some(&clean_plan()),
@@ -555,7 +608,7 @@ mod tests {
         );
         assert!(text.contains("healthy"), "missing healthy verdict:\n{text}");
 
-        let unhealthy = DoctorReport::assemble(false, false, false, None, None);
+        let unhealthy = DoctorReport::assemble(false, false, "unknown", false, None, None);
         let text = unhealthy.render_human();
         assert!(
             text.contains("actionable problem"),

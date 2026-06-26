@@ -1,0 +1,173 @@
+---
+source: crates/gnr8-core/tests/snapshot_nestjs_openapi.rs
+expression: openapi
+---
+openapi: 3.1.0
+info:
+  title: bookstore
+  version: 0.1.0
+security:
+  - ApiKeyAuth: []
+paths:
+  '/books/':
+    get:
+      operationId: listBooks
+      parameters:
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: genre
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: sort
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListBooksResponse'
+    post:
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookDto'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedMessage'
+  '/books/{bookId}':
+    get:
+      operationId: getBook
+      parameters:
+      - name: bookId
+        in: path
+        required: true
+        schema:
+          type: number
+      - name: fmt
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/BookFormat'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookOrError'
+    put:
+      operationId: updateBook
+      parameters:
+      - name: bookId
+        in: path
+        required: true
+        schema:
+          type: number
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookFilters'
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedMessage'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    AuthorDto:
+      type: object
+      required: [bio, name]
+      properties:
+        bio:
+          type: [string, null]
+        name:
+          type: string
+    BookDto:
+      type: object
+      required: [author, format, id, title]
+      properties:
+        author:
+          $ref: '#/components/schemas/AuthorDto'
+        format:
+          $ref: '#/components/schemas/BookFormat'
+        id:
+          type: number
+        rating:
+          type: [number, null]
+        tags:
+          type: array
+          items:
+            type: string
+        title:
+          type: string
+    BookFilters:
+      type: object
+      required: [genre, published]
+      properties:
+        genre:
+          type: string
+        inStock:
+          type: boolean
+        published:
+          type: [number, null]
+        sort:
+          type: [string, null]
+          enum: [asc, desc]
+    BookFormat:
+      type: string
+      enum: [hardcover, paperback]
+    BookOrError:
+      oneOf:
+      - $ref: '#/components/schemas/BookDto'
+      - $ref: '#/components/schemas/OutOfStockDto'
+    CreatedMessage:
+      type: object
+      required: [id, message]
+      properties:
+        id:
+          type: number
+        message:
+          type: string
+    ListBooksResponse:
+      type: object
+      required: [books, nextCursor, total]
+      properties:
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/BookDto'
+        nextCursor:
+          type: [string, null]
+        total:
+          type: number
+    OutOfStockDto:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string

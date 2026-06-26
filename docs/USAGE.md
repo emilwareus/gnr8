@@ -21,7 +21,11 @@ cargo build --release -p gnr8        # binary: target/release/gnr8
 make check                           # fmt + clippy -D warnings + all tests + go builds
 make gates                           # the contract suite (4 snapshots, sdk_compile, determinism, lifecycle)
 ```
-Requires a Go toolchain on PATH (gnr8 shells a Go helper to load the target module).
+Requires the **source language's toolchain** (Go/Python/TypeScript) on PATH — gnr8 shells a
+per-language helper to load the target (Go module, Python `ast`, TS Compiler API). The toolchain that
+matters is the one the analyzed project is written in: a Go service needs `go`, a FastAPI/Flask service
+needs `python3`, a NestJS service needs `node` + the project's own `typescript` (see CLAUDE.md
+"TypeScript toolchain (required, not shipped)").
 
 ## Canonical workflow
 ```
@@ -46,13 +50,17 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
+
+`doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
+reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
 | `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 1 on error |
 
 Notes:
 - `--force` overwrites outputs a user hand-edited (otherwise generate warns+skips them — ownership protection).
 - `inspect` is the ONLY command taking a target dir; the others derive inputs from the pipeline's `Source`.
-- `watch` re-runs on a `*.go` source edit OR a `*.rs` edit under `.gnr8/src/` (you changed the pipeline →
-  recompile + re-run); it ignores its own outputs and the `.gnr8/target`/`.gnr8/cache` dirs (no regen loop).
+- `watch` re-runs on a source-language edit (`.go`/`.py`/`.ts`, picked from the detected source language)
+  OR a `*.rs` edit under `.gnr8/src/` (you changed the pipeline → recompile + re-run); it ignores its own
+  outputs and the `.gnr8/target`/`.gnr8/cache` dirs (no regen loop).
 - No command panics on bad input/missing toolchain — typed error → clean stderr + non-zero. A `.gnr8/`
   that is missing, won't compile, or whose `cargo` is absent surfaces as an actionable error.
 
@@ -80,9 +88,9 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 
 | Trait | Signature | Role | Built-ins |
 |---|---|---|---|
-| `Source` | `load(&self, &Cx) -> Result<ApiGraph, CoreError>` | source code → IR | `GoGin` |
+| `Source` | `load(&self, &Cx) -> Result<ApiGraph, CoreError>` | source code → IR | `GoGin`, `FastApi`, `Flask`, `NestJs` |
 | `Transform` | `apply(&self, &mut ApiGraph, &Cx) -> Result<(), CoreError>` | IR → IR (where TOML knobs now live, as code) | `SetBasePath`, `SetTitle`, `ApplySecurity`, `RenameOperation`, `RenameType` |
-| `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk` |
+| `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
 | `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
 - `Pipeline::new().source(..).transform(..).target(..).post(..)` — builder, stages kept in call order.
@@ -159,7 +167,11 @@ impl Target for ApiMarkdown {
 // …then: .transform(DropDebugRoutes).target(ApiMarkdown { path: "generated/API.md".into() })
 ```
 A `Source` shells out / parses to produce an `ApiGraph`; a `PostProcess` rewrites the in-memory
-`Artifacts` (license header, import rewrite). The full runnable example: `examples/taskflow/`.
+`Artifacts` (license header, import rewrite). The full runnable Go example: `examples/taskflow/`. The
+cross-language example lifecycles (real committed output) live at `examples/fastapi-bookstore/` (Python →
+OpenApi31 + PySdk), `examples/flask-bookstore/` (Python, the honest typed-envelope — untyped surfaces
+become diagnostics → OpenApi31 + PySdk), and `examples/nestjs-bookstore/` (TypeScript → OpenApi31 + TsSdk).
+All five examples (plus `examples/bookstore/` Go/Gin) are byte-identical-regen-gated by `make examples-check`.
 
 ### Host ↔ child boundary
 `gnr8 generate` runs `cargo run --manifest-path .gnr8/Cargo.toml -- __emit` with `cwd = project root`.
@@ -168,6 +180,24 @@ bundle (`{ version, artifacts: [{path, text}], diagnostics }`) on stdout. The **
 writes: the ownership manifest, no-op skip (byte-identical), edit-protection (warn+skip user-edited
 unless `--force`), and excluding the pipeline's own output paths from analysis. The child is a pure,
 side-effect-free function; the host is the single trusted writer — so `check`/`watch`/`doctor` reuse it.
+
+## Supported source frontends (the honest envelope)
+gnr8 supports four source frontends across three languages. Each row states what is actually recognized
+and where the limits are — there is no overclaiming; an unrecognized/untyped surface becomes a diagnostic
+and the fact is omitted (never guessed). The per-language behavior below is the verified extractor
+contract (the committed graph/OpenAPI snapshots are the spec).
+
+| Frontend | Lang | Status | Recognized | Limits / diagnostics |
+|---|---|---|---|---|
+| Gin | Go | full | route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | ONE route group only; `float64`→`float32` narrowing (diag); `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
+| FastAPI | Python | full | `@app`/`@router` verbs, `APIRouter`/literal prefixes, path params (template∩args), typed query params (defaults→required/optional), Pydantic/`@dataclass` bodies, `response_model=`, `status_code=`, `Literal`/`Enum`, `Union` aliases | static `ast` only (never imports/executes the target); unresolvable/foreign type → diagnostic + omit (no guess). |
+| Flask | Python | typed-envelope (honest second-class) | `@app.route`/`methods=`, `Blueprint(url_prefix=)`, `<int:id>` converter path params, OPT-IN typed DTOs/returns; method-derived status (typed `POST`→201, else 200) | untyped `request.json` / unannotated `request.args` / missing return annotation → **diagnostic, NEVER inferred**. State plainly: untyped surfaces are NOT recovered (typed-envelope only). |
+| NestJS | TypeScript | class-DTO scope | `@nestjs/common` verb + `@Param`/`@Query`/`@Body` decorators, `@Controller` prefix (provenance, never folded), DTO **classes**, enums + string-literal-union, method-derived status (`@HttpCode` override) | DTO **classes** only (bare `interface`s are erased — not extracted); never reads `@nestjs/swagger` / `zod` / `class-validator` (rule 1); unresolvable → diagnostic + omit. |
+
+Generated SDKs are **dependency-free in every language**: GoSdk (`net/http`), PySdk (`urllib` +
+`@dataclass`), TsSdk (built-in `fetch` + typed interfaces). The `tsextract` sidecar resolves the
+**project's own `typescript`** toolchain (required, not shipped — see CLAUDE.md); every other sidecar is
+stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself takes zero OSS deps.
 
 ## Recognized Go/Gin patterns (code-first)
 Resolution is via `go/types` (alias/import-robust), not string matching.

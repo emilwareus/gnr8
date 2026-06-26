@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use gnr8_core::graph::{ApiGraph, Operation, Schema};
+use gnr8_core::graph::{ApiGraph, Operation, Schema, Type};
 
 /// Render `inspect routes`: a METHOD/PATH/OPERATION/REQUEST/RESPONSES table (or JSON).
 ///
@@ -63,22 +63,67 @@ pub(crate) fn render_schemas(graph: &ApiGraph, json: bool) -> Result<String, ser
     let mut out = String::new();
     let _ = writeln!(out, "{:<44} {:<7} {:<7} ENUM", "ID", "KIND", "FIELDS");
     for schema in &graph.schemas {
-        let enum_values = if schema.enum_values.is_empty() {
-            "-".to_string()
-        } else {
-            schema.enum_values.join(",")
+        let enum_values = match enum_members(schema) {
+            Some(members) if !members.is_empty() => members.join(","),
+            _ => "-".to_string(),
         };
         let _ = writeln!(
             out,
             "{:<44} {:<7} {:<7} {}",
             schema.id,
-            schema.kind,
-            schema.fields.len(),
+            schema_kind(schema),
+            field_count(schema),
             enum_values
         );
     }
     append_diagnostics(&mut out, graph);
     Ok(out)
+}
+
+/// A short, human-readable discriminator for a schema's neutral [`Type`] body (`object`, `enum`, or
+/// the bare variant token for any other body), for the `inspect schemas` KIND column.
+fn schema_kind(schema: &Schema) -> &'static str {
+    match &schema.body {
+        Type::Object(_) => "object",
+        Type::Enum(_) => "enum",
+        Type::Primitive(_) => "prim",
+        Type::WellKnown(_) => "wellk",
+        Type::Array(_) => "array",
+        Type::Map { .. } => "map",
+        Type::Named(_) => "ref",
+        Type::Union(_) => "union",
+        Type::Any {} => "any",
+    }
+}
+
+/// The number of declared fields for an object-bodied schema (0 for any non-object body).
+fn field_count(schema: &Schema) -> usize {
+    match &schema.body {
+        Type::Object(fields) => fields.len(),
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Enum(_)
+        | Type::Union(_)
+        | Type::Any {} => 0,
+    }
+}
+
+/// The enum members of an enum-bodied schema, or `None` for a non-enum body.
+fn enum_members(schema: &Schema) -> Option<&[String]> {
+    match &schema.body {
+        Type::Enum(members) => Some(members),
+        Type::Object(_)
+        | Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => None,
+    }
 }
 
 /// Render `inspect graph`: a compact combined view (routes + schemas + diagnostics), or the whole
@@ -122,15 +167,18 @@ fn write_operation_line(out: &mut String, op: &Operation) {
 
 /// One compact schema line for the combined graph view.
 fn write_schema_line(out: &mut String, schema: &Schema) {
-    let detail = if schema.enum_values.is_empty() {
-        format!("{} fields", schema.fields.len())
-    } else {
-        format!("enum [{}]", schema.enum_values.join(","))
+    let detail = match enum_members(schema) {
+        Some(members) if !members.is_empty() => format!("enum [{}]", members.join(",")),
+        _ => format!("{} fields", field_count(schema)),
     };
     let _ = writeln!(
         out,
         "  {:<44} {:<7} {} (provenance {}:{})",
-        schema.id, schema.kind, detail, schema.provenance.file, schema.provenance.start_line
+        schema.id,
+        schema_kind(schema),
+        detail,
+        schema.provenance.file,
+        schema.provenance.start_line
     );
 }
 

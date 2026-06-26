@@ -11,12 +11,11 @@
 //! runs and never panics (RUST-04); [`write_to_dir`] materializes the same framing for 03-03's compile
 //! test.
 
-mod bundle;
 mod emit;
 mod gofmt;
 
 use crate::graph::{ApiGraph, Operation};
-use bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{self, SdkBundle, SdkFile};
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///
@@ -83,37 +82,6 @@ fn go_file(name: &str, raw: &str) -> Result<SdkFile, crate::CoreError> {
     })
 }
 
-/// Materialize a generated SDK bundle String's framed files to `dir/<name>` (03-03's compile test).
-///
-/// Takes the public [`generate`] output (the file-marker-framed bundle String) rather than the
-/// crate-private [`bundle::SdkBundle`] so an out-of-crate integration test (`tests/sdk_compile.rs`)
-/// can call it directly. File names are program-controlled — they come from the fixed
-/// `client.go`/`errors.go`/`<tag>.go`/`models.go` frame markers, never from untrusted input — and are
-/// joined onto the caller's program-controlled temp `dir` (threat T-03-03 temp-dir hygiene). The
-/// bundle is split through the shared [`bundle::parse`] framing so the on-disk files match the
-/// snapshot byte-for-byte.
-///
-/// # Errors
-///
-/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty/contains a path separator (so no
-/// frame can escape `dir`) or if any file cannot be written.
-pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
-    for (name, contents) in bundle::parse(bundle) {
-        // Defense-in-depth: the frame names are program-generated, but reject anything that is not a
-        // plain file name so a malformed bundle can never traverse out of `dir` (T-03-03).
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-            return Err(crate::CoreError::SdkGen {
-                message: format!("refusing to write SDK file with unsafe name {name:?}"),
-            });
-        }
-        let path = dir.join(&name);
-        std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
-            message: format!("failed to write SDK file {}: {err}", path.display()),
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so
@@ -145,7 +113,7 @@ mod tests {
           "operation_id": "updateGoal",
           "params": [
             { "name": "uuid", "location": "path", "required": true,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
           ],
           "request_body": { "ref_id": "dto.UpdateGoalInput" },
@@ -157,7 +125,7 @@ mod tests {
           "operation_id": "listGoals",
           "params": [
             { "name": "aggregation", "location": "query", "required": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
           ],
           "request_body": null,
@@ -167,57 +135,57 @@ mod tests {
       ],
       "schemas": [
         {
-          "id": "dto.CommandMessage", "name": "CommandMessage", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.CommandMessage", "name": "CommandMessage",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.CreateGoalInput", "name": "CreateGoalInput", "kind": "object",
-          "fields": [
-            { "json_name": "name", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
+          "body": { "type": "object", "of": [
+            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true,
-              "schema": { "kind": "ref", "format": null, "items": null, "ref_id": "dto.TargetDirection", "additional_properties": null },
+            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+              "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.HttpError", "name": "HttpError", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.HttpError", "name": "HttpError",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput", "kind": "object",
-          "fields": [
-            { "json_name": "total", "required": false, "optional": false,
-              "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput",
+          "body": { "type": "object", "of": [
+            { "json_name": "total", "required": false, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.TargetDirection", "name": "TargetDirection", "kind": "enum",
-          "fields": [], "enum_values": ["gte","lte"],
+          "id": "dto.TargetDirection", "name": "TargetDirection",
+          "body": { "type": "enum", "of": ["gte","lte"] },
           "span": { "file": "/root/c.go", "start_line": 3, "end_line": 3 }
         },
         {
-          "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput", "kind": "object",
-          "fields": [
-            { "json_name": "name", "required": false, "optional": true,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput",
+          "body": { "type": "object", "of": [
+            { "json_name": "name", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
         }
       ],
       "diagnostics": []

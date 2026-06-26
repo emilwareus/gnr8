@@ -13,10 +13,11 @@
 //!
 //! ## What triggers a regeneration
 //!
-//! Config is now CODE in `.gnr8/src/`, so watch covers BOTH the project's Go sources AND the pipeline
-//! crate itself:
+//! Config is now CODE in `.gnr8/src/`, so watch covers BOTH the project's source-language files AND the
+//! pipeline crate itself:
 //!
-//! 1. a `*.go` source edit anywhere under the project root that is NOT under `.gnr8/` and NOT a
+//! 1. a source-language edit (the DETECTED language's extension — `*.go`/`*.py`/`*.ts`, from the single
+//!    `source_toolchain` decision) anywhere under the project root that is NOT under `.gnr8/` and NOT a
 //!    manifest-recorded gnr8 output (a real API change), OR
 //! 2. a `*.rs` edit under `.gnr8/src/` (the user changed the pipeline — recompile + re-run it).
 //!
@@ -86,13 +87,27 @@ impl LatencyReport {
 
 /// Whether a single changed path should TRIGGER a regeneration (PURE — no watcher, no I/O).
 ///
-/// `true` when EITHER the path is a `*.go` source file that is NOT a gnr8 output and NOT under `.gnr8/`
-/// (a real API change), OR it is a `*.rs` file under `gnr8_src` (the pipeline crate's source — the user
-/// edited the config). `output_set` holds gnr8's own outputs + the `.gnr8/target`/`.gnr8/cache` dirs;
-/// anything under one of those is gnr8's own write and returns `false` — the loop-safety core of
-/// WATCH-02. Unit-tested directly without a watcher.
+/// `true` when EITHER the path is a source file in the DETECTED source language (extension == `source_ext`,
+/// e.g. `go`/`py`/`ts`) that is NOT a gnr8 output and NOT under `.gnr8/` (a real API change), OR it is a
+/// `*.rs` file under `gnr8_src` (the pipeline crate's source — the user edited the config). `source_ext`
+/// is threaded in by the caller from the SINGLE `gnr8_core::analyze::source_toolchain` decision over the
+/// source dir (XLANG-04) — this pure function never re-derives it, so there is no second source of truth
+/// and no per-extension fallback (CLAUDE.md rule 3). `output_set` holds gnr8's own outputs + the
+/// `.gnr8/target`/`.gnr8/cache` dirs; anything under one of those is gnr8's own write and returns `false`
+/// — the loop-safety core of WATCH-02. `gnr8_root` is the canonicalized `.gnr8/` crate root: a
+/// source-language file ANYWHERE under it (e.g. `.gnr8/src/helper.ts`) is the pipeline crate's own, NOT
+/// the user's API source, so it never triggers a regeneration — the SAME `.gnr8/` exclusion
+/// `analyze::scan_markers` applies to detection (WR-01: the runtime filter now matches the documented
+/// invariant and the core detector — one consistent rule, no divergence). Unit-tested directly without a
+/// watcher.
 #[must_use]
-fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>, gnr8_src: &Path) -> bool {
+fn is_trigger_path(
+    path: &Path,
+    output_set: &HashSet<PathBuf>,
+    gnr8_root: &Path,
+    gnr8_src: &Path,
+    source_ext: &str,
+) -> bool {
     // A pipeline-source edit (`.gnr8/src/**.rs`) always triggers — recompile + re-run the pipeline.
     if path.starts_with(gnr8_src) && path.extension().is_some_and(|ext| ext == "rs") {
         return true;
@@ -101,8 +116,14 @@ fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>, gnr8_src: &Path) 
     if is_under_any_output(path, output_set) {
         return false;
     }
-    // Only Go source edits outside `.gnr8/` drive an API-change regeneration.
-    path.extension().is_some_and(|ext| ext == "go")
+    // A source-language file anywhere under `.gnr8/` is the crate's, not the user's API source — exclude
+    // it to match the documented contract and `analyze::scan_markers` (WR-01). The `.gnr8/src/**.rs`
+    // pipeline-source trigger above already fired; everything else under `.gnr8/` is non-triggering.
+    if path.starts_with(gnr8_root) {
+        return false;
+    }
+    // Only edits in the DETECTED source language outside `.gnr8/` drive an API-change regeneration.
+    path.extension().is_some_and(|ext| ext == source_ext)
 }
 
 /// Whether a debounced BATCH of changed paths should trigger a regeneration (PURE).
@@ -112,20 +133,28 @@ fn is_trigger_path(path: &Path, output_set: &HashSet<PathBuf>, gnr8_src: &Path) 
 fn batch_should_regenerate(
     paths: &[PathBuf],
     output_set: &HashSet<PathBuf>,
+    gnr8_root: &Path,
     gnr8_src: &Path,
+    source_ext: &str,
 ) -> bool {
     paths
         .iter()
-        .any(|p| is_trigger_path(p, output_set, gnr8_src))
+        .any(|p| is_trigger_path(p, output_set, gnr8_root, gnr8_src, source_ext))
 }
 
 /// Count the DISTINCT trigger paths in a debounced batch (PURE) — the input to the WATCH-03 scenario
 /// label so the `--json` record does not over-claim `single-file-edit` for a multi-file batch (WR-03).
 #[must_use]
-fn count_trigger_paths(paths: &[PathBuf], output_set: &HashSet<PathBuf>, gnr8_src: &Path) -> usize {
+fn count_trigger_paths(
+    paths: &[PathBuf],
+    output_set: &HashSet<PathBuf>,
+    gnr8_root: &Path,
+    gnr8_src: &Path,
+    source_ext: &str,
+) -> usize {
     paths
         .iter()
-        .filter(|p| is_trigger_path(p, output_set, gnr8_src))
+        .filter(|p| is_trigger_path(p, output_set, gnr8_root, gnr8_src, source_ext))
         .collect::<HashSet<_>>()
         .len()
 }
@@ -219,7 +248,21 @@ fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
 /// project root cannot be watched. Per-batch regeneration errors are logged and the loop continues.
 pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow::Result<()> {
     let output_set = build_output_set(project_root);
+    let gnr8_root = canonicalize_or_keep(&project_root.join(".gnr8"));
     let gnr8_src = canonicalize_or_keep(&project_root.join(".gnr8").join("src"));
+
+    // Derive the watched source extension from the SINGLE `source_toolchain` decision over the project
+    // root (the `.gnr8/` crate is excluded from that scan in core — Open Q2). One decision, no
+    // per-extension fallback (CLAUDE.md rule 3); an undetectable/ambiguous source fails startup loudly
+    // via the anyhow boundary rather than watching the wrong (or every) extension.
+    let source_ext = gnr8_core::analyze::source_toolchain(&project_root.to_string_lossy())
+        .map(|tc| tc.source_extension().to_string())
+        .with_context(|| {
+            format!(
+                "cannot determine the source language to watch under {}",
+                project_root.display()
+            )
+        })?;
 
     // The coalesced "a source/pipeline file changed → regenerate" channel. The debouncer callback (a
     // separate thread) sends the count of DISTINCT files that triggered (WR-03); the main loop receives.
@@ -233,7 +276,9 @@ pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow
     }
 
     let filter_set = output_set.clone();
+    let filter_root = gnr8_root.clone();
     let filter_src = gnr8_src.clone();
+    let filter_ext = source_ext.clone();
     let mut debouncer = new_debouncer(debounce, None, move |result: DebounceEventResult| {
         match result {
             Ok(events) => {
@@ -245,8 +290,20 @@ pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow
                     .flat_map(|ev| ev.paths.iter())
                     .map(|p| canonicalize_or_keep(p))
                     .collect();
-                if batch_should_regenerate(&paths, &filter_set, &filter_src) {
-                    let _ = tx.send(count_trigger_paths(&paths, &filter_set, &filter_src));
+                if batch_should_regenerate(
+                    &paths,
+                    &filter_set,
+                    &filter_root,
+                    &filter_src,
+                    &filter_ext,
+                ) {
+                    let _ = tx.send(count_trigger_paths(
+                        &paths,
+                        &filter_set,
+                        &filter_root,
+                        &filter_src,
+                        &filter_ext,
+                    ));
                 }
             }
             Err(errors) => {
@@ -258,7 +315,7 @@ pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow
     })
     .context("failed to create the file-system debouncer")?;
 
-    // Watch the WHOLE project root recursively — the Go sources and `.gnr8/src/` both live under it; the
+    // Watch the WHOLE project root recursively — the source files and `.gnr8/src/` both live under it; the
     // pure filter (not the watch scope) is what excludes gnr8's own writes, so a single recursive watch
     // is correct and simple. (`.gnr8/target` churns during a child build but is filtered out.)
     debouncer
@@ -377,6 +434,11 @@ mod tests {
         set
     }
 
+    /// The `.gnr8` crate root anchor for the WR-01 source-language exclusion.
+    fn gnr8_root() -> PathBuf {
+        PathBuf::from("/proj/.gnr8")
+    }
+
     /// The `.gnr8/src` anchor for the pipeline-source trigger.
     fn gnr8_src() -> PathBuf {
         PathBuf::from("/proj/.gnr8/src")
@@ -385,77 +447,196 @@ mod tests {
     #[test]
     fn output_paths_filtered() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
         // gnr8's own writes are NOT triggers, even the .go SDK files.
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/openapi.yaml"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/sdk/client.go"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
         // The generation crate's build output churns during a child build but must NOT trigger.
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/.gnr8/target/debug/foo"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
     }
 
     #[test]
     fn go_source_triggers() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
-        // A `.go` source edit OUTSIDE the output paths → a trigger.
+        // A `.go` source edit OUTSIDE the output paths → a trigger when the source language is Go.
         assert!(is_trigger_path(
             &PathBuf::from("/proj/handlers/goal.go"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
-        assert!(is_trigger_path(&PathBuf::from("/proj/main.go"), &out, &src));
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/main.go"),
+            &out,
+            &root,
+            &src,
+            "go"
+        ));
+    }
+
+    /// XLANG-04: in a Python project (source_ext == "py") a `*.py` source edit triggers regeneration,
+    /// while a `*.go` file is ignored (it is not the detected source language). Mirrors `go_source_triggers`.
+    #[test]
+    fn py_source_triggers() {
+        let out = output_set();
+        let root = gnr8_root();
+        let src = gnr8_src();
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/app/routes.py"),
+            &out,
+            &root,
+            &src,
+            "py"
+        ));
+        // A stray `*.go` in a Python project is NOT the source language → ignored.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/handlers/goal.go"),
+            &out,
+            &root,
+            &src,
+            "py"
+        ));
+    }
+
+    /// XLANG-04: in a TypeScript project (source_ext == "ts") a `*.ts` source edit triggers, while a
+    /// `*.py` file is ignored. Mirrors `go_source_triggers` for the third language.
+    #[test]
+    fn ts_source_triggers() {
+        let out = output_set();
+        let root = gnr8_root();
+        let src = gnr8_src();
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/src/app.controller.ts"),
+            &out,
+            &root,
+            &src,
+            "ts"
+        ));
+        // A stray `*.py` in a TypeScript project is NOT the source language → ignored.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/app/routes.py"),
+            &out,
+            &root,
+            &src,
+            "ts"
+        ));
     }
 
     #[test]
     fn pipeline_source_triggers() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
-        // Editing the pipeline crate's Rust source must trigger a recompile + re-run.
+        // Editing the pipeline crate's Rust source must trigger a recompile + re-run, regardless of the
+        // detected source language (the `.gnr8/src/**.rs` trigger is language-agnostic).
         assert!(is_trigger_path(
             &PathBuf::from("/proj/.gnr8/src/main.rs"),
             &out,
-            &src
+            &root,
+            &src,
+            "py"
         ));
         // A non-.rs file under .gnr8/src is not a trigger.
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/.gnr8/src/notes.txt"),
             &out,
-            &src
+            &root,
+            &src,
+            "py"
+        ));
+    }
+
+    /// WR-01 regression: a source-LANGUAGE file living anywhere under `.gnr8/` but NOT under
+    /// `target`/`cache` (e.g. a `.ts` helper the user drops in the pipeline crate) is the crate's own,
+    /// NOT the user's API source — it must NOT trigger a regeneration. This is the documented contract
+    /// (module/function docs say "NOT under `.gnr8/`") and matches `analyze::scan_markers`'s exclusion.
+    #[test]
+    fn dot_gnr8_source_language_file_does_not_trigger() {
+        let out = output_set();
+        let root = gnr8_root();
+        let src = gnr8_src();
+        // A `.ts` file in a TS project sitting under `.gnr8/` (not src/, not target/cache) — the
+        // pre-WR-01 code fell through to the extension check and spuriously triggered.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/.gnr8/helper.ts"),
+            &out,
+            &root,
+            &src,
+            "ts"
+        ));
+        // A `.py` file under `.gnr8/scratch/` in a Python project — same exclusion.
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/.gnr8/scratch/notes.py"),
+            &out,
+            &root,
+            &src,
+            "py"
+        ));
+        // Sanity: the identical-extension file OUTSIDE `.gnr8/` still triggers (the exclusion is scoped).
+        assert!(is_trigger_path(
+            &PathBuf::from("/proj/src/app.controller.ts"),
+            &out,
+            &root,
+            &src,
+            "ts"
         ));
     }
 
     #[test]
-    fn non_go_ignored() {
+    fn non_source_language_ignored() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
+        // Non-source files are ignored regardless of the detected language (Go here).
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/README.md"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
-        assert!(!is_trigger_path(&PathBuf::from("/proj/go.mod"), &out, &src));
+        assert!(!is_trigger_path(
+            &PathBuf::from("/proj/go.mod"),
+            &out,
+            &root,
+            &src,
+            "go"
+        ));
         assert!(!is_trigger_path(
             &PathBuf::from("/proj/Makefile"),
             &out,
-            &src
+            &root,
+            &src,
+            "go"
         ));
     }
 
     #[test]
     fn source_wins_over_output() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
         // A batch with gnr8's own writes AND a real source edit triggers (the source edit wins).
         let batch = vec![
@@ -463,7 +644,7 @@ mod tests {
             PathBuf::from("/proj/openapi.yaml"),
             PathBuf::from("/proj/handlers/goal.go"),
         ];
-        assert!(batch_should_regenerate(&batch, &out, &src));
+        assert!(batch_should_regenerate(&batch, &out, &root, &src, "go"));
 
         // A batch of ONLY output writes must NOT trigger (the no-loop guarantee).
         let only_outputs = vec![
@@ -472,7 +653,13 @@ mod tests {
             PathBuf::from("/proj/openapi.yaml"),
             PathBuf::from("/proj/.gnr8/target/debug/gen"),
         ];
-        assert!(!batch_should_regenerate(&only_outputs, &out, &src));
+        assert!(!batch_should_regenerate(
+            &only_outputs,
+            &out,
+            &root,
+            &src,
+            "go"
+        ));
     }
 
     #[test]
@@ -504,15 +691,16 @@ mod tests {
     #[test]
     fn scenario_label_distinguishes_single_from_multi_file_batches() {
         let out = output_set();
+        let root = gnr8_root();
         let src = gnr8_src();
 
         let one = vec![
             PathBuf::from("/proj/handlers/goal.go"),
             PathBuf::from("/proj/sdk/client.go"),
         ];
-        assert_eq!(count_trigger_paths(&one, &out, &src), 1);
+        assert_eq!(count_trigger_paths(&one, &out, &root, &src, "go"), 1);
         assert_eq!(
-            scenario_for_trigger_count(count_trigger_paths(&one, &out, &src)),
+            scenario_for_trigger_count(count_trigger_paths(&one, &out, &root, &src, "go")),
             "single-file-edit"
         );
 
@@ -520,9 +708,9 @@ mod tests {
             PathBuf::from("/proj/handlers/goal.go"),
             PathBuf::from("/proj/handlers/user.go"),
         ];
-        assert_eq!(count_trigger_paths(&two, &out, &src), 2);
+        assert_eq!(count_trigger_paths(&two, &out, &root, &src, "go"), 2);
         assert_eq!(
-            scenario_for_trigger_count(count_trigger_paths(&two, &out, &src)),
+            scenario_for_trigger_count(count_trigger_paths(&two, &out, &root, &src, "go")),
             "multi-file-edit"
         );
 
@@ -530,7 +718,7 @@ mod tests {
             PathBuf::from("/proj/handlers/goal.go"),
             PathBuf::from("/proj/handlers/goal.go"),
         ];
-        assert_eq!(count_trigger_paths(&dup, &out, &src), 1);
+        assert_eq!(count_trigger_paths(&dup, &out, &root, &src, "go"), 1);
 
         assert_eq!(scenario_for_trigger_count(0), "single-file-edit");
     }
@@ -551,7 +739,8 @@ mod tests {
 
         let mut output_set = HashSet::new();
         output_set.insert(canonicalize_or_keep(&sdk_dir));
-        let src = root.join(".gnr8").join("src");
+        let gnr8_root = root.join(".gnr8");
+        let src = gnr8_root.join("src");
 
         let generated = sdk_dir.join("client.go");
         std::fs::write(&generated, b"package sdk\n").expect("write generated file");
@@ -564,7 +753,7 @@ mod tests {
             "a deleted output leaf must still resolve under the canonical output dir; got {event_path:?}"
         );
         assert!(
-            !is_trigger_path(&event_path, &output_set, &src),
+            !is_trigger_path(&event_path, &output_set, &gnr8_root, &src, "go"),
             "a delete event for gnr8's own output must NOT trigger a regeneration (WR-01)"
         );
 

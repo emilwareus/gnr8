@@ -1,0 +1,414 @@
+---
+source: crates/gnr8-core/tests/snapshot_fastapi_graph.rs
+expression: graph
+---
+module: fastapi-bookstore
+operations:
+  - id: list_books
+    method: GET
+    path: /
+    handler: list_books
+    params:
+      - name: cursor
+        location: query
+        required: false
+        schema:
+          type: primitive
+          of:
+            prim: string
+        provenance:
+          file: app/main.py
+          start_line: 41
+          end_line: 41
+      - name: genre
+        location: query
+        required: true
+        schema:
+          type: primitive
+          of:
+            prim: string
+        provenance:
+          file: app/main.py
+          start_line: 39
+          end_line: 39
+      - name: sort
+        location: query
+        required: false
+        schema:
+          type: primitive
+          of:
+            prim: string
+        provenance:
+          file: app/main.py
+          start_line: 40
+          end_line: 40
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: app.models.ListBooksResponse
+    provenance:
+      file: app/main.py
+      start_line: 38
+      end_line: 38
+  - id: create_book
+    method: POST
+    path: /
+    handler: create_book
+    params: []
+    request_body:
+      ref_id: app.models.Book
+    responses:
+      - status: 201
+        body:
+          ref_id: app.models.CreatedMessage
+    provenance:
+      file: app/main.py
+      start_line: 57
+      end_line: 57
+  - id: get_book
+    method: GET
+    path: "/{book_id}"
+    handler: get_book
+    params:
+      - name: book_id
+        location: path
+        required: true
+        schema:
+          type: primitive
+          of:
+            prim: int
+            bits: 64
+            signed: true
+        provenance:
+          file: app/main.py
+          start_line: 66
+          end_line: 66
+      - name: fmt
+        location: query
+        required: false
+        schema:
+          type: named
+          of: app.models.BookFormat
+        provenance:
+          file: app/main.py
+          start_line: 66
+          end_line: 66
+    request_body: ~
+    responses:
+      - status: 200
+        body:
+          ref_id: app.models.BookOrError
+    provenance:
+      file: app/main.py
+      start_line: 65
+      end_line: 65
+  - id: update_book
+    method: PUT
+    path: "/{book_id}"
+    handler: update_book
+    params:
+      - name: book_id
+        location: path
+        required: true
+        schema:
+          type: primitive
+          of:
+            prim: int
+            bits: 64
+            signed: true
+        provenance:
+          file: app/main.py
+          start_line: 76
+          end_line: 76
+    request_body:
+      ref_id: app.models.BookFilters
+    responses:
+      - status: 200
+        body:
+          ref_id: app.models.CreatedMessage
+    provenance:
+      file: app/main.py
+      start_line: 75
+      end_line: 75
+schemas:
+  - id: app.models.Author
+    name: Author
+    body:
+      type: object
+      of:
+        - json_name: bio
+          required: true
+          optional: false
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: name
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 53
+      end_line: 53
+  - id: app.models.Book
+    name: Book
+    body:
+      type: object
+      of:
+        - json_name: author
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: app.models.Author
+          description: ~
+          example: ~
+        - json_name: format
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: named
+            of: app.models.BookFormat
+          description: ~
+          example: ~
+        - json_name: id
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: rating
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: union
+            of:
+              - type: primitive
+                of:
+                  prim: int
+                  bits: 64
+                  signed: true
+              - type: primitive
+                of:
+                  prim: float
+                  bits: 64
+          description: ~
+          example: ~
+        - json_name: tags
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: primitive
+              of:
+                prim: string
+          description: ~
+          example: ~
+        - json_name: title
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 64
+      end_line: 64
+  - id: app.models.BookFilters
+    name: BookFilters
+    body:
+      type: object
+      of:
+        - json_name: genre
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: in_stock
+          required: false
+          optional: true
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: bool
+          description: ~
+          example: ~
+        - json_name: published
+          required: true
+          optional: false
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: sort
+          required: false
+          optional: true
+          nullable: true
+          schema:
+            type: enum
+            of:
+              - asc
+              - desc
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 95
+      end_line: 95
+  - id: app.models.BookFormat
+    name: BookFormat
+    body:
+      type: enum
+      of:
+        - hardcover
+        - paperback
+    provenance:
+      file: app/models.py
+      start_line: 33
+      end_line: 33
+  - id: app.models.BookOrError
+    name: BookOrError
+    body:
+      type: union
+      of:
+        - type: named
+          of: app.models.Book
+        - type: named
+          of: app.models.OutOfStock
+    provenance:
+      file: app/models.py
+      start_line: 130
+      end_line: 130
+  - id: app.models.CreatedMessage
+    name: CreatedMessage
+    body:
+      type: object
+      of:
+        - json_name: id
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+        - json_name: message
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 113
+      end_line: 113
+  - id: app.models.ListBooksResponse
+    name: ListBooksResponse
+    body:
+      type: object
+      of:
+        - json_name: books
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: array
+            of:
+              type: named
+              of: app.models.Book
+          description: ~
+          example: ~
+        - json_name: next_cursor
+          required: true
+          optional: false
+          nullable: true
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+        - json_name: total
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: int
+              bits: 64
+              signed: true
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 135
+      end_line: 135
+  - id: app.models.OutOfStock
+    name: OutOfStock
+    body:
+      type: object
+      of:
+        - json_name: reason
+          required: true
+          optional: false
+          nullable: false
+          schema:
+            type: primitive
+            of:
+              prim: string
+          description: ~
+          example: ~
+    provenance:
+      file: app/models.py
+      start_line: 124
+      end_line: 124
+diagnostics: []
+base_path: /
+title: API
+security: []

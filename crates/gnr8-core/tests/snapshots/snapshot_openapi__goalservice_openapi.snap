@@ -141,9 +141,11 @@ components:
           type: string
           description: Short human-readable goal name
         targetDirection:
-          $ref: '#/components/schemas/TargetDirection'
+          oneOf:
+          - $ref: '#/components/schemas/TargetDirection'
+          - type: null
         targetValue:
-          type: number
+          type: [number, null]
         workflowChainIds:
           type: array
           items:
@@ -161,7 +163,6 @@ components:
           description: Analytics metric to evaluate
         windowDays:
           type: integer
-          format: int64
           description: Rolling window size in days
     GoalResponse:
       type: object
@@ -180,9 +181,11 @@ components:
         name:
           type: string
         targetDirection:
-          $ref: '#/components/schemas/TargetDirection'
+          oneOf:
+          - $ref: '#/components/schemas/TargetDirection'
+          - type: null
         targetValue:
-          type: number
+          type: [number, null]
         uuid:
           type: string
           format: uuid
@@ -206,14 +209,12 @@ components:
           items:
             $ref: '#/components/schemas/GoalResponse'
         nextCursor:
-          type: string
+          type: [string, null]
           format: uuid
         pageSize:
           type: integer
-          format: int64
         total:
           type: integer
-          format: int64
     TargetDirection:
       type: string
       enum: [gte, lte]
@@ -221,7 +222,9 @@ components:
       type: object
       properties:
         analyticsQuery:
-          $ref: '#/components/schemas/GoalAnalyticsQuery'
+          oneOf:
+          - $ref: '#/components/schemas/GoalAnalyticsQuery'
+          - type: null
         description:
           type: string
           description: Updated explanation
@@ -229,9 +232,11 @@ components:
           type: string
           description: Updated goal name
         targetDirection:
-          $ref: '#/components/schemas/TargetDirection'
+          oneOf:
+          - $ref: '#/components/schemas/TargetDirection'
+          - type: null
         targetValue:
-          type: number
+          type: [number, null]
         workflowChainIds:
           type: array
           items:

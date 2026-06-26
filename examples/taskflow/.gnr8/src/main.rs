@@ -23,7 +23,7 @@
 
 // `ApiGraph` and `CoreError` are not in the prelude (they are part of the deeper IR surface a custom
 // stage touches); import them explicitly. The prelude carries everything else we compose.
-use gnr8_core::graph::ApiGraph;
+use gnr8_core::graph::{ApiGraph, Type};
 use gnr8_core::sdk::prelude::*;
 use gnr8_core::CoreError;
 
@@ -78,7 +78,21 @@ impl Target for ApiMarkdown {
 
         md.push_str("\n## Schemas\n\n");
         for schema in &ir.schemas {
-            md.push_str(&format!("- `{}` ({})\n", schema.name, schema.kind));
+            // The neutral `Type` variant IS the schema's kind (the old string `kind` field was removed
+            // when the IR became language-neutral in v2.0). Match exhaustively — a new variant is a
+            // compile error here, never a silently-mislabeled schema (CLAUDE.md rule 3).
+            let kind = match &schema.body {
+                Type::Primitive(_) => "primitive",
+                Type::WellKnown(_) => "well-known",
+                Type::Array(_) => "array",
+                Type::Map { .. } => "map",
+                Type::Named(_) => "named",
+                Type::Object(_) => "object",
+                Type::Enum(_) => "enum",
+                Type::Union(_) => "union",
+                Type::Any {} => "any",
+            };
+            md.push_str(&format!("- `{}` ({})\n", schema.name, kind));
         }
 
         out.write(self.path.clone(), md);

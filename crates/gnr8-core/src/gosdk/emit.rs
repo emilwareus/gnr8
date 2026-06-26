@@ -23,7 +23,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Schema, SchemaType};
+use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
+use crate::sdk::emit_common::{
+    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -66,121 +69,146 @@ pub(crate) fn exported(name: &str) -> String {
     out
 }
 
-/// Split an identifier into words on `_`/`-` separators and lower→upper case boundaries.
+/// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
 ///
-/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `page_size` → `["page", "size"]`.
-fn split_words(name: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut prev_lower = false;
-    for ch in name.chars() {
-        if ch == '_' || ch == '-' || ch == ' ' {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-        current.push(ch);
-        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
-
-/// Map a graph [`SchemaType`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
+/// ALL Go-specific type mapping lives HERE — this is the correct home for per-target mapping (IR-03 /
+/// docs/extensibility.md §2a): `WellKnown::DateTime → time.Time`, `Int → int64`, `Float → float32`,
+/// `Map`/`Any → map[string]any`. The match over [`Type`] is exhaustive — no `_ =>` / `other =>` arm —
+/// so a future variant fails to compile here until handled (T-03).
 ///
-/// `optional` controls pointer wrapping for value types (`number`→`*float32`, `boolean`→`*bool`, etc.).
-/// Strings, slices, and maps are already nilable in Go so they are never pointer-wrapped (matches
-/// `expected/sdk/models.go`, where optional strings stay `string` with omitempty and only value types
-/// like `NextCursor` become `*string`).
+/// `nullable` controls pointer wrapping for value types (`*float32`, `*bool`, `*TargetDirection`, …):
+/// a NULLABLE value type becomes `*T`. Strings, slices, and maps are already nilable in Go so they are
+/// never pointer-wrapped (matches `expected/sdk/models.go`, where an optional string stays `string`
+/// with omitempty and only nullable value types like `NextCursor` become `*string`). The optional axis
+/// is NOT read here — it drives `,omitempty` in [`json_tag`], not the pointer (the two are distinct).
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::SdkGen`] on an unknown `kind` or a `ref`/`array` missing its target.
-fn go_type(schema: &SchemaType, optional: bool, graph: &ApiGraph) -> Result<String, CoreError> {
-    let base = match schema.kind.as_str() {
-        // uuid → string, plain string → string (format is a doc hint only for strings).
-        "string" => match schema.format.as_deref() {
-            Some("date-time") => "time.Time".to_string(),
-            _ => "string".to_string(),
-        },
-        "boolean" => "bool".to_string(),
-        "integer" => "int64".to_string(),
-        // TARGET-API §4: number → float32 (the generator narrows; the diagnostic is already in graph).
-        "number" => "float32".to_string(),
-        "array" => {
-            let items = schema.items.as_deref().ok_or_else(|| CoreError::SdkGen {
-                message: "array schema is missing its `items` element type".to_string(),
-            })?;
-            // Slice elements are never optional-pointer-wrapped.
+/// Returns [`CoreError::SdkGen`] on a dangling `Named` ref, or a [`Type`] the Go target cannot
+/// represent (e.g. [`Type::Union`] — Go has no sum types).
+fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
+    let base = match schema {
+        // A base scalar maps to its Go type; the integer/float width is a target concern (TARGET-API
+        // §4: number → float32 — the generator narrows; the diagnostic is already in the graph).
+        Type::Primitive(prim) => go_primitive(prim).to_string(),
+        // A well-known scalar maps to the Go type that carries it: a date-time is a `time.Time`, a
+        // uuid is a string (Go-ism LOCAL to this target — never in lowering, IR-03).
+        Type::WellKnown(well_known) => go_well_known(well_known).to_string(),
+        Type::Array(items) => {
+            // Slice elements are never nullable-pointer-wrapped.
             return Ok(format!("[]{}", go_type(items, false, graph)?));
         }
-        "object" => {
-            // Free-form map (additionalProperties) → map[string]any; a bare object is unexpected here.
-            if schema.additional_properties == Some(true) {
-                "map[string]any".to_string()
-            } else {
-                return Err(CoreError::SdkGen {
-                    message: "inline object schema without additionalProperties is unsupported \
-                              (expected a named $ref)"
-                        .to_string(),
-                });
-            }
-        }
-        "ref" => {
-            let ref_id = schema.ref_id.as_deref().ok_or_else(|| CoreError::SdkGen {
-                message: "ref schema is missing its `ref_id`".to_string(),
-            })?;
+        // A keyed map and a free-form value both map to `map[string]any` (the Go SDK does not emit a
+        // typed map type in this PoC; the value type is a doc-only refinement).
+        Type::Map { .. } | Type::Any {} => "map[string]any".to_string(),
+        Type::Named(ref_id) => {
             let target = graph
                 .schemas
                 .iter()
-                .find(|s| s.id == ref_id)
+                .find(|s| &s.id == ref_id)
                 .ok_or_else(|| CoreError::SdkGen {
                     message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
                 })?;
-            // Both objects and enum newtypes are referenced by their exported Go name.
+            // Both objects and enum newtypes are referenced by their exported Go name; a NULLABLE
+            // value ref becomes a pointer.
             return Ok(maybe_pointer(
                 target.name.clone(),
-                optional,
+                nullable,
                 is_value_ref(target),
             ));
         }
-        other => {
+        // An inline (anonymous) object is not emitted as a Go type in this PoC (every object is a
+        // named DTO via a $ref) — an explicit error arm, not a catch-all (T-03).
+        Type::Object(_) => {
             return Err(CoreError::SdkGen {
-                message: format!("unknown SchemaType kind '{other}'"),
+                message: "inline object type is unsupported by the Go SDK target \
+                          (expected a named $ref)"
+                    .to_string(),
+            });
+        }
+        // An inline enum is likewise only emitted as a named newtype; an inline one is unsupported.
+        Type::Enum(_) => {
+            return Err(CoreError::SdkGen {
+                message: "inline enum type is unsupported by the Go SDK target \
+                          (expected a named $ref)"
+                    .to_string(),
+            });
+        }
+        // Go has no sum types: a union is a target capability gap, surfaced as an EXPLICIT typed error
+        // arm (T-03), never a silent catch-all. (The Go fixture exercises no unions.)
+        Type::Union(_) => {
+            return Err(CoreError::SdkGen {
+                message: "union type is unsupported by the Go SDK target (Go has no sum types)"
+                    .to_string(),
             });
         }
     };
-    // Strings/maps are nilable already; value types get a pointer when optional.
+    // Strings/maps are nilable already; value types get a pointer when nullable.
     let is_value = matches!(base.as_str(), "bool" | "int64" | "float32" | "time.Time");
-    Ok(maybe_pointer(base, optional, is_value))
+    Ok(maybe_pointer(base, nullable, is_value))
 }
 
-/// Whether a referenced schema lowers to a Go *value* type that needs a pointer to be optional.
+/// Map a neutral [`Prim`] to its Go type (Go-ism LOCAL to this target — IR-03). Integer width is
+/// narrowed to `int64` and float to `float32` per TARGET-API §4 (the narrowing diagnostic is already
+/// in the graph); a byte string maps to Go `[]byte`.
+fn go_primitive(prim: &Prim) -> &'static str {
+    match prim {
+        Prim::String => "string",
+        Prim::Bool => "bool",
+        Prim::Int { .. } => "int64",
+        Prim::Float { .. } => "float32",
+        Prim::Bytes => "[]byte",
+    }
+}
+
+/// Map a neutral [`WellKnown`] to the Go type that carries it (Go-ism LOCAL to this target — IR-03):
+/// a date-time is a `time.Time`; the remaining well-knowns carry as a Go `string` in this `PoC`.
+fn go_well_known(well_known: &WellKnown) -> &'static str {
+    match well_known {
+        WellKnown::DateTime => "time.Time",
+        WellKnown::Uuid
+        | WellKnown::Date
+        | WellKnown::Duration
+        | WellKnown::Decimal
+        | WellKnown::Email
+        | WellKnown::Uri => "string",
+    }
+}
+
+/// Whether a referenced schema lowers to a Go *value* type that needs a pointer to be nullable.
 ///
-/// Enum newtypes are string-backed value types (`*TargetDirection` when optional, per `expected/sdk`);
-/// object refs are structs and are pointer-wrapped only when optional too.
+/// Enum newtypes are string-backed value types (`*TargetDirection` when nullable, per `expected/sdk`);
+/// object refs are structs and are pointer-wrapped only when nullable too. The match over the named
+/// schema's neutral body is exhaustive (T-03).
 fn is_value_ref(target: &Schema) -> bool {
-    // Both enums and structs are value types in Go; an optional field is a pointer either way.
-    matches!(target.kind.as_str(), "enum" | "object")
+    match &target.body {
+        // Both enums and structs are value types in Go; a nullable field is a pointer either way.
+        Type::Enum(_) | Type::Object(_) => true,
+        // A named schema whose body is a scalar/array/map/union/any is not a Go struct/enum newtype;
+        // it is not pointer-wrapped on the named-ref path (its own mapping handles nilability).
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => false,
+    }
 }
 
-/// Wrap `base` in a Go pointer when the field is optional and the underlying Go type is a value type.
-fn maybe_pointer(base: String, optional: bool, is_value: bool) -> String {
-    if optional && is_value {
+/// Wrap `base` in a Go pointer when the field's value may be explicitly null AND the underlying Go type
+/// is a value type. Pointer-wrapping reads the NULLABLE axis (a nilable `*T`), NOT the optional axis
+/// (which drives `,omitempty` in [`json_tag`]) — the two are distinct (RESEARCH Pitfall 4).
+fn maybe_pointer(base: String, nullable: bool, is_value: bool) -> String {
+    if nullable && is_value {
         format!("*{base}")
     } else {
         base
     }
 }
 
-/// Build the Go json struct tag for a field, adding the omitempty option when the field is optional.
+/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field is OPTIONAL
+/// (the presence axis — the key may be absent). Independent of nullability (RESEARCH Pitfall 4).
 fn json_tag(json_name: &str, optional: bool) -> String {
     if optional {
         format!("`json:\"{json_name},omitempty\"`")
@@ -189,12 +217,20 @@ fn json_tag(json_name: &str, optional: bool) -> String {
     }
 }
 
-/// Whether emitting `field`'s Go type requires the `time` import (a `time.Time` value anywhere).
-fn field_needs_time(schema: &SchemaType) -> bool {
-    match schema.kind.as_str() {
-        "string" => schema.format.as_deref() == Some("date-time"),
-        "array" => schema.items.as_deref().is_some_and(field_needs_time),
-        _ => false,
+/// Whether emitting a field of neutral [`Type`] requires the `time` import (a `time.Time` value
+/// anywhere). The match recurses through arrays and is exhaustive over [`Type`] (T-03).
+fn field_needs_time(schema: &Type) -> bool {
+    match schema {
+        Type::WellKnown(WellKnown::DateTime) => true,
+        Type::Array(items) => field_needs_time(items),
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Object(_)
+        | Type::Enum(_)
+        | Type::Union(_)
+        | Type::Any {} => false,
     }
 }
 
@@ -218,20 +254,29 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
             writeln!(body).map_err(sink)?;
         }
         first = false;
-        match schema.kind.as_str() {
-            "enum" => emit_enum(&mut body, schema)?,
-            "object" => {
-                for field in &schema.fields {
+        // A named schema's body is a neutral Type; only Object/Enum are valid model bodies. Every
+        // other variant is an EXPLICIT typed error (T-03), never a catch-all.
+        match &schema.body {
+            Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
+            Type::Object(fields) => {
+                for field in fields {
                     if field_needs_time(&field.schema) {
                         needs_time = true;
                     }
                 }
-                emit_struct(&mut body, schema, graph)?;
+                emit_struct(&mut body, &schema.name, fields, graph)?;
             }
-            other => {
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Union(_)
+            | Type::Any {} => {
                 return Err(CoreError::SdkGen {
                     message: format!(
-                        "schema '{}' has unsupported kind '{other}' (expected object|enum)",
+                        "schema '{}' has an unsupported non-object/non-enum body \
+                         (expected object|enum)",
                         schema.id
                     ),
                 });
@@ -244,9 +289,14 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
 }
 
 /// Emit a single object struct: one exported field per graph field with its Go type and json tag.
-fn emit_struct(body: &mut String, schema: &Schema, graph: &ApiGraph) -> Result<(), CoreError> {
-    writeln!(body, "type {} struct {{", schema.name).map_err(sink)?;
-    for field in &schema.fields {
+fn emit_struct(
+    body: &mut String,
+    name: &str,
+    fields: &[Field],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    writeln!(body, "type {name} struct {{").map_err(sink)?;
+    for field in fields {
         emit_struct_field(body, field, graph)?;
     }
     writeln!(body, "}}").map_err(sink)?;
@@ -254,22 +304,26 @@ fn emit_struct(body: &mut String, schema: &Schema, graph: &ApiGraph) -> Result<(
 }
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
+///
+/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads the OPTIONAL axis — the two are
+/// distinct (RESEARCH Pitfall 4): an optional-not-nullable value stays a non-pointer `T` with omitempty;
+/// a nullable value becomes `*T`.
 fn emit_struct_field(body: &mut String, field: &Field, graph: &ApiGraph) -> Result<(), CoreError> {
     let go_name = exported(&field.json_name);
-    let go_ty = go_type(&field.schema, field.optional, graph)?;
+    let go_ty = go_type(&field.schema, field.nullable, graph)?;
     let tag = json_tag(&field.json_name, field.optional);
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
 }
 
 /// Emit a string-enum newtype + a const block of `NameValue Name = "value"` (values in graph order).
-fn emit_enum(body: &mut String, schema: &Schema) -> Result<(), CoreError> {
-    writeln!(body, "type {} string", schema.name).map_err(sink)?;
+fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
+    writeln!(body, "type {name} string").map_err(sink)?;
     writeln!(body).map_err(sink)?;
     writeln!(body, "const (").map_err(sink)?;
-    for value in &schema.enum_values {
-        let const_name = format!("{}{}", schema.name, exported(value));
-        writeln!(body, "{const_name} {} = \"{value}\"", schema.name).map_err(sink)?;
+    for value in members {
+        let const_name = format!("{name}{}", exported(value));
+        writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
     }
     writeln!(body, ")").map_err(sink)?;
     Ok(())
@@ -351,53 +405,6 @@ return e.StatusCode == 404
     file(package, &["fmt"], &body)
 }
 
-/// The success status + (optional) model of an operation's first 2xx response.
-///
-/// WR-01: `model` is `Option` because a 2xx response can carry no body (e.g. a `204 No Content` or a
-/// body-less `201`); the `status` is always the response's real status so the dispatch compares
-/// against the actual success code rather than a hard-coded `200`.
-struct Success {
-    status: u16,
-    model: Option<String>,
-}
-
-/// Resolve an operation's primary success (lowest 2xx) response status + model name.
-///
-/// Returns the first 2xx response's status regardless of whether it carries a body (WR-01); the
-/// model is `Some` only when that response has a typed body. An operation with no 2xx response at all
-/// yields `None`.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<Success>, CoreError> {
-    for resp in &op.responses {
-        if (200..300).contains(&resp.status) {
-            let model = match &resp.body {
-                Some(body) => {
-                    let model = graph
-                        .schemas
-                        .iter()
-                        .find(|s| s.id == body.ref_id)
-                        .ok_or_else(|| CoreError::SdkGen {
-                            message: format!(
-                                "operation '{}' success response references dangling $ref '{}'",
-                                op.id, body.ref_id
-                            ),
-                        })?;
-                    Some(model.name.clone())
-                }
-                None => None,
-            };
-            return Ok(Some(Success {
-                status: resp.status,
-                model,
-            }));
-        }
-    }
-    Ok(None)
-}
-
 /// The fields of the typed `APIError` envelope the non-2xx branch can populate from a decoded
 /// error body. Each maps a Go field on `APIError` to the json field name the error model must carry
 /// for that assignment to be emitted (so the SDK only ever reads a field the resolved struct has).
@@ -438,41 +445,6 @@ fn error_model_of<'g>(
         }
     }
     Ok(None)
-}
-
-/// Resolve an operation's request-body model name, if it has a typed body.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
-fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
-    let Some(body) = &op.request_body else {
-        return Ok(None);
-    };
-    let model = graph
-        .schemas
-        .iter()
-        .find(|s| s.id == body.ref_id)
-        .ok_or_else(|| CoreError::SdkGen {
-            message: format!(
-                "operation '{}' request body references dangling $ref '{}'",
-                op.id, body.ref_id
-            ),
-        })?;
-    Ok(Some(model.name.clone()))
-}
-
-/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). `base_path` is
-/// the user's `gnr8` config value — the single source of truth for the service prefix shared with the
-/// `OpenAPI` lowering (CLAUDE.md rules 3 & 4) — so the SDK URLs and the spec paths agree.
-fn join_path(base_path: &str, path: &str) -> String {
-    let base = base_path.trim_end_matches('/');
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        format!("{base}/")
-    } else {
-        format!("{base}/{trimmed}")
-    }
 }
 
 /// Emit the single `operations.go` resource surface: ctx-first typed methods on `*Client`.
@@ -547,12 +519,12 @@ fn emit_operation(
     // The return type is the success model when one exists, else an empty struct.
     let return_model = success
         .as_ref()
-        .and_then(|s| s.model.as_deref())
+        .and_then(|(_, model)| model.as_deref())
         .unwrap_or("struct{}")
         .to_string();
     // WR-01: compare against the operation's REAL success status (e.g. 201/204), not a default 200.
     // An op with no 2xx response declared falls back to 200 (the conventional default).
-    let success_status = success.as_ref().map_or(200, |s| s.status);
+    let success_status = success.as_ref().map_or(200, |(status, _)| *status);
 
     // Build the signature argument list.
     let mut args = vec!["ctx context.Context".to_string()];
@@ -582,7 +554,7 @@ fn emit_operation(
     writeln!(body, "var out {return_model}").map_err(sink)?;
 
     let has_body = body_model.is_some();
-    let has_decode = success.as_ref().is_some_and(|s| s.model.is_some());
+    let has_decode = success.as_ref().is_some_and(|(_, model)| model.is_some());
     emit_request_dispatch(
         body,
         op,
@@ -709,13 +681,26 @@ fn emit_request_dispatch(
 /// there is no typed error body), the SDK decodes into a small anonymous struct exposing exactly the
 /// fields `APIError` consumes, so a graph whose error model is shaped differently still compiles.
 fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result<(), CoreError> {
-    // Which APIError fields the resolved error struct can supply (by its declared json fields).
+    // Which APIError fields the resolved error struct can supply (by its declared json fields). A
+    // named error model's body is a neutral Type::Object; a non-object body declares no usable fields.
     let error_model = error_model_of(op, graph)?;
     let usable: Vec<(&str, &str)> = error_model.map_or_else(Vec::new, |model| {
+        let model_fields: &[Field] = match &model.body {
+            Type::Object(fields) => fields,
+            // A non-object error body declares no named fields to copy into APIError.
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Enum(_)
+            | Type::Union(_)
+            | Type::Any {} => &[],
+        };
         API_ERROR_FIELDS
             .iter()
             .copied()
-            .filter(|(_, json_name)| model.fields.iter().any(|f| f.json_name == *json_name))
+            .filter(|(_, json_name)| model_fields.iter().any(|f| f.json_name == *json_name))
             .collect()
     });
 
@@ -806,25 +791,6 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
     Ok(extra.into_iter().collect())
 }
 
-/// Extract the set of `{token}` placeholder names from a path template, in first-seen order.
-///
-/// `"/goal/{uuid}/sub/{kind}"` → `["uuid", "kind"]`. Used by [`emit_url`] to assert the path's
-/// templated tokens exactly match the operation's declared path params (WR-03).
-fn path_tokens(path: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = path;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        if let Some(close) = after.find('}') {
-            tokens.push(after[..close].to_string());
-            rest = &after[close + 1..];
-        } else {
-            break;
-        }
-    }
-    tokens
-}
-
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
 ///
 /// WR-03: the set of `{token}`s in the absolute path is asserted to equal the set of declared path
@@ -844,9 +810,7 @@ fn emit_url(
 
     // WR-03: the templated tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token nor an unused arg can slip through.
-    let token_set: BTreeSet<&str> = tokens.iter().map(String::as_str).collect();
-    let param_set: BTreeSet<&str> = path_params.iter().copied().collect();
-    if token_set != param_set {
+    if !path_tokens_match(&tokens, path_params) {
         return Err(CoreError::SdkGen {
             message: format!(
                 "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
@@ -992,10 +956,10 @@ mod tests {
           "method": "GET", "path": "/list", "handler": "listGoals",
           "operation_id": "listGoals", "params": [
             { "name": "aggregation", "location": "query", "required": true,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } },
             { "name": "cursor", "location": "query", "required": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
           ],
           "request_body": null,
@@ -1005,71 +969,71 @@ mod tests {
       ],
       "schemas": [
         {
-          "id": "dto.CommandMessage", "name": "CommandMessage", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.CommandMessage", "name": "CommandMessage",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.CreateGoalInput", "name": "CreateGoalInput", "kind": "object",
-          "fields": [
-            { "json_name": "analyticsQuery", "required": true, "optional": false,
-              "schema": { "kind": "ref", "format": null, "items": null, "ref_id": "dto.GoalAnalyticsQuery", "additional_properties": null },
+          "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
+          "body": { "type": "object", "of": [
+            { "json_name": "analyticsQuery", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "named", "of": "dto.GoalAnalyticsQuery" },
               "description": null, "example": null },
-            { "json_name": "createdAt", "required": false, "optional": false,
-              "schema": { "kind": "string", "format": "date-time", "items": null, "ref_id": null, "additional_properties": null },
+            { "json_name": "createdAt", "required": false, "optional": false, "nullable": false,
+              "schema": { "type": "well_known", "of": "date_time" },
               "description": null, "example": null },
-            { "json_name": "name", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true,
-              "schema": { "kind": "ref", "format": null, "items": null, "ref_id": "dto.TargetDirection", "additional_properties": null },
+            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+              "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null },
-            { "json_name": "targetValue", "required": false, "optional": true,
-              "schema": { "kind": "number", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+            { "json_name": "targetValue", "required": false, "optional": true, "nullable": true,
+              "schema": { "type": "primitive", "of": { "prim": "float", "bits": 32 } },
               "description": null, "example": null },
-            { "json_name": "workflowChainIds", "required": false, "optional": true,
-              "schema": { "kind": "array", "format": null, "items": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null }, "ref_id": null, "additional_properties": null },
+            { "json_name": "workflowChainIds", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "array", "of": { "type": "well_known", "of": "uuid" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
         },
         {
-          "id": "dto.GoalAnalyticsQuery", "name": "GoalAnalyticsQuery", "kind": "object",
-          "fields": [
-            { "json_name": "windowDays", "required": false, "optional": false,
-              "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.GoalAnalyticsQuery", "name": "GoalAnalyticsQuery",
+          "body": { "type": "object", "of": [
+            { "json_name": "windowDays", "required": false, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
-          "fields": [
-            { "json_name": "metadata", "required": false, "optional": true,
-              "schema": { "kind": "object", "format": null, "items": null, "ref_id": null, "additional_properties": true },
+          "id": "dto.GoalResponse", "name": "GoalResponse",
+          "body": { "type": "object", "of": [
+            { "json_name": "metadata", "required": false, "optional": true, "nullable": false,
+              "schema": { "type": "any", "of": {} },
               "description": null, "example": null },
-            { "json_name": "uuid", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+            { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "well_known", "of": "uuid" },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
+          ] },
+          "span": { "file": "/root/g.go", "start_line": 3, "end_line": 3 }
         },
         {
-          "id": "dto.HttpError", "name": "HttpError", "kind": "object",
-          "fields": [
-            { "json_name": "message", "required": true, "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+          "id": "dto.HttpError", "name": "HttpError",
+          "body": { "type": "object", "of": [
+            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
-          ],
-          "enum_values": [], "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
+          ] },
+          "span": { "file": "/root/c.go", "start_line": 2, "end_line": 2 }
         },
         {
-          "id": "dto.TargetDirection", "name": "TargetDirection", "kind": "enum",
-          "fields": [], "enum_values": ["gte","lte"],
+          "id": "dto.TargetDirection", "name": "TargetDirection",
+          "body": { "type": "enum", "of": ["gte","lte"] },
           "span": { "file": "/root/c.go", "start_line": 3, "end_line": 3 }
         }
       ],
@@ -1102,25 +1066,25 @@ mod tests {
               ],
               "schemas": [
                 {{
-                  "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
-                  "fields": [
-                    {{ "json_name": "uuid", "required": true, "optional": false,
-                      "schema": {{ "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null }},
+                  "id": "dto.GoalResponse", "name": "GoalResponse",
+                  "body": {{ "type": "object", "of": [
+                    {{ "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                      "schema": {{ "type": "well_known", "of": "uuid" }},
                       "description": null, "example": null }}
-                  ],
-                  "enum_values": [], "span": {{ "file": "/root/g.go", "start_line": 1, "end_line": 1 }}
+                  ] }},
+                  "span": {{ "file": "/root/g.go", "start_line": 1, "end_line": 1 }}
                 }},
                 {{
-                  "id": "dto.{error_name}", "name": "{error_name}", "kind": "object",
-                  "fields": [
-                    {{ "json_name": "message", "required": true, "optional": false,
-                      "schema": {{ "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null }},
+                  "id": "dto.{error_name}", "name": "{error_name}",
+                  "body": {{ "type": "object", "of": [
+                    {{ "json_name": "message", "required": true, "optional": false, "nullable": false,
+                      "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }},
-                    {{ "json_name": "slug", "required": false, "optional": true,
-                      "schema": {{ "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null }},
+                    {{ "json_name": "slug", "required": false, "optional": true, "nullable": false,
+                      "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }}
-                  ],
-                  "enum_values": [], "span": {{ "file": "/root/e.go", "start_line": 1, "end_line": 1 }}
+                  ] }},
+                  "span": {{ "file": "/root/e.go", "start_line": 1, "end_line": 1 }}
                 }}
               ],
               "diagnostics": []
@@ -1140,7 +1104,7 @@ mod tests {
               "method": "DELETE", "path": "/{uuid}", "handler": "deleteGoal",
               "operation_id": "deleteGoal", "params": [
                 { "name": "uuid", "location": "path", "required": true,
-                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "schema": { "type": "well_known", "of": "uuid" },
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
               ],
               "request_body": null,
@@ -1165,7 +1129,7 @@ mod tests {
               "method": "DELETE", "path": "/{uuid}", "handler": "deleteGoal",
               "operation_id": "deleteGoal", "params": [
                 { "name": "id", "location": "path", "required": true,
-                  "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } }
               ],
               "request_body": null,
@@ -1191,10 +1155,10 @@ mod tests {
               "method": "GET", "path": "/list", "handler": "listGoals",
               "operation_id": "listGoals", "params": [
                 { "name": "page", "location": "query", "required": true,
-                  "schema": { "kind": "integer", "format": "int64", "items": null, "ref_id": null, "additional_properties": null },
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "span": { "file": "/root/h.go", "start_line": 1, "end_line": 1 } },
                 { "name": "active", "location": "query", "required": false,
-                  "schema": { "kind": "boolean", "format": null, "items": null, "ref_id": null, "additional_properties": null },
+                  "schema": { "type": "primitive", "of": { "prim": "bool" } },
                   "span": { "file": "/root/h.go", "start_line": 2, "end_line": 2 } }
               ],
               "request_body": null,
@@ -1204,13 +1168,13 @@ mod tests {
           ],
           "schemas": [
             {
-              "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
-              "fields": [
-                { "json_name": "uuid", "required": true, "optional": false,
-                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "id": "dto.GoalResponse", "name": "GoalResponse",
+              "body": { "type": "object", "of": [
+                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                  "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
-              ],
-              "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+              ] },
+              "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
             }
           ],
           "diagnostics": []
@@ -1262,13 +1226,13 @@ mod tests {
           ],
           "schemas": [
             {
-              "id": "dto.GoalResponse", "name": "GoalResponse", "kind": "object",
-              "fields": [
-                { "json_name": "uuid", "required": true, "optional": false,
-                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "id": "dto.GoalResponse", "name": "GoalResponse",
+              "body": { "type": "object", "of": [
+                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                  "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
-              ],
-              "enum_values": [], "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
+              ] },
+              "span": { "file": "/root/g.go", "start_line": 1, "end_line": 1 }
             }
           ],
           "diagnostics": []
@@ -1642,45 +1606,49 @@ mod tests {
 
     mod type_mapping {
         use super::{go_type, join_path, sample_graph};
-        use crate::graph::SchemaType;
+        use crate::graph::{Prim, Type, WellKnown};
 
-        fn st(kind: &str, format: Option<&str>) -> SchemaType {
-            SchemaType {
-                kind: kind.to_string(),
-                format: format.map(str::to_string),
-                items: None,
-                ref_id: None,
-                additional_properties: None,
-            }
+        #[test]
+        fn value_types_get_a_pointer_only_when_nullable() {
+            // Pointer-wrapping reads the NULLABLE axis (RESEARCH Pitfall 4): a nullable value type is
+            // `*T`, a non-nullable value type is `T`.
+            let graph = sample_graph();
+            let number = Type::Primitive(Prim::Float { bits: 32 });
+            assert_eq!(go_type(&number, true, &graph).unwrap(), "*float32");
+            assert_eq!(go_type(&number, false, &graph).unwrap(), "float32");
+
+            let boolean = Type::Primitive(Prim::Bool);
+            assert_eq!(go_type(&boolean, true, &graph).unwrap(), "*bool");
+
+            let integer = Type::Primitive(Prim::Int {
+                bits: 64,
+                signed: true,
+            });
+            assert_eq!(go_type(&integer, false, &graph).unwrap(), "int64");
+
+            // strings are nilable already → never pointer-wrapped, even when nullable.
+            let string = Type::Primitive(Prim::String);
+            assert_eq!(go_type(&string, true, &graph).unwrap(), "string");
+
+            let date_time = Type::WellKnown(WellKnown::DateTime);
+            assert_eq!(go_type(&date_time, false, &graph).unwrap(), "time.Time");
+            // a nullable date-time (a value type) becomes a pointer.
+            assert_eq!(go_type(&date_time, true, &graph).unwrap(), "*time.Time");
         }
 
         #[test]
-        fn value_types_get_a_pointer_only_when_optional() {
+        fn union_type_is_an_explicit_target_error_not_a_catch_all() {
+            // Go has no sum types: a union must be an EXPLICIT typed SdkGen error (T-03), proving the
+            // arm exists rather than being swallowed by a catch-all.
             let graph = sample_graph();
-            assert_eq!(
-                go_type(&st("number", None), true, &graph).unwrap(),
-                "*float32"
-            );
-            assert_eq!(
-                go_type(&st("number", None), false, &graph).unwrap(),
-                "float32"
-            );
-            assert_eq!(
-                go_type(&st("boolean", None), true, &graph).unwrap(),
-                "*bool"
-            );
-            assert_eq!(
-                go_type(&st("integer", Some("int64")), false, &graph).unwrap(),
-                "int64"
-            );
-            // strings are nilable already → never pointer-wrapped.
-            assert_eq!(
-                go_type(&st("string", None), true, &graph).unwrap(),
-                "string"
-            );
-            assert_eq!(
-                go_type(&st("string", Some("date-time")), false, &graph).unwrap(),
-                "time.Time"
+            let union = Type::Union(vec![
+                Type::Primitive(Prim::String),
+                Type::Primitive(Prim::Bool),
+            ]);
+            let err = go_type(&union, false, &graph).unwrap_err();
+            assert!(
+                err.to_string().contains("union type is unsupported"),
+                "{err}"
             );
         }
 
@@ -1691,6 +1659,65 @@ mod tests {
             assert_eq!(join_path("/goal", "/{uuid}"), "/goal/{uuid}");
             // A trailing slash on the base is collapsed, never doubled (mirrors lowering::join_base).
             assert_eq!(join_path("/goal/", "/list"), "/goal/list");
+        }
+    }
+
+    /// Pointer (nullable) vs `,omitempty` (optional) are DISTINCT axes (RESEARCH Pitfall 4): the three
+    /// cases prove the conflation is fixed end-to-end through `emit_models`.
+    mod optional_vs_nullable {
+        use super::emit_models;
+        use crate::graph::{ApiGraph, Field, Prim, Type};
+
+        /// A one-object graph with a single value field carrying the given optional/nullable axes.
+        fn graph_with_field(optional: bool, nullable: bool) -> ApiGraph {
+            let mut graph = ApiGraph::default();
+            graph.schemas.push(crate::graph::Schema {
+                id: "dto.S".to_string(),
+                name: "S".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "value".to_string(),
+                    required: !optional,
+                    optional,
+                    nullable,
+                    // a float is a Go value type (float32) — pointer-eligible when nullable.
+                    schema: Type::Primitive(Prim::Float { bits: 32 }),
+                    description: None,
+                    example: None,
+                }]),
+                provenance: crate::graph::SourceSpan {
+                    file: "s.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            });
+            graph
+        }
+
+        #[test]
+        fn optional_not_nullable_value_is_non_pointer_with_omitempty() {
+            let out = emit_models(&graph_with_field(true, false), "svc").unwrap();
+            assert!(
+                out.contains("Value float32 `json:\"value,omitempty\"`"),
+                "optional-not-nullable value must be a non-pointer T WITH omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn nullable_not_optional_value_is_pointer_without_omitempty() {
+            let out = emit_models(&graph_with_field(false, true), "svc").unwrap();
+            assert!(
+                out.contains("Value *float32 `json:\"value\"`"),
+                "nullable-not-optional value must be *T WITHOUT omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn nullable_and_optional_value_is_pointer_with_omitempty() {
+            let out = emit_models(&graph_with_field(true, true), "svc").unwrap();
+            assert!(
+                out.contains("Value *float32 `json:\"value,omitempty\"`"),
+                "nullable-and-optional value must be *T WITH omitempty:\n{out}"
+            );
         }
     }
 }

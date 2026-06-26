@@ -119,6 +119,33 @@ No language terms leak into the IR (no Gin terms do today; no FastAPI/Nest terms
 
 If TS is deferred (option C), v2.0 = phases 6–8 + a trimmed hardening phase; TS becomes v2.1.
 
+## The red-by-design acceptance contract (Phase 1 deliverable)
+
+Phase 1 ships three **static** fixture services plus **six intended-green snapshots** that are **RED
+by design** — they encode the exact neutral graph + OpenAPI a future extractor MUST produce, so the
+later sidecar phases turn them green with **zero snapshot edits**. The red comes honestly: no
+`pyextract`/`tsextract` exists yet, so `build_graph` panics at each test's `.expect()`. All six are
+`#[ignore]`d, so `make check` stays GREEN while they remain visible and runnable on demand
+(`make red`, or `cargo test -p gnr8-core --test <name> -- --ignored`).
+
+| Fixture (static source) | Snapshot test | Turns green in |
+|---|---|---|
+| `fixtures/fastapi-bookstore/` | `snapshot_fastapi_graph` | Phase 2 (`pyextract`) |
+| `fixtures/fastapi-bookstore/` | `snapshot_fastapi_openapi` | Phase 2 (`pyextract`) |
+| `fixtures/flask-bookstore/` | `snapshot_flask_graph` | Phase 2 (`pyextract`) |
+| `fixtures/flask-bookstore/` | `snapshot_flask_openapi` | Phase 2 (`pyextract`) |
+| `fixtures/nestjs-bookstore/` | `snapshot_nestjs_graph` | Phase 4 (`tsextract`) |
+| `fixtures/nestjs-bookstore/` | `snapshot_nestjs_openapi` | Phase 4 (`tsextract`) |
+
+Each fixture encodes the v2.0 acceptance vocabulary in its OWN type system — objects, arrays/lists,
+cross-language enums (`enum.Enum` / `Literal` / TS string-literal-union), unions (`Union` / `A | B`),
+and all four optional×nullable combinations — with **no convention coupling** (rule 1: facts derive
+from the language's own types, never from a third-party schema-annotation tool or a runtime schema
+export). The Flask fixture additionally encodes the **honest second-class envelope**: its untyped
+`request.json` body and unannotated query arg surface as **diagnostics**, never guessed facts (rule 3).
+
+**Run `make red` to see the honest red on demand.**
+
 ## Success criteria (goal-backward)
 
 - `gnr8 generate`, driven by a `.gnr8/` Pipeline, produces OpenAPI 3.1 + a **compiling/typechecking**

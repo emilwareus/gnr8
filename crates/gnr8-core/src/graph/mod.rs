@@ -1,39 +1,44 @@
-//! The internal API graph — the source of truth from which `OpenAPI` and the Go SDK are lowered.
+//! The internal API graph — the source of truth from which `OpenAPI` and SDKs are lowered.
 //!
-//! The graph is deliberately **router-agnostic** (D-03): it stores HTTP route facts (method, path
-//! template, params, request type, response type + status), NOT framework internals. Gin is the only
-//! recognized router in this proof-of-concept, but no Gin-specific field belongs here — that keeps
-//! `chi`/`echo`/`net-http` addable later without reshaping the graph.
+//! The graph is deliberately **language-neutral** (D-03): it stores HTTP route facts (method, path
+//! template, params, request type, response type + status) plus named schemas described by the closed
+//! [`Type`] vocabulary, NOT framework or language internals. No source-language or framework field
+//! belongs here — that keeps additional routers and languages addable later without reshaping the graph.
 //!
 //! Determinism (GRAPH-02 / D-08): every collection in the graph is a sorted [`Vec`] (operations by
-//! `(path, method)`, schemas by id, params by name, responses by status, fields by json name). The
-//! graph never serializes a [`std::collections::HashMap`], so two `build_graph` runs over unchanged
-//! source produce byte-identical output. Operation ids are the handler function symbol (e.g.
-//! `createGoal`) — purely code-derived, with no annotation override (CLAUDE.md rules 1 & 3). Schema
-//! ids are the package-qualified type name the helper already emits.
+//! `(path, method)`, schemas by id, params by name, responses by status, object fields by name, enum
+//! members lexically). The graph never serializes an unordered hash map — only sorted vectors — so two
+//! `build_graph` runs over unchanged source produce byte-identical output. Operation ids are the handler
+//! function symbol (e.g. `createGoal`) — purely code-derived, with no annotation override (CLAUDE.md
+//! rules 1 & 3). Schema ids are the package-qualified type name the sidecar already emits.
 //!
 //! Provenance (D-07): every operation, param, and schema carries a [`SourceSpan`] (file + line range,
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
 use crate::analyze::facts::{
-    FieldFact, GoFacts, ParamFact, ResponseFact, RouteFact, SchemaFact, TypeRef,
+    DiagnosticFact, FieldFact, GoFacts, ParamFact, ResponseFact, RouteFact, SchemaFact, TypeRef,
 };
 
-/// The router-agnostic API graph extracted from one analyzed Go module (D-07).
+// Re-export the neutral type vocabulary so the IR and the facts DTO share ONE definition (the IR
+// mirrors the wire contract byte-for-byte; a single source of truth prevents drift). Consumers of the
+// graph match these variants exhaustively.
+pub use crate::analyze::facts::{FieldFact as Field, Prim, Type, WellKnown};
+
+/// The language-neutral API graph extracted from one analyzed module (D-07).
 ///
 /// All collections are sorted by a stable key so serialization is deterministic (GRAPH-02).
 ///
 /// ## Generation metadata (set by transforms, read by targets)
 ///
 /// `base_path`, `title`, and `security` are **not** extracted from the source — they are facts the
-/// typed Go code cannot express (the Gin group prefix is often a runtime value; the title is author
+/// typed source cannot express (the mount prefix is often a runtime value; the title is author
 /// metadata; auth lives in middleware, not handler signatures, CLAUDE.md rule 4). They live on the
 /// graph as plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads,
 /// then passes to the existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`] functions.
 /// They default to a root-mounted, untitled, unsecured API so a bare `build_graph` graph still lowers.
 #[derive(Debug, serde::Serialize)]
 pub struct ApiGraph {
-    /// The module path of the analyzed target (e.g. `github.com/acme/svc`).
+    /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub module: String,
     /// HTTP operations, sorted by `(path, method)`.
     pub operations: Vec<Operation>,
@@ -80,8 +85,8 @@ impl Default for ApiGraph {
 
 /// One declared security scheme — graph-owned generation metadata (CLAUDE.md rule 4).
 ///
-/// Security cannot be derived from typed Go source (auth lives in middleware), so it is supplied by
-/// the user configuring our engine — an `ApplySecurity` transform pushes one of these onto
+/// Security cannot be derived from typed source (auth lives in middleware), so it is supplied by the
+/// user configuring our engine — an `ApplySecurity` transform pushes one of these onto
 /// [`ApiGraph::security`], and the `OpenAPI` target reads them. This is the public, framework-facing
 /// home for the scheme shape (re-exported via [`crate::sdk::prelude`]); the lowering layer maps it
 /// into the emitted `components.securitySchemes` entry.
@@ -99,10 +104,10 @@ pub struct SecurityScheme {
 
 /// One HTTP operation: a method + path template plus its inferred params/body/responses (D-07).
 ///
-/// Router-agnostic — there is deliberately no Gin handle here; only the recognized HTTP facts.
-/// Every field is derived PURELY from Go code (CLAUDE.md rules 1 & 3); there is no annotation
-/// carry-through (no summary, tags, router-path override, or security here — security comes from
-/// the user's gnr8 config at lowering time, rule 4).
+/// Language-neutral — there is deliberately no framework handle here; only the recognized HTTP facts.
+/// Every field is derived PURELY from source code (CLAUDE.md rules 1 & 3); there is no annotation
+/// carry-through (no summary, tags, router-path override, or security here — security comes from the
+/// user's gnr8 config at lowering time, rule 4).
 #[derive(Debug, serde::Serialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
@@ -111,8 +116,8 @@ pub struct Operation {
     pub method: String,
     /// Code-derived, group-relative, normalized path template (`/`, `/list`, `/{uuid}`).
     ///
-    /// The dynamic group prefix (`"/" + basePath` in the fixture) is NOT folded here; the absolute
-    /// `/goal/...` path is a lowering concern supplied by the Rust layer (never scraped, rule 1).
+    /// The dynamic mount prefix (`"/" + basePath`) is NOT folded here; the absolute path is a
+    /// lowering concern supplied by the host layer (never scraped, rule 1).
     pub path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub handler: String,
@@ -127,7 +132,7 @@ pub struct Operation {
 }
 
 /// One path or query parameter of an operation, derived purely from code. Path params are required;
-/// query params default to type `string` and not required. There is no enum or description — those
+/// query params default to a string type and not required. There is no enum or description — those
 /// were annotation-only and have been removed (CLAUDE.md rules 1 & 3).
 #[derive(Debug, serde::Serialize)]
 pub struct Param {
@@ -137,13 +142,13 @@ pub struct Param {
     pub location: String,
     /// Whether the parameter is required.
     pub required: bool,
-    /// The parameter's primitive schema.
-    pub schema: SchemaType,
+    /// The parameter's type.
+    pub schema: Type,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
 
-/// One response of an operation keyed by HTTP status (from `c.JSON(status, x)`).
+/// One response of an operation keyed by HTTP status.
 #[derive(Debug, serde::Serialize)]
 pub struct Response {
     /// The HTTP status code (e.g. `201`).
@@ -152,53 +157,21 @@ pub struct Response {
     pub body: Option<SchemaRef>,
 }
 
-/// One named schema: an object struct or a string enum.
+/// One named schema. Its shape is carried by the neutral [`Type`] vocabulary: a struct/class becomes
+/// [`Type::Object`], a string-enum becomes [`Type::Enum`]. There is no separate string discriminator —
+/// the [`Type`] variant *is* the discriminant, so a new kind of named type is a compile error in every
+/// consumer rather than a silently-mishandled magic string.
 #[derive(Debug, serde::Serialize)]
 pub struct Schema {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
     pub id: String,
-    /// The Go type name (e.g. `"CreateGoalInput"`).
+    /// The declared type's name (e.g. `"CreateGoalInput"`).
     pub name: String,
-    /// `"object"` for structs, `"enum"` for string-enum newtypes.
-    pub kind: String,
-    /// Object fields, sorted by json name; empty for enums.
-    pub fields: Vec<Field>,
-    /// Sorted enum string values; empty for objects.
-    pub enum_values: Vec<String>,
+    /// The schema body — typically [`Type::Object`] or [`Type::Enum`]. Object fields are sorted by
+    /// name and enum members lexically (determinism).
+    pub body: Type,
     /// Source provenance for the type declaration (D-07).
     pub provenance: SourceSpan,
-}
-
-/// One field of an object schema.
-#[derive(Debug, serde::Serialize)]
-pub struct Field {
-    /// The effective JSON field name (from the `json:"..."` tag).
-    pub json_name: String,
-    /// Whether the field is required (`binding:"required"`).
-    pub required: bool,
-    /// Whether the field is optional (pointer or `,omitempty`).
-    pub optional: bool,
-    /// The field's primitive/ref schema.
-    pub schema: SchemaType,
-    /// Optional description from a `description:"..."` tag.
-    pub description: Option<String>,
-    /// Optional example from an `example:"..."` tag.
-    pub example: Option<String>,
-}
-
-/// A router-/OpenAPI-agnostic description of a Go type (mirrors the helper's `SchemaType`).
-#[derive(Debug, serde::Serialize)]
-pub struct SchemaType {
-    /// One of `string|integer|number|boolean|array|object|ref`.
-    pub kind: String,
-    /// Format hint (e.g. `"uuid"`, `"date-time"`, `"int64"`), if any.
-    pub format: Option<String>,
-    /// Element schema for `array` kinds.
-    pub items: Option<Box<SchemaType>>,
-    /// Referenced schema id for `ref` kinds.
-    pub ref_id: Option<String>,
-    /// `true` for free-form maps (`object` with additional properties).
-    pub additional_properties: Option<bool>,
 }
 
 /// A reference to a schema by its stable id.
@@ -239,18 +212,19 @@ pub struct SourceSpan {
 }
 
 impl ApiGraph {
-    /// Build the router-agnostic graph from the helper's [`GoFacts`].
+    /// Build the language-neutral graph from a sidecar's [`GoFacts`].
     ///
-    /// Maps routes → [`Operation`]s (operation id = handler symbol, D-08), request/response
-    /// type refs → [`SchemaRef`]s, and schema facts → [`Schema`]s, with provenance on every node
-    /// (D-07). `module_root` is the analyzed directory; every span/diagnostic file path is normalized
-    /// relative to it so the serialized graph is portable and byte-stable across machines (GRAPH-02).
+    /// Maps routes → [`Operation`]s (operation id = handler symbol, D-08), request/response type refs
+    /// → [`SchemaRef`]s, and schema facts → [`Schema`]s, with provenance on every node (D-07).
+    /// `module_root` is the analyzed directory; every span/diagnostic file path is normalized relative
+    /// to it so the serialized graph is portable and byte-stable across machines (GRAPH-02).
     ///
-    /// Every collection is sorted by a stable key before it is stored, so two runs over unchanged
-    /// source serialize byte-identically.
+    /// Every collection is sorted by a stable key before it is stored (including the object fields and
+    /// enum members nested inside a schema body), so two runs over unchanged source serialize
+    /// byte-identically.
     ///
     /// `pub(crate)` because it consumes the crate-private [`GoFacts`] DTO; the public entry point is
-    /// [`crate::analyze::build_graph`], which runs the helper and calls this.
+    /// [`crate::analyze::build_graph`], which runs the sidecar and calls this.
     #[must_use]
     pub(crate) fn from_facts(facts: GoFacts, module_root: &str) -> Self {
         let root = normalize_root(module_root);
@@ -272,7 +246,7 @@ impl ApiGraph {
         let mut diagnostics: Vec<Diagnostic> = facts
             .diagnostics
             .into_iter()
-            .map(|diag| Diagnostic {
+            .map(|diag: DiagnosticFact| Diagnostic {
                 severity: diag.severity,
                 message: diag.message,
                 file: relativize(&diag.file, &root),
@@ -291,8 +265,8 @@ impl ApiGraph {
             operations,
             schemas,
             diagnostics,
-            // Generation metadata is not extracted from source — it starts at the defaults and is
-            // set by transforms (SetBasePath / SetTitle / ApplySecurity) before targets read it.
+            // Generation metadata is not extracted from source — it starts at the defaults and is set
+            // by transforms (SetBasePath / SetTitle / ApplySecurity) before targets read it.
             base_path: default_base_path(),
             title: default_title(),
             security: Vec::new(),
@@ -303,7 +277,7 @@ impl ApiGraph {
 impl Operation {
     /// Lower one [`RouteFact`] into an [`Operation`], carrying the code-derived id and sorting children.
     fn from_fact(route: RouteFact, root: &str) -> Self {
-        // Stable operation id (D-08): the handler-symbol-derived id the helper already emits — purely
+        // Stable operation id (D-08): the handler-symbol-derived id the sidecar already emits — purely
         // code-derived, deterministic, with no annotation override path (CLAUDE.md rules 1 & 3).
         let id = route.operation_id;
 
@@ -340,7 +314,7 @@ impl Param {
             name: param.name,
             location: param.location,
             required: param.required,
-            schema: SchemaType::from_fact(param.schema),
+            schema: normalize_type(param.schema),
             provenance: relativize_span(&param.span, root),
         }
     }
@@ -357,42 +331,11 @@ impl Response {
 
 impl Schema {
     fn from_fact(schema: SchemaFact, root: &str) -> Self {
-        let mut fields: Vec<Field> = schema.fields.into_iter().map(Field::from_fact).collect();
-        fields.sort_by(|a, b| a.json_name.cmp(&b.json_name));
-        let mut enum_values = schema.enum_values;
-        enum_values.sort();
         Self {
             id: schema.id,
             name: schema.name,
-            kind: schema.kind,
-            fields,
-            enum_values,
+            body: normalize_type(schema.body),
             provenance: relativize_span(&schema.span, root),
-        }
-    }
-}
-
-impl Field {
-    fn from_fact(field: FieldFact) -> Self {
-        Self {
-            json_name: field.json_name,
-            required: field.required,
-            optional: field.optional,
-            schema: SchemaType::from_fact(field.schema),
-            description: field.description,
-            example: field.example,
-        }
-    }
-}
-
-impl SchemaType {
-    fn from_fact(schema: crate::analyze::facts::SchemaType) -> Self {
-        Self {
-            kind: schema.kind,
-            format: schema.format,
-            items: schema.items.map(|item| Box::new(Self::from_fact(*item))),
-            ref_id: schema.ref_id,
-            additional_properties: schema.additional_properties,
         }
     }
 }
@@ -405,6 +348,48 @@ impl SchemaRef {
     }
 }
 
+/// Recursively normalize a neutral [`Type`] for the IR: sort an object's fields by name and an enum's
+/// members lexically, and recurse through every type-bearing variant, so the serialized graph is
+/// byte-stable (GRAPH-02). The match is exhaustive — no `_ =>` arm — so a future [`Type`] variant
+/// fails to compile here until it is handled explicitly.
+fn normalize_type(ty: Type) -> Type {
+    match ty {
+        Type::Primitive(prim) => Type::Primitive(prim),
+        Type::WellKnown(well_known) => Type::WellKnown(well_known),
+        Type::Array(inner) => Type::Array(Box::new(normalize_type(*inner))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(normalize_type(*key)),
+            value: Box::new(normalize_type(*value)),
+        },
+        Type::Named(id) => Type::Named(id),
+        Type::Object(fields) => Type::Object(normalize_fields(fields)),
+        Type::Enum(mut members) => {
+            members.sort();
+            Type::Enum(members)
+        }
+        Type::Union(variants) => Type::Union(variants.into_iter().map(normalize_type).collect()),
+        Type::Any {} => Type::Any {},
+    }
+}
+
+/// Normalize a list of object fields: sort by name (determinism) and recurse into each field's type.
+fn normalize_fields(fields: Vec<FieldFact>) -> Vec<FieldFact> {
+    let mut fields: Vec<FieldFact> = fields
+        .into_iter()
+        .map(|f| FieldFact {
+            json_name: f.json_name,
+            required: f.required,
+            optional: f.optional,
+            nullable: f.nullable,
+            schema: normalize_type(f.schema),
+            description: f.description,
+            example: f.example,
+        })
+        .collect();
+    fields.sort_by(|a, b| a.json_name.cmp(&b.json_name));
+    fields
+}
+
 /// Normalize the analyzed module root to a trailing-slash-free string for prefix stripping.
 fn normalize_root(module_root: &str) -> String {
     module_root.trim_end_matches('/').to_string()
@@ -414,10 +399,9 @@ fn normalize_root(module_root: &str) -> String {
 /// path like `<root>/internal/goal/ports/http.go` becomes `internal/goal/ports/http.go`. Paths that
 /// are not under the root (or are already relative) are returned unchanged.
 ///
-/// The prefix is stripped only on a path-separator boundary, so a sibling directory whose name
-/// shares the root as a string prefix (e.g. `root = "/a/svc"`, `file = "/a/svc-utils/x.go"`) is left
-/// absolute rather than mis-stripped to `-utils/x.go`. An exact match of the root maps to the empty
-/// relative path.
+/// The prefix is stripped only on a path-separator boundary, so a sibling directory whose name shares
+/// the root as a string prefix (e.g. `root = "/a/svc"`, `file = "/a/svc-utils/x.go"`) is left absolute
+/// rather than mis-stripped to `-utils/x.go`. An exact match of the root maps to the empty relative path.
 fn relativize(file: &str, root: &str) -> String {
     if root.is_empty() {
         return file.to_string();
@@ -443,14 +427,15 @@ fn relativize_span(span: &crate::analyze::facts::SourceSpan, root: &str) -> Sour
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::ApiGraph;
+    use super::{ApiGraph, Type};
     use crate::analyze::facts::GoFacts;
 
-    /// A facts document mirroring real goextract output: two routes whose operation ids are derived
-    /// from the handler symbol (no annotation source), two unsorted schemas, one diagnostic, and
-    /// absolute span paths under a synthetic module root.
+    /// A facts document mirroring real sidecar output: two routes whose operation ids are derived from
+    /// the handler symbol (no annotation source), two unsorted schemas (one object with an unsorted
+    /// field list, one enum with unsorted members), one diagnostic, and absolute span paths under a
+    /// synthetic module root.
     const SAMPLE: &[u8] = br#"{
       "module": "github.com/acme/svc",
       "routes": [
@@ -464,7 +449,7 @@ mod tests {
               "name": "uuid",
               "location": "path",
               "required": true,
-              "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+              "schema": { "type": "well_known", "of": "uuid" },
               "span": { "file": "/root/handlers.go", "start_line": 94, "end_line": 94 }
             }
           ],
@@ -492,26 +477,35 @@ mod tests {
         {
           "id": "internal/common/dto.CreateGoalInput",
           "name": "CreateGoalInput",
-          "kind": "object",
-          "fields": [
-            {
-              "json_name": "name",
-              "required": true,
-              "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-              "description": null,
-              "example": null
-            }
-          ],
-          "enum_values": [],
+          "body": {
+            "type": "object",
+            "of": [
+              {
+                "json_name": "zeta",
+                "required": false,
+                "optional": true,
+                "nullable": true,
+                "schema": { "type": "primitive", "of": { "prim": "string" } },
+                "description": null,
+                "example": null
+              },
+              {
+                "json_name": "name",
+                "required": true,
+                "optional": false,
+                "nullable": false,
+                "schema": { "type": "primitive", "of": { "prim": "string" } },
+                "description": null,
+                "example": null
+              }
+            ]
+          },
           "span": { "file": "/root/goal.go", "start_line": 28, "end_line": 28 }
         },
         {
           "id": "internal/common/dto.TargetDirection",
           "name": "TargetDirection",
-          "kind": "enum",
-          "fields": [],
-          "enum_values": ["lte", "gte"],
+          "body": { "type": "enum", "of": ["lte", "gte"] },
           "span": { "file": "/root/common.go", "start_line": 39, "end_line": 39 }
         }
       ],
@@ -549,7 +543,6 @@ mod tests {
             .iter()
             .find(|op| op.method == "PUT")
             .unwrap();
-        // The id is the handler symbol — there is no annotation override path.
         assert_eq!(put.id, "updateGoal");
         let post = graph
             .operations
@@ -560,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn schemas_sorted_by_id_and_enum_values_sorted() {
+    fn schemas_sorted_by_id_and_enum_members_sorted() {
         let graph = ApiGraph::from_facts(sample_facts(), "/root");
         let ids: Vec<&str> = graph.schemas.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
@@ -570,9 +563,56 @@ mod tests {
                 "internal/common/dto.TargetDirection",
             ]
         );
-        let target = graph.schemas.iter().find(|s| s.kind == "enum").unwrap();
-        // Input was ["lte","gte"]; stored sorted.
-        assert_eq!(target.enum_values, vec!["gte", "lte"]);
+        // The enum body's members come back sorted: input was ["lte","gte"], stored ["gte","lte"].
+        let target = graph
+            .schemas
+            .iter()
+            .find(|s| s.id.ends_with("TargetDirection"))
+            .unwrap();
+        match &target.body {
+            Type::Enum(members) => assert_eq!(members, &vec!["gte", "lte"]),
+            other => panic!("expected enum body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_fields_sorted_by_name() {
+        let graph = ApiGraph::from_facts(sample_facts(), "/root");
+        let create = graph
+            .schemas
+            .iter()
+            .find(|s| s.id.ends_with("CreateGoalInput"))
+            .unwrap();
+        match &create.body {
+            Type::Object(fields) => {
+                let names: Vec<&str> = fields.iter().map(|f| f.json_name.as_str()).collect();
+                // Input was [zeta, name]; stored sorted [name, zeta].
+                assert_eq!(names, vec!["name", "zeta"]);
+            }
+            other => panic!("expected object body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_nullable_axis_is_carried_distinctly_from_optional() {
+        let graph = ApiGraph::from_facts(sample_facts(), "/root");
+        let create = graph
+            .schemas
+            .iter()
+            .find(|s| s.id.ends_with("CreateGoalInput"))
+            .unwrap();
+        let fields = match &create.body {
+            Type::Object(fields) => fields,
+            other => panic!("expected object body, got {other:?}"),
+        };
+        // `name`: neither optional nor nullable.
+        let name = fields.iter().find(|f| f.json_name == "name").unwrap();
+        assert!(!name.optional);
+        assert!(!name.nullable);
+        // `zeta`: both optional and nullable — the two axes are carried independently.
+        let zeta = fields.iter().find(|f| f.json_name == "zeta").unwrap();
+        assert!(zeta.optional);
+        assert!(zeta.nullable);
     }
 
     #[test]
@@ -590,7 +630,6 @@ mod tests {
     #[test]
     fn every_node_carries_relativized_provenance() {
         let graph = ApiGraph::from_facts(sample_facts(), "/root");
-        // Operation spans are stripped of the module root → portable, byte-stable.
         for op in &graph.operations {
             assert_eq!(op.provenance.file, "http.go");
             assert!(!op.provenance.file.starts_with('/'));
@@ -601,19 +640,15 @@ mod tests {
         for schema in &graph.schemas {
             assert!(!schema.provenance.file.starts_with('/'));
         }
-        // Diagnostic file paths are relativized too.
         assert_eq!(graph.diagnostics[0].file, "goal.go");
     }
 
     #[test]
     fn generation_metadata_starts_at_defaults() {
-        // base_path/title/security are generation metadata, not extracted facts: a freshly built
-        // graph carries the defaults (root-mounted, untitled, unsecured) until a transform sets them.
         let graph = ApiGraph::from_facts(sample_facts(), "/root");
         assert_eq!(graph.base_path, "/");
         assert_eq!(graph.title, "API");
         assert!(graph.security.is_empty());
-        // The Default impl agrees with the from_facts seeding.
         let empty = ApiGraph::default();
         assert_eq!(empty.base_path, "/");
         assert_eq!(empty.title, "API");

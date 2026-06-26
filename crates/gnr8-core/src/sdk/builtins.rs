@@ -81,6 +81,182 @@ impl Source for GoGin {
     }
 }
 
+/// The FastAPI (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
+/// driver), exactly like [`GoGin`] wraps goextract.
+///
+/// `inputs` are project-relative source directories; for now exactly ONE is supported, and a
+/// different count is a clear typed error rather than a silent first-wins. The single input is
+/// resolved against [`Cx::project_root`]. This Source does NOT pick the language — it calls the SAME
+/// [`crate::analyze::build_graph`], which detects Python by scanning the target (CLAUDE.md rule 3):
+/// one deterministic path per fact, never a per-Source extraction fork.
+#[derive(Debug, Default, Clone)]
+pub struct FastApi {
+    inputs: Vec<String>,
+}
+
+impl FastApi {
+    /// A FastAPI source with no inputs yet (configure with [`FastApi::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for FastApi {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        // Exactly one input dir for now: reject zero or many with a clear typed error rather than
+        // silently analyzing the first (mirrors GoGin).
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "FastApi source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "FastApi source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        // Resolve against the project root so a relative input analyzes the PROJECT, not the process
+        // cwd. The SAME build_graph the Go source calls — language dispatch is by target detection.
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
+/// The Flask (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
+/// driver), a verbatim twin of [`FastApi`]/[`GoGin`] differing only in the error proper noun.
+///
+/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
+/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
+/// target, never from which Source was used (CLAUDE.md rule 3).
+#[derive(Debug, Default, Clone)]
+pub struct Flask {
+    inputs: Vec<String>,
+}
+
+impl Flask {
+    /// A Flask source with no inputs yet (configure with [`Flask::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for Flask {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "Flask source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "Flask source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
+/// The NestJS (TypeScript) source: wraps [`crate::analyze::build_graph`] (the tsextract subprocess
+/// driver), a verbatim twin of [`FastApi`]/[`Flask`]/[`GoGin`] differing only in the error proper
+/// noun.
+///
+/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
+/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
+/// TARGET (the `*.ts` tree), never from which Source was used (CLAUDE.md rule 3/4): there is no
+/// per-Source extraction fork.
+#[derive(Debug, Default, Clone)]
+pub struct NestJs {
+    inputs: Vec<String>,
+}
+
+impl NestJs {
+    /// A NestJS source with no inputs yet (configure with [`NestJs::inputs`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the source input directories (project-relative). Exactly one is supported for now.
+    #[must_use]
+    pub fn inputs<I, S>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Source for NestJs {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        let input = match self.inputs.as_slice() {
+            [single] => single,
+            [] => {
+                return Err(CoreError::Config {
+                    message:
+                        "NestJs source has no inputs — call .inputs([\".\"]) with one source dir"
+                            .to_string(),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "NestJs source lists {} inputs, but multi-input analysis is not yet \
+                         supported — configure exactly one source dir",
+                        many.len()
+                    ),
+                });
+            }
+        };
+        let resolved = cx.project_root.join(input);
+        crate::analyze::build_graph(&resolved.to_string_lossy())
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------------
@@ -346,13 +522,9 @@ impl Target for GoSdk {
         let dir = self.dir.trim_end_matches('/');
         for (name, contents) in crate::gosdk::split_bundle(&bundle) {
             // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (mirrors gosdk::write_to_dir / the
-            // lifecycle write path, T-03-03).
-            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-                return Err(CoreError::SdkGen {
-                    message: format!("refusing to emit SDK file with unsafe name {name:?}"),
-                });
-            }
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the lifecycle write path, T-03-03).
+            super::bundle::safe_frame_name(&name)?;
             out.write(format!("{dir}/{name}"), contents);
         }
         Ok(())
@@ -362,6 +534,188 @@ impl Target for GoSdk {
     /// Go package inside the analyzed module, so without excluding this dir the source would re-ingest
     /// them and duplicate every schema (the contamination `crate::lifecycle::exclude_output_paths`
     /// prevents on the host path).
+    fn output_anchors(&self) -> Vec<String> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.dir.trim_end_matches('/').to_string()]
+        }
+    }
+}
+
+/// The Python SDK target: generates the multi-file Python SDK bundle and writes each file under
+/// [`PySdk::to`].
+///
+/// The structural twin of [`GoSdk`] (minus the `gofmt` step Python has no analog for). Derives the
+/// SDK's Python package name from [`PySdk::module`] via the SAME [`sdk_package`] single-source-of-truth
+/// derivation `GoSdk` uses (CLAUDE.md rule 3 — no second derivation), takes the URL prefix from
+/// `ir.base_path` (the value `SetBasePath` set and the OpenAPI lowering reads — never re-derived),
+/// calls the existing [`crate::pysdk::generate`] to produce the bundle, splits it into files via
+/// [`crate::pysdk::split_bundle`], and writes each at `<dir>/<name>`.
+#[derive(Debug, Clone)]
+pub struct PySdk {
+    module: String,
+    dir: String,
+}
+
+impl PySdk {
+    /// A Python SDK target with no module/output yet (set with [`PySdk::module`] + [`PySdk::to`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            module: String::new(),
+            dir: String::new(),
+        }
+    }
+
+    /// Set the module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The Python
+    /// package name is derived from this — the single source of truth (CLAUDE.md rule 3), the same
+    /// derivation `GoSdk` uses.
+    #[must_use]
+    pub fn module(mut self, module: impl Into<String>) -> Self {
+        self.module = module.into();
+        self
+    }
+
+    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk-py"`).
+    #[must_use]
+    pub fn to(mut self, dir: impl Into<String>) -> Self {
+        self.dir = dir.into();
+        self
+    }
+}
+
+impl Default for PySdk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Target for PySdk {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+        if self.module.is_empty() {
+            return Err(CoreError::Config {
+                message: "PySdk target has no module — call .module(\"example.com/acme/sdk\")"
+                    .to_string(),
+            });
+        }
+        if self.dir.is_empty() {
+            return Err(CoreError::Config {
+                message: "PySdk target has no output dir — call .to(\"sdk\")".to_string(),
+            });
+        }
+        // Derive the package from the module path via the SAME single source of truth GoSdk uses, and
+        // generate via the existing deterministic Python SDK generator — never a re-derivation, never
+        // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
+        // OpenAPI lowering reads (rule 3/4 — never re-derived).
+        let package = sdk_package(&self.module)?;
+        let bundle = crate::pysdk::generate(ir, &package, &ir.base_path)?;
+        let dir = self.dir.trim_end_matches('/');
+        for (name, contents) in crate::pysdk::split_bundle(&bundle) {
+            // Frame names are program-controlled, but reject anything that is not a plain file name so
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the GoSdk target write path, T-03-02-01).
+            super::bundle::safe_frame_name(&name)?;
+            out.write(format!("{dir}/{name}"), contents);
+        }
+        Ok(())
+    }
+
+    /// The SDK output directory is the critical loop-safety anchor: the generated `*.py` files form a
+    /// Python package inside the analyzed source tree, so without excluding this dir the source would
+    /// re-ingest them and duplicate every schema (the contamination
+    /// `crate::lifecycle::exclude_output_paths` prevents on the host path, T-03-02-02).
+    fn output_anchors(&self) -> Vec<String> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.dir.trim_end_matches('/').to_string()]
+        }
+    }
+}
+
+/// The TypeScript SDK target: generates the multi-file TypeScript SDK bundle and writes each file
+/// under [`TsSdk::to`].
+///
+/// The structural twin of [`PySdk`]/[`GoSdk`]. Derives the SDK's package name from [`TsSdk::module`]
+/// via the SAME [`sdk_package`] single-source-of-truth derivation `PySdk`/`GoSdk` use (CLAUDE.md
+/// rule 3 — no second derivation, no TS-specific sanitizer), takes the URL prefix from `ir.base_path`
+/// (the value `SetBasePath` set and the OpenAPI lowering reads — never re-derived), calls the existing
+/// [`crate::tssdk::generate`] to produce the bundle, splits it into files via
+/// [`crate::tssdk::split_bundle`], and writes each at `<dir>/<name>`.
+#[derive(Debug, Clone)]
+pub struct TsSdk {
+    module: String,
+    dir: String,
+}
+
+impl TsSdk {
+    /// A TypeScript SDK target with no module/output yet (set with [`TsSdk::module`] + [`TsSdk::to`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            module: String::new(),
+            dir: String::new(),
+        }
+    }
+
+    /// Set the module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The package
+    /// name is derived from this — the single source of truth (CLAUDE.md rule 3), the same derivation
+    /// `PySdk`/`GoSdk` use.
+    #[must_use]
+    pub fn module(mut self, module: impl Into<String>) -> Self {
+        self.module = module.into();
+        self
+    }
+
+    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk-ts"`).
+    #[must_use]
+    pub fn to(mut self, dir: impl Into<String>) -> Self {
+        self.dir = dir.into();
+        self
+    }
+}
+
+impl Default for TsSdk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Target for TsSdk {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+        if self.module.is_empty() {
+            return Err(CoreError::Config {
+                message: "TsSdk target has no module — call .module(\"example.com/acme/sdk\")"
+                    .to_string(),
+            });
+        }
+        if self.dir.is_empty() {
+            return Err(CoreError::Config {
+                message: "TsSdk target has no output dir — call .to(\"sdk\")".to_string(),
+            });
+        }
+        // Derive the package from the module path via the SAME single source of truth GoSdk/PySdk use,
+        // and generate via the existing deterministic TypeScript SDK generator — never a re-derivation,
+        // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
+        // the OpenAPI lowering reads (rule 3/4 — never re-derived).
+        let package = sdk_package(&self.module)?;
+        let bundle = crate::tssdk::generate(ir, &package, &ir.base_path)?;
+        let dir = self.dir.trim_end_matches('/');
+        for (name, contents) in crate::tssdk::split_bundle(&bundle) {
+            // Frame names are program-controlled, but reject anything that is not a plain file name so
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the PySdk target write path, T-05-02-01).
+            super::bundle::safe_frame_name(&name)?;
+            out.write(format!("{dir}/{name}"), contents);
+        }
+        Ok(())
+    }
+
+    /// The SDK output directory is the critical loop-safety anchor: the generated `*.ts` files form a
+    /// TypeScript package inside the analyzed source tree, so without excluding this dir the source
+    /// would re-ingest them and duplicate every schema (the contamination
+    /// `crate::lifecycle::exclude_output_paths` prevents on the host path, T-05-02-03).
     fn output_anchors(&self) -> Vec<String> {
         if self.dir.is_empty() {
             Vec::new()
@@ -460,8 +814,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApplySecurity, Cx, GoSdk, Header, OpenApi31, PostProcess, SetBasePath,
-        SetTitle, Target, Transform,
+        sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
+        PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform, TsSdk,
     };
     use crate::graph::ApiGraph;
     use crate::sdk::Artifacts;
@@ -515,6 +869,188 @@ mod tests {
                 .generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
+        assert!(matches!(
+            PySdk::new().generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+        assert!(matches!(
+            PySdk::new()
+                .module("x.com/sdk")
+                .generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn pysdk_target_writes_under_the_output_dir_and_is_deterministic() {
+        let ir = ApiGraph::default();
+        let target = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-py/");
+
+        // A configured run writes one Artifact per generated Python file, all anchored under the
+        // (slash-trimmed) output dir.
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+        assert!(
+            !out.files().is_empty(),
+            "a configured PySdk run must emit at least one Artifact"
+        );
+        for artifact in out.files() {
+            assert!(
+                artifact.path.starts_with("generated/sdk-py/"),
+                "every Artifact path must be under the output dir, got {:?}",
+                artifact.path
+            );
+        }
+
+        // The trimmed output dir is the loop-safety anchor (so the pipeline never re-ingests the
+        // generated *.py); an unconfigured target anchors nothing.
+        assert_eq!(
+            target.output_anchors(),
+            vec!["generated/sdk-py".to_string()]
+        );
+        assert!(PySdk::new().output_anchors().is_empty());
+
+        // Two fresh runs over the same IR yield byte-identical Artifacts (T-03-02-05).
+        let mut out2 = Artifacts::new();
+        target.generate(&ir, &mut out2, &cx()).unwrap();
+        let first: Vec<(&str, &str)> = out
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        let second: Vec<(&str, &str)> = out2
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        assert_eq!(first, second, "two PySdk runs must be byte-identical");
+    }
+
+    #[test]
+    fn tssdk_target_errors_when_unconfigured() {
+        // An unconfigured TsSdk (no module / no dir) is a typed Config error, not a panic — exactly
+        // like PySdk/GoSdk; only the proper noun differs.
+        let ir = ApiGraph::default();
+        let mut out = Artifacts::new();
+        assert!(
+            matches!(
+                TsSdk::new().generate(&ir, &mut out, &cx()),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "TsSdk with no module must be a Config error"
+        );
+        assert!(
+            matches!(
+                TsSdk::new()
+                    .module("x.com/sdk")
+                    .generate(&ir, &mut out, &cx()),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "TsSdk with a module but no output dir must be a Config error"
+        );
+    }
+
+    #[test]
+    fn tssdk_target_writes_under_the_output_dir_and_is_deterministic() {
+        let ir = ApiGraph::default();
+        let target = TsSdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-ts/");
+
+        // A configured run writes one Artifact per generated TypeScript file, all anchored under the
+        // (slash-trimmed) output dir.
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+        assert!(
+            !out.files().is_empty(),
+            "a configured TsSdk run must emit at least one Artifact"
+        );
+        for artifact in out.files() {
+            assert!(
+                artifact.path.starts_with("generated/sdk-ts/"),
+                "every Artifact path must be under the output dir, got {:?}",
+                artifact.path
+            );
+        }
+
+        // The trimmed output dir is the loop-safety anchor (so the pipeline never re-ingests the
+        // generated *.ts); an unconfigured target anchors nothing.
+        assert_eq!(
+            target.output_anchors(),
+            vec!["generated/sdk-ts".to_string()]
+        );
+        assert!(TsSdk::new().output_anchors().is_empty());
+
+        // Two fresh runs over the same IR yield byte-identical Artifacts (T-05-02-03 determinism).
+        let mut out2 = Artifacts::new();
+        target.generate(&ir, &mut out2, &cx()).unwrap();
+        let first: Vec<(&str, &str)> = out
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        let second: Vec<(&str, &str)> = out2
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        assert_eq!(first, second, "two TsSdk runs must be byte-identical");
+    }
+
+    #[test]
+    fn python_sources_error_when_unconfigured() {
+        // Both Python sources reject zero inputs and many inputs with a typed Config error, exactly
+        // like GoGin — the single-input guard is identical; only the proper noun differs.
+        let cx = cx();
+        assert!(
+            matches!(
+                FastApi::new().load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "FastApi with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                FastApi::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "FastApi with many inputs must be a Config error"
+        );
+        assert!(
+            matches!(Flask::new().load(&cx), Err(crate::CoreError::Config { .. })),
+            "Flask with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                Flask::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "Flask with many inputs must be a Config error"
+        );
+    }
+
+    #[test]
+    fn nestjs_source_errors_when_unconfigured() {
+        // The TypeScript source rejects zero inputs and many inputs with a typed Config error,
+        // exactly like the Python/Go sources — the single-input guard is identical; only the proper
+        // noun differs. It calls the SAME build_graph (language detected from the target, rule 3/4).
+        let cx = cx();
+        assert!(
+            matches!(
+                NestJs::new().load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "NestJs with no inputs must be a Config error"
+        );
+        assert!(
+            matches!(
+                NestJs::new().inputs(["a", "b"]).load(&cx),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "NestJs with many inputs must be a Config error"
+        );
     }
 
     #[test]

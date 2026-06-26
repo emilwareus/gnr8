@@ -1,45 +1,51 @@
-//! Serde mirror of the `goextract` JSON facts document — the Rust side of the
-//! Rust↔Go contract (CONTEXT D-02).
+//! Serde mirror of the language-neutral JSON facts document — the host side of
+//! the host↔sidecar contract (CONTEXT D-02).
+//!
+//! This is the **narrow waist**: every language sidecar emits this one shared
+//! facts contract, and the host lowers it through a single internal
+//! representation. The vocabulary is therefore deliberately language-neutral — no
+//! proper noun of any source language and no source-tooling token appears in a
+//! field name or doc comment here.
 //!
 //! Every struct uses `#[serde(deny_unknown_fields)]` so malformed or
-//! forward-incompatible JSON from the helper is rejected rather than silently
-//! trusted (Security V5 / threat T-02-05). The field names mirror the Go `json`
-//! tags in `goextract/internal/facts/facts.go` exactly.
-//!
-//! 02-01 owns the routes-free part of the schema. [`RouteFact`] and its children
-//! ([`ParamFact`], [`ResponseFact`]) are defined now so the type exists for 02-02,
-//! even though `goextract` currently emits an empty `routes` array.
+//! forward-incompatible JSON from a sidecar is rejected rather than silently
+//! trusted (Security V5 / threat T-01-05). The tagged [`Type`] / [`Prim`] enums
+//! likewise reject any key beyond their discriminant + payload. The field names
+//! here mirror the json tags in `goextract/internal/facts/facts.go` exactly —
+//! any change is an atomic two-file edit or the sidecar output fails to
+//! deserialize.
 
-// These DTOs are the deserialize target for 02-03's `build_graph`. Until that
-// consumer lands they are constructed only by the round-trip unit tests, so allow
-// dead_code this wave to keep the clippy `-D warnings` gate green without hiding a
-// real unused-code signal (the fields are all part of the stable JSON contract).
+// These DTOs are the deserialize target for `build_graph`. Some fields are
+// constructed only by the round-trip unit tests until every sidecar/consumer
+// lands, so allow dead_code to keep the clippy `-D warnings` gate green without
+// hiding a real unused-code signal (the fields are all part of the stable JSON
+// contract).
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
-/// The top-level facts document for one analyzed Go module.
+/// The top-level facts document for one analyzed module.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GoFacts {
-    /// The module path of the analyzed target (e.g. `github.com/acme/svc`).
+    /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub(crate) module: String,
-    /// HTTP routes. Empty until 02-02 implements route/handler recognition.
+    /// HTTP routes.
     pub(crate) routes: Vec<RouteFact>,
-    /// Extracted DTO/object and enum schemas, sorted by id by the helper.
+    /// Extracted named schemas (objects + enums), sorted by id by the sidecar.
     pub(crate) schemas: Vec<SchemaFact>,
-    /// Analysis diagnostics (lossy/unsupported patterns), sorted by the helper.
+    /// Analysis diagnostics (lossy/unsupported patterns), sorted by the sidecar.
     pub(crate) diagnostics: Vec<DiagnosticFact>,
 }
 
-/// One HTTP route, derived PURELY from Go code by the helper (no annotation source).
+/// One HTTP route, derived PURELY from source code by a sidecar (no annotation source).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RouteFact {
     /// HTTP method, uppercase (e.g. `"POST"`).
     pub(crate) method: String,
     /// Code-derived, group-relative, normalized path template (`/`, `/list`,
-    /// `/{uuid}`). The dynamic `"/" + basePath` group prefix is not folded here.
+    /// `/{uuid}`). The dynamic mount/base prefix is not folded here.
     pub(crate) path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub(crate) handler: String,
@@ -56,7 +62,7 @@ pub(crate) struct RouteFact {
 }
 
 /// One path or query parameter of a route, derived purely from code. Path params
-/// are required; query params default to type `string` and not required. There is
+/// are required; query params default to a string type and not required. There is
 /// no description or enum — those were annotation-only and are gone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,13 +73,13 @@ pub(crate) struct ParamFact {
     pub(crate) location: String,
     /// Whether the parameter is required.
     pub(crate) required: bool,
-    /// The parameter's primitive schema.
-    pub(crate) schema: SchemaType,
+    /// The parameter's type.
+    pub(crate) schema: Type,
     /// Source provenance for the parameter access.
     pub(crate) span: SourceSpan,
 }
 
-/// One response of a route keyed by HTTP status (from `c.JSON(status, x)`).
+/// One response of a route keyed by HTTP status.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponseFact {
@@ -83,56 +89,143 @@ pub(crate) struct ResponseFact {
     pub(crate) body: Option<TypeRef>,
 }
 
-/// One extracted named type: an object struct or a string enum.
+/// One extracted named type. Its body is carried by the neutral [`Type`] enum:
+/// a struct/class becomes [`Type::Object`], a string-enum becomes [`Type::Enum`].
+/// There is no separate string discriminator — the [`Type`] variant *is* the
+/// discriminant (a new kind of named type is a compile error, not a magic string).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SchemaFact {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
     pub(crate) id: String,
-    /// The Go type name (e.g. `"CreateGoalInput"`).
+    /// The declared type's name (e.g. `"CreateGoalInput"`).
     pub(crate) name: String,
-    /// `"object"` for structs, `"enum"` for string-enum newtypes.
-    pub(crate) kind: String,
-    /// Object fields, sorted by json name; empty for enums.
-    pub(crate) fields: Vec<FieldFact>,
-    /// Sorted enum string values; empty for objects.
-    pub(crate) enum_values: Vec<String>,
+    /// The schema body — typically [`Type::Object`] or [`Type::Enum`].
+    pub(crate) body: Type,
     /// Source provenance for the type declaration.
     pub(crate) span: SourceSpan,
 }
 
 /// One field of an object schema.
-#[derive(Debug, Deserialize)]
+///
+/// `pub` (with `pub` fields) and re-exported by the graph as `graph::Field`: it is
+/// the single field representation for both the wire DTO and the public IR (the IR
+/// mirrors the wire contract — one definition prevents drift). Derives `Serialize`
+/// because it appears inside [`Type::Object`], which the graph serializes.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct FieldFact {
-    /// The effective JSON field name (from the `json:"..."` tag).
-    pub(crate) json_name: String,
-    /// Whether the field is required (`binding:"required"`).
-    pub(crate) required: bool,
-    /// Whether the field is optional (pointer or `,omitempty`).
-    pub(crate) optional: bool,
-    /// The field's primitive/ref schema.
-    pub(crate) schema: SchemaType,
-    /// Optional description from a `description:"..."` tag.
-    pub(crate) description: Option<String>,
-    /// Optional example from an `example:"..."` tag.
-    pub(crate) example: Option<String>,
+pub struct FieldFact {
+    /// The effective serialized field name.
+    pub json_name: String,
+    /// Whether the field is required (it must be present in a valid payload).
+    pub required: bool,
+    /// The *presence* axis: whether the key may be absent from the serialized
+    /// payload. Independent of [`Self::nullable`]; all four combinations are
+    /// representable (a field can be optional, nullable, both, or neither).
+    pub optional: bool,
+    /// The *value* axis: whether the value, when present, may be explicitly null.
+    /// Independent of [`Self::optional`].
+    pub nullable: bool,
+    /// The field's type.
+    pub schema: Type,
+    /// Optional human description.
+    pub description: Option<String>,
+    /// Optional example value.
+    pub example: Option<String>,
 }
 
-/// A router-/OpenAPI-agnostic description of a Go type.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SchemaType {
-    /// One of `string|integer|number|boolean|array|object|ref`.
-    pub(crate) kind: String,
-    /// Format hint (e.g. `"uuid"`, `"date-time"`, `"int64"`), if any.
-    pub(crate) format: Option<String>,
-    /// Element schema for `array` kinds.
-    pub(crate) items: Option<Box<SchemaType>>,
-    /// Referenced schema id for `ref` kinds.
-    pub(crate) ref_id: Option<String>,
-    /// `true` for free-form maps (`object` with additional properties).
-    pub(crate) additional_properties: Option<bool>,
+/// The closed, language-neutral type vocabulary every sidecar emits and every
+/// target lowers into its own language (the IR's narrow waist, `docs/extensibility.md`
+/// §2a). Being a closed enum, adding a variant is a compile error in every
+/// consumer that does not yet handle it — exhaustiveness is the whole point.
+///
+/// Serialized with an adjacent tag: `{"type": "<variant>", "of": <payload>}`
+/// (`Any` carries an empty payload, `{"type": "any", "of": {}}`). The adjacent
+/// representation rejects any key beyond `type`/`of`, preserving the strict
+/// deserialize discipline at the enum boundary.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "type", content = "of", rename_all = "snake_case")]
+pub enum Type {
+    /// A base scalar (string, bool, sized int, sized float, bytes).
+    Primitive(Prim),
+    /// A semantically-named scalar with a canonical wire form (uuid, date-time, …).
+    WellKnown(WellKnown),
+    /// A homogeneous sequence of `T`.
+    Array(Box<Type>),
+    /// A keyed map from `key` to `value`.
+    Map {
+        /// The map key type.
+        key: Box<Type>,
+        /// The map value type.
+        value: Box<Type>,
+    },
+    /// A reference to a named schema by its stable id.
+    Named(String),
+    /// An inline (anonymous) object with the given fields.
+    Object(Vec<FieldFact>),
+    /// A closed set of string members (string enum / literal union / `Literal`).
+    Enum(Vec<String>),
+    /// A sum type: a value is exactly one of the listed variant types.
+    Union(Vec<Type>),
+    /// A free-form value (e.g. an untyped map) — explicitly lossy, never a default.
+    ///
+    /// Modeled as an empty struct variant (serialized `{"type": "any", "of": {}}`)
+    /// rather than a bare unit variant: a unit variant in an adjacently-tagged enum
+    /// fails to deserialize when buffered inside a `deny_unknown_fields` struct
+    /// (serde requires the content key in that path). The empty `of` object keeps
+    /// the variant strict and round-trippable everywhere.
+    Any {},
+}
+
+/// A base scalar primitive. Serialized internally-tagged on `prim`, so sized
+/// variants carry their width inline (`{"prim": "int", "bits": 64, "signed": true}`,
+/// `{"prim": "string"}`). Internal tagging keeps the wire form flat and easy to
+/// mirror in a sidecar; `Prim` has only unit and struct variants, for which the
+/// internally-tagged representation round-trips cleanly even when buffered.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "prim", rename_all = "snake_case")]
+pub enum Prim {
+    /// A unicode string.
+    String,
+    /// A boolean.
+    Bool,
+    /// A sized, optionally-signed integer (e.g. 64-bit signed = an `int64`).
+    Int {
+        /// The bit width (e.g. 32, 64).
+        bits: u16,
+        /// Whether the integer is signed.
+        signed: bool,
+    },
+    /// A sized IEEE float (e.g. 32-bit = a `float32`).
+    Float {
+        /// The bit width (e.g. 32, 64).
+        bits: u16,
+    },
+    /// A raw byte string.
+    Bytes,
+}
+
+/// A semantically-named scalar with a canonical wire representation. Each target
+/// maps these into its own language (a date-time becomes the target's date/time
+/// type); the neutral vocabulary stays target-agnostic. Serialized as a plain
+/// `snake_case` string (e.g. `"uuid"`, `"date_time"`).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WellKnown {
+    /// A UUID (preserves the former `format: "uuid"` fact).
+    Uuid,
+    /// An RFC-3339 date-time (preserves the former `format: "date-time"` fact).
+    DateTime,
+    /// A calendar date (no time component).
+    Date,
+    /// A time duration.
+    Duration,
+    /// An arbitrary-precision decimal.
+    Decimal,
+    /// An email address.
+    Email,
+    /// A URI.
+    Uri,
 }
 
 /// A reference to a schema by its stable id.
@@ -159,7 +252,7 @@ pub(crate) struct DiagnosticFact {
 
 /// File + line range provenance attached to nodes (D-07).
 ///
-/// Also derives `Serialize` because it flows into the graph serialization in 02-03.
+/// Also derives `Serialize` because it flows into the graph serialization.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceSpan {
@@ -176,10 +269,10 @@ mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5);
     // scope the allow to the test module so the workspace-wide RUST-04 deny stays
     // intact for production code.
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    /// A minimal facts document mirroring real goextract output (one object schema,
-    /// one enum, one diagnostic, empty routes).
+    /// A minimal facts document in the neutral shape (one object schema, one enum,
+    /// one diagnostic, empty routes).
     const SAMPLE: &[u8] = br#"{
       "module": "github.com/acme/svc",
       "routes": [],
@@ -187,40 +280,38 @@ mod tests {
         {
           "id": "internal/common/dto.CreateGoalInput",
           "name": "CreateGoalInput",
-          "kind": "object",
-          "fields": [
-            {
-              "json_name": "name",
-              "required": true,
-              "optional": false,
-              "schema": { "kind": "string", "format": null, "items": null, "ref_id": null, "additional_properties": null },
-              "description": "Short name",
-              "example": null
-            },
-            {
-              "json_name": "workflowChainIds",
-              "required": false,
-              "optional": true,
-              "schema": {
-                "kind": "array",
-                "format": null,
-                "items": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
-                "ref_id": null,
-                "additional_properties": null
+          "body": {
+            "type": "object",
+            "of": [
+              {
+                "json_name": "name",
+                "required": true,
+                "optional": false,
+                "nullable": false,
+                "schema": { "type": "primitive", "of": { "prim": "string" } },
+                "description": "Short name",
+                "example": null
               },
-              "description": null,
-              "example": null
-            }
-          ],
-          "enum_values": [],
+              {
+                "json_name": "workflowChainIds",
+                "required": false,
+                "optional": true,
+                "nullable": false,
+                "schema": {
+                  "type": "array",
+                  "of": { "type": "well_known", "of": "uuid" }
+                },
+                "description": null,
+                "example": null
+              }
+            ]
+          },
           "span": { "file": "goal.go", "start_line": 28, "end_line": 28 }
         },
         {
           "id": "internal/common/dto.TargetDirection",
           "name": "TargetDirection",
-          "kind": "enum",
-          "fields": [],
-          "enum_values": ["gte", "lte"],
+          "body": { "type": "enum", "of": ["gte", "lte"] },
           "span": { "file": "common.go", "start_line": 39, "end_line": 39 }
         }
       ],
@@ -236,7 +327,7 @@ mod tests {
 
     mod go_facts {
         use super::SAMPLE;
-        use crate::analyze::facts::GoFacts;
+        use crate::analyze::facts::{GoFacts, Prim, Type, WellKnown};
 
         #[test]
         fn deserializes_sample_facts_without_error() {
@@ -248,21 +339,99 @@ mod tests {
 
             let create = &facts.schemas[0];
             assert_eq!(create.name, "CreateGoalInput");
-            assert_eq!(create.kind, "object");
-            let name = &create.fields[0];
+            // The named schema body is a neutral Object, not a "kind" string.
+            let fields = match &create.body {
+                Type::Object(fields) => fields,
+                other => panic!("expected object body, got {other:?}"),
+            };
+            let name = &fields[0];
             assert_eq!(name.json_name, "name");
             assert!(name.required);
-            assert_eq!(name.schema.kind, "string");
+            // A string primitive deserializes into Type::Primitive(Prim::String).
+            assert!(matches!(name.schema, Type::Primitive(Prim::String)));
 
-            let chain = &create.fields[1];
-            assert_eq!(chain.schema.kind, "array");
-            let items = chain.schema.items.as_ref().unwrap();
-            assert_eq!(items.kind, "string");
-            assert_eq!(items.format.as_deref(), Some("uuid"));
+            // An array of uuids -> Type::Array(Box<Type::WellKnown(Uuid)>).
+            let chain = &fields[1];
+            match &chain.schema {
+                Type::Array(inner) => {
+                    assert!(matches!(**inner, Type::WellKnown(WellKnown::Uuid)));
+                }
+                other => panic!("expected array, got {other:?}"),
+            }
 
+            // The enum schema body is Type::Enum with preserved members.
             let enum_schema = &facts.schemas[1];
-            assert_eq!(enum_schema.kind, "enum");
-            assert_eq!(enum_schema.enum_values, vec!["gte", "lte"]);
+            match &enum_schema.body {
+                Type::Enum(values) => assert_eq!(values, &vec!["gte", "lte"]),
+                other => panic!("expected enum body, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn deserializes_ref_named_and_union_and_map_and_any() {
+            // $ref -> Named; union -> Union; map -> Map; free-form -> Any; int -> sized Primitive.
+            let json = br#"{
+              "module": "m",
+              "routes": [],
+              "schemas": [
+                {
+                  "id": "S",
+                  "name": "S",
+                  "body": {
+                    "type": "object",
+                    "of": [
+                      { "json_name": "ref", "required": true, "optional": false, "nullable": false,
+                        "schema": { "type": "named", "of": "other.Schema" },
+                        "description": null, "example": null },
+                      { "json_name": "either", "required": true, "optional": false, "nullable": false,
+                        "schema": { "type": "union", "of": [
+                          { "type": "primitive", "of": { "prim": "string" } },
+                          { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } }
+                        ] },
+                        "description": null, "example": null },
+                      { "json_name": "lookup", "required": true, "optional": false, "nullable": false,
+                        "schema": { "type": "map", "of": {
+                          "key": { "type": "primitive", "of": { "prim": "string" } },
+                          "value": { "type": "primitive", "of": { "prim": "float", "bits": 32 } }
+                        } },
+                        "description": null, "example": null },
+                      { "json_name": "freeform", "required": true, "optional": false, "nullable": false,
+                        "schema": { "type": "any", "of": {} },
+                        "description": null, "example": null }
+                    ]
+                  },
+                  "span": { "file": "s.go", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "diagnostics": []
+            }"#;
+            let facts: GoFacts = serde_json::from_slice(json).unwrap();
+            let fields = match &facts.schemas[0].body {
+                Type::Object(f) => f,
+                other => panic!("expected object, got {other:?}"),
+            };
+            assert!(matches!(&fields[0].schema, Type::Named(id) if id == "other.Schema"));
+            match &fields[1].schema {
+                Type::Union(variants) => {
+                    assert!(matches!(variants[0], Type::Primitive(Prim::String)));
+                    assert!(matches!(
+                        variants[1],
+                        Type::Primitive(Prim::Int {
+                            bits: 64,
+                            signed: true
+                        })
+                    ));
+                }
+                other => panic!("expected union, got {other:?}"),
+            }
+            match &fields[2].schema {
+                Type::Map { key, value } => {
+                    assert!(matches!(**key, Type::Primitive(Prim::String)));
+                    assert!(matches!(**value, Type::Primitive(Prim::Float { bits: 32 })));
+                }
+                other => panic!("expected map, got {other:?}"),
+            }
+            assert!(matches!(fields[3].schema, Type::Any {}));
         }
 
         #[test]
@@ -281,10 +450,99 @@ mod tests {
                 "deny_unknown_fields must reject an unexpected top-level key"
             );
         }
+
+        #[test]
+        fn rejects_unknown_nested_field() {
+            // An extra key inside a nested field struct must also fail.
+            let bad = br#"{
+              "module": "x",
+              "routes": [],
+              "schemas": [
+                {
+                  "id": "S", "name": "S",
+                  "body": { "type": "object", "of": [
+                    { "json_name": "n", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null, "bogus": 1 }
+                  ] },
+                  "span": { "file": "f", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "diagnostics": []
+            }"#;
+            let result: Result<GoFacts, _> = serde_json::from_slice(bad);
+            assert!(
+                result.is_err(),
+                "deny_unknown_fields must reject an unexpected nested field key"
+            );
+        }
+    }
+
+    mod axes {
+        use crate::analyze::facts::{GoFacts, Type};
+
+        // Build a one-object-schema facts doc with a single field carrying the
+        // given optional/nullable axes, so each combination can be asserted.
+        fn field_with_axes(optional: bool, nullable: bool) -> Vec<FieldFactView> {
+            let json = format!(
+                r#"{{
+                  "module": "m", "routes": [],
+                  "schemas": [
+                    {{ "id": "S", "name": "S",
+                       "body": {{ "type": "object", "of": [
+                         {{ "json_name": "f", "required": false, "optional": {optional}, "nullable": {nullable},
+                            "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
+                            "description": null, "example": null }}
+                       ] }},
+                       "span": {{ "file": "f", "start_line": 1, "end_line": 1 }} }}
+                  ],
+                  "diagnostics": [] }}"#
+            );
+            let facts: GoFacts = serde_json::from_slice(json.as_bytes()).unwrap();
+            let fields = match facts.schemas.into_iter().next().unwrap().body {
+                Type::Object(f) => f,
+                other => panic!("expected object, got {other:?}"),
+            };
+            fields
+                .into_iter()
+                .map(|f| FieldFactView {
+                    optional: f.optional,
+                    nullable: f.nullable,
+                })
+                .collect()
+        }
+
+        struct FieldFactView {
+            optional: bool,
+            nullable: bool,
+        }
+
+        #[test]
+        fn optional_not_nullable_round_trips_distinctly() {
+            let f = &field_with_axes(true, false)[0];
+            assert!(f.optional);
+            assert!(!f.nullable);
+        }
+
+        #[test]
+        fn nullable_not_optional_round_trips_distinctly() {
+            let f = &field_with_axes(false, true)[0];
+            assert!(!f.optional);
+            assert!(f.nullable);
+        }
+
+        #[test]
+        fn all_four_optional_nullable_combinations_are_distinct() {
+            for (opt, null) in [(false, false), (false, true), (true, false), (true, true)] {
+                let f = &field_with_axes(opt, null)[0];
+                assert_eq!(f.optional, opt);
+                assert_eq!(f.nullable, null);
+            }
+        }
     }
 
     /// Round-trip a fully-populated route fact (the code-first shape) so the serde
-    /// mirror stays in lockstep with `goextract`'s purely code-derived output: a
+    /// mirror stays in lockstep with a sidecar's purely code-derived output: a
     /// handler-derived `operation_id`, a path param, and responses by numeric
     /// status. There is no `router_path`/`summary`/`tags`/`secured`/
     /// `security_schemes` and no param `description`/`enum_values` — those were
@@ -292,9 +550,6 @@ mod tests {
     mod route_facts {
         use crate::analyze::facts::GoFacts;
 
-        // Mirrors a real `go run . ../fixtures/goalservice` route entry for
-        // `PUT /{uuid}`: operation_id derived from the handler symbol, a code-read
-        // path param, a bound request body, and 200/400/404 from c.JSON.
         const ROUTE: &[u8] = br#"{
           "module": "github.com/acme/svc",
           "routes": [
@@ -308,7 +563,7 @@ mod tests {
                   "name": "uuid",
                   "location": "path",
                   "required": true,
-                  "schema": { "kind": "string", "format": "uuid", "items": null, "ref_id": null, "additional_properties": null },
+                  "schema": { "type": "well_known", "of": "uuid" },
                   "span": { "file": "handlers.go", "start_line": 94, "end_line": 94 }
                 }
               ],
@@ -333,7 +588,6 @@ mod tests {
 
             assert_eq!(r.method, "PUT");
             assert_eq!(r.path, "/{uuid}");
-            // operation_id is the handler symbol — no annotation override.
             assert_eq!(r.operation_id, "updateGoal");
             assert_eq!(r.handler, "updateGoal");
 
@@ -347,12 +601,14 @@ mod tests {
             assert_eq!(uuid.name, "uuid");
             assert_eq!(uuid.location, "path");
             assert!(uuid.required);
-            assert_eq!(uuid.schema.format.as_deref(), Some("uuid"));
+            assert!(matches!(
+                uuid.schema,
+                crate::analyze::facts::Type::WellKnown(crate::analyze::facts::WellKnown::Uuid)
+            ));
         }
 
         #[test]
         fn rejects_unknown_route_field() {
-            // A new Go field that the Rust mirror has not adopted must fail-fast.
             let bad = br#"{
               "module": "x",
               "routes": [
@@ -374,8 +630,6 @@ mod tests {
 
         #[test]
         fn rejects_removed_annotation_route_field() {
-            // The removed annotation fields (e.g. `security_schemes`) must now be
-            // rejected by deny_unknown_fields — proving they are gone for good.
             let bad = br#"{
               "module": "x",
               "routes": [

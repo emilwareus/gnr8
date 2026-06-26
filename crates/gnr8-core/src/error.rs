@@ -35,6 +35,33 @@ pub enum CoreError {
         source: std::io::Error,
     },
 
+    /// The Python toolchain could not be spawned (e.g. `python3` is not installed or not on `PATH`).
+    ///
+    /// Wraps the [`std::io::Error`] from spawning the `pyextract` subprocess so the cause is
+    /// preserved without panicking (RUST-04 / T-02-02-py). The Python twin of
+    /// [`Self::GoToolchainMissing`]; the two are kept distinct so a caller can tell which sidecar's
+    /// toolchain is absent.
+    #[error("Python toolchain not available (is `python3` installed and on PATH?): {source}")]
+    PythonToolchainMissing {
+        /// The underlying spawn error from [`std::process::Command::output`].
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The TypeScript/Node toolchain could not be spawned (e.g. `node` is not installed or not on
+    /// `PATH`).
+    ///
+    /// Wraps the [`std::io::Error`] from spawning the `tsextract` subprocess so the cause is
+    /// preserved without panicking (RUST-04 / T-04-02). The TypeScript twin of
+    /// [`Self::PythonToolchainMissing`] / [`Self::GoToolchainMissing`]; the three are kept distinct so
+    /// a caller can tell which sidecar's toolchain is absent.
+    #[error("TypeScript toolchain not available (is `node` installed and on PATH?): {source}")]
+    TypeScriptToolchainMissing {
+        /// The underlying spawn error from [`std::process::Command::output`].
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The `goextract` helper ran but exited with a non-zero status.
     ///
     /// Carries the exit `code` (absent if the process was signal-terminated) and the captured
@@ -62,8 +89,9 @@ pub enum CoreError {
     ///
     /// Raised for forward-incompatible or malformed graph facts that the lowering layer cannot
     /// represent — e.g. a dangling `$ref` (a `request_body`/`response.body` whose `ref_id` is not
-    /// among `graph.schemas`) or an unknown [`crate::graph::SchemaType`] `kind`. The `message`
-    /// names the offending id so the failure is diagnosable without a panic (RUST-04 / V5, T-03-01-01).
+    /// among `graph.schemas`) or a neutral [`crate::graph::Type`] the `OpenAPI` target cannot
+    /// represent. The `message` names the offending id so the failure is diagnosable without a panic
+    /// (RUST-04 / V5, T-03-01-01).
     #[error("lowering failed: {message}")]
     Lowering {
         /// Human-readable failure detail naming the offending id.
@@ -190,6 +218,26 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(msg.contains("Go toolchain not available"), "{msg}");
+            assert!(msg.contains("no such file"), "{msg}");
+        }
+
+        #[test]
+        fn python_toolchain_missing_renders_with_source() {
+            let err = CoreError::PythonToolchainMissing {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Python toolchain not available"), "{msg}");
+            assert!(msg.contains("no such file"), "{msg}");
+        }
+
+        #[test]
+        fn typescript_toolchain_missing_renders_with_source() {
+            let err = CoreError::TypeScriptToolchainMissing {
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("TypeScript toolchain not available"), "{msg}");
             assert!(msg.contains("no such file"), "{msg}");
         }
 

@@ -360,7 +360,7 @@ func pathParam(name string, fset *token.FileSet, pos token.Pos) facts.ParamFact 
 		Name:     name,
 		Location: "path",
 		Required: true,
-		Schema:   facts.SchemaType{Kind: "string"},
+		Schema:   facts.PrimitiveType(facts.StringPrim()),
 		Span:     spanOf(fset, pos),
 	}
 }
@@ -373,7 +373,7 @@ func queryParam(name string, fset *token.FileSet, pos token.Pos) facts.ParamFact
 		Name:     name,
 		Location: "query",
 		Required: false,
-		Schema:   facts.SchemaType{Kind: "string"},
+		Schema:   facts.PrimitiveType(facts.StringPrim()),
 		Span:     spanOf(fset, pos),
 	}
 }

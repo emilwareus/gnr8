@@ -1,0 +1,9 @@
+# Fixture-local documentation of the framework this service targets.
+#
+# NOTE (Phase 1): this file is DOCUMENTATION ONLY. It is NEVER pip-installed and
+# NEVER linked into gnr8-core. This phase ships STATIC source + red-by-design
+# snapshots; no extractor runs against this fixture yet (pyextract lands in Phase 2).
+# gnr8 will later derive API facts from Python's OWN type system (annotations,
+# Pydantic/@dataclass field types) — NEVER from FastAPI's runtime /openapi.json
+# or any third-party schema tool (CLAUDE.md rule 1).
+fastapi

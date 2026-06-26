@@ -201,23 +201,56 @@ fn run_check(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Probe whether the Go toolchain is present by attempting to spawn `go version`.
+/// Probe whether the DETECTED source language's toolchain is ACTUALLY ready, returning `(language,
+/// present)`.
 ///
-/// `.is_ok()` means the `go` binary SPAWNED (a non-zero exit still means `go` exists); a spawn
-/// `io::Error` (binary not found) means it is ABSENT. `go`/`version` are passed as DISCRETE `Command`
-/// args (never `sh -c`), so no shell metacharacter can be injected (T-05-01-01).
-fn probe_go() -> bool {
-    std::process::Command::new("go")
-        .arg("version")
-        .output()
-        .is_ok()
+/// One `gnr8_core::analyze::source_toolchain` decision over the project root picks the language (the
+/// `.gnr8/` crate is excluded from that scan in core, so it does not spoof detection — Open Q2). That
+/// SINGLE decision then routes to exactly one readiness check (no try-go-then-python fallback — CLAUDE.md
+/// rule 3):
+/// - Go/Python: spawn the discrete probe binary (`go version` / `python3 --version`) and require it to
+///   EXIT SUCCESSFULLY (WR-05). `.output().map(|o| o.status.success())` — a spawn `io::Error` (binary not
+///   found) OR a non-zero exit (a broken/stub binary that cannot even run `--version`) both mean NOT
+///   ready, so doctor no longer reports a non-functional shim as healthy.
+/// - TypeScript: the real toolchain is `node` AND the user's `typescript`. Delegate to the core probe
+///   (`tsextract/probe.js`, which runs the SAME `ts.resolveTypescript` `generate` uses) so a project
+///   with `node` but no `typescript` reports UNHEALTHY up front instead of passing doctor then failing
+///   at generate (WR-02). Still one source of truth — the probe reuses the extractor's resolution.
+///
+/// On `Err` (empty/ambiguous source) the language is `"unknown"` and the toolchain is reported absent —
+/// surfaced as a doctor finding, never a panic. The binary name is one of three compile-time
+/// `&'static str` arms and the args are literals, never `sh -c` (T-06-01).
+fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
+    let Ok(toolchain) = gnr8_core::analyze::source_toolchain(&root.to_string_lossy()) else {
+        return ("unknown".to_string(), false);
+    };
+    let present = if toolchain == gnr8_core::analyze::SourceToolchain::TypeScript {
+        // TypeScript's real toolchain is `node` + a resolvable `typescript`; the core probe verifies
+        // BOTH via the same resolution `generate` uses (WR-02 — one source of truth, no fallback).
+        gnr8_core::analyze::typescript_toolchain_present(&root.to_string_lossy())
+    } else {
+        // Go/Python are wholly `go`/`python3`: spawn the discrete probe binary and require a SUCCESSFUL
+        // exit (WR-05) — spawn-success alone masked a broken binary that exits non-zero. `go` uses the
+        // bare `version` subcommand; `python3` uses the `--version` flag.
+        let version_arg = if toolchain.probe_binary() == "go" {
+            "version"
+        } else {
+            "--version"
+        };
+        std::process::Command::new(toolchain.probe_binary())
+            .arg(version_arg)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    (toolchain.language().to_string(), present)
 }
 
 /// Run `gnr8 doctor`: a health aggregator that runs the user's `.gnr8/` pipeline once and reports its
 /// diagnostics + drift (HARD-01 / D-01, D-02). Mirrors `run_check`'s shell-vs-decision split (this is
 /// the impure shell; the pure grouping + exit policy lives in [`doctor::DoctorReport`]).
 ///
-/// Collects three lifecycle facts (`.gnr8/` present, Go toolchain present, the pipeline runs), and —
+/// Collects three lifecycle facts (`.gnr8/` present, the DETECTED source-language toolchain present via
+/// one `analyze::source_toolchain` decision, the pipeline runs), and —
 /// when the pipeline runs cleanly — its diagnostics and the dry-run drift plan. A pipeline failure (a
 /// compile error, a missing toolchain) is REPORTED as a finding, never `?`/unwrap'd into a crash
 /// (Pitfall 4 / D-02). Prints the human report or `--json`, then exits non-zero ONLY on an actionable
@@ -225,7 +258,7 @@ fn probe_go() -> bool {
 fn run_doctor(json: bool) -> Result<()> {
     let root = project_root()?;
     let initialized = gnr8_core::workspace::manifest_path(&root).is_file();
-    let go_present = probe_go();
+    let (language, source_present) = probe_source_lang_toolchain(&root);
 
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
     // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
@@ -242,7 +275,8 @@ fn run_doctor(json: bool) -> Result<()> {
 
     let report = doctor::DoctorReport::assemble(
         initialized,
-        go_present,
+        source_present,
+        &language,
         pipeline_ran,
         diagnostics,
         drift.as_ref(),

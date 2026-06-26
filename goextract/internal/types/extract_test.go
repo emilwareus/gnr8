@@ -42,13 +42,52 @@ func schemaByName(schemas []facts.SchemaFact, name string) (facts.SchemaFact, bo
 	return facts.SchemaFact{}, false
 }
 
+// objectFields returns a named schema's object fields, or nil if its body is not an
+// object (the neutral Type body carries fields as Type{Type: "object", Of: []FieldFact}).
+func objectFields(s facts.SchemaFact) []facts.FieldFact {
+	if s.Body.Type != facts.TypeObject {
+		return nil
+	}
+	fields, _ := s.Body.Of.([]facts.FieldFact)
+	return fields
+}
+
+// enumMembers returns a named schema's enum members, or nil if its body is not an enum.
+func enumMembers(s facts.SchemaFact) []string {
+	if s.Body.Type != facts.TypeEnum {
+		return nil
+	}
+	members, _ := s.Body.Of.([]string)
+	return members
+}
+
 func fieldByJSON(s facts.SchemaFact, jsonName string) (facts.FieldFact, bool) {
-	for _, f := range s.Fields {
+	for _, f := range objectFields(s) {
 		if f.JSONName == jsonName {
 			return f, true
 		}
 	}
 	return facts.FieldFact{}, false
+}
+
+// primName returns the Prim tag of a primitive Type (e.g. "string", "int"), or "".
+func primName(ty facts.Type) string {
+	if ty.Type != facts.TypePrimitive {
+		return ""
+	}
+	if p, ok := ty.Of.(*facts.Prim); ok {
+		return p.Prim
+	}
+	return ""
+}
+
+// wellKnownName returns the canonical name of a well_known Type (e.g. "uuid"), or "".
+func wellKnownName(ty facts.Type) string {
+	if ty.Type != facts.TypeWellKnown {
+		return ""
+	}
+	name, _ := ty.Of.(string)
+	return name
 }
 
 func TestExtractObjectAndEnumCounts(t *testing.T) {
@@ -60,13 +99,13 @@ func TestExtractObjectAndEnumCounts(t *testing.T) {
 	}
 	var objects, enums []string
 	for _, s := range schemas {
-		switch s.Kind {
-		case "object":
+		switch s.Body.Type {
+		case facts.TypeObject:
 			objects = append(objects, s.Name)
-		case "enum":
+		case facts.TypeEnum:
 			enums = append(enums, s.Name)
 		default:
-			t.Errorf("unexpected schema kind %q for %s", s.Kind, s.Name)
+			t.Errorf("unexpected schema body kind %q for %s", s.Body.Type, s.Name)
 		}
 	}
 	sort.Strings(objects)
@@ -89,8 +128,9 @@ func TestExtractObjectAndEnumCounts(t *testing.T) {
 	if !ok {
 		t.Fatal("TargetDirection enum not found")
 	}
-	if len(dir.EnumValues) != 2 || dir.EnumValues[0] != "gte" || dir.EnumValues[1] != "lte" {
-		t.Errorf("expected sorted enum values [gte lte], got %v", dir.EnumValues)
+	members := enumMembers(dir)
+	if len(members) != 2 || members[0] != "gte" || members[1] != "lte" {
+		t.Errorf("expected sorted enum members [gte lte], got %v", members)
 	}
 }
 
@@ -109,11 +149,11 @@ func TestCreateGoalInputFields(t *testing.T) {
 	if !name.Required || name.Optional {
 		t.Errorf("name: want required=true optional=false, got required=%v optional=%v", name.Required, name.Optional)
 	}
-	if name.Schema.Kind != "string" {
-		t.Errorf("name kind: want string, got %s", name.Schema.Kind)
+	if got := primName(name.Schema); got != facts.PrimString {
+		t.Errorf("name type: want primitive string, got %q (%+v)", got, name.Schema)
 	}
 
-	// targetValue: optional (pointer+omitempty), number.
+	// targetValue: optional+nullable (a pointer), float primitive.
 	tv, ok := fieldByJSON(s, "targetValue")
 	if !ok {
 		t.Fatal("field 'targetValue' not found")
@@ -121,32 +161,39 @@ func TestCreateGoalInputFields(t *testing.T) {
 	if !tv.Optional || tv.Required {
 		t.Errorf("targetValue: want optional=true required=false, got optional=%v required=%v", tv.Optional, tv.Required)
 	}
-	if tv.Schema.Kind != "number" {
-		t.Errorf("targetValue kind: want number, got %s", tv.Schema.Kind)
+	if !tv.Nullable {
+		t.Errorf("targetValue: a pointer field must be nullable, got nullable=%v", tv.Nullable)
+	}
+	if got := primName(tv.Schema); got != facts.PrimFloat {
+		t.Errorf("targetValue type: want primitive float, got %q (%+v)", got, tv.Schema)
 	}
 
-	// workflowChainIds: array of string format uuid.
+	// workflowChainIds: array of well-known uuid.
 	wc, ok := fieldByJSON(s, "workflowChainIds")
 	if !ok {
 		t.Fatal("field 'workflowChainIds' not found")
 	}
-	if wc.Schema.Kind != "array" || wc.Schema.Items == nil {
-		t.Fatalf("workflowChainIds: want array with items, got %+v", wc.Schema)
+	if wc.Schema.Type != facts.TypeArray {
+		t.Fatalf("workflowChainIds: want array, got %+v", wc.Schema)
 	}
-	if wc.Schema.Items.Kind != "string" || wc.Schema.Items.Format == nil || *wc.Schema.Items.Format != "uuid" {
-		t.Errorf("workflowChainIds items: want string/uuid, got %+v", wc.Schema.Items)
+	elem, ok := wc.Schema.Of.(*facts.Type)
+	if !ok || elem == nil {
+		t.Fatalf("workflowChainIds: array element missing, got %+v", wc.Schema.Of)
+	}
+	if got := wellKnownName(*elem); got != facts.WellKnownUUID {
+		t.Errorf("workflowChainIds element: want well-known uuid, got %q (%+v)", got, *elem)
 	}
 
-	// analyticsQuery: ref to GoalAnalyticsQuery schema.
+	// analyticsQuery: named ref to GoalAnalyticsQuery schema.
 	aq, ok := fieldByJSON(s, "analyticsQuery")
 	if !ok {
 		t.Fatal("field 'analyticsQuery' not found")
 	}
-	if aq.Schema.Kind != "ref" || aq.Schema.RefID == nil {
-		t.Fatalf("analyticsQuery: want ref, got %+v", aq.Schema)
+	if aq.Schema.Type != facts.TypeNamed {
+		t.Fatalf("analyticsQuery: want named ref, got %+v", aq.Schema)
 	}
-	if *aq.Schema.RefID != "internal/common/dto.GoalAnalyticsQuery" {
-		t.Errorf("analyticsQuery ref_id: want internal/common/dto.GoalAnalyticsQuery, got %s", *aq.Schema.RefID)
+	if id, _ := aq.Schema.Of.(string); id != "internal/common/dto.GoalAnalyticsQuery" {
+		t.Errorf("analyticsQuery named id: want internal/common/dto.GoalAnalyticsQuery, got %v", aq.Schema.Of)
 	}
 }
 
@@ -175,16 +222,17 @@ func TestGoalResponseWellKnownAndFreeFormMap(t *testing.T) {
 	if !ok {
 		t.Fatal("createdAt field not found")
 	}
-	if createdAt.Schema.Kind != "string" || createdAt.Schema.Format == nil || *createdAt.Schema.Format != "date-time" {
-		t.Errorf("createdAt: want string/date-time, got %+v", createdAt.Schema)
+	if got := wellKnownName(createdAt.Schema); got != facts.WellKnownDateTime {
+		t.Errorf("createdAt: want well-known date_time, got %q (%+v)", got, createdAt.Schema)
 	}
 
 	metadata, ok := fieldByJSON(s, "metadata")
 	if !ok {
 		t.Fatal("metadata field not found")
 	}
-	if metadata.Schema.Kind != "object" || metadata.Schema.AdditionalProperties == nil || !*metadata.Schema.AdditionalProperties {
-		t.Errorf("metadata: want object additionalProperties=true, got %+v", metadata.Schema)
+	// A free-form Go map lowers to the neutral Any type (explicitly lossy).
+	if metadata.Schema.Type != facts.TypeAny {
+		t.Errorf("metadata: want any (free-form), got %+v", metadata.Schema)
 	}
 
 	// A free-form-map diagnostic for GoalResponse.Metadata must exist.
