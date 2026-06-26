@@ -219,10 +219,7 @@ mod tests {
     #[test]
     fn generated_client_contains_the_operation_methods_and_models_the_enum() {
         let out = generate(&sample_graph(), "bookstore", "/").unwrap();
-        assert!(
-            out.contains("async createBook(body: models.Book)"),
-            "{out}"
-        );
+        assert!(out.contains("async createBook(body: models.Book)"), "{out}");
         assert!(out.contains("async listBooks(cursor?: string)"), "{out}");
         assert!(
             out.contains("export type BookFormat = \"hardcover\" | \"paperback\";"),

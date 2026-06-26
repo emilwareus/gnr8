@@ -103,19 +103,30 @@ pub(crate) fn camel(name: &str) -> String {
 /// `optional` axis is NOT read here — it drives the field declaration's `?:` in [`emit_interface`], not
 /// the type (the two are distinct, independent axes).
 ///
+/// `ns` is the namespace prefix prepended to every resolved [`Type::Named`] symbol so the SAME mapping
+/// serves both files with one path (rule 3): `models.ts` references its sibling symbols BARE (`ns = ""`),
+/// while `client.ts` reaches them through its `import * as models` namespace (`ns = "models."`). Without
+/// this, a named enum/model used as a param type emits a bare symbol that is out of scope in `client.ts`
+/// (`error TS2304: Cannot find name 'BookFormat'`). The prefix is the caller's context, NOT a fallback.
+///
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] on a dangling `Named` ref or an inline [`Type::Object`].
-pub(crate) fn ts_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
+pub(crate) fn ts_type(
+    schema: &Type,
+    nullable: bool,
+    graph: &ApiGraph,
+    ns: &str,
+) -> Result<String, CoreError> {
     let base = match schema {
         Type::Primitive(prim) => ts_primitive(prim).to_string(),
         // Every well-known scalar carries on the wire as a string in this dependency-free SDK (a
         // date-time is an RFC-3339 `string`; a uuid/email/uri is a `string`) — A7. No `Date` import.
         Type::WellKnown(_) => "string".to_string(),
-        Type::Array(items) => format!("{}[]", ts_type(items, false, graph)?),
+        Type::Array(items) => format!("{}[]", ts_type(items, false, graph, ns)?),
         // A keyed map maps to the stricter typed `Record<string, V>` (Open Q1 resolution): the value
         // type is preserved rather than widened to `unknown`.
-        Type::Map { value, .. } => format!("Record<string, {}>", ts_type(value, false, graph)?),
+        Type::Map { value, .. } => format!("Record<string, {}>", ts_type(value, false, graph, ns)?),
         Type::Any {} => "unknown".to_string(),
         Type::Named(ref_id) => {
             let target = graph
@@ -125,7 +136,9 @@ pub(crate) fn ts_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result
                 .ok_or_else(|| CoreError::SdkGen {
                     message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
                 })?;
-            target.name.clone()
+            // Prefix the resolved symbol with the caller's namespace (`""` in models.ts, `"models."`
+            // in client.ts) so the reference resolves in BOTH files (rule 3, one path).
+            format!("{ns}{}", target.name)
         }
         // An inline enum stays inline as a string-literal union (members in graph-sorted order) — the
         // case the Go target rejects. A named enum (a top-level Schema body) is instead a `type` alias;
@@ -140,7 +153,7 @@ pub(crate) fn ts_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result
         Type::Union(variants) => {
             let mut parts: Vec<String> = Vec::with_capacity(variants.len());
             for variant in variants {
-                parts.push(ts_type(variant, false, graph)?);
+                parts.push(ts_type(variant, false, graph, ns)?);
             }
             parts.join(" | ")
         }
@@ -239,7 +252,8 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             | Type::Named(_)
             | Type::Union(_)
             | Type::Any {} => {
-                let alias = ts_type(&schema.body, false, graph)?;
+                // models.ts references its sibling symbols BARE (no namespace prefix).
+                let alias = ts_type(&schema.body, false, graph, "")?;
                 writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
             }
         }
@@ -283,7 +297,8 @@ fn emit_interface(
         // The wire key (`json_name`) is the property name verbatim. A key that is not a plain
         // identifier is still valid TS as a property name (TS accepts any string literal as a member),
         // but the bookstore fixtures only carry identifier-safe keys; emit the key directly.
-        let hint = ts_type(&field.schema, field.nullable, graph)?;
+        // An interface field references its sibling model/enum symbols BARE — same file (models.ts).
+        let hint = ts_type(&field.schema, field.nullable, graph, "")?;
         let opt = if field.optional { "?" } else { "" };
         writeln!(out, "  {}{opt}: {hint};", field.json_name).map_err(sink)?;
     }
@@ -363,7 +378,10 @@ fn join_path(base_path: &str, path: &str) -> String {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<(u16, Option<String>)>, CoreError> {
+fn success_of(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<Option<(u16, Option<String>)>, CoreError> {
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
             let model = match &resp.body {
@@ -588,19 +606,22 @@ fn emit_operation(
     // Signature: path params (positional), body (typed), required query (positional), then optional
     // query params (`?: T`). All non-optional args precede optional ones (TS requirement).
     let mut args: Vec<String> = Vec::new();
+    // A param type emitted into client.ts must reach a named model/enum through the `models` namespace
+    // import (the symbols live in models.ts, not in scope here) — pass the `"models."` prefix so a named
+    // enum param (e.g. `format: models.BookFormat`) resolves instead of emitting a bare TS2304 name.
     for (p, ident) in path_params.iter().zip(path_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph)?;
+        let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
     }
     if let Some(model) = &body_model {
         args.push(format!("body: models.{model}"));
     }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph)?;
+        let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph)?;
+        let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}?: {ty}"));
     }
 
@@ -705,12 +726,18 @@ fn emit_op_dispatch(
     has_body: bool,
     return_model: Option<&str>,
 ) -> Result<(), CoreError> {
-    writeln!(out, "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{")
-        .map_err(sink)?;
+    writeln!(
+        out,
+        "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{"
+    )
+    .map_err(sink)?;
     writeln!(out, "      method: \"{method}\",").map_err(sink)?;
     if has_body {
-        writeln!(out, "      headers: {{ \"Content-Type\": \"application/json\" }},")
-            .map_err(sink)?;
+        writeln!(
+            out,
+            "      headers: {{ \"Content-Type\": \"application/json\" }},"
+        )
+        .map_err(sink)?;
         writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
     }
     writeln!(out, "    }});").map_err(sink)?;
@@ -863,11 +890,11 @@ mod tests {
         fn primitives_and_wellknown_map_to_typescript_scalars() {
             let g = ApiGraph::default();
             assert_eq!(
-                ts_type(&Type::Primitive(Prim::String), false, &g).unwrap(),
+                ts_type(&Type::Primitive(Prim::String), false, &g, "").unwrap(),
                 "string"
             );
             assert_eq!(
-                ts_type(&Type::Primitive(Prim::Bool), false, &g).unwrap(),
+                ts_type(&Type::Primitive(Prim::Bool), false, &g, "").unwrap(),
                 "boolean"
             );
             assert_eq!(
@@ -877,18 +904,19 @@ mod tests {
                         signed: true
                     }),
                     false,
-                    &g
+                    &g,
+                    "",
                 )
                 .unwrap(),
                 "number"
             );
             assert_eq!(
-                ts_type(&Type::Primitive(Prim::Float { bits: 64 }), false, &g).unwrap(),
+                ts_type(&Type::Primitive(Prim::Float { bits: 64 }), false, &g, "").unwrap(),
                 "number"
             );
             // a bytes primitive carries base64 as a string.
             assert_eq!(
-                ts_type(&Type::Primitive(Prim::Bytes), false, &g).unwrap(),
+                ts_type(&Type::Primitive(Prim::Bytes), false, &g, "").unwrap(),
                 "string"
             );
             // a date-time well-known carries as a string (A7).
@@ -896,7 +924,8 @@ mod tests {
                 ts_type(
                     &Type::WellKnown(crate::graph::WellKnown::DateTime),
                     false,
-                    &g
+                    &g,
+                    "",
                 )
                 .unwrap(),
                 "string"
@@ -907,7 +936,7 @@ mod tests {
         fn nullable_wraps_the_type_with_pipe_null() {
             let g = ApiGraph::default();
             assert_eq!(
-                ts_type(&Type::Primitive(Prim::String), true, &g).unwrap(),
+                ts_type(&Type::Primitive(Prim::String), true, &g, "").unwrap(),
                 "string | null"
             );
         }
@@ -923,10 +952,10 @@ mod tests {
                 }),
                 Type::Primitive(Prim::Float { bits: 64 }),
             ]);
-            assert_eq!(ts_type(&rating, false, &g).unwrap(), "number | number");
+            assert_eq!(ts_type(&rating, false, &g, "").unwrap(), "number | number");
             // nullable wraps the whole union.
             assert_eq!(
-                ts_type(&rating, true, &g).unwrap(),
+                ts_type(&rating, true, &g, "").unwrap(),
                 "number | number | null"
             );
         }
@@ -936,15 +965,38 @@ mod tests {
             // BookFilters.sort-shaped inline enum: go_type errors; TS emits a literal union, graph order.
             let g = ApiGraph::default();
             let sort = Type::Enum(vec!["asc".to_string(), "desc".to_string()]);
-            assert_eq!(ts_type(&sort, false, &g).unwrap(), "\"asc\" | \"desc\"");
+            assert_eq!(ts_type(&sort, false, &g, "").unwrap(), "\"asc\" | \"desc\"");
         }
 
         #[test]
         fn named_ref_resolves_to_the_schema_name() {
             let g = sample_graph();
             let named = Type::Named("app.models.BookFormat".to_string());
-            assert_eq!(ts_type(&named, false, &g).unwrap(), "BookFormat");
-            assert_eq!(ts_type(&named, true, &g).unwrap(), "BookFormat | null");
+            assert_eq!(ts_type(&named, false, &g, "").unwrap(), "BookFormat");
+            assert_eq!(ts_type(&named, true, &g, "").unwrap(), "BookFormat | null");
+        }
+
+        #[test]
+        fn named_ref_is_namespace_qualified_for_client_ts_context() {
+            // In client.ts a named enum/model param must reach models.ts through the `models` namespace
+            // import — passing `ns = "models."` qualifies the symbol so it is in scope (regression for
+            // the TS2304 `Cannot find name 'BookFormat'` codegen bug the tssdk_compile gate caught).
+            let g = sample_graph();
+            let named = Type::Named("app.models.BookFormat".to_string());
+            assert_eq!(
+                ts_type(&named, false, &g, "models.").unwrap(),
+                "models.BookFormat"
+            );
+            assert_eq!(
+                ts_type(&named, true, &g, "models.").unwrap(),
+                "models.BookFormat | null"
+            );
+            // An array of a named ref carries the prefix through the element type.
+            let arr = Type::Array(Box::new(named));
+            assert_eq!(
+                ts_type(&arr, false, &g, "models.").unwrap(),
+                "models.BookFormat[]"
+            );
         }
 
         #[test]
@@ -953,7 +1005,7 @@ mod tests {
             let g = sample_graph();
             let body = g.schemas.iter().find(|s| s.name == "BookOrError").unwrap();
             assert_eq!(
-                ts_type(&body.body, false, &g).unwrap(),
+                ts_type(&body.body, false, &g, "").unwrap(),
                 "Book | OutOfStock"
             );
         }
@@ -962,26 +1014,27 @@ mod tests {
         fn array_and_map_and_any_map_to_typescript_generics() {
             let g = ApiGraph::default();
             let arr = Type::Array(Box::new(Type::Primitive(Prim::String)));
-            assert_eq!(ts_type(&arr, false, &g).unwrap(), "string[]");
+            assert_eq!(ts_type(&arr, false, &g, "").unwrap(), "string[]");
             let map = Type::Map {
                 key: Box::new(Type::Primitive(Prim::String)),
                 value: Box::new(Type::Primitive(Prim::Float { bits: 64 })),
             };
             // Open Q1: the typed Record<string, V> (value preserved, not widened to unknown).
             assert_eq!(
-                ts_type(&map, false, &g).unwrap(),
+                ts_type(&map, false, &g, "").unwrap(),
                 "Record<string, number>"
             );
-            assert_eq!(ts_type(&Type::Any {}, false, &g).unwrap(), "unknown");
+            assert_eq!(ts_type(&Type::Any {}, false, &g, "").unwrap(), "unknown");
         }
 
         #[test]
         fn inline_object_is_a_typed_error_parity_with_go_and_python() {
             let g = ApiGraph::default();
             let obj = Type::Object(vec![]);
-            let err = ts_type(&obj, false, &g).unwrap_err();
+            let err = ts_type(&obj, false, &g, "").unwrap_err();
             assert!(
-                err.to_string().contains("inline object type is unsupported"),
+                err.to_string()
+                    .contains("inline object type is unsupported"),
                 "{err}"
             );
         }
@@ -989,7 +1042,7 @@ mod tests {
         #[test]
         fn dangling_named_ref_is_a_typed_error() {
             let g = ApiGraph::default();
-            let err = ts_type(&Type::Named("dto.Nope".to_string()), false, &g).unwrap_err();
+            let err = ts_type(&Type::Named("dto.Nope".to_string()), false, &g, "").unwrap_err();
             assert!(err.to_string().contains("dangling $ref"), "{err}");
         }
     }
@@ -1027,7 +1080,10 @@ mod tests {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(out.contains("export interface BookFilters {"), "{out}");
             // required, non-nullable.
-            assert!(out.contains("  genre: string;"), "required non-nullable:\n{out}");
+            assert!(
+                out.contains("  genre: string;"),
+                "required non-nullable:\n{out}"
+            );
             // optional (`?:`), non-nullable.
             assert!(
                 out.contains("  in_stock?: boolean;"),
@@ -1201,10 +1257,7 @@ mod tests {
                 out.contains("body: JSON.stringify(body),"),
                 "body op serializes the body:\n{out}"
             );
-            assert!(
-                out.contains("method: \"POST\","),
-                "{out}"
-            );
+            assert!(out.contains("method: \"POST\","), "{out}");
         }
 
         #[test]
@@ -1230,7 +1283,10 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
-            assert!(out.contains("query.set(\"cursor\", String(cursor));"), "{out}");
+            assert!(
+                out.contains("query.set(\"cursor\", String(cursor));"),
+                "{out}"
+            );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
             // no body for a body-less op.
             assert!(
@@ -1342,7 +1398,10 @@ mod tests {
             let out = emit_client("bookstore");
             assert!(out.contains("fetch?: typeof fetch;"), "{out}");
             assert!(out.contains("this.fetchFn = opts.fetch ?? fetch;"), "{out}");
-            assert!(out.contains("import { ApiError } from \"./errors\";"), "{out}");
+            assert!(
+                out.contains("import { ApiError } from \"./errors\";"),
+                "{out}"
+            );
             // no third-party HTTP libs (TSSDK-01/02).
             assert!(!out.contains("axios"), "{out}");
             assert!(!out.contains("node-fetch"), "{out}");
@@ -1352,7 +1411,10 @@ mod tests {
         #[test]
         fn errors_define_typed_apierror_extends_error_with_is_not_found() {
             let out = emit_errors("bookstore");
-            assert!(out.contains("export class ApiError extends Error {"), "{out}");
+            assert!(
+                out.contains("export class ApiError extends Error {"),
+                "{out}"
+            );
             assert!(out.contains("public readonly status: number,"), "{out}");
             assert!(out.contains("public readonly body: unknown,"), "{out}");
             assert!(out.contains("isNotFound(): boolean {"), "{out}");
@@ -1362,8 +1424,14 @@ mod tests {
         #[test]
         fn index_reexports_client_apierror_and_every_model() {
             let out = emit_index(&ops_graph(), "bookstore");
-            assert!(out.contains("export { Client } from \"./client\";"), "{out}");
-            assert!(out.contains("export { ApiError } from \"./errors\";"), "{out}");
+            assert!(
+                out.contains("export { Client } from \"./client\";"),
+                "{out}"
+            );
+            assert!(
+                out.contains("export { ApiError } from \"./errors\";"),
+                "{out}"
+            );
             assert!(out.contains("  Book,"), "{out}");
             assert!(out.contains("  CreatedMessage,"), "{out}");
             assert!(out.contains("} from \"./models\";"), "{out}");
@@ -1395,7 +1463,10 @@ mod tests {
               "diagnostics": [] }"#;
             let g = graph_from(facts);
             let err = emit_models(&g, "pkg").unwrap_err();
-            assert!(err.to_string().contains("share the TypeScript name"), "{err}");
+            assert!(
+                err.to_string().contains("share the TypeScript name"),
+                "{err}"
+            );
         }
     }
 }
