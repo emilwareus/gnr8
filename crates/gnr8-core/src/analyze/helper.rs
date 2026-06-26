@@ -191,6 +191,24 @@ fn run_tsextract_with(node_bin: &str, target_dir: &str) -> Result<facts::GoFacts
     Ok(parsed)
 }
 
+/// Health-probe whether the TypeScript toolchain is ACTUALLY ready for `target_dir` (WR-02): both
+/// `node` runs AND the user's `typescript` is resolvable, using the EXACT resolution `run_tsextract`
+/// uses at generate time (`tsextract/probe.js` calls the SAME `ts.resolveTypescript`, so there is one
+/// source of truth — no second detector, no fallback; CLAUDE.md rule 3). Returns `true` iff the probe
+/// exits 0.
+///
+/// `gnr8 doctor` calls this so a TS project with `node` but no `typescript` reports UNHEALTHY up front,
+/// rather than passing doctor and failing at `generate`. A spawn error (no `node`) or a non-zero exit
+/// (typescript absent) both mean "not ready" → `false`; never a panic (the doctor renders it as a
+/// finding). Spawned with DISCRETE args from `tsextract_dir`, never `sh -c` (T-06-01).
+pub(crate) fn typescript_toolchain_present(target_dir: &str) -> bool {
+    Command::new("node")
+        .args(["probe.js", target_dir])
+        .current_dir(tsextract_dir())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5);
@@ -199,7 +217,7 @@ mod tests {
 
     use super::{
         goextract_dir, pyextract_dir, run_goextract_with, run_pyextract_with, run_tsextract_with,
-        tsextract_dir,
+        tsextract_dir, typescript_toolchain_present,
     };
     use crate::CoreError;
 
@@ -280,6 +298,60 @@ mod tests {
             );
             // Display must render without panic and mention the toolchain.
             assert!(err.to_string().contains("TypeScript toolchain"));
+        }
+    }
+
+    mod typescript_toolchain_probe {
+        use super::{tsextract_dir, typescript_toolchain_present};
+
+        /// WR-02: `typescript_toolchain_present` returns `true` when `typescript` IS resolvable — here
+        /// from the sidecar's own dev `node_modules` (restored by `make tsextract-deps`, exactly the
+        /// gnr8 test-suite contract). Skips gracefully if those dev deps are not installed so the unit
+        /// run never fails on a machine without `npm ci` (the `examples-check` gate covers the wired
+        /// end-to-end path). The nestjs fixture is a valid TS target dir to point the probe at.
+        #[test]
+        fn reports_present_when_typescript_resolves_from_the_sidecar() {
+            if !tsextract_dir()
+                .join("node_modules")
+                .join("typescript")
+                .is_dir()
+            {
+                eprintln!(
+                    "skipping: tsextract/node_modules/typescript absent (run `make tsextract-deps`)"
+                );
+                return;
+            }
+            let nestjs = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/nestjs-bookstore"
+            );
+            assert!(
+                typescript_toolchain_present(nestjs),
+                "with the sidecar's dev typescript installed, the TS toolchain probe must report present"
+            );
+        }
+
+        /// WR-02: the probe reports ABSENT (no panic) when `typescript` cannot resolve from EITHER the
+        /// target or the sidecar. Forced deterministically by pointing the probe at a target dir that
+        /// is `node`-resolvable but holds no `typescript`, while the sidecar's own `node_modules` is the
+        /// only other search root — so this asserts the not-found exit path maps to `false` rather than
+        /// a spawn-success masking a missing toolchain. (A bogus target dir with no `node_modules`; the
+        /// sidecar may still resolve it, so this test only asserts the call never panics and returns a
+        /// bool — the negative wiring is exercised end-to-end by `examples-check`/`probe.js`.)
+        #[test]
+        fn never_panics_and_returns_a_bool_for_a_bare_target() {
+            let dir = std::env::temp_dir().join(format!(
+                "gnr8-ts-probe-bare-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Just assert it returns without panic; the value depends on whether the sidecar has the
+            // dev typescript installed (resolvable) or not (absent) — both are valid environments.
+            let _present: bool = typescript_toolchain_present(&dir.to_string_lossy());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

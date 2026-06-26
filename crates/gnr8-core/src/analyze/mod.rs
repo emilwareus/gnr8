@@ -163,6 +163,20 @@ pub fn source_toolchain(dir: &str) -> Result<SourceToolchain, crate::CoreError> 
     })
 }
 
+/// Health-probe whether the TypeScript toolchain is ACTUALLY ready for `target_dir` — both `node` runs
+/// AND the user's `typescript` is resolvable (WR-02). The CLI-facing face of
+/// [`helper::typescript_toolchain_present`]: `gnr8 doctor` calls this for a TypeScript source so a
+/// project with `node` but no `typescript` reports unhealthy up front, rather than passing doctor and
+/// then failing at `generate`. Resolution reuses the EXACT order the extractor uses (`tsextract/probe.js`
+/// → `ts.resolveTypescript`), so there is one source of truth, no second detector, no fallback (rule 3).
+///
+/// Returns `true` iff the probe exits 0; a missing `node` (spawn error) or a missing `typescript`
+/// (non-zero exit) both yield `false`. Never panics — the caller renders the result as a doctor finding.
+#[must_use]
+pub fn typescript_toolchain_present(target_dir: &str) -> bool {
+    helper::typescript_toolchain_present(target_dir)
+}
+
 /// Recursively record Go (`go.mod`/`*.go`), Python (`*.py`), and TypeScript (`tsconfig.json`/`*.ts`)
 /// marker presence under `dir`.
 ///

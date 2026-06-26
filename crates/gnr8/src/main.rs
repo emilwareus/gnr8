@@ -201,32 +201,47 @@ fn run_check(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Probe whether the DETECTED source language's toolchain is present, returning `(language, present)`.
+/// Probe whether the DETECTED source language's toolchain is ACTUALLY ready, returning `(language,
+/// present)`.
 ///
 /// One `gnr8_core::analyze::source_toolchain` decision over the project root picks the language (the
-/// `.gnr8/` crate is excluded from that scan in core, so it does not spoof detection — Open Q2). On
-/// `Ok(tc)` the toolchain's discrete probe binary (`go`/`python3`/`node`) is spawned with the matching
-/// literal version arg; `.is_ok()` means the binary SPAWNED (a non-zero exit still means it exists), a
-/// spawn `io::Error` (not found) means ABSENT. On `Err` (empty/ambiguous source) the language is
-/// `"unknown"` and the toolchain is reported absent — surfaced as a doctor finding, never a panic.
+/// `.gnr8/` crate is excluded from that scan in core, so it does not spoof detection — Open Q2). That
+/// SINGLE decision then routes to exactly one readiness check (no try-go-then-python fallback — CLAUDE.md
+/// rule 3):
+/// - Go/Python: spawn the discrete probe binary (`go version` / `python3 --version`) and require it to
+///   EXIT SUCCESSFULLY (WR-05). `.output().map(|o| o.status.success())` — a spawn `io::Error` (binary not
+///   found) OR a non-zero exit (a broken/stub binary that cannot even run `--version`) both mean NOT
+///   ready, so doctor no longer reports a non-functional shim as healthy.
+/// - TypeScript: the real toolchain is `node` AND the user's `typescript`. Delegate to the core probe
+///   (`tsextract/probe.js`, which runs the SAME `ts.resolveTypescript` `generate` uses) so a project
+///   with `node` but no `typescript` reports UNHEALTHY up front instead of passing doctor then failing
+///   at generate (WR-02). Still one source of truth — the probe reuses the extractor's resolution.
 ///
-/// There is exactly ONE detection decision and NO try-go-then-python fallback (CLAUDE.md rule 3); the
-/// binary name is one of three compile-time `&'static str` arms and the args are literals, never
-/// `sh -c`, so no shell metacharacter can be injected (T-06-01).
+/// On `Err` (empty/ambiguous source) the language is `"unknown"` and the toolchain is reported absent —
+/// surfaced as a doctor finding, never a panic. The binary name is one of three compile-time
+/// `&'static str` arms and the args are literals, never `sh -c` (T-06-01).
 fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
     let Ok(toolchain) = gnr8_core::analyze::source_toolchain(&root.to_string_lossy()) else {
         return ("unknown".to_string(), false);
     };
-    // `go` uses the bare `version` subcommand; `python3`/`node` use the `--version` flag.
-    let version_arg = if toolchain.probe_binary() == "go" {
-        "version"
+    let present = if toolchain == gnr8_core::analyze::SourceToolchain::TypeScript {
+        // TypeScript's real toolchain is `node` + a resolvable `typescript`; the core probe verifies
+        // BOTH via the same resolution `generate` uses (WR-02 — one source of truth, no fallback).
+        gnr8_core::analyze::typescript_toolchain_present(&root.to_string_lossy())
     } else {
-        "--version"
+        // Go/Python are wholly `go`/`python3`: spawn the discrete probe binary and require a SUCCESSFUL
+        // exit (WR-05) — spawn-success alone masked a broken binary that exits non-zero. `go` uses the
+        // bare `version` subcommand; `python3` uses the `--version` flag.
+        let version_arg = if toolchain.probe_binary() == "go" {
+            "version"
+        } else {
+            "--version"
+        };
+        std::process::Command::new(toolchain.probe_binary())
+            .arg(version_arg)
+            .output()
+            .is_ok_and(|o| o.status.success())
     };
-    let present = std::process::Command::new(toolchain.probe_binary())
-        .arg(version_arg)
-        .output()
-        .is_ok();
     (toolchain.language().to_string(), present)
 }
 
