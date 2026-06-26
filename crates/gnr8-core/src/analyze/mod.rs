@@ -181,12 +181,17 @@ fn scan_markers(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip gnr8's OWN generation crate (`.gnr8/`): it is Rust pipeline code plus a `target`
-            // build tree that may vendor other-language deps, which would otherwise spoof the
-            // language detector into a false ambiguity over a project root (Open Q2 / Pitfall 2).
-            // `.gnr8/` is never the user's API source, so excluding it is correct, not a fallback.
-            if path.file_name().and_then(|n| n.to_str()) == Some(".gnr8") {
-                continue;
+            // Skip gnr8's OWN generation crate (`.gnr8/`) AND the well-known build/vendor/VCS dirs
+            // (`.git`, `node_modules`, `target`): these are Rust pipeline code, dependency caches, and
+            // build trees that may vendor other-language deps, which would otherwise spoof the language
+            // detector into a false ambiguity over an otherwise single-language project root (WR-03 /
+            // Open Q2 / Pitfall 2). None of these is ever the user's API source, so this is the SAME
+            // one deterministic skip set the runtime watch filter uses (CLAUDE.md rule 3 — one
+            // consistent rule, never a fallback). Mirrors `tsextract/load.js:49`'s `node_modules` skip.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if matches!(name, ".gnr8" | ".git" | "node_modules" | "target") {
+                    continue;
+                }
             }
             scan_markers(&path, has_go, has_python, has_ts);
             continue;
@@ -453,6 +458,45 @@ mod tests {
             result.unwrap(),
             Lang::Python,
             "the .gnr8/ crate must be excluded so a vendored other-language file does not spoof detection"
+        );
+    }
+
+    /// WR-03 regression: a single-language TypeScript tree whose root ALSO carries the well-known
+    /// build/vendor dirs (`node_modules`, `target`, `.git`) holding a vendored OTHER-language file
+    /// (`*.go`) must still classify as TypeScript — those dirs are skipped by the same deterministic
+    /// scan the watch filter uses, so a vendored other-language file cannot spoof a false ambiguity.
+    #[test]
+    fn detect_language_skips_build_and_vendor_dirs_so_vendored_files_do_not_spoof_ambiguity() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-detect-skip-vendor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        // The user's source is unambiguously TypeScript (`app.ts`); a vendored `*.go` sits under each
+        // of `node_modules/`, `target/`, and `.git/` — none of which is the user's API source.
+        std::fs::create_dir_all(dir.join("node_modules").join("pkg")).unwrap();
+        std::fs::create_dir_all(dir.join("target").join("debug")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("app.ts"), b"export const x = 1;\n").unwrap();
+        std::fs::write(
+            dir.join("node_modules").join("pkg").join("codegen.go"),
+            b"package x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("target").join("debug").join("vendored.go"),
+            b"package y\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".git").join("hook.py"), b"x = 1\n").unwrap();
+        let result = detect_language(&dir.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result.unwrap(),
+            Lang::TypeScript,
+            "node_modules/target/.git must be skipped so vendored other-language files do not spoof ambiguity"
         );
     }
 
