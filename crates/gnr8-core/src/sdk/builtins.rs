@@ -522,13 +522,9 @@ impl Target for GoSdk {
         let dir = self.dir.trim_end_matches('/');
         for (name, contents) in crate::gosdk::split_bundle(&bundle) {
             // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (mirrors gosdk::write_to_dir / the
-            // lifecycle write path, T-03-03).
-            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-                return Err(CoreError::SdkGen {
-                    message: format!("refusing to emit SDK file with unsafe name {name:?}"),
-                });
-            }
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the lifecycle write path, T-03-03).
+            super::bundle::safe_frame_name(&name)?;
             out.write(format!("{dir}/{name}"), contents);
         }
         Ok(())
@@ -617,13 +613,9 @@ impl Target for PySdk {
         let dir = self.dir.trim_end_matches('/');
         for (name, contents) in crate::pysdk::split_bundle(&bundle) {
             // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (mirrors pysdk::write_to_dir / the
-            // GoSdk target write path, T-03-02-01).
-            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-                return Err(CoreError::SdkGen {
-                    message: format!("refusing to emit SDK file with unsafe name {name:?}"),
-                });
-            }
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the GoSdk target write path, T-03-02-01).
+            super::bundle::safe_frame_name(&name)?;
             out.write(format!("{dir}/{name}"), contents);
         }
         Ok(())
@@ -712,13 +704,9 @@ impl Target for TsSdk {
         let dir = self.dir.trim_end_matches('/');
         for (name, contents) in crate::tssdk::split_bundle(&bundle) {
             // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (mirrors tssdk::write_to_dir / the
-            // PySdk target write path, T-05-02-01).
-            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-                return Err(CoreError::SdkGen {
-                    message: format!("refusing to emit SDK file with unsafe name {name:?}"),
-                });
-            }
+            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
+            // by the PySdk target write path, T-05-02-01).
+            super::bundle::safe_frame_name(&name)?;
             out.write(format!("{dir}/{name}"), contents);
         }
         Ok(())
