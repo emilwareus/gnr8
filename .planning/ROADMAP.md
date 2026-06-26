@@ -212,7 +212,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 06-02-PLAN.md — `examples/fastapi-bookstore/` + `examples/nestjs-bookstore/`: copied source + `.gnr8/` Pipeline crates (FastApi→OpenApi31+PySdk; NestJs→OpenApi31+TsSdk) + REAL committed `generated/` output; `make examples-check` cross-language regen-and-diff gate [XLANG-01, XLANG-02, XLANG-05]
+- [x] 06-02-PLAN.md — `examples/fastapi-bookstore/` + `examples/nestjs-bookstore/`: copied source + `.gnr8/` Pipeline crates (FastApi→OpenApi31+PySdk; NestJs→OpenApi31+TsSdk) + REAL committed `generated/` output; `make examples-check` cross-language regen-and-diff gate [XLANG-01, XLANG-02, XLANG-05]
 
 **Wave 3** *(blocked on Waves 1-2)*
 
@@ -234,4 +234,4 @@ dependencies.)
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
-| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 1/3 | In Progress|  |
+| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 2/3 | In Progress|  |

@@ -4,13 +4,13 @@ milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
 status: executing
 stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-26T05:38:51.542Z"
+last_updated: "2026-06-26T05:50:39.067Z"
 last_activity: 2026-06-26 -- Phase 06 execution started
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 19
-  completed_plans: 17
+  completed_plans: 18
   percent: 83
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-25)
 ## Current Position
 
 Phase: 06 (Cross-Language Hardening + Examples + Docs) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Executing Phase 06
 Last activity: 2026-06-26 -- Phase 06 execution started
 
-Progress: [█████████░] 89%
+Progress: [██████████] 95%
 
 ## Performance Metrics
 
@@ -72,6 +72,7 @@ Progress: [█████████░] 89%
 | Phase 05 P02 | 9min | 2 tasks | 3 files |
 | Phase 05 P03 | 11min | 2 tasks | 3 files |
 | Phase 06 P01 | 7min | 3 tasks | 4 files |
+| Phase 06 P02 | 18min | 3 tasks | 26 files |
 
 ## Accumulated Context
 
@@ -107,6 +108,7 @@ Recent decisions affecting current work:
 - [Phase 05]: [05-03] tssdk hermetic typecheck gate (tests/tssdk_compile.rs): generate -> write to a unique stdlib temp dir -> run the VENDORED tsc --noEmit --strict --lib es2022,dom (,dom is load-bearing: lib.dom.d.ts declares fetch) over the generated .ts (exit 0); discrete Command args + current_dir; banned-import grep; skip-if-toolchain-absent; two-run determinism. Wired into the explicit gates --test list.
 - [Phase 05]: [05-03] Rule-1 fix the gate caught: ts_type gained an ns namespace-prefix arg (one path, rule 3) — models.ts passes empty (bare), client.ts passes 'models.' so a named-enum/model PARAM resolves through the client's models import (fixed client.ts TS2304 Cannot find name BookFormat).
 - [Phase ?]: [06-01] doctor/watch follow the SOURCE language via one pub source_toolchain decision delegating to detect_language (rule 3, no fallback); LifecycleHealth.go_toolchain renamed to source_toolchain + a language field added; pinned --json field set updated in lockstep (T-06-03).
+- [Phase 06]: [06-02] Cross-language examples = copied static source + a .gnr8/ Pipeline crate (config is code, rule 4) + REAL committed gnr8 generate output. FastApi uses inputs([.]) not inputs([app]) so the source's absolute app.models imports resolve (.gnr8/ already excluded from detection); make examples-check reuses gnr8 check (exits 1 on drift) as the regen-and-diff (rule 2), wired into make check across Go/Python/TS.
 
 ### Pending Todos
 
@@ -127,7 +129,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-26T05:38:34.058Z
+Last session: 2026-06-26T05:50:11.609Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
