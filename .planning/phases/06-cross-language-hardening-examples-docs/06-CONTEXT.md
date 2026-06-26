@@ -23,8 +23,8 @@ integrates, hardens, documents, and proves what Phases 1–5 built.
   (FastAPI full; Flask typed-only with its documented gaps; NestJS class DTOs), so users know exactly
   what each frontend covers and what produces diagnostics.
 - **XLANG-04 — `doctor`/`check`/`watch` cross-language parity:** generalize toolchain detection so
-  `gnr8 doctor` probes the RIGHT toolchain per the source language (Go→go, Python→python3, TS→node+the
-  vendored typescript), and `check` (drift) + `watch` (loop-safety) work for python/ts sidecars. Today
+  `gnr8 doctor` probes the RIGHT toolchain per the source language (Go→go, Python→python3, TS→node + the
+  user's own typescript resolved from the project), and `check` (drift) + `watch` (loop-safety) work for python/ts sidecars. Today
   `doctor`/`check` are Go-toolchain-specific (`crates/gnr8/src/doctor.rs`, `main::run_doctor`).
 - **XLANG-05 — invariants + determinism:** confirm every sidecar is stdlib-only in its language (Python
   `ast`; TS = `typescript` only) and `gnr8-core` takes ZERO OSS crates; cross-language output is
@@ -39,8 +39,13 @@ new languages beyond Go/Python/TS.
 ## Implementation Decisions
 
 ### Locked (from PROJECT.md / REQUIREMENTS / STATE — non-negotiable)
-- **gnr8-core takes ZERO OSS crates** (rule 2). The ONLY toolchain OSS is the `typescript` carve-out
-  (TS sidecar only, behind the JSON-facts boundary). Generated SDKs stay dependency-free.
+- **gnr8 ships ZERO OSS** (rule 2). gnr8-core takes zero OSS crates AND gnr8 vendors/ships no
+  `typescript`. UPDATED FRAMING (post-vendoring-removal): `tsextract` borrows the USER's own
+  `typescript`, resolved from the target project (`tsextract/ts.js`) — exactly as `goextract` uses
+  the user's `go` and `pyextract` uses the user's `python3`. `typescript` is a **required user
+  toolchain**, NOT a bundled/shipped dependency (the old 23MB `tsextract/node_modules` vendoring was
+  removed; it's a gitignored devDependency restored via `npm ci` for gnr8's OWN test suite only).
+  Generated SDKs stay dependency-free.
 - **Every sidecar stdlib-only in its language:** Go (stdlib go/* — modulo the v1 known-debt
   golang.org/x/tools to retire later), Python (`ast`), TS (`typescript` only). Document, don't expand.
 - **Deterministic, byte-identical output** across languages and runs (the committed example output is the
@@ -48,10 +53,15 @@ new languages beyond Go/Python/TS.
 - **Config is code:** examples are driven by `.gnr8/` Rust Pipeline crates, NEVER data files (rule 4).
 - **Honest limits (XLANG-03):** the Flask typed-envelope gaps and the NestJS class-DTO scope are stated
   plainly in docs/USAGE.md — no overclaiming.
-- **The `typescript` carve-out must be RECORDED** in CLAUDE.md + PROJECT.md as the documented, bounded
-  rule-2 exception (language's own reference compiler, TS sidecar toolchain only, bright-line excludes
-  @nestjs/swagger/zod/class-validator; `gnr8-core` + generated SDKs stay dependency-free; FUT-04 may
-  retire it). This is an explicit deliverable (XLANG-05), not a violation.
+- **The `typescript` toolchain dependency must be RECORDED** in CLAUDE.md + PROJECT.md (XLANG-05).
+  CORRECTED FRAMING: `typescript` is a **required user toolchain** that `tsextract` resolves from the
+  target project (the language's own reference compiler) — gnr8 ships/vendors NONE of it, the same way
+  it ships no `go`/`python3`/`node`. So this is NOT a "bundled OSS dependency carve-out" — rule 2 holds
+  literally (gnr8-core zero crates; nothing OSS shipped). What IS recorded is the bright line:
+  `tsextract` reads facts ONLY from the source's own TS types via that toolchain, NEVER from
+  @nestjs/swagger/zod/class-validator; generated SDKs stay dependency-free; FUT-04 (a hand-rolled
+  stdlib-pure TS parser) could remove even the toolchain requirement. Frame it as a toolchain
+  prerequisite + bright-line, not a loosening of rule 2.
 
 ### Recommended defaults (auto-accepted; Claude's discretion at plan/exec, guided by RESEARCH)
 - **Example projects:** add `examples/fastapi-bookstore/` and `examples/nestjs-bookstore/` (or reuse the
@@ -66,10 +76,12 @@ new languages beyond Go/Python/TS.
   new output paths).
 - **docs/USAGE.md:** a per-language table (frontend → supported constructs → diagnostics/limits) plus a
   short "how to drive each language from `.gnr8/`" section. Update, don't duplicate, the existing USAGE.md.
-- **CLAUDE.md carve-out wording:** add a concise, bounded note under rule 2 (or a dedicated "Documented
-  exception" subsection) recording the `typescript` carve-out exactly as scoped above — do NOT loosen
-  rule 2 generally; it remains "zero OSS in gnr8-core, stdlib-only sidecars, the ONE exception is the TS
-  sidecar's `typescript` dependency."
+- **CLAUDE.md wording:** add a concise, bounded note under rule 2 recording that `tsextract` requires
+  the user's own `typescript` toolchain (resolved from the target project — like `go`/`python3`/`node`),
+  ships none, and reads facts only from the source's own TS types (bright-line: never
+  @nestjs/swagger/zod/class-validator). Frame as a **toolchain prerequisite + bright line**, NOT a rule-2
+  OSS-dependency exception — rule 2 ("zero OSS in gnr8-core, stdlib-only sidecars, ship nothing OSS")
+  holds literally. Also fix `docs/USAGE.md` line ~109 / any stale "vendored typescript" references.
 
 ### Optional hardening (deferred Phase-5 code-review findings — fix here if cheap, else backlog)
 - **WR-02 (TsSdk):** non-scalar query param `String()` coercion needs a defined wire-encoding rule.
@@ -106,7 +118,7 @@ doctor/check/watch code and the locked invariants.
 - `.gnr8/` Pipeline crate → `gnr8 generate` → committed `generated/`; `gnr8 check` = drift gate;
   `gnr8 watch` = loop-safe regen; `gnr8 doctor` = health aggregate. Determinism via byte-identical regen.
 - `make check` is the green gate; toolchains: Go (at /home/vercel-sandbox/.local/go-install/go/bin),
-  Python3 3.9.25, Node v24 + vendored typescript (tsextract/node_modules). PATH persisted in ~/.bashrc.
+  Python3 3.9.25, Node v24 + typescript (resolved from the target project; gnr8 ships none — a gitignored dev install backs gnr8's own tests via `make tsextract-deps`). PATH persisted in ~/.bashrc.
 
 ### Integration Points
 - New `examples/*/` projects + their `.gnr8/` crates + committed `generated/`; doctor/check/watch
@@ -120,7 +132,7 @@ doctor/check/watch code and the locked invariants.
 
 - Prove each language end-to-end from a real `.gnr8/` lifecycle with committed output (the v1 bookstore pattern).
 - doctor/check/watch must follow the source language's toolchain (single deterministic detection, reuse detect_language).
-- Record the `typescript` carve-out precisely in CLAUDE.md + PROJECT.md — bounded, not a general loosening of rule 2.
+- Record that `typescript` is a REQUIRED USER TOOLCHAIN (resolved from the target project, gnr8 ships none) + the bright line in CLAUDE.md + PROJECT.md — NOT a rule-2 OSS-dependency exception.
 - The committed example output IS the cross-language determinism proof (regen-and-diff in make check).
 
 </specifics>
