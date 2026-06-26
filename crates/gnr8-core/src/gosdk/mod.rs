@@ -11,12 +11,11 @@
 //! runs and never panics (RUST-04); [`write_to_dir`] materializes the same framing for 03-03's compile
 //! test.
 
-mod bundle;
 mod emit;
 mod gofmt;
 
 use crate::graph::{ApiGraph, Operation};
-use bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{self, SdkBundle, SdkFile};
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///

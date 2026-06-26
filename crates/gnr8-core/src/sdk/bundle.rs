@@ -1,34 +1,34 @@
 //! The multi-file SDK bundle and its deterministic file-marker framing (D-06).
 //!
-//! `pysdk::generate` returns a single `String` so the whole Python SDK is locked in one reviewable
-//! artifact. To keep that String unambiguous and round-trippable, each generated Python file is framed
-//! by a stable, greppable marker line:
+//! Each per-language `generate` returns a single `String` so the whole SDK is locked in one reviewable
+//! artifact. To keep that String unambiguous and round-trippable, each generated file is framed by a
+//! stable, greppable marker line:
 //!
 //! ```text
-//! // ==== gnr8:file client.py ====
-//! <contents of client.py>
-//! // ==== gnr8:file models.py ====
-//! <contents of models.py>
+//! // ==== gnr8:file client.go ====
+//! <contents of client.go>
+//! // ==== gnr8:file models.go ====
+//! <contents of models.go>
 //! ...
 //! ```
 //!
-//! The marker is a Go-style `//` comment line; it does NOT need to be valid Python — it never appears
-//! inside emitted Python and [`parse`] strips it before any file is written, so the framing stays
-//! byte-identical to the proven `gosdk` twin. [`parse`] splits the bundle back into `(name, contents)`
-//! pairs — the SAME framing `write_to_dir` uses to materialize files (single source of truth). File
-//! order is FIXED + sorted (`__init__.py`, `client.py`, `errors.py`, then `models.py`), and `to_string`
-//! is byte-identical across runs (determinism, PYSDK-03).
+//! The marker is a Go-style `//` comment line; it never appears inside any emitted source and [`parse`]
+//! strips it before any file is written, so the framing is shared byte-identically across the Go, Python,
+//! and TypeScript emitters (single source of truth). [`parse`] splits the bundle back into
+//! `(name, contents)` pairs — the SAME framing [`write_to_dir`] uses to materialize files. File order is
+//! FIXED + sorted by each emitter's push order, and `to_string` is byte-identical across runs
+//! (determinism).
 
-/// One generated Python file: its on-disk name (e.g. `client.py`) and its emitted contents.
+/// One generated SDK file: its on-disk name (e.g. `client.go`) and its emitted contents.
 #[derive(Debug, Clone)]
 pub(crate) struct SdkFile {
-    /// The file name written to disk and embedded in the frame marker (e.g. `"models.py"`).
+    /// The file name written to disk and embedded in the frame marker (e.g. `"models.go"`).
     pub(crate) name: String,
-    /// The emitted Python source.
+    /// The emitted source.
     pub(crate) contents: String,
 }
 
-/// An ordered set of generated Python files forming the SDK package.
+/// An ordered set of generated files forming the SDK package.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SdkBundle {
     /// Files in their fixed, sorted emission order (see module docs).
@@ -67,7 +67,7 @@ impl std::fmt::Display for SdkBundle {
 
 /// Parse a bundle String back into `(name, contents)` pairs by splitting on the frame markers.
 ///
-/// The inverse of [`SdkBundle::to_string`]; `write_to_dir` and the round-trip test share this single
+/// The inverse of [`SdkBundle::to_string`]; [`write_to_dir`] and the round-trip test share this single
 /// framing definition. Any leading text before the first marker is ignored (there is none in practice).
 /// Contents preserve the file's trailing newline.
 pub(crate) fn parse(bundle: &str) -> Vec<(String, String)> {
@@ -110,20 +110,20 @@ mod tests {
         SdkBundle {
             files: vec![
                 SdkFile {
-                    name: "__init__.py".to_string(),
-                    contents: "from .client import Client\n".to_string(),
+                    name: "client.go".to_string(),
+                    contents: "package sdk\n\nfunc NewClient() {}\n".to_string(),
                 },
                 SdkFile {
-                    name: "client.py".to_string(),
-                    contents: "class Client:\n    pass\n".to_string(),
+                    name: "errors.go".to_string(),
+                    contents: "package sdk\n\ntype APIError struct{}\n".to_string(),
                 },
                 SdkFile {
-                    name: "errors.py".to_string(),
-                    contents: "class ApiError(Exception):\n    pass\n".to_string(),
+                    name: "operations.go".to_string(),
+                    contents: "package sdk\n\nfunc (c *Client) CreateGoal() {}\n".to_string(),
                 },
                 SdkFile {
-                    name: "models.py".to_string(),
-                    contents: "from dataclasses import dataclass\n".to_string(),
+                    name: "models.go".to_string(),
+                    contents: "package sdk\n\ntype CreateGoalInput struct{}\n".to_string(),
                 },
             ],
         }
@@ -135,7 +135,7 @@ mod tests {
         let text = bundle.to_string();
 
         // Each file is framed by its marker, in the fixed order.
-        let order: Vec<_> = ["__init__.py", "client.py", "errors.py", "models.py"]
+        let order: Vec<_> = ["client.go", "errors.go", "operations.go", "models.go"]
             .iter()
             .map(|n| text.find(&format!("// ==== gnr8:file {n} ====")).unwrap())
             .collect();
@@ -166,12 +166,12 @@ mod tests {
 
     #[test]
     fn marker_never_collides_with_file_contents() {
-        // The marker prefix must not appear inside any framed Python content, or parse would mis-split.
+        // The marker prefix must not appear inside any framed content, or parse would mis-split.
         let bundle = sample_bundle();
         for file in &bundle.files {
             assert!(
                 !file.contents.contains("// ==== gnr8:file"),
-                "marker must not appear in emitted Python"
+                "marker must not appear in emitted source"
             );
         }
     }

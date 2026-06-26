@@ -14,11 +14,10 @@
 //! markers; the pipeline is byte-identical across runs and never panics (RUST-04). [`write_to_dir`]
 //! materializes the same framing.
 
-mod bundle;
 mod emit;
 
 use crate::graph::{ApiGraph, Operation};
-use bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{self, SdkBundle, SdkFile};
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
 /// TSSDK-01).
