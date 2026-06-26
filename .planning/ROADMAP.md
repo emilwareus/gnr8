@@ -219,6 +219,6 @@ dependencies.)
 | 1. Language-Neutral IR + Facts Contract + Fixtures | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
-| 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
+| 4. TypeScript Source — `tsextract` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |

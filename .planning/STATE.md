@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: executing
-stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-26T00:15:40.429Z"
+status: ready_to_plan
+stopped_at: Phase 05 complete (3/3) — ready to discuss Phase 6
+last_updated: 2026-06-26T00:38:34.066Z
 last_activity: 2026-06-25 -- Phase 05 execution started
 progress:
   total_phases: 6
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-25)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Phase 05 — TypeScript Target — TsSdk
+**Current focus:** Phase 6 — cross language hardening + examples + docs
 
 ## Current Position
 
-Phase: 05 (TypeScript Target — TsSdk) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 05
-Last activity: 2026-06-25 -- Phase 05 execution started
+Phase: 6
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-06-26
 
 Progress: [██████████] 100%
 
@@ -36,7 +36,7 @@ Progress: [██████████] 100%
 
 **Velocity:**
 
-- Total plans completed: 13 (this milestone)
+- Total plans completed: 16 (this milestone)
 - Average duration: N/A
 - Total execution time: 0.0 hours
 
@@ -48,6 +48,7 @@ Progress: [██████████] 100%
 | 02 | 4 | - | - |
 | 03 | 3 | - | - |
 | 04 | 3 | - | - |
+| 05 | 3 | - | - |
 
 **Recent Trend:**
 
