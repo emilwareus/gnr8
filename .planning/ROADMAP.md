@@ -203,7 +203,20 @@ Plans:
   3. `gnr8 doctor` / `check` / `watch` work across all supported language sidecars (toolchain detection, drift, loop-safety).
   4. Every sidecar is stdlib-only in its language (Python `ast`; TS = `typescript` only); `gnr8-core` takes zero OSS deps; all output is deterministic and byte-identical — and the `typescript` carve-out is recorded in PROJECT.md/CLAUDE.md.
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 06-01-PLAN.md — CLI parity: expose a pub source-toolchain API + generalize `doctor` probe & `watch` trigger off the single `detect_language` decision (+ pinned `--json` field-set update); `check` verified language-agnostic [XLANG-04]
+
+**Wave 2** *(blocked on Wave 1)*
+
+- [ ] 06-02-PLAN.md — `examples/fastapi-bookstore/` + `examples/nestjs-bookstore/`: copied source + `.gnr8/` Pipeline crates (FastApi→OpenApi31+PySdk; NestJs→OpenApi31+TsSdk) + REAL committed `generated/` output; `make examples-check` cross-language regen-and-diff gate [XLANG-01, XLANG-02, XLANG-05]
+
+**Wave 3** *(blocked on Waves 1-2)*
+
+- [ ] 06-03-PLAN.md — `docs/USAGE.md` honest per-language envelope; record the bounded `typescript` carve-out in CLAUDE.md (consistent w/ PROJECT.md); assert zero NEW OSS deps in gnr8-core; backlog WR-02/WR-04; full green gate [XLANG-03, XLANG-05]
 
 ## Progress
 
