@@ -179,7 +179,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 05-01-PLAN.md — `tssdk/` module (bundle/emit/mod): exhaustive `ts_type` (no `_=>`), interface models, string-literal-union enums, fetch `Client` (injectable transport), typed `ApiError`; determinism [TSSDK-01]
+- [x] 05-01-PLAN.md — `tssdk/` module (bundle/emit/mod): exhaustive `ts_type` (no `_=>`), interface models, string-literal-union enums, fetch `Client` (injectable transport), typed `ApiError`; determinism [TSSDK-01]
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -220,5 +220,5 @@ dependencies.)
 | 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
-| 5. TypeScript Target — `TsSdk` | v2.0 | 0/3 | Not started | - |
+| 5. TypeScript Target — `TsSdk` | v2.0 | 1/3 | In Progress|  |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |
