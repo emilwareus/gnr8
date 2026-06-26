@@ -102,9 +102,11 @@ GNR8_BIN := target/release/gnr8
 GO_BIN := /home/vercel-sandbox/.local/go-install/go/bin
 examples-check: tsextract-deps
 	cargo build --release -p gnr8
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # TypeScript
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go (Gin)
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/taskflow          && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go (custom-stage ApiMarkdown demo)
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python (FastAPI)
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/flask-bookstore   && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python (Flask typed-envelope)
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # TypeScript (NestJS)
 
 # Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
 # multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.

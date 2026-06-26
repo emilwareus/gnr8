@@ -1,0 +1,108 @@
+openapi: 3.1.0
+info:
+  title: Bookstore Orders API
+  version: 0.1.0
+paths:
+  '/orders/':
+    get:
+      operationId: list_orders
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderConfirmation'
+    post:
+      operationId: create_order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderInput'
+      responses:
+        '201':
+          description: Response 201
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderConfirmation'
+  '/orders/raw':
+    post:
+      operationId: create_order_raw
+      responses: {}
+  '/orders/{order_id}':
+    get:
+      operationId: get_order
+      parameters:
+      - name: order_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderConfirmation'
+components:
+  schemas:
+    Availability:
+      type: string
+      enum: [in_stock, out_of_stock]
+    OrderConfirmation:
+      type: object
+      required: [availability, lines, message, order_id]
+      properties:
+        availability:
+          $ref: '#/components/schemas/Availability'
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/Price'
+        message:
+          type: [string, null]
+        order_id:
+          type: integer
+    OrderInput:
+      type: object
+      required: [book_id, price]
+      properties:
+        book_id:
+          type: integer
+        coupon:
+          type: [string, null]
+        discount:
+          oneOf:
+          - oneOf:
+            - type: integer
+            - type: number
+          - type: null
+        note:
+          type: [string, null]
+        price:
+          $ref: '#/components/schemas/Price'
+        quantity:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+    Price:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: number
+        currency:
+          type: string
+          enum: [eur, usd]
