@@ -88,6 +88,57 @@ pub(crate) fn camel(name: &str) -> String {
     out
 }
 
+/// Escape an arbitrary wire string into a TypeScript double-quoted string literal (the quotes
+/// included).
+///
+/// This is the SINGLE deterministic helper used everywhere a wire value is emitted as a TS string
+/// literal — inline string-literal-union members ([`ts_type`]), named-enum alias members
+/// ([`emit_enum_alias`]), and quoted non-identifier interface property names ([`emit_interface`]).
+/// One path, no fallback (rule 3).
+///
+/// Enum/property values flow from arbitrary source-language string constants and are NOT constrained
+/// to identifier-safe ASCII (JSON keys/enum values routinely carry `-`, `/`, `.`, spaces, and
+/// occasionally `"`/`\`). Interpolating such a value raw into a `"…"` literal either breaks `tsc`
+/// (an embedded `"`) or SILENTLY corrupts the literal type (an embedded `\b` becomes a backspace),
+/// so the SDK's compile-time contract would no longer match the wire value. Escaping `\` and `"`
+/// (plus newline/CR/tab and other C0 control chars) preserves the wire value EXACTLY while keeping
+/// the emitted literal valid TS (CR-01).
+fn ts_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Any other C0 control char → a `\uXXXX` escape (deterministic lower-hex).
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Is `name` a plain (bare) TypeScript identifier — usable UNQUOTED as an interface member name?
+///
+/// Non-empty, first char `A-Za-z_$`, every later char `A-Za-z0-9_$`. A wire key that fails this
+/// (kebab-case, leading digit, spaces, empty) must be emitted as a QUOTED string-literal member via
+/// [`ts_string_literal`] (CR-02). Reserved words are intentionally NOT rejected: TypeScript accepts
+/// reserved words as object/interface member names, so treating them as bare identifiers is valid.
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Map a neutral graph [`Type`] to its TypeScript type, resolving named refs to model names.
 ///
 /// ALL TypeScript-specific type mapping lives HERE (per-target mapping, IR-03). The match over [`Type`]
@@ -145,7 +196,7 @@ pub(crate) fn ts_type(
         // see emit_models.
         Type::Enum(members) => members
             .iter()
-            .map(|m| format!("\"{m}\""))
+            .map(|m| ts_string_literal(m))
             .collect::<Vec<_>>()
             .join(" | "),
         // A sum type becomes a native `A | B` union (the case the Go target rejects — Go has no sum
@@ -262,15 +313,17 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
 }
 
 /// Emit a named enum alias: `export type {name} = "a" | "b";` (members in graph order). The wire string
-/// IS the literal — there are no member identifiers to sanitize (TS string-literal unions have none), so
-/// the Python `SCREAMING_SNAKE`/keyword machinery has no analog here (RESEARCH Pitfall 6).
+/// IS the literal — a string-literal union has no member *identifier* to sanitize (so the Python
+/// `SCREAMING_SNAKE`/keyword machinery has no analog here; RESEARCH Pitfall 6) — but the literal VALUE
+/// still must be escaped for a TS double-quoted string literal so an embedded `"`/`\`/control char does
+/// not break `tsc` or silently corrupt the literal type (CR-01); [`ts_string_literal`] does both.
 fn emit_enum_alias(out: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
     if members.is_empty() {
         // An empty closed set has no inhabitants — `never` is the precise TS type.
         writeln!(out, "export type {name} = never;").map_err(sink)?;
         return Ok(());
     }
-    let lits: Vec<String> = members.iter().map(|m| format!("\"{m}\"")).collect();
+    let lits: Vec<String> = members.iter().map(|m| ts_string_literal(m)).collect();
     writeln!(out, "export type {name} = {};", lits.join(" | ")).map_err(sink)?;
     Ok(())
 }
@@ -294,13 +347,20 @@ fn emit_interface(
     }
     writeln!(out, "export interface {name} {{").map_err(sink)?;
     for field in fields {
-        // The wire key (`json_name`) is the property name verbatim. A key that is not a plain
-        // identifier is still valid TS as a property name (TS accepts any string literal as a member),
-        // but the bookstore fixtures only carry identifier-safe keys; emit the key directly.
-        // An interface field references its sibling model/enum symbols BARE — same file (models.ts).
+        // The wire key (`json_name`) is the property name. A plain identifier is emitted bare; any
+        // other wire key (kebab-case, leading digit, spaces, empty) is NOT a legal bare member name,
+        // so it is emitted as a QUOTED + escaped string-literal member — TS accepts any string literal
+        // as a member name, and the quoted form keeps the wire key EXACT (CR-02). One deterministic
+        // rule, no fallback (rule 3). An interface field references its sibling model/enum symbols
+        // BARE — same file (models.ts).
+        let key = if is_ident(&field.json_name) {
+            field.json_name.clone()
+        } else {
+            ts_string_literal(&field.json_name)
+        };
         let hint = ts_type(&field.schema, field.nullable, graph, "")?;
         let opt = if field.optional { "?" } else { "" };
-        writeln!(out, "  {}{opt}: {hint};", field.json_name).map_err(sink)?;
+        writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
     writeln!(out, "}}").map_err(sink)?;
     Ok(())
@@ -1445,6 +1505,98 @@ mod tests {
         fn graph_from(facts: &[u8]) -> ApiGraph {
             let facts = serde_json::from_slice(facts).unwrap();
             ApiGraph::from_facts(facts, "/root")
+        }
+
+        // CR-01: an enum member carrying a `"`/`\`/control char must be ESCAPED into a valid TS
+        // string literal — an embedded `"` would break tsc, an embedded `\b` would silently corrupt
+        // the literal type. The wire value must be preserved exactly (escaped, not stripped).
+        #[test]
+        fn cr01_named_enum_member_with_special_chars_is_escaped() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "a.Weird", "name": "Weird",
+                  "body": { "type": "enum", "of": ["a\"b", "c\\d", "e\nf", "plain"] },
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "diagnostics": [] }"#;
+            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            // `"` is backslash-escaped (not a bare quote that would terminate the literal early).
+            assert!(
+                out.contains(r#""a\"b""#),
+                "embedded quote must be escaped:\n{out}"
+            );
+            // `\` is doubled (so `\d` cannot become an escape sequence).
+            assert!(
+                out.contains(r#""c\\d""#),
+                "backslash must be doubled:\n{out}"
+            );
+            // newline becomes `\n` (not a raw line break inside the literal).
+            assert!(out.contains(r#""e\nf""#), "newline must be escaped:\n{out}");
+            // an identifier-safe member is untouched (happy path unchanged).
+            assert!(out.contains(r#""plain""#), "plain member unchanged:\n{out}");
+            // the raw (unescaped) embedded quote must NOT appear as a bare `"a"b"`.
+            assert!(
+                !out.contains(r#""a"b""#),
+                "raw unescaped quote must not leak:\n{out}"
+            );
+        }
+
+        // CR-01 (inline-enum site): the SAME escaping must apply to an inline string-literal union.
+        #[test]
+        fn cr01_inline_enum_field_member_with_special_chars_is_escaped() {
+            use super::ts_type;
+            let g = ApiGraph::default();
+            let e = crate::graph::Type::Enum(vec!["a\"b".to_string(), "c\\d".to_string()]);
+            assert_eq!(ts_type(&e, false, &g, "").unwrap(), r#""a\"b" | "c\\d""#);
+        }
+
+        // CR-02: a non-identifier wire key (kebab-case, leading digit, spaces) must be emitted as a
+        // QUOTED member name — a bare `content-type?:` is a tsc parse error. The wire key stays exact.
+        #[test]
+        fn cr02_non_identifier_field_name_is_quoted() {
+            let facts = br#"{
+              "module": "app", "routes": [],
+              "schemas": [
+                { "id": "a.Headers", "name": "Headers",
+                  "body": { "type": "object", "of": [
+                    { "json_name": "content-type", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null },
+                    { "json_name": "123abc", "required": false, "optional": true, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                      "description": null, "example": null },
+                    { "json_name": "user name", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null },
+                    { "json_name": "plainKey", "required": true, "optional": false, "nullable": false,
+                      "schema": { "type": "primitive", "of": { "prim": "bool" } },
+                      "description": null, "example": null }
+                  ] },
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "diagnostics": [] }"#;
+            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            // kebab-case key → quoted (the `?`/`:` stay OUTSIDE the quotes).
+            assert!(
+                out.contains(r#"  "content-type": string;"#),
+                "kebab-case key must be quoted:\n{out}"
+            );
+            // leading-digit key → quoted, and the optional `?` stays outside the quotes.
+            assert!(
+                out.contains(r#"  "123abc"?: number;"#),
+                "leading-digit optional key must be quoted with `?` outside:\n{out}"
+            );
+            // key with a space → quoted.
+            assert!(
+                out.contains(r#"  "user name": string;"#),
+                "spaced key must be quoted:\n{out}"
+            );
+            // an identifier-safe key stays UNQUOTED (happy path unchanged — snapshot-safe).
+            assert!(
+                out.contains("  plainKey: boolean;"),
+                "identifier-safe key stays bare:\n{out}"
+            );
         }
 
         // WR-05: two distinct schema ids sharing a TS name is a typed error (no silent redeclaration).
