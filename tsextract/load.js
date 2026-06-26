@@ -18,7 +18,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const ts = require("typescript");
+const ts = require("./ts");
 
 // One loaded program: the `ts.Program`, its `TypeChecker`, the discovered file
 // list, and the canonical target directory (for relative-id derivation).

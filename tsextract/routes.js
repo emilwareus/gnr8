@@ -22,7 +22,7 @@
 // span. A ParamFact has EXACTLY name, location, required, schema, span. A
 // ResponseFact has EXACTLY status, body — body = {ref_id:<id>} or null.
 
-const ts = require("typescript");
+const ts = require("./ts");
 
 const load = require("./load");
 const types = require("./types");

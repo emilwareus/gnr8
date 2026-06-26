@@ -26,7 +26,7 @@
 // `description`/`example` always null. `required = !optional` (nullable does NOT
 // affect required — RESEARCH Pitfall 3).
 
-const ts = require("typescript");
+const ts = require("./ts");
 
 const load = require("./load");
 const types = require("./types");

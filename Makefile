@@ -18,7 +18,7 @@
 # they fail honestly. They flip green with ZERO snapshot edits when pyextract (Phase 2) and
 # tsextract (Phase 4) land. `make gates` mirrors the blocking CI `gates` job.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all tsextract-deps
 
 # Auto-format the workspace in place.
 fmt:
@@ -44,8 +44,9 @@ test:
 # pysdk_compile (temp dir + bookstore package + py_compile + import + stdlib http.server round-trip:
 # 2xx dataclass + 4xx typed ApiError via an injected OpenerDirector, PYSDK-02 — actually RUNS here since
 # python3 is present), tssdk_compile (temp dir + generate the TS SDK + the hermetic
-# `tsc --noEmit --strict --lib es2022,dom` typecheck via the VENDORED typescript + a banned-import grep,
-# TSSDK-02 — actually RUNS here since node + the vendored tsc are present), the `sdk_pipeline`
+# `tsc --noEmit --strict --lib es2022,dom` typecheck via the dev-installed typescript (`make tsextract-deps`;
+# in real use the user's own project typescript) + a banned-import grep,
+# TSSDK-02 — actually RUNS here since node + typescript are present), the `sdk_pipeline`
 # SDK-framework integration test, and the `lifecycle` suite
 # (manifest round-trip + the
 # pure `plan_writes` truth table over synthetic Artifacts + the `.gnr8/` crate scaffold + the
@@ -59,6 +60,14 @@ gates:
 	cargo test -p gnr8
 	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test tssdk_compile --test sdk_pipeline --test lifecycle
 	cargo test -p gnr8-core --test snapshot_nestjs_graph --test snapshot_nestjs_openapi
+
+# Restore the `typescript` toolchain for gnr8's OWN test suite (the nestjs snapshot extraction +
+# the tssdk_compile typecheck). gnr8 ships NO typescript — in real use `tsextract` borrows the user's
+# own `typescript` from the target project (like goextract uses `go`, pyextract uses `python3`). This
+# dev install is gitignored and restored on demand. No-op (and the dependent tests skip gracefully)
+# when node/npm is absent. `npm ci` is offline+reproducible against the committed package-lock.json.
+tsextract-deps:
+	@command -v npm >/dev/null 2>&1 && (cd tsextract && npm ci --silent) || echo "npm absent — TS tests will skip"
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
@@ -79,6 +88,6 @@ red:
 
 # Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
 # multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.
-check: fmt-check clippy test fixture-build goextract-build
+check: fmt-check clippy tsextract-deps test fixture-build goextract-build
 
 all: check

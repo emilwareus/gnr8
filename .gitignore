@@ -35,14 +35,12 @@ target
 __pycache__/
 *.pyc
 
-# Node sidecar dependencies.
-# VENDORING DECISION (04-01, Option A — hermetic): the tsextract sidecar's SOLE dependency
-# (`typescript`, the documented rule-2 carve-out — zero transitive deps, ~23M) is COMMITTED so tests
-# run offline with no `npm ci` step, mirroring the Go test's offline ethos. Ignore node_modules
-# everywhere by default, then NEGATE for tsextract/ so the vendored typescript stays tracked.
+# Node sidecar dependencies — never committed.
+# `tsextract` borrows the USER's own `typescript` (resolved from the target project, like goextract
+# uses `go` and pyextract uses `python3`); gnr8 ships no typescript. `typescript` is a devDependency
+# for gnr8's OWN test suite only — restored on demand via `npm ci` in tsextract/ (gitignored), with
+# the snapshot/typecheck tests skipping gracefully if node/typescript is absent.
 node_modules/
-!tsextract/node_modules/
-!tsextract/node_modules/**
 
 # GSD transient state / sensitive auth-capture inbox — never commit
 .planning/HANDOFF.json

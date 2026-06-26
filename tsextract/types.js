@@ -30,7 +30,7 @@
 // no third-party schema-annotation / validation library on the target is ever read.
 
 const path = require("path");
-const ts = require("typescript");
+const ts = require("./ts");
 
 const load = require("./load");
 
