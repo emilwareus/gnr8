@@ -46,7 +46,7 @@ paths, static-only extraction, deterministic byte-identical output).
 - [x] **Phase 3: Python Target — `PySdk`** - Dependency-free `urllib` + `@dataclass` SDK with a typed `ApiError`; hermetic generate-and-run test against the FastAPI fixture; `PySdk` Target built-in. (completed 2026-06-25)
 - [x] **Phase 4: TypeScript Source — `tsextract`** - NestJS recognizer on the `typescript` Compiler API with bright-line third-party-schema exclusions; `NestJs` Source built-in (the documented rule-2 carve-out). (completed 2026-06-25)
 - [x] **Phase 5: TypeScript Target — `TsSdk`** - Dependency-free `fetch`-based typed client; hermetic `tsc --noEmit` typecheck; `TsSdk` Target built-in. (completed 2026-06-26)
-- [ ] **Phase 6: Cross-Language Hardening + Examples + Docs** - FastAPI + NestJS `.gnr8/` example lifecycles with real committed output; per-language envelope tables in `docs/USAGE.md`; doctor/check/watch parity; cross-language determinism; record the `typescript` carve-out.
+- [x] **Phase 6: Cross-Language Hardening + Examples + Docs** - FastAPI + NestJS `.gnr8/` example lifecycles with real committed output; per-language envelope tables in `docs/USAGE.md`; doctor/check/watch parity; cross-language determinism; record the `typescript` carve-out. (completed 2026-06-26)
 
 ## Phase Details
 
@@ -216,7 +216,7 @@ Plans:
 
 **Wave 3** *(blocked on Waves 1-2)*
 
-- [ ] 06-03-PLAN.md — `docs/USAGE.md` honest per-language envelope; record the bounded `typescript` carve-out in CLAUDE.md (consistent w/ PROJECT.md); assert zero NEW OSS deps in gnr8-core; backlog WR-02/WR-04; full green gate [XLANG-03, XLANG-05]
+- [x] 06-03-PLAN.md — `docs/USAGE.md` honest per-language envelope; record the bounded `typescript` carve-out in CLAUDE.md (consistent w/ PROJECT.md); assert zero NEW OSS deps in gnr8-core; backlog WR-02/WR-04; full green gate [XLANG-03, XLANG-05]
 
 ## Progress
 
@@ -234,7 +234,7 @@ dependencies.)
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
-| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 2/3 | In Progress|  |
+| 6. Cross-Language Hardening + Examples + Docs | v2.0 | 3/3 | Complete   | 2026-06-26 |
 
 ## Backlog (deferred)
 

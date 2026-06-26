@@ -51,7 +51,7 @@ Requirements for this milestone. Each maps to exactly one roadmap phase.
 
 - [x] **XLANG-01**: A developer drives a **FastAPI** service end-to-end (`gnr8 generate`) → OpenAPI 3.1 + a Python SDK from a `.gnr8/` lifecycle, with real committed example output.
 - [x] **XLANG-02**: A developer drives a **NestJS** service end-to-end → OpenAPI 3.1 + a TS SDK from a `.gnr8/` lifecycle, with real committed example output.
-- [ ] **XLANG-03**: `docs/USAGE.md` documents the honest per-language supported envelope (FastAPI full; Flask typed-only; NestJS class DTOs), with limits stated.
+- [x] **XLANG-03**: `docs/USAGE.md` documents the honest per-language supported envelope (FastAPI full; Flask typed-only; NestJS class DTOs), with limits stated.
 - [x] **XLANG-04**: `gnr8 doctor` / `check` / `watch` work across all supported language sidecars (toolchain detection, drift, loop-safety).
 - [x] **XLANG-05**: Every sidecar is stdlib-only in its language (Python `ast`; TS = `typescript` only); `gnr8-core` takes zero OSS deps; all output is deterministic.
 
@@ -110,7 +110,7 @@ Each requirement maps to exactly one phase (v2.0 phases restart at 1 — `--rese
 | TSSDK-03 | Phase 5 | Complete |
 | XLANG-01 | Phase 6 | Complete |
 | XLANG-02 | Phase 6 | Complete |
-| XLANG-03 | Phase 6 | Pending |
+| XLANG-03 | Phase 6 | Complete |
 | XLANG-04 | Phase 6 | Complete |
 | XLANG-05 | Phase 6 | Complete |
 

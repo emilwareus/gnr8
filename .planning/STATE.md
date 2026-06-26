@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: executing
-stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-26T05:50:39.067Z"
-last_activity: 2026-06-26 -- Phase 06 execution started
+status: ready_for_verification
+stopped_at: Completed 06-03-PLAN.md (phase 06 complete, v2.0 ready for verification)
+last_updated: "2026-06-26T06:00:00.000Z"
+last_activity: 2026-06-26 -- Phase 06 complete (final plan 06-03 executed); v2.0 ready for verification
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 19
-  completed_plans: 18
-  percent: 83
+  completed_plans: 19
+  percent: 100
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-25)
 
 ## Current Position
 
-Phase: 06 (Cross-Language Hardening + Examples + Docs) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 06
-Last activity: 2026-06-26 -- Phase 06 execution started
+Phase: 06 (Cross-Language Hardening + Examples + Docs) — COMPLETE
+Plan: 3 of 3 (all complete)
+Status: Phase 06 complete — v2.0 ready for verification
+Last activity: 2026-06-26 -- Phase 06 complete (final plan 06-03 executed)
 
-Progress: [██████████] 95%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -73,6 +73,7 @@ Progress: [██████████] 95%
 | Phase 05 P03 | 11min | 2 tasks | 3 files |
 | Phase 06 P01 | 7min | 3 tasks | 4 files |
 | Phase 06 P02 | 18min | 3 tasks | 26 files |
+| Phase 06 P03 | 9min | 4 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -84,6 +85,7 @@ Recent decisions affecting current work:
 - [v2.0]: Each new language = a sidecar emitting the SAME JSON facts contract (`crates/gnr8-core/src/analyze/facts.rs`, `deny_unknown_fields`) + one new SDK `Target`; the Rust lowering → OpenAPI pipeline is reused, never forked. The router-agnostic IR is the narrow waist.
 - [v2.0]: Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing/executing user code (importing = executing = a security boundary). Static-only; unresolved → diagnostic, never a fallback (rule 3).
 - [v2.0]: TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar — the single documented rule-2 carve-out (the language's own reference compiler, zero-dependency, behind the JSON-facts boundary). Bright line: never read `@nestjs/swagger` / `zod` / `class-validator` (rule 1).
+- [Phase 06]: [06-03] CORRECTED FRAMING — `typescript` is recorded as a REQUIRED USER TOOLCHAIN (tsextract borrows the user's own via `tsextract/ts.js`, exactly as goextract uses `go` / pyextract uses `python3`), NOT a shipped/bundled/vendored dep. gnr8 ships ZERO OSS, so rule 2 holds LITERALLY (not a carve-out/loosening). CLAUDE.md `### TypeScript toolchain (required, not shipped)` + PROJECT.md reworded to agree; bright line still excludes @nestjs/swagger/zod/class-validator. XLANG-05 "zero OSS" = add no NEW dep (the four debt crates unchanged, NOT retired); WR-02/WR-04 backlogged 999.x; `make check` incl. `examples-check` green end-to-end. Phase 06 + v2.0 ready for verification.
 - [v2.0]: Generated SDKs stay dependency-free (`PySdk` = stdlib `urllib` + `@dataclass`; `TsSdk` = built-in `fetch` + typed interfaces), like the v1.0 Go SDK's `net/http`.
 - [v1.0]: OpenAPI is an artifact, not the internal model; the graph is the source of truth; deterministic byte-identical output (carried forward, still in force).
 - [Phase ?]: [01-01] Neutral Type enum: adjacently-tagged ({type,of}); Prim internally-tagged; Type::Any = empty struct variant for buffered deny_unknown_fields safety. IR re-exports the facts vocabulary (one definition, zero drift).
@@ -129,7 +131,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-06-26T05:50:11.609Z
+Last session: 2026-06-26T05:59:30.054Z
 Stopped at: Completed 01-03-PLAN.md (phase 01 complete)
 Resume file: None
 
