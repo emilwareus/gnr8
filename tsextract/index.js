@@ -70,10 +70,15 @@ function main(argv) {
     process.stdout.write(run(targetDir));
     process.stdout.write("\n");
   } catch (exc) {
-    // Surface ANY failure (an unhandled shape -> TypeError, etc.) to stderr so a genuine internal
-    // bug is diagnosable, not masked as a clean tool diagnostic. stdout stays facts-only; the
-    // non-zero exit still maps to HelperExit.
-    process.stderr.write("tsextract: " + (exc && exc.stack ? exc.stack : exc) + "\n");
+    // A missing `typescript` toolchain (WR-04) is a USER gap, not an internal bug: render its message
+    // as the clean one-line diagnostic. ANY OTHER failure (an unhandled shape -> TypeError, etc.) keeps
+    // the full stack so a genuine internal bug stays diagnosable. stdout stays facts-only; the non-zero
+    // exit still maps to HelperExit either way.
+    if (exc && exc.toolchainMissing) {
+      process.stderr.write(exc.message + "\n");
+    } else {
+      process.stderr.write("tsextract: " + (exc && exc.stack ? exc.stack : exc) + "\n");
+    }
     return 1;
   }
   return 0;
