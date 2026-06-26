@@ -89,6 +89,80 @@ pub(crate) fn detect_language(target_dir: &str) -> Result<Lang, crate::CoreError
     }
 }
 
+/// The source language's toolchain identity, as the gnr8 CLI needs it.
+///
+/// This is the SINGLE public face of the language detector for the CLI (`doctor`/`watch`): it carries
+/// the discrete probe-binary name and the watch trigger extension per language WITHOUT exposing the
+/// internal [`Lang`]/[`detect_language`] surface or letting a caller re-derive the language a second way
+/// (CLAUDE.md rule 3 — one source of truth). It is produced ONLY by [`source_toolchain`], which maps the
+/// one [`detect_language`] decision onto these arms — never a try-one-then-fall-back chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceToolchain {
+    /// A Go module — probed with `go version`, watched on `*.go`.
+    Go,
+    /// A Python package/app — probed with `python3 --version`, watched on `*.py`.
+    Python,
+    /// A TypeScript project — probed with `node --version`, watched on `*.ts`.
+    TypeScript,
+}
+
+impl SourceToolchain {
+    /// The discrete binary name to spawn as a presence probe (`go` / `python3` / `node`).
+    ///
+    /// A compile-time `&'static str` (one of three arms), never user input — the caller spawns it with
+    /// DISCRETE literal version args, never `sh -c` (T-06-01).
+    #[must_use]
+    pub fn probe_binary(self) -> &'static str {
+        match self {
+            Self::Go => "go",
+            Self::Python => "python3",
+            Self::TypeScript => "node",
+        }
+    }
+
+    /// The source-file extension (no leading dot) a watch edit must carry to trigger regeneration
+    /// (`go` / `py` / `ts`).
+    #[must_use]
+    pub fn source_extension(self) -> &'static str {
+        match self {
+            Self::Go => "go",
+            Self::Python => "py",
+            Self::TypeScript => "ts",
+        }
+    }
+
+    /// A short, stable language label for reports (`"go"` / `"python"` / `"typescript"`).
+    #[must_use]
+    pub fn language(self) -> &'static str {
+        match self {
+            Self::Go => "go",
+            Self::Python => "python",
+            Self::TypeScript => "typescript",
+        }
+    }
+}
+
+/// Resolve the source language's toolchain identity for a directory by the ONE [`detect_language`]
+/// decision (CLI-facing surface for `doctor`/`watch`).
+///
+/// This is a PURE MAPPING over the single classifier — it delegates to [`detect_language`] and maps each
+/// [`Lang`] arm to the matching [`SourceToolchain`] arm. It is NOT a second detector and NOT a
+/// try-go-then-python fallback (CLAUDE.md rule 3): there is exactly one file scan, exactly one decision.
+/// `detect_language`'s typed ambiguity/none [`crate::CoreError::Config`] propagates unchanged so an
+/// undetectable/mixed tree is surfaced, never guessed (the caller reports it as a finding, not a panic).
+///
+/// # Errors
+///
+/// Propagates [`detect_language`]'s [`crate::CoreError::Config`] when `dir` holds more than one of
+/// Go/Python/TypeScript source (ambiguous) or none.
+pub fn source_toolchain(dir: &str) -> Result<SourceToolchain, crate::CoreError> {
+    Ok(match detect_language(dir)? {
+        Lang::Go => SourceToolchain::Go,
+        Lang::Python => SourceToolchain::Python,
+        Lang::TypeScript => SourceToolchain::TypeScript,
+    })
+}
+
 /// Recursively record Go (`go.mod`/`*.go`), Python (`*.py`), and TypeScript (`tsconfig.json`/`*.ts`)
 /// marker presence under `dir`.
 ///
@@ -107,6 +181,13 @@ fn scan_markers(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // Skip gnr8's OWN generation crate (`.gnr8/`): it is Rust pipeline code plus a `target`
+            // build tree that may vendor other-language deps, which would otherwise spoof the
+            // language detector into a false ambiguity over a project root (Open Q2 / Pitfall 2).
+            // `.gnr8/` is never the user's API source, so excluding it is correct, not a fallback.
+            if path.file_name().and_then(|n| n.to_str()) == Some(".gnr8") {
+                continue;
+            }
             scan_markers(&path, has_go, has_python, has_ts);
             continue;
         }
@@ -164,7 +245,7 @@ mod tests {
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{detect_language, Lang};
+    use super::{detect_language, source_toolchain, Lang, SourceToolchain};
     use crate::CoreError;
 
     const FASTAPI_FIXTURE_DIR: &str = concat!(
@@ -272,6 +353,106 @@ mod tests {
         assert!(
             matches!(&result, Err(CoreError::Config { message }) if message.contains("ambiguous")),
             "a mixed Go/Python tree must be a typed Config error naming the ambiguity, got {result:?}"
+        );
+    }
+
+    /// `source_toolchain` is the CLI-facing mapping over the SINGLE `detect_language` decision: a
+    /// single-language fixture returns the matching arm (with the right probe binary + extension +
+    /// language label), proving the delegation maps each `Lang` to its `SourceToolchain` (rule 3 — one
+    /// decision, never a fallback). The arm's accessors are checked so the CLI gets the right discrete
+    /// probe binary and watch extension.
+    #[test]
+    fn source_toolchain_maps_single_language_fixtures_to_the_right_arm() {
+        let go = source_toolchain(GOALSERVICE_FIXTURE_DIR).unwrap();
+        assert_eq!(go, SourceToolchain::Go);
+        assert_eq!(go.probe_binary(), "go");
+        assert_eq!(go.source_extension(), "go");
+        assert_eq!(go.language(), "go");
+
+        let py = source_toolchain(FASTAPI_FIXTURE_DIR).unwrap();
+        assert_eq!(py, SourceToolchain::Python);
+        assert_eq!(py.probe_binary(), "python3");
+        assert_eq!(py.source_extension(), "py");
+        assert_eq!(py.language(), "python");
+
+        let ts = source_toolchain(NESTJS_FIXTURE_DIR).unwrap();
+        assert_eq!(ts, SourceToolchain::TypeScript);
+        assert_eq!(ts.probe_binary(), "node");
+        assert_eq!(ts.source_extension(), "ts");
+        assert_eq!(ts.language(), "typescript");
+    }
+
+    /// `source_toolchain` over a mixed (ambiguous) tree propagates the SAME typed `CoreError::Config`
+    /// `detect_language` raises — it never guesses an arm. A freshly-created temp dir with both a `*.go`
+    /// and a `*.py` marker exercises the ambiguity path (the no-fallback invariant, rule 3).
+    #[test]
+    fn source_toolchain_propagates_config_error_on_a_mixed_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-toolchain-mixed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.go"), b"package main\n").unwrap();
+        std::fs::write(dir.join("app.py"), b"x = 1\n").unwrap();
+        let result = source_toolchain(&dir.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(result, Err(CoreError::Config { .. })),
+            "a mixed tree must propagate a typed Config error, never guess an arm, got {result:?}"
+        );
+    }
+
+    /// `source_toolchain` over an empty dir propagates the typed `CoreError::Config` (no markers) —
+    /// never a panic, never a default arm.
+    #[test]
+    fn source_toolchain_propagates_config_error_on_an_empty_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-toolchain-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = source_toolchain(&dir.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(result, Err(CoreError::Config { .. })),
+            "an empty tree must propagate a typed Config error, got {result:?}"
+        );
+    }
+
+    /// `detect_language` (and thus `source_toolchain`) excludes a nested `.gnr8/` crate from the scan:
+    /// a single-language source tree carrying a `.gnr8/` dir with another language's files under it must
+    /// still classify as the source language, not trip the ambiguity guard (Open Q2 / Pitfall 2).
+    #[test]
+    fn detect_language_excludes_the_dot_gnr8_crate_from_the_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-detect-skip-gnr8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        // The user's source is Python (`app.py`); the `.gnr8/` crate holds Rust + a vendored `*.go`
+        // under target — which must NOT spoof the detector into Go or into an ambiguity error.
+        std::fs::create_dir_all(dir.join(".gnr8").join("target")).unwrap();
+        std::fs::write(dir.join("app.py"), b"x = 1\n").unwrap();
+        std::fs::write(dir.join(".gnr8").join("src.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.join(".gnr8").join("target").join("vendored.go"),
+            b"package x\n",
+        )
+        .unwrap();
+        let result = detect_language(&dir.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result.unwrap(),
+            Lang::Python,
+            "the .gnr8/ crate must be excluded so a vendored other-language file does not spoof detection"
         );
     }
 
