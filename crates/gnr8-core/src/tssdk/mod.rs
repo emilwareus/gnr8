@@ -63,7 +63,7 @@ pub fn generate(
 
     files.push(SdkFile {
         name: "index.ts".to_string(),
-        contents: emit::emit_index(graph, package),
+        contents: emit::emit_index(graph, package)?,
     });
 
     files.push(SdkFile {

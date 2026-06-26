@@ -259,14 +259,19 @@ fn ts_primitive(prim: &Prim) -> &'static str {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if a field's schema cannot be mapped or two schemas collide on a name.
-pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
-    let mut out = String::new();
-
-    // Schema NAMES (not ids) become the TypeScript top-level symbols (interface/type) and the index.ts
-    // re-export surface. Two distinct ids that share a name would emit two `interface Book` definitions
-    // (a TS redeclaration error) and a duplicated re-export (WR-05). The graph does not guarantee
-    // name-uniqueness across ids, so reject a true collision with a typed error rather than emit
-    // silently-broken TypeScript. One deterministic check; no fallback (rule 3).
+/// Reject a graph in which two distinct schema ids map to the SAME TypeScript symbol name.
+///
+/// Schema NAMES (not ids) become the TypeScript top-level symbols (interface/type) in `models.ts` AND
+/// the `index.ts` re-export surface. Two distinct ids sharing a name would emit two `interface Book`
+/// definitions (a TS redeclaration error) and a duplicated re-export (WR-05). The graph does not
+/// guarantee name-uniqueness across ids, so this is the SINGLE shared check both `emit_models` and
+/// `emit_index` call, so the two passes can never drift on which names are legal (rule 3: one source of
+/// truth, no fallback). One deterministic pass over the graph-sorted schemas.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on the first duplicated TypeScript name.
+fn check_unique_schema_names(graph: &ApiGraph) -> Result<(), CoreError> {
     let mut seen_names: Vec<&str> = Vec::with_capacity(graph.schemas.len());
     for schema in &graph.schemas {
         if seen_names.contains(&schema.name.as_str()) {
@@ -280,6 +285,13 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
         }
         seen_names.push(schema.name.as_str());
     }
+    Ok(())
+}
+
+pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+    let mut out = String::new();
+
+    check_unique_schema_names(graph)?;
 
     for (i, schema) in graph.schemas.iter().enumerate() {
         if i > 0 {
@@ -832,7 +844,18 @@ fn emit_op_dispatch(
 /// Emit `index.ts`: re-export `Client`, `ApiError`, and every named model/enum symbol so a consumer can
 /// `import { Client, Book } from "<pkg>"`. Symbols are emitted in graph order (deterministic). Twin of
 /// `pysdk::emit::emit_init`.
-pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> String {
+///
+/// Shares the SINGLE [`check_unique_schema_names`] validator with [`emit_models`] so the re-export
+/// surface can never drift from the model definitions: a duplicate schema name is rejected here too
+/// (WR-05), regardless of the `generate` call order (this runs before `emit_models`). One source of
+/// truth, no second rule (rule 3).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] when two schemas map to the same TypeScript symbol name.
+pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+    check_unique_schema_names(graph)?;
+
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
     out.push_str("export type { ClientOptions } from \"./client\";\n");
@@ -844,11 +867,11 @@ pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> String {
     if !names.is_empty() {
         out.push_str("export type {\n");
         for name in &names {
-            let _ = writeln!(out, "  {name},");
+            writeln!(out, "  {name},").map_err(sink)?;
         }
         out.push_str("} from \"./models\";\n");
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1528,7 +1551,7 @@ mod tests {
 
         #[test]
         fn index_reexports_client_apierror_and_every_model() {
-            let out = emit_index(&ops_graph(), "bookstore");
+            let out = emit_index(&ops_graph(), "bookstore").unwrap();
             assert!(
                 out.contains("export { Client } from \"./client\";"),
                 "{out}"
