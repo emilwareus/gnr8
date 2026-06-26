@@ -277,7 +277,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             // Python's `class X(str, enum.Enum)` and Go's `type X string`.
             Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
             // A named object → an `interface`.
-            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph)?,
+            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
             // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
             // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
@@ -294,6 +294,31 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
                 let alias = ts_type(&schema.body, false, graph, "")?;
                 writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Emit one model schema into its own TypeScript file.
+pub(crate) fn emit_model_schema(
+    graph: &ApiGraph,
+    schema: &crate::graph::Schema,
+) -> Result<String, CoreError> {
+    check_unique_schema_names(graph)?;
+    let mut out = String::new();
+    out.push_str("import type * as models from \"./index\";\n\n");
+    match &schema.body {
+        Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
+        Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "models.")?,
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => {
+            let alias = ts_type(&schema.body, false, graph, "models.")?;
+            writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
         }
     }
     Ok(out)
@@ -326,6 +351,7 @@ fn emit_interface(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    ns: &str,
 ) -> Result<(), CoreError> {
     if fields.is_empty() {
         // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
@@ -345,7 +371,7 @@ fn emit_interface(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let hint = ts_type(&field.schema, field.nullable, graph, "")?;
+        let hint = ts_type(&field.schema, field.nullable, graph, ns)?;
         let opt = if field.optional { "?" } else { "" };
         writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
@@ -381,26 +407,33 @@ export class ApiError extends Error {
 /// the platform `fetch` — the swappable injectable transport seam (RESEARCH Pattern 3). No `axios` /
 /// `node-fetch` import; `typeof fetch` needs the DOM lib at typecheck time (handled by the test's
 /// `--lib es2022,dom`).
-pub(crate) fn emit_client(_package: &str) -> String {
-    "\
-import { ApiError } from \"./errors\";
-import * as models from \"./models\";
-
-export interface ClientOptions {
-  baseUrl: string;
-  fetch?: typeof fetch;
+#[cfg(test)]
+pub(crate) fn emit_client(package: &str) -> String {
+    emit_client_with_models(package, "models")
 }
 
-export class Client {
+/// Emit `client.ts` with a configurable model-barrel import path.
+pub(crate) fn emit_client_with_models(_package: &str, model_module: &str) -> String {
+    format!(
+        "\
+import {{ ApiError }} from \"./errors\";
+import * as models from \"./{model_module}\";
+
+export interface ClientOptions {{
+  baseUrl: string;
+  fetch?: typeof fetch;
+}}
+
+export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
 
-  constructor(opts: ClientOptions) {
+  constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
-  }
+  }}
 "
-    .to_string()
+    )
 }
 
 /// Emit `client.ts`'s operation methods (appended to the client file by [`generate`]).
@@ -668,16 +701,26 @@ fn emit_op_query(
     if query_params.is_empty() {
         return Ok(());
     }
-    writeln!(out, "    const query = new URLSearchParams();").map_err(sink)?;
+    writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        writeln!(out, "    query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+        writeln!(
+            out,
+            "    searchParams.set(\"{}\", String({ident}));",
+            p.name
+        )
+        .map_err(sink)?;
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        writeln!(out, "      query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+        writeln!(
+            out,
+            "      searchParams.set(\"{}\", String({ident}));",
+            p.name
+        )
+        .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    writeln!(out, "    const qs = query.toString();").map_err(sink)?;
+    writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
     writeln!(out, "    if (qs) {{").map_err(sink)?;
     writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
@@ -734,7 +777,17 @@ fn emit_op_dispatch(
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] when two schemas map to the same TypeScript symbol name.
-pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+#[cfg(test)]
+pub(crate) fn emit_index(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
+    emit_index_with_models(graph, package, "models")
+}
+
+/// Emit `index.ts` with a configurable model-barrel export path.
+pub(crate) fn emit_index_with_models(
+    graph: &ApiGraph,
+    _package: &str,
+    model_module: &str,
+) -> Result<String, CoreError> {
     check_unique_schema_names(graph)?;
 
     let mut out = String::new();
@@ -750,7 +803,22 @@ pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> Result<String, Cor
         for name in &names {
             writeln!(out, "  {name},").map_err(sink)?;
         }
-        out.push_str("} from \"./models\";\n");
+        writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
+    }
+    Ok(out)
+}
+
+/// Emit `models/index.ts` for split-model layout.
+pub(crate) fn emit_models_index(graph: &ApiGraph) -> Result<String, CoreError> {
+    check_unique_schema_names(graph)?;
+    let mut out = String::new();
+    for schema in &graph.schemas {
+        writeln!(
+            out,
+            "export * from \"./{}\";",
+            crate::sdk::emit_common::file_stem(&schema.name)
+        )
+        .map_err(sink)?;
     }
     Ok(out)
 }
@@ -1263,7 +1331,7 @@ mod tests {
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("query.set(\"cursor\", String(cursor));"),
+                out.contains("searchParams.set(\"cursor\", String(cursor));"),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -1335,7 +1403,7 @@ mod tests {
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(out.contains("query.set(\"q\", String(q));"), "{out}");
+            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 

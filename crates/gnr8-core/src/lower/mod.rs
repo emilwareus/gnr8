@@ -69,6 +69,29 @@ pub fn to_openapi(
     base_path: &str,
     security: &[GraphSecurityScheme],
 ) -> Result<String, crate::CoreError> {
+    let doc = build_openapi_doc(graph, title, base_path, security)?;
+    Ok(yaml::write(&doc))
+}
+
+/// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document serialized as pretty JSON.
+pub fn to_openapi_json(
+    graph: &ApiGraph,
+    title: &str,
+    base_path: &str,
+    security: &[GraphSecurityScheme],
+) -> Result<String, crate::CoreError> {
+    let doc = build_openapi_doc(graph, title, base_path, security)?;
+    serde_json::to_string_pretty(&doc).map_err(|err| crate::CoreError::Lowering {
+        message: format!("failed to serialize OpenAPI JSON: {err}"),
+    })
+}
+
+fn build_openapi_doc(
+    graph: &ApiGraph,
+    title: &str,
+    base_path: &str,
+    security: &[GraphSecurityScheme],
+) -> Result<OpenApiDoc, crate::CoreError> {
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
         .schemas
@@ -80,7 +103,7 @@ pub fn to_openapi(
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
     let security = build_security(security)?;
 
-    let doc = OpenApiDoc {
+    Ok(OpenApiDoc {
         openapi: "3.1.0",
         info: Info {
             title: title.to_string(),
@@ -93,9 +116,7 @@ pub fn to_openapi(
             security_schemes: security.schemes,
             schemas,
         },
-    };
-
-    Ok(yaml::write(&doc))
+    })
 }
 
 /// The lowered security: the top-level `security` requirements and the `components.securitySchemes`,

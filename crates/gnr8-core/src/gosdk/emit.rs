@@ -66,6 +66,11 @@ pub(crate) fn exported(name: &str) -> String {
             }
         }
     }
+    if out.is_empty() {
+        out.push_str("Value");
+    } else if !out.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) {
+        out.insert_str(0, "Value");
+    }
     out
 }
 
@@ -288,6 +293,44 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     Ok(file(package, &imports, &body))
 }
 
+/// Emit one model schema into its own Go file.
+pub(crate) fn emit_model_schema(
+    graph: &ApiGraph,
+    package: &str,
+    schema: &Schema,
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    let mut needs_time = false;
+    match &schema.body {
+        Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
+        Type::Object(fields) => {
+            for field in fields {
+                if field_needs_time(&field.schema) {
+                    needs_time = true;
+                }
+            }
+            emit_struct(&mut body, &schema.name, fields, graph)?;
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "schema '{}' has an unsupported non-object/non-enum body \
+                     (expected object|enum)",
+                    schema.id
+                ),
+            });
+        }
+    }
+    let imports = if needs_time { vec!["time"] } else { Vec::new() };
+    Ok(file(package, &imports, &body))
+}
+
 /// Emit a single object struct: one exported field per graph field with its Go type and json tag.
 fn emit_struct(
     body: &mut String,
@@ -476,16 +519,20 @@ pub(crate) fn emit_operations(
         first = false;
         emit_operation(&mut body, op, graph, base_path)?;
     }
-    // Operation methods always touch context/net-http/encoding-json/bytes/fmt (request build + decode).
-    // WR-02: non-string query params additionally need `strconv`/`time` to URL-encode; `file` sorts +
-    // de-duplicates the union.
-    let mut imports: Vec<&str> = vec!["bytes", "context", "encoding/json", "fmt", "net/http"];
+    // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
+    // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
+    // need strconv/time. This stays correct when split layout emits one operation per file.
+    let mut imports: Vec<&str> = vec!["context", "encoding/json", "net/http"];
+    if ops.iter().any(|op| op.request_body.is_some()) {
+        imports.push("bytes");
+    }
     imports.extend(query_imports(ops, graph)?);
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
     if ops
         .iter()
         .any(|op| op.params.iter().any(|p| p.location == "path"))
     {
+        imports.push("fmt");
         imports.push("net/url");
     }
     Ok(file(package, &imports, &body))
@@ -1252,6 +1299,9 @@ mod tests {
             assert_eq!(exported("createGoal"), "CreateGoal");
             assert_eq!(exported("nextCursor"), "NextCursor");
             assert_eq!(exported("message"), "Message");
+            assert_eq!(exported("openai/gpt-image-2"), "OpenaiGptImage2");
+            assert_eq!(exported("3d-model"), "Value3dModel");
+            assert_eq!(exported("///"), "Value");
         }
 
         #[test]
@@ -1398,7 +1448,7 @@ mod tests {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
-            for imp in ["bytes", "context", "encoding/json", "fmt", "net/http"] {
+            for imp in ["bytes", "context", "encoding/json", "net/http"] {
                 assert!(
                     out.contains(&format!("\"{imp}\"")),
                     "missing import {imp}:\n{out}"

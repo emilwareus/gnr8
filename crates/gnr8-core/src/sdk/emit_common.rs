@@ -12,16 +12,17 @@ use std::collections::BTreeSet;
 use crate::graph::{ApiGraph, Operation};
 use crate::CoreError;
 
-/// Split an identifier into words on `_`/`-`/space separators and lower→upper case boundaries.
+/// Split an identifier into words on non-alphanumeric separators and lower→upper case boundaries.
 ///
-/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `page_size` → `["page", "size"]`. The shared
-/// tokenizer behind every per-language casing helper.
+/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `page_size` → `["page", "size"]`;
+/// `openai/gpt-image-2` → `["openai", "gpt", "image", "2"]`. The shared tokenizer behind every
+/// per-language casing helper.
 pub(crate) fn split_words(name: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut prev_lower = false;
     for ch in name.chars() {
-        if ch == '_' || ch == '-' || ch == ' ' {
+        if !ch.is_ascii_alphanumeric() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
             }
@@ -38,6 +39,37 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
         words.push(current);
     }
     words
+}
+
+/// Convert an operation/type name into a deterministic lowercase file stem.
+///
+/// The result is ASCII `[a-z0-9_]+`, never empty, never starts with a digit, and is suitable as the
+/// basename portion of generated files (`model_foo.go`, `models/foo.ts`, ...). This is file-structure
+/// only; it never changes the public SDK symbol name.
+pub(crate) fn file_stem(name: &str) -> String {
+    let mut out = split_words(name)
+        .iter()
+        .map(|w| w.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("_");
+    if out.is_empty() {
+        out.push_str("value");
+    }
+    if out.starts_with(|ch: char| ch.is_ascii_digit()) {
+        out.insert_str(0, "value_");
+    }
+    out
+}
+
+/// Put `file_name` under an optional relative directory for configurable split layouts.
+///
+/// Empty/`None` means the package root. The returned path is still validated by the bundle writer before
+/// materialization, so this helper only normalizes harmless leading/trailing slashes.
+pub(crate) fn file_in_dir(dir: Option<&str>, file_name: &str) -> String {
+    match dir.map(|s| s.trim_matches('/')) {
+        Some("") | None => file_name.to_string(),
+        Some(dir) => format!("{dir}/{file_name}"),
+    }
 }
 
 /// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). `base_path` is

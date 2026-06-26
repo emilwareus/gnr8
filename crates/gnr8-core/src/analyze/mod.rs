@@ -250,11 +250,35 @@ pub fn build_graph(fixture_dir: &str) -> Result<crate::graph::ApiGraph, crate::C
     // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
     // sidecar dir) AND the graph relativizes span file paths against the same root the helper saw.
     let target = helper::resolve_target(fixture_dir);
-    let facts = match detect_language(&target)? {
+    build_graph_for_lang(&target, detect_language(&target)?)
+}
+
+/// Build a graph from `fixture_dir` using the explicitly configured source language.
+///
+/// Pipeline sources such as `GoGin` already encode the intended language. They use this path so a Go
+/// service can contain Python/TypeScript fixtures or examples without being rejected as an ambiguous
+/// mixed-language tree. The auto-detecting [`build_graph`] remains the CLI/debug convenience for
+/// callers that do not have an explicit source stage.
+pub(crate) fn build_graph_for_lang(
+    fixture_dir: &str,
+    lang: Lang,
+) -> Result<crate::graph::ApiGraph, crate::CoreError> {
+    let target = helper::resolve_target(fixture_dir);
+    let facts = match lang {
         Lang::Python => helper::run_pyextract(&target)?,
         Lang::Go => helper::run_goextract(&target)?,
         Lang::TypeScript => helper::run_tsextract(&target)?,
     };
+    Ok(crate::graph::ApiGraph::from_facts(facts, &target))
+}
+
+/// Build a Go graph from `fixture_dir`, optionally scoped to Go package patterns.
+pub(crate) fn build_go_graph_with_patterns(
+    fixture_dir: &str,
+    patterns: &[String],
+) -> Result<crate::graph::ApiGraph, crate::CoreError> {
+    let target = helper::resolve_target(fixture_dir);
+    let facts = helper::run_goextract_patterns(&target, patterns)?;
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
 
@@ -372,6 +396,38 @@ mod tests {
         assert!(
             matches!(&result, Err(CoreError::Config { message }) if message.contains("ambiguous")),
             "a mixed Go/Python tree must be a typed Config error naming the ambiguity, got {result:?}"
+        );
+    }
+
+    /// An explicit pipeline source already knows its language, so it must not be blocked by the
+    /// auto-detector when a Go tree also contains Python fixtures/examples. The forced path should
+    /// reach the Go sidecar; this synthetic package is intentionally incomplete for extraction, so
+    /// any failure must be a toolchain/helper/facts error — never the detector's ambiguity `Config`.
+    #[test]
+    fn build_graph_for_lang_bypasses_ambiguity_for_explicit_source_language() {
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-forced-go-mixed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("go.mod"), b"module example.com/mixed\n\ngo 1.22\n").unwrap();
+        std::fs::write(dir.join("main.go"), b"package mixed\n").unwrap();
+        std::fs::write(dir.join("fixture.py"), b"x = 1\n").unwrap();
+
+        let auto_result = detect_language(&dir.to_string_lossy());
+        let forced_result = super::build_graph_for_lang(&dir.to_string_lossy(), Lang::Go);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(auto_result, Err(CoreError::Config { .. })),
+            "auto detection must still reject a mixed tree, got {auto_result:?}"
+        );
+        assert!(
+            !matches!(forced_result, Err(CoreError::Config { .. })),
+            "explicit Go source must not fail at language ambiguity detection, got {forced_result:?}"
         );
     }
 

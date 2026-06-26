@@ -98,15 +98,23 @@ fn parse_marker(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Reject a frame name that is not a plain file name, so a malformed bundle can never traverse out of
-/// the target dir (defense-in-depth; the names are program-generated). The single definition of the SDK
-/// frame-name path-safety check, shared by [`write_to_dir`] and the SDK targets in `sdk::builtins`.
+/// Reject a frame path that could traverse out of the target dir (defense-in-depth; the names are
+/// program-generated). Nested relative paths are allowed so split layouts can write files such as
+/// `models/book.ts`.
 ///
 /// # Errors
 ///
-/// Returns [`crate::CoreError::SdkGen`] if `name` is empty or contains a path separator or `..`.
+/// Returns [`crate::CoreError::SdkGen`] if `name` is empty, absolute, contains `..`, or uses Windows
+/// separators.
 pub(crate) fn safe_frame_name(name: &str) -> Result<(), crate::CoreError> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+    let path = std::path::Path::new(name);
+    if name.is_empty()
+        || name.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(crate::CoreError::SdkGen {
             message: format!("refusing to write SDK file with unsafe name {name:?}"),
         });
@@ -125,12 +133,20 @@ pub(crate) fn safe_frame_name(name: &str) -> Result<(), crate::CoreError> {
 ///
 /// # Errors
 ///
-/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty/contains a path separator (so no frame
-/// can escape `dir`) or if any file cannot be written.
+/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty, absolute, parent-traversing, or uses
+/// platform-ambiguous separators (so no frame can escape `dir`) or if any file cannot be written.
 pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
     for (name, contents) in parse(bundle) {
         safe_frame_name(&name)?;
         let path = dir.join(&name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| crate::CoreError::SdkGen {
+                message: format!(
+                    "failed to create SDK output dir {}: {err}",
+                    parent.display()
+                ),
+            })?;
+        }
         std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
             message: format!("failed to write SDK file {}: {err}", path.display()),
         })?;
@@ -144,7 +160,7 @@ mod tests {
     // the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{parse, SdkBundle, SdkFile};
+    use super::{parse, safe_frame_name, SdkBundle, SdkFile};
 
     fn sample_bundle() -> SdkBundle {
         SdkBundle {
@@ -212,6 +228,33 @@ mod tests {
             assert!(
                 !file.contents.contains("// ==== gnr8:file"),
                 "marker must not appear in emitted source"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_frame_name_allows_nested_relative_paths_for_split_layouts() {
+        for name in [
+            "models/book.ts",
+            "models/__init__.py",
+            "nested/model_book.go",
+        ] {
+            safe_frame_name(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn safe_frame_name_rejects_paths_that_can_escape_or_are_platform_ambiguous() {
+        for name in [
+            "",
+            "../escape.ts",
+            "models/../../escape.py",
+            "/tmp/escape.go",
+            "models\\book.ts",
+        ] {
+            assert!(
+                safe_frame_name(name).is_err(),
+                "unsafe frame name should be rejected: {name}"
             );
         }
     }

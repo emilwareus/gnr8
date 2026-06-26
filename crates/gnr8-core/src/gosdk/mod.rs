@@ -15,7 +15,9 @@ mod emit;
 mod gofmt;
 
 use crate::graph::{ApiGraph, Operation};
-use crate::sdk::bundle::{self, SdkBundle, SdkFile};
+use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::emit_common::{file_in_dir, file_stem};
+use crate::sdk::layout::SdkFileLayout;
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///
@@ -41,45 +43,73 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
-    let mut files: Vec<SdkFile> = Vec::new();
+    generate_with_layout(graph, package, base_path, SdkFileLayout::compact())
+}
 
-    // Fixed leading files (sorted: client.go before errors.go).
-    files.push(go_file("client.go", &emit::emit_client(package))?);
-    files.push(go_file("errors.go", &emit::emit_errors(package))?);
-
-    // All operations go into a single generic `operations.go` resource surface. Tags were an
-    // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
-    // the file name is generic (not the package/fixture name) so it never overfits to one service.
-    let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let raw = emit::emit_operations(graph, package, base_path, &ops)?;
-    files.push(go_file("operations.go", &raw)?);
-
-    // Trailing models.go.
-    files.push(go_file("models.go", &emit::emit_models(graph, package)?)?);
-
-    // The bundle's fixed sorted order is established by push order above (client, errors,
-    // operations, models) — exactly the D-06 frame order the snapshot locks.
+/// Generate the Go SDK with a configurable file layout.
+pub fn generate_with_layout(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: SdkFileLayout,
+) -> Result<String, crate::CoreError> {
+    let files = generate_files_with_layout(graph, package, base_path, layout)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
 
-/// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
-///
-/// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
-/// per-file outputs (to hash + ownership-track each file) without re-implementing the marker split
-/// or reaching into the private `bundle` submodule. Single source of truth for the framing — the
-/// same one [`write_to_dir`] uses. The caller is responsible for the frame-name path-safety check
-/// when materializing (the names are program-controlled; see [`write_to_dir`]).
-pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
-    bundle::parse(bundle)
+pub(crate) fn generate_files_with_layout(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: SdkFileLayout,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let mut files: Vec<SdkFile> = Vec::new();
+
+    // Fixed leading files (sorted: client.go before errors.go).
+    files.push(raw_go_file("client.go", emit::emit_client(package)));
+    files.push(raw_go_file("errors.go", emit::emit_errors(package)));
+
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    if layout.is_split() {
+        for op in &ops {
+            let raw = emit::emit_operations(graph, package, base_path, &[*op])?;
+            let name = file_in_dir(
+                layout.operation_dir_ref(),
+                &format!("api_{}.go", file_stem(&op.id)),
+            );
+            files.push(raw_go_file(name, raw));
+        }
+        for schema in &graph.schemas {
+            let raw = emit::emit_model_schema(graph, package, schema)?;
+            let name = file_in_dir(
+                layout.model_dir_ref(),
+                &format!("model_{}.go", file_stem(&schema.name)),
+            );
+            files.push(raw_go_file(name, raw));
+        }
+    } else {
+        // All operations go into a single generic `operations.go` resource surface. Tags were an
+        // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
+        // the file name is generic (not the package/fixture name) so it never overfits to one service.
+        let raw = emit::emit_operations(graph, package, base_path, &ops)?;
+        files.push(raw_go_file("operations.go", raw));
+
+        // Trailing models.go.
+        files.push(raw_go_file("models.go", emit::emit_models(graph, package)?));
+    }
+
+    let mut files = gofmt::gofmt_files(files)?;
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
 }
 
-/// `gofmt` a raw emitted file and wrap it as a named [`SdkFile`].
-fn go_file(name: &str, raw: &str) -> Result<SdkFile, crate::CoreError> {
-    Ok(SdkFile {
-        name: name.to_string(),
-        contents: gofmt::gofmt(raw)?,
-    })
+/// Wrap a raw emitted file as a named [`SdkFile`] before batched formatting.
+fn raw_go_file(name: impl Into<String>, raw: impl Into<String>) -> SdkFile {
+    SdkFile {
+        name: name.into(),
+        contents: raw.into(),
+    }
 }
 
 #[cfg(test)]
@@ -89,8 +119,9 @@ mod tests {
     // toolchain (generate runs gofmt) and skip gracefully if it is absent.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::generate;
+    use super::{generate, generate_with_layout};
     use crate::graph::ApiGraph;
+    use crate::sdk::layout::SdkFileLayout;
 
     /// A facts document (code-first shape — no annotation facts) covering three operations plus the
     /// fixture request/response models + the code-defined `TargetDirection` enum — enough to assert the
@@ -265,5 +296,55 @@ mod tests {
             out.contains("func (c *Client) CreateGoal(ctx context.Context"),
             "CreateGoal must take ctx first:\n{out}"
         );
+    }
+
+    #[test]
+    fn split_layout_emits_one_operation_file_and_one_model_file_per_item() {
+        if !gofmt_available() {
+            eprintln!("skipping split layout test: gofmt unavailable");
+            return;
+        }
+        let out = generate_with_layout(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            SdkFileLayout::split(),
+        )
+        .unwrap();
+        for marker in [
+            "// ==== gnr8:file api_create_goal.go ====",
+            "// ==== gnr8:file api_list_goals.go ====",
+            "// ==== gnr8:file api_update_goal.go ====",
+            "// ==== gnr8:file model_create_goal_input.go ====",
+            "// ==== gnr8:file model_target_direction.go ====",
+        ] {
+            assert!(out.contains(marker), "missing {marker}:\n{out}");
+        }
+        assert!(
+            !out.contains("// ==== gnr8:file operations.go ===="),
+            "split layout must not emit the compact operations file:\n{out}"
+        );
+        assert!(
+            !out.contains("// ==== gnr8:file models.go ===="),
+            "split layout must not emit the compact models file:\n{out}"
+        );
+    }
+
+    #[test]
+    fn split_layout_can_place_operation_and_model_files_in_configured_dirs() {
+        if !gofmt_available() {
+            eprintln!("skipping custom split layout test: gofmt unavailable");
+            return;
+        }
+        let layout = SdkFileLayout::split()
+            .operation_dir("apis")
+            .model_dir("types");
+        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", layout).unwrap();
+        for marker in [
+            "// ==== gnr8:file apis/api_create_goal.go ====",
+            "// ==== gnr8:file types/model_create_goal_input.go ====",
+        ] {
+            assert!(out.contains(marker), "missing {marker}:\n{out}");
+        }
     }
 }

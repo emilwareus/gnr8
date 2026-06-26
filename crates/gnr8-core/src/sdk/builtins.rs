@@ -13,6 +13,8 @@
 
 use super::{Artifacts, Cx, PostProcess, Source, Target, Transform};
 use crate::graph::{ApiGraph, SecurityScheme};
+use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::model_style::PyModelStyle;
 use crate::CoreError;
 
 // ---------------------------------------------------------------------------------------------------
@@ -28,6 +30,7 @@ use crate::CoreError;
 #[derive(Debug, Default, Clone)]
 pub struct GoGin {
     inputs: Vec<String>,
+    package_patterns: Vec<String>,
 }
 
 impl GoGin {
@@ -45,6 +48,18 @@ impl GoGin {
         S: Into<String>,
     {
         self.inputs = inputs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Scope Go package loading to the given `go/packages` patterns, resolved from the input module
+    /// root. Empty means the historical whole-module `"./..."` load.
+    #[must_use]
+    pub fn packages<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.package_patterns = patterns.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -77,7 +92,7 @@ impl Source for GoGin {
         // input-resolution and keeps span provenance relative to the same root.
         let resolved = cx.project_root.join(input);
         let input_arg = resolved.to_string_lossy();
-        crate::analyze::build_graph(&input_arg)
+        crate::analyze::build_go_graph_with_patterns(&input_arg, &self.package_patterns)
     }
 }
 
@@ -139,7 +154,10 @@ impl Source for FastApi {
         // Resolve against the project root so a relative input analyzes the PROJECT, not the process
         // cwd. The SAME build_graph the Go source calls — language dispatch is by target detection.
         let resolved = cx.project_root.join(input);
-        crate::analyze::build_graph(&resolved.to_string_lossy())
+        crate::analyze::build_graph_for_lang(
+            &resolved.to_string_lossy(),
+            crate::analyze::Lang::Python,
+        )
     }
 }
 
@@ -195,7 +213,10 @@ impl Source for Flask {
             }
         };
         let resolved = cx.project_root.join(input);
-        crate::analyze::build_graph(&resolved.to_string_lossy())
+        crate::analyze::build_graph_for_lang(
+            &resolved.to_string_lossy(),
+            crate::analyze::Lang::Python,
+        )
     }
 }
 
@@ -253,7 +274,10 @@ impl Source for NestJs {
             }
         };
         let resolved = cx.project_root.join(input);
-        crate::analyze::build_graph(&resolved.to_string_lossy())
+        crate::analyze::build_graph_for_lang(
+            &resolved.to_string_lossy(),
+            crate::analyze::Lang::TypeScript,
+        )
     }
 }
 
@@ -458,6 +482,57 @@ impl Target for OpenApi31 {
     }
 }
 
+/// The OpenAPI 3.1 JSON target: lowers the frozen IR to OpenAPI and writes pretty JSON.
+#[derive(Debug, Clone)]
+pub struct OpenApi31Json {
+    path: String,
+}
+
+impl OpenApi31Json {
+    /// An OpenAPI 3.1 JSON target with no output path yet (set with [`OpenApi31Json::to`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            path: String::new(),
+        }
+    }
+
+    /// Set the output path for the OpenAPI JSON document (e.g. `"generated/openapi.json"`).
+    #[must_use]
+    pub fn to(mut self, path: impl Into<String>) -> Self {
+        self.path = path.into();
+        self
+    }
+}
+
+impl Default for OpenApi31Json {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Target for OpenApi31Json {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+        if self.path.is_empty() {
+            return Err(CoreError::Config {
+                message: "OpenApi31Json target has no output path — call .to(\"openapi.json\")"
+                    .to_string(),
+            });
+        }
+        let doc = crate::lower::to_openapi_json(ir, &ir.title, &ir.base_path, &ir.security)?;
+        out.write(self.path.clone(), doc);
+        Ok(())
+    }
+
+    fn output_anchors(&self) -> Vec<String> {
+        if self.path.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.path.clone()]
+        }
+    }
+}
+
 /// The Go SDK target: generates the multi-file Go SDK bundle and writes each file under [`GoSdk::to`].
 ///
 /// Derives the SDK's Go package name from [`GoSdk::module`] (the last path segment, sanitized — the
@@ -468,6 +543,7 @@ impl Target for OpenApi31 {
 pub struct GoSdk {
     module: String,
     dir: String,
+    layout: SdkFileLayout,
 }
 
 impl GoSdk {
@@ -477,6 +553,7 @@ impl GoSdk {
         Self {
             module: String::new(),
             dir: String::new(),
+            layout: SdkFileLayout::compact(),
         }
     }
 
@@ -493,6 +570,19 @@ impl GoSdk {
     pub fn to(mut self, dir: impl Into<String>) -> Self {
         self.dir = dir.into();
         self
+    }
+
+    /// Set the generated file layout.
+    #[must_use]
+    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Use the split layout for larger SDKs.
+    #[must_use]
+    pub fn split_files(self) -> Self {
+        self.layout(SdkFileLayout::split().root_operations().root_models())
     }
 }
 
@@ -518,15 +608,13 @@ impl Target for GoSdk {
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
-        let bundle = crate::gosdk::generate(ir, &package, &ir.base_path)?;
-        let dir = self.dir.trim_end_matches('/');
-        for (name, contents) in crate::gosdk::split_bundle(&bundle) {
-            // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
-            // by the lifecycle write path, T-03-03).
-            super::bundle::safe_frame_name(&name)?;
-            out.write(format!("{dir}/{name}"), contents);
-        }
+        let files = crate::gosdk::generate_files_with_layout(
+            ir,
+            &package,
+            &ir.base_path,
+            self.layout.clone(),
+        )?;
+        write_sdk_files(out, &self.dir, files)?;
         Ok(())
     }
 
@@ -556,6 +644,8 @@ impl Target for GoSdk {
 pub struct PySdk {
     module: String,
     dir: String,
+    layout: SdkFileLayout,
+    model_style: PyModelStyle,
 }
 
 impl PySdk {
@@ -565,6 +655,8 @@ impl PySdk {
         Self {
             module: String::new(),
             dir: String::new(),
+            layout: SdkFileLayout::compact(),
+            model_style: PyModelStyle::default(),
         }
     }
 
@@ -581,6 +673,33 @@ impl PySdk {
     #[must_use]
     pub fn to(mut self, dir: impl Into<String>) -> Self {
         self.dir = dir.into();
+        self
+    }
+
+    /// Set the generated file layout.
+    #[must_use]
+    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Use the split layout for larger SDKs.
+    #[must_use]
+    pub fn split_files(self) -> Self {
+        self.layout(SdkFileLayout::split().model_dir("models"))
+    }
+
+    /// Use Pydantic v2 `BaseModel` models. This is the default.
+    #[must_use]
+    pub fn pydantic(mut self) -> Self {
+        self.model_style = PyModelStyle::Pydantic;
+        self
+    }
+
+    /// Use stdlib dataclass models instead of Pydantic.
+    #[must_use]
+    pub fn dataclasses(mut self) -> Self {
+        self.model_style = PyModelStyle::Dataclass;
         self
     }
 }
@@ -609,15 +728,14 @@ impl Target for PySdk {
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
         // OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let bundle = crate::pysdk::generate(ir, &package, &ir.base_path)?;
-        let dir = self.dir.trim_end_matches('/');
-        for (name, contents) in crate::pysdk::split_bundle(&bundle) {
-            // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
-            // by the GoSdk target write path, T-03-02-01).
-            super::bundle::safe_frame_name(&name)?;
-            out.write(format!("{dir}/{name}"), contents);
-        }
+        let files = crate::pysdk::generate_files_with_options(
+            ir,
+            &package,
+            &ir.base_path,
+            self.layout.clone(),
+            self.model_style,
+        )?;
+        write_sdk_files(out, &self.dir, files)?;
         Ok(())
     }
 
@@ -647,6 +765,7 @@ impl Target for PySdk {
 pub struct TsSdk {
     module: String,
     dir: String,
+    layout: SdkFileLayout,
 }
 
 impl TsSdk {
@@ -656,6 +775,7 @@ impl TsSdk {
         Self {
             module: String::new(),
             dir: String::new(),
+            layout: SdkFileLayout::compact(),
         }
     }
 
@@ -673,6 +793,19 @@ impl TsSdk {
     pub fn to(mut self, dir: impl Into<String>) -> Self {
         self.dir = dir.into();
         self
+    }
+
+    /// Set the generated file layout.
+    #[must_use]
+    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Use the split layout for larger SDKs.
+    #[must_use]
+    pub fn split_files(self) -> Self {
+        self.layout(SdkFileLayout::split().model_dir("models"))
     }
 }
 
@@ -700,15 +833,13 @@ impl Target for TsSdk {
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
         // the OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let bundle = crate::tssdk::generate(ir, &package, &ir.base_path)?;
-        let dir = self.dir.trim_end_matches('/');
-        for (name, contents) in crate::tssdk::split_bundle(&bundle) {
-            // Frame names are program-controlled, but reject anything that is not a plain file name so
-            // a malformed bundle can never traverse out of `dir` (the shared frame-name guard, also used
-            // by the PySdk target write path, T-05-02-01).
-            super::bundle::safe_frame_name(&name)?;
-            out.write(format!("{dir}/{name}"), contents);
-        }
+        let files = crate::tssdk::generate_files_with_layout(
+            ir,
+            &package,
+            &ir.base_path,
+            self.layout.clone(),
+        )?;
+        write_sdk_files(out, &self.dir, files)?;
         Ok(())
     }
 
@@ -807,6 +938,20 @@ fn sdk_package(module: &str) -> Result<String, CoreError> {
     Ok(pkg.to_string())
 }
 
+fn write_sdk_files(
+    out: &mut Artifacts,
+    dir: &str,
+    files: Vec<super::bundle::SdkFile>,
+) -> Result<(), CoreError> {
+    let dir = dir.trim_end_matches('/');
+    for file in files {
+        // File names are program-controlled, but reject anything that can traverse out of `dir`.
+        super::bundle::safe_frame_name(&file.name)?;
+        out.write(format!("{dir}/{}", file.name), file.contents);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow
@@ -815,7 +960,7 @@ mod tests {
 
     use super::{
         sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
-        PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform, TsSdk,
+        OpenApi31Json, PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform, TsSdk,
     };
     use crate::graph::ApiGraph;
     use crate::sdk::Artifacts;
@@ -857,6 +1002,10 @@ mod tests {
         let mut out = Artifacts::new();
         assert!(matches!(
             OpenApi31::new().generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+        assert!(matches!(
+            OpenApi31Json::new().generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
         assert!(matches!(

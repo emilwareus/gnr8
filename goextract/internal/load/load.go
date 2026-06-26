@@ -47,13 +47,18 @@ type Result struct {
 	Errors   []LoadError
 }
 
-// Load type-checks the module rooted at targetDir (pattern "./...") in full-type
-// mode and returns the packages, a shared FileSet, and any per-package errors.
+// Load type-checks the module rooted at targetDir in full-type mode and returns
+// the packages, a shared FileSet, and any per-package errors.
+//
+// When patterns is empty, it loads "./..." for the historical whole-module
+// behavior. Callers may pass package patterns such as "./internal/foo/ports" to
+// scope extraction in large modules that contain non-contract examples, tools,
+// generated files, or fixtures.
 //
 // A non-nil error is returned only for hard loader failures (e.g. the directory
 // is not a module); per-package type/parse errors are returned in Result.Errors
 // for the caller to diagnose without aborting (GO-06).
-func Load(targetDir string) (*Result, error) {
+func Load(targetDir string, patterns ...string) (*Result, error) {
 	fset := token.NewFileSet()
 	cfg := &packages.Config{
 		Dir:   targetDir,
@@ -62,7 +67,10 @@ func Load(targetDir string) (*Result, error) {
 		Fset:  fset,
 	}
 
-	pkgs, err := packages.Load(cfg, "./...")
+	if len(patterns) == 0 {
+		patterns = []string{"./..."}
+	}
+	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		return nil, err
 	}

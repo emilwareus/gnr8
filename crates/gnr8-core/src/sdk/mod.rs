@@ -30,6 +30,8 @@
 pub mod builtins;
 pub mod bundle;
 pub(crate) mod emit_common;
+pub mod layout;
+pub mod model_style;
 
 use std::path::PathBuf;
 
@@ -337,9 +339,11 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, NestJs, OpenApi31, PySdk,
-        RenameOperation, RenameType, SetBasePath, SetTitle, TsSdk,
+        ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, NestJs, OpenApi31, OpenApi31Json,
+        PySdk, RenameOperation, RenameType, SetBasePath, SetTitle, TsSdk,
     };
+    pub use super::layout::SdkFileLayout;
+    pub use super::model_style::PyModelStyle;
     pub use super::{Artifact, Artifacts, Cx, Pipeline, PostProcess, Source, Target, Transform};
     pub use crate::graph::SecurityScheme;
 }

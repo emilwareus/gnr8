@@ -23,6 +23,7 @@ import (
 const (
 	uuidPkgPath = "github.com/google/uuid"
 	timePkgPath = "time"
+	jsonPkgPath = "encoding/json"
 )
 
 // Extract returns one SchemaFact per DTO struct and per string-enum named type
@@ -202,6 +203,8 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 		return facts.WellKnownType(facts.WellKnownUUID)
 	case pkgPath == timePkgPath && obj.Name() == "Time":
 		return facts.WellKnownType(facts.WellKnownDateTime)
+	case pkgPath == jsonPkgPath && obj.Name() == "RawMessage":
+		return facts.AnyType()
 	}
 	// A named string (with or without a const set) refs its own schema; the enum
 	// values are resolved by the enum SchemaFact (see Extract). A non-string named
