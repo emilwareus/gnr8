@@ -32,6 +32,30 @@ to own it. When in doubt, write it ourselves and keep it in this codebase.
 
 Before adding ANY dependency: the answer is no. There is no approval path that adds an OSS dependency.
 
+### TypeScript toolchain (required, not shipped)
+
+This is **not an exception to rule 2** — rule 2 holds literally: **gnr8 ships ZERO OSS.** `gnr8-core`
+takes zero crates, and **no `typescript` is vendored or bundled.** What this subsection records is a
+*toolchain prerequisite*, the same class of fact as "a Go service needs `go` on PATH."
+
+The `tsextract` Node sidecar reads TypeScript types via the language's own reference Compiler API. It
+gets that compiler the same way every sidecar gets its toolchain: it **borrows the USER's own
+`typescript`, resolved from the target project being analyzed** (`tsextract/ts.js`) — exactly as
+`goextract` uses the user's `go`, `pyextract` uses the user's `python3`, and every sidecar uses
+`node`/`cargo`. `typescript` is therefore a **REQUIRED USER TOOLCHAIN, not a shipped/bundled/vendored
+OSS dependency.** (A gitignored `devDependency`, restored via `npm ci` / `make tsextract-deps`, backs
+gnr8's OWN test suite only — it is never shipped to users and never committed.)
+
+The bright line (this records a prerequisite; it does **not** loosen rule 2 anywhere):
+
+- `tsextract` derives facts ONLY from the source's own TypeScript types via that toolchain — it NEVER
+  reads `@nestjs/swagger`, `zod`, `class-validator`, or any third-party schema/annotation tool (rule 1
+  forbids those absolutely).
+- Every other sidecar stays stdlib-only (Go `go/types`/`go/ast`; Python `ast`). gnr8 ships no OSS.
+- `gnr8-core` and every generated SDK (GoSdk, PySdk, TsSdk) remain dependency-free.
+- A future hand-rolled stdlib-pure TypeScript parser (FUT-04) could remove even the toolchain
+  requirement.
+
 ## 3. No fallback logic / no dual control-flow paths
 
 There must be **exactly one deterministic way** to derive each fact. **Forbidden patterns:**

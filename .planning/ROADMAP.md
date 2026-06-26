@@ -235,3 +235,17 @@ dependencies.)
 | 4. TypeScript Source — `tsextract` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete   | 2026-06-26 |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 2/3 | In Progress|  |
+
+## Backlog (deferred)
+
+Deferred hardening items, recorded so they are tracked without disturbing the green snapshots. These are
+**not** folded into the current acceptance output: folding them changes byte-committed TsSdk snapshots +
+the NestJS example output, which the Phase-5 REVIEW-FIX deliberately skipped for that reason.
+
+- **Backlog 999.1 — WR-02: TsSdk non-scalar query param `String()` wire-encoding rule** (deferred
+  Phase-5 finding; folding it changes the green TsSdk snapshots). The generated TS client coerces a
+  non-scalar query param via `String(...)`, which needs a defined wire-encoding rule before it is
+  hardened.
+- **Backlog 999.2 — WR-04: TsSdk asymmetric success/error JSON decode** (same reason). The generated TS
+  client decodes the success and error response bodies asymmetrically; unifying the decode path would
+  change the committed snapshots.
