@@ -84,35 +84,6 @@ pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
     bundle::parse(bundle)
 }
 
-/// Materialize a generated SDK bundle String's framed files to `dir/<name>`.
-///
-/// Takes the public [`generate`] output (the file-marker-framed bundle String) so an out-of-crate
-/// integration test can call it directly. File names are program-controlled — they come from the fixed
-/// `client.ts`/`errors.ts`/`index.ts`/`models.ts` frame markers, never untrusted input — and are joined
-/// onto the caller's program-controlled `dir`. The bundle is split through the shared [`bundle::parse`]
-/// framing so the on-disk files match the bundle byte-for-byte.
-///
-/// # Errors
-///
-/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty/contains a path separator (so no frame
-/// can escape `dir`) or if any file cannot be written.
-pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
-    for (name, contents) in bundle::parse(bundle) {
-        // Defense-in-depth: the frame names are program-generated, but reject anything that is not a
-        // plain file name so a malformed bundle can never traverse out of `dir` (T-05-01-01).
-        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
-            return Err(crate::CoreError::SdkGen {
-                message: format!("refusing to write SDK file with unsafe name {name:?}"),
-            });
-        }
-        let path = dir.join(&name);
-        std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
-            message: format!("failed to write SDK file {}: {err}", path.display()),
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so
@@ -121,8 +92,9 @@ mod tests {
     // hermetic typecheck lands in plan 03's tests/tssdk_compile.rs).
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, split_bundle, write_to_dir};
+    use super::{generate, split_bundle};
     use crate::graph::ApiGraph;
+    use crate::sdk::bundle::write_to_dir;
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.

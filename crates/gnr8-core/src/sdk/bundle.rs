@@ -98,6 +98,46 @@ fn parse_marker(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Reject a frame name that is not a plain file name, so a malformed bundle can never traverse out of
+/// the target dir (defense-in-depth; the names are program-generated). The single definition of the SDK
+/// frame-name path-safety check, shared by [`write_to_dir`] and the SDK targets in `sdk::builtins`.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::SdkGen`] if `name` is empty or contains a path separator or `..`.
+pub(crate) fn safe_frame_name(name: &str) -> Result<(), crate::CoreError> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(crate::CoreError::SdkGen {
+            message: format!("refusing to write SDK file with unsafe name {name:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Materialize a generated SDK bundle String's framed files to `dir/<name>`.
+///
+/// Takes the public per-language `generate` output (the file-marker-framed bundle String) so an
+/// out-of-crate integration test can call it directly. File names are program-controlled — they come
+/// from the fixed per-language frame markers, never untrusted input — and are validated by
+/// [`safe_frame_name`] before being joined onto the caller's program-controlled `dir`. The bundle is
+/// split through the shared [`parse`] framing so the on-disk files match the bundle byte-for-byte. The
+/// framing is language-agnostic, so this one definition serves the Go, Python, and TypeScript SDKs.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::SdkGen`] if a frame name is empty/contains a path separator (so no frame
+/// can escape `dir`) or if any file cannot be written.
+pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
+    for (name, contents) in parse(bundle) {
+        safe_frame_name(&name)?;
+        let path = dir.join(&name);
+        std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
+            message: format!("failed to write SDK file {}: {err}", path.display()),
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so

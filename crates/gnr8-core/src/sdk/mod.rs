@@ -28,7 +28,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod builtins;
-pub(crate) mod bundle;
+pub mod bundle;
 
 use std::path::PathBuf;
 

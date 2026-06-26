@@ -137,7 +137,8 @@ fn materialize_sdk() -> PathBuf {
     let bundle = gnr8_core::tssdk::generate(&graph, PACKAGE, &graph.base_path)
         .expect("tssdk::generate must succeed");
     let dir = unique_temp_dir("ok");
-    gnr8_core::tssdk::write_to_dir(&bundle, &dir).expect("write_to_dir must materialize the SDK");
+    gnr8_core::sdk::bundle::write_to_dir(&bundle, &dir)
+        .expect("write_to_dir must materialize the SDK");
     dir
 }
 

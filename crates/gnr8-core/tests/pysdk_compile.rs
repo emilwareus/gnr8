@@ -109,7 +109,7 @@ fn materialize_sdk() -> PathBuf {
     let dir = unique_temp_dir("ok");
     let pkg_dir = dir.join(PACKAGE);
     std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
-    gnr8_core::pysdk::write_to_dir(&bundle, &pkg_dir)
+    gnr8_core::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
         .expect("write_to_dir must materialize the SDK");
     dir
 }

@@ -100,7 +100,7 @@ fn materialize_sdk() -> PathBuf {
     let bundle = gnr8_core::gosdk::generate(&graph, "goalservice", "/goal")
         .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir("ok");
-    gnr8_core::gosdk::write_to_dir(&bundle, &dir)
+    gnr8_core::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");
     write_go_mod(&dir);
     dir
