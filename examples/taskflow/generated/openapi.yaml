@@ -136,10 +136,9 @@ components:
           items:
             type: string
         notes:
-          type: string
+          type: [string, null]
         priority:
           type: integer
-          format: int64
         status:
           $ref: '#/components/schemas/Status'
         title:
@@ -169,10 +168,9 @@ components:
           items:
             type: string
         notes:
-          type: string
+          type: [string, null]
         priority:
           type: integer
-          format: int64
         status:
           $ref: '#/components/schemas/Status'
         title:
@@ -192,11 +190,12 @@ components:
           items:
             type: string
         notes:
-          type: string
+          type: [string, null]
         priority:
-          type: integer
-          format: int64
+          type: [integer, null]
         status:
-          $ref: '#/components/schemas/Status'
+          oneOf:
+          - $ref: '#/components/schemas/Status'
+          - type: null
         title:
-          type: string
+          type: [string, null]
