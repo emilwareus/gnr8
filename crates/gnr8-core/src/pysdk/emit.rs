@@ -584,9 +584,12 @@ fn join_path(base_path: &str, path: &str) -> String {
 
 /// Resolve an operation's primary success (lowest 2xx) response status + model name.
 ///
-/// Returns the first 2xx response's status regardless of whether it carries a body; the model is `Some`
-/// only when that response has a typed body. An operation with no 2xx response yields `None`. Twin of
-/// `gosdk::emit::success_of`.
+/// Returns the FIRST 2xx response in `op.responses` order. The graph sorts each operation's responses
+/// by status at build time (`graph::mod` `responses.sort_by_key(|r| r.status)`, locked by the
+/// `responses_sorted_by_status` test), so "first 2xx in order" IS "lowest 2xx" — this relies on that
+/// single upstream ordering rather than re-sorting here (rule 3: one source of truth, no second sort
+/// path). The model is `Some` only when that response carries a typed body; an operation with no 2xx
+/// response yields `None`. Twin of `gosdk::emit::success_of`.
 ///
 /// # Errors
 ///
