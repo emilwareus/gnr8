@@ -642,6 +642,101 @@ impl Target for PySdk {
     }
 }
 
+/// The TypeScript SDK target: generates the multi-file TypeScript SDK bundle and writes each file
+/// under [`TsSdk::to`].
+///
+/// The structural twin of [`PySdk`]/[`GoSdk`]. Derives the SDK's package name from [`TsSdk::module`]
+/// via the SAME [`sdk_package`] single-source-of-truth derivation `PySdk`/`GoSdk` use (CLAUDE.md
+/// rule 3 — no second derivation, no TS-specific sanitizer), takes the URL prefix from `ir.base_path`
+/// (the value `SetBasePath` set and the OpenAPI lowering reads — never re-derived), calls the existing
+/// [`crate::tssdk::generate`] to produce the bundle, splits it into files via
+/// [`crate::tssdk::split_bundle`], and writes each at `<dir>/<name>`.
+#[derive(Debug, Clone)]
+pub struct TsSdk {
+    module: String,
+    dir: String,
+}
+
+impl TsSdk {
+    /// A TypeScript SDK target with no module/output yet (set with [`TsSdk::module`] + [`TsSdk::to`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            module: String::new(),
+            dir: String::new(),
+        }
+    }
+
+    /// Set the module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The package
+    /// name is derived from this — the single source of truth (CLAUDE.md rule 3), the same derivation
+    /// `PySdk`/`GoSdk` use.
+    #[must_use]
+    pub fn module(mut self, module: impl Into<String>) -> Self {
+        self.module = module.into();
+        self
+    }
+
+    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk-ts"`).
+    #[must_use]
+    pub fn to(mut self, dir: impl Into<String>) -> Self {
+        self.dir = dir.into();
+        self
+    }
+}
+
+impl Default for TsSdk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Target for TsSdk {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+        if self.module.is_empty() {
+            return Err(CoreError::Config {
+                message: "TsSdk target has no module — call .module(\"example.com/acme/sdk\")"
+                    .to_string(),
+            });
+        }
+        if self.dir.is_empty() {
+            return Err(CoreError::Config {
+                message: "TsSdk target has no output dir — call .to(\"sdk\")".to_string(),
+            });
+        }
+        // Derive the package from the module path via the SAME single source of truth GoSdk/PySdk use,
+        // and generate via the existing deterministic TypeScript SDK generator — never a re-derivation,
+        // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
+        // the OpenAPI lowering reads (rule 3/4 — never re-derived).
+        let package = sdk_package(&self.module)?;
+        let bundle = crate::tssdk::generate(ir, &package, &ir.base_path)?;
+        let dir = self.dir.trim_end_matches('/');
+        for (name, contents) in crate::tssdk::split_bundle(&bundle) {
+            // Frame names are program-controlled, but reject anything that is not a plain file name so
+            // a malformed bundle can never traverse out of `dir` (mirrors tssdk::write_to_dir / the
+            // PySdk target write path, T-05-02-01).
+            if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+                return Err(CoreError::SdkGen {
+                    message: format!("refusing to emit SDK file with unsafe name {name:?}"),
+                });
+            }
+            out.write(format!("{dir}/{name}"), contents);
+        }
+        Ok(())
+    }
+
+    /// The SDK output directory is the critical loop-safety anchor: the generated `*.ts` files form a
+    /// TypeScript package inside the analyzed source tree, so without excluding this dir the source
+    /// would re-ingest them and duplicate every schema (the contamination
+    /// `crate::lifecycle::exclude_output_paths` prevents on the host path, T-05-02-03).
+    fn output_anchors(&self) -> Vec<String> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.dir.trim_end_matches('/').to_string()]
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // PostProcess
 // ---------------------------------------------------------------------------------------------------
@@ -732,7 +827,7 @@ mod tests {
 
     use super::{
         sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
-        PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform,
+        PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform, TsSdk,
     };
     use crate::graph::ApiGraph;
     use crate::sdk::Artifacts;
@@ -843,6 +938,77 @@ mod tests {
             .map(|a| (a.path.as_str(), a.text.as_str()))
             .collect();
         assert_eq!(first, second, "two PySdk runs must be byte-identical");
+    }
+
+    #[test]
+    fn tssdk_target_errors_when_unconfigured() {
+        // An unconfigured TsSdk (no module / no dir) is a typed Config error, not a panic — exactly
+        // like PySdk/GoSdk; only the proper noun differs.
+        let ir = ApiGraph::default();
+        let mut out = Artifacts::new();
+        assert!(
+            matches!(
+                TsSdk::new().generate(&ir, &mut out, &cx()),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "TsSdk with no module must be a Config error"
+        );
+        assert!(
+            matches!(
+                TsSdk::new()
+                    .module("x.com/sdk")
+                    .generate(&ir, &mut out, &cx()),
+                Err(crate::CoreError::Config { .. })
+            ),
+            "TsSdk with a module but no output dir must be a Config error"
+        );
+    }
+
+    #[test]
+    fn tssdk_target_writes_under_the_output_dir_and_is_deterministic() {
+        let ir = ApiGraph::default();
+        let target = TsSdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-ts/");
+
+        // A configured run writes one Artifact per generated TypeScript file, all anchored under the
+        // (slash-trimmed) output dir.
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+        assert!(
+            !out.files().is_empty(),
+            "a configured TsSdk run must emit at least one Artifact"
+        );
+        for artifact in out.files() {
+            assert!(
+                artifact.path.starts_with("generated/sdk-ts/"),
+                "every Artifact path must be under the output dir, got {:?}",
+                artifact.path
+            );
+        }
+
+        // The trimmed output dir is the loop-safety anchor (so the pipeline never re-ingests the
+        // generated *.ts); an unconfigured target anchors nothing.
+        assert_eq!(
+            target.output_anchors(),
+            vec!["generated/sdk-ts".to_string()]
+        );
+        assert!(TsSdk::new().output_anchors().is_empty());
+
+        // Two fresh runs over the same IR yield byte-identical Artifacts (T-05-02-03 determinism).
+        let mut out2 = Artifacts::new();
+        target.generate(&ir, &mut out2, &cx()).unwrap();
+        let first: Vec<(&str, &str)> = out
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        let second: Vec<(&str, &str)> = out2
+            .files()
+            .iter()
+            .map(|a| (a.path.as_str(), a.text.as_str()))
+            .collect();
+        assert_eq!(first, second, "two TsSdk runs must be byte-identical");
     }
 
     #[test]

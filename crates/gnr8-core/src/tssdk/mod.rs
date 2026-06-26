@@ -80,12 +80,7 @@ pub fn generate(
 ///
 /// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
 /// per-file outputs without re-implementing the marker split. Single source of truth for the framing —
-/// the same one [`write_to_dir`] uses. (Consumed by the `TsSdk` target in `sdk::builtins`, plan 02.)
-///
-/// Allowed dead-code until plan 02 wires the `TsSdk` Target: the only in-crate caller (the Target in
-/// `sdk::builtins`, the analog of `crate::pysdk::split_bundle`'s caller) lands next plan. The mod tests
-/// already exercise it; the allow keeps `-D warnings` green in the interim without weakening visibility.
-#[allow(dead_code)]
+/// the same one [`write_to_dir`] uses. (Consumed by the `TsSdk` target in `sdk::builtins`.)
 pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
     bundle::parse(bundle)
 }
