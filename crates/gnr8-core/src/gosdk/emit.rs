@@ -24,6 +24,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
+use crate::sdk::emit_common::{
+    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -64,33 +67,6 @@ pub(crate) fn exported(name: &str) -> String {
         }
     }
     out
-}
-
-/// Split an identifier into words on `_`/`-` separators and lower→upper case boundaries.
-///
-/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `page_size` → `["page", "size"]`.
-fn split_words(name: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut prev_lower = false;
-    for ch in name.chars() {
-        if ch == '_' || ch == '-' || ch == ' ' {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-        current.push(ch);
-        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
 }
 
 /// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
@@ -429,53 +405,6 @@ return e.StatusCode == 404
     file(package, &["fmt"], &body)
 }
 
-/// The success status + (optional) model of an operation's first 2xx response.
-///
-/// WR-01: `model` is `Option` because a 2xx response can carry no body (e.g. a `204 No Content` or a
-/// body-less `201`); the `status` is always the response's real status so the dispatch compares
-/// against the actual success code rather than a hard-coded `200`.
-struct Success {
-    status: u16,
-    model: Option<String>,
-}
-
-/// Resolve an operation's primary success (lowest 2xx) response status + model name.
-///
-/// Returns the first 2xx response's status regardless of whether it carries a body (WR-01); the
-/// model is `Some` only when that response has a typed body. An operation with no 2xx response at all
-/// yields `None`.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-fn success_of(op: &Operation, graph: &ApiGraph) -> Result<Option<Success>, CoreError> {
-    for resp in &op.responses {
-        if (200..300).contains(&resp.status) {
-            let model = match &resp.body {
-                Some(body) => {
-                    let model = graph
-                        .schemas
-                        .iter()
-                        .find(|s| s.id == body.ref_id)
-                        .ok_or_else(|| CoreError::SdkGen {
-                            message: format!(
-                                "operation '{}' success response references dangling $ref '{}'",
-                                op.id, body.ref_id
-                            ),
-                        })?;
-                    Some(model.name.clone())
-                }
-                None => None,
-            };
-            return Ok(Some(Success {
-                status: resp.status,
-                model,
-            }));
-        }
-    }
-    Ok(None)
-}
-
 /// The fields of the typed `APIError` envelope the non-2xx branch can populate from a decoded
 /// error body. Each maps a Go field on `APIError` to the json field name the error model must carry
 /// for that assignment to be emitted (so the SDK only ever reads a field the resolved struct has).
@@ -516,41 +445,6 @@ fn error_model_of<'g>(
         }
     }
     Ok(None)
-}
-
-/// Resolve an operation's request-body model name, if it has a typed body.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
-fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
-    let Some(body) = &op.request_body else {
-        return Ok(None);
-    };
-    let model = graph
-        .schemas
-        .iter()
-        .find(|s| s.id == body.ref_id)
-        .ok_or_else(|| CoreError::SdkGen {
-            message: format!(
-                "operation '{}' request body references dangling $ref '{}'",
-                op.id, body.ref_id
-            ),
-        })?;
-    Ok(Some(model.name.clone()))
-}
-
-/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). `base_path` is
-/// the user's `gnr8` config value — the single source of truth for the service prefix shared with the
-/// `OpenAPI` lowering (CLAUDE.md rules 3 & 4) — so the SDK URLs and the spec paths agree.
-fn join_path(base_path: &str, path: &str) -> String {
-    let base = base_path.trim_end_matches('/');
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        format!("{base}/")
-    } else {
-        format!("{base}/{trimmed}")
-    }
 }
 
 /// Emit the single `operations.go` resource surface: ctx-first typed methods on `*Client`.
@@ -625,12 +519,12 @@ fn emit_operation(
     // The return type is the success model when one exists, else an empty struct.
     let return_model = success
         .as_ref()
-        .and_then(|s| s.model.as_deref())
+        .and_then(|(_, model)| model.as_deref())
         .unwrap_or("struct{}")
         .to_string();
     // WR-01: compare against the operation's REAL success status (e.g. 201/204), not a default 200.
     // An op with no 2xx response declared falls back to 200 (the conventional default).
-    let success_status = success.as_ref().map_or(200, |s| s.status);
+    let success_status = success.as_ref().map_or(200, |(status, _)| *status);
 
     // Build the signature argument list.
     let mut args = vec!["ctx context.Context".to_string()];
@@ -660,7 +554,7 @@ fn emit_operation(
     writeln!(body, "var out {return_model}").map_err(sink)?;
 
     let has_body = body_model.is_some();
-    let has_decode = success.as_ref().is_some_and(|s| s.model.is_some());
+    let has_decode = success.as_ref().is_some_and(|(_, model)| model.is_some());
     emit_request_dispatch(
         body,
         op,
@@ -897,25 +791,6 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
     Ok(extra.into_iter().collect())
 }
 
-/// Extract the set of `{token}` placeholder names from a path template, in first-seen order.
-///
-/// `"/goal/{uuid}/sub/{kind}"` → `["uuid", "kind"]`. Used by [`emit_url`] to assert the path's
-/// templated tokens exactly match the operation's declared path params (WR-03).
-fn path_tokens(path: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = path;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        if let Some(close) = after.find('}') {
-            tokens.push(after[..close].to_string());
-            rest = &after[close + 1..];
-        } else {
-            break;
-        }
-    }
-    tokens
-}
-
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
 ///
 /// WR-03: the set of `{token}`s in the absolute path is asserted to equal the set of declared path
@@ -935,9 +810,7 @@ fn emit_url(
 
     // WR-03: the templated tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token nor an unused arg can slip through.
-    let token_set: BTreeSet<&str> = tokens.iter().map(String::as_str).collect();
-    let param_set: BTreeSet<&str> = path_params.iter().copied().collect();
-    if token_set != param_set {
+    if !path_tokens_match(&tokens, path_params) {
         return Err(CoreError::SdkGen {
             message: format!(
                 "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",

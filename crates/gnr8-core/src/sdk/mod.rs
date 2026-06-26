@@ -29,6 +29,7 @@
 
 pub mod builtins;
 pub mod bundle;
+pub(crate) mod emit_common;
 
 use std::path::PathBuf;
 

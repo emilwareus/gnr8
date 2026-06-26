@@ -26,6 +26,9 @@
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::sdk::emit_common::{
+    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -51,34 +54,6 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 ";
-
-/// Split an identifier into words on `_`/`-`/space separators and lower→upper case boundaries.
-///
-/// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `next_cursor` → `["next", "cursor"]`. The shared
-/// tokenizer behind every Python casing helper (twin of `gosdk::emit::split_words`).
-fn split_words(name: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut prev_lower = false;
-    for ch in name.chars() {
-        if ch == '_' || ch == '-' || ch == ' ' {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if ch.is_ascii_uppercase() && prev_lower && !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-        current.push(ch);
-        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
-}
 
 /// Convert an identifier to `snake_case` (Python method/attribute name): `createBook` → `create_book`.
 pub(crate) fn snake(name: &str) -> String {
@@ -570,98 +545,6 @@ class Client:
     .to_string()
 }
 
-/// Join the `base_path` prefix with a group-relative operation path (slash-collapsed). Twin of
-/// `gosdk::emit::join_path` — the SAME single source of truth (`ir.base_path`) the `OpenAPI` lowering uses.
-fn join_path(base_path: &str, path: &str) -> String {
-    let base = base_path.trim_end_matches('/');
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        format!("{base}/")
-    } else {
-        format!("{base}/{trimmed}")
-    }
-}
-
-/// Resolve an operation's primary success (lowest 2xx) response status + model name.
-///
-/// Returns the FIRST 2xx response in `op.responses` order. The graph sorts each operation's responses
-/// by status at build time (`graph::mod` `responses.sort_by_key(|r| r.status)`, locked by the
-/// `responses_sorted_by_status` test), so "first 2xx in order" IS "lowest 2xx" — this relies on that
-/// single upstream ordering rather than re-sorting here (rule 3: one source of truth, no second sort
-/// path). The model is `Some` only when that response carries a typed body; an operation with no 2xx
-/// response yields `None`. Twin of `gosdk::emit::success_of`.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-fn success_of(
-    op: &Operation,
-    graph: &ApiGraph,
-) -> Result<Option<(u16, Option<String>)>, CoreError> {
-    for resp in &op.responses {
-        if (200..300).contains(&resp.status) {
-            let model = match &resp.body {
-                Some(body) => {
-                    let model = graph
-                        .schemas
-                        .iter()
-                        .find(|s| s.id == body.ref_id)
-                        .ok_or_else(|| CoreError::SdkGen {
-                            message: format!(
-                                "operation '{}' success response references dangling $ref '{}'",
-                                op.id, body.ref_id
-                            ),
-                        })?;
-                    Some(model.name.clone())
-                }
-                None => None,
-            };
-            return Ok(Some((resp.status, model)));
-        }
-    }
-    Ok(None)
-}
-
-/// Resolve an operation's request-body model name, if it has a typed body. Twin of
-/// `gosdk::emit::body_model_of`.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
-fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
-    let Some(body) = &op.request_body else {
-        return Ok(None);
-    };
-    let model = graph
-        .schemas
-        .iter()
-        .find(|s| s.id == body.ref_id)
-        .ok_or_else(|| CoreError::SdkGen {
-            message: format!(
-                "operation '{}' request body references dangling $ref '{}'",
-                op.id, body.ref_id
-            ),
-        })?;
-    Ok(Some(model.name.clone()))
-}
-
-/// Extract the `{token}` placeholder names from a path template, in first-seen order. Twin of
-/// `gosdk::emit::path_tokens`.
-fn path_tokens(path: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = path;
-    while let Some(open) = rest.find('{') {
-        let after = &rest[open + 1..];
-        if let Some(close) = after.find('}') {
-            tokens.push(after[..close].to_string());
-            rest = &after[close + 1..];
-        } else {
-            break;
-        }
-    }
-    tokens
-}
-
 /// Emit `client.py`'s operation methods (appended to the client file by [`generate`]).
 ///
 /// `ops` are all of the graph's operations, in graph order. Each method:
@@ -781,13 +664,12 @@ fn emit_operation(
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
     let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
 
-    // The templated path tokens must be exactly the declared path params (set equality), so neither a
-    // dangling token (a KeyError at runtime) nor an unused arg can slip through (twin of WR-03).
-    let mut token_set: Vec<&str> = tokens.iter().map(String::as_str).collect();
-    token_set.sort_unstable();
+    // The templated path tokens must be exactly the declared path params (order-independent set
+    // equality), so neither a dangling token (a KeyError at runtime) nor an unused arg can slip through
+    // (twin of WR-03). `param_set` is built sorted for a stable error message.
     let mut param_set: Vec<&str> = path_params.iter().map(|p| p.name.as_str()).collect();
     param_set.sort_unstable();
-    if token_set != param_set {
+    if !path_tokens_match(&tokens, &param_set) {
         return Err(CoreError::SdkGen {
             message: format!(
                 "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
