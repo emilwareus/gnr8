@@ -169,7 +169,9 @@ impl Target for ApiMarkdown {
 A `Source` shells out / parses to produce an `ApiGraph`; a `PostProcess` rewrites the in-memory
 `Artifacts` (license header, import rewrite). The full runnable Go example: `examples/taskflow/`. The
 cross-language example lifecycles (real committed output) live at `examples/fastapi-bookstore/` (Python →
-OpenApi31 + PySdk) and `examples/nestjs-bookstore/` (TypeScript → OpenApi31 + TsSdk).
+OpenApi31 + PySdk), `examples/flask-bookstore/` (Python, the honest typed-envelope — untyped surfaces
+become diagnostics → OpenApi31 + PySdk), and `examples/nestjs-bookstore/` (TypeScript → OpenApi31 + TsSdk).
+All five examples (plus `examples/bookstore/` Go/Gin) are byte-identical-regen-gated by `make examples-check`.
 
 ### Host ↔ child boundary
 `gnr8 generate` runs `cargo run --manifest-path .gnr8/Cargo.toml -- __emit` with `cwd = project root`.
