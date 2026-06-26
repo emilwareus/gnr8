@@ -183,7 +183,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 05-02-PLAN.md — `TsSdk` Target built-in (clone PySdk: `sdk_package` reuse, `ir.base_path`, safe-name guard, output_anchors), prelude export, unconfigured-error + determinism tests [TSSDK-03]
+- [x] 05-02-PLAN.md — `TsSdk` Target built-in (clone PySdk: `sdk_package` reuse, `ir.base_path`, safe-name guard, output_anchors), prelude export, unconfigured-error + determinism tests [TSSDK-03]
 
 **Wave 3** *(blocked on Waves 1-2)*
 
@@ -220,5 +220,5 @@ dependencies.)
 | 2. Python Source — `pyextract` | v2.0 | 4/4 | Complete   | 2026-06-25 |
 | 3. Python Target — `PySdk` | v2.0 | 3/3 | Complete   | 2026-06-25 |
 | 4. TypeScript Source — `tsextract` | v2.0 | 0/TBD | Not started | - |
-| 5. TypeScript Target — `TsSdk` | v2.0 | 1/3 | In Progress|  |
+| 5. TypeScript Target — `TsSdk` | v2.0 | 2/3 | In Progress|  |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 0/TBD | Not started | - |
