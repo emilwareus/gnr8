@@ -668,6 +668,7 @@ mod tests {
             written: vec!["openapi.yaml".to_string(), "sdk/client.go".to_string()],
             unchanged: vec!["sdk/models.go".to_string()],
             skipped: vec![],
+            deleted: vec![],
         };
         let report =
             LatencyReport::from_outcome("single-file-edit", Duration::from_millis(42), &outcome);

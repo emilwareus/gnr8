@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_graph.rs
+assertion_line: 26
 expression: graph
 ---
 module: github.com/gnr8/gnr8-fixtures/goalservice
@@ -276,7 +277,7 @@ schemas:
             type: primitive
             of:
               prim: int
-              bits: 64
+              bits: 32
               signed: true
           description: Rolling window size in days
           example: ~
@@ -443,7 +444,7 @@ schemas:
             type: primitive
             of:
               prim: int
-              bits: 64
+              bits: 32
               signed: true
           description: ~
           example: ~

@@ -112,7 +112,7 @@ pub(crate) struct SchemaFact {
 /// the single field representation for both the wire DTO and the public IR (the IR
 /// mirrors the wire contract — one definition prevents drift). Derives `Serialize`
 /// because it appears inside [`Type::Object`], which the graph serializes.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldFact {
     /// The effective serialized field name.
@@ -143,7 +143,7 @@ pub struct FieldFact {
 /// (`Any` carries an empty payload, `{"type": "any", "of": {}}`). The adjacent
 /// representation rejects any key beyond `type`/`of`, preserving the strict
 /// deserialize discipline at the enum boundary.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", content = "of", rename_all = "snake_case")]
 pub enum Type {
     /// A base scalar (string, bool, sized int, sized float, bytes).
@@ -182,7 +182,7 @@ pub enum Type {
 /// `{"prim": "string"}`). Internal tagging keeps the wire form flat and easy to
 /// mirror in a sidecar; `Prim` has only unit and struct variants, for which the
 /// internally-tagged representation round-trips cleanly even when buffered.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "prim", rename_all = "snake_case")]
 pub enum Prim {
     /// A unicode string.
@@ -209,7 +209,7 @@ pub enum Prim {
 /// maps these into its own language (a date-time becomes the target's date/time
 /// type); the neutral vocabulary stays target-agnostic. Serialized as a plain
 /// `snake_case` string (e.g. `"uuid"`, `"date_time"`).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WellKnown {
     /// A UUID (preserves the former `format: "uuid"` fact).

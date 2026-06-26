@@ -15,9 +15,10 @@ mod emit;
 
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
-use crate::sdk::emit_common::{file_in_dir, file_stem};
+use crate::sdk::emit_common::{api_key_header_name, file_stem, model_file_name};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Python SDK as a deterministic multi-file bundle String (D-06, PYSDK-01).
 ///
@@ -48,6 +49,7 @@ pub fn generate(
         base_path,
         SdkFileLayout::compact(),
         PyModelStyle::default(),
+        SdkTypeAliases::default(),
     )
 }
 
@@ -58,7 +60,14 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    generate_with_options(graph, package, base_path, layout, PyModelStyle::default())
+    generate_with_options(
+        graph,
+        package,
+        base_path,
+        layout,
+        PyModelStyle::default(),
+        SdkTypeAliases::default(),
+    )
 }
 
 /// Generate the Python SDK with configurable file layout and model style.
@@ -68,8 +77,10 @@ pub fn generate_with_options(
     base_path: &str,
     layout: SdkFileLayout,
     model_style: PyModelStyle,
+    aliases: SdkTypeAliases,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_options(graph, package, base_path, layout, model_style)?;
+    let files =
+        generate_files_with_options(graph, package, base_path, layout, model_style, aliases)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -80,8 +91,11 @@ pub(crate) fn generate_files_with_options(
     base_path: &str,
     layout: SdkFileLayout,
     model_style: PyModelStyle,
+    aliases: SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
     // order the bundle locks. client.py is the client skeleton followed by the operation methods.
@@ -94,7 +108,8 @@ pub(crate) fn generate_files_with_options(
     });
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let mut client = emit::emit_client_with_models(package, &model_module, model_style);
+    let mut client =
+        emit::emit_client_with_models(package, &model_module, model_style, auth_header.as_deref());
     client.push_str(&emit::emit_operations_with_style(
         graph,
         package,
@@ -114,19 +129,42 @@ pub(crate) fn generate_files_with_options(
 
     if layout.is_split() {
         files.push(SdkFile {
-            name: file_in_dir(Some(model_dir), "__init__.py"),
-            contents: emit::emit_models_init(graph),
+            name: crate::sdk::emit_common::file_in_dir(Some(model_dir), "__init__.py"),
+            contents: emit::emit_models_init(graph, &resolved_aliases),
         });
         for schema in &graph.schemas {
+            let default_name = crate::sdk::emit_common::file_in_dir(
+                Some(model_dir),
+                &format!("{}.py", file_stem(&schema.name)),
+            );
+            let name = if layout.model_file_template_ref().is_some() {
+                model_file_name(&layout, schema, &format!("{}.py", file_stem(&schema.name)))?
+            } else {
+                default_name
+            };
             files.push(SdkFile {
-                name: file_in_dir(Some(model_dir), &format!("{}.py", file_stem(&schema.name))),
+                name,
                 contents: emit::emit_model_schema(graph, schema, model_style)?,
+            });
+        }
+        for alias in &resolved_aliases {
+            files.push(SdkFile {
+                name: crate::sdk::emit_common::file_in_dir(
+                    Some(model_dir),
+                    &format!("{}.py", file_stem(&alias.alias)),
+                ),
+                contents: emit::emit_model_alias(alias),
             });
         }
     } else {
         files.push(SdkFile {
             name: "models.py".to_string(),
-            contents: emit::emit_models_with_style(graph, package, model_style)?,
+            contents: emit::emit_models_with_style_and_aliases(
+                graph,
+                package,
+                model_style,
+                &resolved_aliases,
+            )?,
         });
     }
 

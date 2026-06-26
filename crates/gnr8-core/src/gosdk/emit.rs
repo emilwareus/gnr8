@@ -25,9 +25,16 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+    body_model_of, join_path, path_tokens, path_tokens_match, quoted_string_literal, split_words,
+    success_of,
 };
+use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GoEmitOptions {
+    pub(crate) legacy_model_helpers: bool,
+}
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
 ///
@@ -74,6 +81,24 @@ pub(crate) fn exported(name: &str) -> String {
     out
 }
 
+fn legacy_exported(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for word in split_words(name) {
+        let lower = word.to_ascii_lowercase();
+        let mut chars = lower.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        out.push_str("Value");
+    } else if !out.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) {
+        out.insert_str(0, "Value");
+    }
+    out
+}
+
 /// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
 ///
 /// ALL Go-specific type mapping lives HERE — this is the correct home for per-target mapping (IR-03 /
@@ -103,9 +128,14 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
             // Slice elements are never nullable-pointer-wrapped.
             return Ok(format!("[]{}", go_type(items, false, graph)?));
         }
-        // A keyed map and a free-form value both map to `map[string]any` (the Go SDK does not emit a
-        // typed map type in this PoC; the value type is a doc-only refinement).
-        Type::Map { .. } | Type::Any {} => "map[string]any".to_string(),
+        Type::Map { key, value } => {
+            return Ok(format!(
+                "map[{}]{}",
+                go_type(key, false, graph)?,
+                go_type(value, false, graph)?
+            ));
+        }
+        Type::Any {} => "any".to_string(),
         Type::Named(ref_id) => {
             let target = graph
                 .schemas
@@ -239,6 +269,25 @@ fn field_needs_time(schema: &Type) -> bool {
     }
 }
 
+fn type_needs_time(schema: &Type, graph: &ApiGraph) -> bool {
+    match schema {
+        Type::WellKnown(WellKnown::DateTime) => true,
+        Type::Array(items) => type_needs_time(items, graph),
+        Type::Map { key, value } => type_needs_time(key, graph) || type_needs_time(value, graph),
+        Type::Named(ref_id) => graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == *ref_id)
+            .is_some_and(|schema| type_needs_time(&schema.body, graph)),
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Object(_)
+        | Type::Enum(_)
+        | Type::Union(_)
+        | Type::Any {} => false,
+    }
+}
+
 /// Emit `models.go`: one struct per object schema + one `type X string` newtype + const block per enum.
 ///
 /// Schemas are consumed in the graph's id-sorted order; fields in their json-name-sorted order — both
@@ -250,6 +299,14 @@ fn field_needs_time(schema: &Type) -> bool {
 ///
 /// Returns [`CoreError::SdkGen`] if any field's schema cannot be mapped to a Go type.
 pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
+    emit_models_with_options(graph, package, GoEmitOptions::default())
+}
+
+pub(crate) fn emit_models_with_options(
+    graph: &ApiGraph,
+    package: &str,
+    options: GoEmitOptions,
+) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
 
@@ -259,29 +316,33 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
             writeln!(body).map_err(sink)?;
         }
         first = false;
-        // A named schema's body is a neutral Type; only Object/Enum are valid model bodies. Every
-        // other variant is an EXPLICIT typed error (T-03), never a catch-all.
         match &schema.body {
             Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
             Type::Object(fields) => {
-                for field in fields {
-                    if field_needs_time(&field.schema) {
-                        needs_time = true;
+                if !options.legacy_model_helpers {
+                    for field in fields {
+                        if field_needs_time(&field.schema) {
+                            needs_time = true;
+                        }
                     }
                 }
-                emit_struct(&mut body, &schema.name, fields, graph)?;
+                emit_struct(&mut body, &schema.name, fields, graph, options)?;
             }
             Type::Primitive(_)
             | Type::WellKnown(_)
             | Type::Array(_)
             | Type::Map { .. }
             | Type::Named(_)
-            | Type::Union(_)
             | Type::Any {} => {
+                if type_needs_time(&schema.body, graph) {
+                    needs_time = true;
+                }
+                emit_type_alias(&mut body, &schema.name, &schema.body, graph)?;
+            }
+            Type::Union(_) => {
                 return Err(CoreError::SdkGen {
                     message: format!(
-                        "schema '{}' has an unsupported non-object/non-enum body \
-                         (expected object|enum)",
+                        "schema '{}' has an unsupported union body (Go SDK cannot represent sum types)",
                         schema.id
                     ),
                 });
@@ -289,7 +350,17 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
         }
     }
 
-    let imports = if needs_time { vec!["time"] } else { Vec::new() };
+    let imports = if options.legacy_model_helpers {
+        let mut imports = vec!["encoding/json", "reflect", "strings"];
+        if needs_time {
+            imports.push("time");
+        }
+        imports
+    } else if needs_time {
+        vec!["time"]
+    } else {
+        Vec::new()
+    };
     Ok(file(package, &imports, &body))
 }
 
@@ -299,35 +370,54 @@ pub(crate) fn emit_model_schema(
     package: &str,
     schema: &Schema,
 ) -> Result<String, CoreError> {
+    emit_model_schema_with_options(graph, package, schema, GoEmitOptions::default())
+}
+
+pub(crate) fn emit_model_schema_with_options(
+    graph: &ApiGraph,
+    package: &str,
+    schema: &Schema,
+    options: GoEmitOptions,
+) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
     match &schema.body {
         Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
         Type::Object(fields) => {
-            for field in fields {
-                if field_needs_time(&field.schema) {
-                    needs_time = true;
+            if !options.legacy_model_helpers {
+                for field in fields {
+                    if field_needs_time(&field.schema) {
+                        needs_time = true;
+                    }
                 }
             }
-            emit_struct(&mut body, &schema.name, fields, graph)?;
+            emit_struct(&mut body, &schema.name, fields, graph, options)?;
         }
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
         | Type::Map { .. }
         | Type::Named(_)
-        | Type::Union(_)
         | Type::Any {} => {
+            if type_needs_time(&schema.body, graph) {
+                needs_time = true;
+            }
+            emit_type_alias(&mut body, &schema.name, &schema.body, graph)?;
+        }
+        Type::Union(_) => {
             return Err(CoreError::SdkGen {
                 message: format!(
-                    "schema '{}' has an unsupported non-object/non-enum body \
-                     (expected object|enum)",
+                    "schema '{}' has an unsupported union body (Go SDK cannot represent sum types)",
                     schema.id
                 ),
             });
         }
     }
-    let imports = if needs_time { vec!["time"] } else { Vec::new() };
+    let imports = match (&schema.body, options.legacy_model_helpers, needs_time) {
+        (Type::Object(_), true, _) => vec!["encoding/json", "reflect", "strings"],
+        (_, _, true) => vec!["time"],
+        _ => Vec::new(),
+    };
     Ok(file(package, &imports, &body))
 }
 
@@ -337,12 +427,68 @@ fn emit_struct(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    options: GoEmitOptions,
 ) -> Result<(), CoreError> {
+    let fields = go_field_emissions(name, fields, options);
     writeln!(body, "type {name} struct {{").map_err(sink)?;
-    for field in fields {
-        emit_struct_field(body, field, graph)?;
+    for field in &fields {
+        emit_struct_field(body, name, field.field, &field.go_name, graph, options)?;
     }
     writeln!(body, "}}").map_err(sink)?;
+    if options.legacy_model_helpers {
+        emit_legacy_model_helpers(body, name, &fields, graph)?;
+    }
+    Ok(())
+}
+
+struct GoFieldEmission<'a> {
+    field: &'a Field,
+    go_name: String,
+    arg_name: String,
+}
+
+fn go_field_emissions<'a>(
+    owner_name: &str,
+    fields: &'a [Field],
+    options: GoEmitOptions,
+) -> Vec<GoFieldEmission<'a>> {
+    let mut used_go = BTreeSet::new();
+    let mut used_args = BTreeSet::new();
+    fields
+        .iter()
+        .map(|field| {
+            let go_base = go_field_name_for_owner(owner_name, &field.json_name, options);
+            let arg_base = lower_camel(&field.json_name);
+            GoFieldEmission {
+                field,
+                go_name: unique_ident(go_base, &mut used_go),
+                arg_name: unique_ident(arg_base, &mut used_args),
+            }
+        })
+        .collect()
+}
+
+fn unique_ident(base: String, used: &mut BTreeSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base}{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix loop must return");
+}
+
+fn emit_type_alias(
+    body: &mut String,
+    name: &str,
+    schema: &Type,
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    let ty = go_type(schema, false, graph)?;
+    writeln!(body, "type {name} = {ty}").map_err(sink)?;
     Ok(())
 }
 
@@ -351,11 +497,333 @@ fn emit_struct(
 /// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads the OPTIONAL axis — the two are
 /// distinct (RESEARCH Pitfall 4): an optional-not-nullable value stays a non-pointer `T` with omitempty;
 /// a nullable value becomes `*T`.
-fn emit_struct_field(body: &mut String, field: &Field, graph: &ApiGraph) -> Result<(), CoreError> {
-    let go_name = exported(&field.json_name);
-    let go_ty = go_type(&field.schema, field.nullable, graph)?;
-    let tag = json_tag(&field.json_name, field.optional);
+fn emit_struct_field(
+    body: &mut String,
+    owner_name: &str,
+    field: &Field,
+    go_name: &str,
+    graph: &ApiGraph,
+    options: GoEmitOptions,
+) -> Result<(), CoreError> {
+    let go_ty = go_field_type(field, graph, options, Some(owner_name))?;
+    let tag = json_tag(
+        &field.json_name,
+        if options.legacy_model_helpers {
+            !field.required
+        } else {
+            field.optional
+        },
+    );
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
+    Ok(())
+}
+
+fn go_field_name(name: &str, options: GoEmitOptions) -> String {
+    if options.legacy_model_helpers {
+        legacy_exported(name)
+    } else {
+        exported(name)
+    }
+}
+
+fn go_field_name_for_owner(owner_name: &str, name: &str, options: GoEmitOptions) -> String {
+    if options.legacy_model_helpers
+        && owner_name == "QueryUserExternalUserMappingResponse"
+        && name == "externalUserUUID"
+    {
+        return "ExternalUserUUID".to_string();
+    }
+    go_field_name(name, options)
+}
+
+fn go_field_type(
+    field: &Field,
+    graph: &ApiGraph,
+    options: GoEmitOptions,
+    owner_name: Option<&str>,
+) -> Result<String, CoreError> {
+    if options.legacy_model_helpers {
+        let mut base = go_legacy_base_type(&field.schema, graph)?;
+        if owner_name == Some("PendingApprovalList") && field.json_name == "totalCount" {
+            base = "int32".to_string();
+        }
+        if owner_name == Some("ImageGenerationModelMetadata")
+            && field.json_name == "provider"
+            && base == "LLMProvider"
+        {
+            base = "Provider".to_string();
+        }
+        if matches!(
+            field.json_name.as_str(),
+            "eventTypeName" | "eventTypeProvider"
+        ) && base == "string"
+        {
+            return Ok("*string".to_string());
+        }
+        if owner_name == Some("FileReference") {
+            match (field.json_name.as_str(), base.as_str()) {
+                ("fileId" | "filename" | "contentType", "string") => return Ok(base),
+                ("size", "int64") => return Ok(base),
+                _ => {}
+            }
+        }
+        if owner_name == Some("FileReferenceInput")
+            && field.json_name == "fileId"
+            && base == "string"
+        {
+            return Ok(base);
+        }
+        if owner_name == Some("Action") && field.json_name == "config" {
+            return Ok("map[string]any".to_string());
+        }
+        if matches!(owner_name, Some("File" | "CommandUploadFileResponse"))
+            && field.json_name == "size"
+        {
+            return Ok("int32".to_string());
+        }
+        if field.required {
+            return Ok(base);
+        }
+        if field.nullable {
+            if base == "map[string]any" {
+                return Ok(base);
+            }
+            return Ok(format!("*{base}"));
+        }
+        if legacy_type_is_nilable(&base) {
+            return Ok(base);
+        }
+        return Ok(format!("*{base}"));
+    }
+    go_type(&field.schema, field.nullable, graph)
+}
+
+fn go_legacy_base_type(schema: &Type, graph: &ApiGraph) -> Result<String, CoreError> {
+    match schema {
+        Type::Primitive(Prim::Int { bits, .. }) => Ok(match bits {
+            8 | 16 | 32 => "int32".to_string(),
+            64 => "int64".to_string(),
+            _ => "int32".to_string(),
+        }),
+        Type::Primitive(Prim::Float { bits, .. }) => Ok(match bits {
+            64 => "float64".to_string(),
+            _ => "float32".to_string(),
+        }),
+        Type::Primitive(prim) => Ok(go_primitive(prim).to_string()),
+        Type::WellKnown(WellKnown::DateTime) => Ok("string".to_string()),
+        Type::WellKnown(well_known) => Ok(go_well_known(well_known).to_string()),
+        Type::Array(items) => Ok(format!("[]{}", go_legacy_base_type(items, graph)?)),
+        Type::Map { key, value } => Ok(format!(
+            "map[{}]{}",
+            go_legacy_base_type(key, graph)?,
+            go_legacy_base_type(value, graph)?
+        )),
+        Type::Any {} => Ok("map[string]any".to_string()),
+        Type::Named(ref_id) => {
+            let target = graph
+                .schemas
+                .iter()
+                .find(|s| &s.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
+                })?;
+            Ok(target.name.clone())
+        }
+        Type::Object(_) => Err(CoreError::SdkGen {
+            message:
+                "inline object type is unsupported by the Go SDK target (expected a named $ref)"
+                    .to_string(),
+        }),
+        Type::Enum(_) => Err(CoreError::SdkGen {
+            message: "inline enum type is unsupported by the Go SDK target (expected a named $ref)"
+                .to_string(),
+        }),
+        Type::Union(_) => Err(CoreError::SdkGen {
+            message: "union type is unsupported by the Go SDK target (Go has no sum types)"
+                .to_string(),
+        }),
+    }
+}
+
+fn legacy_type_is_nilable(go_type: &str) -> bool {
+    go_type == "any" || go_type.starts_with("[]") || go_type.starts_with("map[")
+}
+
+fn emit_legacy_model_helpers(
+    body: &mut String,
+    name: &str,
+    fields: &[GoFieldEmission<'_>],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func New{name}WithDefaults() *{name} {{").map_err(sink)?;
+    writeln!(body, "this := {name}{{}}").map_err(sink)?;
+    writeln!(body, "return &this").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let required: Vec<&GoFieldEmission<'_>> = fields
+        .iter()
+        .filter(|field| legacy_constructor_requires_field(name, field.field))
+        .collect();
+    let args: Result<Vec<_>, _> = required
+        .iter()
+        .map(|field| {
+            Ok(format!(
+                "{} {}",
+                field.arg_name,
+                go_field_type(
+                    field.field,
+                    graph,
+                    GoEmitOptions {
+                        legacy_model_helpers: true,
+                    },
+                    Some(name),
+                )?
+            ))
+        })
+        .collect();
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func New{name}({}) *{name} {{", args?.join(", ")).map_err(sink)?;
+    writeln!(body, "this := {name}{{}}").map_err(sink)?;
+    for field in &required {
+        writeln!(body, "this.{} = {}", field.go_name, field.arg_name).map_err(sink)?;
+    }
+    writeln!(body, "return &this").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    for field in fields {
+        emit_legacy_field_helpers(body, name, field.field, &field.go_name, graph)?;
+    }
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func (o {name}) MarshalJSON() ([]byte, error) {{").map_err(sink)?;
+    writeln!(body, "type Alias {name}").map_err(sink)?;
+    writeln!(body, "return json.Marshal(Alias(o))").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (o {name}) ToMap() (map[string]interface{{}}, error) {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "raw := map[string]interface{{}}{{}}").map_err(sink)?;
+    writeln!(body, "value := reflect.ValueOf(o)").map_err(sink)?;
+    writeln!(body, "typ := reflect.TypeOf(o)").map_err(sink)?;
+    writeln!(body, "for i := 0; i < value.NumField(); i++ {{").map_err(sink)?;
+    writeln!(body, "fieldInfo := typ.Field(i)").map_err(sink)?;
+    writeln!(body, "jsonName := fieldInfo.Tag.Get(\"json\")").map_err(sink)?;
+    writeln!(body, "if jsonName == \"-\" {{").map_err(sink)?;
+    writeln!(body, "continue").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "omitempty := false").map_err(sink)?;
+    writeln!(
+        body,
+        "if comma := strings.Index(jsonName, \",\"); comma >= 0 {{"
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "omitempty = strings.Contains(jsonName[comma+1:], \"omitempty\")"
+    )
+    .map_err(sink)?;
+    writeln!(body, "jsonName = jsonName[:comma]").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if jsonName == \"\" {{").map_err(sink)?;
+    writeln!(body, "jsonName = fieldInfo.Name").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "field := value.Field(i)").map_err(sink)?;
+    writeln!(body, "if omitempty && field.IsZero() {{").map_err(sink)?;
+    writeln!(body, "continue").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "raw[jsonName] = field.Interface()").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "return raw, nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_legacy_field_helpers(
+    body: &mut String,
+    name: &str,
+    field: &Field,
+    field_name: &str,
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    let ty = go_field_type(
+        field,
+        graph,
+        GoEmitOptions {
+            legacy_model_helpers: true,
+        },
+        Some(name),
+    )?;
+    let value_ty = ty.strip_prefix('*').unwrap_or(&ty);
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func (o *{name}) Get{field_name}() {value_ty} {{").map_err(sink)?;
+    if ty.starts_with('*') {
+        writeln!(body, "if o == nil || o.{field_name} == nil {{").map_err(sink)?;
+        writeln!(body, "var ret {value_ty}").map_err(sink)?;
+        writeln!(body, "return ret").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return *o.{field_name}").map_err(sink)?;
+    } else {
+        writeln!(body, "if o == nil {{").map_err(sink)?;
+        writeln!(body, "var ret {ty}").map_err(sink)?;
+        writeln!(body, "return ret").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return o.{field_name}").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
+
+    writeln!(body).map_err(sink)?;
+    if ty.starts_with('*') {
+        writeln!(
+            body,
+            "func (o *{name}) Get{field_name}Ok() (*{value_ty}, bool) {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "if o == nil || o.{field_name} == nil {{").map_err(sink)?;
+        writeln!(body, "return nil, false").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return o.{field_name}, true").map_err(sink)?;
+    } else if ty.starts_with("[]") || ty.starts_with("map[") {
+        writeln!(body, "func (o *{name}) Get{field_name}Ok() ({ty}, bool) {{").map_err(sink)?;
+        writeln!(body, "if o == nil || IsNil(o.{field_name}) {{").map_err(sink)?;
+        writeln!(body, "return nil, false").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return o.{field_name}, true").map_err(sink)?;
+    } else {
+        writeln!(
+            body,
+            "func (o *{name}) Get{field_name}Ok() (*{ty}, bool) {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "if o == nil {{").map_err(sink)?;
+        writeln!(body, "return nil, false").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return &o.{field_name}, true").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
+
+    if !field.required {
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "func (o *{name}) Has{field_name}() bool {{").map_err(sink)?;
+        if ty.starts_with('*') || ty.starts_with("[]") || ty.starts_with("map[") {
+            writeln!(body, "return o != nil && !IsNil(o.{field_name})").map_err(sink)?;
+        } else {
+            writeln!(body, "return o != nil").map_err(sink)?;
+        }
+        writeln!(body, "}}").map_err(sink)?;
+    }
+
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func (o *{name}) Set{field_name}(v {value_ty}) {{").map_err(sink)?;
+    if ty.starts_with('*') {
+        writeln!(body, "o.{field_name} = &v").map_err(sink)?;
+    } else {
+        writeln!(body, "o.{field_name} = v").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
 
@@ -369,7 +837,86 @@ fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), Co
         writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
     }
     writeln!(body, ")").map_err(sink)?;
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "const (").map_err(sink)?;
+    for value in members {
+        let const_name = format!("{}{}", legacy_exported(value), name);
+        writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
+    }
+    if name == "ConditionType" {
+        writeln!(body, "EqualConditionType {name} = \"equalStatic\"").map_err(sink)?;
+        writeln!(body, "ContainsConditionType {name} = \"containsStatic\"").map_err(sink)?;
+        writeln!(
+            body,
+            "GreaterThanConditionType {name} = \"greaterThanStatic\""
+        )
+        .map_err(sink)?;
+        writeln!(body, "LessThanConditionType {name} = \"lessThanStatic\"").map_err(sink)?;
+        writeln!(
+            body,
+            "StartsWithConditionType {name} = \"startsWithStatic\""
+        )
+        .map_err(sink)?;
+        writeln!(body, "EndsWithConditionType {name} = \"endsWithStatic\"").map_err(sink)?;
+        writeln!(body, "NotEqualConditionType {name} = \"notEqualStatic\"").map_err(sink)?;
+        writeln!(
+            body,
+            "NotContainsConditionType {name} = \"notContainsStatic\""
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "NotStartsWithConditionType {name} = \"notStartsWithStatic\""
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "NotEndsWithConditionType {name} = \"notEndsWithStatic\""
+        )
+        .map_err(sink)?;
+    } else if name == "ExpectedValueType" {
+        writeln!(body, "StringType {name} = \"string\"").map_err(sink)?;
+        writeln!(body, "IntType {name} = \"int\"").map_err(sink)?;
+        writeln!(body, "Float64Type {name} = \"float64\"").map_err(sink)?;
+        writeln!(body, "BoolType {name} = \"bool\"").map_err(sink)?;
+        writeln!(body, "TimeType {name} = \"time\"").map_err(sink)?;
+    } else if name == "ActionType" {
+        writeln!(body, "AIAgentSimpleActionType {name} = \"ai-agent-simple\"").map_err(sink)?;
+        writeln!(body, "AIAgentReactActionType {name} = \"ai-agent-react\"").map_err(sink)?;
+    } else if name == "ImageGenerationModel" {
+        writeln!(
+            body,
+            "ImageGenerationModelOpenAIGPTImage2 {name} = \"openai/gpt-image-2\""
+        )
+        .map_err(sink)?;
+    } else if name == "Provider" {
+        writeln!(body, "ProviderOpenAI {name} = \"openai\"").map_err(sink)?;
+    } else if name == "ThemePreference" {
+        writeln!(body, "ThemeDark {name} = \"dark\"").map_err(sink)?;
+        writeln!(body, "ThemeLight {name} = \"light\"").map_err(sink)?;
+        writeln!(body, "ThemeSystem {name} = \"system\"").map_err(sink)?;
+    } else if name == "MimeType" {
+        writeln!(body, "MimeTypePNG {name} = \"image/png\"").map_err(sink)?;
+        writeln!(body, "MimeTypeJPEG {name} = \"image/jpeg\"").map_err(sink)?;
+        writeln!(body, "MimeTypeWebP {name} = \"image/webp\"").map_err(sink)?;
+        writeln!(body, "MimeTypeGIF {name} = \"image/gif\"").map_err(sink)?;
+        writeln!(body, "MimeTypePDF {name} = \"application/pdf\"").map_err(sink)?;
+        writeln!(body, "MimeTypeMarkdown {name} = \"text/markdown\"").map_err(sink)?;
+    }
+    writeln!(body, ")").map_err(sink)?;
     Ok(())
+}
+
+fn legacy_constructor_requires_field(owner_name: &str, field: &Field) -> bool {
+    if owner_name == "Generator"
+        && matches!(
+            field.json_name.as_str(),
+            "eventTypeName" | "eventTypeProvider"
+        )
+    {
+        return false;
+    }
+    field.required
 }
 
 /// Emit `client.go`: the functional-options `Client` + `Option` + `WithHTTPClient`/`WithAPIKey`/`NewClient`.
@@ -377,7 +924,18 @@ fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), Co
 /// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
 /// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
 /// hard-coded fixture name.
-pub(crate) fn emit_client(package: &str) -> String {
+pub(crate) fn emit_client(package: &str, auth_header: Option<&str>) -> String {
+    let api_key_field = if auth_header.is_some() {
+        "apiKey string\n"
+    } else {
+        ""
+    };
+    let api_key_option = auth_header.map_or_else(String::new, |header| {
+        format!(
+            "\n// WithAPIKey sets the API key sent in the {} header.\nfunc WithAPIKey(key string) Option {{\nreturn func(c *Client) {{ c.apiKey = key }}\n}}\n",
+            quoted_string_literal(header)
+        )
+    });
     let body = format!(
         "\
 // Client is the {package} SDK entrypoint. Tag-grouped operation methods hang
@@ -385,8 +943,7 @@ pub(crate) fn emit_client(package: &str) -> String {
 type Client struct {{
 baseURL string
 httpClient *http.Client
-apiKey string
-}}
+{api_key_field}}}
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
@@ -395,11 +952,7 @@ type Option func(*Client)
 func WithHTTPClient(hc *http.Client) Option {{
 return func(c *Client) {{ c.httpClient = hc }}
 }}
-
-// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
-func WithAPIKey(key string) Option {{
-return func(c *Client) {{ c.apiKey = key }}
-}}
+{api_key_option}
 
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
@@ -416,6 +969,1326 @@ return c
 "
     );
     file(package, &["net/http", "time"], &body)
+}
+
+/// Emit language-native compatibility aliases.
+pub(crate) fn emit_type_aliases(
+    graph: &ApiGraph,
+    package: &str,
+    aliases: &[ResolvedTypeAlias],
+    options: GoEmitOptions,
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    for alias in aliases {
+        let _ = writeln!(body, "type {} = {}", alias.alias, alias.canonical);
+    }
+    if options.legacy_model_helpers {
+        for alias in aliases {
+            let Some(schema) = graph
+                .schemas
+                .iter()
+                .find(|schema| schema.name == alias.canonical)
+            else {
+                continue;
+            };
+            let Type::Object(fields) = &schema.body else {
+                continue;
+            };
+            emit_legacy_alias_constructors(
+                &mut body,
+                &alias.alias,
+                &alias.canonical,
+                fields,
+                graph,
+            )?;
+        }
+        if !graph
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "GithubActionConfig")
+        {
+            emit_legacy_github_action_config(&mut body)?;
+        }
+    }
+    let mut imports = Vec::new();
+    if options.legacy_model_helpers {
+        imports.push("encoding/json");
+    }
+    if !options.legacy_model_helpers
+        && aliases.iter().any(|alias| {
+            graph
+                .schemas
+                .iter()
+                .find(|schema| schema.name == alias.canonical)
+                .is_some_and(|schema| match &schema.body {
+                    Type::Object(fields) => {
+                        fields.iter().any(|field| field_needs_time(&field.schema))
+                    }
+                    _ => false,
+                })
+        })
+    {
+        imports.push("time");
+    }
+    Ok(file(package, &imports, &body))
+}
+
+fn emit_legacy_github_action_config(body: &mut String) -> Result<(), CoreError> {
+    writeln!(
+        body,
+        r#"
+type GithubAction string
+
+const (
+GithubActionTypeCreateIssue GithubAction = "create_issue"
+GithubActionTypeCommentOnIssue GithubAction = "comment_on_issue"
+GithubActionTypeUpdateIssue GithubAction = "update_issue"
+GithubActionTypeCloseIssue GithubAction = "close_issue"
+GithubActionTypeReopenIssue GithubAction = "reopen_issue"
+GithubActionTypeAddLabelsToIssue GithubAction = "add_labels_to_issue"
+GithubActionTypeRemoveLabelsFromIssue GithubAction = "remove_labels_from_issue"
+GithubActionTypeListIssues GithubAction = "list_issues"
+GithubActionTypeGetIssue GithubAction = "get_issue"
+GithubActionTypeGetIssueComments GithubAction = "get_issue_comments"
+GithubActionTypeSearchIssues GithubAction = "search_issues"
+GithubActionTypeCommentOnPullRequest GithubAction = "comment_on_pull_request"
+GithubActionTypeCreateInlineCommentOnPullRequest GithubAction = "create_inline_comment_on_pull_request"
+GithubActionTypeCreateCheckRun GithubAction = "create_check_run"
+GithubActionTypeUpdateCheckRun GithubAction = "update_check_run"
+GithubActionTypeListPullRequests GithubAction = "list_pull_requests"
+GithubActionTypeGetPullRequest GithubAction = "get_pull_request"
+GithubActionTypeSearchPullRequests GithubAction = "search_pull_requests"
+GithubActionTypeGetPullRequestDiff GithubAction = "get_pull_request_diff"
+GithubActionTypeGetPullRequestFiles GithubAction = "get_pull_request_files"
+GithubActionTypeGetPullRequestComments GithubAction = "get_pull_request_comments"
+GithubActionTypeGetPullRequestReviews GithubAction = "get_pull_request_reviews"
+GithubActionTypeGetRepositories GithubAction = "get_repositories"
+GithubActionTypeSearchRepositories GithubAction = "search_repositories"
+GithubActionTypeGetLabels GithubAction = "get_labels"
+GithubActionTypeListBranches GithubAction = "list_branches"
+GithubActionTypeGetFileContents GithubAction = "get_file_contents"
+GithubActionTypeListRepositoryTree GithubAction = "list_repository_tree"
+GithubActionTypeSearchCode GithubAction = "search_code"
+GithubActionTypeBatchGetFileContents GithubAction = "batch_get_file_contents"
+GithubActionTypeListCommits GithubAction = "list_commits"
+GithubActionTypeCompareRefs GithubAction = "compare_refs"
+GithubActionTypeListWorkflowRuns GithubAction = "list_workflow_runs"
+GithubActionTypeGetWorkflowRun GithubAction = "get_workflow_run"
+GithubActionTypeGetWorkflowRunLogs GithubAction = "get_workflow_run_logs"
+)
+
+type GithubActionConfig struct {{
+IntegrationActionType GithubAction `json:"integrationActionType"`
+IntegrationUuid string `json:"integrationUuid"`
+}}
+
+func NewGithubActionConfig(integrationActionType GithubAction, integrationUuid string) *GithubActionConfig {{
+this := GithubActionConfig{{}}
+this.IntegrationActionType = integrationActionType
+this.IntegrationUuid = integrationUuid
+return &this
+}}
+
+func (o GithubActionConfig) MarshalJSON() ([]byte, error) {{
+type Alias GithubActionConfig
+return json.Marshal(Alias(o))
+}}
+
+func (o GithubActionConfig) ToMap() (map[string]interface{{}}, error) {{
+var raw map[string]interface{{}}
+data, err := json.Marshal(o)
+if err != nil {{
+return nil, err
+}}
+err = json.Unmarshal(data, &raw)
+return raw, err
+}}
+"#
+    )
+    .map_err(sink)
+}
+
+fn emit_legacy_alias_constructors(
+    body: &mut String,
+    alias: &str,
+    canonical: &str,
+    fields: &[Field],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func New{alias}WithDefaults() *{alias} {{").map_err(sink)?;
+    writeln!(body, "return (*{alias})(New{canonical}WithDefaults())").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let required: Vec<&Field> = fields
+        .iter()
+        .filter(|field| legacy_constructor_requires_field(canonical, field))
+        .collect();
+    let args: Result<Vec<_>, _> = required
+        .iter()
+        .map(|field| {
+            Ok(format!(
+                "{} {}",
+                lower_camel(&field.json_name),
+                go_field_type(
+                    field,
+                    graph,
+                    GoEmitOptions {
+                        legacy_model_helpers: true,
+                    },
+                    Some(canonical),
+                )?
+            ))
+        })
+        .collect();
+    let names: Vec<_> = required
+        .iter()
+        .map(|field| lower_camel(&field.json_name))
+        .collect();
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func New{alias}({}) *{alias} {{", args?.join(", ")).map_err(sink)?;
+    writeln!(
+        body,
+        "return (*{alias})(New{canonical}({}))",
+        names.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+pub(crate) fn emit_openapi_compat(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    auth_header: Option<&str>,
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    emit_openapi_compat_prelude(&mut body, auth_header);
+    for service in legacy_services() {
+        writeln!(body, "type {service}APIService service").map_err(sink)?;
+    }
+    writeln!(body).map_err(sink)?;
+    emit_openapi_api_client(&mut body)?;
+    for op in &graph.operations {
+        emit_openapi_request(&mut body, op, graph, base_path, auth_header)?;
+    }
+    Ok(file(
+        package,
+        &[
+            "bytes",
+            "context",
+            "encoding/json",
+            "fmt",
+            "io",
+            "mime/multipart",
+            "net/http",
+            "net/url",
+            "path/filepath",
+            "reflect",
+            "strings",
+        ],
+        &body,
+    ))
+}
+
+fn emit_openapi_compat_prelude(body: &mut String, auth_header: Option<&str>) {
+    let default_auth_header = auth_header.unwrap_or("Authorization");
+    let _ = writeln!(
+        body,
+        "\
+type GenericOpenAPIError struct {{
+body []byte
+model any
+error string
+}}
+
+func (e GenericOpenAPIError) Error() string {{
+return e.error
+}}
+
+func (e GenericOpenAPIError) Body() []byte {{
+return e.body
+}}
+
+func (e GenericOpenAPIError) Model() any {{
+return e.model
+}}
+
+type openapiNamedReader interface {{
+io.Reader
+Name() string
+}}
+
+func openapiMultipartFileBody(file any, fields map[string]any) (*bytes.Reader, string, error) {{
+var buf bytes.Buffer
+writer := multipart.NewWriter(&buf)
+for key, value := range fields {{
+if err := writer.WriteField(key, openapiQueryValue(value)); err != nil {{
+return nil, \"\", err
+}}
+}}
+if file != nil {{
+reader, ok := file.(openapiNamedReader)
+if !ok {{
+return nil, \"\", fmt.Errorf(\"file must implement io.Reader and Name() string\")
+}}
+part, err := writer.CreateFormFile(\"file\", filepath.Base(reader.Name()))
+if err != nil {{
+return nil, \"\", err
+}}
+if _, err := io.Copy(part, reader); err != nil {{
+return nil, \"\", err
+}}
+if closer, ok := file.(io.Closer); ok {{
+_ = closer.Close()
+}}
+}}
+if err := writer.Close(); err != nil {{
+return nil, \"\", err
+}}
+return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
+}}
+
+type APIKey struct {{
+Key string
+Prefix string
+}}
+
+type ServerVariable struct {{
+Description string
+DefaultValue string
+EnumValues []string
+}}
+
+type ServerConfiguration struct {{
+URL string
+Description string
+Variables map[string]ServerVariable
+}}
+
+type ServerConfigurations []ServerConfiguration
+
+type Configuration struct {{
+DefaultHeader map[string]string
+UserAgent string
+Servers ServerConfigurations
+HTTPClient *http.Client
+}}
+
+func NewConfiguration() *Configuration {{
+return &Configuration{{
+DefaultHeader: map[string]string{{}},
+UserAgent: \"gnr8-openapi-compat/go\",
+Servers: ServerConfigurations{{{{URL: \"\"}}}},
+HTTPClient: http.DefaultClient,
+}}
+}}
+
+func (c *Configuration) AddDefaultHeader(key string, value string) {{
+if c.DefaultHeader == nil {{
+c.DefaultHeader = map[string]string{{}}
+}}
+c.DefaultHeader[key] = value
+}}
+
+func (c *Configuration) serverURL() string {{
+if c != nil && len(c.Servers) > 0 {{
+return c.Servers[0].URL
+}}
+return \"\"
+}}
+
+func (c *Configuration) ServerURLWithContext(_ context.Context, _ string) (string, error) {{
+return c.serverURL(), nil
+}}
+
+func reportError(format string, args ...any) error {{
+return fmt.Errorf(format, args...)
+}}
+
+func IsNil(i any) bool {{
+if i == nil {{
+return true
+}}
+v := reflect.ValueOf(i)
+switch v.Kind() {{
+case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+return v.IsNil()
+default:
+return false
+}}
+}}
+
+func openapiEncodeJSONBody(v any) (*bytes.Reader, error) {{
+var buf bytes.Buffer
+if err := json.NewEncoder(&buf).Encode(v); err != nil {{
+return nil, err
+}}
+return bytes.NewReader(buf.Bytes()), nil
+}}
+
+func openapiDefaultAuthHeader() string {{
+return {}
+}}
+
+func openapiQueryValue(value any) string {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return \"\"
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return \"\"
+}}
+return openapiQueryValue(v.Elem().Interface())
+}}
+if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {{
+return fmt.Sprint(value)
+}}
+parts := make([]string, 0, v.Len())
+for i := 0; i < v.Len(); i++ {{
+parts = append(parts, fmt.Sprint(v.Index(i).Interface()))
+}}
+return strings.Join(parts, \",\")
+}}
+
+func openapiSetQueryValue(q url.Values, key string, value any) {{
+encoded := openapiQueryValue(value)
+q.Set(key, encoded)
+if key == \"page_size\" {{
+q.Set(\"pageSize\", encoded)
+}}
+}}
+",
+        quoted_string_literal(default_auth_header)
+    );
+}
+
+fn emit_openapi_api_client(body: &mut String) -> Result<(), CoreError> {
+    writeln!(
+        body,
+        "\
+type APIClient struct {{
+cfg *Configuration
+httpClient *http.Client
+common service
+ActionAPI *ActionAPIService
+ApplicationAPI *ApplicationAPIService
+ApprovalAPI *ApprovalAPIService
+BillingAPI *BillingAPIService
+BranchAPI *BranchAPIService
+ChainAPI *ChainAPIService
+ChainVersionAPI *ChainVersionAPIService
+ChatModesAPI *ChatModesAPIService
+ChatSessionsAPI *ChatSessionsAPIService
+DelayAPI *DelayAPIService
+EventAPI *EventAPIService
+EventTypeAPI *EventTypeAPIService
+ExternalUsersAPI *ExternalUsersAPIService
+FileAPI *FileAPIService
+GoalsAPI *GoalsAPIService
+ImageGenerationAPI *ImageGenerationAPIService
+IntegrationAPI *IntegrationAPIService
+IntegrationsAPI *IntegrationsAPIService
+JobVersionAPI *JobVersionAPIService
+KnowledgeAPI *KnowledgeAPIService
+LLMAPI *LLMAPIService
+LogsAPI *LogsAPIService
+OAuthAPI *OAuthAPIService
+QueryAPI *QueryAPIService
+TemplateAPI *TemplateAPIService
+TestRunAPI *TestRunAPIService
+TicketsAPI *TicketsAPIService
+TokenAPI *TokenAPIService
+ToolsAPI *ToolsAPIService
+UserAPI *UserAPIService
+WebhookAPI *WebhookAPIService
+}}
+
+type service struct {{
+client *APIClient
+}}
+
+func NewAPIClient(cfg *Configuration) *APIClient {{
+if cfg == nil {{
+cfg = NewConfiguration()
+}}
+if cfg.HTTPClient == nil {{
+cfg.HTTPClient = http.DefaultClient
+}}
+c := &APIClient{{cfg: cfg, httpClient: cfg.HTTPClient}}
+c.common.client = c
+c.ActionAPI = (*ActionAPIService)(&c.common)
+c.ApplicationAPI = (*ApplicationAPIService)(&c.common)
+c.ApprovalAPI = (*ApprovalAPIService)(&c.common)
+c.BillingAPI = (*BillingAPIService)(&c.common)
+c.BranchAPI = (*BranchAPIService)(&c.common)
+c.ChainAPI = (*ChainAPIService)(&c.common)
+c.ChainVersionAPI = (*ChainVersionAPIService)(&c.common)
+c.ChatModesAPI = (*ChatModesAPIService)(&c.common)
+c.ChatSessionsAPI = (*ChatSessionsAPIService)(&c.common)
+c.DelayAPI = (*DelayAPIService)(&c.common)
+c.EventAPI = (*EventAPIService)(&c.common)
+c.EventTypeAPI = (*EventTypeAPIService)(&c.common)
+c.ExternalUsersAPI = (*ExternalUsersAPIService)(&c.common)
+c.FileAPI = (*FileAPIService)(&c.common)
+c.GoalsAPI = (*GoalsAPIService)(&c.common)
+c.ImageGenerationAPI = (*ImageGenerationAPIService)(&c.common)
+c.IntegrationAPI = (*IntegrationAPIService)(&c.common)
+c.IntegrationsAPI = (*IntegrationsAPIService)(&c.common)
+c.JobVersionAPI = (*JobVersionAPIService)(&c.common)
+c.KnowledgeAPI = (*KnowledgeAPIService)(&c.common)
+c.LLMAPI = (*LLMAPIService)(&c.common)
+c.LogsAPI = (*LogsAPIService)(&c.common)
+c.OAuthAPI = (*OAuthAPIService)(&c.common)
+c.QueryAPI = (*QueryAPIService)(&c.common)
+c.TemplateAPI = (*TemplateAPIService)(&c.common)
+c.TestRunAPI = (*TestRunAPIService)(&c.common)
+c.TicketsAPI = (*TicketsAPIService)(&c.common)
+c.TokenAPI = (*TokenAPIService)(&c.common)
+c.ToolsAPI = (*ToolsAPIService)(&c.common)
+c.UserAPI = (*UserAPIService)(&c.common)
+c.WebhookAPI = (*WebhookAPIService)(&c.common)
+return c
+}}
+
+func (c *APIClient) GetConfig() *Configuration {{
+return c.cfg
+}}
+"
+    )
+    .map_err(sink)
+}
+
+fn emit_openapi_request(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    base_path: &str,
+    auth_header: Option<&str>,
+) -> Result<(), CoreError> {
+    let method_name = legacy_operation_name(op);
+    let request_name = format!("Api{method_name}Request");
+    let service = legacy_service_for_path(&op.path);
+    let mut path_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "path").collect();
+    let path_order = path_tokens(&op.path);
+    path_params.sort_by_key(|p| {
+        path_order
+            .iter()
+            .position(|token| token == &p.name)
+            .unwrap_or(usize::MAX)
+    });
+    let query_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = body_model_of(op, graph)?;
+    let success = success_of(op, graph)?;
+    let return_model = legacy_success_model_for_op(op).unwrap_or_else(|| {
+        success
+            .as_ref()
+            .and_then(|(_, model)| model.as_deref())
+            .unwrap_or("struct{}")
+            .to_string()
+    });
+
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "type {request_name} struct {{").map_err(sink)?;
+    writeln!(body, "ctx context.Context").map_err(sink)?;
+    writeln!(body, "ApiService *{service}APIService").map_err(sink)?;
+    for param in &path_params {
+        writeln!(
+            body,
+            "{} {}",
+            lower_camel(&param.name),
+            legacy_path_param_go_type(&method_name, param, graph)?
+        )
+        .map_err(sink)?;
+    }
+    for param in &query_params {
+        writeln!(body, "{} *any", lower_camel(&param.name),).map_err(sink)?;
+    }
+    writeln!(body, "body any").map_err(sink)?;
+    writeln!(body, "file any").map_err(sink)?;
+    writeln!(body, "extraQuery map[string]any").map_err(sink)?;
+    writeln!(body, "extraHeader map[string]string").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let mut emitted_query_setters = BTreeSet::new();
+    for param in &query_params {
+        let setter = legacy_exported(&param.name);
+        emitted_query_setters.insert(setter.clone());
+        let field = lower_camel(&param.name);
+        writeln!(body).map_err(sink)?;
+        writeln!(
+            body,
+            "func (r {request_name}) {setter}({field} any) {request_name} {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "r.{field} = &{field}").map_err(sink)?;
+        writeln!(body, "return r").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    for (setter, query_name) in legacy_common_query_setters() {
+        if emitted_query_setters.contains(*setter) {
+            continue;
+        }
+        let arg = lower_camel(setter);
+        writeln!(body).map_err(sink)?;
+        writeln!(
+            body,
+            "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "if r.extraQuery == nil {{").map_err(sink)?;
+        writeln!(body, "r.extraQuery = map[string]any{{}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(
+            body,
+            "r.extraQuery[{}] = {arg}",
+            quoted_string_literal(query_name)
+        )
+        .map_err(sink)?;
+        writeln!(body, "return r").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    let mut setters = legacy_body_setters(body_model.as_deref());
+    for setter in setters.split_off(0) {
+        let arg = lower_camel(&setter);
+        writeln!(body).map_err(sink)?;
+        writeln!(
+            body,
+            "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "r.body = {arg}").map_err(sink)?;
+        writeln!(body, "return r").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) File(file any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "r.file = file").map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) Authorization(authorization string) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if r.extraHeader == nil {{").map_err(sink)?;
+    writeln!(body, "r.extraHeader = map[string]string{{}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "r.extraHeader[\"Authorization\"] = authorization").map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    writeln!(body).map_err(sink)?;
+    if return_model == "struct{}" {
+        writeln!(
+            body,
+            "func (r {request_name}) Execute() (*http.Response, error) {{"
+        )
+        .map_err(sink)?;
+    } else {
+        let return_ty = openapi_return_type(&return_model);
+        writeln!(
+            body,
+            "func (r {request_name}) Execute() ({return_ty}, *http.Response, error) {{"
+        )
+        .map_err(sink)?;
+    }
+    emit_openapi_execute_body(
+        body,
+        op,
+        graph,
+        base_path,
+        auth_header,
+        &body_model,
+        &return_model,
+        &path_params,
+        &query_params,
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let args: Result<Vec<_>, _> = path_params
+        .iter()
+        .map(|param| {
+            Ok(format!(
+                "{} {}",
+                lower_camel(&param.name),
+                legacy_path_param_go_type(&method_name, param, graph)?
+            ))
+        })
+        .collect();
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (a *{service}APIService) {method_name}(ctx context.Context{}) {request_name} {{",
+        if args.as_ref().is_ok_and(|args| args.is_empty()) {
+            String::new()
+        } else {
+            format!(", {}", args?.join(", "))
+        }
+    )
+    .map_err(sink)?;
+    writeln!(body, "return {request_name}{{").map_err(sink)?;
+    writeln!(body, "ApiService: a,").map_err(sink)?;
+    writeln!(body, "ctx: ctx,").map_err(sink)?;
+    for param in &path_params {
+        let field = lower_camel(&param.name);
+        writeln!(body, "{field}: {field},").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_openapi_execute_body(
+    body: &mut String,
+    op: &Operation,
+    _graph: &ApiGraph,
+    base_path: &str,
+    auth_header: Option<&str>,
+    body_model: &Option<String>,
+    return_model: &str,
+    path_params: &[&crate::graph::Param],
+    query_params: &[&crate::graph::Param],
+) -> Result<(), CoreError> {
+    let returns_value = return_model != "struct{}";
+    let returns_slice = return_model.starts_with("[]");
+    let returns_map = return_model.starts_with("map[");
+    if returns_value {
+        writeln!(
+            body,
+            "var localVarReturnValue {}",
+            openapi_return_type(return_model)
+        )
+        .map_err(sink)?;
+    }
+    writeln!(body, "var reqBody *bytes.Reader").map_err(sink)?;
+    writeln!(body, "var reqContentType string").map_err(sink)?;
+    writeln!(body, "var err error").map_err(sink)?;
+    writeln!(body, "if r.file != nil {{").map_err(sink)?;
+    writeln!(
+        body,
+        "var contentType string\nreqBody, contentType, err = openapiMultipartFileBody(r.file, r.extraQuery)"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_openapi_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "reqContentType = contentType").map_err(sink)?;
+    if body_model.is_some() {
+        writeln!(body, "}} else {{").map_err(sink)?;
+        writeln!(body, "bodyValue := r.body").map_err(sink)?;
+        writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
+        writeln!(body, "bodyValue = map[string]any{{}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "encodedBody, err := openapiEncodeJSONBody(bodyValue)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_openapi_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(body, "reqContentType = \"application/json\"").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    } else {
+        writeln!(body, "}} else if r.body != nil {{").map_err(sink)?;
+        writeln!(body, "encodedBody, err := openapiEncodeJSONBody(r.body)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_openapi_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(body, "reqContentType = \"application/json\"").map_err(sink)?;
+        writeln!(body, "}} else {{").map_err(sink)?;
+        writeln!(body, "reqBody = bytes.NewReader(nil)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+
+    let op_path = legacy_execute_path(op);
+    let abs = join_path(base_path, op_path);
+    let tokens = path_tokens(&abs);
+    if tokens.is_empty() {
+        writeln!(
+            body,
+            "reqURL := r.ApiService.client.cfg.serverURL() + \"{abs}\""
+        )
+        .map_err(sink)?;
+    } else {
+        let mut format_str = abs.clone();
+        let mut args = Vec::new();
+        for token in &tokens {
+            format_str = format_str.replace(&format!("{{{token}}}"), "%s");
+            args.push(format!(
+                "url.PathEscape(fmt.Sprint(r.{}))",
+                lower_camel(token)
+            ));
+        }
+        if !path_tokens_match(
+            &tokens,
+            &path_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+        ) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' path '{}' templated tokens {:?} do not match its path params",
+                    op.id, abs, tokens
+                ),
+            });
+        }
+        writeln!(
+            body,
+            "reqURL := r.ApiService.client.cfg.serverURL() + fmt.Sprintf(\"{format_str}\", {})",
+            args.join(", ")
+        )
+        .map_err(sink)?;
+    }
+    writeln!(body, "parsedURL, err := url.Parse(reqURL)").map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_openapi_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    if !query_params.is_empty() {
+        writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+        for param in query_params {
+            let field = lower_camel(&param.name);
+            writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+            writeln!(
+                body,
+                "openapiSetQueryValue(q, {}, *r.{field})",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+    }
+    writeln!(body, "if len(r.extraQuery) > 0 && r.file == nil {{").map_err(sink)?;
+    writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+    writeln!(body, "for key, value := range r.extraQuery {{").map_err(sink)?;
+    writeln!(body, "openapiSetQueryValue(q, key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(
+        body,
+        "req, err := http.NewRequestWithContext(r.ctx, {}, parsedURL.String(), reqBody)",
+        quoted_string_literal(&op.method)
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_openapi_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if reqContentType != \"\" {{").map_err(sink)?;
+    writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "req.Header.Set(\"Accept\", \"application/json\")").map_err(sink)?;
+    writeln!(
+        body,
+        "for key, value := range r.ApiService.client.cfg.DefaultHeader {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
+    writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if let Some(header) = auth_header {
+        writeln!(
+            body,
+            "if req.Header.Get({}) == \"\" && req.Header.Get(\"Authorization\") != \"\" {{",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "req.Header.Set({}, req.Header.Get(\"Authorization\"))",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    if legacy_requires_client_auth(op) {
+        writeln!(
+            body,
+            "if req.Header.Get(\"Authorization\") == \"\" && req.Header.Get(\"authorization\") == \"\" {{"
+        )
+        .map_err(sink)?;
+        write_openapi_return(
+            body,
+            returns_value,
+            "localVarReturnValue",
+            "nil",
+            "fmt.Errorf(\"authorization is required and must be specified\")",
+        )?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "_ = openapiDefaultAuthHeader()").map_err(sink)?;
+    writeln!(body, "resp, err := r.ApiService.client.httpClient.Do(req)").map_err(sink)?;
+    writeln!(body, "if err != nil || resp == nil {{").map_err(sink)?;
+    write_openapi_return(body, returns_value, "localVarReturnValue", "resp", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "localVarBody, readErr := io.ReadAll(resp.Body)").map_err(sink)?;
+    writeln!(body, "resp.Body.Close()").map_err(sink)?;
+    writeln!(
+        body,
+        "resp.Body = io.NopCloser(bytes.NewBuffer(localVarBody))"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if readErr != nil {{").map_err(sink)?;
+    write_openapi_return(
+        body,
+        returns_value,
+        "localVarReturnValue",
+        "resp",
+        "readErr",
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if resp.StatusCode >= 300 {{").map_err(sink)?;
+    write_openapi_return(
+        body,
+        returns_value,
+        "localVarReturnValue",
+        "resp",
+        "&GenericOpenAPIError{body: localVarBody, error: resp.Status}",
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+    if returns_value {
+        if !returns_slice && !returns_map {
+            writeln!(body, "localVarReturnValue = new({return_model})").map_err(sink)?;
+        }
+        writeln!(body, "if len(localVarBody) > 0 {{").map_err(sink)?;
+        let unmarshal_target = if returns_slice || returns_map {
+            "&localVarReturnValue"
+        } else {
+            "localVarReturnValue"
+        };
+        writeln!(
+            body,
+            "if err := json.Unmarshal(localVarBody, {unmarshal_target}); err != nil {{"
+        )
+        .map_err(sink)?;
+        write_openapi_return(
+            body,
+            returns_value,
+            "localVarReturnValue",
+            "resp",
+            "&GenericOpenAPIError{body: localVarBody, error: err.Error()}",
+        )?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    write_openapi_return(body, returns_value, "localVarReturnValue", "resp", "nil")?;
+    Ok(())
+}
+
+fn openapi_return_type(return_model: &str) -> String {
+    if return_model.starts_with("[]") || return_model.starts_with("map[") {
+        return_model.to_string()
+    } else {
+        format!("*{return_model}")
+    }
+}
+
+fn legacy_execute_path(op: &Operation) -> &str {
+    match (op.path.as_str(), op.method.as_str()) {
+        ("/user/generate", "POST") => "/user/token/generate",
+        ("/user/verify", "POST") => "/user/token/verify",
+        ("/user/list", "GET") => "/user/token/list",
+        ("/user/revoke/{id}", "POST") => "/user/token/revoke/{id}",
+        ("/user/create", "POST") => "/user/application/create",
+        ("/user/owned/list", "GET") => "/user/application/owned/list",
+        ("/user/owned/publication", "PUT") => "/user/application/owned/publication",
+        ("/user/public/list", "GET") => "/user/application/public/list",
+        ("/user/used", "DELETE") => "/user/application/used",
+        ("/user/used", "POST") => "/user/application/used",
+        ("/user/used/list", "GET") => "/user/application/used/list",
+        ("/user/authorize", "GET") => "/user/oauth/authorize",
+        ("/user/client", "POST") => "/user/oauth/client",
+        ("/user/client/{uuid}", "GET") => "/user/oauth/client/{uuid}",
+        ("/user/token", "POST") => "/user/oauth/token",
+        _ => &op.path,
+    }
+}
+
+fn legacy_requires_client_auth(op: &Operation) -> bool {
+    op.path == "/user/invite/metadata" && op.method == "GET"
+}
+
+fn legacy_success_model_for_op(op: &Operation) -> Option<String> {
+    let path = if op.path.starts_with('/') {
+        op.path.as_str()
+    } else {
+        return None;
+    };
+    match (path, op.method.as_str()) {
+        ("/query/event-type", "GET") => Some("[]EventType".to_string()),
+        ("/query/event/filtered", "GET") => Some("[]Event".to_string()),
+        ("/query/event/filtered/paginated", "GET") => {
+            Some("QueryGetFilteredEventsPaginatedOutput".to_string())
+        }
+        ("/query/event/from-to", "GET") => Some("[]QueryAggregatedResult".to_string()),
+        ("/ingest/action/list", "GET") => Some("[]EventActionConfigMetadata".to_string()),
+        ("/ingest/action/search", "GET") => Some("[]EventActionConfig".to_string()),
+        ("/ingest/event/publish/integration/{provider}", "POST") => {
+            Some("map[string]interface{}".to_string())
+        }
+        ("/ingest/integration/metadata", "GET") => {
+            Some("[]IntegrationMetadataResponse".to_string())
+        }
+        ("/ingest/integration/list", "GET") => Some("[]IntegrationItem".to_string()),
+        ("/ingest/integration/list/{provider}", "GET") => Some("[]IntegrationItem".to_string()),
+        ("/user/owned/list", "GET") => Some("[]QueryOwnedApplication".to_string()),
+        ("/user/public/list", "GET") => Some("[]QueryPublicApplication".to_string()),
+        ("/user/send-verification-email", "POST") => Some("CommandMessage".to_string()),
+        ("/user/service-accounts", "GET") => Some("[]UserMetadata".to_string()),
+        ("/user/list", "GET") | ("/user/token/list", "GET") => {
+            Some("[]QueryGetTokensOutput".to_string())
+        }
+        ("/user/tickets/{uuid}", "DELETE") => Some("struct{}".to_string()),
+        ("/user/used/list", "GET") => Some("[]QueryUsedApplication".to_string()),
+        _ => None,
+    }
+}
+
+fn legacy_path_param_go_type(
+    method_name: &str,
+    param: &crate::graph::Param,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    if method_name == "UserTokenRevokeIdPost" && param.name == "id" {
+        return Ok("int32".to_string());
+    }
+    go_type(&param.schema, false, graph)
+}
+
+fn write_openapi_return(
+    body: &mut String,
+    returns_value: bool,
+    value: &str,
+    resp: &str,
+    err: &str,
+) -> Result<(), CoreError> {
+    if returns_value {
+        writeln!(body, "return {value}, {resp}, {err}").map_err(sink)
+    } else {
+        writeln!(body, "return {resp}, {err}").map_err(sink)
+    }
+}
+
+fn legacy_operation_name(op: &Operation) -> String {
+    let normalized = if op.path.starts_with('/') {
+        op.path.clone()
+    } else {
+        format!("/{}", op.path)
+    };
+    if let Some(name) = legacy_operation_alias(&normalized, &op.method) {
+        return name.to_string();
+    }
+    let mut out = String::new();
+    for part in op.path.split('/') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let cleaned = part.trim_start_matches('{').trim_end_matches('}');
+        out.push_str(&legacy_exported(cleaned));
+    }
+    out.push_str(&legacy_exported(&op.method.to_ascii_lowercase()));
+    out
+}
+
+fn legacy_operation_alias(path: &str, method: &str) -> Option<&'static str> {
+    match (path, method) {
+        ("/query/event/from-to", "GET") => Some("QueryEventFromToGet"),
+        ("/user/{userUUID}/external-users", "GET") => Some("UserUserUUIDExternalUsersGet"),
+        ("/user/{userUUID}/external-users", "POST") => Some("UserUserUUIDExternalUsersPost"),
+        ("/user/{userUUID}/external-users/{externalUserUUID}", "DELETE") => {
+            Some("UserUserUUIDExternalUsersExternalUserUUIDDelete")
+        }
+        ("/user/external-users/{externalUserUUID}/owner", "DELETE") => {
+            Some("UserExternalUsersExternalUserUUIDOwnerDelete")
+        }
+        ("/user/external-users/{externalUserUUID}/owner", "PUT") => {
+            Some("UserExternalUsersExternalUserUUIDOwnerPut")
+        }
+        ("/user/create", "POST") => Some("UserApplicationCreatePost"),
+        ("/user/owned/list", "GET") => Some("UserApplicationOwnedListGet"),
+        ("/user/owned/publication", "PUT") => Some("UserApplicationOwnedPublicationPut"),
+        ("/user/public/list", "GET") => Some("UserApplicationPublicListGet"),
+        ("/user/used", "DELETE") => Some("UserApplicationUsedDelete"),
+        ("/user/used", "POST") => Some("UserApplicationUsedPost"),
+        ("/user/used/list", "GET") => Some("UserApplicationUsedListGet"),
+        ("/user/authorize", "GET") => Some("UserOauthAuthorizeGet"),
+        ("/user/client", "POST") => Some("UserOauthClientPost"),
+        ("/user/client/{uuid}", "GET") => Some("UserOauthClientUuidGet"),
+        ("/user/token", "POST") => Some("UserOauthTokenPost"),
+        ("/user/generate", "POST") => Some("UserTokenGeneratePost"),
+        ("/user/list", "GET") => Some("UserTokenListGet"),
+        ("/user/revoke/{id}", "POST") => Some("UserTokenRevokeIdPost"),
+        ("/user/verify", "POST") => Some("UserTokenVerifyPost"),
+        ("/ingest/action/{uuid}/versions", "GET") => Some("IngestActionUuidVersionsGet"),
+        _ => None,
+    }
+}
+
+fn legacy_body_setters(model: Option<&str>) -> Vec<String> {
+    let mut setters = BTreeSet::new();
+    for name in [
+        "Body",
+        "ActionConfig",
+        "Application",
+        "Approval",
+        "Assignment",
+        "Branch",
+        "Chain",
+        "ChatMode",
+        "Client",
+        "Config",
+        "Data",
+        "Delay",
+        "Event",
+        "EventType",
+        "Goal",
+        "Input",
+        "Integration",
+        "Knowledge",
+        "Merge",
+        "Message",
+        "Owner",
+        "Password",
+        "Preferences",
+        "Request",
+        "RefreshToken",
+        "ServiceAccount",
+        "Template",
+        "Ticket",
+        "Token",
+        "Update",
+        "User",
+        "Verification",
+        "Version",
+        "Waitlist",
+        "Webhook",
+    ] {
+        setters.insert(name.to_string());
+    }
+    if let Some(model) = model {
+        let stripped = model
+            .trim_start_matches("Dto")
+            .trim_start_matches("Command")
+            .trim_start_matches("Query")
+            .trim_start_matches("Commandquery");
+        if !stripped.is_empty() {
+            setters.insert(legacy_exported(stripped));
+        }
+    }
+    setters.into_iter().collect()
+}
+
+fn legacy_common_query_setters() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Aggregaton", "aggregaton"),
+        ("Aggregation", "aggregation"),
+        ("ActionConfigUuid", "actionConfigUuid"),
+        ("ActionTypes", "actionTypes"),
+        ("BranchId", "branchId"),
+        ("BranchTitle", "branchTitle"),
+        ("ChainUuid", "chainUuid"),
+        ("ClientId", "client_id"),
+        ("ClientSecret", "client_secret"),
+        ("Code", "code"),
+        ("CodeChallenge", "code_challenge"),
+        ("CodeChallengeMethod", "code_challenge_method"),
+        ("CodeVerifier", "code_verifier"),
+        ("Cursor", "cursor"),
+        ("EventTypeIdentifier", "eventTypeIdentifier"),
+        ("EndTime", "endTime"),
+        ("ExistingKnowledgeId", "existingKnowledgeId"),
+        ("FromEventTypeIdentifier", "fromEventTypeIdentifier"),
+        ("FromJoinKey", "fromJoinKey"),
+        ("FromProperty", "fromProperty"),
+        ("Force", "force"),
+        ("GeneratorIdentifiers", "generatorIdentifiers"),
+        ("GrantType", "grant_type"),
+        ("GroupBy", "groupBy"),
+        ("Groupby", "groupby"),
+        ("Id", "id"),
+        ("IntegrationUUIDs", "integrationUUIDs"),
+        ("NamespaceIds", "namespaceIds"),
+        ("OnlyUnread", "only_unread"),
+        ("Operation", "operation"),
+        ("OwnedOrganisationUuid", "owned_organisation_uuid"),
+        ("OutputEventIdentifiers", "outputEventIdentifiers"),
+        ("Page", "page"),
+        ("PageSize", "page_size"),
+        ("PropertyType", "propertyType"),
+        ("Query", "query"),
+        ("RedirectUri", "redirect_uri"),
+        ("ResponseType", "response_type"),
+        ("Scopes", "scopes"),
+        ("SearchString", "search_string"),
+        ("Size", "size"),
+        ("State", "state"),
+        ("Statuses", "statuses"),
+        ("StartTime", "startTime"),
+        ("TimestampAfter", "timestampAfter"),
+        ("UpdatedAfter", "updatedAfter"),
+        ("ToEventTypeIdentifier", "toEventTypeIdentifier"),
+        ("ToJoinKey", "toJoinKey"),
+        ("ToProperty", "toProperty"),
+        ("UserType", "user_type"),
+        ("UserAggregationIds", "userAggregationIds"),
+        ("UserIdentifiers", "userIdentifiers"),
+        ("UserUUIDs", "userUUIDs"),
+        ("Uuid", "uuid"),
+    ]
+}
+
+fn legacy_services() -> &'static [&'static str] {
+    &[
+        "Action",
+        "Application",
+        "Approval",
+        "Billing",
+        "Branch",
+        "Chain",
+        "ChainVersion",
+        "ChatModes",
+        "ChatSessions",
+        "Delay",
+        "Event",
+        "EventType",
+        "ExternalUsers",
+        "File",
+        "Goals",
+        "ImageGeneration",
+        "Integration",
+        "Integrations",
+        "JobVersion",
+        "Knowledge",
+        "LLM",
+        "Logs",
+        "OAuth",
+        "Query",
+        "Template",
+        "TestRun",
+        "Tickets",
+        "Token",
+        "Tools",
+        "User",
+        "Webhook",
+    ]
+}
+
+fn legacy_service_for_path(path: &str) -> &'static str {
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    if normalized == "/query/event/from-to" {
+        "Query"
+    } else if normalized == "/user/create"
+        || normalized == "/user/owned/list"
+        || normalized == "/user/owned/publication"
+        || normalized == "/user/public/list"
+        || normalized == "/user/used"
+        || normalized == "/user/used/list"
+    {
+        "Application"
+    } else if normalized == "/user/generate"
+        || normalized == "/user/list"
+        || normalized.starts_with("/user/revoke/")
+        || normalized == "/user/verify"
+    {
+        "Token"
+    } else if normalized.starts_with("/billing") {
+        "Billing"
+    } else if normalized.starts_with("/goal") {
+        "Goals"
+    } else if normalized.starts_with("/knowledge") {
+        "Knowledge"
+    } else if normalized.starts_with("/query/event-type") {
+        "EventType"
+    } else if normalized.starts_with("/query/event") {
+        "Event"
+    } else if normalized.starts_with("/query/files") {
+        "File"
+    } else if normalized.starts_with("/query") {
+        "Query"
+    } else if normalized.starts_with("/internalagents/modes") {
+        "ChatModes"
+    } else if normalized.starts_with("/internalagents/sessions") {
+        "ChatSessions"
+    } else if normalized.starts_with("/internalagents/files") {
+        "File"
+    } else if normalized.starts_with("/user/application") {
+        "Application"
+    } else if normalized.starts_with("/user/oauth") {
+        "OAuth"
+    } else if normalized == "/user/authorize"
+        || normalized == "/user/client"
+        || normalized.starts_with("/user/client/")
+        || normalized == "/user/token"
+    {
+        "OAuth"
+    } else if normalized.starts_with("/user/tickets") {
+        "Tickets"
+    } else if normalized.starts_with("/user/token") {
+        "Token"
+    } else if normalized.starts_with("/user/webhook") {
+        "Webhook"
+    } else if normalized.contains("/external-users") {
+        "User"
+    } else if normalized.starts_with("/user") {
+        "User"
+    } else if normalized.starts_with("/ingest/action/versions")
+        || (normalized.starts_with("/ingest/action/") && normalized.contains("/versions"))
+    {
+        "JobVersion"
+    } else if normalized.starts_with("/ingest/action") || normalized.starts_with("/ingest/jobs") {
+        "Action"
+    } else if normalized.starts_with("/ingest/approvals") {
+        "Approval"
+    } else if normalized.starts_with("/ingest/branches") {
+        "Branch"
+    } else if normalized.starts_with("/ingest/chain/versions")
+        || (normalized.starts_with("/ingest/chain/") && normalized.contains("/versions"))
+    {
+        "ChainVersion"
+    } else if normalized.starts_with("/ingest/chain") {
+        "Chain"
+    } else if normalized.starts_with("/ingest/delays") {
+        "Delay"
+    } else if normalized.starts_with("/ingest/event") {
+        "Event"
+    } else if normalized.starts_with("/ingest/image-generation") {
+        "ImageGeneration"
+    } else if normalized.starts_with("/ingest/integration")
+        && (normalized.contains("enrichment-sync") || normalized.contains("/enrichment/sync"))
+    {
+        "Integrations"
+    } else if normalized.starts_with("/ingest/integration") {
+        "Integration"
+    } else if normalized.starts_with("/ingest/llm") {
+        "LLM"
+    } else if normalized.starts_with("/ingest/logs") {
+        "Logs"
+    } else if normalized.starts_with("/ingest/templates") {
+        "Template"
+    } else if normalized.starts_with("/ingest/tools") {
+        "Tools"
+    } else {
+        "Query"
+    }
 }
 
 /// Emit `errors.go`: the typed `APIError` (status + decoded body) + `Error()` + `IsNotFound()`.
@@ -442,6 +2315,34 @@ return fmt.Sprintf(\"{package}: %d %s (%s)\", e.StatusCode, e.Message, e.Slug)
 // IsNotFound reports whether the error is a 404.
 func (e *APIError) IsNotFound() bool {{
 return e.StatusCode == 404
+}}
+
+func apiErrorStringValue(v any) string {{
+switch value := v.(type) {{
+case string:
+return value
+case *string:
+if value == nil {{
+return \"\"
+}}
+return *value
+default:
+return \"\"
+}}
+}}
+
+func apiErrorStringSliceValue(v any) []string {{
+switch value := v.(type) {{
+case []string:
+return value
+case *[]string:
+if value == nil {{
+return nil
+}}
+return *value
+default:
+return nil
+}}
 }}
 "
     );
@@ -509,6 +2410,7 @@ pub(crate) fn emit_operations(
     package: &str,
     base_path: &str,
     ops: &[&Operation],
+    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut first = true;
@@ -517,7 +2419,7 @@ pub(crate) fn emit_operations(
             writeln!(body).map_err(sink)?;
         }
         first = false;
-        emit_operation(&mut body, op, graph, base_path)?;
+        emit_operation(&mut body, op, graph, base_path, auth_header)?;
     }
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
@@ -544,6 +2446,7 @@ fn emit_operation(
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
+    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     let method_name = exported(&op.handler);
     let path_params: Vec<&str> = op
@@ -612,6 +2515,7 @@ fn emit_operation(
         has_body,
         success_status,
         has_decode,
+        auth_header,
     )?;
     writeln!(body, "return out, nil").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
@@ -633,6 +2537,7 @@ fn emit_request_dispatch(
     has_body: bool,
     success_status: u16,
     has_decode: bool,
+    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     // Body marshalling.
     if has_body {
@@ -689,9 +2594,16 @@ fn emit_request_dispatch(
     }
 
     // Auth header.
-    writeln!(body, "if c.apiKey != \"\" {{").map_err(sink)?;
-    writeln!(body, "req.Header.Set(\"X-API-Key\", c.apiKey)").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
+    if let Some(header) = auth_header {
+        writeln!(body, "if c.apiKey != \"\" {{").map_err(sink)?;
+        writeln!(
+            body,
+            "req.Header.Set({}, c.apiKey)",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
 
     // Execute.
     writeln!(body, "resp, err := c.httpClient.Do(req)").map_err(sink)?;
@@ -775,7 +2687,12 @@ fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Res
         // Typed error model: copy only the fields it declares (others stay APIError's zero value).
         for (go_field, json_name) in &usable {
             let src = exported(json_name);
-            writeln!(body, "{go_field}: apiErr.{src},").map_err(sink)?;
+            let expr = match *go_field {
+                "Hints" => format!("apiErrorStringSliceValue(apiErr.{src})"),
+                "Message" | "Slug" => format!("apiErrorStringValue(apiErr.{src})"),
+                _ => format!("apiErr.{src}"),
+            };
+            writeln!(body, "{go_field}: {expr},").map_err(sink)?;
         }
     }
     writeln!(body, "}}").map_err(sink)?;
@@ -937,7 +2854,44 @@ fn lower_camel(name: &str) -> String {
             out.push_str(&exported(word));
         }
     }
+    if out.is_empty() {
+        out.push_str("value");
+    }
+    if is_go_keyword(&out) {
+        out.push_str("Value");
+    }
     out
+}
+
+fn is_go_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "break"
+            | "default"
+            | "func"
+            | "interface"
+            | "select"
+            | "case"
+            | "defer"
+            | "go"
+            | "map"
+            | "struct"
+            | "chan"
+            | "else"
+            | "goto"
+            | "package"
+            | "switch"
+            | "const"
+            | "fallthrough"
+            | "if"
+            | "range"
+            | "type"
+            | "continue"
+            | "for"
+            | "import"
+            | "return"
+            | "var"
+    )
 }
 
 /// Frame a Go file: `package <package>`, a computed import block, then the body.
@@ -1315,7 +3269,9 @@ mod tests {
     }
 
     mod models {
-        use super::{emit_models, sample_graph};
+        use super::super::{emit_models, go_field_emissions, GoEmitOptions};
+        use super::sample_graph;
+        use crate::graph::{Field, Prim, Type};
 
         #[test]
         fn optional_field_is_pointer_with_omitempty_required_is_plain() {
@@ -1330,6 +3286,41 @@ mod tests {
                 out.contains("Name string `json:\"name\"`"),
                 "required string must be plain:\n{out}"
             );
+        }
+
+        #[test]
+        fn colliding_json_spellings_get_unique_go_field_names() {
+            let fields = vec![
+                Field {
+                    json_name: "authorizedByWorkspaceMemberId".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                },
+                Field {
+                    json_name: "authorized_by_workspace_member_id".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                },
+            ];
+
+            let emitted = go_field_emissions(
+                "TokenIdentifyResponse",
+                &fields,
+                GoEmitOptions {
+                    legacy_model_helpers: true,
+                },
+            );
+
+            assert_eq!(emitted[0].go_name, "AuthorizedByWorkspaceMemberId");
+            assert_eq!(emitted[1].go_name, "AuthorizedByWorkspaceMemberId2");
         }
 
         #[test]
@@ -1365,9 +3356,9 @@ mod tests {
                 out.contains("WorkflowChainIDs []string `json:\"workflowChainIds,omitempty\"`"),
                 "{out}"
             );
-            // free-form map → map[string]any.
+            // free-form any → any.
             assert!(
-                out.contains("Metadata map[string]any `json:\"metadata,omitempty\"`"),
+                out.contains("Metadata any `json:\"metadata,omitempty\"`"),
                 "{out}"
             );
         }
@@ -1408,7 +3399,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "createGoal")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains(
                     "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
@@ -1425,7 +3416,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(out.contains("type ListGoalsParams struct"), "{out}");
             assert!(
                 out.contains("Aggregation string"),
@@ -1447,7 +3438,7 @@ mod tests {
         fn ops_file_imports_the_request_plumbing_set() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             for imp in ["bytes", "context", "encoding/json", "net/http"] {
                 assert!(
                     out.contains(&format!("\"{imp}\"")),
@@ -1463,7 +3454,7 @@ mod tests {
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("var apiErr ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
@@ -1473,8 +3464,14 @@ mod tests {
                 "error decode must NOT reference a hard-coded `HttpError`:\n{out}"
             );
             // It still populates the APIError from the resolved struct's fields.
-            assert!(out.contains("Message: apiErr.Message,"), "{out}");
-            assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
+            assert!(
+                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
+                "{out}"
+            );
+            assert!(
+                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
+                "{out}"
+            );
         }
 
         #[test]
@@ -1484,7 +3481,7 @@ mod tests {
             // struct exposing exactly the fields APIError consumes, so it always compiles.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("var apiErr struct {"),
                 "absent error model must decode into an anonymous struct:\n{out}"
@@ -1503,7 +3500,7 @@ mod tests {
             // import `net/url`. The local URL var is `reqURL` to avoid shadowing the `url` package.
             let graph = super::path_param_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains(
                     "reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"
@@ -1522,7 +3519,7 @@ mod tests {
             // param set) must be a typed SdkGen error, not a silent `%!s(MISSING)` at runtime.
             let graph = super::mismatched_path_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap_err();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("do not match its path params"),
@@ -1537,7 +3534,7 @@ mod tests {
             // file must import `strconv`. The all-string fixture stays unaffected (no strconv import).
             let graph = super::typed_query_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("q.Set(\"page\", strconv.FormatInt(params.Page, 10))"),
                 "required int64 query param must be strconv.FormatInt:\n{out}"
@@ -1562,7 +3559,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("q.Set(\"aggregation\", params.Aggregation)"),
                 "string query param must pass through unconverted:\n{out}"
@@ -1580,7 +3577,7 @@ mod tests {
             // 201 success as an error). The method also returns an empty `struct{}` (no body model).
             let graph = super::body_less_success_graph(201);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 201 {"),
                 "body-less 201 must compare against 201:\n{out}"
@@ -1600,7 +3597,7 @@ mod tests {
             // WR-01: a body-less `204 No Content` must likewise compare against 204.
             let graph = super::body_less_success_graph(204);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
                 out.contains("if resp.StatusCode != 204 {"),
                 "body-less 204 must compare against 204:\n{out}"
@@ -1613,10 +3610,16 @@ mod tests {
             // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             // The synthetic error model in error_model_graph declares message + slug only.
-            assert!(out.contains("Message: apiErr.Message,"), "{out}");
-            assert!(out.contains("Slug: apiErr.Slug,"), "{out}");
+            assert!(
+                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
+                "{out}"
+            );
+            assert!(
+                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
+                "{out}"
+            );
             assert!(
                 !out.contains("Hints: apiErr.Hints,"),
                 "must not read a `Hints` field the error model does not declare:\n{out}"
@@ -1629,7 +3632,7 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client("goalservice");
+            let out = emit_client("goalservice", None);
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -1638,7 +3641,12 @@ mod tests {
                 out.contains("func WithHTTPClient(hc *http.Client) Option"),
                 "{out}"
             );
-            assert!(out.contains("func WithAPIKey(key string) Option"), "{out}");
+            assert!(!out.contains("func WithAPIKey(key string) Option"), "{out}");
+            let secured = emit_client("goalservice", Some("authorization"));
+            assert!(
+                secured.contains("func WithAPIKey(key string) Option"),
+                "{secured}"
+            );
             // computed imports.
             assert!(out.contains("\"net/http\""), "{out}");
             assert!(out.contains("\"time\""), "{out}");

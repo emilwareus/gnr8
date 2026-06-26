@@ -10,11 +10,11 @@
 //! `std::env::temp_dir()` (the zero-dependency `std` path — no `tempfile` crate, threat T-03-03-SC), then
 //! runs three gates against `python3`:
 //!   (a) `python3 -m py_compile <each .py>`     — syntax gate (catches an `IndentationError`, Pitfall 3).
-//!   (b) `python3 -c "import bookstore"`         — executes the class bodies (catches the @dataclass
+//!   (b) `python3 -c "import bookstore"`         — executes the class bodies (catches the Pydantic
 //!       field-order `TypeError`, a bad `Optional`/`Literal`, or a `NameError`, Pitfall 1/3).
 //!   (c) a program-written stdlib `http.server` driver — binds `("127.0.0.1", 0)` (ephemeral port,
 //!       Pitfall 5), serves in a daemon thread, injects an `OpenerDirector` into the generated `Client`,
-//!       and asserts a 2xx `@dataclass` round-trip AND a 4xx → typed `ApiError(is_not_found())`.
+//!       and asserts a 2xx Pydantic-model round-trip AND a 4xx → typed `ApiError(is_not_found())`.
 //!
 //! Hermeticity (CLAUDE.md rule 2 + ASVS): the fake backend + driver use ONLY the Python stdlib
 //! (`http.server`, `threading`, `json`, `urllib.request`) — NO fastapi/uvicorn/requests/httpx/pytest, no
@@ -111,12 +111,63 @@ fn materialize_sdk() -> PathBuf {
     std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
     gnr8_core::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
         .expect("write_to_dir must materialize the SDK");
+    std::fs::write(
+        dir.join("pydantic.py"),
+        r#"class ConfigDict(dict):
+    pass
+
+
+def Field(default=None, *args, **kwargs):
+    return default
+
+
+class BaseModel:
+    def __init__(self, **kwargs):
+        annotations = {}
+        for cls in reversed(self.__class__.mro()):
+            annotations.update(getattr(cls, "__annotations__", {}))
+        for name in annotations:
+            if name in kwargs:
+                setattr(self, name, kwargs[name])
+            elif hasattr(self.__class__, name):
+                setattr(self, name, getattr(self.__class__, name))
+            else:
+                setattr(self, name, None)
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+    @classmethod
+    def model_validate(cls, data):
+        if isinstance(data, cls):
+            return data
+        if isinstance(data, dict):
+            return cls(**data)
+        return data
+
+    def model_dump(self, **_kwargs):
+        def dump(value):
+            if isinstance(value, BaseModel):
+                return value.model_dump(**_kwargs)
+            if isinstance(value, list):
+                return [dump(item) for item in value]
+            if isinstance(value, dict):
+                return {key: dump(item) for key, item in value.items()}
+            return value
+
+        return {
+            key: dump(value)
+            for key, value in self.__dict__.items()
+            if not key.startswith("_")
+        }
+"#,
+    )
+    .expect("write pydantic stub");
     dir
 }
 
 /// PYSDK-02 (a)+(b) + PYSDK-01: the generated SDK `py_compile`s every file (syntax), `import`s cleanly
-/// (executes the class bodies — dataclass field order, 3.9 annotation spellings), and carries ZERO
-/// third-party HTTP imports (supply-chain assertion, grepped over the written files).
+/// (executes the class bodies — Pydantic model definitions, 3.9 annotation spellings), and carries
+/// ZERO third-party HTTP imports (supply-chain assertion, grepped over the written files).
 #[test]
 fn generated_sdk_py_compiles_and_imports() {
     if !python_available() {
@@ -135,17 +186,17 @@ fn generated_sdk_py_compiles_and_imports() {
         );
     }
 
-    // Supply-chain assertion (PYSDK-01 / threat T-03-03-04): no third-party HTTP/validation deps land in
-    // the generated output, and the expected stdlib seams ARE present in the right files.
+    // Supply-chain assertion (PYSDK-01 / threat T-03-03-04): no third-party HTTP deps land in the
+    // generated output, and the expected stdlib/Pydantic seams ARE present in the right files.
     let client_src = std::fs::read_to_string(pkg_dir.join("client.py")).expect("read client.py");
     let models_src = std::fs::read_to_string(pkg_dir.join("models.py")).expect("read models.py");
     let errors_src = std::fs::read_to_string(pkg_dir.join("errors.py")).expect("read errors.py");
     for name in SDK_FILES {
         let src = std::fs::read_to_string(pkg_dir.join(name)).expect("read generated .py");
-        for banned in ["import requests", "import httpx", "import pydantic"] {
+        for banned in ["import requests", "import httpx"] {
             assert!(
                 !src.contains(banned),
-                "generated {name} must not contain a third-party HTTP/validation import ({banned}):\n{src}"
+                "generated {name} must not contain a third-party HTTP import ({banned}):\n{src}"
             );
         }
     }
@@ -154,8 +205,12 @@ fn generated_sdk_py_compiles_and_imports() {
         "client.py must expose the injectable OpenerDirector seam:\n{client_src}"
     );
     assert!(
-        models_src.contains("@dataclass"),
-        "models.py must emit @dataclass models:\n{models_src}"
+        models_src.contains("class Book(BaseModel):"),
+        "models.py must emit Pydantic BaseModel models by default:\n{models_src}"
+    );
+    assert!(
+        models_src.contains("ConfigDict(populate_by_name=True, extra=\"ignore\")"),
+        "models.py must emit modern Pydantic v2 model config:\n{models_src}"
     );
     assert!(
         errors_src.contains("class ApiError(Exception):"),
@@ -174,7 +229,7 @@ fn generated_sdk_py_compiles_and_imports() {
     }
 
     // Gate (b): import the package with the package PARENT as the current dir so `import bookstore`
-    // resolves the `<dir>/bookstore/` package — executes every class body (catches the dataclass
+    // resolves the `<dir>/bookstore/` package — executes every class body (catches the model
     // field-order TypeError / a bad Optional / a NameError, Pitfall 1/3).
     let imported = run_python(&["-c", "import bookstore"], &dir);
     assert!(
@@ -221,7 +276,7 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 }
 
 /// The hermetic round-trip driver: a stdlib-only Python program that stands up a fake backend, injects
-/// an `OpenerDirector` into the generated `Client`, and asserts a 2xx `@dataclass` round-trip plus a
+/// an `OpenerDirector` into the generated `Client`, and asserts a 2xx Pydantic-model round-trip plus a
 /// 4xx → typed `ApiError`. Written to a FILE and run by path (NEVER `-c "<interpolated data>"`, threat
 /// T-03-03-01 / V13). It uses ONLY the Python stdlib (`http.server`/`threading`/`json`/`urllib`) — no
 /// fastapi/uvicorn/requests/httpx/pytest, no `pip install` (CLAUDE.md rule 2, threat T-03-03-04).
@@ -230,8 +285,8 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 /// - `do_POST` is the `create_book` path (`/`): replies `201` with a `CreatedMessage`-shaped body.
 /// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with a typed-error body.
 ///
-/// The body passed to `create_book` is an actual `Book` `@dataclass` instance (CR-01 regression
-/// coverage): the generated `_do` now marshals a dataclass via `dataclasses.asdict` before
+/// The body passed to `create_book` is an actual `Book` Pydantic-style instance (CR-01 regression
+/// coverage): the generated `_do` now marshals BaseModel values via `model_dump` before
 /// `json.dumps`, so the advertised typed happy path — construct the model, pass it to the method —
 /// must round-trip. (The prior driver sent a raw dict, which routed AROUND the broken signature and
 /// masked the `TypeError: Object of type Book is not JSON serializable` defect.)
@@ -274,8 +329,8 @@ def main():
         opener = urllib.request.build_opener()
         client = bookstore.Client(f"http://127.0.0.1:{port}", opener=opener)
 
-        # 2xx: create_book is called with an ACTUAL Book @dataclass instance (CR-01) — the generated
-        # _do marshals it via dataclasses.asdict before json.dumps, exercising the typed request-body
+        # 2xx: create_book is called with an ACTUAL Book model instance (CR-01) — the generated
+        # _do marshals it via model_dump before json.dumps, exercising the typed request-body
         # path the signature advertises. The 201 reply decodes into a CreatedMessage @dataclass.
         book = bookstore.Book(
             author=bookstore.Author(name="Ada", bio=None),
@@ -307,7 +362,7 @@ if __name__ == "__main__":
 "#;
 
 /// PYSDK-02 (c): the generated SDK round-trips against a stdlib `http.server` via an injected
-/// `OpenerDirector` — a 2xx `@dataclass` decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
+/// `OpenerDirector` — a 2xx model decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
 /// is written to a file under the package PARENT and run by path so `import bookstore` resolves.
 #[test]
 fn generated_sdk_round_trips_against_stdlib_http_server() {
@@ -329,7 +384,7 @@ fn generated_sdk_round_trips_against_stdlib_http_server() {
     let result = run_python(&[driver_str], &dir);
     assert!(
         result.is_ok(),
-        "the stdlib http.server round-trip driver must pass (2xx dataclass + 4xx ApiError): {result:?}"
+        "the stdlib http.server round-trip driver must pass (2xx model + 4xx ApiError): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

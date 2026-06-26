@@ -16,8 +16,11 @@ mod gofmt;
 
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
-use crate::sdk::emit_common::{file_in_dir, file_stem};
+use crate::sdk::emit_common::{
+    api_key_header_name, file_stem, model_file_name, operation_file_name,
+};
 use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///
@@ -53,7 +56,8 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_layout(graph, package, base_path, layout)?;
+    let files =
+        generate_files_with_layout(graph, package, base_path, layout, SdkTypeAliases::default())?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -63,40 +67,63 @@ pub(crate) fn generate_files_with_layout(
     package: &str,
     base_path: &str,
     layout: SdkFileLayout,
+    aliases: SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
+    let legacy_options = emit::GoEmitOptions {
+        legacy_model_helpers: aliases.uses_legacy_source_prefixes(),
+    };
 
     // Fixed leading files (sorted: client.go before errors.go).
-    files.push(raw_go_file("client.go", emit::emit_client(package)));
+    files.push(raw_go_file(
+        "client.go",
+        emit::emit_client(package, auth_header.as_deref()),
+    ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
+    if !resolved_aliases.is_empty() {
+        files.push(raw_go_file(
+            "aliases.go",
+            emit::emit_type_aliases(graph, package, &resolved_aliases, legacy_options)?,
+        ));
+    }
+    if aliases.uses_legacy_source_prefixes() {
+        files.push(raw_go_file(
+            "openapi_compat.go",
+            emit::emit_openapi_compat(graph, package, base_path, auth_header.as_deref())?,
+        ));
+    }
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
         for op in &ops {
-            let raw = emit::emit_operations(graph, package, base_path, &[*op])?;
-            let name = file_in_dir(
-                layout.operation_dir_ref(),
-                &format!("api_{}.go", file_stem(&op.id)),
-            );
+            let raw =
+                emit::emit_operations(graph, package, base_path, &[*op], auth_header.as_deref())?;
+            let name = operation_file_name(&layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
             files.push(raw_go_file(name, raw));
         }
         for schema in &graph.schemas {
-            let raw = emit::emit_model_schema(graph, package, schema)?;
-            let name = file_in_dir(
-                layout.model_dir_ref(),
+            let raw = emit::emit_model_schema_with_options(graph, package, schema, legacy_options)?;
+            let name = model_file_name(
+                &layout,
+                schema,
                 &format!("model_{}.go", file_stem(&schema.name)),
-            );
+            )?;
             files.push(raw_go_file(name, raw));
         }
     } else {
         // All operations go into a single generic `operations.go` resource surface. Tags were an
         // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
         // the file name is generic (not the package/fixture name) so it never overfits to one service.
-        let raw = emit::emit_operations(graph, package, base_path, &ops)?;
+        let raw = emit::emit_operations(graph, package, base_path, &ops, auth_header.as_deref())?;
         files.push(raw_go_file("operations.go", raw));
 
         // Trailing models.go.
-        files.push(raw_go_file("models.go", emit::emit_models(graph, package)?));
+        files.push(raw_go_file(
+            "models.go",
+            emit::emit_models_with_options(graph, package, legacy_options)?,
+        ));
     }
 
     let mut files = gofmt::gofmt_files(files)?;

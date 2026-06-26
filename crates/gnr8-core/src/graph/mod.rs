@@ -36,7 +36,7 @@ pub use crate::analyze::facts::{FieldFact as Field, Prim, Type, WellKnown};
 /// graph as plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads,
 /// then passes to the existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`] functions.
 /// They default to a root-mounted, untitled, unsecured API so a bare `build_graph` graph still lowers.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiGraph {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub module: String,
@@ -90,7 +90,7 @@ impl Default for ApiGraph {
 /// [`ApiGraph::security`], and the `OpenAPI` target reads them. This is the public, framework-facing
 /// home for the scheme shape (re-exported via [`crate::sdk::prelude`]); the lowering layer maps it
 /// into the emitted `components.securitySchemes` entry.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SecurityScheme {
     /// The `OpenAPI` scheme id (the key under `components.securitySchemes`, e.g. `"ApiKeyAuth"`).
     pub id: String,
@@ -108,7 +108,7 @@ pub struct SecurityScheme {
 /// Every field is derived PURELY from source code (CLAUDE.md rules 1 & 3); there is no annotation
 /// carry-through (no summary, tags, router-path override, or security here — security comes from the
 /// user's gnr8 config at lowering time, rule 4).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
     pub id: String,
@@ -121,6 +121,13 @@ pub struct Operation {
     pub path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub handler: String,
+    /// Optional SDK grouping metadata set by transforms, never extracted from source.
+    ///
+    /// Emitters may use this for file placement or future grouped client surfaces. It is deliberately
+    /// generation metadata, not a framework fact, so it stays configurable without reshaping the
+    /// source extractors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Path and query parameters, sorted by name.
     pub params: Vec<Param>,
     /// The request body schema reference, if a typed body was inferred.
@@ -134,7 +141,7 @@ pub struct Operation {
 /// One path or query parameter of an operation, derived purely from code. Path params are required;
 /// query params default to a string type and not required. There is no enum or description — those
 /// were annotation-only and have been removed (CLAUDE.md rules 1 & 3).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     /// The parameter name (e.g. `"uuid"`, `"cursor"`).
     pub name: String,
@@ -149,7 +156,7 @@ pub struct Param {
 }
 
 /// One response of an operation keyed by HTTP status.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Response {
     /// The HTTP status code (e.g. `201`).
     pub status: u16,
@@ -161,7 +168,7 @@ pub struct Response {
 /// [`Type::Object`], a string-enum becomes [`Type::Enum`]. There is no separate string discriminator —
 /// the [`Type`] variant *is* the discriminant, so a new kind of named type is a compile error in every
 /// consumer rather than a silently-mishandled magic string.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
     pub id: String,
@@ -175,7 +182,7 @@ pub struct Schema {
 }
 
 /// A reference to a schema by its stable id.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SchemaRef {
     /// The referenced schema id.
     pub ref_id: String,
@@ -201,7 +208,7 @@ pub struct Diagnostic {
 ///
 /// Graph-owned (not the crate-private `facts::SourceSpan`) so the public graph surface is
 /// self-contained and the analyzed-module prefix has been stripped from `file` for portability.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     /// The source file path, relative to the analyzed module.
     pub file: String,
@@ -300,6 +307,7 @@ impl Operation {
             method: route.method,
             path: route.path,
             handler: route.handler,
+            group: None,
             params,
             request_body: route.request_body.map(SchemaRef::from_fact),
             responses,

@@ -11,11 +11,15 @@
 // module-wide (mirrors the rest of the framework surface).
 #![allow(clippy::doc_markdown)]
 
-use super::{Artifacts, Cx, PostProcess, Source, Target, Transform};
-use crate::graph::{ApiGraph, SecurityScheme};
+use super::{
+    collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
+};
+use crate::graph::{ApiGraph, Response, SchemaRef, SecurityScheme, Type};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::surface::SdkTypeAliases;
 use crate::CoreError;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------------------------------
 // Source
@@ -91,9 +95,66 @@ impl Source for GoGin {
         // process cwd (an absolute input is left as-is by `Path::join`). This matches the lifecycle's
         // input-resolution and keeps span provenance relative to the same root.
         let resolved = cx.project_root.join(input);
+        let cache_key = go_gin_cache_key(&resolved, &self.package_patterns, cx);
+        if let Some(cached) = load_go_gin_cache(cx, &cache_key) {
+            return Ok(cached);
+        }
         let input_arg = resolved.to_string_lossy();
-        crate::analyze::build_go_graph_with_patterns(&input_arg, &self.package_patterns)
+        let graph =
+            crate::analyze::build_go_graph_with_patterns(&input_arg, &self.package_patterns)?;
+        save_go_gin_cache(cx, &cache_key, &graph);
+        Ok(graph)
     }
+
+    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
+        let [single] = self.inputs.as_slice() else {
+            return None;
+        };
+        Some(vec![cx.project_root.join(single)])
+    }
+}
+
+fn go_gin_cache_key(input: &Path, package_patterns: &[String], cx: &Cx) -> String {
+    let mut files = Vec::new();
+    collect_cache_input_files(input, &mut files);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gnr8-go-gin-source-cache-v1\n");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\n");
+    for pattern in package_patterns {
+        hasher.update(pattern.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(hash_files(&files, &cx.project_root).as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn load_go_gin_cache(cx: &Cx, key: &str) -> Option<ApiGraph> {
+    let bytes = std::fs::read(go_gin_cache_path(cx, key)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
+    let path = go_gin_cache_path(cx, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(graph) else {
+        return;
+    };
+    let _ = std::fs::write(path, bytes);
+}
+
+fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {
+    cx.project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("sources")
+        .join("go-gin")
+        .join(format!("{key}.json"))
 }
 
 /// The FastAPI (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
@@ -332,6 +393,221 @@ impl Transform for SetTitle {
     }
 }
 
+/// Set or replace the typed success response for one operation.
+///
+/// This is a graph-level correction hook for source frameworks where a handler's response type is not
+/// statically recoverable. Because it mutates the neutral IR, every downstream target sees the same
+/// response fact: OpenAPI, Go, Python, and TypeScript stay in agreement.
+#[derive(Debug, Clone)]
+pub struct SetOperationSuccessResponse {
+    matcher: OperationMatcher,
+    schema: String,
+    status: u16,
+}
+
+#[derive(Debug, Clone)]
+enum OperationMatcher {
+    Id(String),
+    Route { method: String, path: String },
+}
+
+impl SetOperationSuccessResponse {
+    /// Match an operation by generated operation id.
+    #[must_use]
+    pub fn for_operation(operation_id: impl Into<String>, schema: impl Into<String>) -> Self {
+        Self {
+            matcher: OperationMatcher::Id(operation_id.into()),
+            schema: schema.into(),
+            status: 200,
+        }
+    }
+
+    /// Match an operation by method and graph path.
+    #[must_use]
+    pub fn for_route(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Self {
+        Self {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            schema: schema.into(),
+            status: 200,
+        }
+    }
+
+    /// Override the success status code to set. Defaults to 200.
+    #[must_use]
+    pub const fn status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+impl Transform for SetOperationSuccessResponse {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        let schema_matches: Vec<_> = ir
+            .schemas
+            .iter()
+            .filter(|schema| schema.id == self.schema || schema.name == self.schema)
+            .map(|schema| schema.id.clone())
+            .collect();
+        let schema_id = match schema_matches.as_slice() {
+            [single] => single.clone(),
+            [] => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "success response schema {:?} does not match any graph schema id or name",
+                        self.schema
+                    ),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "success response schema {:?} matches {} schemas; use the full schema id",
+                        self.schema,
+                        many.len()
+                    ),
+                });
+            }
+        };
+
+        let matches: Vec<usize> = ir
+            .operations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| {
+                let is_match = match &self.matcher {
+                    OperationMatcher::Id(id) => op.id == *id,
+                    OperationMatcher::Route { method, path } => {
+                        op.method == *method && op.path == *path
+                    }
+                };
+                is_match.then_some(index)
+            })
+            .collect();
+        let op_index = match matches.as_slice() {
+            [single] => *single,
+            [] => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "success response override did not match any operation: {:?}",
+                        self.matcher
+                    ),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "success response override matched {} operations: {:?}",
+                        many.len(),
+                        self.matcher
+                    ),
+                });
+            }
+        };
+
+        let op = &mut ir.operations[op_index];
+        op.responses
+            .retain(|response| response.status != self.status);
+        op.responses.push(Response {
+            status: self.status,
+            body: Some(SchemaRef { ref_id: schema_id }),
+        });
+        op.responses.sort_by_key(|response| response.status);
+        Ok(())
+    }
+}
+
+/// Override the type of one field in one object schema.
+///
+/// This is a graph-level correction hook for schema shapes that are intentionally dynamic in source
+/// code and cannot be recovered precisely by static extraction. Because the override happens in the
+/// neutral IR, OpenAPI and every SDK target agree on the corrected field shape.
+#[derive(Debug, Clone)]
+pub struct SetSchemaFieldType {
+    schema: String,
+    field: String,
+    ty: Type,
+}
+
+impl SetSchemaFieldType {
+    /// Match a schema by id or bare generated name, then replace `field`'s type.
+    #[must_use]
+    pub fn new(schema: impl Into<String>, field: impl Into<String>, ty: Type) -> Self {
+        Self {
+            schema: schema.into(),
+            field: field.into(),
+            ty,
+        }
+    }
+
+    /// Set the field to a homogeneous array of free-form object/value payloads.
+    #[must_use]
+    pub fn array_of_free_form_objects(schema: impl Into<String>, field: impl Into<String>) -> Self {
+        Self::new(schema, field, Type::Array(Box::new(Type::Any {})))
+    }
+}
+
+impl Transform for SetSchemaFieldType {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        let matches: Vec<usize> = ir
+            .schemas
+            .iter()
+            .enumerate()
+            .filter_map(|(index, schema)| {
+                (schema.id == self.schema || schema.name == self.schema).then_some(index)
+            })
+            .collect();
+        let schema_index = match matches.as_slice() {
+            [single] => *single,
+            [] => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "field type override schema {:?} does not match any graph schema id or name",
+                        self.schema
+                    ),
+                });
+            }
+            many => {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "field type override schema {:?} matches {} schemas; use the full schema id",
+                        self.schema,
+                        many.len()
+                    ),
+                });
+            }
+        };
+
+        let schema = &mut ir.schemas[schema_index];
+        let Type::Object(fields) = &mut schema.body else {
+            return Err(CoreError::Config {
+                message: format!(
+                    "field type override schema {:?} is not an object schema",
+                    self.schema
+                ),
+            });
+        };
+
+        let field = fields
+            .iter_mut()
+            .find(|field| field.json_name == self.field)
+            .ok_or_else(|| CoreError::Config {
+                message: format!(
+                    "field type override did not find field {:?} on schema {:?}",
+                    self.field, self.schema
+                ),
+            })?;
+        field.schema = self.ty.clone();
+        Ok(())
+    }
+}
+
 /// Push a security scheme onto [`ApiGraph::security`] — the single source of truth for the generated
 /// `security` requirement + `components.securitySchemes` (replaces the `[[security.schemes]]` knob,
 /// CLAUDE.md rule 4).
@@ -416,6 +692,81 @@ impl Transform for RenameType {
         let mut naming = crate::lifecycle::NamingOverrides::default();
         naming.types.insert(self.from.clone(), self.to.clone());
         crate::lifecycle::apply_naming(ir, &naming)
+    }
+}
+
+/// Assign SDK operation groups from configurable rules.
+///
+/// Groups are generation metadata used by SDK layout templates and future grouped client surfaces.
+/// Rules run in the order they are configured; the first match for an operation wins.
+#[derive(Debug, Clone, Default)]
+pub struct GroupOperations {
+    rules: Vec<GroupRule>,
+}
+
+#[derive(Debug, Clone)]
+enum GroupRule {
+    PathPrefix { prefix: String, group: String },
+    Operation { id: String, group: String },
+}
+
+impl GroupOperations {
+    /// No grouping rules.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Group operations whose path starts with `prefix`.
+    #[must_use]
+    pub fn by_path_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::PathPrefix {
+            prefix: prefix.into(),
+            group: group.into(),
+        });
+        self
+    }
+
+    /// Group one operation by exact operation id.
+    #[must_use]
+    pub fn by_operation(mut self, id: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::Operation {
+            id: id.into(),
+            group: group.into(),
+        });
+        self
+    }
+}
+
+impl Transform for GroupOperations {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        for op in &mut ir.operations {
+            op.group = None;
+            for rule in &self.rules {
+                let matched = match rule {
+                    GroupRule::PathPrefix { prefix, group } => {
+                        if op.path.starts_with(prefix) {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    GroupRule::Operation { id, group } => {
+                        if op.id == *id {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if matched {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -533,6 +884,108 @@ impl Target for OpenApi31Json {
     }
 }
 
+/// A static text-file target for SDK/runtime files that should be produced alongside generated code.
+///
+/// Include entries are exact relative file paths, or directory prefixes ending in `/**`.
+/// Files are read from `from` and written under `to` with the same relative path. This keeps
+/// hand-authored support modules, package metadata, examples, or docs inside the same deterministic
+/// lifecycle as generated SDK files without baking any project-specific paths into gnr8.
+#[derive(Debug, Clone, Default)]
+pub struct StaticFiles {
+    from_dir: String,
+    to_dir: String,
+    includes: Vec<String>,
+}
+
+impl StaticFiles {
+    /// A static file target with no source/destination yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the project-relative source directory to read static files from.
+    #[must_use]
+    pub fn from(mut self, dir: impl Into<String>) -> Self {
+        self.from_dir = dir.into();
+        self
+    }
+
+    /// Set the project-relative destination directory to write static files under.
+    #[must_use]
+    pub fn to(mut self, dir: impl Into<String>) -> Self {
+        self.to_dir = dir.into();
+        self
+    }
+
+    /// Set exact file includes and/or recursive directory includes ending in `/**`.
+    #[must_use]
+    pub fn include<I, S>(mut self, includes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.includes = includes.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl Target for StaticFiles {
+    fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
+        if self.from_dir.is_empty() {
+            return Err(CoreError::Config {
+                message: "StaticFiles target has no source dir — call .from(\"path\")".to_string(),
+            });
+        }
+        if self.to_dir.is_empty() {
+            return Err(CoreError::Config {
+                message: "StaticFiles target has no output dir — call .to(\"path\")".to_string(),
+            });
+        }
+
+        let source_root = cx.project_root.join(self.from_dir.trim_end_matches('/'));
+        let mut files = Vec::new();
+        for include in &self.includes {
+            collect_static_include(&source_root, include, &mut files)?;
+        }
+        files.sort();
+        files.dedup();
+
+        let to_dir = self.to_dir.trim_end_matches('/');
+        for rel in files {
+            let source_path = source_root.join(&rel);
+            let text = std::fs::read_to_string(&source_path).map_err(|err| CoreError::Io {
+                message: format!(
+                    "failed to read static file {}: {err}",
+                    source_path.display()
+                ),
+            })?;
+            out.write(format!("{to_dir}/{rel}"), text);
+        }
+        Ok(())
+    }
+
+    fn output_anchors(&self) -> Vec<String> {
+        if self.to_dir.is_empty() {
+            return Vec::new();
+        }
+
+        let to_dir = self.to_dir.trim_end_matches('/');
+        let mut anchors: Vec<String> = self
+            .includes
+            .iter()
+            .map(|include| {
+                let rel = include.trim_end_matches("/**").trim_end_matches('/');
+                format!("{to_dir}/{rel}")
+            })
+            .collect();
+        anchors.sort();
+        anchors.dedup();
+        anchors.retain(|anchor| !anchor.ends_with('/'));
+        anchors
+    }
+}
+
 /// The Go SDK target: generates the multi-file Go SDK bundle and writes each file under [`GoSdk::to`].
 ///
 /// Derives the SDK's Go package name from [`GoSdk::module`] (the last path segment, sanitized — the
@@ -544,6 +997,7 @@ pub struct GoSdk {
     module: String,
     dir: String,
     layout: SdkFileLayout,
+    aliases: SdkTypeAliases,
 }
 
 impl GoSdk {
@@ -554,6 +1008,7 @@ impl GoSdk {
             module: String::new(),
             dir: String::new(),
             layout: SdkFileLayout::compact(),
+            aliases: SdkTypeAliases::default(),
         }
     }
 
@@ -584,6 +1039,20 @@ impl GoSdk {
     pub fn split_files(self) -> Self {
         self.layout(SdkFileLayout::split().root_operations().root_models())
     }
+
+    /// Add compatibility type aliases to the generated SDK surface.
+    #[must_use]
+    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Expose `alias` as an additional type name for a schema id or generated schema name.
+    #[must_use]
+    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
+        let aliases = self.aliases.clone().type_alias(schema, alias);
+        self.aliases(aliases)
+    }
 }
 
 impl Default for GoSdk {
@@ -613,8 +1082,13 @@ impl Target for GoSdk {
             &package,
             &ir.base_path,
             self.layout.clone(),
+            self.aliases.clone(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
+        out.write(
+            format!("{}/go.mod", self.dir.trim_end_matches('/')),
+            format!("module {}\n\ngo 1.23\n", self.module),
+        );
         Ok(())
     }
 
@@ -646,6 +1120,7 @@ pub struct PySdk {
     dir: String,
     layout: SdkFileLayout,
     model_style: PyModelStyle,
+    aliases: SdkTypeAliases,
 }
 
 impl PySdk {
@@ -657,6 +1132,7 @@ impl PySdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             model_style: PyModelStyle::default(),
+            aliases: SdkTypeAliases::default(),
         }
     }
 
@@ -702,6 +1178,20 @@ impl PySdk {
         self.model_style = PyModelStyle::Dataclass;
         self
     }
+
+    /// Add compatibility type aliases to the generated SDK surface.
+    #[must_use]
+    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Expose `alias` as an additional type name for a schema id or generated schema name.
+    #[must_use]
+    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
+        let aliases = self.aliases.clone().type_alias(schema, alias);
+        self.aliases(aliases)
+    }
 }
 
 impl Default for PySdk {
@@ -734,6 +1224,7 @@ impl Target for PySdk {
             &ir.base_path,
             self.layout.clone(),
             self.model_style,
+            self.aliases.clone(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         Ok(())
@@ -766,6 +1257,7 @@ pub struct TsSdk {
     module: String,
     dir: String,
     layout: SdkFileLayout,
+    aliases: SdkTypeAliases,
 }
 
 impl TsSdk {
@@ -776,6 +1268,7 @@ impl TsSdk {
             module: String::new(),
             dir: String::new(),
             layout: SdkFileLayout::compact(),
+            aliases: SdkTypeAliases::default(),
         }
     }
 
@@ -806,6 +1299,20 @@ impl TsSdk {
     #[must_use]
     pub fn split_files(self) -> Self {
         self.layout(SdkFileLayout::split().model_dir("models"))
+    }
+
+    /// Add compatibility type aliases to the generated SDK surface.
+    #[must_use]
+    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Expose `alias` as an additional type name for a schema id or generated schema name.
+    #[must_use]
+    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
+        let aliases = self.aliases.clone().type_alias(schema, alias);
+        self.aliases(aliases)
     }
 }
 
@@ -838,6 +1345,7 @@ impl Target for TsSdk {
             &package,
             &ir.base_path,
             self.layout.clone(),
+            self.aliases.clone(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         Ok(())
@@ -952,6 +1460,89 @@ fn write_sdk_files(
     Ok(())
 }
 
+fn collect_static_include(
+    source_root: &Path,
+    include: &str,
+    out: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    if let Some(prefix) = include.strip_suffix("/**") {
+        validate_static_rel(prefix)?;
+        collect_static_dir(source_root, Path::new(prefix), out)
+    } else {
+        validate_static_rel(include)?;
+        out.push(include.replace('\\', "/"));
+        Ok(())
+    }
+}
+
+fn collect_static_dir(
+    source_root: &Path,
+    rel_dir: &Path,
+    out: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    let dir = source_root.join(rel_dir);
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|err| CoreError::Io {
+        message: format!("failed to read static dir {}: {err}", dir.display()),
+    })? {
+        let entry = entry.map_err(|err| CoreError::Io {
+            message: format!(
+                "failed to read static dir entry in {}: {err}",
+                dir.display()
+            ),
+        })?;
+        entries.push(entry.path());
+    }
+    entries.sort();
+
+    for path in entries {
+        let rel = path
+            .strip_prefix(source_root)
+            .map_err(|err| CoreError::Config {
+                message: format!(
+                    "static file {} is not under source root {}: {err}",
+                    path.display(),
+                    source_root.display()
+                ),
+            })?;
+        let rel_str = rel_to_slash_string(rel)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|err| CoreError::Io {
+            message: format!("failed to inspect static file {}: {err}", path.display()),
+        })?;
+        if meta.is_dir() {
+            collect_static_dir(source_root, rel, out)?;
+        } else if meta.is_file() {
+            validate_static_rel(&rel_str)?;
+            out.push(rel_str);
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_rel(path: &str) -> Result<(), CoreError> {
+    super::bundle::safe_frame_name(path).map_err(|err| CoreError::Config {
+        message: format!("invalid StaticFiles include {path:?}: {err}"),
+    })
+}
+
+fn rel_to_slash_string(path: &Path) -> Result<String, CoreError> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(CoreError::Config {
+                message: format!("invalid static file path {}", path.display()),
+            });
+        };
+        let Some(part) = part.to_str() else {
+            return Err(CoreError::Config {
+                message: format!("static file path is not UTF-8: {}", path.display()),
+            });
+        };
+        parts.push(part);
+    }
+    Ok(parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow
@@ -960,13 +1551,33 @@ mod tests {
 
     use super::{
         sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
-        OpenApi31Json, PostProcess, PySdk, SetBasePath, SetTitle, Source, Target, Transform, TsSdk,
+        OpenApi31Json, PostProcess, PySdk, SetBasePath, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
-    use crate::graph::ApiGraph;
+    use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SourceSpan, Type};
     use crate::sdk::Artifacts;
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
+    }
+
+    fn span() -> SourceSpan {
+        SourceSpan {
+            file: "handlers.go".to_string(),
+            start_line: 10,
+            end_line: 20,
+        }
+    }
+
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("gnr8-static-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -987,6 +1598,78 @@ mod tests {
         assert_eq!(s.kind, "apiKey");
         assert_eq!(s.location, "header");
         assert_eq!(s.name, "X-API-Key");
+    }
+
+    #[test]
+    fn transform_sets_operation_success_response_by_route() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.CreateBookResponse".to_string(),
+                name: "CreateBookResponse".to_string(),
+                body: Type::Object(vec![]),
+                provenance: span(),
+            }],
+            operations: vec![Operation {
+                id: "createBook".to_string(),
+                method: "POST".to_string(),
+                path: "/books".to_string(),
+                handler: "createBook".to_string(),
+                group: None,
+                params: vec![],
+                request_body: None,
+                responses: vec![],
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        SetOperationSuccessResponse::for_route("post", "/books", "CreateBookResponse")
+            .status(201)
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].responses.len(), 1);
+        assert_eq!(ir.operations[0].responses[0].status, 201);
+        assert_eq!(
+            ir.operations[0].responses[0]
+                .body
+                .as_ref()
+                .map(|body| body.ref_id.as_str()),
+            Some("app.CreateBookResponse")
+        );
+    }
+
+    #[test]
+    fn transform_sets_schema_field_type() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.DocumentBody".to_string(),
+                name: "DocumentBody".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "blocks".to_string(),
+                    required: true,
+                    optional: false,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                }]),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        SetSchemaFieldType::array_of_free_form_objects("DocumentBody", "blocks")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let Type::Object(fields) = &ir.schemas[0].body else {
+            panic!("expected object schema");
+        };
+        assert!(matches!(
+            fields[0].schema,
+            Type::Array(ref inner) if matches!(**inner, Type::Any {})
+        ));
     }
 
     #[test]
@@ -1028,6 +1711,85 @@ mod tests {
                 .generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
+        assert!(matches!(
+            StaticFiles::new().generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+        assert!(matches!(
+            StaticFiles::new()
+                .from("static")
+                .generate(&ir, &mut out, &cx()),
+            Err(crate::CoreError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn static_files_target_copies_exact_files_and_recursive_dirs() {
+        let root = temp_project("copies");
+        std::fs::create_dir_all(root.join("static/runtime/nested")).unwrap();
+        std::fs::write(root.join("static/runtime/__init__.py"), "ROOT\n").unwrap();
+        std::fs::write(root.join("static/runtime/nested/tool.py"), "TOOL\n").unwrap();
+        std::fs::write(root.join("static/README.md"), "README\n").unwrap();
+
+        let mut out = Artifacts::new();
+        StaticFiles::new()
+            .from("static")
+            .to("pkg")
+            .include(["runtime/**", "README.md"])
+            .generate(&ApiGraph::default(), &mut out, &Cx::new(&root))
+            .unwrap();
+
+        let files: Vec<_> = out
+            .files()
+            .iter()
+            .map(|file| (file.path.as_str(), file.text.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("pkg/README.md", "README\n"),
+                ("pkg/runtime/__init__.py", "ROOT\n"),
+                ("pkg/runtime/nested/tool.py", "TOOL\n"),
+            ]
+        );
+        assert_eq!(
+            StaticFiles::new()
+                .from("static")
+                .to("pkg")
+                .include(["runtime/**", "README.md"])
+                .output_anchors(),
+            vec!["pkg/README.md".to_string(), "pkg/runtime".to_string()]
+        );
+    }
+
+    #[test]
+    fn static_files_target_rejects_unsafe_includes() {
+        let mut out = Artifacts::new();
+        let err = StaticFiles::new()
+            .from("static")
+            .to("pkg")
+            .include(["../secret.py"])
+            .generate(&ApiGraph::default(), &mut out, &cx())
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid StaticFiles include"));
+    }
+
+    #[test]
+    fn gosdk_target_emits_go_mod_under_output_dir() {
+        let ir = ApiGraph::default();
+        let target = GoSdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-go");
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+
+        let go_mod = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-go/go.mod")
+            .expect("GoSdk must emit go.mod so pruned SDK dirs remain buildable");
+        assert_eq!(go_mod.text, "module example.com/bookstore/sdk\n\ngo 1.23\n");
     }
 
     #[test]

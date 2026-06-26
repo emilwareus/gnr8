@@ -18,8 +18,9 @@ mod emit;
 
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
-use crate::sdk::emit_common::{file_in_dir, file_stem};
+use crate::sdk::emit_common::{api_key_header_name, file_in_dir, file_stem, model_file_name};
 use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
 /// TSSDK-01).
@@ -55,7 +56,8 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_layout(graph, package, base_path, layout)?;
+    let files =
+        generate_files_with_layout(graph, package, base_path, layout, SdkTypeAliases::default())?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -65,15 +67,25 @@ pub(crate) fn generate_files_with_layout(
     package: &str,
     base_path: &str,
     layout: SdkFileLayout,
+    aliases: SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     let model_dir = layout.model_dir_ref().unwrap_or("models");
-    let mut client = emit::emit_client_with_models(package, model_dir.trim_matches('/'));
-    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    let mut client =
+        emit::emit_client_with_models(package, model_dir.trim_matches('/'), auth_header.as_deref());
+    client.push_str(&emit::emit_operations(
+        graph,
+        package,
+        base_path,
+        &ops,
+        auth_header.as_deref(),
+    )?);
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -86,24 +98,42 @@ pub(crate) fn generate_files_with_layout(
 
     files.push(SdkFile {
         name: "index.ts".to_string(),
-        contents: emit::emit_index_with_models(graph, package, model_dir.trim_matches('/'))?,
+        contents: emit::emit_index_with_models(
+            graph,
+            package,
+            model_dir.trim_matches('/'),
+            &resolved_aliases,
+        )?,
     });
 
     if layout.is_split() {
         files.push(SdkFile {
             name: file_in_dir(Some(model_dir), "index.ts"),
-            contents: emit::emit_models_index(graph)?,
+            contents: emit::emit_models_index(graph, &resolved_aliases)?,
         });
         for schema in &graph.schemas {
+            let default_name =
+                file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
+            let name = if layout.model_file_template_ref().is_some() {
+                model_file_name(&layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
+            } else {
+                default_name
+            };
             files.push(SdkFile {
-                name: file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name))),
+                name,
                 contents: emit::emit_model_schema(graph, schema)?,
+            });
+        }
+        for alias in &resolved_aliases {
+            files.push(SdkFile {
+                name: file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias))),
+                contents: emit::emit_model_alias(alias),
             });
         }
     } else {
         files.push(SdkFile {
             name: "models.ts".to_string(),
-            contents: emit::emit_models(graph, package)?,
+            contents: emit::emit_models_with_aliases(graph, package, &resolved_aliases)?,
         });
     }
 

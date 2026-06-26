@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::analyze::facts;
+use crate::manifest::blake3_hex;
 use crate::CoreError;
 
 /// The directory of the `goextract` Go module, resolved relative to this crate's
@@ -101,10 +102,16 @@ fn run_goextract_with(
     target_dir: &str,
     patterns: &[String],
 ) -> Result<facts::GoFacts, CoreError> {
-    let mut cmd = Command::new(go_bin);
-    cmd
-        // `run`, `.`, and the target dir are DISCRETE args (no shell, no interpolation).
-        .args(["run", ".", target_dir])
+    let mut cmd = if go_bin == "go" {
+        Command::new(goextract_binary(go_bin)?)
+    } else {
+        let mut cmd = Command::new(go_bin);
+        // Tests that pass a fake Go binary exercise the legacy `go run` shape so missing-toolchain
+        // categorization stays simple and explicit.
+        cmd.args(["run", "."]);
+        cmd
+    };
+    cmd.arg(target_dir)
         .args(patterns)
         .current_dir(goextract_dir());
     let output = cmd
@@ -122,6 +129,86 @@ fn run_goextract_with(
     let parsed: facts::GoFacts = serde_json::from_slice(&output.stdout)
         .map_err(|source| CoreError::FactsParse { source })?;
     Ok(parsed)
+}
+
+fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
+    let source_hash = goextract_source_hash();
+    let dir = std::env::temp_dir()
+        .join("gnr8-goextract")
+        .join(source_hash);
+    let binary = dir.join(if cfg!(windows) {
+        "goextract.exe"
+    } else {
+        "goextract"
+    });
+    if binary.is_file() {
+        return Ok(binary);
+    }
+
+    std::fs::create_dir_all(&dir).map_err(|source| CoreError::Io {
+        message: format!(
+            "failed to create goextract cache dir {}: {source}",
+            dir.display()
+        ),
+    })?;
+    let output = Command::new(go_bin)
+        .args(["build", "-o"])
+        .arg(&binary)
+        .arg(".")
+        .current_dir(goextract_dir())
+        .output()
+        .map_err(|source| CoreError::GoToolchainMissing { source })?;
+    if !output.status.success() {
+        return Err(CoreError::HelperExit {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(binary)
+}
+
+fn goextract_source_hash() -> String {
+    let root = goextract_dir();
+    let mut files = Vec::new();
+    collect_goextract_source_files(&root, &mut files);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gnr8-goextract-binary-cache-v1\n");
+    for path in files {
+        let rel = path.strip_prefix(&root).unwrap_or(&path);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        if let Ok(bytes) = std::fs::read(path) {
+            hasher.update(blake3_hex(&bytes).as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn collect_goextract_source_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if matches!(name, ".git" | "target" | "vendor") {
+                continue;
+            }
+            collect_goextract_source_files(&path, out);
+            continue;
+        }
+        if name == "go.mod"
+            || name == "go.sum"
+            || path.extension().and_then(|ext| ext.to_str()) == Some("go")
+        {
+            out.push(path);
+        }
+    }
+    out.sort();
 }
 
 /// Run the `pyextract` Python helper against `target_dir` and return the parsed facts.

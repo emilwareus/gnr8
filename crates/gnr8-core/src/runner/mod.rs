@@ -20,14 +20,14 @@
 use std::process::ExitCode;
 
 use crate::graph::Diagnostic;
-use crate::sdk::{Artifact, Cx, Pipeline};
+use crate::sdk::{Artifact, Cx, FileStamp, Pipeline};
 use crate::CoreError;
 
 /// The current artifact-bundle wire-schema version. Bumped on any breaking change to the JSON shape;
 /// the host (the `gnr8` binary) rejects a bundle whose `version` differs from this, so a `.gnr8/`
 /// crate built against a skewed `gnr8-core` fails with an actionable error instead of a confusing
 /// parse error or silently-wrong output (forward/back-compat across the boundary).
-pub const BUNDLE_VERSION: u32 = 1;
+pub const BUNDLE_VERSION: u32 = 2;
 
 /// The exit code for a usage error (unknown / missing subcommand). `0` = success, `1` = run error,
 /// `2` = usage, mirroring conventional CLI exit semantics.
@@ -46,16 +46,39 @@ pub struct ArtifactBundle {
     pub artifacts: Vec<Artifact>,
     /// Diagnostics the IR carried after transforms (lossy/unsupported source patterns).
     pub diagnostics: Vec<Diagnostic>,
+    /// Project-relative target output anchors, used by the host to prune stale generated files.
+    #[serde(default)]
+    pub output_anchors: Vec<String>,
+    /// Optional key for artifacts stored under `.gnr8/cache/artifacts/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_cache_key: Option<String>,
+    /// Source input roots that can be rescanned by the host before a hot no-op child skip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_input_roots: Vec<String>,
+    /// Source input file stamps captured by the child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_input_stamps: Vec<FileStamp>,
 }
 
 impl ArtifactBundle {
     /// Wrap a pipeline's artifacts + diagnostics in the current versioned envelope.
     #[must_use]
-    fn new(artifacts: Vec<Artifact>, diagnostics: Vec<Diagnostic>) -> Self {
+    fn new(
+        artifacts: Vec<Artifact>,
+        diagnostics: Vec<Diagnostic>,
+        output_anchors: Vec<String>,
+        artifact_cache_key: Option<String>,
+        cache_input_roots: Vec<String>,
+        cache_input_stamps: Vec<FileStamp>,
+    ) -> Self {
         Self {
             version: BUNDLE_VERSION,
             artifacts,
             diagnostics,
+            output_anchors,
+            artifact_cache_key,
+            cache_input_roots,
+            cache_input_stamps,
         }
     }
 }
@@ -127,8 +150,18 @@ pub fn run(pipeline: Pipeline) -> ExitCode {
 /// Propagates any pipeline error, or a [`CoreError::SdkGen`] if the bundle cannot be serialized (it
 /// is plain owned data, so this is effectively unreachable, but it stays a typed error, never a panic).
 fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
-    let outcome = pipeline.run(cx)?;
-    let bundle = ArtifactBundle::new(outcome.artifacts.into_files(), outcome.diagnostics);
+    let outcome = pipeline.run_for_emit(cx)?;
+    let bundle = ArtifactBundle::new(
+        outcome.artifacts.into_files(),
+        outcome.diagnostics,
+        pipeline.output_anchors(),
+        outcome
+            .artifact_cache_hit
+            .then_some(outcome.artifact_cache_key)
+            .flatten(),
+        pipeline.cache_input_roots(cx),
+        pipeline.cache_input_stamps(cx),
+    );
     serde_json::to_string(&bundle).map_err(|err| CoreError::SdkGen {
         message: format!("failed to serialize the artifact bundle: {err}"),
     })

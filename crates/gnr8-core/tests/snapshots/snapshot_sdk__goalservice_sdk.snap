@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_sdk.rs
+assertion_line: 27
 expression: sdk
 ---
 // ==== gnr8:file client.go ====
@@ -15,7 +16,6 @@ import (
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
-	apiKey     string
 }
 
 // Option mutates a Client during construction (functional-options pattern).
@@ -24,11 +24,6 @@ type Option func(*Client)
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
-}
-
-// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
-func WithAPIKey(key string) Option {
-	return func(c *Client) { c.apiKey = key }
 }
 
 // NewClient builds a Client for the given base URL, applying any options. A
@@ -66,178 +61,33 @@ func (e *APIError) Error() string {
 func (e *APIError) IsNotFound() bool {
 	return e.StatusCode == 404
 }
-// ==== gnr8:file operations.go ====
-package goalservice
 
-import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/url"
-)
-
-// CreateGoal -> POST /goal/
-func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessageWithUUID, error) {
-	var out CommandMessageWithUUID
-	payload, err := json.Marshal(in)
-	if err != nil {
-		return out, err
-	}
-	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + "/goal/"
-	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
-	if err != nil {
-		return out, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 201 {
-		var apiErr HttpError
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
-		return out, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
+func apiErrorStringValue(v any) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case *string:
+		if value == nil {
+			return ""
 		}
+		return *value
+	default:
+		return ""
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
-	}
-	return out, nil
 }
 
-// ListGoalsParams carries the query parameters for ListGoals.
-type ListGoalsParams struct {
-	Aggregation *string
-	Cursor      *string
-	PageSize    *string
-}
-
-// ListGoals -> GET /goal/list
-func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoalsOutput, error) {
-	var out ListGoalsOutput
-	reqURL := c.baseURL + "/goal/list"
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return out, err
-	}
-	q := req.URL.Query()
-	if params.Aggregation != nil {
-		q.Set("aggregation", *params.Aggregation)
-	}
-	if params.Cursor != nil {
-		q.Set("cursor", *params.Cursor)
-	}
-	if params.PageSize != nil {
-		q.Set("page_size", *params.PageSize)
-	}
-	req.URL.RawQuery = q.Encode()
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		var apiErr struct {
-			Message string   `json:"message"`
-			Slug    string   `json:"slug"`
-			Hints   []string `json:"hints"`
+func apiErrorStringSliceValue(v any) []string {
+	switch value := v.(type) {
+	case []string:
+		return value
+	case *[]string:
+		if value == nil {
+			return nil
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
-		return out, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
-		}
+		return *value
+	default:
+		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
-	}
-	return out, nil
-}
-
-// DeleteGoal -> DELETE /goal/{uuid}
-func (c *Client) DeleteGoal(ctx context.Context, uuid string) (CommandMessage, error) {
-	var out CommandMessage
-	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
-	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
-	if err != nil {
-		return out, err
-	}
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		var apiErr HttpError
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
-		return out, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
-		}
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
-	}
-	return out, nil
-}
-
-// UpdateGoal -> PUT /goal/{uuid}
-func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput) (CommandMessage, error) {
-	var out CommandMessage
-	payload, err := json.Marshal(in)
-	if err != nil {
-		return out, err
-	}
-	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
-	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
-	if err != nil {
-		return out, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		var apiErr HttpError
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
-		return out, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
-		}
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
-	}
-	return out, nil
 }
 // ==== gnr8:file models.go ====
 package goalservice
@@ -272,7 +122,7 @@ type GoalResponse struct {
 	AnalyticsQuery  GoalAnalyticsQuery `json:"analyticsQuery"`
 	CreatedAt       time.Time          `json:"createdAt"`
 	Description     string             `json:"description,omitempty"`
-	Metadata        map[string]any     `json:"metadata,omitempty"`
+	Metadata        any                `json:"metadata,omitempty"`
 	Name            string             `json:"name"`
 	TargetDirection *TargetDirection   `json:"targetDirection,omitempty"`
 	TargetValue     *float32           `json:"targetValue,omitempty"`
@@ -299,6 +149,11 @@ const (
 	TargetDirectionLte TargetDirection = "lte"
 )
 
+const (
+	GteTargetDirection TargetDirection = "gte"
+	LteTargetDirection TargetDirection = "lte"
+)
+
 type UpdateGoalInput struct {
 	AnalyticsQuery   *GoalAnalyticsQuery `json:"analyticsQuery,omitempty"`
 	Description      string              `json:"description,omitempty"`
@@ -306,4 +161,165 @@ type UpdateGoalInput struct {
 	TargetDirection  *TargetDirection    `json:"targetDirection,omitempty"`
 	TargetValue      *float32            `json:"targetValue,omitempty"`
 	WorkflowChainIDs []string            `json:"workflowChainIds,omitempty"`
+}
+// ==== gnr8:file operations.go ====
+package goalservice
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+)
+
+// CreateGoal -> POST /goal/
+func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessageWithUUID, error) {
+	var out CommandMessageWithUUID
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return out, err
+	}
+	reqBody := bytes.NewReader(payload)
+	reqURL := c.baseURL + "/goal/"
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		var apiErr HttpError
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		return out, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    apiErrorStringValue(apiErr.Message),
+			Slug:       apiErrorStringValue(apiErr.Slug),
+			Hints:      apiErrorStringSliceValue(apiErr.Hints),
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// ListGoalsParams carries the query parameters for ListGoals.
+type ListGoalsParams struct {
+	Aggregation *string
+	Cursor      *string
+	PageSize    *string
+}
+
+// ListGoals -> GET /goal/list
+func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoalsOutput, error) {
+	var out ListGoalsOutput
+	reqURL := c.baseURL + "/goal/list"
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return out, err
+	}
+	q := req.URL.Query()
+	if params.Aggregation != nil {
+		q.Set("aggregation", *params.Aggregation)
+	}
+	if params.Cursor != nil {
+		q.Set("cursor", *params.Cursor)
+	}
+	if params.PageSize != nil {
+		q.Set("page_size", *params.PageSize)
+	}
+	req.URL.RawQuery = q.Encode()
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		var apiErr struct {
+			Message string   `json:"message"`
+			Slug    string   `json:"slug"`
+			Hints   []string `json:"hints"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		return out, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    apiErr.Message,
+			Slug:       apiErr.Slug,
+			Hints:      apiErr.Hints,
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// DeleteGoal -> DELETE /goal/{uuid}
+func (c *Client) DeleteGoal(ctx context.Context, uuid string) (CommandMessage, error) {
+	var out CommandMessage
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		var apiErr HttpError
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		return out, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    apiErrorStringValue(apiErr.Message),
+			Slug:       apiErrorStringValue(apiErr.Slug),
+			Hints:      apiErrorStringSliceValue(apiErr.Hints),
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// UpdateGoal -> PUT /goal/{uuid}
+func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput) (CommandMessage, error) {
+	var out CommandMessage
+	payload, err := json.Marshal(in)
+	if err != nil {
+		return out, err
+	}
+	reqBody := bytes.NewReader(payload)
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		var apiErr HttpError
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		return out, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    apiErrorStringValue(apiErr.Message),
+			Slug:       apiErrorStringValue(apiErr.Slug),
+			Hints:      apiErrorStringSliceValue(apiErr.Hints),
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
 }

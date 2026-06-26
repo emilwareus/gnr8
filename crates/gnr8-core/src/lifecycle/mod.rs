@@ -37,12 +37,12 @@
 // (skill ch.2.4, mirrors manifest/mod.rs).
 #![allow(clippy::doc_markdown)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path};
 
 use crate::graph::ApiGraph;
 use crate::manifest::{self, blake3_hex, Manifest};
-use crate::sdk::Artifact;
+use crate::sdk::{Artifact, ArtifactMetadata};
 
 /// The provenance tag recorded for every artifact the host writes.
 ///
@@ -110,6 +110,8 @@ pub struct GenerateOutcome {
     pub unchanged: Vec<String>,
     /// Paths that were protected (user-edited / pre-existing untracked) and skipped without `force`.
     pub skipped: Vec<String>,
+    /// Generated-output files removed because this run no longer produces them.
+    pub deleted: Vec<String>,
 }
 
 /// Classify each generated [`Artifact`] — the PURE heart of WS-04 / WATCH-01.
@@ -167,6 +169,39 @@ pub fn plan_writes(
     WritePlan { files }
 }
 
+/// Classify generated files from cached path/hash metadata.
+///
+/// This is used by warm no-op host paths where the child has proved the artifact cache is valid but
+/// the host does not yet know whether it needs the full generated text. `new_bytes` is intentionally
+/// empty in the returned plan; callers must only use it for dry-run reporting or when they have already
+/// established that no file needs writing.
+#[must_use]
+pub fn plan_metadata_writes(
+    artifacts: &[ArtifactMetadata],
+    manifest: &Manifest,
+    on_disk_hash: &dyn Fn(&str) -> Option<String>,
+) -> WritePlan {
+    let mut files = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let path = &artifact.path;
+        let action = match (on_disk_hash(path), manifest.recorded_hash(path)) {
+            (None, _) => WriteAction::Write,
+            (Some(disk_hash), Some(recorded)) if disk_hash != recorded => WriteAction::UserEdited,
+            (Some(disk_hash), Some(_)) if disk_hash == artifact.hash => WriteAction::Unchanged,
+            (Some(_), Some(_)) => WriteAction::Write,
+            (Some(_), None) => WriteAction::UserEdited,
+        };
+        files.push(PlannedFile {
+            path: path.clone(),
+            action,
+            new_bytes: Vec::new(),
+            new_hash: artifact.hash.clone(),
+            source: SOURCE_GENERATED.to_string(),
+        });
+    }
+    WritePlan { files }
+}
+
 /// Materialize a [`WritePlan`] to disk (the impure half, RESEARCH Pattern 3).
 ///
 /// For each file: `Write` (and `UserEdited` when `force`) → validate the path against `project_root`,
@@ -187,6 +222,25 @@ pub fn apply_writes(
     plan: &WritePlan,
     manifest: &mut Manifest,
     force: bool,
+) -> Result<GenerateOutcome, crate::CoreError> {
+    apply_writes_with_anchors(project_root, plan, manifest, force, &[])
+}
+
+/// Materialize a [`WritePlan`] and prune stale files under declared target output anchors.
+///
+/// This is the same write policy as [`apply_writes`], plus cleanup:
+/// - manifest-owned files no longer produced are deleted when unchanged from the last generated hash;
+/// - with `force`, other files under output directory anchors that are no longer produced are deleted too.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Io`] for unsafe output paths or filesystem failures. Never panics.
+pub fn apply_writes_with_anchors(
+    project_root: &Path,
+    plan: &WritePlan,
+    manifest: &mut Manifest,
+    force: bool,
+    output_anchors: &[String],
 ) -> Result<GenerateOutcome, crate::CoreError> {
     let mut out = GenerateOutcome::default();
     for file in &plan.files {
@@ -215,10 +269,180 @@ pub fn apply_writes(
         }
     }
 
+    let current_paths: BTreeSet<String> = plan.files.iter().map(|f| f.path.clone()).collect();
+    prune_stale_manifest_files(project_root, manifest, &current_paths, &mut out)?;
+    prune_anchor_files(
+        project_root,
+        output_anchors,
+        &current_paths,
+        manifest,
+        force,
+        &mut out,
+    )?;
+
     // D-04: drop manifest entries for paths this generation no longer produces.
-    let current_paths: Vec<String> = plan.files.iter().map(|f| f.path.clone()).collect();
-    manifest.prune_to(&current_paths);
+    let current_paths_vec: Vec<String> = current_paths.iter().cloned().collect();
+    manifest.prune_to(&current_paths_vec);
     Ok(out)
+}
+
+fn prune_stale_manifest_files(
+    project_root: &Path,
+    manifest: &Manifest,
+    current_paths: &BTreeSet<String>,
+    out: &mut GenerateOutcome,
+) -> Result<(), crate::CoreError> {
+    for entry in &manifest.files {
+        if current_paths.contains(&entry.path) {
+            continue;
+        }
+        let safe = safe_output_path(project_root, &entry.path)?;
+        let Ok(bytes) = std::fs::read(&safe) else {
+            continue;
+        };
+        if blake3_hex(&bytes) == entry.hash {
+            std::fs::remove_file(&safe).map_err(|err| crate::CoreError::Io {
+                message: format!(
+                    "failed to delete stale generated file {}: {err}",
+                    safe.display()
+                ),
+            })?;
+            out.deleted.push(entry.path.clone());
+        } else {
+            out.skipped.push(entry.path.clone());
+        }
+    }
+    Ok(())
+}
+
+fn prune_anchor_files(
+    project_root: &Path,
+    output_anchors: &[String],
+    current_paths: &BTreeSet<String>,
+    manifest: &Manifest,
+    force: bool,
+    out: &mut GenerateOutcome,
+) -> Result<(), crate::CoreError> {
+    if !force {
+        return Ok(());
+    }
+
+    let mut seen = BTreeSet::new();
+    for anchor in output_anchors {
+        let anchor_path = safe_output_path(project_root, anchor)?;
+        if anchor_path.is_file() {
+            prune_anchor_file(
+                project_root,
+                anchor,
+                current_paths,
+                manifest,
+                out,
+                &mut seen,
+            )?;
+        } else if anchor_path.is_dir() {
+            prune_anchor_dir(
+                project_root,
+                &anchor_path,
+                current_paths,
+                manifest,
+                out,
+                &mut seen,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_anchor_dir(
+    project_root: &Path,
+    dir: &Path,
+    current_paths: &BTreeSet<String>,
+    manifest: &Manifest,
+    out: &mut GenerateOutcome,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), crate::CoreError> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut dirs = Vec::new();
+    while let Some(next) = stack.pop() {
+        dirs.push(next.clone());
+        let entries = std::fs::read_dir(&next).map_err(|err| crate::CoreError::Io {
+            message: format!(
+                "failed to read generated output dir {}: {err}",
+                next.display()
+            ),
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| crate::CoreError::Io {
+                message: format!(
+                    "failed to read generated output dir {}: {err}",
+                    next.display()
+                ),
+            })?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|err| crate::CoreError::Io {
+                message: format!(
+                    "failed to inspect generated output {}: {err}",
+                    path.display()
+                ),
+            })?;
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                let rel = project_relative_path(project_root, &path)?;
+                prune_anchor_file(project_root, &rel, current_paths, manifest, out, seen)?;
+            }
+        }
+    }
+
+    for dir in dirs.into_iter().rev() {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(())
+}
+
+fn prune_anchor_file(
+    project_root: &Path,
+    rel: &str,
+    current_paths: &BTreeSet<String>,
+    manifest: &Manifest,
+    out: &mut GenerateOutcome,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), crate::CoreError> {
+    if current_paths.contains(rel) || !seen.insert(rel.to_string()) {
+        return Ok(());
+    }
+    let safe = safe_output_path(project_root, rel)?;
+    if !safe.exists() {
+        return Ok(());
+    }
+
+    if manifest.recorded_hash(rel).is_some() && !out.deleted.iter().any(|path| path == rel) {
+        out.skipped.retain(|path| path != rel);
+    }
+
+    std::fs::remove_file(&safe).map_err(|err| crate::CoreError::Io {
+        message: format!(
+            "failed to delete stale generated file {}: {err}",
+            safe.display()
+        ),
+    })?;
+    if !out.deleted.iter().any(|path| path == rel) {
+        out.deleted.push(rel.to_string());
+    }
+    Ok(())
+}
+
+fn project_relative_path(project_root: &Path, path: &Path) -> Result<String, crate::CoreError> {
+    let rel = path
+        .strip_prefix(project_root)
+        .map_err(|err| crate::CoreError::Io {
+            message: format!(
+                "generated output path {} is not under project root {}: {err}",
+                path.display(),
+                project_root.display()
+            ),
+        })?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Resolve a user-config output path against `project_root`, REJECTING any path that escapes the root
@@ -267,6 +491,16 @@ fn safe_output_path(
 fn validate_output_paths(
     project_root: &Path,
     artifacts: &[Artifact],
+) -> Result<(), crate::CoreError> {
+    for artifact in artifacts {
+        safe_output_path(project_root, &artifact.path)?;
+    }
+    Ok(())
+}
+
+fn validate_metadata_output_paths(
+    project_root: &Path,
+    artifacts: &[ArtifactMetadata],
 ) -> Result<(), crate::CoreError> {
     for artifact in artifacts {
         safe_output_path(project_root, &artifact.path)?;
@@ -525,9 +759,29 @@ pub fn plan_only(
 ) -> Result<WritePlan, crate::CoreError> {
     validate_output_paths(project_root, artifacts)?;
     let manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
-    let root = project_root.to_path_buf();
-    let on_disk = move |path: &str| -> Option<Vec<u8>> { std::fs::read(root.join(path)).ok() };
+    let disk = read_artifacts_from_disk(project_root, artifacts);
+    let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
     Ok(plan_writes(artifacts, &manifest, &on_disk))
+}
+
+/// Compute the dry-run write plan from cached artifact path/hash metadata.
+///
+/// The resulting plan is suitable for drift reporting (`gnr8 check` / `gnr8 doctor`). Its
+/// `new_bytes` fields are empty because the metadata cache deliberately avoids loading generated text.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Io`] for a root-escaping output path, or propagates manifest I/O.
+pub fn plan_only_cached(
+    project_root: &Path,
+    artifacts: &[ArtifactMetadata],
+) -> Result<WritePlan, crate::CoreError> {
+    validate_metadata_output_paths(project_root, artifacts)?;
+    let manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
+    let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts);
+    let on_disk_hash =
+        move |path: &str| -> Option<String> { disk_hashes.get(path).cloned().flatten() };
+    Ok(plan_metadata_writes(artifacts, &manifest, &on_disk_hash))
 }
 
 /// Write the child's `artifacts`, writing only changed files, and return the outcome counts.
@@ -550,17 +804,146 @@ pub fn regenerate(
     artifacts: &[Artifact],
     force: bool,
 ) -> Result<GenerateOutcome, crate::CoreError> {
+    regenerate_with_anchors(project_root, artifacts, &[], force)
+}
+
+/// Write artifacts and prune stale files under target output anchors.
+///
+/// # Errors
+///
+/// Propagates any manifest/write/prune I/O error as its typed [`CoreError`](crate::CoreError).
+/// Never panics.
+pub fn regenerate_with_anchors(
+    project_root: &Path,
+    artifacts: &[Artifact],
+    output_anchors: &[String],
+    force: bool,
+) -> Result<GenerateOutcome, crate::CoreError> {
     validate_output_paths(project_root, artifacts)?;
     let gnr8_dir = project_root.join(WORKSPACE_DIR);
     let mut manifest = manifest::load(&gnr8_dir)?;
 
-    let root = project_root.to_path_buf();
-    let on_disk = move |path: &str| -> Option<Vec<u8>> { std::fs::read(root.join(path)).ok() };
+    let disk = read_artifacts_from_disk(project_root, artifacts);
+    let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
     let plan = plan_writes(artifacts, &manifest, &on_disk);
 
-    let outcome = apply_writes(project_root, &plan, &mut manifest, force)?;
+    let outcome =
+        apply_writes_with_anchors(project_root, &plan, &mut manifest, force, output_anchors)?;
     manifest.save(&gnr8_dir)?;
     Ok(outcome)
+}
+
+/// Try to complete a generation from cached artifact metadata without loading generated text.
+///
+/// Returns `Ok(Some(outcome))` when every produced file is either unchanged or protected/skipped, so
+/// full text is unnecessary. Returns `Ok(None)` when at least one file must be written; the caller
+/// should then load the full artifact cache and use [`regenerate_with_anchors`].
+///
+/// # Errors
+///
+/// Propagates manifest/write/prune I/O errors as typed [`crate::CoreError`] values.
+pub fn regenerate_cached_with_anchors(
+    project_root: &Path,
+    artifacts: &[ArtifactMetadata],
+    output_anchors: &[String],
+    force: bool,
+) -> Result<Option<GenerateOutcome>, crate::CoreError> {
+    validate_metadata_output_paths(project_root, artifacts)?;
+    let gnr8_dir = project_root.join(WORKSPACE_DIR);
+    let mut manifest = manifest::load(&gnr8_dir)?;
+
+    let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts);
+    let on_disk_hash =
+        move |path: &str| -> Option<String> { disk_hashes.get(path).cloned().flatten() };
+    let plan = plan_metadata_writes(artifacts, &manifest, &on_disk_hash);
+    if plan.files.iter().any(|file| {
+        matches!(file.action, WriteAction::Write)
+            || (force && matches!(file.action, WriteAction::UserEdited))
+    }) {
+        return Ok(None);
+    }
+
+    let mut out = GenerateOutcome::default();
+    for file in &plan.files {
+        match file.action {
+            WriteAction::Unchanged => {
+                out.unchanged.push(file.path.clone());
+                manifest.record(&file.path, &file.new_hash, &file.source);
+            }
+            WriteAction::UserEdited => out.skipped.push(file.path.clone()),
+            WriteAction::Write => return Ok(None),
+        }
+    }
+
+    let current_paths: BTreeSet<String> = plan.files.iter().map(|f| f.path.clone()).collect();
+    prune_stale_manifest_files(project_root, &manifest, &current_paths, &mut out)?;
+    prune_anchor_files(
+        project_root,
+        output_anchors,
+        &current_paths,
+        &manifest,
+        force,
+        &mut out,
+    )?;
+
+    let current_paths_vec: Vec<String> = current_paths.iter().cloned().collect();
+    manifest.prune_to(&current_paths_vec);
+    manifest.save(&gnr8_dir)?;
+    Ok(Some(out))
+}
+
+fn read_artifacts_from_disk(
+    project_root: &Path,
+    artifacts: &[Artifact],
+) -> HashMap<String, Option<Vec<u8>>> {
+    if artifacts.is_empty() {
+        return HashMap::new();
+    }
+
+    let workers = std::thread::available_parallelism().map_or(4, usize::from);
+    let workers = workers.clamp(1, artifacts.len());
+    let chunk_size = artifacts.len().div_ceil(workers);
+    let root = project_root.to_path_buf();
+    let paths: Vec<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size) {
+            let root = root.clone();
+            let chunk = chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                chunk
+                    .into_iter()
+                    .map(|path| {
+                        let bytes = std::fs::read(root.join(&path)).ok();
+                        (path, bytes)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut disk = HashMap::with_capacity(paths.len());
+        for handle in handles {
+            if let Ok(entries) = handle.join() {
+                disk.extend(entries);
+            }
+        }
+        disk
+    })
+}
+
+fn read_artifact_hashes_from_disk(
+    project_root: &Path,
+    artifacts: &[ArtifactMetadata],
+) -> HashMap<String, Option<String>> {
+    let paths: Vec<String> = artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
+    crate::sdk::hash_project_files(project_root, &paths)
 }
 
 #[cfg(test)]
@@ -569,8 +952,19 @@ mod tests {
     // allow so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{apply_writes, safe_output_path, WriteAction};
+    use super::{apply_writes, apply_writes_with_anchors, safe_output_path, WriteAction};
     use crate::manifest::Manifest;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("gnr8-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn safe_output_path_rejects_traversal_and_absolute() {
@@ -621,6 +1015,55 @@ mod tests {
             matches!(result, Err(crate::CoreError::Io { .. })),
             "a traversal path must be rejected with CoreError::Io in dry-run too, got {result:?}"
         );
+    }
+
+    #[test]
+    fn apply_writes_deletes_unchanged_manifest_owned_stale_files() {
+        let root = temp_root("stale-owned");
+        std::fs::create_dir_all(root.join("sdk")).unwrap();
+        std::fs::write(root.join("sdk/old.go"), "package sdk\n").unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.record(
+            "sdk/old.go",
+            &crate::manifest::blake3_hex(b"package sdk\n"),
+            "generated",
+        );
+        let plan = super::WritePlan {
+            files: vec![super::PlannedFile {
+                path: "sdk/new.go".to_string(),
+                action: WriteAction::Write,
+                new_bytes: b"package sdk\n// new\n".to_vec(),
+                new_hash: crate::manifest::blake3_hex(b"package sdk\n// new\n"),
+                source: "generated".to_string(),
+            }],
+        };
+
+        let outcome = apply_writes_with_anchors(&root, &plan, &mut manifest, false, &[]).unwrap();
+
+        assert!(!root.join("sdk/old.go").exists());
+        assert!(root.join("sdk/new.go").exists());
+        assert_eq!(outcome.deleted, vec!["sdk/old.go"]);
+        assert_eq!(manifest.recorded_hash("sdk/old.go"), None);
+        assert!(manifest.recorded_hash("sdk/new.go").is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn force_prunes_untracked_files_under_output_anchors() {
+        let root = temp_root("anchor-prune");
+        std::fs::create_dir_all(root.join("sdk/nested")).unwrap();
+        std::fs::write(root.join("sdk/nested/old.go"), "package sdk\n").unwrap();
+        let plan = super::WritePlan::default();
+        let mut manifest = Manifest::default();
+
+        let outcome =
+            apply_writes_with_anchors(&root, &plan, &mut manifest, true, &["sdk".to_string()])
+                .unwrap();
+
+        assert!(!root.join("sdk/nested/old.go").exists());
+        assert_eq!(outcome.deleted, vec!["sdk/nested/old.go"]);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// WATCH-01 loop-safety twin: the pure output-anchor test matches a file AT or UNDER an anchor,

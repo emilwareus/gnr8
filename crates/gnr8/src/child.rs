@@ -26,6 +26,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use gnr8_core::runner::ArtifactBundle;
@@ -37,6 +38,8 @@ const GNR8_CARGO_ENV: &str = "GNR8_CARGO";
 const CARGO_ENV: &str = "CARGO";
 /// The default cargo binary when neither override is set.
 const DEFAULT_CARGO: &str = "cargo";
+/// The generation crate directory under the project root.
+const WORKSPACE_DIR: &str = ".gnr8";
 
 /// Run the user's `.gnr8/` generation crate with `subcommand` (`__emit` / `__inspect`) and return the
 /// parsed [`ArtifactBundle`] it printed on stdout.
@@ -69,30 +72,26 @@ pub(crate) fn run_child(
         });
     }
 
-    let cargo = cargo_binary();
-    let output = Command::new(&cargo)
-        .arg("run")
-        .arg("--quiet")
-        .arg("--manifest-path")
-        .arg(&manifest)
-        .arg("--")
-        .arg(subcommand)
-        .current_dir(project_root)
-        .output()
-        .map_err(|err| CoreError::ChildRun {
+    let invocation = child_invocation(project_root, &manifest, subcommand);
+    let output = invocation.command().output().map_err(|err| {
+        let cargo = cargo_binary();
+        CoreError::ChildRun {
             message: format!(
-                "failed to run the .gnr8 generation crate via `{cargo} run` ({err}) — is Rust/cargo \
-                 installed and on PATH? (override the cargo binary with $GNR8_CARGO if needed)"
+                "failed to run the .gnr8 generation crate via `{}` ({err}) — is Rust/cargo \
+                 installed and on PATH? (override the cargo binary with $GNR8_CARGO if needed)",
+                invocation.description(&cargo)
             ),
-        })?;
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CoreError::ChildRun {
             message: format!(
-                "the .gnr8 generation crate failed (`{cargo} run -- {subcommand}` exited with {}).\n\
+                "the .gnr8 generation crate failed (`{}` exited with {}).\n\
                  This is usually a compile error in your .gnr8/src/main.rs pipeline, or a generation \
                  error from it (e.g. the Go toolchain is missing). cargo/child output:\n{}",
+                invocation.description(&cargo_binary()),
                 describe_status(output.status),
                 stderr.trim_end()
             ),
@@ -150,6 +149,166 @@ fn cargo_binary() -> String {
         }
     }
     DEFAULT_CARGO.to_string()
+}
+
+enum ChildInvocation {
+    Direct {
+        binary: PathBuf,
+        project_root: PathBuf,
+        subcommand: String,
+    },
+    CargoRun {
+        cargo: String,
+        manifest: PathBuf,
+        project_root: PathBuf,
+        subcommand: String,
+    },
+}
+
+impl ChildInvocation {
+    fn command(&self) -> Command {
+        match self {
+            Self::Direct {
+                binary,
+                project_root,
+                subcommand,
+            } => {
+                let mut command = Command::new(binary);
+                command.arg(subcommand).current_dir(project_root);
+                command
+            }
+            Self::CargoRun {
+                cargo,
+                manifest,
+                project_root,
+                subcommand,
+            } => {
+                let mut command = Command::new(cargo);
+                command
+                    .arg("run")
+                    .arg("--quiet")
+                    .arg("--manifest-path")
+                    .arg(manifest)
+                    .arg("--")
+                    .arg(subcommand)
+                    .current_dir(project_root);
+                command
+            }
+        }
+    }
+
+    fn description(&self, fallback_cargo: &str) -> String {
+        match self {
+            Self::Direct {
+                binary, subcommand, ..
+            } => {
+                format!("{} {subcommand}", binary.display())
+            }
+            Self::CargoRun {
+                cargo, subcommand, ..
+            } => format!(
+                "{} run --quiet --manifest-path .gnr8/Cargo.toml -- {subcommand}",
+                if cargo.is_empty() {
+                    fallback_cargo
+                } else {
+                    cargo
+                }
+            ),
+        }
+    }
+}
+
+fn child_invocation(project_root: &Path, manifest: &Path, subcommand: &str) -> ChildInvocation {
+    if let Some(binary) = fresh_child_binary(project_root, manifest) {
+        return ChildInvocation::Direct {
+            binary,
+            project_root: project_root.to_path_buf(),
+            subcommand: subcommand.to_string(),
+        };
+    }
+    ChildInvocation::CargoRun {
+        cargo: cargo_binary(),
+        manifest: manifest.to_path_buf(),
+        project_root: project_root.to_path_buf(),
+        subcommand: subcommand.to_string(),
+    }
+}
+
+fn fresh_child_binary(project_root: &Path, manifest: &Path) -> Option<PathBuf> {
+    let package = package_name(manifest)?;
+    let binary = project_root
+        .join(WORKSPACE_DIR)
+        .join("target")
+        .join("debug")
+        .join(package);
+    if !binary.is_file() || !is_executable_fresh(&binary, project_root, manifest) {
+        return None;
+    }
+    Some(binary)
+}
+
+fn is_executable_fresh(binary: &Path, project_root: &Path, manifest: &Path) -> bool {
+    let Ok(binary_modified) = binary.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    generation_workspace_inputs(project_root, manifest)
+        .into_iter()
+        .filter_map(|path| {
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .all(|modified| modified <= binary_modified)
+}
+
+fn generation_workspace_inputs(project_root: &Path, manifest: &Path) -> Vec<PathBuf> {
+    let mut inputs = vec![manifest.to_path_buf()];
+    let lock = manifest.with_file_name("Cargo.lock");
+    if lock.is_file() {
+        inputs.push(lock);
+    }
+    collect_files(&project_root.join(WORKSPACE_DIR).join("src"), &mut inputs);
+    if let Ok(exe) = std::env::current_exe() {
+        inputs.push(exe);
+    }
+    inputs
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+fn package_name(manifest: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(manifest).ok()?;
+    let mut in_package = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        return Some(value.trim().trim_matches('"').to_string());
+    }
+    None
 }
 
 /// Render an [`std::process::ExitStatus`] as a short string for the error message (the numeric code,

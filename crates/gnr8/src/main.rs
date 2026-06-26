@@ -96,6 +96,8 @@ struct LifecycleReport {
     unchanged: Vec<String>,
     /// Paths protected (user-edited / pre-existing) and skipped — overwrite with `--force`.
     skipped: Vec<String>,
+    /// Stale generated-output files deleted during this generation.
+    deleted: Vec<String>,
 }
 
 /// Run `gnr8 generate` (+ `--force`): run the user's `.gnr8/` pipeline (child process), then write only
@@ -105,11 +107,16 @@ struct LifecycleReport {
 /// error in the user's pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
 fn run_generate(force: bool, json: bool) -> Result<()> {
     let root = project_root()?;
-    let bundle = child::run_child(&root, "__emit")?;
-    let outcome = gnr8_core::lifecycle::regenerate(&root, &bundle.artifacts, force)?;
+    let (outcome, diagnostics) = if let Some(noop) = pre_child_verified_noop(&root) {
+        (noop.outcome, noop.diagnostics)
+    } else {
+        let mut bundle = child::run_child(&root, "__emit")?;
+        let outcome = regenerate_bundle(&root, &mut bundle, force)?;
+        (outcome, bundle.diagnostics.clone())
+    };
 
     // Surface the pipeline's diagnostics (lossy/unsupported source patterns the child reported).
-    for diag in &bundle.diagnostics {
+    for diag in &diagnostics {
         eprintln!(
             "{}: {} ({}:{})",
             diag.severity, diag.message, diag.file, diag.line
@@ -127,13 +134,15 @@ fn run_generate(force: bool, json: bool) -> Result<()> {
             written: outcome.written,
             unchanged: outcome.unchanged,
             skipped: outcome.skipped,
+            deleted: outcome.deleted,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "{} written, {} unchanged, {} skipped (user-edited; use --force to overwrite)",
+            "{} written, {} unchanged, {} deleted, {} skipped (user-edited; use --force to overwrite)",
             outcome.written.len(),
             outcome.unchanged.len(),
+            outcome.deleted.len(),
             outcome.skipped.len()
         );
     }
@@ -147,8 +156,12 @@ fn run_generate(force: bool, json: bool) -> Result<()> {
 /// boundary, never a panic.
 fn run_check(json: bool) -> Result<()> {
     let root = project_root()?;
-    let bundle = child::run_child(&root, "__emit")?;
-    let plan = gnr8_core::lifecycle::plan_only(&root, &bundle.artifacts)?;
+    let plan = if let Some(noop) = pre_child_verified_noop(&root) {
+        clean_plan_from_paths(noop.outcome.unchanged)
+    } else {
+        let mut bundle = child::run_child(&root, "__emit")?;
+        plan_bundle(&root, &mut bundle)?
+    };
 
     // Partition the plan into stale (would be written) vs drifted (user-edited) vs clean (unchanged).
     let mut stale: Vec<String> = Vec::new();
@@ -199,6 +212,356 @@ fn run_check(json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn clean_plan_from_paths(paths: Vec<String>) -> gnr8_core::lifecycle::WritePlan {
+    gnr8_core::lifecycle::WritePlan {
+        files: paths
+            .into_iter()
+            .map(|path| gnr8_core::lifecycle::PlannedFile {
+                path,
+                action: gnr8_core::lifecycle::WriteAction::Unchanged,
+                new_bytes: Vec::new(),
+                new_hash: String::new(),
+                source: "generated".to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn regenerate_bundle(
+    root: &std::path::Path,
+    bundle: &mut gnr8_core::runner::ArtifactBundle,
+    force: bool,
+) -> Result<gnr8_core::lifecycle::GenerateOutcome, gnr8_core::CoreError> {
+    if let Some(metadata) = cached_artifact_metadata(root, bundle) {
+        if let Some(outcome) = verified_noop_outcome(root, bundle, &metadata) {
+            save_verified_noop_stamp(root, bundle, &metadata, &outcome);
+            return Ok(outcome);
+        }
+        if let Some(outcome) = gnr8_core::lifecycle::regenerate_cached_with_anchors(
+            root,
+            &metadata,
+            &bundle.output_anchors,
+            force,
+        )? {
+            save_verified_noop_stamp(root, bundle, &metadata, &outcome);
+            return Ok(outcome);
+        }
+    }
+    ensure_bundle_artifacts(root, bundle)?;
+    let outcome = gnr8_core::lifecycle::regenerate_with_anchors(
+        root,
+        &bundle.artifacts,
+        &bundle.output_anchors,
+        force,
+    )?;
+    Ok(outcome)
+}
+
+fn plan_bundle(
+    root: &std::path::Path,
+    bundle: &mut gnr8_core::runner::ArtifactBundle,
+) -> Result<gnr8_core::lifecycle::WritePlan, gnr8_core::CoreError> {
+    if let Some(metadata) = cached_artifact_metadata(root, bundle) {
+        return gnr8_core::lifecycle::plan_only_cached(root, &metadata);
+    }
+    ensure_bundle_artifacts(root, bundle)?;
+    gnr8_core::lifecycle::plan_only(root, &bundle.artifacts)
+}
+
+fn cached_artifact_metadata(
+    root: &std::path::Path,
+    bundle: &gnr8_core::runner::ArtifactBundle,
+) -> Option<Vec<gnr8_core::sdk::ArtifactMetadata>> {
+    if !bundle.artifacts.is_empty() {
+        return None;
+    }
+    let key = bundle.artifact_cache_key.as_deref()?;
+    gnr8_core::sdk::load_artifact_cache_metadata(root, key)
+}
+
+fn ensure_bundle_artifacts(
+    root: &std::path::Path,
+    bundle: &mut gnr8_core::runner::ArtifactBundle,
+) -> Result<(), gnr8_core::CoreError> {
+    if !bundle.artifacts.is_empty() {
+        return Ok(());
+    }
+    let Some(key) = bundle.artifact_cache_key.as_deref() else {
+        return Ok(());
+    };
+    bundle.artifacts =
+        gnr8_core::sdk::load_artifact_cache_files(root, key).ok_or_else(|| {
+            gnr8_core::CoreError::ChildRun {
+                message: format!(
+                    "the .gnr8 generation crate emitted artifact cache key {key}, but the host \
+                     could not read the corresponding cache file. Re-run generation to rebuild the cache."
+                ),
+            }
+        })?;
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VerifiedNoopStamp {
+    artifact_cache_key: String,
+    output_anchors: Vec<String>,
+    artifact_paths: Vec<String>,
+    input_roots: Vec<String>,
+    input_files: Vec<gnr8_core::sdk::FileStamp>,
+    output_files: Vec<gnr8_core::sdk::FileStamp>,
+    diagnostics: Vec<gnr8_core::graph::Diagnostic>,
+}
+
+struct CachedNoop {
+    outcome: gnr8_core::lifecycle::GenerateOutcome,
+    diagnostics: Vec<gnr8_core::graph::Diagnostic>,
+}
+
+fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
+    let stamp = load_verified_noop_stamp(root)?;
+    let current_inputs = collect_hot_input_stamps(root, &stamp.input_roots)?;
+    if current_inputs != stamp.input_files {
+        return None;
+    }
+    let current_outputs =
+        collect_verified_file_stamps(root, &stamp.output_anchors, &stamp.artifact_paths)?;
+    if current_outputs != stamp.output_files {
+        return None;
+    }
+    Some(CachedNoop {
+        outcome: gnr8_core::lifecycle::GenerateOutcome {
+            written: Vec::new(),
+            unchanged: stamp.artifact_paths,
+            skipped: Vec::new(),
+            deleted: Vec::new(),
+        },
+        diagnostics: stamp.diagnostics,
+    })
+}
+
+fn verified_noop_outcome(
+    root: &std::path::Path,
+    bundle: &gnr8_core::runner::ArtifactBundle,
+    metadata: &[gnr8_core::sdk::ArtifactMetadata],
+) -> Option<gnr8_core::lifecycle::GenerateOutcome> {
+    let key = bundle.artifact_cache_key.as_deref()?;
+    let stamp = load_verified_noop_stamp(root)?;
+    if stamp.artifact_cache_key != key || stamp.output_anchors != bundle.output_anchors {
+        return None;
+    }
+    let artifact_paths = artifact_paths(metadata);
+    let current = collect_verified_file_stamps(root, &bundle.output_anchors, &artifact_paths)?;
+    if current != stamp.output_files {
+        return None;
+    }
+    Some(gnr8_core::lifecycle::GenerateOutcome {
+        written: Vec::new(),
+        unchanged: metadata
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect(),
+        skipped: Vec::new(),
+        deleted: Vec::new(),
+    })
+}
+
+fn save_verified_noop_stamp(
+    root: &std::path::Path,
+    bundle: &gnr8_core::runner::ArtifactBundle,
+    metadata: &[gnr8_core::sdk::ArtifactMetadata],
+    outcome: &gnr8_core::lifecycle::GenerateOutcome,
+) {
+    if !outcome.written.is_empty() || !outcome.skipped.is_empty() || !outcome.deleted.is_empty() {
+        return;
+    }
+    let Some(key) = bundle.artifact_cache_key.as_deref() else {
+        return;
+    };
+    if bundle.cache_input_roots.is_empty() || bundle.cache_input_stamps.is_empty() {
+        return;
+    }
+    let artifact_paths = artifact_paths(metadata);
+    let Some(output_files) =
+        collect_verified_file_stamps(root, &bundle.output_anchors, &artifact_paths)
+    else {
+        return;
+    };
+    let Some(input_files) = combine_input_stamps(root, &bundle.cache_input_stamps) else {
+        return;
+    };
+    let stamp = VerifiedNoopStamp {
+        artifact_cache_key: key.to_string(),
+        output_anchors: bundle.output_anchors.clone(),
+        artifact_paths,
+        input_roots: bundle.cache_input_roots.clone(),
+        input_files,
+        output_files,
+        diagnostics: bundle.diagnostics.clone(),
+    };
+    let path = verified_noop_stamp_path(root);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(&stamp) else {
+        return;
+    };
+    let _ = std::fs::write(path, bytes);
+}
+
+fn collect_verified_file_stamps(
+    root: &std::path::Path,
+    output_anchors: &[String],
+    artifact_paths: &[String],
+) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+    let mut paths = std::collections::BTreeSet::new();
+    for path in artifact_paths {
+        paths.insert(path.clone());
+    }
+    for anchor in output_anchors {
+        collect_anchor_stamp_paths(root, anchor, &mut paths)?;
+    }
+    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(|path| root.join(path)).collect();
+    gnr8_core::sdk::stamp_project_paths(root, &paths)
+}
+
+fn artifact_paths(metadata: &[gnr8_core::sdk::ArtifactMetadata]) -> Vec<String> {
+    metadata
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect()
+}
+
+fn load_verified_noop_stamp(root: &std::path::Path) -> Option<VerifiedNoopStamp> {
+    std::fs::read(verified_noop_stamp_path(root))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn combine_input_stamps(
+    root: &std::path::Path,
+    source_stamps: &[gnr8_core::sdk::FileStamp],
+) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+    let mut stamps = source_stamps.to_vec();
+    stamps.extend(host_config_stamps(root)?);
+    stamps.sort();
+    Some(stamps)
+}
+
+fn collect_hot_input_stamps(
+    root: &std::path::Path,
+    input_roots: &[String],
+) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+    if input_roots.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for input_root in input_roots {
+        collect_hot_input_files(&root.join(input_root), &mut paths)?;
+    }
+    paths.extend(host_config_paths(root));
+    gnr8_core::sdk::stamp_project_paths(root, &paths)
+}
+
+fn host_config_stamps(root: &std::path::Path) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+    gnr8_core::sdk::stamp_project_paths(root, &host_config_paths(root))
+}
+
+fn host_config_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let gnr8_dir = root.join(".gnr8");
+    collect_hot_input_files(&gnr8_dir.join("src"), &mut paths);
+    for name in ["Cargo.toml", "Cargo.lock"] {
+        let path = gnr8_dir.join(name);
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        paths.push(exe);
+    }
+    paths
+}
+
+fn collect_hot_input_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Option<()> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        if path.is_dir() {
+            if matches!(
+                name,
+                ".context"
+                    | ".git"
+                    | ".gnr8"
+                    | "node_modules"
+                    | "target"
+                    | "vendor"
+                    | "__pycache__"
+            ) {
+                continue;
+            }
+            collect_hot_input_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Some(())
+}
+
+fn collect_anchor_stamp_paths(
+    root: &std::path::Path,
+    anchor: &str,
+    paths: &mut std::collections::BTreeSet<String>,
+) -> Option<()> {
+    if anchor.is_empty()
+        || std::path::Path::new(anchor).components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return None;
+    }
+    let anchor_path = root.join(anchor);
+    if anchor_path.is_file() {
+        paths.insert(anchor.to_string());
+        return Some(());
+    }
+    if !anchor_path.is_dir() {
+        return Some(());
+    }
+    let mut stack = vec![anchor_path];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                paths.insert(rel);
+            }
+        }
+    }
+    Some(())
+}
+
+fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(".gnr8").join("cache").join("verified-noop.json")
 }
 
 /// Probe whether the DETECTED source language's toolchain is ACTUALLY ready, returning `(language,
@@ -262,16 +625,14 @@ fn run_doctor(json: bool) -> Result<()> {
 
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
     // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
-    let bundle = if initialized {
+    let mut bundle = if initialized {
         child::run_child(&root, "__emit").ok()
     } else {
         None
     };
     let pipeline_ran = bundle.is_some();
     let diagnostics = bundle.as_ref().map(|b| b.diagnostics.clone());
-    let drift = bundle
-        .as_ref()
-        .and_then(|b| gnr8_core::lifecycle::plan_only(&root, &b.artifacts).ok());
+    let drift = bundle.as_mut().and_then(|b| plan_bundle(&root, b).ok());
 
     let report = doctor::DoctorReport::assemble(
         initialized,

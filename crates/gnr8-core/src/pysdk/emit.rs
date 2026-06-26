@@ -27,9 +27,11 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+    body_model_of, file_stem, join_path, path_tokens, path_tokens_match, quoted_string_literal,
+    split_words, success_of,
 };
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -53,7 +55,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 ";
 
 /// The fixed, deterministic import header for Pydantic v2 model files.
@@ -61,7 +63,7 @@ const PYDANTIC_MODELS_HEADER: &str = "\
 from __future__ import annotations
 
 import enum
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 ";
@@ -145,7 +147,11 @@ pub(crate) fn safe_ident(s: &str) -> String {
 
 /// Whether a Python field identifier differs from its wire key and needs a Pydantic alias.
 fn needs_alias(field: &Field) -> bool {
-    safe_ident(&field.json_name) != field.json_name
+    pydantic_field_ident(field) != field.json_name
+}
+
+fn pydantic_field_ident(field: &Field) -> String {
+    safe_ident(&snake(&field.json_name))
 }
 
 /// Quote a Python string literal for generated source.
@@ -177,7 +183,12 @@ fn pydantic_field_rhs(field: &Field, has_default: bool) -> String {
 
 /// Keep nullability in the type hint while using the default solely for key absence.
 fn optional_default_hint(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
-    py_type(&field.schema, field.nullable, graph)
+    let hint = py_type(&field.schema, field.nullable, graph)?;
+    if field.nullable {
+        Ok(hint)
+    } else {
+        Ok(format!("Optional[{hint}]"))
+    }
 }
 
 fn pydantic_default_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
@@ -299,10 +310,20 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     emit_models_with_style(graph, package, PyModelStyle::default())
 }
 
+#[cfg(test)]
 pub(crate) fn emit_models_with_style(
     graph: &ApiGraph,
     _package: &str,
     model_style: PyModelStyle,
+) -> Result<String, CoreError> {
+    emit_models_with_style_and_aliases(graph, _package, model_style, &[])
+}
+
+pub(crate) fn emit_models_with_style_and_aliases(
+    graph: &ApiGraph,
+    _package: &str,
+    model_style: PyModelStyle,
+    aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
     let mut out = String::new();
     out.push_str(models_header(model_style));
@@ -358,6 +379,12 @@ pub(crate) fn emit_models_with_style(
             }
         }
     }
+    if !aliases.is_empty() {
+        out.push('\n');
+        for alias in aliases {
+            writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
+        }
+    }
     Ok(out)
 }
 
@@ -370,14 +397,17 @@ pub(crate) fn emit_model_schema(
     let mut out = String::new();
     out.push_str(models_header(model_style));
     let deps = model_dependencies(&schema.body, graph, &schema.name);
-    for dep in deps {
-        writeln!(
-            out,
-            "from .{} import {}",
-            crate::sdk::emit_common::file_stem(&dep),
-            dep
-        )
-        .map_err(sink)?;
+    if !deps.is_empty() {
+        writeln!(out, "if TYPE_CHECKING:").map_err(sink)?;
+        for dep in deps {
+            writeln!(
+                out,
+                "    from .{} import {}",
+                crate::sdk::emit_common::file_stem(&dep),
+                dep
+            )
+            .map_err(sink)?;
+        }
     }
     out.push('\n');
     match &schema.body {
@@ -399,23 +429,50 @@ pub(crate) fn emit_model_schema(
     Ok(out)
 }
 
+/// Emit a split-model compatibility alias shim.
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+    format!(
+        "from __future__ import annotations\n\nfrom .{} import {} as {}\n\n__all__ = [\"{}\"]\n",
+        file_stem(&alias.canonical),
+        alias.canonical,
+        alias.alias,
+        alias.alias
+    )
+}
+
 /// Emit `models/__init__.py` for split-model layout.
-pub(crate) fn emit_models_init(graph: &ApiGraph) -> String {
+pub(crate) fn emit_models_init(graph: &ApiGraph, aliases: &[ResolvedTypeAlias]) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
     for schema in &graph.schemas {
         let _ = writeln!(
             out,
             "from .{} import {}",
-            crate::sdk::emit_common::file_stem(&schema.name),
+            file_stem(&schema.name),
             schema.name
+        );
+    }
+    for alias in aliases {
+        let _ = writeln!(
+            out,
+            "from .{} import {}",
+            file_stem(&alias.alias),
+            alias.alias
         );
     }
     out.push_str("\n__all__ = [\n");
     for schema in &graph.schemas {
         let _ = writeln!(out, "    \"{}\",", schema.name);
     }
-    out.push_str("]\n");
+    for alias in aliases {
+        let _ = writeln!(out, "    \"{}\",", alias.alias);
+    }
+    out.push_str("]\n\n");
+    out.push_str("_types_namespace = {name: globals()[name] for name in __all__}\n");
+    out.push_str("for _model in _types_namespace.values():\n");
+    out.push_str("    if hasattr(_model, \"model_rebuild\"):\n");
+    out.push_str("        _model.model_rebuild(_types_namespace=_types_namespace)\n");
+    out.push_str("del _model, _types_namespace\n");
     out
 }
 
@@ -581,11 +638,8 @@ fn emit_pydantic_model(
         "    model_config = ConfigDict(populate_by_name=True, extra=\"ignore\")"
     )
     .map_err(sink)?;
-    if fields.is_empty() {
-        return Ok(());
-    }
     for field in fields {
-        let ident = safe_ident(&field.json_name);
+        let ident = pydantic_field_ident(field);
         let suffix = if field.optional {
             pydantic_default_suffix(field, graph)?
         } else {
@@ -593,6 +647,21 @@ fn emit_pydantic_model(
         };
         writeln!(out, "    {ident}: {suffix}").map_err(sink)?;
     }
+    writeln!(out).map_err(sink)?;
+    writeln!(out, "    @classmethod").map_err(sink)?;
+    writeln!(
+        out,
+        "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+    )
+    .map_err(sink)?;
+    writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
+    writeln!(out).map_err(sink)?;
+    writeln!(out, "    def to_dict(self) -> Dict[str, Any]:").map_err(sink)?;
+    writeln!(
+        out,
+        "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+    )
+    .map_err(sink)?;
     Ok(())
 }
 
@@ -722,7 +791,7 @@ class ApiError(Exception):
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", PyModelStyle::default())
+    emit_client_with_models(package, "models", PyModelStyle::default(), None)
 }
 
 /// Emit `client.py` with a configurable model package import path.
@@ -730,6 +799,7 @@ pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     model_style: PyModelStyle,
+    auth_header: Option<&str>,
 ) -> String {
     let (extra_import, body_encode, body_comment) = match model_style {
         PyModelStyle::Pydantic => (
@@ -743,6 +813,12 @@ pub(crate) fn emit_client_with_models(
             "        # Dataclass request models need conversion before json.dumps.\n",
         ),
     };
+    let auth_line = auth_header.map_or_else(String::new, |header| {
+        format!(
+            "        if self._api_key:\n            req.add_header({}, self._api_key)\n",
+            quoted_string_literal(header)
+        )
+    });
     let out = format!(
         "\
 from __future__ import annotations
@@ -778,9 +854,7 @@ class Client:
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
         if data is not None:
             req.add_header(\"Content-Type\", \"application/json\")
-        if self._api_key:
-            req.add_header(\"X-API-Key\", self._api_key)
-        try:
+{auth_line}        try:
             with self._opener.open(req) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
@@ -1397,11 +1471,11 @@ mod tests {
                 out.contains("    genre: str\n"),
                 "required has no default:\n{out}"
             );
-            // optional non-nullable bool → defaulted but not widened; missing is allowed, explicit None
-            // is still rejected by Pydantic's value validation.
+            // optional non-nullable bool → defaulted and widened so generated wrappers can pass None
+            // before dumping with exclude_none.
             assert!(
-                out.contains("    in_stock: bool = Field(default=None)\n"),
-                "optional non-nullable field must be defaulted without becoming nullable:\n{out}"
+                out.contains("    in_stock: Optional[bool] = Field(default=None)\n"),
+                "optional non-nullable field must accept None at wrapper boundaries:\n{out}"
             );
             // required-but-nullable → Optional hint, NO default (it is required/present).
             assert!(
@@ -1413,11 +1487,13 @@ mod tests {
         #[test]
         fn inline_enum_and_union_fields_use_literal_and_union_hints() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
-            // BookFilters.sort inline enum, optional + non-nullable → defaulted without becoming
-            // nullable; explicit None is still invalid.
+            // BookFilters.sort inline enum, optional + non-nullable → defaulted and widened for
+            // wrapper-boundary None values.
             assert!(
-                out.contains("    sort: Literal[\"asc\", \"desc\"] = Field(default=None)"),
-                "optional inline enum field must be defaulted without becoming nullable:\n{out}"
+                out.contains(
+                    "    sort: Optional[Literal[\"asc\", \"desc\"]] = Field(default=None)"
+                ),
+                "optional inline enum field must accept None at wrapper boundaries:\n{out}"
             );
             // Book.rating inline union, optional+nullable → Optional[Union[..]] = None.
             assert!(
@@ -1435,7 +1511,9 @@ mod tests {
             );
             assert!(out.contains("import enum"), "{out}");
             assert!(
-                out.contains("from typing import Any, Dict, List, Literal, Optional, Union"),
+                out.contains(
+                    "from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union"
+                ),
                 "{out}"
             );
             assert!(
@@ -1445,6 +1523,26 @@ mod tests {
             assert!(out.contains("class Book(BaseModel):"), "{out}");
             assert!(
                 out.contains("model_config = ConfigDict(populate_by_name=True, extra=\"ignore\")"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn pydantic_models_keep_from_dict_and_to_dict_compat_methods() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(
+                out.contains("def from_dict(cls, _data: Dict[str, Any]) -> \"Book\":"),
+                "Pydantic models should keep legacy decode compatibility:\n{out}"
+            );
+            assert!(out.contains("return cls.model_validate(_data)"), "{out}");
+            assert!(
+                out.contains("def to_dict(self) -> Dict[str, Any]:"),
+                "Pydantic models should keep legacy encode compatibility:\n{out}"
+            );
+            assert!(
+                out.contains(
+                    "return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+                ),
                 "{out}"
             );
         }
@@ -1735,7 +1833,7 @@ mod tests {
                 "keyword field renamed:\n{out}"
             );
             assert!(
-                out.contains("    class_: str = Field(default=None, alias=\"class\")"),
+                out.contains("    class_: Optional[str] = Field(default=None, alias=\"class\")"),
                 "keyword optional field renamed + defaulted:\n{out}"
             );
             assert!(

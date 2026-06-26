@@ -67,7 +67,7 @@ func schemaFor(
 ) (facts.SchemaFact, bool) {
 	switch under := named.Underlying().(type) {
 	case *gotypes.Struct:
-		if !structHasJSONTag(under) {
+		if under.NumFields() > 0 && !structHasJSONTag(under) {
 			return facts.SchemaFact{}, false
 		}
 		span := spanOf(fset, named.Obj().Pos())
@@ -79,21 +79,45 @@ func schemaFor(
 			Span: span,
 		}, true
 	case *gotypes.Basic:
-		if under.Kind() != gotypes.String {
-			return facts.SchemaFact{}, false
-		}
-		values := enumValues(named, scope)
-		if len(values) == 0 {
-			return facts.SchemaFact{}, false
+		body := mapType(under, namedSchemaCtx(named, modulePath, fset, diags))
+		if under.Kind() == gotypes.String {
+			if values := enumValues(named, scope); len(values) > 0 {
+				body = facts.EnumType(values)
+			}
 		}
 		return facts.SchemaFact{
 			ID:   schemaID(named, modulePath),
 			Name: named.Obj().Name(),
-			Body: facts.EnumType(values),
+			Body: body,
+			Span: spanOf(fset, named.Obj().Pos()),
+		}, true
+	case *gotypes.Slice, *gotypes.Array, *gotypes.Map:
+		return facts.SchemaFact{
+			ID:   schemaID(named, modulePath),
+			Name: named.Obj().Name(),
+			Body: mapType(under, namedSchemaCtx(named, modulePath, fset, diags)),
 			Span: spanOf(fset, named.Obj().Pos()),
 		}, true
 	default:
 		return facts.SchemaFact{}, false
+	}
+}
+
+func namedSchemaCtx(
+	named *gotypes.Named,
+	modulePath string,
+	fset *token.FileSet,
+	diags *diag.Accumulator,
+) mapCtx {
+	file, line := positionOf(fset, named.Obj().Pos())
+	return mapCtx{
+		structName:   named.Obj().Name(),
+		fieldName:    named.Obj().Name(),
+		declaredType: typeString(named),
+		modulePath:   modulePath,
+		file:         file,
+		line:         line,
+		diags:        diags,
 	}
 }
 
@@ -179,10 +203,16 @@ func mapType(t gotypes.Type, ctx mapCtx) facts.Type {
 		return mapType(u.Elem(), ctx)
 	case *gotypes.Slice:
 		return facts.ArrayType(mapType(u.Elem(), ctx))
+	case *gotypes.Array:
+		return facts.ArrayType(mapType(u.Elem(), ctx))
 	case *gotypes.Map:
-		// map[string]T -> a free-form value; warn on free-form maps.
-		ctx.diags.FreeFormMap(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
-		return facts.AnyType()
+		if _, ok := gotypes.Unalias(u.Elem()).(*gotypes.Interface); ok {
+			ctx.diags.FreeFormMap(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
+			return facts.AnyType()
+		}
+		key := mapType(u.Key(), ctx)
+		value := mapType(u.Elem(), ctx)
+		return facts.MapTypeOf(key, value)
 	case *gotypes.Named:
 		return mapNamed(u, ctx)
 	case *gotypes.Basic:
@@ -205,6 +235,8 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 		return facts.WellKnownType(facts.WellKnownDateTime)
 	case pkgPath == jsonPkgPath && obj.Name() == "RawMessage":
 		return facts.AnyType()
+	case pkgPath == jsonPkgPath && obj.Name() == "Number":
+		return facts.PrimitiveType(facts.FloatPrim(64))
 	}
 	// A named string (with or without a const set) refs its own schema; the enum
 	// values are resolved by the enum SchemaFact (see Extract). A non-string named
@@ -218,9 +250,13 @@ func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.Type {
 		return facts.PrimitiveType(facts.BoolPrim())
 	case gotypes.String:
 		return facts.PrimitiveType(facts.StringPrim())
-	case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64:
+	case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32:
+		return facts.PrimitiveType(facts.IntPrim(32, true))
+	case gotypes.Int64:
 		return facts.PrimitiveType(facts.IntPrim(64, true))
-	case gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
+	case gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32:
+		return facts.PrimitiveType(facts.IntPrim(32, false))
+	case gotypes.Uint64:
 		// Carry the `signed` axis faithfully: an unsigned source type is NOT a
 		// signed int. The neutral Prim::Int { signed } exists precisely so a
 		// target can distinguish uint64 from int64 (one source of truth per fact).

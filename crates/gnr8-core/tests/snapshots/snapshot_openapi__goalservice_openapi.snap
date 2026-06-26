@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_openapi.rs
+assertion_line: 39
 expression: openapi
 ---
 openapi: 3.1.0
