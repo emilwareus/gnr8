@@ -157,7 +157,20 @@ def _build_class_schema(class_def, dotted, abs_path, table, diags):
     name = class_def.name
     qualified = "{}.{}".format(dotted, name)
     if _is_enum_class(class_def):
-        body = {"type": "enum", "of": _enum_members(class_def)}
+        members = _enum_members(class_def)
+        if not members:
+            # Only string-valued members are representable as a neutral string enum.
+            # An int/auto()/tuple-valued enum yields no members — omit the fact with a
+            # diagnostic rather than emitting an invalid empty `enum: []` (rule 3: no
+            # guess; mirrors the empty-Literal guard in types.py).
+            diags.warn(
+                "enum '{}' has no string-valued members (int/auto()/tuple enums are not "
+                "representable as a neutral string enum); schema omitted".format(name),
+                abs_path,
+                getattr(class_def, "lineno", 0),
+            )
+            return None
+        body = {"type": "enum", "of": members}
     elif _is_model_class(class_def) or _is_dataclass(class_def):
         body = {
             "type": "object",

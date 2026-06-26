@@ -188,13 +188,16 @@ def _resolves_to_schema_ref(annotation, in_module, table):
     return None
 
 
-def _build_params(func, path, in_module, abs_path, table, diags):
+def _build_params(func, path, method, in_module, abs_path, table, diags):
     """Build the param + request_body facts from the typed handler signature.
 
     A param whose name appears in the path template -> ``location: path`` (required);
     otherwise -> ``location: query`` (required = the param has NO default). The first
-    param whose annotation resolves to a class becomes the request body ($ref).
+    param whose annotation resolves to a class becomes the request body ($ref) — but
+    only on a body-bearing method: a model-typed param on a GET/HEAD/DELETE is not a
+    request body and is omitted (no guess), matching the Flask path's ``allows_body``.
     """
+    allows_body = method not in _BODYLESS_METHODS
     params = []
     request_body = None
     path_names = _path_param_names(path)
@@ -208,7 +211,7 @@ def _build_params(func, path, in_module, abs_path, table, diags):
         # A parameter typed by a model/@dataclass class is the request body, not a param.
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
-            if request_body is None:
+            if allows_body and request_body is None:
                 request_body = {"ref_id": body_ref}
             continue
 
@@ -244,7 +247,7 @@ def _build_params(func, path, in_module, abs_path, table, diags):
             continue
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
-            if request_body is None:
+            if allows_body and request_body is None:
                 request_body = {"ref_id": body_ref}
             continue
         in_path = arg.arg in path_names
@@ -322,7 +325,7 @@ def recognize_fastapi(modules, table, diags):
                 continue
             method = decorator.func.attr.upper()
             params, request_body = _build_params(
-                stmt, path, module.dotted, abs_path, table, diags
+                stmt, path, method, module.dotted, abs_path, table, diags
             )
             status = _build_response(decorator)
             body_ref = _response_model_ref(decorator, module.dotted, table)

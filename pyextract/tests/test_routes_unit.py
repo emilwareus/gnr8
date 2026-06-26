@@ -93,13 +93,13 @@ class FastAPIKwOnlyParamTests(unittest.TestCase):
     must NOT be silently dropped; required-ness comes from ``kw_defaults``. Also
     positional-only params (before ``/``) must count in default alignment."""
 
-    def _params(self, source, path="/"):
+    def _params(self, source, path="/", method="POST"):
         func = _func(source)
         module = _FakeModule("app.main", source)
         table = SymbolTable([module])
         diags = Diagnostics()
         params, _body = routes._build_params(
-            func, path, "app.main", module.abs_path, table, diags
+            func, path, method, "app.main", module.abs_path, table, diags
         )
         return {p["name"]: p for p in params}, diags
 
@@ -168,6 +168,40 @@ class FlaskBodylessMethodTests(unittest.TestCase):
     def test_delete_omits_body(self):
         _params, body = self._run_multi("DELETE")
         self.assertIsNone(body)
+
+
+class FastAPIBodylessMethodTests(unittest.TestCase):
+    """A FastAPI model-typed handler param is a request body only on a body-bearing
+    method; on GET/HEAD/DELETE it is omitted (no guess) — matching the Flask guard."""
+
+    SRC = (
+        "from app.dto import CreateInput\n"
+        "def handler(payload: CreateInput):\n"
+        "    pass\n"
+    )
+    DTO = "class CreateInput:\n    x: int\n"
+
+    def _body(self, method):
+        modules = [
+            _FakeModule("app.main", self.SRC),
+            _FakeModule("app.dto", self.DTO),
+        ]
+        func = _func(self.SRC)
+        table = SymbolTable(modules)
+        diags = Diagnostics()
+        _params, body = routes._build_params(
+            func, "/", method, "app.main", modules[0].abs_path, table, diags
+        )
+        return body
+
+    def test_post_derives_body(self):
+        self.assertEqual(self._body("POST"), {"ref_id": "app.dto.CreateInput"})
+
+    def test_get_omits_body(self):
+        self.assertIsNone(self._body("GET"))
+
+    def test_delete_omits_body(self):
+        self.assertIsNone(self._body("DELETE"))
 
 
 if __name__ == "__main__":

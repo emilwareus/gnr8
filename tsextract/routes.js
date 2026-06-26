@@ -363,10 +363,10 @@ function recognizeNestController(loaded, diags, registry) {
     if (sf.isDeclarationFile) {
       continue;
     }
-    const rel = load.relFile(loaded.targetDir, sf.fileName);
-    if (rel.startsWith("..") || rel.includes("node_modules")) {
-      continue; // the target's source only
+    if (!load.underTarget(loaded.targetDir, sf.fileName)) {
+      continue; // the target's source only (one shared rule — load.underTarget)
     }
+    const rel = load.relFile(loaded.targetDir, sf.fileName);
 
     sf.forEachChild((node) => {
       if (!ts.isClassDeclaration(node) || !node.name) {
