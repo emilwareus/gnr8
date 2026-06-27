@@ -23,9 +23,9 @@
 
 // `ApiGraph` and `CoreError` are not in the prelude (they are part of the deeper IR surface a custom
 // stage touches); import them explicitly. The prelude carries everything else we compose.
-use gnr8_core::graph::{ApiGraph, Type};
-use gnr8_core::sdk::prelude::*;
-use gnr8_core::CoreError;
+use gnr8::graph::{ApiGraph, Type};
+use gnr8::sdk::prelude::*;
+use gnr8::CoreError;
 
 // ---------------------------------------------------------------------------------------------------
 // A custom Transform: edit the IR in Rust before generation.
@@ -124,7 +124,7 @@ fn join_base(base: &str, relative: &str) -> String {
 // ---------------------------------------------------------------------------------------------------
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             // Source: read the Go + Gin service in this module (built-in).
             .source(GoGin::new().inputs(["."]))

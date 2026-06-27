@@ -20,9 +20,9 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 
 #[test]
 fn sdk_matches_expected_for_goalservice() {
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let sdk = gnr8_core::gosdk::generate(&graph, "goalservice", "/goal")
+    let sdk = gnr8::gosdk::generate(&graph, "goalservice", "/goal")
         .expect("Phase 3 sdk::generate must succeed (requires gofmt)");
     insta::assert_snapshot!("goalservice_sdk", sdk);
 }

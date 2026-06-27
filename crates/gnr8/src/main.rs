@@ -2,7 +2,7 @@
 //!
 //! gnr8 is configured ONLY by code: `gnr8 init` scaffolds a `.gnr8/` Rust crate (the pipeline), and
 //! every generating command runs that crate as a child process (`cargo run --manifest-path`), receives
-//! its [`gnr8_core::runner::ArtifactBundle`], and owns writing the files (the ownership manifest, no-op
+//! its [`gnr8::runner::ArtifactBundle`], and owns writing the files (the ownership manifest, no-op
 //! skip, edit protection). There is no TOML config anywhere. Each command surfaces real errors (a
 //! missing `.gnr8/`, a compile error in the user's pipeline, a missing Go toolchain) through this
 //! `anyhow` boundary as a clean stderr message + a deliberate non-zero exit, never a panic (RUST-04).
@@ -72,8 +72,8 @@ impl Output {
 /// The current project root, resolved against the working directory. The child runs with this as its
 /// `current_dir`, and `regenerate`/`plan_only` resolve output paths against it. A `current_dir` failure
 /// surfaces as `CoreError::Workspace` (clean message, never a panic).
-fn project_root() -> Result<std::path::PathBuf, gnr8_core::CoreError> {
-    std::env::current_dir().map_err(|e| gnr8_core::CoreError::Workspace {
+fn project_root() -> Result<std::path::PathBuf, gnr8::CoreError> {
+    std::env::current_dir().map_err(|e| gnr8::CoreError::Workspace {
         message: format!("failed to resolve the current directory: {e}"),
     })
 }
@@ -83,7 +83,7 @@ fn project_root() -> Result<std::path::PathBuf, gnr8_core::CoreError> {
 /// "nothing to do" (D-01). `--json` emits the created/skipped lists.
 fn run_init(output: Output) -> Result<()> {
     let root = project_root()?;
-    let outcome = gnr8_core::workspace::init(&root)?;
+    let outcome = gnr8::workspace::init(&root)?;
 
     if output.json {
         #[derive(serde::Serialize)]
@@ -258,9 +258,9 @@ fn run_check(output: Output) -> Result<()> {
     let mut clean: Vec<String> = Vec::new();
     for file in &plan.files {
         match file.action {
-            gnr8_core::lifecycle::WriteAction::Write => stale.push(file.path.clone()),
-            gnr8_core::lifecycle::WriteAction::UserEdited => drifted.push(file.path.clone()),
-            gnr8_core::lifecycle::WriteAction::Unchanged => clean.push(file.path.clone()),
+            gnr8::lifecycle::WriteAction::Write => stale.push(file.path.clone()),
+            gnr8::lifecycle::WriteAction::UserEdited => drifted.push(file.path.clone()),
+            gnr8::lifecycle::WriteAction::Unchanged => clean.push(file.path.clone()),
         }
     }
     let has_drift = plan.has_drift();
@@ -309,13 +309,13 @@ fn run_check(output: Output) -> Result<()> {
     Ok(())
 }
 
-fn clean_plan_from_paths(paths: Vec<String>) -> gnr8_core::lifecycle::WritePlan {
-    gnr8_core::lifecycle::WritePlan {
+fn clean_plan_from_paths(paths: Vec<String>) -> gnr8::lifecycle::WritePlan {
+    gnr8::lifecycle::WritePlan {
         files: paths
             .into_iter()
-            .map(|path| gnr8_core::lifecycle::PlannedFile {
+            .map(|path| gnr8::lifecycle::PlannedFile {
                 path,
-                action: gnr8_core::lifecycle::WriteAction::Unchanged,
+                action: gnr8::lifecycle::WriteAction::Unchanged,
                 new_bytes: Vec::new(),
                 new_hash: String::new(),
                 source: "generated".to_string(),
@@ -326,15 +326,15 @@ fn clean_plan_from_paths(paths: Vec<String>) -> gnr8_core::lifecycle::WritePlan 
 
 fn regenerate_bundle(
     root: &std::path::Path,
-    bundle: &mut gnr8_core::runner::ArtifactBundle,
+    bundle: &mut gnr8::runner::ArtifactBundle,
     force: bool,
-) -> Result<gnr8_core::lifecycle::GenerateOutcome, gnr8_core::CoreError> {
+) -> Result<gnr8::lifecycle::GenerateOutcome, gnr8::CoreError> {
     if let Some(metadata) = cached_artifact_metadata(root, bundle) {
         if let Some(outcome) = verified_noop_outcome(root, bundle, &metadata) {
             save_verified_noop_stamp(root, bundle, &metadata, &outcome);
             return Ok(outcome);
         }
-        if let Some(outcome) = gnr8_core::lifecycle::regenerate_cached_with_anchors(
+        if let Some(outcome) = gnr8::lifecycle::regenerate_cached_with_anchors(
             root,
             &metadata,
             &bundle.output_anchors,
@@ -345,7 +345,7 @@ fn regenerate_bundle(
         }
     }
     ensure_bundle_artifacts(root, bundle)?;
-    let outcome = gnr8_core::lifecycle::regenerate_with_anchors(
+    let outcome = gnr8::lifecycle::regenerate_with_anchors(
         root,
         &bundle.artifacts,
         &bundle.output_anchors,
@@ -356,30 +356,30 @@ fn regenerate_bundle(
 
 fn plan_bundle(
     root: &std::path::Path,
-    bundle: &mut gnr8_core::runner::ArtifactBundle,
-) -> Result<gnr8_core::lifecycle::WritePlan, gnr8_core::CoreError> {
+    bundle: &mut gnr8::runner::ArtifactBundle,
+) -> Result<gnr8::lifecycle::WritePlan, gnr8::CoreError> {
     if let Some(metadata) = cached_artifact_metadata(root, bundle) {
-        return gnr8_core::lifecycle::plan_only_cached(root, &metadata);
+        return gnr8::lifecycle::plan_only_cached(root, &metadata);
     }
     ensure_bundle_artifacts(root, bundle)?;
-    gnr8_core::lifecycle::plan_only(root, &bundle.artifacts)
+    gnr8::lifecycle::plan_only(root, &bundle.artifacts)
 }
 
 fn cached_artifact_metadata(
     root: &std::path::Path,
-    bundle: &gnr8_core::runner::ArtifactBundle,
-) -> Option<Vec<gnr8_core::sdk::ArtifactMetadata>> {
+    bundle: &gnr8::runner::ArtifactBundle,
+) -> Option<Vec<gnr8::sdk::ArtifactMetadata>> {
     if !bundle.artifacts.is_empty() {
         return None;
     }
     let key = bundle.artifact_cache_key.as_deref()?;
-    gnr8_core::sdk::load_artifact_cache_metadata(root, key)
+    gnr8::sdk::load_artifact_cache_metadata(root, key)
 }
 
 fn ensure_bundle_artifacts(
     root: &std::path::Path,
-    bundle: &mut gnr8_core::runner::ArtifactBundle,
-) -> Result<(), gnr8_core::CoreError> {
+    bundle: &mut gnr8::runner::ArtifactBundle,
+) -> Result<(), gnr8::CoreError> {
     if !bundle.artifacts.is_empty() {
         return Ok(());
     }
@@ -387,8 +387,8 @@ fn ensure_bundle_artifacts(
         return Ok(());
     };
     bundle.artifacts =
-        gnr8_core::sdk::load_artifact_cache_files(root, key).ok_or_else(|| {
-            gnr8_core::CoreError::ChildRun {
+        gnr8::sdk::load_artifact_cache_files(root, key).ok_or_else(|| {
+            gnr8::CoreError::ChildRun {
                 message: format!(
                     "the .gnr8 generation crate emitted artifact cache key {key}, but the host \
                      could not read the corresponding cache file. Re-run generation to rebuild the cache."
@@ -404,14 +404,14 @@ struct VerifiedNoopStamp {
     output_anchors: Vec<String>,
     artifact_paths: Vec<String>,
     input_roots: Vec<String>,
-    input_files: Vec<gnr8_core::sdk::FileStamp>,
-    output_files: Vec<gnr8_core::sdk::FileStamp>,
-    diagnostics: Vec<gnr8_core::graph::Diagnostic>,
+    input_files: Vec<gnr8::sdk::FileStamp>,
+    output_files: Vec<gnr8::sdk::FileStamp>,
+    diagnostics: Vec<gnr8::graph::Diagnostic>,
 }
 
 struct CachedNoop {
-    outcome: gnr8_core::lifecycle::GenerateOutcome,
-    diagnostics: Vec<gnr8_core::graph::Diagnostic>,
+    outcome: gnr8::lifecycle::GenerateOutcome,
+    diagnostics: Vec<gnr8::graph::Diagnostic>,
     source_files: usize,
     artifact_files: usize,
 }
@@ -430,7 +430,7 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     let source_files = stamp.input_files.len();
     let artifact_files = stamp.output_files.len();
     Some(CachedNoop {
-        outcome: gnr8_core::lifecycle::GenerateOutcome {
+        outcome: gnr8::lifecycle::GenerateOutcome {
             written: Vec::new(),
             unchanged: stamp.artifact_paths,
             skipped: Vec::new(),
@@ -444,9 +444,9 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
 
 fn verified_noop_outcome(
     root: &std::path::Path,
-    bundle: &gnr8_core::runner::ArtifactBundle,
-    metadata: &[gnr8_core::sdk::ArtifactMetadata],
-) -> Option<gnr8_core::lifecycle::GenerateOutcome> {
+    bundle: &gnr8::runner::ArtifactBundle,
+    metadata: &[gnr8::sdk::ArtifactMetadata],
+) -> Option<gnr8::lifecycle::GenerateOutcome> {
     let key = bundle.artifact_cache_key.as_deref()?;
     let stamp = load_verified_noop_stamp(root)?;
     if stamp.artifact_cache_key != key || stamp.output_anchors != bundle.output_anchors {
@@ -457,7 +457,7 @@ fn verified_noop_outcome(
     if current != stamp.output_files {
         return None;
     }
-    Some(gnr8_core::lifecycle::GenerateOutcome {
+    Some(gnr8::lifecycle::GenerateOutcome {
         written: Vec::new(),
         unchanged: metadata
             .iter()
@@ -470,9 +470,9 @@ fn verified_noop_outcome(
 
 fn save_verified_noop_stamp(
     root: &std::path::Path,
-    bundle: &gnr8_core::runner::ArtifactBundle,
-    metadata: &[gnr8_core::sdk::ArtifactMetadata],
-    outcome: &gnr8_core::lifecycle::GenerateOutcome,
+    bundle: &gnr8::runner::ArtifactBundle,
+    metadata: &[gnr8::sdk::ArtifactMetadata],
+    outcome: &gnr8::lifecycle::GenerateOutcome,
 ) {
     if !outcome.written.is_empty() || !outcome.skipped.is_empty() || !outcome.deleted.is_empty() {
         return;
@@ -518,7 +518,7 @@ fn collect_verified_file_stamps(
     root: &std::path::Path,
     output_anchors: &[String],
     artifact_paths: &[String],
-) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+) -> Option<Vec<gnr8::sdk::FileStamp>> {
     let mut paths = std::collections::BTreeSet::new();
     for path in artifact_paths {
         paths.insert(path.clone());
@@ -527,10 +527,10 @@ fn collect_verified_file_stamps(
         collect_anchor_stamp_paths(root, anchor, &mut paths)?;
     }
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(|path| root.join(path)).collect();
-    gnr8_core::sdk::stamp_project_paths(root, &paths)
+    gnr8::sdk::stamp_project_paths(root, &paths)
 }
 
-fn artifact_paths(metadata: &[gnr8_core::sdk::ArtifactMetadata]) -> Vec<String> {
+fn artifact_paths(metadata: &[gnr8::sdk::ArtifactMetadata]) -> Vec<String> {
     metadata
         .iter()
         .map(|artifact| artifact.path.clone())
@@ -545,8 +545,8 @@ fn load_verified_noop_stamp(root: &std::path::Path) -> Option<VerifiedNoopStamp>
 
 fn combine_input_stamps(
     root: &std::path::Path,
-    source_stamps: &[gnr8_core::sdk::FileStamp],
-) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+    source_stamps: &[gnr8::sdk::FileStamp],
+) -> Option<Vec<gnr8::sdk::FileStamp>> {
     let mut stamps = source_stamps.to_vec();
     stamps.extend(host_config_stamps(root)?);
     stamps.sort();
@@ -556,7 +556,7 @@ fn combine_input_stamps(
 fn collect_hot_input_stamps(
     root: &std::path::Path,
     input_roots: &[String],
-) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
+) -> Option<Vec<gnr8::sdk::FileStamp>> {
     if input_roots.is_empty() {
         return None;
     }
@@ -565,11 +565,11 @@ fn collect_hot_input_stamps(
         collect_hot_input_files(&root.join(input_root), &mut paths)?;
     }
     paths.extend(host_config_paths(root));
-    gnr8_core::sdk::stamp_project_paths(root, &paths)
+    gnr8::sdk::stamp_project_paths(root, &paths)
 }
 
-fn host_config_stamps(root: &std::path::Path) -> Option<Vec<gnr8_core::sdk::FileStamp>> {
-    gnr8_core::sdk::stamp_project_paths(root, &host_config_paths(root))
+fn host_config_stamps(root: &std::path::Path) -> Option<Vec<gnr8::sdk::FileStamp>> {
+    gnr8::sdk::stamp_project_paths(root, &host_config_paths(root))
 }
 
 fn host_config_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -668,7 +668,7 @@ fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {
 /// Probe whether the DETECTED source language's toolchain is ACTUALLY ready, returning `(language,
 /// present)`.
 ///
-/// One `gnr8_core::analyze::source_toolchain` decision over the project root picks the language (the
+/// One `gnr8::analyze::source_toolchain` decision over the project root picks the language (the
 /// `.gnr8/` crate is excluded from that scan in core, so it does not spoof detection — Open Q2). That
 /// SINGLE decision then routes to exactly one readiness check (no try-go-then-python fallback — CLAUDE.md
 /// rule 3):
@@ -685,13 +685,13 @@ fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {
 /// surfaced as a doctor finding, never a panic. The binary name is one of three compile-time
 /// `&'static str` arms and the args are literals, never `sh -c` (T-06-01).
 fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
-    let Ok(toolchain) = gnr8_core::analyze::source_toolchain(&root.to_string_lossy()) else {
+    let Ok(toolchain) = gnr8::analyze::source_toolchain(&root.to_string_lossy()) else {
         return ("unknown".to_string(), false);
     };
-    let present = if toolchain == gnr8_core::analyze::SourceToolchain::TypeScript {
+    let present = if toolchain == gnr8::analyze::SourceToolchain::TypeScript {
         // TypeScript's real toolchain is `node` + a resolvable `typescript`; the core probe verifies
         // BOTH via the same resolution `generate` uses (WR-02 — one source of truth, no fallback).
-        gnr8_core::analyze::typescript_toolchain_present(&root.to_string_lossy())
+        gnr8::analyze::typescript_toolchain_present(&root.to_string_lossy())
     } else {
         // Go/Python are wholly `go`/`python3`: spawn the discrete probe binary and require a SUCCESSFUL
         // exit (WR-05) — spawn-success alone masked a broken binary that exits non-zero. `go` uses the
@@ -721,7 +721,7 @@ fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
 /// problem (mirrors `run_check`).
 fn run_doctor(output: Output) -> Result<()> {
     let root = project_root()?;
-    let initialized = gnr8_core::workspace::manifest_path(&root).is_file();
+    let initialized = gnr8::workspace::manifest_path(&root).is_file();
     let (language, source_present) = probe_source_lang_toolchain(&root);
 
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
@@ -797,15 +797,15 @@ fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     let total_start = Instant::now();
     let rendered = match action {
         InspectAction::Routes { path } => {
-            let graph = gnr8_core::analyze::build_graph(path)?;
+            let graph = gnr8::analyze::build_graph(path)?;
             render::render_routes(&graph, output.json)?
         }
         InspectAction::Schemas { path } => {
-            let graph = gnr8_core::analyze::build_graph(path)?;
+            let graph = gnr8::analyze::build_graph(path)?;
             render::render_schemas(&graph, output.json)?
         }
         InspectAction::Graph { path } => {
-            let graph = gnr8_core::analyze::build_graph(path)?;
+            let graph = gnr8::analyze::build_graph(path)?;
             render::render_graph(&graph, output.json)?
         }
     };
@@ -814,7 +814,7 @@ fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     Ok(())
 }
 
-fn lifecycle_summary(outcome: &gnr8_core::lifecycle::GenerateOutcome) -> String {
+fn lifecycle_summary(outcome: &gnr8::lifecycle::GenerateOutcome) -> String {
     format!(
         "{} written, {} unchanged, {} deleted, {} skipped",
         outcome.written.len(),
@@ -824,7 +824,7 @@ fn lifecycle_summary(outcome: &gnr8_core::lifecycle::GenerateOutcome) -> String 
     )
 }
 
-fn print_diagnostics(output: Output, diagnostics: &[gnr8_core::graph::Diagnostic]) {
+fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
     if diagnostics.is_empty() || output.json {
         return;
     }

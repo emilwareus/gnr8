@@ -4,8 +4,9 @@ The release process is intentionally shaped like `exlint`:
 
 - `Release dry-run` runs on pushes/PRs and exercises crates.io dry-run packaging plus per-platform CLI
   archives.
-- `Release` is a manual `workflow_dispatch` from `main`: bump patch version, commit to `main`, create
-  `vX.Y.Z`, optionally publish crates, then upload CLI archives and checksums to the GitHub Release.
+- `Release` is a manual `workflow_dispatch` from `main`: bump the release version, commit to `main`,
+  create `vX.Y.Z`, optionally publish the single public `gnr8` crate, then upload CLI archives and
+  checksums to the GitHub Release.
 
 ## Local Dry Run
 
@@ -45,20 +46,19 @@ Each archive contains:
 - `share/gnr8/pyextract`
 - `share/gnr8/tsextract`
 
-The `share/gnr8` tree is required because `gnr8 init` scaffolds a `.gnr8` Rust crate that depends on
-`gnr8-core`, and source extraction shells out to the Go/Python/TypeScript sidecars. `gnr8` discovers
-this tree automatically from the archive layout; `GNR8_RESOURCE_DIR` can override it.
+The `share/gnr8` tree is required because source extraction shells out to the Go/Python/TypeScript
+sidecars, and archive installs can scaffold `.gnr8` with a local path dependency for offline use.
+`gnr8` discovers this tree automatically from the archive layout; `GNR8_RESOURCE_DIR` can override it.
 
 ## GitHub Release
 
 1. Make sure `main` is green.
 2. Open **Actions → Release → Run workflow** on `main`.
-3. Leave `publish_cli=true`.
-4. Leave `publish_crates=false` unless you intentionally want to publish `gnr8-core` and `gnr8` to
-   crates.io. The GitHub archive install path is primary until `cargo install gnr8` sidecar-resource
-   behavior is finalized.
-5. The workflow bumps the patch version in `Cargo.toml`, refreshes `Cargo.lock`, commits to `main`,
-   creates tag `vX.Y.Z`, builds assets, and creates/updates the GitHub Release.
+3. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
+4. Leave `publish_cli=true` to upload the CLI archives.
+5. The workflow bumps the release version in `Cargo.toml`, refreshes `Cargo.lock`, commits to `main`,
+   creates tag `vX.Y.Z`, publishes `gnr8` when requested, builds assets, and creates/updates the
+   GitHub Release.
 
 ## Install Script
 
@@ -86,4 +86,3 @@ They also need the source language toolchain for the service they analyze:
 
 Generated Python SDKs use Pydantic v2 models by default. Consumers who need stdlib-only Python models
 can configure `PySdk::new().dataclasses()` in `.gnr8/src/main.rs`.
-

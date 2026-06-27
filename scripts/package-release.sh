@@ -27,7 +27,7 @@ case "$target" in
   *windows*) binary_name="${BINARY_NAME:-gnr8.exe}" ;;
 esac
 
-cargo build --locked --release -p gnr8 --target "$target"
+cargo build --locked --release -p gnr8-cli --target "$target"
 
 binary_path="target/$target/release/$binary_name"
 if [[ ! -f "$binary_path" ]]; then
@@ -77,4 +77,3 @@ EOF
 tar -C "$stage" -czf "$dist/$archive" .
 python3 "$ROOT/scripts/sha256_file.py" "$dist/$archive" > "$dist/$archive.sha256"
 echo "$dist/$archive"
-

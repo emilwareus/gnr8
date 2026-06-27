@@ -25,8 +25,8 @@
 
 use std::fmt::Write as _;
 
-use gnr8_core::graph::Diagnostic;
-use gnr8_core::lifecycle::{WriteAction, WritePlan};
+use gnr8::graph::Diagnostic;
+use gnr8::lifecycle::{WriteAction, WritePlan};
 
 /// The read-only lifecycle facts `doctor` reports (each is an ACTIONABLE problem when false). Collected
 /// by `run_doctor` and handed to [`DoctorReport::assemble`].
@@ -377,8 +377,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::DoctorReport;
-    use gnr8_core::graph::Diagnostic;
-    use gnr8_core::lifecycle::{PlannedFile, WriteAction, WritePlan};
+    use gnr8::graph::Diagnostic;
+    use gnr8::lifecycle::{PlannedFile, WriteAction, WritePlan};
     use std::collections::HashSet;
 
     /// One informational analysis WARN (the kind the fixture emits several of).

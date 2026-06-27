@@ -33,7 +33,7 @@ actionable problem rather than crashing — but `generate` needs it.)
 
 ```bash
 # from the repo root
-cargo build --release -p gnr8
+cargo build --release -p gnr8-cli
 ```
 
 The binary lands at `target/release/gnr8`. The rest of the demo refers to it as `$GNR8`:
@@ -75,10 +75,10 @@ cat .gnr8/src/main.rs
 ```
 
 ```rust
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/"))

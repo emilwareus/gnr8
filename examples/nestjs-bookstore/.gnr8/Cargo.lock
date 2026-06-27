@@ -66,8 +66,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "gnr8-core"
-version = "0.1.0"
+name = "gnr8"
+version = "0.0.10"
 dependencies = [
  "blake3",
  "serde",
@@ -97,7 +97,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 name = "nestjs-bookstore-gnr8-gen"
 version = "0.1.0"
 dependencies = [
- "gnr8-core",
+ "gnr8",
 ]
 
 [[package]]

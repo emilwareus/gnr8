@@ -20,10 +20,10 @@
 //!   output.sdk + module → GoSdk::new().module("example.com/bookstore/sdk").to("generated/sdk")
 //! plus a Header post-process that stamps the generated banner on every .go file.
 
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/books"))

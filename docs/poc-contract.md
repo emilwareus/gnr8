@@ -78,7 +78,7 @@ The `.gnr8/` project-local workspace is split into two lifecycles (D-06):
   / JSON config file.** `gnr8 init` scaffolds it and `gnr8 generate` compiles + runs it.
 - A **git-ignored cache / output lifecycle** subtree (`.gnr8/target/`, `.gnr8/cache/`).
 
-The customization surface is the `gnr8_core::sdk` API: a `Pipeline` of `Source` / `Transform` / `Target` /
+The customization surface is the `gnr8::sdk` API: a `Pipeline` of `Source` / `Transform` / `Target` /
 `PostProcess` stages, with built-ins for the common cases and user-implemented traits for the rest. See
 [`code-as-config.md`](code-as-config.md) and [`extensibility.md`](extensibility.md) for the full design,
 and `docs/USAGE.md` for the reference.

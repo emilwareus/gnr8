@@ -277,24 +277,24 @@ dependencies = [
 name = "gnr8"
 version = "0.0.10"
 dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "gnr8-core",
- "notify-debouncer-full",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "gnr8-core"
-version = "0.0.10"
-dependencies = [
  "blake3",
  "insta",
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "gnr8-cli"
+version = "0.0.10"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "gnr8",
+ "notify-debouncer-full",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

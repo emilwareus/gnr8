@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gnr8_core::graph::SecurityScheme;
-use gnr8_core::sdk::prelude::*;
+use gnr8::graph::SecurityScheme;
+use gnr8::sdk::prelude::*;
 
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 const TSC: &str = concat!(
@@ -59,7 +59,7 @@ fn run_checked(mut cmd: Command) -> Result<(), String> {
     Err(msg)
 }
 
-fn add_runtime_metadata(ir: &mut gnr8_core::graph::ApiGraph) {
+fn add_runtime_metadata(ir: &mut gnr8::graph::ApiGraph) {
     ir.base_path = "/goal".to_string();
     ir.security.push(SecurityScheme {
         id: "SessionAuth".to_string(),
@@ -77,7 +77,7 @@ fn add_runtime_metadata(ir: &mut gnr8_core::graph::ApiGraph) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn generated_sdks_support_configurable_surface_and_compile() {
-    let mut ir = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("fixture graph");
+    let mut ir = gnr8::analyze::build_graph(FIXTURE_DIR).expect("fixture graph");
     add_runtime_metadata(&mut ir);
 
     let aliases = SdkTypeAliases::new().type_alias("CreateGoalInput", "CreateGoalPayload");

@@ -43,7 +43,7 @@ this session; **exit code 0**. Every sub-gate passed:
 | `snapshot_graph` | **1 passed** | graph report matches `expected/` golden |
 | `snapshot_openapi` | **1 passed** | OpenAPI matches `expected/` golden |
 | `snapshot_sdk` | **1 passed** | Go SDK matches `expected/` golden |
-| `gnr8_core` doc-tests | 0 passed, 1 ignored | (doc example marked `ignore`) |
+| `gnr8` doc-tests | 0 passed, 1 ignored | (doc example marked `ignore`) |
 
 The blocking subset (`make gates` — lib + bin tests + the 4 contract snapshots + determinism +
 `sdk_compile` + `lifecycle`) is a strict subset of the above and is green as part of this run.
