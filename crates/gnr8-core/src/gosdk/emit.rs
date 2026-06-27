@@ -327,7 +327,14 @@ pub(crate) fn emit_models_with_options(
         }
         first = false;
         match &schema.body {
-            Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
+            Type::Enum(members) => {
+                emit_enum(
+                    &mut body,
+                    &schema.name,
+                    members,
+                    options.compat_model_helpers,
+                )?;
+            }
             Type::Object(fields) => {
                 if !options.compat_model_helpers {
                     for field in fields {
@@ -383,7 +390,14 @@ pub(crate) fn emit_model_schema_with_options(
     let mut body = String::new();
     let mut needs_time = false;
     match &schema.body {
-        Type::Enum(members) => emit_enum(&mut body, &schema.name, members)?,
+        Type::Enum(members) => {
+            emit_enum(
+                &mut body,
+                &schema.name,
+                members,
+                options.compat_model_helpers,
+            )?;
+        }
         Type::Object(fields) => {
             if !options.compat_model_helpers {
                 for field in fields {
@@ -781,7 +795,12 @@ fn emit_compat_field_helpers(
 }
 
 /// Emit a string-enum newtype + a const block of `NameValue Name = "value"` (values in graph order).
-fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
+fn emit_enum(
+    body: &mut String,
+    name: &str,
+    members: &[String],
+    emit_compat_aliases: bool,
+) -> Result<(), CoreError> {
     writeln!(body, "type {name} string").map_err(sink)?;
     writeln!(body).map_err(sink)?;
     writeln!(body, "const (").map_err(sink)?;
@@ -798,9 +817,11 @@ fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), Co
         if emitted_compat_consts.insert(const_name.clone()) {
             writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
         }
-        for alias in compat_enum_constant_aliases(name, value) {
-            if emitted_compat_consts.insert(alias.clone()) {
-                writeln!(body, "{alias} {name} = \"{value}\"").map_err(sink)?;
+        if emit_compat_aliases {
+            for alias in compat_enum_constant_aliases(name, value) {
+                if emitted_compat_consts.insert(alias.clone()) {
+                    writeln!(body, "{alias} {name} = \"{value}\"").map_err(sink)?;
+                }
             }
         }
     }
@@ -906,7 +927,7 @@ fn replace_word_like_token(name: &str, from: &str, to: &str) -> Vec<String> {
         let after_ok = name[end..]
             .chars()
             .next()
-            .map_or(true, |ch| ch.is_ascii_uppercase() || ch.is_ascii_digit());
+            .is_none_or(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit());
         if before_ok && after_ok {
             let mut alias = String::with_capacity(name.len() + to.len().saturating_sub(from.len()));
             alias.push_str(&name[..start]);
@@ -1084,6 +1105,7 @@ pub(crate) fn emit_compat_client_surface(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_compat_client_prelude(body: &mut String, auth_header: Option<&str>) {
     let default_auth_header = auth_header.unwrap_or("Authorization");
     let _ = writeln!(
@@ -1285,6 +1307,7 @@ fn emit_compat_api_client(body: &mut String, services: &[String]) -> Result<(), 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_compat_request(
     body: &mut String,
     op: &Operation,
@@ -1315,7 +1338,7 @@ fn emit_compat_request(
     writeln!(body, "ctx context.Context").map_err(sink)?;
     writeln!(body, "ApiService *{service}APIService").map_err(sink)?;
     for param in &path_params {
-        writeln!(body, "{} any", lower_camel(&param.name),).map_err(sink)?;
+        writeln!(body, "{} any", lower_camel(&param.name)).map_err(sink)?;
     }
     for param in &query_params {
         writeln!(body, "{} *any", lower_camel(&param.name)).map_err(sink)?;
@@ -1397,7 +1420,7 @@ fn emit_compat_request(
 
     let args: Result<Vec<_>, _> = path_params
         .iter()
-        .map(|param| Ok(format!("{} any", lower_camel(&param.name),)))
+        .map(|param| Ok(format!("{} any", lower_camel(&param.name))))
         .collect();
     let args = args?;
     writeln!(body).map_err(sink)?;
@@ -1538,7 +1561,7 @@ fn emit_compat_file_and_auth_setters(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_compat_execute_body(
     body: &mut String,
     op: &Operation,
@@ -1899,8 +1922,7 @@ fn compat_service_name(op: &Operation) -> String {
             op.path
                 .split('/')
                 .find(|part| !part.trim().is_empty())
-                .map(compat_exported)
-                .unwrap_or_else(|| "Default".to_string())
+                .map_or_else(|| "Default".to_string(), compat_exported)
         },
         compat_exported,
     )
