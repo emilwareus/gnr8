@@ -16,20 +16,56 @@ mod watch;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, InspectAction};
+use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let output = Output::new(cli.json, cli.verbose);
 
     // `inspect` analyzes a target dir directly (a dev/debug tool over `analyze::build_graph`); it is
     // dispatched first and renders straight to stdout. The remaining commands either scaffold (`init`)
     // or delegate to the user's `.gnr8/` child crate and own writing/policy.
     match &cli.command {
-        Commands::Inspect { action } => run_inspect(action, cli.json),
-        Commands::Init => run_init(cli.json),
-        Commands::Generate { force } => run_generate(*force, cli.json),
-        Commands::Check => run_check(cli.json),
-        Commands::Watch { debounce_ms } => run_watch(*debounce_ms, cli.json),
-        Commands::Doctor => run_doctor(cli.json),
+        Commands::Inspect { action } => run_inspect(action, output),
+        Commands::Init => run_init(output),
+        Commands::Generate { force } => run_generate(*force, output),
+        Commands::Check => run_check(output),
+        Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
+        Commands::Doctor => run_doctor(output),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Output {
+    json: bool,
+    verbose: u8,
+}
+
+impl Output {
+    fn new(json: bool, verbose: u8) -> Self {
+        Self { json, verbose }
+    }
+
+    fn progress(self, message: impl AsRef<str>) {
+        if !self.json {
+            println!("{}", message.as_ref());
+        }
+    }
+
+    fn verbose(self, message: impl AsRef<str>) {
+        if !self.json && self.verbose > 0 {
+            println!("  {}", message.as_ref());
+        }
+    }
+
+    fn verbose_paths(self, label: &str, paths: &[String]) {
+        if self.json || self.verbose < 2 || paths.is_empty() {
+            return;
+        }
+        println!("  {label}:");
+        for path in paths {
+            println!("    {path}");
+        }
     }
 }
 
@@ -45,11 +81,11 @@ fn project_root() -> Result<std::path::PathBuf, gnr8_core::CoreError> {
 /// Scaffold the mandatory `.gnr8/` generation crate in the working directory (idempotent) and summarize
 /// the outcome. Re-running over an existing crate preserves the user's `src/main.rs` and reports
 /// "nothing to do" (D-01). `--json` emits the created/skipped lists.
-fn run_init(json: bool) -> Result<()> {
+fn run_init(output: Output) -> Result<()> {
     let root = project_root()?;
     let outcome = gnr8_core::workspace::init(&root)?;
 
-    if json {
+    if output.json {
         #[derive(serde::Serialize)]
         struct InitReport {
             created: Vec<String>,
@@ -64,24 +100,26 @@ fn run_init(json: bool) -> Result<()> {
     }
 
     if outcome.created.is_empty() {
-        println!(
+        output.progress(format!(
             "nothing to do — .gnr8/ already present (skipped: {})",
             outcome.skipped.join(", ")
-        );
+        ));
     } else {
         if outcome.skipped.is_empty() {
-            println!(
+            output.progress(format!(
                 "initialized .gnr8/ (created: {})",
                 outcome.created.join(", ")
-            );
+            ));
         } else {
-            println!(
+            output.progress(format!(
                 "initialized .gnr8/ (created: {}; skipped: {})",
                 outcome.created.join(", "),
                 outcome.skipped.join(", ")
-            );
+            ));
         }
-        println!("edit .gnr8/src/main.rs to adapt parsing + generation, then run `gnr8 generate`.");
+        output.progress(
+            "edit .gnr8/src/main.rs to adapt parsing + generation, then run `gnr8 generate`.",
+        );
     }
     Ok(())
 }
@@ -105,23 +143,48 @@ struct LifecycleReport {
 /// the "no silent clobbering" protection is VISIBLE (T-04-02-04). Pipeline diagnostics the child carried
 /// are surfaced too. `--json` serializes the counts. A missing `.gnr8/` (run `gnr8 init`), a compile
 /// error in the user's pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
-fn run_generate(force: bool, json: bool) -> Result<()> {
+fn run_generate(force: bool, output: Output) -> Result<()> {
     let root = project_root()?;
-    let (outcome, diagnostics) = if let Some(noop) = pre_child_verified_noop(&root) {
-        (noop.outcome, noop.diagnostics)
-    } else {
-        let mut bundle = child::run_child(&root, "__emit")?;
-        let outcome = regenerate_bundle(&root, &mut bundle, force)?;
-        (outcome, bundle.diagnostics.clone())
-    };
+    let total_start = Instant::now();
+    let hot_start = Instant::now();
+    let hot_noop = pre_child_verified_noop(&root);
+    let hot_elapsed = hot_start.elapsed();
+    let mut pipeline_elapsed = None;
+    let mut write_elapsed = None;
+    let (outcome, diagnostics, cache_label, source_files, artifact_files) =
+        if let Some(noop) = hot_noop {
+            (
+                noop.outcome,
+                noop.diagnostics,
+                "verified hot no-op",
+                noop.source_files,
+                noop.artifact_files,
+            )
+        } else {
+            output.progress("generate: running pipeline");
+            let pipeline_start = Instant::now();
+            let mut bundle = child::run_child(&root, "__emit")?;
+            pipeline_elapsed = Some(pipeline_start.elapsed());
+            let source_files = bundle.cache_input_stamps.len();
+            let mut artifact_files = bundle.artifacts.len();
+            output.progress("generate: writing outputs");
+            let write_start = Instant::now();
+            let outcome = regenerate_bundle(&root, &mut bundle, force)?;
+            write_elapsed = Some(write_start.elapsed());
+            if artifact_files == 0 {
+                artifact_files =
+                    outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
+            }
+            (
+                outcome,
+                bundle.diagnostics.clone(),
+                "pipeline",
+                source_files,
+                artifact_files,
+            )
+        };
 
-    // Surface the pipeline's diagnostics (lossy/unsupported source patterns the child reported).
-    for diag in &diagnostics {
-        eprintln!(
-            "{}: {} ({}:{})",
-            diag.severity, diag.message, diag.file, diag.line
-        );
-    }
+    print_diagnostics(output, &diagnostics);
     // Warn (stderr) for every protected file so the user SEES which outputs were not clobbered.
     for path in &outcome.skipped {
         eprintln!(
@@ -129,7 +192,7 @@ fn run_generate(force: bool, json: bool) -> Result<()> {
         );
     }
 
-    if json {
+    if output.json {
         let report = LifecycleReport {
             written: outcome.written,
             unchanged: outcome.unchanged,
@@ -138,13 +201,22 @@ fn run_generate(force: bool, json: bool) -> Result<()> {
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!(
-            "{} written, {} unchanged, {} deleted, {} skipped (user-edited; use --force to overwrite)",
-            outcome.written.len(),
-            outcome.unchanged.len(),
-            outcome.deleted.len(),
-            outcome.skipped.len()
-        );
+        let summary = lifecycle_summary(&outcome);
+        output.progress(format!("generate: done ({summary})"));
+        output.verbose(format!("mode: {cache_label}"));
+        output.verbose(format!("parsed/input files: {source_files}"));
+        output.verbose(format!("artifacts: {artifact_files}"));
+        output.verbose(format!("hot no-op check: {}", fmt_duration(hot_elapsed)));
+        if let Some(elapsed) = pipeline_elapsed {
+            output.verbose(format!("pipeline: {}", fmt_duration(elapsed)));
+        }
+        if let Some(elapsed) = write_elapsed {
+            output.verbose(format!("write plan: {}", fmt_duration(elapsed)));
+        }
+        output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
+        output.verbose_paths("written", &outcome.written);
+        output.verbose_paths("deleted", &outcome.deleted);
+        output.verbose_paths("skipped", &outcome.skipped);
     }
     Ok(())
 }
@@ -154,13 +226,30 @@ fn run_generate(force: bool, json: bool) -> Result<()> {
 /// (`UserEdited`); exits 0 when every output is `Unchanged`. Reuses the exact pure decision function —
 /// zero new policy. `--json` emits the stale/drifted path lists. Pipeline errors flow through the anyhow
 /// boundary, never a panic.
-fn run_check(json: bool) -> Result<()> {
+fn run_check(output: Output) -> Result<()> {
     let root = project_root()?;
-    let plan = if let Some(noop) = pre_child_verified_noop(&root) {
-        clean_plan_from_paths(noop.outcome.unchanged)
+    let total_start = Instant::now();
+    let hot_start = Instant::now();
+    let hot_noop = pre_child_verified_noop(&root);
+    let hot_elapsed = hot_start.elapsed();
+    let mut pipeline_elapsed = None;
+    let mut plan_elapsed = None;
+    let (plan, source_files) = if let Some(noop) = hot_noop {
+        (
+            clean_plan_from_paths(noop.outcome.unchanged),
+            noop.source_files,
+        )
     } else {
+        output.progress("check: running pipeline");
+        let pipeline_start = Instant::now();
         let mut bundle = child::run_child(&root, "__emit")?;
-        plan_bundle(&root, &mut bundle)?
+        pipeline_elapsed = Some(pipeline_start.elapsed());
+        let source_files = bundle.cache_input_stamps.len();
+        output.progress("check: planning writes");
+        let plan_start = Instant::now();
+        let plan = plan_bundle(&root, &mut bundle)?;
+        plan_elapsed = Some(plan_start.elapsed());
+        (plan, source_files)
     };
 
     // Partition the plan into stale (would be written) vs drifted (user-edited) vs clean (unchanged).
@@ -176,7 +265,7 @@ fn run_check(json: bool) -> Result<()> {
     }
     let has_drift = plan.has_drift();
 
-    if json {
+    if output.json {
         #[derive(serde::Serialize)]
         struct CheckReport {
             up_to_date: bool,
@@ -186,26 +275,32 @@ fn run_check(json: bool) -> Result<()> {
         }
         let report = CheckReport {
             up_to_date: !has_drift,
-            stale,
-            drifted,
+            stale: stale.clone(),
+            drifted: drifted.clone(),
             unchanged: clean,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if has_drift {
-        for path in &stale {
-            eprintln!("stale: {path} is out of date (run `gnr8 generate`)");
-        }
-        for path in &drifted {
-            eprintln!("drifted: {path} was hand-edited and differs from the generated output");
-        }
-        println!(
-            "outputs are NOT up to date: {} stale, {} drifted",
+        output.progress(format!(
+            "check: not up to date ({} stale, {} drifted; run `gnr8 check -v` for paths)",
             stale.len(),
             drifted.len()
-        );
+        ));
     } else {
-        println!("outputs are up to date ({} unchanged)", clean.len());
+        output.progress(format!("check: up to date ({} unchanged)", clean.len()));
     }
+    output.verbose(format!("parsed/input files: {source_files}"));
+    output.verbose(format!("outputs checked: {}", plan.files.len()));
+    output.verbose(format!("hot no-op check: {}", fmt_duration(hot_elapsed)));
+    if let Some(elapsed) = pipeline_elapsed {
+        output.verbose(format!("pipeline: {}", fmt_duration(elapsed)));
+    }
+    if let Some(elapsed) = plan_elapsed {
+        output.verbose(format!("write plan: {}", fmt_duration(elapsed)));
+    }
+    output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
+    output.verbose_paths("stale", &stale);
+    output.verbose_paths("drifted", &drifted);
 
     if has_drift {
         // Deliberate non-zero exit so `gnr8 check` is a usable CI gate (RESEARCH Open Q 3).
@@ -317,6 +412,8 @@ struct VerifiedNoopStamp {
 struct CachedNoop {
     outcome: gnr8_core::lifecycle::GenerateOutcome,
     diagnostics: Vec<gnr8_core::graph::Diagnostic>,
+    source_files: usize,
+    artifact_files: usize,
 }
 
 fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
@@ -330,6 +427,8 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     if current_outputs != stamp.output_files {
         return None;
     }
+    let source_files = stamp.input_files.len();
+    let artifact_files = stamp.output_files.len();
     Some(CachedNoop {
         outcome: gnr8_core::lifecycle::GenerateOutcome {
             written: Vec::new(),
@@ -338,6 +437,8 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
             deleted: Vec::new(),
         },
         diagnostics: stamp.diagnostics,
+        source_files,
+        artifact_files,
     })
 }
 
@@ -618,14 +719,16 @@ fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
 /// compile error, a missing toolchain) is REPORTED as a finding, never `?`/unwrap'd into a crash
 /// (Pitfall 4 / D-02). Prints the human report or `--json`, then exits non-zero ONLY on an actionable
 /// problem (mirrors `run_check`).
-fn run_doctor(json: bool) -> Result<()> {
+fn run_doctor(output: Output) -> Result<()> {
     let root = project_root()?;
     let initialized = gnr8_core::workspace::manifest_path(&root).is_file();
     let (language, source_present) = probe_source_lang_toolchain(&root);
 
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
     // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
+    let total_start = Instant::now();
     let mut bundle = if initialized {
+        output.progress("doctor: running pipeline");
         child::run_child(&root, "__emit").ok()
     } else {
         None
@@ -643,10 +746,11 @@ fn run_doctor(json: bool) -> Result<()> {
         drift.as_ref(),
     );
 
-    if json {
+    if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", report.render_human());
+        output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
     }
 
     if report.has_actionable_problem() {
@@ -663,25 +767,25 @@ fn run_doctor(json: bool) -> Result<()> {
 /// re-runs it), filters out gnr8's own output writes (no self-loop), and times each regeneration. Ctrl-C
 /// exits with code 0; a missing `.gnr8/` or a pipeline error flows through the anyhow boundary — never a
 /// panic (D-09 / RUST-04).
-fn run_watch(debounce_ms: u64, json: bool) -> Result<()> {
+fn run_watch(debounce_ms: u64, output: Output) -> Result<()> {
     // Floor the debounce window at a small minimum (IN-04): `--debounce-ms 0` would create a
     // zero-window debouncer that defeats burst-coalescing and amplifies the delete/rename edge case.
     const MIN_DEBOUNCE_MS: u64 = 10;
 
     let root = project_root()?;
 
-    if !json {
-        println!(
-            "watching {} (sources + .gnr8/src) — press Ctrl-C to stop",
+    if !output.json {
+        output.progress(format!(
+            "watch: {} (sources + .gnr8/src, Ctrl-C to stop)",
             root.display()
-        );
+        ));
     }
 
     // The COLD scenario: an initial regeneration ensures outputs are current and measures cold latency.
-    watch::cold_regenerate(&root, json)?;
+    watch::cold_regenerate(&root, output.json, output.verbose)?;
 
     let debounce = std::time::Duration::from_millis(debounce_ms.max(MIN_DEBOUNCE_MS));
-    watch::run(&root, debounce, json)
+    watch::run(&root, debounce, output.json, output.verbose)
 }
 
 /// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and
@@ -689,21 +793,61 @@ fn run_watch(debounce_ms: u64, json: bool) -> Result<()> {
 /// the child pipeline, since the renderers take an `ApiGraph` and the IR carries no transforms yet). The
 /// `build_graph` `CoreError` and any render error both flow through the anyhow boundary (clean message +
 /// exit 1, never a panic).
-fn run_inspect(action: &InspectAction, json: bool) -> Result<()> {
-    let output = match action {
+fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
+    let total_start = Instant::now();
+    let rendered = match action {
         InspectAction::Routes { path } => {
             let graph = gnr8_core::analyze::build_graph(path)?;
-            render::render_routes(&graph, json)?
+            render::render_routes(&graph, output.json)?
         }
         InspectAction::Schemas { path } => {
             let graph = gnr8_core::analyze::build_graph(path)?;
-            render::render_schemas(&graph, json)?
+            render::render_schemas(&graph, output.json)?
         }
         InspectAction::Graph { path } => {
             let graph = gnr8_core::analyze::build_graph(path)?;
-            render::render_graph(&graph, json)?
+            render::render_graph(&graph, output.json)?
         }
     };
-    print!("{output}");
+    print!("{rendered}");
+    output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
     Ok(())
+}
+
+fn lifecycle_summary(outcome: &gnr8_core::lifecycle::GenerateOutcome) -> String {
+    format!(
+        "{} written, {} unchanged, {} deleted, {} skipped",
+        outcome.written.len(),
+        outcome.unchanged.len(),
+        outcome.deleted.len(),
+        outcome.skipped.len()
+    )
+}
+
+fn print_diagnostics(output: Output, diagnostics: &[gnr8_core::graph::Diagnostic]) {
+    if diagnostics.is_empty() || output.json {
+        return;
+    }
+    if output.verbose == 0 {
+        eprintln!(
+            "warning: {} pipeline diagnostics (run with -v for details)",
+            diagnostics.len()
+        );
+        return;
+    }
+    for diag in diagnostics {
+        eprintln!(
+            "{}: {} ({}:{})",
+            diag.severity, diag.message, diag.file, diag.line
+        );
+    }
+}
+
+fn fmt_duration(duration: Duration) -> String {
+    let millis = duration.as_secs_f64() * 1000.0;
+    if millis < 10.0 {
+        format!("{millis:.1} ms")
+    } else {
+        format!("{millis:.0} ms")
+    }
 }
