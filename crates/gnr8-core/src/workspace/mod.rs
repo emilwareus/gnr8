@@ -20,9 +20,10 @@
 //!
 //! `gnr8-core` is not published yet. When `init` runs INSIDE the gnr8 repo (detected by walking up for
 //! `crates/gnr8-core`), it emits a `path = "…/crates/gnr8-core"` dependency so the example + integration
-//! tests build against the in-repo crate. Outside the repo it emits `gnr8-core = "0.1"` with a TODO
-//! comment (publishing is a later milestone). This is the ONLY branch, and it is a presence check of a
-//! single fact (are we in the repo?), not a fallback between two ways to derive the same value.
+//! tests build against the in-repo crate. Outside the repo, an installed release archive can provide
+//! `share/gnr8/crates/gnr8-core`; `init` then emits a `path = "…"` dependency to that installed source
+//! so the generated `.gnr8` crate builds without crates.io publication. If neither source exists it
+//! emits the future published dependency with an actionable TODO.
 //!
 //! Idempotency (D-01): every workspace file is written *only if absent*, via
 //! `OpenOptions::create_new(true)` — atomically failing with [`std::io::ErrorKind::AlreadyExists`] if
@@ -160,11 +161,25 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
 fn core_dependency_line(root: &Path) -> String {
     match locate_in_repo_core(root) {
         Some(rel) => format!("gnr8-core = {{ path = {rel:?} }}"),
-        None => {
-            "gnr8-core = \"0.1\"  # TODO: gnr8-core is not published yet — set the real version once it is"
-                .to_string()
-        }
+        None => match locate_installed_core(root) {
+            Some(path) => format!("gnr8-core = {{ path = {path:?} }}"),
+            None => {
+                "gnr8-core = \"0.1\"  # TODO: gnr8-core is not published yet — set the real version once it is"
+                    .to_string()
+            }
+        },
     }
+}
+
+fn locate_installed_core(_root: &Path) -> Option<String> {
+    let candidate = crate::resource::resource_dir()?
+        .join("crates")
+        .join("gnr8-core");
+    if !candidate.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let path = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// Locate an in-repo `crates/gnr8-core` directory at or above `root`, returning the path RELATIVE to

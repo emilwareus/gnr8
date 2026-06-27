@@ -83,7 +83,7 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -149,7 +149,7 @@ func (c *Client) GetBook(ctx context.Context, id string) (Book, error) {
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -185,7 +185,7 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

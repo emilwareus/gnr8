@@ -167,7 +167,7 @@ enum ChildInvocation {
 
 impl ChildInvocation {
     fn command(&self) -> Command {
-        match self {
+        let mut command = match self {
             Self::Direct {
                 binary,
                 project_root,
@@ -194,7 +194,11 @@ impl ChildInvocation {
                     .current_dir(project_root);
                 command
             }
+        };
+        if let Some(resource_dir) = gnr8_core::resource::resource_dir() {
+            command.env(gnr8_core::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
         }
+        command
     }
 
     fn description(&self, fallback_cargo: &str) -> String {

@@ -5,12 +5,14 @@ code; this matches the current build. Product invariants: [`../CLAUDE.md`](../CL
 fact, no third-party deps, no fallback/dual paths, config supplies what typed source can't).
 
 ## What it is / isn't
-- Reads a **Go + Gin** service via `go/types`, builds a router-agnostic API graph, emits **OpenAPI 3.1**
-  + a **compiling Go SDK**. Code-first: your code is the single source of truth for the API. Go + Gin is
-  the first supported frontend; the model is general by design.
-- **Envelope (hard limits today):** Go only; Gin only; **exactly ONE route group per service** (one
-  base path). Multi-group/multi-domain services are NOT supported (paths collapse → error). Other Go
-  routers extract zero routes.
+- Reads source services into a router-agnostic API graph, emits **OpenAPI 3.1**, and generates
+  client SDKs. Supported source frontends today: **Go + Gin**, **Python FastAPI**,
+  **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**. Code-first: your code is the
+  single source of truth for the API.
+- **Envelope (hard limits today):** each `Source` takes exactly one input directory. Go support is Gin
+  only and supports exactly one route group per service. Flask intentionally extracts typed DTO/return
+  envelopes only. NestJS extracts DTO classes, not erased interfaces or swagger/zod/class-validator
+  metadata. Unsupported facts become diagnostics, not guesses.
 - **Config is CODE, not a file.** Facts not in typed source (base/mount path, OpenAPI title, security
   schemes) — and the whole parse/generate lifecycle — are expressed as Rust in a project-local `.gnr8/`
   crate that drives the engine. There is **no TOML/YAML/JSON config** (see "Config: the `.gnr8/` crate").
@@ -194,10 +196,11 @@ contract (the committed graph/OpenAPI snapshots are the spec).
 | Flask | Python | typed-envelope (honest second-class) | `@app.route`/`methods=`, `Blueprint(url_prefix=)`, `<int:id>` converter path params, OPT-IN typed DTOs/returns; method-derived status (typed `POST`→201, else 200) | untyped `request.json` / unannotated `request.args` / missing return annotation → **diagnostic, NEVER inferred**. State plainly: untyped surfaces are NOT recovered (typed-envelope only). |
 | NestJS | TypeScript | class-DTO scope | `@nestjs/common` verb + `@Param`/`@Query`/`@Body` decorators, `@Controller` prefix (provenance, never folded), DTO **classes**, enums + string-literal-union, method-derived status (`@HttpCode` override) | DTO **classes** only (bare `interface`s are erased — not extracted); never reads `@nestjs/swagger` / `zod` / `class-validator` (rule 1); unresolvable → diagnostic + omit. |
 
-Generated SDKs are **dependency-free in every language**: GoSdk (`net/http`), PySdk (`urllib` +
-`@dataclass`), TsSdk (built-in `fetch` + typed interfaces). The `tsextract` sidecar resolves the
+Generated SDKs keep HTTP dependency-free: GoSdk uses `net/http`, PySdk uses `urllib`, and TsSdk uses
+the built-in `fetch`. PySdk emits Pydantic v2 `BaseModel` models by default, with
+`.dataclasses()` available for stdlib-only model consumers. The `tsextract` sidecar resolves the
 **project's own `typescript`** toolchain (required, not shipped — see CLAUDE.md); every other sidecar is
-stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself takes zero OSS deps.
+stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small Rust dependency set.
 
 ## Recognized Go/Gin patterns (code-first)
 Resolution is via `go/types` (alias/import-robust), not string matching.

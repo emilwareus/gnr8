@@ -21,3 +21,31 @@ func (e *APIError) Error() string {
 func (e *APIError) IsNotFound() bool {
 	return e.StatusCode == 404
 }
+
+func apiErrorStringValue(v any) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case *string:
+		if value == nil {
+			return ""
+		}
+		return *value
+	default:
+		return ""
+	}
+}
+
+func apiErrorStringSliceValue(v any) []string {
+	switch value := v.(type) {
+	case []string:
+		return value
+	case *[]string:
+		if value == nil {
+			return nil
+		}
+		return *value
+	default:
+		return nil
+	}
+}

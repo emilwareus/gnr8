@@ -103,8 +103,8 @@ paths:
           content: { application/json: { schema: { $ref: '#/components/schemas/CreatedMessage' } } }
 ```
 
-**Python SDK** — a typed, dependency-free `urllib` client with a method per
-operation and `@dataclass` models that mirror the schemas.
+**Python SDK** — a typed `urllib` client with a method per operation and Pydantic v2 models that mirror
+the schemas.
 
 ## What this showcases
 

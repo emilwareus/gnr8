@@ -1,24 +1,12 @@
 # gnr8 quality gates (D-16 + Go fixture gate).
 #
 # `make check` is the full LOCAL gate and mirrors CI. It runs fmt-check, clippy
-# (--locked, -D warnings), the test suite, and the Go fixture build/vet.
+# (--locked, -D warnings), Rust tests, sidecar tests, fixture/helper builds, and example regen checks.
 #
-# The Go contract tests (snapshot_graph/diagnostics/openapi/sdk) are GREEN, and `make gates` runs
-# them as the blocking set alongside determinism + the sdk_compile test (temp dir + zero-require
-# go.mod + go build + httptest smoke, SDK-05).
-#
-# Milestone v2.0 (Phase 1) reintroduces a CONTROLLED red-by-design set: the multi-language
-# acceptance contract. Three static fixture services — fastapi-bookstore, flask-bookstore,
-# nestjs-bookstore — ship with six intended-green snapshot tests
-# (snapshot_{fastapi,flask,nestjs}_{graph,openapi}) that are RED by design today: no py/ts extractor
-# exists yet, so build_graph panics honestly at the test's `.expect()`. These six are marked
-# `#[ignore]` so `cargo test` (the `test:` target) SKIPS them and the green gate stays green; they
-# are NEVER in the blocking `gates:` list. They remain visible and runnable on demand via
-# `make red` (or `cargo test -p gnr8-core --test snapshot_fastapi_graph -- --ignored`, etc.), where
-# they fail honestly. They flip green with ZERO snapshot edits when pyextract (Phase 2) and
-# tsextract (Phase 4) land. `make gates` mirrors the blocking CI `gates` job.
+# The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
+# contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build red check all tsextract-deps examples-check
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test red check all examples-check
 
 # Auto-format the workspace in place.
 fmt:
@@ -32,8 +20,7 @@ fmt-check:
 clippy:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
-# Full test suite. The six multi-language acceptance snapshots are `#[ignore]`d (red-by-design,
-# Phase 1 / Milestone v2.0), so this run SKIPS them and stays green; run them on demand via `make red`.
+# Full Rust test suite.
 test:
 	cargo test --all-features
 
@@ -69,6 +56,12 @@ gates:
 tsextract-deps:
 	@command -v npm >/dev/null 2>&1 && (cd tsextract && npm ci --silent) || echo "npm absent — TS tests will skip"
 
+pyextract-test:
+	python3 -m unittest discover pyextract/tests
+
+tsextract-test: tsextract-deps
+	@command -v node >/dev/null 2>&1 && (cd tsextract && for test in tests/*.test.js; do node "$$test"; done) || echo "node absent — TS sidecar tests skipped"
+
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
 	cd fixtures/goalservice && go build ./... && go vet ./...
@@ -102,14 +95,19 @@ GNR8_BIN := target/release/gnr8
 GO_BIN := /home/vercel-sandbox/.local/go-install/go/bin
 examples-check: tsextract-deps
 	cargo build --release -p gnr8
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go (Gin)
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/taskflow          && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Go (custom-stage ApiMarkdown demo)
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python (FastAPI)
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/flask-bookstore   && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # Python (Flask typed-envelope)
-	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate && "$(CURDIR)/$(GNR8_BIN)" check'   # TypeScript (NestJS)
+	@set -e; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	mkdir -p "$$tmp/examples"; \
+	for dir in examples/*/generated; do mkdir -p "$$tmp/$$dir"; cp -R "$$dir"/. "$$tmp/$$dir"/; done; \
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/taskflow          && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/flask-bookstore   && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
+	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
+	for dir in examples/*/generated; do diff -ru "$$tmp/$$dir" "$$dir"; done
 
-# Full local gate, mirrors CI. Green for everything Phase 1 delivers; the six red-by-design
-# multi-language acceptance snapshots are `#[ignore]`d (skipped, not failing) — see `make red`.
-check: fmt-check clippy tsextract-deps test fixture-build goextract-build examples-check
+# Full local gate, mirrors CI.
+check: fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test examples-check
 
 all: check

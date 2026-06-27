@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod lower;
 pub mod manifest;
 pub mod pysdk;
+pub mod resource;
 pub mod runner;
 pub mod sdk;
 pub mod tssdk;

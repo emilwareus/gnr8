@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import dataclasses
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+from pydantic import BaseModel
+
 from .errors import ApiError
 from .models import *  # noqa: F401,F403  (re-export models for return-type annotations)
 
 
 class Client:
-    """Dependency-free SDK client over urllib (no requests/httpx)."""
+    """SDK client over urllib (no requests/httpx)."""
 
     def __init__(
         self,
@@ -26,17 +27,14 @@ class Client:
         self._opener = opener or urllib.request.build_opener()
 
     def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
-        # A typed request-body model is a @dataclass, which json.dumps cannot serialize directly
-        # (TypeError) — marshal it to a dict first (dataclasses.asdict recurses into nested
-        # dataclasses). The single deterministic encode path; stdlib only (CLAUDE.md rule 2).
-        if body is not None and dataclasses.is_dataclass(body):
-            body = dataclasses.asdict(body)
+        # Pydantic v2 request models need alias-aware JSON-mode dumping before json.dumps.
+        if isinstance(body, BaseModel):
+            body = body.model_dump(mode="json", by_alias=True, exclude_unset=True)
+
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        if self._api_key:
-            req.add_header("X-API-Key", self._api_key)
         try:
             with self._opener.open(req) as resp:
                 return resp.status, resp.read()
@@ -69,7 +67,7 @@ class Client:
         if _status != 200:
             self._raise(_status, _raw)
         _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.from_dict(_data)
+        return OrderConfirmation.model_validate(_data)
 
     def create_order(self, body: OrderInput) -> OrderConfirmation:
         path = "/orders/"
@@ -77,7 +75,7 @@ class Client:
         if _status != 201:
             self._raise(_status, _raw)
         _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.from_dict(_data)
+        return OrderConfirmation.model_validate(_data)
 
     def create_order_raw(self) -> Any:
         path = "/orders/raw"
@@ -92,4 +90,4 @@ class Client:
         if _status != 200:
             self._raise(_status, _raw)
         _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.from_dict(_data)
+        return OrderConfirmation.model_validate(_data)

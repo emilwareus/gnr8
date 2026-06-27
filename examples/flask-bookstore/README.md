@@ -1,7 +1,7 @@
 # Flask bookstore example
 
-An end-to-end gnr8 lifecycle for a **Flask** service: `Flask` source → OpenAPI 3.1 + a dependency-free
-Python SDK, driven entirely by the `.gnr8/` Rust `Pipeline` crate (config is code — there is no
+An end-to-end gnr8 lifecycle for a **Flask** service: `Flask` source → OpenAPI 3.1 + a Python SDK,
+driven entirely by the `.gnr8/` Rust `Pipeline` crate (config is code — there is no
 `config.toml`).
 
 This example demonstrates gnr8's **honest Flask typed-envelope** (the second-class Python frontend):
@@ -32,4 +32,4 @@ gnr8 check         # dry-run: confirms the committed output is byte-identical (d
 
 - `app/` — the static Flask source (copied from `fixtures/flask-bookstore`).
 - `.gnr8/src/main.rs` — the generation pipeline (the config).
-- `generated/` — committed OpenAPI 3.1 document + the dependency-free Python SDK.
+- `generated/` — committed OpenAPI 3.1 document + the generated Python SDK.

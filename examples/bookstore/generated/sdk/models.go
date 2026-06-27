@@ -44,6 +44,14 @@ const (
 	GenreScifi      Genre = "scifi"
 )
 
+const (
+	FictionGenre    Genre = "fiction"
+	MysteryGenre    Genre = "mystery"
+	NonfictionGenre Genre = "nonfiction"
+	RomanceGenre    Genre = "romance"
+	ScifiGenre      Genre = "scifi"
+)
+
 type Publisher struct {
 	Country string `json:"country"`
 	Name    string `json:"name"`
