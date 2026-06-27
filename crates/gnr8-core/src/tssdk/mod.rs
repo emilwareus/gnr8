@@ -46,18 +46,22 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
-    generate_with_layout(graph, package, base_path, SdkFileLayout::compact())
+    generate_with_layout(graph, package, base_path, &SdkFileLayout::compact())
 }
 
 /// Generate the TypeScript SDK with a configurable file layout.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`].
 pub fn generate_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
+    layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files =
-        generate_files_with_layout(graph, package, base_path, layout, SdkTypeAliases::default())?;
+    let aliases = SdkTypeAliases::default();
+    let files = generate_files_with_layout(graph, package, base_path, layout, &aliases)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -66,8 +70,8 @@ pub(crate) fn generate_files_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
-    aliases: SdkTypeAliases,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_header = api_key_header_name(graph)?;
@@ -115,7 +119,7 @@ pub(crate) fn generate_files_with_layout(
             let default_name =
                 file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
             let name = if layout.model_file_template_ref().is_some() {
-                model_file_name(&layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
+                model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
             } else {
                 default_name
             };
@@ -314,7 +318,7 @@ mod tests {
 
     #[test]
     fn split_layout_emits_models_directory_with_barrel_file() {
-        let out = generate_with_layout(&sample_graph(), "bookstore", "/", SdkFileLayout::split())
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &SdkFileLayout::split())
             .unwrap();
         let files = split_bundle(&out);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
@@ -350,7 +354,7 @@ mod tests {
     #[test]
     fn split_layout_can_place_models_in_a_configured_directory() {
         let layout = SdkFileLayout::split().model_dir("schemas");
-        let out = generate_with_layout(&sample_graph(), "bookstore", "/", layout).unwrap();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
         let files = split_bundle(&out);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"schemas/book.ts"));

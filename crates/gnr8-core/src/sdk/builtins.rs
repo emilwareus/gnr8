@@ -1081,8 +1081,8 @@ impl Target for GoSdk {
             ir,
             &package,
             &ir.base_path,
-            self.layout.clone(),
-            self.aliases.clone(),
+            &self.layout,
+            &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
         out.write(
@@ -1222,9 +1222,9 @@ impl Target for PySdk {
             ir,
             &package,
             &ir.base_path,
-            self.layout.clone(),
+            &self.layout,
             self.model_style,
-            self.aliases.clone(),
+            &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
         Ok(())
@@ -1344,8 +1344,8 @@ impl Target for TsSdk {
             ir,
             &package,
             &ir.base_path,
-            self.layout.clone(),
-            self.aliases.clone(),
+            &self.layout,
+            &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
         Ok(())

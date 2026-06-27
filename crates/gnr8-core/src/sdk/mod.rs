@@ -662,6 +662,7 @@ struct FileHashCacheState {
     dirty: bool,
 }
 
+#[derive(Clone, Copy)]
 enum FileHashCacheScope {
     Inputs,
     Outputs,

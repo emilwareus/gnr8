@@ -75,6 +75,7 @@ fn add_runtime_metadata(ir: &mut gnr8_core::graph::ApiGraph) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn generated_sdks_support_configurable_surface_and_compile() {
     let mut ir = gnr8_core::analyze::build_graph(FIXTURE_DIR).expect("fixture graph");
     add_runtime_metadata(&mut ir);

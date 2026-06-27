@@ -185,10 +185,9 @@ pub fn plan_metadata_writes(
     for artifact in artifacts {
         let path = &artifact.path;
         let action = match (on_disk_hash(path), manifest.recorded_hash(path)) {
-            (None, _) => WriteAction::Write,
             (Some(disk_hash), Some(recorded)) if disk_hash != recorded => WriteAction::UserEdited,
             (Some(disk_hash), Some(_)) if disk_hash == artifact.hash => WriteAction::Unchanged,
-            (Some(_), Some(_)) => WriteAction::Write,
+            (None, _) | (Some(_), Some(_)) => WriteAction::Write,
             (Some(_), None) => WriteAction::UserEdited,
         };
         files.push(PlannedFile {

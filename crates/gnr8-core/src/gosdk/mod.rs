@@ -46,18 +46,22 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
-    generate_with_layout(graph, package, base_path, SdkFileLayout::compact())
+    generate_with_layout(graph, package, base_path, &SdkFileLayout::compact())
 }
 
 /// Generate the Go SDK with a configurable file layout.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`].
 pub fn generate_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
+    layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files =
-        generate_files_with_layout(graph, package, base_path, layout, SdkTypeAliases::default())?;
+    let aliases = SdkTypeAliases::default();
+    let files = generate_files_with_layout(graph, package, base_path, layout, &aliases)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -66,14 +70,14 @@ pub(crate) fn generate_files_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
-    aliases: SdkTypeAliases,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_header = api_key_header_name(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
-    let legacy_options = emit::GoEmitOptions {
-        legacy_model_helpers: aliases.uses_legacy_source_prefixes(),
+    let compat_options = emit::GoEmitOptions {
+        compat_model_helpers: aliases.has_source_prefix_aliases(),
     };
 
     // Fixed leading files (sorted: client.go before errors.go).
@@ -85,28 +89,21 @@ pub(crate) fn generate_files_with_layout(
     if !resolved_aliases.is_empty() {
         files.push(raw_go_file(
             "aliases.go",
-            emit::emit_type_aliases(graph, package, &resolved_aliases, legacy_options)?,
+            emit::emit_type_aliases(graph, package, &resolved_aliases, compat_options)?,
         ));
     }
-    if aliases.uses_legacy_source_prefixes() {
-        files.push(raw_go_file(
-            "openapi_compat.go",
-            emit::emit_openapi_compat(graph, package, base_path, auth_header.as_deref())?,
-        ));
-    }
-
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
         for op in &ops {
             let raw =
                 emit::emit_operations(graph, package, base_path, &[*op], auth_header.as_deref())?;
-            let name = operation_file_name(&layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
+            let name = operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
             files.push(raw_go_file(name, raw));
         }
         for schema in &graph.schemas {
-            let raw = emit::emit_model_schema_with_options(graph, package, schema, legacy_options)?;
+            let raw = emit::emit_model_schema_with_options(graph, package, schema, compat_options)?;
             let name = model_file_name(
-                &layout,
+                layout,
                 schema,
                 &format!("model_{}.go", file_stem(&schema.name)),
             )?;
@@ -122,7 +119,7 @@ pub(crate) fn generate_files_with_layout(
         // Trailing models.go.
         files.push(raw_go_file(
             "models.go",
-            emit::emit_models_with_options(graph, package, legacy_options)?,
+            emit::emit_models_with_options(graph, package, compat_options)?,
         ));
     }
 
@@ -335,7 +332,7 @@ mod tests {
             &sample_graph(),
             "goalservice",
             "/goal",
-            SdkFileLayout::split(),
+            &SdkFileLayout::split(),
         )
         .unwrap();
         for marker in [
@@ -366,7 +363,7 @@ mod tests {
         let layout = SdkFileLayout::split()
             .operation_dir("apis")
             .model_dir("types");
-        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", layout).unwrap();
+        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap();
         for marker in [
             "// ==== gnr8:file apis/api_create_goal.go ====",
             "// ==== gnr8:file types/model_create_goal_input.go ====",

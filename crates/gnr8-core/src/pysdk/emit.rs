@@ -313,10 +313,10 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
 #[cfg(test)]
 pub(crate) fn emit_models_with_style(
     graph: &ApiGraph,
-    _package: &str,
+    package: &str,
     model_style: PyModelStyle,
 ) -> Result<String, CoreError> {
-    emit_models_with_style_and_aliases(graph, _package, model_style, &[])
+    emit_models_with_style_and_aliases(graph, package, model_style, &[])
 }
 
 pub(crate) fn emit_models_with_style_and_aliases(
@@ -354,7 +354,7 @@ pub(crate) fn emit_models_with_style_and_aliases(
             // `json.dumps` serialize the member value as its string — the twin of Go's `type X string`.
             Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
             Type::Object(fields) => {
-                emit_model_class(&mut out, &schema.name, fields, graph, model_style)?
+                emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
             }
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Union[Book, OutOfStock]`, or a
             // scalar/array/map alias) → a module-level type alias. This is the load-bearing divergence
@@ -413,7 +413,7 @@ pub(crate) fn emit_model_schema(
     match &schema.body {
         Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
         Type::Object(fields) => {
-            emit_model_class(&mut out, &schema.name, fields, graph, model_style)?
+            emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
         }
         Type::Primitive(_)
         | Type::WellKnown(_)
@@ -1003,6 +1003,7 @@ fn resolve_op_args<'op>(
 }
 
 /// Emit a single operation method (4-space indented as a `Client` method body).
+#[allow(clippy::too_many_lines)]
 fn emit_operation(
     out: &mut String,
     op: &Operation,
@@ -1165,7 +1166,7 @@ pub(crate) fn emit_init_with_models(
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
     let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
     if !names.is_empty() {
-        out.push_str(&format!("from .{model_module} import (\n"));
+        let _ = writeln!(out, "from .{model_module} import (");
         for name in &names {
             let _ = writeln!(out, "    {name},");
         }

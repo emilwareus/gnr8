@@ -19,7 +19,13 @@ pub(crate) struct ResolvedTypeAlias {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SdkTypeAliases {
     schema_aliases: Vec<(String, String)>,
-    legacy_source_prefixes: bool,
+    source_prefix_aliases: Vec<SourcePrefixAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourcePrefixAlias {
+    source_match: String,
+    alias_prefix: String,
 }
 
 impl SdkTypeAliases {
@@ -39,34 +45,51 @@ impl SdkTypeAliases {
         self
     }
 
-    /// Expose common source-package-prefixed aliases used by OpenAPI Generator style SDKs.
+    /// Expose prefixed aliases for schemas whose source id contains `source_match`.
     ///
-    /// This is intentionally source-id based rather than project-specific: schemas coming from package
-    /// segments such as `/dto`, `/command`, `/query`, and `/commandquery` get additional aliases like
-    /// `DtoUser`, `CommandCreateUser`, `QueryLoginUser`, and `CommandqueryCreateTokenOutput`.
+    /// This is source-id based rather than project-specific. For example,
+    /// `source_prefix_alias("/transport/", "Transport")` exposes `TransportUser` next to a canonical
+    /// `User` schema when the graph schema id contains `/transport/`.
     #[must_use]
-    pub fn legacy_source_prefixes(mut self) -> Self {
-        self.legacy_source_prefixes = true;
+    pub fn source_prefix_alias(
+        mut self,
+        source_match: impl Into<String>,
+        alias_prefix: impl Into<String>,
+    ) -> Self {
+        self.source_prefix_aliases.push(SourcePrefixAlias {
+            source_match: source_match.into(),
+            alias_prefix: alias_prefix.into(),
+        });
         self
     }
 
     /// Whether no aliases are configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.schema_aliases.is_empty()
+        self.schema_aliases.is_empty() && self.source_prefix_aliases.is_empty()
     }
 
     pub(crate) fn resolve(&self, graph: &ApiGraph) -> Result<Vec<ResolvedTypeAlias>, CoreError> {
         let mut out = Vec::new();
-        if self.legacy_source_prefixes {
+        for rule in &self.source_prefix_aliases {
+            if rule.source_match.is_empty() {
+                return Err(CoreError::Config {
+                    message: "SDK source prefix alias has an empty source match".to_string(),
+                });
+            }
+            if rule.alias_prefix.is_empty() {
+                return Err(CoreError::Config {
+                    message: "SDK source prefix alias has an empty alias prefix".to_string(),
+                });
+            }
             for schema in &graph.schemas {
-                let Some(prefix) = legacy_prefix_for_schema_id(&schema.id) else {
-                    continue;
-                };
-                if schema.name.starts_with(prefix) {
+                if !schema.id.contains(&rule.source_match) {
                     continue;
                 }
-                let alias = format!("{prefix}{}", schema.name);
+                if schema.name.starts_with(&rule.alias_prefix) {
+                    continue;
+                }
+                let alias = format!("{}{}", rule.alias_prefix, schema.name);
                 if alias == schema.name {
                     continue;
                 }
@@ -148,22 +171,8 @@ impl SdkTypeAliases {
         Ok(out)
     }
 
-    pub(crate) const fn uses_legacy_source_prefixes(&self) -> bool {
-        self.legacy_source_prefixes
-    }
-}
-
-fn legacy_prefix_for_schema_id(id: &str) -> Option<&'static str> {
-    if id.contains("/dto.") || id.contains("/dto/") || id.contains("common/dto.") {
-        Some("Dto")
-    } else if id.contains("/commandquery.") || id.contains("/commandquery/") {
-        Some("Commandquery")
-    } else if id.contains("/command.") || id.contains("/command/") {
-        Some("Command")
-    } else if id.contains("/query.") || id.contains("/query/") {
-        Some("Query")
-    } else {
-        None
+    pub(crate) fn has_source_prefix_aliases(&self) -> bool {
+        !self.source_prefix_aliases.is_empty()
     }
 }
 
@@ -199,10 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_legacy_source_prefix_aliases() {
-        let aliases = SdkTypeAliases::new().legacy_source_prefixes();
+    fn resolves_source_prefix_aliases() {
+        let aliases = SdkTypeAliases::new().source_prefix_alias("common/dto.", "Transport");
         let resolved = aliases.resolve(&graph()).unwrap();
         assert_eq!(resolved[0].canonical, "CreateBookInput");
-        assert_eq!(resolved[0].alias, "DtoCreateBookInput");
+        assert_eq!(resolved[0].alias, "TransportCreateBookInput");
     }
 }

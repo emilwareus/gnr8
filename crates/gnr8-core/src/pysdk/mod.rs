@@ -47,18 +47,22 @@ pub fn generate(
         graph,
         package,
         base_path,
-        SdkFileLayout::compact(),
+        &SdkFileLayout::compact(),
         PyModelStyle::default(),
-        SdkTypeAliases::default(),
+        &SdkTypeAliases::default(),
     )
 }
 
 /// Generate the Python SDK with a configurable file layout.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`].
 pub fn generate_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
+    layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
     generate_with_options(
         graph,
@@ -66,18 +70,23 @@ pub fn generate_with_layout(
         base_path,
         layout,
         PyModelStyle::default(),
-        SdkTypeAliases::default(),
+        &SdkTypeAliases::default(),
     )
 }
 
 /// Generate the Python SDK with configurable file layout and model style.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`], plus configuration errors for invalid compatibility
+/// aliases.
 pub fn generate_with_options(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
+    layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: SdkTypeAliases,
+    aliases: &SdkTypeAliases,
 ) -> Result<String, crate::CoreError> {
     let files =
         generate_files_with_options(graph, package, base_path, layout, model_style, aliases)?;
@@ -89,9 +98,9 @@ pub(crate) fn generate_files_with_options(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    layout: SdkFileLayout,
+    layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: SdkTypeAliases,
+    aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_header = api_key_header_name(graph)?;
@@ -138,7 +147,7 @@ pub(crate) fn generate_files_with_options(
                 &format!("{}.py", file_stem(&schema.name)),
             );
             let name = if layout.model_file_template_ref().is_some() {
-                model_file_name(&layout, schema, &format!("{}.py", file_stem(&schema.name)))?
+                model_file_name(layout, schema, &format!("{}.py", file_stem(&schema.name)))?
             } else {
                 default_name
             };
@@ -337,7 +346,7 @@ mod tests {
 
     #[test]
     fn split_layout_emits_models_package_with_init_file() {
-        let out = generate_with_layout(&sample_graph(), "bookstore", "/", SdkFileLayout::split())
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &SdkFileLayout::split())
             .unwrap();
         let files = split_bundle(&out);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
@@ -373,7 +382,7 @@ mod tests {
     #[test]
     fn split_layout_can_place_models_in_a_configured_package_directory() {
         let layout = SdkFileLayout::split().model_dir("schemas");
-        let out = generate_with_layout(&sample_graph(), "bookstore", "/", layout).unwrap();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
         let files = split_bundle(&out);
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"schemas/book.py"));

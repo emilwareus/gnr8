@@ -286,7 +286,7 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 /// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with a typed-error body.
 ///
 /// The body passed to `create_book` is an actual `Book` Pydantic-style instance (CR-01 regression
-/// coverage): the generated `_do` now marshals BaseModel values via `model_dump` before
+/// coverage): the generated `_do` now marshals `BaseModel` values via `model_dump` before
 /// `json.dumps`, so the advertised typed happy path — construct the model, pass it to the method —
 /// must round-trip. (The prior driver sent a raw dict, which routed AROUND the broken signature and
 /// masked the `TypeError: Object of type Book is not JSON serializable` defect.)

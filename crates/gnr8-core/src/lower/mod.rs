@@ -74,6 +74,11 @@ pub fn to_openapi(
 }
 
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document serialized as pretty JSON.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Lowering`] if the graph cannot be lowered or the `OpenAPI` document
+/// cannot be serialized.
 pub fn to_openapi_json(
     graph: &ApiGraph,
     title: &str,

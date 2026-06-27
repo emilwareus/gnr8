@@ -13,6 +13,7 @@
 //! stderr; `child.stdin.take()` is handled with a `let Some(..) else { return Err(..) }` — there is no
 //! `.expect("piped")` (RESEARCH Pattern 3 caveat).
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -126,7 +127,7 @@ fn create_temp_root() -> Result<PathBuf, CoreError> {
         let candidate = base.join(format!("{prefix}-{attempt}"));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(CoreError::Io {
                     message: format!(
@@ -206,7 +207,7 @@ fn format_gofmt_error(stderr: &str, src: &str) -> String {
     for line_no in start..=end {
         let marker = if line_no == line { ">" } else { " " };
         let text = lines.get(line_no - 1).copied().unwrap_or("");
-        out.push_str(&format!("{marker}{line_no:>5}: {text}\n"));
+        let _ = writeln!(out, "{marker}{line_no:>5}: {text}");
     }
     out
 }

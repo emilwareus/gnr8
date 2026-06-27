@@ -8,6 +8,7 @@
 //! definition per fact (CLAUDE.md rule 3).
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Operation, Schema};
 use crate::sdk::layout::SdkFileLayout;
@@ -31,9 +32,7 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
             prev_lower = false;
             continue;
         }
-        let next_is_lower = chars
-            .get(idx + 1)
-            .is_some_and(|next| next.is_ascii_lowercase());
+        let next_is_lower = chars.get(idx + 1).is_some_and(char::is_ascii_lowercase);
         let prev_is_upper = current
             .chars()
             .last()
@@ -130,7 +129,9 @@ pub(crate) fn quoted_string_literal(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
             c => out.push(c),
         }
     }

@@ -2,7 +2,7 @@
 
 Date: 2026-06-26
 
-Benchmark target: a realistic external Go backend with split Go, Python, and TypeScript SDK output. The target name and path are intentionally omitted.
+Benchmark target: a large Go API with split Go, Python, and TypeScript SDK output. Project names and paths are intentionally omitted.
 
 Machine: macOS, 16 logical CPUs.
 

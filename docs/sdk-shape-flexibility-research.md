@@ -2,7 +2,7 @@
 
 Date: 2026-06-26
 
-This document researches how gnr8 should support flexible SDK shapes without overfitting to one migration target. The immediate pressure came from a realistic external Go backend whose existing generated SDKs had a mature public surface. The target name and path are intentionally omitted.
+This document researches how gnr8 should support flexible SDK shapes without overfitting to one migration target. The benchmark pressure came from a large existing Go API whose generated SDKs had a mature public surface. Project names and paths are intentionally omitted.
 
 ## Executive Summary
 
@@ -70,10 +70,10 @@ Examples of compatibility-sensitive shape:
 
 - Go client constructor names and config type: `NewAPIClient(Configuration)` vs `NewClient(baseURL, opts...)`.
 - Go service fields: `client.GoalsAPI.GoalPost(...).Execute()` vs `client.CreateGoal(...)`.
-- Python import paths: `package.api.goals_api`, `package.api_client`, `package.configuration`, `package.models.dto_create_goal_input`.
+- Python import paths: `package.api.goals_api`, `package.api_client`, `package.configuration`, `package.models.legacy_create_goal_input`.
 - Python model helper methods: `to_dict`, `from_dict`, `to_json`, `from_json`, `validate_assignment`.
 - TypeScript runtime: Axios `Configuration`/`BaseAPI`/request builders vs fetch `Client`.
-- TypeScript model names and files: `DtoCreateGoalInput` in `models/dto-create-goal-input.ts` vs `CreateGoalInput` in `models/create_goal_input.ts`.
+- TypeScript model names and files: `LegacyCreateGoalInput` in `models/legacy-create-goal-input.ts` vs `CreateGoalInput` in `models/create_goal_input.ts`.
 - Auth plumbing and header names.
 - Return envelope shape: raw model vs `(model, response, error)` or response wrappers.
 - Generated docs/package metadata that consumers import or rely on.
@@ -233,16 +233,16 @@ Add:
 ```rust
 SchemaNaming {
     canonical: "CreateGoalInput",
-    public: "DtoCreateGoalInput",
+    public: "LegacyCreateGoalInput",
     aliases: ["CreateGoalInput"],
-    file_stem: "dto-create-goal-input",
+    file_stem: "legacy-create-goal-input",
 }
 ```
 
 For Go:
 
 ```go
-type DtoCreateGoalInput = CreateGoalInput
+type LegacyCreateGoalInput = CreateGoalInput
 ```
 
 or generate the compatibility name as canonical and the clean name as alias, depending on profile.
@@ -250,27 +250,27 @@ or generate the compatibility name as canonical and the clean name as alias, dep
 For Python:
 
 ```python
-DtoCreateGoalInput = CreateGoalInput
+LegacyCreateGoalInput = CreateGoalInput
 ```
 
 and optionally generate module shims:
 
 ```python
-# models/dto_create_goal_input.py
-from .create_goal_input import CreateGoalInput as DtoCreateGoalInput
+# models/legacy_create_goal_input.py
+from .create_goal_input import CreateGoalInput as LegacyCreateGoalInput
 ```
 
 For TypeScript:
 
 ```ts
-export type DtoCreateGoalInput = CreateGoalInput;
+export type LegacyCreateGoalInput = CreateGoalInput;
 ```
 
 and optionally generate old path shims:
 
 ```ts
-// models/dto-create-goal-input.ts
-export type { CreateGoalInput as DtoCreateGoalInput } from "./create_goal_input";
+// models/legacy-create-goal-input.ts
+export type { CreateGoalInput as LegacyCreateGoalInput } from "./create_goal_input";
 ```
 
 ### 5. Add Template/File Path Mapping
@@ -379,23 +379,23 @@ Example contract:
 
 ```toml
 [go]
-symbols = ["APIClient", "Configuration", "GoalsAPIService", "DtoCreateGoalInput"]
+symbols = ["APIClient", "Configuration", "GoalsAPIService", "LegacyCreateGoalInput"]
 imports = ["github.com/acme/sdk"]
 
 [python]
 imports = [
   "pkg.api_client.ApiClient",
   "pkg.configuration.Configuration",
-  "pkg.models.dto_create_goal_input.DtoCreateGoalInput",
+  "pkg.models.legacy_create_goal_input.LegacyCreateGoalInput",
 ]
 
 [typescript]
 imports = [
   "./api/goals-api",
   "./configuration",
-  "./models/dto-create-goal-input",
+  "./models/legacy-create-goal-input",
 ]
-types = ["GoalsApi", "Configuration", "DtoCreateGoalInput"]
+types = ["GoalsApi", "Configuration", "LegacyCreateGoalInput"]
 ```
 
 ## Capability Matrix
@@ -469,7 +469,7 @@ Tasks:
 
 Acceptance:
 
-- A profile can add `Dto` schema prefixes without changing source extraction.
+- A profile can add compatibility schema prefixes without changing source extraction.
 - A profile can generate model aliases in Go/Python/TS.
 - A profile can place files with configurable path templates.
 
@@ -592,4 +592,3 @@ Acceptance:
 4. Should template overrides be available before `SdkModel`?
 
    Recommendation: no. Without `SdkModel`, templates would depend on unstable emitter internals.
-
