@@ -6,8 +6,9 @@
 an **OpenAPI 3.1** document and a client **SDK** from it. The generation lifecycle is **configured in
 code**, so you, or an AI agent, can adapt exactly how it parses and generates for your project.
 
-> Status: **early.** The first supported frontend is **Go + Gin**, working end to end. The internal
-> model is general by design, so more source frameworks and SDK targets are additive, not rewrites.
+> Status: **early release candidate.** Supported frontends are **Go + Gin**, **Python FastAPI**,
+> **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**, with OpenAPI 3.1 plus
+> Go/Python/TypeScript SDK generation.
 
 > **Full reference (CLI, config, type mapping, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
 
@@ -42,8 +43,9 @@ internal API model   ── language- & router-agnostic: methods, paths, params,
    └─▶ client SDK   (typed client + models + errors; it compiles)
 ```
 
-The first supported frontend reads **Go + Gin** via `go/types`. A native engine builds a deterministic
-model (identical input → byte-identical output) and generates the OpenAPI document and the SDK. The
+The first supported frontend reads **Go + Gin** via `go/types`; Python and TypeScript frontends use
+static sidecars for FastAPI, Flask, and NestJS. A native engine builds a deterministic
+model (identical input → byte-identical output) and generates the OpenAPI document and SDKs. The
 generation lifecycle is **a Rust crate at `.gnr8/`** — `gnr8 init` scaffolds it, and `gnr8 generate`
 compiles and runs it, so adapting how your code is parsed and generated is just editing code. That same
 `.gnr8/` workspace tracks what it generated (so it never overwrites your edits), regenerates only what
@@ -146,9 +148,9 @@ cd examples/bookstore
 
 ## Status
 
-**Today:** Go + Gin, one route group per service, working end to end → OpenAPI 3.1 + a compiling client
-SDK; the `.gnr8/` lifecycle (`init` / `generate` / `check` / `watch` / `doctor`), incremental
-regeneration, and edit-protection.
+**Today:** Go + Gin, FastAPI, Flask typed-envelope, and NestJS class-DTO sources work end to end →
+OpenAPI 3.1 plus compiling/typechecked Go, Python, and TypeScript client SDKs; the `.gnr8/` lifecycle
+(`init` / `generate` / `check` / `watch` / `doctor`), incremental regeneration, and edit-protection.
 
 **Configuration is code.** `gnr8 init` scaffolds a small Rust crate at `.gnr8/` that drives the
 lifecycle — there is **no TOML/YAML config file**. You (or an agent) edit `.gnr8/src/main.rs`: it builds

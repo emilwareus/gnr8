@@ -1,53 +1,51 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
-@dataclass
-class Author:
+from pydantic import BaseModel, ConfigDict, Field
+
+class Author(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     bio: Optional[str]
     name: str
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "Author":
-        return cls(
-            bio=_data["bio"],
-            name=_data["name"],
-        )
+        return cls.model_validate(_data)
 
-@dataclass
-class Book:
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+class Book(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     author: Author
     format: BookFormat
     id: int
+    rating: Optional[Union[int, float]] = Field(default=None)
+    tags: Optional[List[str]] = Field(default=None)
     title: str
-    rating: Optional[Union[int, float]] = None
-    tags: Optional[List[str]] = None
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "Book":
-        return cls(
-            author=Author.from_dict(_data["author"]),
-            format=_data["format"],
-            id=_data["id"],
-            rating=(_data["rating"]) if "rating" in _data and _data["rating"] is not None else None,
-            tags=(_data["tags"]) if "tags" in _data and _data["tags"] is not None else None,
-            title=_data["title"],
-        )
+        return cls.model_validate(_data)
 
-@dataclass
-class BookFilters:
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+class BookFilters(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     genre: str
+    in_stock: Optional[bool] = Field(default=None)
     published: Optional[int]
-    in_stock: Optional[bool] = None
-    sort: Optional[Literal["asc", "desc"]] = None
+    sort: Optional[Literal["asc", "desc"]] = Field(default=None)
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "BookFilters":
-        return cls(
-            genre=_data["genre"],
-            in_stock=(_data["in_stock"]) if "in_stock" in _data and _data["in_stock"] is not None else None,
-            published=_data["published"],
-            sort=(_data["sort"]) if "sort" in _data and _data["sort"] is not None else None,
-        )
+        return cls.model_validate(_data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 class BookFormat(str, enum.Enum):
     HARDCOVER = "hardcover"
@@ -55,35 +53,38 @@ class BookFormat(str, enum.Enum):
 
 BookOrError = "Union[Book, OutOfStock]"
 
-@dataclass
-class CreatedMessage:
+class CreatedMessage(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     id: int
     message: str
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "CreatedMessage":
-        return cls(
-            id=_data["id"],
-            message=_data["message"],
-        )
+        return cls.model_validate(_data)
 
-@dataclass
-class ListBooksResponse:
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+class ListBooksResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     books: List[Book]
     next_cursor: Optional[str]
     total: int
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "ListBooksResponse":
-        return cls(
-            books=[Book.from_dict(_item) for _item in _data["books"]],
-            next_cursor=_data["next_cursor"],
-            total=_data["total"],
-        )
+        return cls.model_validate(_data)
 
-@dataclass
-class OutOfStock:
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+class OutOfStock(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
     reason: str
+
     @classmethod
     def from_dict(cls, _data: Dict[str, Any]) -> "OutOfStock":
-        return cls(
-            reason=_data["reason"],
-        )
+        return cls.model_validate(_data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json", by_alias=True, exclude_none=True)

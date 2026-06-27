@@ -22,7 +22,7 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
 
-// WithAPIKey sets the API key sent to satisfy the ApiKeyAuth security scheme.
+// WithAPIKey sets the API key sent in the "X-API-Key" header.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
 }

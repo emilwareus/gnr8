@@ -10,6 +10,7 @@ export class Client {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
 
+
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchFn = opts.fetch ?? fetch;
@@ -18,20 +19,22 @@ export class Client {
 
   async listBooks(genre: string, cursor?: string, sort?: string): Promise<models.ListBooksResponse> {
     let path = `/books/`;
-    const query = new URLSearchParams();
-    query.set("genre", String(genre));
+    const searchParams = new URLSearchParams();
+    searchParams.set("genre", String(genre));
     if (cursor !== undefined) {
-      query.set("cursor", String(cursor));
+      searchParams.set("cursor", String(cursor));
     }
     if (sort !== undefined) {
-      query.set("sort", String(sort));
+      searchParams.set("sort", String(sort));
     }
-    const qs = query.toString();
+    const qs = searchParams.toString();
     if (qs) {
       path = path + "?" + qs;
     }
+    const headers: Record<string, string> = {};
     const res = await this.fetchFn(`${this.baseUrl}${path}`, {
       method: "GET",
+      headers,
     });
     if (res.status !== 200) {
       throw new ApiError(res.status, await res.json().catch(() => null));
@@ -42,9 +45,11 @@ export class Client {
 
   async createBook(body: models.BookDto): Promise<models.CreatedMessage> {
     let path = `/books/`;
+    const headers: Record<string, string> = {};
+    headers["Content-Type"] = "application/json";
     const res = await this.fetchFn(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
     if (res.status !== 201) {
@@ -56,16 +61,18 @@ export class Client {
 
   async getBook(bookId: number, fmt?: models.BookFormat): Promise<models.BookOrError> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
-    const query = new URLSearchParams();
+    const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
-      query.set("fmt", String(fmt));
+      searchParams.set("fmt", String(fmt));
     }
-    const qs = query.toString();
+    const qs = searchParams.toString();
     if (qs) {
       path = path + "?" + qs;
     }
+    const headers: Record<string, string> = {};
     const res = await this.fetchFn(`${this.baseUrl}${path}`, {
       method: "GET",
+      headers,
     });
     if (res.status !== 200) {
       throw new ApiError(res.status, await res.json().catch(() => null));
@@ -76,9 +83,11 @@ export class Client {
 
   async updateBook(bookId: number, body: models.BookFilters): Promise<models.CreatedMessage> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
+    const headers: Record<string, string> = {};
+    headers["Content-Type"] = "application/json";
     const res = await this.fetchFn(`${this.baseUrl}${path}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
     if (res.status !== 200) {

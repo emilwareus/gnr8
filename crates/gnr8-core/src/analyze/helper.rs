@@ -26,7 +26,7 @@ use crate::CoreError;
 /// manifest dir (single source of truth for the path). Mirrors how the contract
 /// tests resolve `FIXTURE_DIR` (see `crates/gnr8-core/tests/snapshot_graph.rs`).
 pub(crate) fn goextract_dir() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../goextract"))
+    sidecar_root().join("goextract")
 }
 
 /// The repo root that HOLDS the `pyextract/` Python package, resolved relative to this crate's
@@ -35,7 +35,7 @@ pub(crate) fn goextract_dir() -> PathBuf {
 /// this is the deliberate analog of [`goextract_dir`] one level up. Carries the v1 compile-time-path
 /// debt forward without deepening it (CONTEXT decision; RESEARCH A6).
 pub(crate) fn pyextract_dir() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+    sidecar_root()
 }
 
 /// The directory of the `tsextract` Node sidecar (it HOLDS `index.js` + `node_modules`), resolved
@@ -45,7 +45,12 @@ pub(crate) fn pyextract_dir() -> PathBuf {
 /// (which runs `python3 -m pyextract`). Carries the v1 compile-time-path debt forward without
 /// deepening it (CONTEXT decision; RESEARCH A6).
 pub(crate) fn tsextract_dir() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tsextract"))
+    sidecar_root().join("tsextract")
+}
+
+fn sidecar_root() -> PathBuf {
+    crate::resource::resource_dir()
+        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")))
 }
 
 /// Resolve `target_dir` to a CANONICAL absolute path.

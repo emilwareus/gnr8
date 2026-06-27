@@ -32,6 +32,12 @@ const (
 	StatusOpen       Status = "open"
 )
 
+const (
+	DoneStatus       Status = "done"
+	InProgressStatus Status = "in_progress"
+	OpenStatus       Status = "open"
+)
+
 type Task struct {
 	Assignee Assignee  `json:"assignee"`
 	DueAt    time.Time `json:"dueAt"`

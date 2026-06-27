@@ -83,7 +83,7 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -149,7 +149,7 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -185,7 +185,7 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
+			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
