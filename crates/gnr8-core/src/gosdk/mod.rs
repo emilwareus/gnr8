@@ -86,6 +86,16 @@ pub(crate) fn generate_files_with_layout(
         emit::emit_client(package, auth_header.as_deref()),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
+    if aliases.has_source_prefix_aliases() {
+        files.push(raw_go_file(
+            "compat_helpers.go",
+            emit::emit_compat_helpers(package),
+        ));
+        files.push(raw_go_file(
+            "compat_client.go",
+            emit::emit_compat_client_surface(graph, package, base_path, auth_header.as_deref())?,
+        ));
+    }
     if !resolved_aliases.is_empty() {
         files.push(raw_go_file(
             "aliases.go",
@@ -143,9 +153,10 @@ mod tests {
     // toolchain (generate runs gofmt) and skip gracefully if it is absent.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, generate_with_layout};
+    use super::{generate, generate_files_with_layout, generate_with_layout};
     use crate::graph::ApiGraph;
     use crate::sdk::layout::SdkFileLayout;
+    use crate::sdk::surface::SdkTypeAliases;
 
     /// A facts document (code-first shape — no annotation facts) covering three operations plus the
     /// fixture request/response models + the code-defined `TargetDirection` enum — enough to assert the
@@ -369,6 +380,44 @@ mod tests {
             "// ==== gnr8:file types/model_create_goal_input.go ====",
         ] {
             assert!(out.contains(marker), "missing {marker}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn source_prefix_aliases_emit_grouped_go_compat_client_surface() {
+        if !gofmt_available() {
+            eprintln!("skipping compat client test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        for op in &mut graph.operations {
+            op.group = Some("Goals".to_string());
+        }
+        let aliases = SdkTypeAliases::new().source_prefix_alias("dto.", "Dto");
+        let files = generate_files_with_layout(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &aliases,
+        )
+        .unwrap();
+        let compat = files
+            .iter()
+            .find(|file| file.name == "compat_client.go")
+            .map(|file| file.contents.as_str())
+            .expect("compat_client.go should be emitted");
+
+        for snippet in [
+            "func NewConfiguration() *Configuration",
+            "func NewAPIClient(cfg *Configuration) *APIClient",
+            "GoalsAPI   *GoalsAPIService",
+            "func (a *GoalsAPIService) ListGet(ctx context.Context) ApiListGetRequest",
+            "func (r ApiListGetRequest) Aggregation(aggregation any) ApiListGetRequest",
+            "func (r ApiPostRequest) GoalInput(goalInput any) ApiPostRequest",
+            "func (r ApiListGetRequest) Execute() (*ListGoalsOutput, *http.Response, error)",
+        ] {
+            assert!(compat.contains(snippet), "missing {snippet}:\n{compat}");
         }
     }
 }

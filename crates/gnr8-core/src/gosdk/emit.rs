@@ -85,6 +85,15 @@ fn compat_exported(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for word in split_words(name) {
         let lower = word.to_ascii_lowercase();
+        if word.chars().all(|ch| ch.is_ascii_uppercase()) {
+            match lower.as_str() {
+                "id" | "uuid" | "url" | "api" | "http" | "json" => {
+                    out.push_str(&lower.to_ascii_uppercase());
+                    continue;
+                }
+                _ => {}
+            }
+        }
         let mut chars = lower.chars();
         if let Some(first) = chars.next() {
             out.extend(first.to_uppercase());
@@ -526,14 +535,14 @@ fn go_field_type(
 ) -> Result<String, CoreError> {
     if options.compat_model_helpers {
         let base = go_compat_base_type(&field.schema, graph)?;
-        if field.required {
-            return Ok(base);
-        }
         if field.nullable {
             if base == "map[string]any" {
                 return Ok(base);
             }
             return Ok(format!("*{base}"));
+        }
+        if field.required {
+            return Ok(base);
         }
         if compat_type_is_nilable(&base) {
             return Ok(base);
@@ -783,12 +792,131 @@ fn emit_enum(body: &mut String, name: &str, members: &[String]) -> Result<(), Co
     writeln!(body, ")").map_err(sink)?;
     writeln!(body).map_err(sink)?;
     writeln!(body, "const (").map_err(sink)?;
+    let mut emitted_compat_consts = BTreeSet::new();
     for value in members {
         let const_name = format!("{}{}", compat_exported(value), name);
-        writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
+        if emitted_compat_consts.insert(const_name.clone()) {
+            writeln!(body, "{const_name} {name} = \"{value}\"").map_err(sink)?;
+        }
+        for alias in compat_enum_constant_aliases(name, value) {
+            if emitted_compat_consts.insert(alias.clone()) {
+                writeln!(body, "{alias} {name} = \"{value}\"").map_err(sink)?;
+            }
+        }
     }
     writeln!(body, ")").map_err(sink)?;
     Ok(())
+}
+
+fn compat_enum_constant_aliases(name: &str, value: &str) -> Vec<String> {
+    let mut aliases = BTreeSet::new();
+    let value_name = compat_exported(value);
+    aliases.extend(compat_initialism_aliases(&format!("{value_name}{name}")));
+    aliases.extend(compat_initialism_aliases(&format!(
+        "{name}{}",
+        exported(value)
+    )));
+    aliases.insert(format!("{name}Type{}", exported(value)));
+    if let Some(owner_suffix) = name.strip_suffix("ValueType") {
+        if !owner_suffix.is_empty() {
+            aliases.insert(format!("{value_name}Type"));
+        }
+    }
+    if name.ends_with("ConditionType") {
+        if let Some(stripped) = value_name.strip_suffix("Static") {
+            if !stripped.is_empty() {
+                aliases.insert(format!("{stripped}ConditionType"));
+            }
+        }
+    }
+    if let Some(owner_suffix) = name.strip_suffix("Preference") {
+        if !owner_suffix.is_empty() {
+            aliases.insert(format!("{owner_suffix}{}", exported(value)));
+        }
+    }
+    if let Some(owner_suffix) = name.strip_prefix("LLM") {
+        if !owner_suffix.is_empty() {
+            let alias = format!("{owner_suffix}{}", exported(value));
+            aliases.insert(alias.clone());
+            aliases.extend(compat_initialism_aliases(&alias));
+        }
+    }
+    if let Some((_, subtype)) = value.rsplit_once('/') {
+        let subtype_name = subtype
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(compat_exported)
+            .collect::<String>();
+        if !subtype_name.is_empty() {
+            let alias = format!("{name}{subtype_name}");
+            aliases.insert(alias.clone());
+            aliases.extend(compat_initialism_aliases(&alias));
+        }
+    }
+    aliases.into_iter().collect()
+}
+
+fn compat_initialism_aliases(name: &str) -> Vec<String> {
+    const INITIALISMS: &[(&str, &str)] = &[
+        ("Ai", "AI"),
+        ("Api", "API"),
+        ("Gpt", "GPT"),
+        ("Http", "HTTP"),
+        ("Id", "ID"),
+        ("Json", "JSON"),
+        ("Jpeg", "JPEG"),
+        ("Gif", "GIF"),
+        ("Llm", "LLM"),
+        ("Oauth", "OAuth"),
+        ("Openai", "OpenAI"),
+        ("Pdf", "PDF"),
+        ("Png", "PNG"),
+        ("Url", "URL"),
+        ("Uuid", "UUID"),
+        ("Webp", "WebP"),
+    ];
+    let mut aliases = BTreeSet::new();
+    let mut pending = vec![name.to_string()];
+    for (from, to) in INITIALISMS {
+        let current = pending.clone();
+        for item in current {
+            for candidate in replace_word_like_token(&item, from, to) {
+                if candidate != item && aliases.insert(candidate.clone()) {
+                    pending.push(candidate);
+                }
+            }
+        }
+    }
+    aliases.into_iter().collect()
+}
+
+fn replace_word_like_token(name: &str, from: &str, to: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut offset = 0;
+    while let Some(found) = name[offset..].find(from) {
+        let start = offset + found;
+        let end = start + from.len();
+        let first = name[start..].chars().next();
+        let before_ok = start == 0
+            || name[..start]
+                .chars()
+                .last()
+                .is_some_and(|ch| !ch.is_ascii_alphanumeric())
+            || first.is_some_and(|ch| ch.is_ascii_uppercase());
+        let after_ok = name[end..]
+            .chars()
+            .next()
+            .map_or(true, |ch| ch.is_ascii_uppercase() || ch.is_ascii_digit());
+        if before_ok && after_ok {
+            let mut alias = String::with_capacity(name.len() + to.len().saturating_sub(from.len()));
+            alias.push_str(&name[..start]);
+            alias.push_str(to);
+            alias.push_str(&name[end..]);
+            aliases.push(alias);
+        }
+        offset = end;
+    }
+    aliases
 }
 
 fn compat_constructor_requires_field(_owner_name: &str, field: &Field) -> bool {
@@ -880,9 +1008,6 @@ pub(crate) fn emit_type_aliases(
         }
     }
     let mut imports = Vec::new();
-    if options.compat_model_helpers {
-        imports.push("encoding/json");
-    }
     if !options.compat_model_helpers
         && aliases.iter().any(|alias| {
             graph
@@ -900,6 +1025,1078 @@ pub(crate) fn emit_type_aliases(
         imports.push("time");
     }
     Ok(file(package, &imports, &body))
+}
+
+pub(crate) fn emit_compat_helpers(package: &str) -> String {
+    let body = "\
+func IsNil(value any) bool {
+if value == nil {
+return true
+}
+reflected := reflect.ValueOf(value)
+switch reflected.Kind() {
+case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+return reflected.IsNil()
+default:
+return false
+}
+}
+";
+    file(package, &["reflect"], body)
+}
+
+pub(crate) fn emit_compat_client_surface(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    auth_header: Option<&str>,
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    emit_compat_client_prelude(&mut body, auth_header);
+
+    let services = compat_services(graph);
+    let query_setters = compat_query_setters(graph);
+    for service in &services {
+        writeln!(body, "type {service}APIService service").map_err(sink)?;
+    }
+    writeln!(body).map_err(sink)?;
+    emit_compat_api_client(&mut body, &services)?;
+    for op in &graph.operations {
+        emit_compat_request(&mut body, op, graph, base_path, auth_header, &query_setters)?;
+    }
+
+    Ok(file(
+        package,
+        &[
+            "bytes",
+            "context",
+            "encoding/json",
+            "fmt",
+            "io",
+            "mime/multipart",
+            "net/http",
+            "net/url",
+            "path/filepath",
+            "reflect",
+            "strings",
+        ],
+        &body,
+    ))
+}
+
+fn emit_compat_client_prelude(body: &mut String, auth_header: Option<&str>) {
+    let default_auth_header = auth_header.unwrap_or("Authorization");
+    let _ = writeln!(
+        body,
+        "\
+type GenericOpenAPIError struct {{
+body []byte
+model any
+error string
+}}
+
+func (e GenericOpenAPIError) Error() string {{
+return e.error
+}}
+
+func (e GenericOpenAPIError) Body() []byte {{
+return e.body
+}}
+
+func (e GenericOpenAPIError) Model() any {{
+return e.model
+}}
+
+type compatNamedReader interface {{
+io.Reader
+Name() string
+}}
+
+func compatMultipartFileBody(file any, fields map[string]any) (*bytes.Reader, string, error) {{
+var buf bytes.Buffer
+writer := multipart.NewWriter(&buf)
+for key, value := range fields {{
+if err := writer.WriteField(key, compatQueryValue(value)); err != nil {{
+return nil, \"\", err
+}}
+}}
+if file != nil {{
+reader, ok := file.(compatNamedReader)
+if !ok {{
+return nil, \"\", fmt.Errorf(\"file must implement io.Reader and Name() string\")
+}}
+part, err := writer.CreateFormFile(\"file\", filepath.Base(reader.Name()))
+if err != nil {{
+return nil, \"\", err
+}}
+if _, err := io.Copy(part, reader); err != nil {{
+return nil, \"\", err
+}}
+if closer, ok := file.(io.Closer); ok {{
+_ = closer.Close()
+}}
+}}
+if err := writer.Close(); err != nil {{
+return nil, \"\", err
+}}
+return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
+}}
+
+type APIKey struct {{
+Key string
+Prefix string
+}}
+
+type ServerVariable struct {{
+Description string
+DefaultValue string
+EnumValues []string
+}}
+
+type ServerConfiguration struct {{
+URL string
+Description string
+Variables map[string]ServerVariable
+}}
+
+type ServerConfigurations []ServerConfiguration
+
+type Configuration struct {{
+DefaultHeader map[string]string
+UserAgent string
+Servers ServerConfigurations
+HTTPClient *http.Client
+}}
+
+func NewConfiguration() *Configuration {{
+return &Configuration{{
+DefaultHeader: map[string]string{{}},
+UserAgent: \"gnr8-compat/go\",
+Servers: ServerConfigurations{{{{URL: \"\"}}}},
+HTTPClient: http.DefaultClient,
+}}
+}}
+
+func (c *Configuration) AddDefaultHeader(key string, value string) {{
+if c.DefaultHeader == nil {{
+c.DefaultHeader = map[string]string{{}}
+}}
+c.DefaultHeader[key] = value
+}}
+
+func (c *Configuration) serverURL() string {{
+if c != nil && len(c.Servers) > 0 {{
+return c.Servers[0].URL
+}}
+return \"\"
+}}
+
+func (c *Configuration) ServerURLWithContext(_ context.Context, _ string) (string, error) {{
+return c.serverURL(), nil
+}}
+
+func reportError(format string, args ...any) error {{
+return fmt.Errorf(format, args...)
+}}
+
+func compatEncodeJSONBody(v any) (*bytes.Reader, error) {{
+var buf bytes.Buffer
+if err := json.NewEncoder(&buf).Encode(v); err != nil {{
+return nil, err
+}}
+return bytes.NewReader(buf.Bytes()), nil
+}}
+
+func compatDefaultAuthHeader() string {{
+return {}
+}}
+
+func compatQueryValue(value any) string {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return \"\"
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return \"\"
+}}
+return compatQueryValue(v.Elem().Interface())
+}}
+if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {{
+return fmt.Sprint(value)
+}}
+parts := make([]string, 0, v.Len())
+for i := 0; i < v.Len(); i++ {{
+parts = append(parts, fmt.Sprint(v.Index(i).Interface()))
+}}
+return strings.Join(parts, \",\")
+}}
+
+func compatSetQueryValue(q url.Values, key string, value any) {{
+q.Set(key, compatQueryValue(value))
+}}
+",
+        quoted_string_literal(default_auth_header)
+    );
+}
+
+fn emit_compat_api_client(body: &mut String, services: &[String]) -> Result<(), CoreError> {
+    writeln!(body, "type APIClient struct {{").map_err(sink)?;
+    writeln!(body, "cfg *Configuration").map_err(sink)?;
+    writeln!(body, "httpClient *http.Client").map_err(sink)?;
+    writeln!(body, "common service").map_err(sink)?;
+    for service in services {
+        writeln!(body, "{service}API *{service}APIService").map_err(sink)?;
+        for alias in compat_initialism_aliases(service) {
+            writeln!(body, "{alias}API *{service}APIService").map_err(sink)?;
+        }
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "type service struct {{").map_err(sink)?;
+    writeln!(body, "client *APIClient").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func NewAPIClient(cfg *Configuration) *APIClient {{").map_err(sink)?;
+    writeln!(body, "if cfg == nil {{").map_err(sink)?;
+    writeln!(body, "cfg = NewConfiguration()").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if cfg.HTTPClient == nil {{").map_err(sink)?;
+    writeln!(body, "cfg.HTTPClient = http.DefaultClient").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(
+        body,
+        "c := &APIClient{{cfg: cfg, httpClient: cfg.HTTPClient}}"
+    )
+    .map_err(sink)?;
+    writeln!(body, "c.common.client = c").map_err(sink)?;
+    for service in services {
+        writeln!(body, "c.{service}API = (*{service}APIService)(&c.common)").map_err(sink)?;
+        for alias in compat_initialism_aliases(service) {
+            writeln!(body, "c.{alias}API = c.{service}API").map_err(sink)?;
+        }
+    }
+    writeln!(body, "return c").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "func (c *APIClient) GetConfig() *Configuration {{").map_err(sink)?;
+    writeln!(body, "return c.cfg").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_compat_request(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    base_path: &str,
+    auth_header: Option<&str>,
+    global_query_setters: &[(String, String)],
+) -> Result<(), CoreError> {
+    let method_name = compat_operation_name(op);
+    let request_name = format!("Api{method_name}Request");
+    let service = compat_service_name(op);
+    let mut path_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "path").collect();
+    let path_order = path_tokens(&op.path);
+    path_params.sort_by_key(|p| {
+        path_order
+            .iter()
+            .position(|token| token == &p.name)
+            .unwrap_or(usize::MAX)
+    });
+    let query_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = body_model_of(op, graph)?;
+    let return_model = compat_success_return_model(op, graph)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(body, "type {request_name} struct {{").map_err(sink)?;
+    writeln!(body, "ctx context.Context").map_err(sink)?;
+    writeln!(body, "ApiService *{service}APIService").map_err(sink)?;
+    for param in &path_params {
+        writeln!(body, "{} any", lower_camel(&param.name),).map_err(sink)?;
+    }
+    for param in &query_params {
+        writeln!(body, "{} *any", lower_camel(&param.name)).map_err(sink)?;
+    }
+    writeln!(body, "body any").map_err(sink)?;
+    writeln!(body, "file any").map_err(sink)?;
+    writeln!(body, "extraQuery map[string]any").map_err(sink)?;
+    writeln!(body, "extraHeader map[string]string").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let mut emitted_methods = BTreeSet::new();
+    for param in &query_params {
+        let setter = compat_exported(&param.name);
+        for setter in compat_method_names(&setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_query_setter(
+                body,
+                &request_name,
+                &setter,
+                &param.name,
+                &lower_camel(&param.name),
+            )?;
+        }
+    }
+    for (setter, query_name) in global_query_setters {
+        for setter in compat_method_names(setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_extra_query_setter(body, &request_name, &setter, query_name)?;
+        }
+    }
+    for (setter, query_name) in compat_body_field_query_setters(body_model.as_deref(), graph) {
+        for setter in compat_method_names(&setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_extra_query_setter(body, &request_name, &setter, &query_name)?;
+        }
+    }
+    for setter in compat_body_setters(body_model.as_deref(), &service) {
+        for setter in compat_method_names(&setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_body_setter(body, &request_name, &setter)?;
+        }
+    }
+    emit_compat_file_and_auth_setters(body, &request_name)?;
+
+    writeln!(body).map_err(sink)?;
+    if return_model == "struct{}" {
+        writeln!(
+            body,
+            "func (r {request_name}) Execute() (*http.Response, error) {{"
+        )
+        .map_err(sink)?;
+    } else {
+        let return_ty = compat_return_type(&return_model);
+        writeln!(
+            body,
+            "func (r {request_name}) Execute() ({return_ty}, *http.Response, error) {{"
+        )
+        .map_err(sink)?;
+    }
+    emit_compat_execute_body(
+        body,
+        op,
+        base_path,
+        auth_header,
+        body_model.is_some(),
+        &return_model,
+        &path_params,
+        &query_params,
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let args: Result<Vec<_>, _> = path_params
+        .iter()
+        .map(|param| Ok(format!("{} any", lower_camel(&param.name),)))
+        .collect();
+    let args = args?;
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (a *{service}APIService) {method_name}(ctx context.Context{}) {request_name} {{",
+        if args.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", args.join(", "))
+        }
+    )
+    .map_err(sink)?;
+    writeln!(body, "return {request_name}{{").map_err(sink)?;
+    writeln!(body, "ApiService: a,").map_err(sink)?;
+    writeln!(body, "ctx: ctx,").map_err(sink)?;
+    for param in &path_params {
+        let field = lower_camel(&param.name);
+        writeln!(body, "{field}: {field},").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_compat_extra_query_setter(
+    body: &mut String,
+    request_name: &str,
+    setter: &str,
+    query_name: &str,
+) -> Result<(), CoreError> {
+    let arg = compat_arg_name(setter);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if r.extraQuery == nil {{").map_err(sink)?;
+    writeln!(body, "r.extraQuery = map[string]any{{}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(
+        body,
+        "r.extraQuery[{}] = {arg}",
+        quoted_string_literal(query_name)
+    )
+    .map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_compat_query_setter(
+    body: &mut String,
+    request_name: &str,
+    setter: &str,
+    query_name: &str,
+    field: &str,
+) -> Result<(), CoreError> {
+    let arg = compat_arg_name(setter);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "r.{field} = &{arg}").map_err(sink)?;
+    writeln!(body, "if r.extraQuery == nil {{").map_err(sink)?;
+    writeln!(body, "r.extraQuery = map[string]any{{}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(
+        body,
+        "r.extraQuery[{}] = {arg}",
+        quoted_string_literal(query_name)
+    )
+    .map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_compat_body_setter(
+    body: &mut String,
+    request_name: &str,
+    setter: &str,
+) -> Result<(), CoreError> {
+    let arg = compat_arg_name(setter);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "r.body = {arg}").map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn compat_arg_name(name: &str) -> String {
+    let candidate = lower_camel(name);
+    match candidate.as_str() {
+        "any" | "bool" | "byte" | "comparable" | "complex64" | "complex128" | "error"
+        | "float32" | "float64" | "int" | "int8" | "int16" | "int32" | "int64" | "rune"
+        | "string" | "uint" | "uint8" | "uint16" | "uint32" | "uint64" | "uintptr" => {
+            format!("{candidate}Value")
+        }
+        _ => candidate,
+    }
+}
+
+fn emit_compat_file_and_auth_setters(
+    body: &mut String,
+    request_name: &str,
+) -> Result<(), CoreError> {
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) File(file any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "r.file = file").map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) Authorization(authorization string) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if r.extraHeader == nil {{").map_err(sink)?;
+    writeln!(body, "r.extraHeader = map[string]string{{}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "r.extraHeader[\"Authorization\"] = authorization").map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_compat_execute_body(
+    body: &mut String,
+    op: &Operation,
+    base_path: &str,
+    auth_header: Option<&str>,
+    has_declared_body: bool,
+    return_model: &str,
+    path_params: &[&crate::graph::Param],
+    query_params: &[&crate::graph::Param],
+) -> Result<(), CoreError> {
+    let returns_value = return_model != "struct{}";
+    let returns_slice = return_model.starts_with("[]");
+    let returns_map = return_model.starts_with("map[");
+    if returns_value {
+        writeln!(
+            body,
+            "var localVarReturnValue {}",
+            compat_return_type(return_model)
+        )
+        .map_err(sink)?;
+    }
+    writeln!(body, "var reqBody *bytes.Reader").map_err(sink)?;
+    writeln!(body, "var reqContentType string").map_err(sink)?;
+    writeln!(body, "var err error").map_err(sink)?;
+    writeln!(body, "if r.file != nil {{").map_err(sink)?;
+    writeln!(
+        body,
+        "var contentType string\nreqBody, contentType, err = compatMultipartFileBody(r.file, r.extraQuery)"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "reqContentType = contentType").map_err(sink)?;
+    if has_declared_body {
+        writeln!(body, "}} else {{").map_err(sink)?;
+        writeln!(body, "bodyValue := r.body").map_err(sink)?;
+        writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
+        writeln!(body, "bodyValue = map[string]any{{}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "encodedBody, err := compatEncodeJSONBody(bodyValue)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(body, "reqContentType = \"application/json\"").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    } else {
+        writeln!(body, "}} else if r.body != nil {{").map_err(sink)?;
+        writeln!(body, "encodedBody, err := compatEncodeJSONBody(r.body)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(body, "reqContentType = \"application/json\"").map_err(sink)?;
+        writeln!(body, "}} else {{").map_err(sink)?;
+        writeln!(body, "reqBody = bytes.NewReader(nil)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+
+    emit_compat_request_url(body, op, base_path, path_params, returns_value)?;
+    emit_compat_query(body, query_params)?;
+    writeln!(
+        body,
+        "req, err := http.NewRequestWithContext(r.ctx, {}, parsedURL.String(), reqBody)",
+        quoted_string_literal(&op.method)
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if reqContentType != \"\" {{").map_err(sink)?;
+    writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "req.Header.Set(\"Accept\", \"application/json\")").map_err(sink)?;
+    writeln!(
+        body,
+        "for key, value := range r.ApiService.client.cfg.DefaultHeader {{"
+    )
+    .map_err(sink)?;
+    writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
+    writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if let Some(header) = auth_header {
+        writeln!(
+            body,
+            "if req.Header.Get({}) == \"\" && req.Header.Get(\"Authorization\") != \"\" {{",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "req.Header.Set({}, req.Header.Get(\"Authorization\"))",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "_ = compatDefaultAuthHeader()").map_err(sink)?;
+    writeln!(body, "resp, err := r.ApiService.client.httpClient.Do(req)").map_err(sink)?;
+    writeln!(body, "if err != nil || resp == nil {{").map_err(sink)?;
+    write_compat_return(body, returns_value, "localVarReturnValue", "resp", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "localVarBody, readErr := io.ReadAll(resp.Body)").map_err(sink)?;
+    writeln!(body, "resp.Body.Close()").map_err(sink)?;
+    writeln!(
+        body,
+        "resp.Body = io.NopCloser(bytes.NewBuffer(localVarBody))"
+    )
+    .map_err(sink)?;
+    writeln!(body, "if readErr != nil {{").map_err(sink)?;
+    write_compat_return(
+        body,
+        returns_value,
+        "localVarReturnValue",
+        "resp",
+        "readErr",
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "if resp.StatusCode >= 300 {{").map_err(sink)?;
+    write_compat_return(
+        body,
+        returns_value,
+        "localVarReturnValue",
+        "resp",
+        "&GenericOpenAPIError{body: localVarBody, error: resp.Status}",
+    )?;
+    writeln!(body, "}}").map_err(sink)?;
+    if returns_value {
+        if !returns_slice && !returns_map {
+            writeln!(body, "localVarReturnValue = new({return_model})").map_err(sink)?;
+        }
+        writeln!(body, "if len(localVarBody) > 0 {{").map_err(sink)?;
+        let unmarshal_target = if returns_slice || returns_map {
+            "&localVarReturnValue"
+        } else {
+            "localVarReturnValue"
+        };
+        writeln!(
+            body,
+            "if err := json.Unmarshal(localVarBody, {unmarshal_target}); err != nil {{"
+        )
+        .map_err(sink)?;
+        write_compat_return(
+            body,
+            returns_value,
+            "localVarReturnValue",
+            "resp",
+            "&GenericOpenAPIError{body: localVarBody, error: err.Error()}",
+        )?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    write_compat_return(body, returns_value, "localVarReturnValue", "resp", "nil")?;
+    Ok(())
+}
+
+fn emit_compat_request_url(
+    body: &mut String,
+    op: &Operation,
+    base_path: &str,
+    path_params: &[&crate::graph::Param],
+    returns_value: bool,
+) -> Result<(), CoreError> {
+    let abs = join_path(base_path, &op.path);
+    let tokens = path_tokens(&abs);
+    if tokens.is_empty() {
+        writeln!(
+            body,
+            "reqURL := r.ApiService.client.cfg.serverURL() + \"{abs}\""
+        )
+        .map_err(sink)?;
+    } else {
+        let mut format_str = abs.clone();
+        let mut args = Vec::new();
+        for token in &tokens {
+            format_str = format_str.replace(&format!("{{{token}}}"), "%s");
+            args.push(format!(
+                "url.PathEscape(fmt.Sprint(r.{}))",
+                lower_camel(token)
+            ));
+        }
+        if !path_tokens_match(
+            &tokens,
+            &path_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+        ) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' path '{}' templated tokens {:?} do not match its path params",
+                    op.id, abs, tokens
+                ),
+            });
+        }
+        writeln!(
+            body,
+            "reqURL := r.ApiService.client.cfg.serverURL() + fmt.Sprintf(\"{format_str}\", {})",
+            args.join(", ")
+        )
+        .map_err(sink)?;
+    }
+    writeln!(body, "parsedURL, err := url.Parse(reqURL)").map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_compat_query(
+    body: &mut String,
+    query_params: &[&crate::graph::Param],
+) -> Result<(), CoreError> {
+    if !query_params.is_empty() {
+        writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+        for param in query_params {
+            let field = lower_camel(&param.name);
+            writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+            writeln!(
+                body,
+                "compatSetQueryValue(q, {}, *r.{field})",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+    }
+    writeln!(body, "if len(r.extraQuery) > 0 && r.file == nil {{").map_err(sink)?;
+    writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+    writeln!(body, "for key, value := range r.extraQuery {{").map_err(sink)?;
+    writeln!(body, "compatSetQueryValue(q, key, value)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn compat_services(graph: &ApiGraph) -> Vec<String> {
+    graph
+        .operations
+        .iter()
+        .map(compat_service_name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn compat_query_setters(graph: &ApiGraph) -> Vec<(String, String)> {
+    let mut setters = BTreeSet::new();
+    for query_name in [
+        "client_id",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "force",
+        "grant_type",
+        "redirect_uri",
+    ] {
+        setters.insert((compat_exported(query_name), query_name.to_string()));
+    }
+    for op in &graph.operations {
+        for param in &op.params {
+            let setter = compat_exported(&param.name);
+            if compat_request_reserved_method(&setter) {
+                continue;
+            }
+            setters.insert((setter, param.name.clone()));
+        }
+    }
+    for schema in graph
+        .schemas
+        .iter()
+        .filter(|schema| compat_query_schema(schema))
+    {
+        let Type::Object(fields) = &schema.body else {
+            continue;
+        };
+        for field in fields {
+            let setter = compat_exported(&field.json_name);
+            if compat_request_reserved_method(&setter) {
+                continue;
+            }
+            setters.insert((setter, field.json_name.clone()));
+        }
+    }
+    setters.into_iter().collect()
+}
+
+fn compat_method_names(name: &str) -> Vec<String> {
+    const CANONICAL_TO_LEGACY: &[(&str, &str)] = &[
+        ("ID", "Id"),
+        ("UUID", "Uuid"),
+        ("URL", "Url"),
+        ("API", "Api"),
+        ("HTTP", "Http"),
+        ("JSON", "Json"),
+    ];
+    const LEGACY_TO_CANONICAL: &[(&str, &str)] = &[
+        ("Id", "ID"),
+        ("Uuid", "UUID"),
+        ("Url", "URL"),
+        ("Api", "API"),
+        ("Http", "HTTP"),
+        ("Json", "JSON"),
+    ];
+    let mut names = BTreeSet::from([name.to_string()]);
+    for (from, to) in CANONICAL_TO_LEGACY.iter().chain(LEGACY_TO_CANONICAL.iter()) {
+        for alias in replace_word_like_token(name, from, to) {
+            if !alias.is_empty() {
+                names.insert(alias);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn compat_query_schema(schema: &Schema) -> bool {
+    let name = schema.name.to_ascii_lowercase();
+    name.contains("query")
+        || name.contains("filter")
+        || name.contains("form")
+        || name.contains("oauth")
+        || name.contains("pdf")
+        || name.contains("search")
+        || name.contains("pagination")
+        || name.contains("paginated")
+        || name.contains("upload")
+}
+
+fn compat_body_field_query_setters(model: Option<&str>, graph: &ApiGraph) -> Vec<(String, String)> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    let Some(schema) = graph.schemas.iter().find(|schema| schema.name == model) else {
+        return Vec::new();
+    };
+    let Type::Object(fields) = &schema.body else {
+        return Vec::new();
+    };
+    let mut setters = BTreeSet::new();
+    for field in fields {
+        let setter = compat_exported(&field.json_name);
+        if compat_request_reserved_method(&setter) {
+            continue;
+        }
+        setters.insert((setter, field.json_name.clone()));
+    }
+    setters.into_iter().collect()
+}
+
+fn compat_service_name(op: &Operation) -> String {
+    op.group.as_deref().map_or_else(
+        || {
+            op.path
+                .split('/')
+                .find(|part| !part.trim().is_empty())
+                .map(compat_exported)
+                .unwrap_or_else(|| "Default".to_string())
+        },
+        compat_exported,
+    )
+}
+
+fn compat_operation_name(op: &Operation) -> String {
+    if op
+        .handler
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
+        return op.handler.clone();
+    }
+    let mut out = String::new();
+    for part in op.path.split('/') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let cleaned = part.trim_start_matches('{').trim_end_matches('}');
+        out.push_str(&compat_exported(cleaned));
+    }
+    out.push_str(&compat_exported(&op.method.to_ascii_lowercase()));
+    if out.is_empty() {
+        compat_exported(&op.handler)
+    } else {
+        out
+    }
+}
+
+fn compat_body_setters(model: Option<&str>, service: &str) -> Vec<String> {
+    let mut setters = BTreeSet::from(["Body".to_string()]);
+    setters.insert(service.to_string());
+    setters.insert(format!("{service}Config"));
+    if let Some(singular) = singular_compat_name(service) {
+        setters.insert(singular.clone());
+        setters.insert(format!("{singular}Config"));
+    }
+    let Some(model) = model else {
+        return filter_compat_body_setters(setters);
+    };
+    let words = split_words(model);
+    for start in 0..words.len() {
+        let suffix = words[start..].join("");
+        let exported_suffix = compat_exported(&suffix);
+        if !exported_suffix.is_empty() {
+            setters.insert(exported_suffix.clone());
+            for trimmed in compat_trimmed_body_setters(&exported_suffix) {
+                setters.insert(trimmed);
+            }
+        }
+    }
+    for word in &words {
+        let setter = compat_exported(word);
+        if !setter.is_empty() {
+            setters.insert(setter);
+        }
+    }
+    if words.iter().any(|word| word.eq_ignore_ascii_case("assign")) {
+        setters.insert("Assignment".to_string());
+    }
+    setters.insert("Request".to_string());
+    filter_compat_body_setters(setters)
+}
+
+fn singular_compat_name(name: &str) -> Option<String> {
+    if name.ends_with("ies") && name.len() > 3 {
+        return Some(format!("{}y", &name[..name.len() - 3]));
+    }
+    if name.ends_with('s') && !name.ends_with("ss") && name.len() > 1 {
+        return Some(name[..name.len() - 1].to_string());
+    }
+    None
+}
+
+fn filter_compat_body_setters(setters: BTreeSet<String>) -> Vec<String> {
+    setters
+        .into_iter()
+        .filter(|setter| !compat_request_reserved_method(setter))
+        .collect()
+}
+
+fn compat_request_reserved_method(name: &str) -> bool {
+    matches!(name, "Authorization" | "Execute" | "File")
+}
+
+fn compat_trimmed_body_setters(name: &str) -> Vec<String> {
+    const LEADING: &[&str] = &[
+        "Commandquery",
+        "CommandQuery",
+        "Command",
+        "Query",
+        "Dto",
+        "Create",
+        "Update",
+        "Delete",
+        "Get",
+        "List",
+        "Post",
+        "Put",
+        "Patch",
+        "Upload",
+    ];
+    const TRAILING: &[&str] = &[
+        "Input", "Request", "Output", "Response", "Dto", "Body", "Payload",
+    ];
+    let mut out = BTreeSet::new();
+    let mut current = name.to_string();
+    loop {
+        let mut changed = false;
+        for prefix in LEADING {
+            if current.len() > prefix.len() && current.starts_with(prefix) {
+                out.insert((*prefix).to_string());
+                current = current[prefix.len()..].to_string();
+                changed = true;
+                break;
+            }
+        }
+        for suffix in TRAILING {
+            if current.len() > suffix.len() && current.ends_with(suffix) {
+                current.truncate(current.len() - suffix.len());
+                changed = true;
+                break;
+            }
+        }
+        if !current.is_empty() {
+            out.insert(current.clone());
+        }
+        if !changed {
+            break;
+        }
+    }
+    if out.contains("VerifyEmail") {
+        out.insert("Verification".to_string());
+    }
+    out.into_iter().collect()
+}
+
+fn compat_return_type(return_model: &str) -> String {
+    if return_model.starts_with("[]") || return_model.starts_with("map[") {
+        return_model.to_string()
+    } else {
+        format!("*{return_model}")
+    }
+}
+
+fn compat_success_return_model(op: &Operation, graph: &ApiGraph) -> Result<String, CoreError> {
+    for resp in &op.responses {
+        if !(200..300).contains(&resp.status) {
+            continue;
+        }
+        let Some(body) = &resp.body else {
+            return Ok("struct{}".to_string());
+        };
+        let schema = graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == body.ref_id)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' success response references dangling $ref '{}'",
+                    op.id, body.ref_id
+                ),
+            })?;
+        return match &schema.body {
+            Type::Object(_) | Type::Enum(_) => Ok(schema.name.clone()),
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Any {} => go_compat_base_type(&schema.body, graph),
+            Type::Union(_) => Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' success response schema '{}' has an unsupported union body",
+                    op.id, schema.id
+                ),
+            }),
+        };
+    }
+    Ok("struct{}".to_string())
+}
+
+fn write_compat_return(
+    body: &mut String,
+    returns_value: bool,
+    value: &str,
+    resp: &str,
+    err: &str,
+) -> Result<(), CoreError> {
+    if returns_value {
+        writeln!(body, "return {value}, {resp}, {err}").map_err(sink)
+    } else {
+        writeln!(body, "return {resp}, {err}").map_err(sink)
+    }
 }
 
 fn emit_compat_alias_constructors(
@@ -940,14 +2137,20 @@ fn emit_compat_alias_constructors(
         .map(|field| lower_camel(&field.json_name))
         .collect();
     writeln!(body).map_err(sink)?;
-    writeln!(body, "func New{alias}({}) *{alias} {{", args?.join(", ")).map_err(sink)?;
-    writeln!(
-        body,
-        "return (*{alias})(New{canonical}({}))",
-        names.join(", ")
-    )
-    .map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
+    if !required.is_empty() && required.iter().all(|field| field.nullable) {
+        writeln!(body, "func New{alias}() *{alias} {{").map_err(sink)?;
+        writeln!(body, "return New{alias}WithDefaults()").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    } else {
+        writeln!(body, "func New{alias}({}) *{alias} {{", args?.join(", ")).map_err(sink)?;
+        writeln!(
+            body,
+            "return (*{alias})(New{canonical}({}))",
+            names.join(", ")
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
     Ok(())
 }
 
