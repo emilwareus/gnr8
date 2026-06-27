@@ -6,7 +6,7 @@ members = ["crates/gnr8-core", "crates/gnr8"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.10"
+version = "0.1.0"
 edition = "2021"        # D-08
 rust-version = "1.85"   # MSRV floor: clap 4.6 requires 1.85
 license = "MIT"         # matches repo LICENSE
@@ -46,4 +46,4 @@ notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consume
 ctrlc = "3.5"                   # graceful Ctrl-C → AtomicBool for the watch loop (consumed in 04-03;
                                 # the FSEvents backend suppresses the default SIGINT disposition, so the
                                 # std-only approach proved insufficient — RESEARCH A5 sanctioned fallback)
-gnr8 = { path = "crates/gnr8-core", version = "0.0.10" }
+gnr8 = { path = "crates/gnr8-core", version = "0.1.0" }
