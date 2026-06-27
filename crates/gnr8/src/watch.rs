@@ -79,7 +79,7 @@ impl LatencyReport {
     /// The human-readable one-liner (the non-`--json` rendering).
     fn human_line(&self) -> String {
         format!(
-            "[{}] regenerated in {} ms ({} written, {} unchanged)",
+            "watch: {} done in {} ms ({} written, {} unchanged)",
             self.scenario, self.millis, self.written, self.unchanged
         )
     }
@@ -246,7 +246,12 @@ fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
 ///
 /// Returns an error if the Ctrl-C handler cannot be installed, the debouncer cannot be created, or the
 /// project root cannot be watched. Per-batch regeneration errors are logged and the loop continues.
-pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow::Result<()> {
+pub(crate) fn run(
+    project_root: &Path,
+    debounce: Duration,
+    json: bool,
+    verbose: u8,
+) -> anyhow::Result<()> {
     let output_set = build_output_set(project_root);
     let gnr8_root = canonicalize_or_keep(&project_root.join(".gnr8"));
     let gnr8_src = canonicalize_or_keep(&project_root.join(".gnr8").join("src"));
@@ -332,7 +337,12 @@ pub(crate) fn run(project_root: &Path, debounce: Duration, json: bool) -> anyhow
                 while let Ok(more) = rx.try_recv() {
                     triggers += more;
                 }
-                regenerate_and_report(scenario_for_trigger_count(triggers), project_root, json);
+                regenerate_and_report(
+                    scenario_for_trigger_count(triggers),
+                    project_root,
+                    json,
+                    verbose,
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -359,7 +369,7 @@ fn regenerate_once(project_root: &Path) -> Result<GenerateOutcome, gnr8_core::Co
 
 /// Time one regeneration and print its latency line (human or `--json`). A regeneration error is logged
 /// to stderr and the loop continues (a transient pipeline failure must not kill a long-running watch).
-fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool) {
+fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool, verbose: u8) {
     let t0 = Instant::now();
     match regenerate_once(project_root) {
         Ok(outcome) => {
@@ -370,14 +380,14 @@ fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool) {
                 );
             }
             let report = LatencyReport::from_outcome(scenario, elapsed, &outcome);
-            print_report(&report, json);
+            print_report(&report, json, verbose, &outcome);
         }
         Err(err) => eprintln!("watch: regeneration failed (continuing): {err}"),
     }
 }
 
 /// Render a [`LatencyReport`] as a human line or, under `--json`, a single JSON record per line.
-fn print_report(report: &LatencyReport, json: bool) {
+fn print_report(report: &LatencyReport, json: bool, verbose: u8, outcome: &GenerateOutcome) {
     if json {
         match serde_json::to_string(report) {
             Ok(line) => println!("{line}"),
@@ -385,6 +395,13 @@ fn print_report(report: &LatencyReport, json: bool) {
         }
     } else {
         println!("{}", report.human_line());
+        if verbose > 0 {
+            println!(
+                "  outputs: {} deleted, {} skipped",
+                outcome.deleted.len(),
+                outcome.skipped.len()
+            );
+        }
     }
 }
 
@@ -396,7 +413,7 @@ fn print_report(report: &LatencyReport, json: bool) {
 /// Propagates a regeneration error (missing `.gnr8/`, a pipeline compile/run error, a missing Go
 /// toolchain) so startup fails loudly via the anyhow boundary rather than entering a watch loop with
 /// stale/absent outputs.
-pub(crate) fn cold_regenerate(project_root: &Path, json: bool) -> anyhow::Result<()> {
+pub(crate) fn cold_regenerate(project_root: &Path, json: bool, verbose: u8) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let outcome = regenerate_once(project_root).context("initial (cold) regeneration failed")?;
     let elapsed = t0.elapsed();
@@ -406,7 +423,7 @@ pub(crate) fn cold_regenerate(project_root: &Path, json: bool) -> anyhow::Result
         );
     }
     let report = LatencyReport::from_outcome("cold", elapsed, &outcome);
-    print_report(&report, json);
+    print_report(&report, json, verbose, &outcome);
     Ok(())
 }
 
@@ -668,6 +685,7 @@ mod tests {
             written: vec!["openapi.yaml".to_string(), "sdk/client.go".to_string()],
             unchanged: vec!["sdk/models.go".to_string()],
             skipped: vec![],
+            deleted: vec![],
         };
         let report =
             LatencyReport::from_outcome("single-file-edit", Duration::from_millis(42), &outcome);

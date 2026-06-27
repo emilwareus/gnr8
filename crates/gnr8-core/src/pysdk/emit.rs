@@ -1,13 +1,13 @@
 //! `format!`-based Python SDK emitters (D-05: no template engine; small internal templating only).
 //!
-//! Each emitter turns the router-agnostic [`crate::graph::ApiGraph`] into one idiomatic, dependency-free
-//! Python source file. Unlike [`crate::gosdk::emit`], there is NO `gofmt` normalization step (Python has
-//! no stdlib formatter; `black`/`autopep8` are third-party — CLAUDE.md rule 2): every emitter produces
+//! Each emitter turns the router-agnostic [`crate::graph::ApiGraph`] into one idiomatic Python source
+//! file. Unlike [`crate::gosdk::emit`], there is NO `gofmt` normalization step (Python has no stdlib
+//! formatter; `black`/`autopep8` are third-party — CLAUDE.md rule 2): every emitter produces
 //! already-correct, significant-whitespace Python directly.
 //!
-//! - [`emit_models`]   — one `@dataclass` per object [`Schema`] (fields partitioned required-first so the
-//!   class imports without a `TypeError` on Python 3.9), one `class X(str, enum.Enum)` per named enum
-//!   [`Schema`]; Python types follow [`py_type`].
+//! - [`emit_models`]   — one Pydantic v2 `BaseModel` per object [`Schema`] by default (or one
+//!   `@dataclass` in dataclass mode), plus one `class X(str, enum.Enum)` per named enum [`Schema`];
+//!   Python types follow [`py_type`].
 //! - [`emit_client`]   — the injectable `urllib.request.OpenerDirector`-backed `Client` (Task 3).
 //! - [`emit_errors`]   — the typed `ApiError(Exception)` (Task 3).
 //! - [`emit_operations`] / [`emit_init`] — the per-operation methods + the re-export surface (Task 3).
@@ -27,8 +27,11 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+    body_model_of, file_stem, join_path, path_tokens, path_tokens_match, quoted_string_literal,
+    split_words, success_of,
 };
+use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -47,13 +50,30 @@ fn sink(err: std::fmt::Error) -> CoreError {
 /// than a computed set — deterministic by construction (no `BTreeSet` to iterate). `from __future__
 /// import annotations` makes every annotation a lazy string, sidestepping Python-3.9 generic-subscription
 /// concerns (`List[..]`/`Optional[..]`) and forward-reference ordering between models.
-const MODELS_HEADER: &str = "\
+const DATACLASS_MODELS_HEADER: &str = "\
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 ";
+
+/// The fixed, deterministic import header for Pydantic v2 model files.
+const PYDANTIC_MODELS_HEADER: &str = "\
+from __future__ import annotations
+
+import enum
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+
+from pydantic import BaseModel, ConfigDict, Field
+";
+
+fn models_header(model_style: PyModelStyle) -> &'static str {
+    match model_style {
+        PyModelStyle::Pydantic => PYDANTIC_MODELS_HEADER,
+        PyModelStyle::Dataclass => DATACLASS_MODELS_HEADER,
+    }
+}
 
 /// Convert an identifier to `snake_case` (Python method/attribute name): `createBook` → `create_book`.
 pub(crate) fn snake(name: &str) -> String {
@@ -97,11 +117,94 @@ const RESERVED_ARGS: &[&str] = &["self", "body"];
 /// through this — only the *Python identifier* is renamed; callers keep the original `p.name`/`json_name`
 /// for the on-the-wire key (CR-02). One deterministic path, no fallback (rule 3).
 pub(crate) fn safe_ident(s: &str) -> String {
-    if PY_KEYWORDS.contains(&s) || s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        format!("{s}_")
-    } else {
+    let candidate = if s
+        .chars()
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+    {
         s.to_string()
+    } else {
+        let words = split_words(s)
+            .iter()
+            .map(|w| w.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if words.is_empty() {
+            "field".to_string()
+        } else {
+            words.join("_")
+        }
+    };
+
+    if PY_KEYWORDS.contains(&candidate.as_str()) {
+        format!("{candidate}_")
+    } else if candidate.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("_{candidate}")
+    } else {
+        candidate
     }
+}
+
+/// Whether a Python field identifier differs from its wire key and needs a Pydantic alias.
+fn needs_alias(field: &Field) -> bool {
+    pydantic_field_ident(field) != field.json_name
+}
+
+fn pydantic_field_ident(field: &Field) -> String {
+    safe_ident(&snake(&field.json_name))
+}
+
+/// Quote a Python string literal for generated source.
+fn py_string_literal(value: &str) -> String {
+    format!("{value:?}")
+}
+
+/// Emit a field default/metadata expression for a Pydantic v2 model.
+fn pydantic_field_expr(field: &Field, has_default: bool) -> String {
+    let default = if has_default { "default=None" } else { "..." };
+    if needs_alias(field) {
+        format!("{default}, alias={}", py_string_literal(&field.json_name))
+    } else if has_default {
+        "default=None".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Build the right-hand side for a Pydantic v2 field declaration.
+fn pydantic_field_rhs(field: &Field, has_default: bool) -> String {
+    let expr = pydantic_field_expr(field, has_default);
+    if expr.is_empty() {
+        String::new()
+    } else {
+        format!(" = Field({expr})")
+    }
+}
+
+/// Keep nullability in the type hint while using the default solely for key absence.
+fn optional_default_hint(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+    let hint = py_type(&field.schema, field.nullable, graph)?;
+    if field.nullable {
+        Ok(hint)
+    } else {
+        Ok(format!("Optional[{hint}]"))
+    }
+}
+
+fn pydantic_default_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+    Ok(format!(
+        "{}{}",
+        optional_default_hint(field, graph)?,
+        pydantic_field_rhs(field, true)
+    ))
+}
+
+fn pydantic_required_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+    Ok(format!(
+        "{}{}",
+        py_type(&field.schema, field.nullable, graph)?,
+        pydantic_field_rhs(field, false)
+    ))
 }
 
 /// Map a neutral graph [`Type`] to its Python type hint, resolving named refs to model names.
@@ -128,9 +231,9 @@ pub(crate) fn py_type(
 ) -> Result<String, CoreError> {
     let base = match schema {
         Type::Primitive(prim) => py_primitive(prim).to_string(),
-        // Every well-known scalar carries on the wire as a string in this dependency-free SDK (a
-        // date-time is an RFC-3339 `str`; a uuid/email/uri is a `str`) — A7. No `datetime` import, so
-        // the @dataclass marshals cleanly through `json`.
+        // Every well-known scalar carries on the wire as a string in this SDK (a date-time is an
+        // RFC-3339 `str`; a uuid/email/uri is a `str`) — A7. No `datetime` import, so model instances
+        // marshal cleanly through `json`.
         Type::WellKnown(_) => "str".to_string(),
         Type::Array(items) => format!("List[{}]", py_type(items, false, graph)?),
         // A keyed map and a free-form value map to `Dict[str, Any]` / `Any`.
@@ -189,11 +292,12 @@ fn py_primitive(prim: &Prim) -> &'static str {
     }
 }
 
-/// Emit `models.py`: one `@dataclass` per object schema + one `class X(str, enum.Enum)` per named enum.
+/// Emit `models.py`: one model class per object schema + one `class X(str, enum.Enum)` per named enum.
 ///
 /// Schemas are consumed in the graph's id-sorted order (determinism). A schema whose body is
-/// [`Type::Enum`] becomes a named enum class; a [`Type::Object`] becomes a `@dataclass`; every other
-/// body is a typed [`CoreError::SdkGen`] (mirror of the Go twin's non-object/non-enum arm).
+/// [`Type::Enum`] becomes a named enum class; a [`Type::Object`] becomes a Pydantic v2 model by default
+/// or a dataclass in dataclass mode; every other body is a typed [`CoreError::SdkGen`] (mirror of the Go
+/// twin's non-object/non-enum arm).
 ///
 /// `package` is currently unused in the body (the file carries no package clause in Python) but is kept
 /// in the signature to mirror the Go twin and the `generate` call site.
@@ -201,9 +305,28 @@ fn py_primitive(prim: &Prim) -> &'static str {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if a field's schema cannot be mapped or a schema body is unsupported.
-pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+#[cfg(test)]
+pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
+    emit_models_with_style(graph, package, PyModelStyle::default())
+}
+
+#[cfg(test)]
+pub(crate) fn emit_models_with_style(
+    graph: &ApiGraph,
+    package: &str,
+    model_style: PyModelStyle,
+) -> Result<String, CoreError> {
+    emit_models_with_style_and_aliases(graph, package, model_style, &[])
+}
+
+pub(crate) fn emit_models_with_style_and_aliases(
+    graph: &ApiGraph,
+    _package: &str,
+    model_style: PyModelStyle,
+    aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
     let mut out = String::new();
-    out.push_str(MODELS_HEADER);
+    out.push_str(models_header(model_style));
 
     // Schema NAMES (not ids) become the Python top-level symbols (class/alias) and the __init__
     // re-export surface. Two distinct ids that share a name would emit two `class Book` definitions
@@ -230,8 +353,9 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             // A named enum (top-level Schema body) → a `class X(str, enum.Enum)`. The `str` mixin makes
             // `json.dumps` serialize the member value as its string — the twin of Go's `type X string`.
             Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
-            // A named object → a `@dataclass`.
-            Type::Object(fields) => emit_dataclass(&mut out, &schema.name, fields, graph)?,
+            Type::Object(fields) => {
+                emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
+            }
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Union[Book, OutOfStock]`, or a
             // scalar/array/map alias) → a module-level type alias. This is the load-bearing divergence
             // from the Go twin, which rejected named unions outright (Go has no sum types). `py_type`
@@ -244,7 +368,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             | Type::Union(_)
             | Type::Any {} => {
                 // A module-level alias assignment is evaluated EAGERLY at import time (unlike a
-                // @dataclass annotation, which `from __future__ import annotations` keeps lazy). The
+                // model annotation, which `from __future__ import annotations` keeps lazy). The
                 // schemas are id-sorted, so an alias may reference a class defined LATER in the file
                 // (e.g. `BookOrError = Union[Book, OutOfStock]` precedes `OutOfStock`) — an eager RHS
                 // raises `NameError` at import. Emit the RHS as a PEP-484 string forward reference so
@@ -255,7 +379,139 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             }
         }
     }
+    if !aliases.is_empty() {
+        out.push('\n');
+        for alias in aliases {
+            writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
+        }
+    }
     Ok(out)
+}
+
+/// Emit one model schema into its own Python module.
+pub(crate) fn emit_model_schema(
+    graph: &ApiGraph,
+    schema: &crate::graph::Schema,
+    model_style: PyModelStyle,
+) -> Result<String, CoreError> {
+    let mut out = String::new();
+    out.push_str(models_header(model_style));
+    let deps = model_dependencies(&schema.body, graph, &schema.name);
+    if !deps.is_empty() {
+        writeln!(out, "if TYPE_CHECKING:").map_err(sink)?;
+        for dep in deps {
+            writeln!(
+                out,
+                "    from .{} import {}",
+                crate::sdk::emit_common::file_stem(&dep),
+                dep
+            )
+            .map_err(sink)?;
+        }
+    }
+    out.push('\n');
+    match &schema.body {
+        Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
+        Type::Object(fields) => {
+            emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => {
+            let alias = py_type(&schema.body, false, graph)?;
+            writeln!(out, "{} = \"{alias}\"", schema.name).map_err(sink)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Emit a split-model compatibility alias shim.
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+    format!(
+        "from __future__ import annotations\n\nfrom .{} import {} as {}\n\n__all__ = [\"{}\"]\n",
+        file_stem(&alias.canonical),
+        alias.canonical,
+        alias.alias,
+        alias.alias
+    )
+}
+
+/// Emit `models/__init__.py` for split-model layout.
+pub(crate) fn emit_models_init(graph: &ApiGraph, aliases: &[ResolvedTypeAlias]) -> String {
+    let mut out = String::new();
+    out.push_str("from __future__ import annotations\n\n");
+    for schema in &graph.schemas {
+        let _ = writeln!(
+            out,
+            "from .{} import {}",
+            file_stem(&schema.name),
+            schema.name
+        );
+    }
+    for alias in aliases {
+        let _ = writeln!(
+            out,
+            "from .{} import {}",
+            file_stem(&alias.alias),
+            alias.alias
+        );
+    }
+    out.push_str("\n__all__ = [\n");
+    for schema in &graph.schemas {
+        let _ = writeln!(out, "    \"{}\",", schema.name);
+    }
+    for alias in aliases {
+        let _ = writeln!(out, "    \"{}\",", alias.alias);
+    }
+    out.push_str("]\n\n");
+    out.push_str("_types_namespace = {name: globals()[name] for name in __all__}\n");
+    out.push_str("for _model in _types_namespace.values():\n");
+    out.push_str("    if hasattr(_model, \"model_rebuild\"):\n");
+    out.push_str("        _model.model_rebuild(_types_namespace=_types_namespace)\n");
+    out.push_str("del _model, _types_namespace\n");
+    out
+}
+
+fn model_dependencies(body: &Type, graph: &ApiGraph, self_name: &str) -> Vec<String> {
+    let mut deps = Vec::new();
+    collect_model_dependencies(body, graph, self_name, &mut deps);
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
+fn collect_model_dependencies(
+    schema: &Type,
+    graph: &ApiGraph,
+    self_name: &str,
+    out: &mut Vec<String>,
+) {
+    match schema {
+        Type::Named(ref_id) => {
+            if let Some(target) = graph.schemas.iter().find(|s| &s.id == ref_id) {
+                if target.name != self_name {
+                    out.push(target.name.clone());
+                }
+            }
+        }
+        Type::Array(items) => collect_model_dependencies(items, graph, self_name, out),
+        Type::Map { value, .. } => collect_model_dependencies(value, graph, self_name, out),
+        Type::Union(variants) => {
+            for variant in variants {
+                collect_model_dependencies(variant, graph, self_name, out);
+            }
+        }
+        Type::Object(fields) => {
+            for field in fields {
+                collect_model_dependencies(&field.schema, graph, self_name, out);
+            }
+        }
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) | Type::Any {} => {}
+    }
 }
 
 /// Emit a named enum class: `class {name}(str, enum.Enum)` with `MEMBER = "value"` lines.
@@ -356,6 +612,59 @@ fn decode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> String {
 /// required (no default) first, optional (default `= None`) last — before emitting. `kw_only=True` is
 /// Python 3.10+ and unavailable on 3.9, so partitioning is the 3.9-safe fix. The reorder is a
 /// presentation concern only: json keys are name-addressed, so wire behavior is unchanged.
+fn emit_model_class(
+    out: &mut String,
+    name: &str,
+    fields: &[Field],
+    graph: &ApiGraph,
+    model_style: PyModelStyle,
+) -> Result<(), CoreError> {
+    match model_style {
+        PyModelStyle::Pydantic => emit_pydantic_model(out, name, fields, graph),
+        PyModelStyle::Dataclass => emit_dataclass(out, name, fields, graph),
+    }
+}
+
+/// Emit a Pydantic v2 `BaseModel` for an object schema.
+fn emit_pydantic_model(
+    out: &mut String,
+    name: &str,
+    fields: &[Field],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    writeln!(out, "class {name}(BaseModel):").map_err(sink)?;
+    writeln!(
+        out,
+        "    model_config = ConfigDict(populate_by_name=True, extra=\"ignore\")"
+    )
+    .map_err(sink)?;
+    for field in fields {
+        let ident = pydantic_field_ident(field);
+        let suffix = if field.optional {
+            pydantic_default_suffix(field, graph)?
+        } else {
+            pydantic_required_suffix(field, graph)?
+        };
+        writeln!(out, "    {ident}: {suffix}").map_err(sink)?;
+    }
+    writeln!(out).map_err(sink)?;
+    writeln!(out, "    @classmethod").map_err(sink)?;
+    writeln!(
+        out,
+        "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+    )
+    .map_err(sink)?;
+    writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
+    writeln!(out).map_err(sink)?;
+    writeln!(out, "    def to_dict(self) -> Dict[str, Any]:").map_err(sink)?;
+    writeln!(
+        out,
+        "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+    )
+    .map_err(sink)?;
+    Ok(())
+}
+
 fn emit_dataclass(
     out: &mut String,
     name: &str,
@@ -472,7 +781,7 @@ class ApiError(Exception):
     .to_string()
 }
 
-/// Emit `client.py`: the dependency-free `Client` backed by an injectable `urllib` `OpenerDirector`.
+/// Emit `client.py`: the `Client` backed by an injectable `urllib` `OpenerDirector`.
 ///
 /// The operation methods (one per graph operation) are appended to this same file by [`emit_operations`]
 /// and re-frame into `client.py`. The `Client` holds a `base_url`, an optional `api_key`, and an
@@ -480,23 +789,53 @@ class ApiError(Exception):
 /// hermetic test injects (RESEARCH Pattern 3). `_do` builds a `urllib.request.Request`, sets the
 /// `Content-Type`/`X-API-Key` headers, opens via the injected opener, and catches
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
-pub(crate) fn emit_client(_package: &str) -> String {
-    "\
+#[cfg(test)]
+pub(crate) fn emit_client(package: &str) -> String {
+    emit_client_with_models(package, "models", PyModelStyle::default(), None)
+}
+
+/// Emit `client.py` with a configurable model package import path.
+pub(crate) fn emit_client_with_models(
+    _package: &str,
+    model_module: &str,
+    model_style: PyModelStyle,
+    auth_header: Option<&str>,
+) -> String {
+    let (extra_import, body_encode, body_comment) = match model_style {
+        PyModelStyle::Pydantic => (
+            "from pydantic import BaseModel\n",
+            "        if isinstance(body, BaseModel):\n            body = body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n",
+            "        # Pydantic v2 request models need alias-aware JSON-mode dumping before json.dumps.\n",
+        ),
+        PyModelStyle::Dataclass => (
+            "import dataclasses\n",
+            "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n",
+            "        # Dataclass request models need conversion before json.dumps.\n",
+        ),
+    };
+    let auth_line = auth_header.map_or_else(String::new, |header| {
+        format!(
+            "        if self._api_key:\n            req.add_header({}, self._api_key)\n",
+            quoted_string_literal(header)
+        )
+    });
+    let out = format!(
+        "\
 from __future__ import annotations
 
-import dataclasses
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
+{extra_import}
 from .errors import ApiError
 from .models import *  # noqa: F401,F403  (re-export models for return-type annotations)
 
 
 class Client:
-    \"\"\"Dependency-free SDK client over urllib (no requests/httpx).\"\"\"
+    \"\"\"SDK client over urllib (no requests/httpx).\"\"\"
 
     def __init__(
         self,
@@ -510,18 +849,12 @@ class Client:
         self._opener = opener or urllib.request.build_opener()
 
     def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
-        # A typed request-body model is a @dataclass, which json.dumps cannot serialize directly
-        # (TypeError) — marshal it to a dict first (dataclasses.asdict recurses into nested
-        # dataclasses). The single deterministic encode path; stdlib only (CLAUDE.md rule 2).
-        if body is not None and dataclasses.is_dataclass(body):
-            body = dataclasses.asdict(body)
+{body_comment}{body_encode}
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
         if data is not None:
             req.add_header(\"Content-Type\", \"application/json\")
-        if self._api_key:
-            req.add_header(\"X-API-Key\", self._api_key)
-        try:
+{auth_line}        try:
             with self._opener.open(req) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
@@ -530,11 +863,11 @@ class Client:
     @staticmethod
     def _raise(status: int, raw: bytes) -> None:
         try:
-            decoded = json.loads(raw) if raw else {}
+            decoded = json.loads(raw) if raw else {{}}
         except ValueError:
-            decoded = {}
+            decoded = {{}}
         if not isinstance(decoded, dict):
-            decoded = {}
+            decoded = {{}}
         raise ApiError(
             status,
             decoded.get(\"message\", \"\"),
@@ -542,7 +875,15 @@ class Client:
             decoded.get(\"hints\"),
         )
 "
-    .to_string()
+    );
+    if model_module == "models" {
+        out
+    } else {
+        out.replace(
+            "from .models import *",
+            &format!("from .{model_module} import *"),
+        )
+    }
 }
 
 /// Emit `client.py`'s operation methods (appended to the client file by [`generate`]).
@@ -554,22 +895,33 @@ class Client:
 ///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
 ///   present optional params; joins `base_path` + `op.path`;
 /// - calls `self._do`, and on a status != the operation's real success status raises `ApiError` via
-///   `self._raise`; on success decodes JSON into the response dataclass (or returns the raw dict).
+///   `self._raise`; on success decodes JSON into the response model (or returns the raw dict).
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] on a dangling body/response `$ref`, or a path whose templated tokens do
 /// not match its declared path params.
+#[cfg(test)]
 pub(crate) fn emit_operations(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+) -> Result<String, CoreError> {
+    emit_operations_with_style(graph, package, base_path, ops, PyModelStyle::default())
+}
+
+pub(crate) fn emit_operations_with_style(
     graph: &ApiGraph,
     _package: &str,
     base_path: &str,
     ops: &[&Operation],
+    model_style: PyModelStyle,
 ) -> Result<String, CoreError> {
     let mut out = String::new();
     for op in ops {
         out.push('\n');
-        emit_operation(&mut out, op, graph, base_path)?;
+        emit_operation(&mut out, op, graph, base_path, model_style)?;
     }
     Ok(out)
 }
@@ -651,11 +1003,13 @@ fn resolve_op_args<'op>(
 }
 
 /// Emit a single operation method (4-space indented as a `Client` method body).
+#[allow(clippy::too_many_lines)]
 fn emit_operation(
     out: &mut String,
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
+    model_style: PyModelStyle,
 ) -> Result<(), CoreError> {
     let method_name = snake(&op.handler);
     let abs = join_path(base_path, &op.path);
@@ -775,10 +1129,15 @@ fn emit_operation(
     writeln!(out, "        if _status != {success_status}:").map_err(sink)?;
     writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
     if let Some(model) = &return_model {
-        // Decode via the generated from_dict (CR-04): forward-compatible (ignores unknown response
-        // keys) and recursive into nested dataclasses, rather than the fragile `Model(**_data)`.
         writeln!(out, "        _data = json.loads(_raw) if _raw else {{}}").map_err(sink)?;
-        writeln!(out, "        return {model}.from_dict(_data)").map_err(sink)?;
+        match model_style {
+            PyModelStyle::Pydantic => {
+                writeln!(out, "        return {model}.model_validate(_data)").map_err(sink)?;
+            }
+            PyModelStyle::Dataclass => {
+                writeln!(out, "        return {model}.from_dict(_data)").map_err(sink)?;
+            }
+        }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
     }
@@ -788,7 +1147,17 @@ fn emit_operation(
 /// Emit `__init__.py`: re-export `Client`, `ApiError`, and every model/enum class so `import <pkg>`
 /// exposes the whole surface. Class names are emitted in graph order (deterministic). Twin of the Go
 /// twin's single-package surface (Go has no `__init__`, so this is Python-specific but deterministic).
-pub(crate) fn emit_init(graph: &ApiGraph, _package: &str) -> String {
+#[cfg(test)]
+pub(crate) fn emit_init(graph: &ApiGraph, package: &str) -> String {
+    emit_init_with_models(graph, package, "models")
+}
+
+/// Emit `__init__.py` with a configurable model package import path.
+pub(crate) fn emit_init_with_models(
+    graph: &ApiGraph,
+    _package: &str,
+    model_module: &str,
+) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
     out.push_str("from .client import Client\n");
@@ -797,7 +1166,7 @@ pub(crate) fn emit_init(graph: &ApiGraph, _package: &str) -> String {
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
     let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
     if !names.is_empty() {
-        out.push_str("from .models import (\n");
+        let _ = writeln!(out, "from .{model_module} import (");
         for name in &names {
             let _ = writeln!(out, "    {name},");
         }
@@ -821,10 +1190,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        emit_client, emit_errors, emit_init, emit_models, emit_operations, py_type,
-        screaming_snake, snake,
+        emit_client, emit_errors, emit_init, emit_models, emit_models_with_style, emit_operations,
+        py_type, screaming_snake, snake,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
+    use crate::sdk::model_style::PyModelStyle;
 
     /// A facts document covering the FastApi-bookstore shapes that diverge from the Go target: a named
     /// enum (`BookFormat`), a named union (`BookOrError`), an inline union field (`Book.rating:
@@ -1056,7 +1426,7 @@ mod tests {
     }
 
     mod models {
-        use super::{emit_models, sample_graph};
+        use super::{emit_models, emit_models_with_style, sample_graph, PyModelStyle};
 
         #[test]
         fn named_enum_emits_str_enum_class_with_screaming_snake_members() {
@@ -1074,11 +1444,12 @@ mod tests {
         }
 
         #[test]
-        fn dataclass_emits_required_fields_before_optional_fields() {
+        fn dataclass_style_emits_required_fields_before_optional_fields() {
             // BookFilters: genre (required), in_stock (optional), published (required-but-nullable),
             // sort (optional). Alphabetical graph order interleaves defaults; the emitter must put both
             // required fields (genre, published) before both optional ones (in_stock, sort).
-            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            let out = emit_models_with_style(&sample_graph(), "bookstore", PyModelStyle::Dataclass)
+                .unwrap();
             let genre = out.find("    genre:").expect("genre field");
             let published = out.find("    published:").expect("published field");
             let in_stock = out.find("    in_stock:").expect("in_stock field");
@@ -1101,11 +1472,11 @@ mod tests {
                 out.contains("    genre: str\n"),
                 "required has no default:\n{out}"
             );
-            // optional non-nullable bool → defaulted AND widened to Optional[bool] so `= None` is not a
-            // type-lie against the non-nullable value type (WR-02): the key-absent axis lives in the hint.
+            // optional non-nullable bool → defaulted and widened so generated wrappers can pass None
+            // before dumping with exclude_none.
             assert!(
-                out.contains("    in_stock: Optional[bool] = None\n"),
-                "optional non-nullable field must be Optional[..] defaulted (WR-02):\n{out}"
+                out.contains("    in_stock: Optional[bool] = Field(default=None)\n"),
+                "optional non-nullable field must accept None at wrapper boundaries:\n{out}"
             );
             // required-but-nullable → Optional hint, NO default (it is required/present).
             assert!(
@@ -1117,15 +1488,17 @@ mod tests {
         #[test]
         fn inline_enum_and_union_fields_use_literal_and_union_hints() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
-            // BookFilters.sort inline enum, optional + non-nullable → widened to Optional[Literal[..]]
-            // for the defaulted form (WR-02): `= None` is no longer a type-lie against the bare Literal.
+            // BookFilters.sort inline enum, optional + non-nullable → defaulted and widened for
+            // wrapper-boundary None values.
             assert!(
-                out.contains("    sort: Optional[Literal[\"asc\", \"desc\"]] = None"),
-                "optional inline enum field must be Optional[Literal[..]] defaulted (WR-02):\n{out}"
+                out.contains(
+                    "    sort: Optional[Literal[\"asc\", \"desc\"]] = Field(default=None)"
+                ),
+                "optional inline enum field must accept None at wrapper boundaries:\n{out}"
             );
             // Book.rating inline union, optional+nullable → Optional[Union[..]] = None.
             assert!(
-                out.contains("    rating: Optional[Union[int, float]] = None"),
+                out.contains("    rating: Optional[Union[int, float]] = Field(default=None)"),
                 "inline union field must be Optional[Union[..]] defaulted:\n{out}"
             );
         }
@@ -1137,10 +1510,40 @@ mod tests {
                 out.starts_with("from __future__ import annotations"),
                 "every module starts with the lazy-annotation future import:\n{out}"
             );
-            assert!(out.contains("from dataclasses import dataclass"), "{out}");
             assert!(out.contains("import enum"), "{out}");
             assert!(
-                out.contains("from typing import Any, Dict, List, Literal, Optional, Union"),
+                out.contains(
+                    "from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("from pydantic import BaseModel, ConfigDict, Field"),
+                "{out}"
+            );
+            assert!(out.contains("class Book(BaseModel):"), "{out}");
+            assert!(
+                out.contains("model_config = ConfigDict(populate_by_name=True, extra=\"ignore\")"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn pydantic_models_keep_from_dict_and_to_dict_compat_methods() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(
+                out.contains("def from_dict(cls, _data: Dict[str, Any]) -> \"Book\":"),
+                "Pydantic models should keep legacy decode compatibility:\n{out}"
+            );
+            assert!(out.contains("return cls.model_validate(_data)"), "{out}");
+            assert!(
+                out.contains("def to_dict(self) -> Dict[str, Any]:"),
+                "Pydantic models should keep legacy encode compatibility:\n{out}"
+            );
+            assert!(
+                out.contains(
+                    "return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+                ),
                 "{out}"
             );
         }
@@ -1264,9 +1667,8 @@ mod tests {
                 "compares real 201:\n{out}"
             );
             assert!(out.contains("self._raise(_status, _raw)"), "{out}");
-            // Typed return decodes via the forward-compatible recursive from_dict (CR-04).
             assert!(
-                out.contains("return CreatedMessage.from_dict(_data)"),
+                out.contains("return CreatedMessage.model_validate(_data)"),
                 "{out}"
             );
             assert!(
@@ -1351,7 +1753,7 @@ mod tests {
         use super::{emit_client, emit_errors, emit_init, ops_graph};
 
         #[test]
-        fn client_has_injectable_opener_and_no_third_party_imports() {
+        fn client_has_injectable_opener_and_no_third_party_http_imports() {
             let out = emit_client("bookstore");
             assert!(
                 out.contains("opener: Optional[urllib.request.OpenerDirector] = None"),
@@ -1388,7 +1790,9 @@ mod tests {
     /// each on an input shape the bookstore fixture does NOT exercise.
     mod regressions {
         use super::super::safe_ident;
-        use super::{emit_models, emit_operations, ApiGraph, Operation};
+        use super::{
+            emit_models, emit_models_with_style, emit_operations, ApiGraph, Operation, PyModelStyle,
+        };
 
         fn graph_from(facts: &[u8]) -> ApiGraph {
             let facts = serde_json::from_slice(facts).unwrap();
@@ -1403,7 +1807,7 @@ mod tests {
             assert_eq!(safe_ident("class"), "class_");
             assert_eq!(safe_ident("import"), "import_");
             // a leading-digit name is also unsafe as an identifier.
-            assert_eq!(safe_ident("2fast"), "2fast_");
+            assert_eq!(safe_ident("2fast"), "_2fast");
             // a non-keyword (e.g. `id`, `type`) is left untouched (they are builtins, not keywords).
             assert_eq!(safe_ident("id"), "id");
             assert_eq!(safe_ident("type"), "type");
@@ -1430,17 +1834,16 @@ mod tests {
                 "keyword field renamed:\n{out}"
             );
             assert!(
-                out.contains("    class_: Optional[str] = None"),
-                "keyword optional field renamed + widened:\n{out}"
-            );
-            // ... but the from_dict binds the ORIGINAL wire key.
-            assert!(
-                out.contains("from_=_data[\"from\"]"),
-                "wire key preserved:\n{out}"
+                out.contains("    class_: Optional[str] = Field(default=None, alias=\"class\")"),
+                "keyword optional field renamed + defaulted:\n{out}"
             );
             assert!(
-                out.contains("class_=(_data[\"class\"]) if \"class\" in _data"),
-                "optional wire key preserved:\n{out}"
+                out.contains("    from_: str = Field(..., alias=\"from\")"),
+                "required wire key preserved as alias:\n{out}"
+            );
+            assert!(
+                out.contains("alias=\"class\""),
+                "optional wire key preserved as alias:\n{out}"
             );
         }
 
@@ -1457,7 +1860,8 @@ mod tests {
                   "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } }
               ],
               "diagnostics": [] }"#;
-            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            let out =
+                emit_models_with_style(&graph_from(facts), "pkg", PyModelStyle::Dataclass).unwrap();
             // first collision keeps the base, the second is suffixed — both wire values intact.
             assert!(out.contains("    OUT_OF_STOCK = \"out-of-stock\""), "{out}");
             assert!(
@@ -1507,7 +1911,8 @@ mod tests {
                   "span": { "file": "/root/m.py", "start_line": 2, "end_line": 2 } }
               ],
               "diagnostics": [] }"#;
-            let out = emit_models(&graph_from(facts), "pkg").unwrap();
+            let out =
+                emit_models_with_style(&graph_from(facts), "pkg", PyModelStyle::Dataclass).unwrap();
             // a from_dict classmethod is emitted; nested object field recurses; nested array maps.
             assert!(
                 out.contains("def from_dict(cls, _data: Dict[str, Any])"),

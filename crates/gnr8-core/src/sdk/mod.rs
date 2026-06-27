@@ -30,10 +30,16 @@
 pub mod builtins;
 pub mod bundle;
 pub(crate) mod emit_common;
+pub mod layout;
+pub mod model_style;
+pub mod surface;
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use crate::graph::{ApiGraph, Diagnostic};
+use crate::manifest::blake3_hex;
 use crate::CoreError;
 
 /// The execution context handed to every stage.
@@ -69,6 +75,29 @@ pub struct Artifact {
     pub path: String,
     /// The file's full UTF-8 text contents.
     pub text: String,
+}
+
+/// A generated file's identity without its full text payload.
+///
+/// Stored beside the artifact cache so no-op host runs can classify files by path/hash without
+/// deserializing megabytes of generated SDK text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactMetadata {
+    /// The project-relative output path.
+    pub path: String,
+    /// The blake3 hash of the generated UTF-8 text bytes.
+    pub hash: String,
+}
+
+/// A metadata-only file identity for hot no-op checks.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct FileStamp {
+    /// Project-relative file path.
+    pub path: String,
+    /// File length in bytes.
+    pub len: u64,
+    /// File modification timestamp as nanoseconds since the Unix epoch.
+    pub modified_ns: u128,
 }
 
 /// The accumulating set of generated files, kept **sorted by path** for determinism.
@@ -120,6 +149,13 @@ impl Artifacts {
     pub fn into_files(self) -> Vec<Artifact> {
         self.files
     }
+
+    /// Build an artifact set from an already-sorted or unsorted file list, normalizing path order.
+    #[must_use]
+    pub fn from_files(mut files: Vec<Artifact>) -> Self {
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Self { files }
+    }
 }
 
 /// A source: source code (or an artifact) → IR (+ diagnostics on the graph).
@@ -134,6 +170,14 @@ pub trait Source {
     /// Returns a typed [`CoreError`] if the source cannot be loaded (e.g. the Go toolchain is missing
     /// or the source fails to parse). Never panics.
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError>;
+
+    /// Roots that define this source's input surface for host-side hot no-op checks.
+    ///
+    /// Returning `None` disables the pre-child fast path for this source. Built-in sources with
+    /// explicit input directories implement this; custom sources are conservative by default.
+    fn cache_input_roots(&self, _cx: &Cx) -> Option<Vec<PathBuf>> {
+        None
+    }
 }
 
 /// A transform: IR → IR, run (in order) on the merged graph before it is frozen for targets.
@@ -238,6 +282,51 @@ impl Pipeline {
         self
     }
 
+    /// Project-relative output anchors declared by every target in this pipeline.
+    ///
+    /// The child includes these in the artifact bundle so the host writer can prune files that used to
+    /// be produced by a generated output directory after a split-layout or naming change.
+    #[must_use]
+    pub fn output_anchors(&self) -> Vec<String> {
+        self.targets
+            .iter()
+            .flat_map(|target| target.output_anchors())
+            .collect()
+    }
+
+    /// Source input roots that are safe for the host to rescan before a hot no-op child skip.
+    #[must_use]
+    pub fn cache_input_roots(&self, cx: &Cx) -> Vec<String> {
+        let mut roots = Vec::new();
+        for source in &self.sources {
+            let Some(source_roots) = source.cache_input_roots(cx) else {
+                return Vec::new();
+            };
+            roots.extend(
+                source_roots
+                    .into_iter()
+                    .map(|root| project_relative_path(&cx.project_root, &root)),
+            );
+        }
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// File stamps for this pipeline's declared source input roots.
+    #[must_use]
+    pub fn cache_input_stamps(&self, cx: &Cx) -> Vec<FileStamp> {
+        let roots = self.cache_input_roots(cx);
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let mut paths = Vec::new();
+        for root in roots {
+            collect_cache_input_files(&cx.project_root.join(root), &mut paths);
+        }
+        stamp_project_paths(&cx.project_root, &paths).unwrap_or_default()
+    }
+
     /// Run the pipeline through transforms only and return the frozen IR (no targets, no posts).
     ///
     /// The shared front half of [`Pipeline::run`] and the runner's `__inspect` mode: load the single
@@ -279,11 +368,7 @@ impl Pipeline {
         // own previously-generated output (e.g. a committed `generated/sdk/*.go` Go package in the
         // analyzed module). Anchors are gathered from the targets' declared output paths; the same
         // `crate::lifecycle` exclusion is reused so there is ONE definition, no divergence.
-        let mut anchors: Vec<String> = self
-            .targets
-            .iter()
-            .flat_map(|t| t.output_anchors())
-            .collect();
+        let mut anchors: Vec<String> = self.output_anchors();
         anchors.push(crate::lifecycle::WORKSPACE_DIR.to_string());
         let anchor_refs: Vec<&str> = anchors.iter().map(String::as_str).collect();
         crate::lifecycle::exclude_output_anchors(&mut ir, &anchor_refs);
@@ -304,9 +389,34 @@ impl Pipeline {
     ///
     /// Propagates any source/transform/target/post error as its typed [`CoreError`]. Never panics.
     pub fn run(&self, cx: &Cx) -> Result<RunOutcome, CoreError> {
+        self.run_with_cache(cx, false)
+    }
+
+    pub(crate) fn run_for_emit(&self, cx: &Cx) -> Result<RunOutcome, CoreError> {
+        self.run_with_cache(cx, true)
+    }
+
+    fn run_with_cache(&self, cx: &Cx, compact_cache_hit: bool) -> Result<RunOutcome, CoreError> {
         let ir = self.build_ir(cx)?;
         // Collect diagnostics off the frozen IR (clone so the borrow ends before targets read `ir`).
         let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
+        let cache_key = artifact_cache_key(&ir, cx)?;
+        if compact_cache_hit && artifact_cache_exists(cx, &cache_key) {
+            return Ok(RunOutcome {
+                artifacts: Artifacts::new(),
+                diagnostics,
+                artifact_cache_key: Some(cache_key),
+                artifact_cache_hit: true,
+            });
+        }
+        if let Some(cached) = load_artifact_cache(cx, &cache_key) {
+            return Ok(RunOutcome {
+                artifacts: Artifacts::from_files(cached.artifacts),
+                diagnostics,
+                artifact_cache_key: Some(cache_key),
+                artifact_cache_hit: true,
+            });
+        }
 
         let mut artifacts = Artifacts::new();
         for target in &self.targets {
@@ -315,11 +425,357 @@ impl Pipeline {
         for post in &self.posts {
             post.run(&mut artifacts, cx)?;
         }
+        save_artifact_cache(cx, &cache_key, artifacts.files());
         Ok(RunOutcome {
             artifacts,
             diagnostics,
+            artifact_cache_key: Some(cache_key),
+            artifact_cache_hit: false,
         })
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ArtifactCache {
+    artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ArtifactMetadataCache {
+    artifacts: Vec<ArtifactMetadata>,
+}
+
+fn artifact_cache_key(ir: &ApiGraph, cx: &Cx) -> Result<String, CoreError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gnr8-artifact-cache-v2\n");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\n");
+    let ir_json = serde_json::to_vec(ir).map_err(|source| CoreError::SdkGen {
+        message: format!("failed to serialize IR for artifact cache key: {source}"),
+    })?;
+    hasher.update(blake3_hex(&ir_json).as_bytes());
+    hasher.update(b"\n");
+    hasher.update(config_surface_fingerprint(cx).as_bytes());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn config_surface_fingerprint(cx: &Cx) -> String {
+    let mut inputs = Vec::new();
+    let gnr8_dir = cx.project_root.join(crate::lifecycle::WORKSPACE_DIR);
+    collect_cache_input_files(&gnr8_dir.join("src"), &mut inputs);
+    for name in ["Cargo.toml", "Cargo.lock"] {
+        let path = gnr8_dir.join(name);
+        if path.is_file() {
+            inputs.push(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        inputs.push(exe);
+    }
+    hash_files(&inputs, &cx.project_root)
+}
+
+fn load_artifact_cache(cx: &Cx, key: &str) -> Option<ArtifactCache> {
+    let path = artifact_cache_path(cx, key);
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn artifact_cache_exists(cx: &Cx, key: &str) -> bool {
+    artifact_cache_path(cx, key).is_file()
+}
+
+/// Load cached artifacts for a child-emitted artifact-cache reference.
+#[must_use]
+pub fn load_artifact_cache_files(project_root: &Path, key: &str) -> Option<Vec<Artifact>> {
+    load_artifact_cache(&Cx::new(project_root.to_path_buf()), key).map(|cache| cache.artifacts)
+}
+
+/// Load cached artifact path/hash metadata for a child-emitted artifact-cache reference.
+#[must_use]
+pub fn load_artifact_cache_metadata(
+    project_root: &Path,
+    key: &str,
+) -> Option<Vec<ArtifactMetadata>> {
+    load_artifact_metadata_cache(&Cx::new(project_root.to_path_buf()), key)
+        .map(|cache| cache.artifacts)
+}
+
+fn save_artifact_cache(cx: &Cx, key: &str, artifacts: &[Artifact]) {
+    let path = artifact_cache_path(cx, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let cache = ArtifactCache {
+        artifacts: artifacts.to_vec(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    let _ = std::fs::write(path, bytes);
+
+    let metadata: Vec<ArtifactMetadata> = artifacts
+        .iter()
+        .map(|artifact| ArtifactMetadata {
+            path: artifact.path.clone(),
+            hash: blake3_hex(artifact.text.as_bytes()),
+        })
+        .collect();
+    save_artifact_metadata_cache(cx, key, &metadata);
+}
+
+fn artifact_cache_path(cx: &Cx, key: &str) -> PathBuf {
+    cx.project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("artifacts")
+        .join(format!("{key}.json"))
+}
+
+fn load_artifact_metadata_cache(cx: &Cx, key: &str) -> Option<ArtifactMetadataCache> {
+    let path = artifact_metadata_cache_path(cx, key);
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_artifact_metadata_cache(cx: &Cx, key: &str, artifacts: &[ArtifactMetadata]) {
+    let path = artifact_metadata_cache_path(cx, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let cache = ArtifactMetadataCache {
+        artifacts: artifacts.to_vec(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    let _ = std::fs::write(path, bytes);
+}
+
+fn artifact_metadata_cache_path(cx: &Cx, key: &str) -> PathBuf {
+    cx.project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("artifacts")
+        .join(format!("{key}.meta.json"))
+}
+
+pub(crate) fn collect_cache_input_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if matches!(
+                name,
+                ".context"
+                    | ".git"
+                    | ".gnr8"
+                    | "node_modules"
+                    | "target"
+                    | "vendor"
+                    | "__pycache__"
+            ) {
+                continue;
+            }
+            collect_cache_input_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+}
+
+pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut sorted = files.to_vec();
+    sorted.sort();
+    let mut cache = FileHashCacheState::load(root, FileHashCacheScope::Inputs);
+    for path in sorted {
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(cache.hash_path(&path).as_bytes());
+        hasher.update(b"\0");
+    }
+    cache.save();
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn hash_project_files(root: &Path, paths: &[String]) -> HashMap<String, Option<String>> {
+    let mut cache = FileHashCacheState::load(root, FileHashCacheScope::Outputs);
+    let mut out = HashMap::with_capacity(paths.len());
+    for path in paths {
+        let absolute = root.join(path);
+        let hash = absolute.is_file().then(|| cache.hash_path(&absolute));
+        out.insert(path.clone(), hash);
+    }
+    cache.save();
+    out
+}
+
+/// Build metadata-only stamps for project files.
+#[must_use]
+pub fn stamp_project_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
+    let mut stamps = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        stamps.push(FileStamp {
+            path: project_relative_path(root, path),
+            len: metadata.len(),
+            modified_ns: modified_ns(&metadata),
+        });
+    }
+    stamps.sort();
+    Some(stamps)
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct FileHashCache {
+    entries: BTreeMap<String, FileHashCacheEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FileHashCacheEntry {
+    len: u64,
+    modified_ns: u128,
+    hash: String,
+}
+
+struct FileHashCacheState {
+    path: Option<PathBuf>,
+    root: PathBuf,
+    cache: FileHashCache,
+    dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FileHashCacheScope {
+    Inputs,
+    Outputs,
+}
+
+impl FileHashCacheState {
+    fn load(root: &Path, scope: FileHashCacheScope) -> Self {
+        let path = file_hash_cache_path(root, scope);
+        let cache = path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            root: root.to_path_buf(),
+            cache,
+            dirty: false,
+        }
+    }
+
+    fn hash_path(&mut self, path: &Path) -> String {
+        let key = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Ok(metadata) = std::fs::metadata(path) else {
+            if self.cache.entries.remove(&key).is_some() {
+                self.dirty = true;
+            }
+            return "<missing>".to_string();
+        };
+        let fingerprint = FileHashFingerprint::from_metadata(&metadata);
+        if let Some(entry) = self.cache.entries.get(&key) {
+            if entry.len == fingerprint.len && entry.modified_ns == fingerprint.modified_ns {
+                return entry.hash.clone();
+            }
+        }
+        let hash = match std::fs::read(path) {
+            Ok(bytes) => blake3_hex(&bytes),
+            Err(_) => "<missing>".to_string(),
+        };
+        self.cache.entries.insert(
+            key,
+            FileHashCacheEntry {
+                len: fingerprint.len,
+                modified_ns: fingerprint.modified_ns,
+                hash: hash.clone(),
+            },
+        );
+        self.dirty = true;
+        hash
+    }
+
+    fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec(&self.cache) else {
+            return;
+        };
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+struct FileHashFingerprint {
+    len: u64,
+    modified_ns: u128,
+}
+
+impl FileHashFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified_ns: modified_ns(metadata),
+        }
+    }
+}
+
+fn modified_ns(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn file_hash_cache_path(root: &Path, scope: FileHashCacheScope) -> Option<PathBuf> {
+    let gnr8_dir = root.join(crate::lifecycle::WORKSPACE_DIR);
+    let file_name = match scope {
+        FileHashCacheScope::Inputs => "input-file-hashes.json",
+        FileHashCacheScope::Outputs => "output-file-hashes.json",
+    };
+    gnr8_dir
+        .is_dir()
+        .then(|| gnr8_dir.join("cache").join(file_name))
 }
 
 /// The result of a [`Pipeline::run`]: the generated artifacts + the diagnostics collected from the IR.
@@ -329,6 +785,10 @@ pub struct RunOutcome {
     pub artifacts: Artifacts,
     /// Diagnostics carried by the IR after transforms (lossy/unsupported source patterns).
     pub diagnostics: Vec<Diagnostic>,
+    /// Artifact cache key for this run, when available.
+    pub artifact_cache_key: Option<String>,
+    /// Whether target generation was skipped because the artifact cache was already warm.
+    pub artifact_cache_hit: bool,
 }
 
 /// The composition surface a `.gnr8/` lifecycle imports: `use gnr8_core::sdk::prelude::*;`.
@@ -337,10 +797,17 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApplySecurity, FastApi, Flask, GoGin, GoSdk, Header, NestJs, OpenApi31, PySdk,
-        RenameOperation, RenameType, SetBasePath, SetTitle, TsSdk,
+        ApplySecurity, FastApi, Flask, GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31,
+        OpenApi31Json, PySdk, RenameOperation, RenameType, SetBasePath,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
-    pub use super::{Artifact, Artifacts, Cx, Pipeline, PostProcess, Source, Target, Transform};
+    pub use super::layout::SdkFileLayout;
+    pub use super::model_style::PyModelStyle;
+    pub use super::surface::SdkTypeAliases;
+    pub use super::{
+        Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
+        Target, Transform,
+    };
     pub use crate::graph::SecurityScheme;
 }
 

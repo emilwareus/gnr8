@@ -69,6 +69,34 @@ pub fn to_openapi(
     base_path: &str,
     security: &[GraphSecurityScheme],
 ) -> Result<String, crate::CoreError> {
+    let doc = build_openapi_doc(graph, title, base_path, security)?;
+    Ok(yaml::write(&doc))
+}
+
+/// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document serialized as pretty JSON.
+///
+/// # Errors
+///
+/// Returns [`crate::CoreError::Lowering`] if the graph cannot be lowered or the `OpenAPI` document
+/// cannot be serialized.
+pub fn to_openapi_json(
+    graph: &ApiGraph,
+    title: &str,
+    base_path: &str,
+    security: &[GraphSecurityScheme],
+) -> Result<String, crate::CoreError> {
+    let doc = build_openapi_doc(graph, title, base_path, security)?;
+    serde_json::to_string_pretty(&doc).map_err(|err| crate::CoreError::Lowering {
+        message: format!("failed to serialize OpenAPI JSON: {err}"),
+    })
+}
+
+fn build_openapi_doc(
+    graph: &ApiGraph,
+    title: &str,
+    base_path: &str,
+    security: &[GraphSecurityScheme],
+) -> Result<OpenApiDoc, crate::CoreError> {
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
         .schemas
@@ -80,7 +108,7 @@ pub fn to_openapi(
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
     let security = build_security(security)?;
 
-    let doc = OpenApiDoc {
+    Ok(OpenApiDoc {
         openapi: "3.1.0",
         info: Info {
             title: title.to_string(),
@@ -93,9 +121,7 @@ pub fn to_openapi(
             security_schemes: security.schemes,
             schemas,
         },
-    };
-
-    Ok(yaml::write(&doc))
+    })
 }
 
 /// The lowered security: the top-level `security` requirements and the `components.securitySchemes`,
@@ -290,11 +316,10 @@ fn build_component_schemas(
         .collect()
 }
 
-/// Lower one named graph [`Schema`] (an [`Type::Object`], [`Type::Enum`], or [`Type::Union`] body) into
-/// a [`SchemaObject`]. A named schema's body is a neutral [`Type`]; `Object`/`Enum`/`Union` are valid
-/// component bodies, every other variant is an explicit typed error (a named schema is never a bare
-/// scalar/array/ref). The match is exhaustive — no `_ =>`/`other =>` arm — so a future [`Type`] variant
-/// fails to compile here until it is handled (T-03).
+/// Lower one named graph [`Schema`] into a component [`SchemaObject`]. A named schema's body is a
+/// neutral [`Type`]: structs, string enums, scalar aliases, array aliases, map aliases, unions, and
+/// `Any` aliases are all valid component bodies. The match is exhaustive — no `_ =>`/`other =>` arm —
+/// so a future [`Type`] variant fails to compile here until it is handled (T-03).
 fn lower_named_schema(
     schema: &Schema,
     ref_to_name: &BTreeMap<&str, &str>,
@@ -310,25 +335,15 @@ fn lower_named_schema(
             })
         }
         Type::Object(fields) => lower_object(fields, ref_to_name),
-        // A sum type (e.g. a Python `Union[A, B]` / `A | B` alias) is a legitimate NAMED component:
-        // it lowers to the 3.1 `oneOf` of its lowered variants (the same shape `lower_schema_type`
-        // produces inline), so a route can `$ref` it as a response/body. Languages without sum types
-        // (Go) simply never emit a union-bodied named schema, so this arm is inert for them.
-        Type::Union(_) => lower_schema_type(&schema.body, ref_to_name),
-        // A named component is otherwise a struct/class (Object), a string enum (Enum), or a union
-        // (above). Any other neutral type as a *named* body is a contract error — an explicit arm, not
-        // a catch-all (T-03).
+        // Named aliases lower exactly like inline field schemas, but live under components so other
+        // schemas and SDK model split layouts can reference them by name.
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
         | Type::Map { .. }
+        | Type::Union(_)
         | Type::Named(_)
-        | Type::Any {} => Err(crate::CoreError::Lowering {
-            message: format!(
-                "named schema '{}' has a non-object/non-enum body that cannot be a component",
-                schema.id
-            ),
-        }),
+        | Type::Any {} => lower_schema_type(&schema.body, ref_to_name),
     }
 }
 
@@ -754,17 +769,24 @@ mod tests {
     }
 
     #[test]
-    fn named_schema_with_non_object_body_returns_lowering_error() {
+    fn named_schema_with_array_body_lowers_to_component_alias() {
         use crate::graph::Type;
         let mut graph = sample_graph();
-        // A named component whose body is a bare array (not Object/Enum) cannot be a component schema:
-        // an EXPLICIT typed error arm, not a swallowed catch-all (T-03).
+        // A named component whose body is an array alias is a valid component schema. This is needed
+        // for source languages where DTO fields can refer to named collection/scalar aliases.
+        graph.schemas[1].name = "ArrayAlias".to_string();
         graph.schemas[1].body = Type::Array(Box::new(Type::Primitive(crate::graph::Prim::String)));
-        let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
-        let crate::CoreError::Lowering { message } = err else {
-            panic!("expected Lowering, got {err:?}");
-        };
-        assert!(message.contains("non-object/non-enum body"), "{message}");
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let schema_block = yaml
+            .split("  ArrayAlias:")
+            .nth(1)
+            .expect("ArrayAlias component")
+            .split("  GoalResponse:")
+            .next()
+            .expect("component block");
+        assert!(schema_block.contains("type: array"), "{schema_block}");
+        assert!(schema_block.contains("items:"), "{schema_block}");
+        assert!(schema_block.contains("type: string"), "{schema_block}");
     }
 
     #[test]

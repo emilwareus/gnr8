@@ -17,7 +17,10 @@
 mod emit;
 
 use crate::graph::{ApiGraph, Operation};
-use crate::sdk::bundle::{self, SdkBundle, SdkFile};
+use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::emit_common::{api_key_header_name, file_in_dir, file_stem, model_file_name};
+use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
 /// TSSDK-01).
@@ -43,13 +46,50 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
+    generate_with_layout(graph, package, base_path, &SdkFileLayout::compact())
+}
+
+/// Generate the TypeScript SDK with a configurable file layout.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`].
+pub fn generate_with_layout(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+) -> Result<String, crate::CoreError> {
+    let aliases = SdkTypeAliases::default();
+    let files = generate_files_with_layout(graph, package, base_path, layout, &aliases)?;
+    let bundle = SdkBundle { files };
+    Ok(bundle.to_string())
+}
+
+pub(crate) fn generate_files_with_layout(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let mut client = emit::emit_client(package);
-    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    let model_dir = layout.model_dir_ref().unwrap_or("models");
+    let mut client =
+        emit::emit_client_with_models(package, model_dir.trim_matches('/'), auth_header.as_deref());
+    client.push_str(&emit::emit_operations(
+        graph,
+        package,
+        base_path,
+        &ops,
+        auth_header.as_deref(),
+    )?);
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -62,17 +102,47 @@ pub fn generate(
 
     files.push(SdkFile {
         name: "index.ts".to_string(),
-        contents: emit::emit_index(graph, package)?,
+        contents: emit::emit_index_with_models(
+            graph,
+            package,
+            model_dir.trim_matches('/'),
+            &resolved_aliases,
+        )?,
     });
 
-    files.push(SdkFile {
-        name: "models.ts".to_string(),
-        contents: emit::emit_models(graph, package)?,
-    });
+    if layout.is_split() {
+        files.push(SdkFile {
+            name: file_in_dir(Some(model_dir), "index.ts"),
+            contents: emit::emit_models_index(graph, &resolved_aliases)?,
+        });
+        for schema in &graph.schemas {
+            let default_name =
+                file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
+            let name = if layout.model_file_template_ref().is_some() {
+                model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
+            } else {
+                default_name
+            };
+            files.push(SdkFile {
+                name,
+                contents: emit::emit_model_schema(graph, schema)?,
+            });
+        }
+        for alias in &resolved_aliases {
+            files.push(SdkFile {
+                name: file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias))),
+                contents: emit::emit_model_alias(alias),
+            });
+        }
+    } else {
+        files.push(SdkFile {
+            name: "models.ts".to_string(),
+            contents: emit::emit_models_with_aliases(graph, package, &resolved_aliases)?,
+        });
+    }
 
-    // The bundle's fixed alpha order is established by push order above.
-    let bundle = SdkBundle { files };
-    Ok(bundle.to_string())
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
 }
 
 /// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
@@ -80,8 +150,9 @@ pub fn generate(
 /// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
 /// per-file outputs without re-implementing the marker split. Single source of truth for the framing —
 /// the same one [`write_to_dir`] uses. (Consumed by the `TsSdk` target in `sdk::builtins`.)
+#[cfg(test)]
 pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
-    bundle::parse(bundle)
+    crate::sdk::bundle::parse(bundle)
 }
 
 #[cfg(test)]
@@ -92,9 +163,10 @@ mod tests {
     // hermetic typecheck lands in plan 03's tests/tssdk_compile.rs).
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, split_bundle};
+    use super::{generate, generate_with_layout, split_bundle};
     use crate::graph::ApiGraph;
     use crate::sdk::bundle::write_to_dir;
+    use crate::sdk::layout::SdkFileLayout;
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.
@@ -219,7 +291,7 @@ mod tests {
 
     #[test]
     fn write_to_dir_rejects_an_unsafe_frame_name() {
-        // A hand-forged bundle whose frame name contains a path separator must be refused (T-05-01-01).
+        // A hand-forged bundle whose frame name escapes the target dir must be refused (T-05-01-01).
         let evil = "// ==== gnr8:file ../escape.ts ====\nexport const x = 1;\n";
         let dir = std::env::temp_dir();
         let err = write_to_dir(evil, &dir).unwrap_err();
@@ -242,5 +314,55 @@ mod tests {
             assert!(dir.join(name).is_file(), "missing materialized {name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_emits_models_directory_with_barrel_file() {
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &SdkFileLayout::split())
+            .unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "client.ts",
+                "errors.ts",
+                "index.ts",
+                "models/book.ts",
+                "models/book_format.ts",
+                "models/created_message.ts",
+                "models/index.ts",
+            ]
+        );
+        assert!(
+            !names.contains(&"models.ts"),
+            "split layout must not emit compact models.ts"
+        );
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("gnr8-tssdk-split-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_to_dir(&out, &dir).unwrap();
+        assert!(dir.join("models/book.ts").is_file());
+        assert!(dir.join("models/index.ts").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_can_place_models_in_a_configured_directory() {
+        let layout = SdkFileLayout::split().model_dir("schemas");
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"schemas/book.ts"));
+        assert!(names.contains(&"schemas/index.ts"));
+        assert!(
+            out.contains("import * as models from \"./schemas\";"),
+            "{out}"
+        );
+        assert!(out.contains("} from \"./schemas\";"), "{out}");
     }
 }

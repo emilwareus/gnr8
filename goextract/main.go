@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	goextract <target-dir>
+//	goextract <target-dir> [package-pattern...]
 //
 // 02-01 extracts DTO struct/enum schemas + float64/free-form-map diagnostics.
 // Routes/handlers (02-02) and the Rust ApiGraph/inspect (02-03) build on this.
@@ -31,8 +31,9 @@ func main() {
 		os.Exit(1)
 	}
 	targetDir := os.Args[1]
+	patterns := os.Args[2:]
 
-	if err := run(targetDir, os.Stdout); err != nil {
+	if err := run(targetDir, patterns, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "goextract:", err)
 		os.Exit(1)
 	}
@@ -41,8 +42,8 @@ func main() {
 // run loads the module, builds the facts document, and writes JSON to w. Any hard
 // loader failure is returned as an error; per-package load errors become
 // diagnostics (GO-06) so a partial graph is never silently emitted.
-func run(targetDir string, w *os.File) error {
-	res, err := load.Load(targetDir)
+func run(targetDir string, patterns []string, w *os.File) error {
+	res, err := load.Load(targetDir, patterns...)
 	if err != nil {
 		return err
 	}

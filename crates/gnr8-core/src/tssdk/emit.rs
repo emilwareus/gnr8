@@ -30,8 +30,10 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, join_path, path_tokens, path_tokens_match, split_words, success_of,
+    body_model_of, file_stem, join_path, path_tokens, path_tokens_match, quoted_string_literal,
+    split_words, success_of,
 };
+use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -263,7 +265,16 @@ fn check_unique_schema_names(graph: &ApiGraph) -> Result<(), CoreError> {
     Ok(())
 }
 
-pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+#[cfg(test)]
+pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
+    emit_models_with_aliases(graph, package, &[])
+}
+
+pub(crate) fn emit_models_with_aliases(
+    graph: &ApiGraph,
+    _package: &str,
+    aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
     let mut out = String::new();
 
     check_unique_schema_names(graph)?;
@@ -277,7 +288,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             // Python's `class X(str, enum.Enum)` and Go's `type X string`.
             Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
             // A named object → an `interface`.
-            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph)?,
+            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
             // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
             // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
@@ -296,7 +307,49 @@ pub(crate) fn emit_models(graph: &ApiGraph, _package: &str) -> Result<String, Co
             }
         }
     }
+    for alias in aliases {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
+    }
     Ok(out)
+}
+
+/// Emit one model schema into its own TypeScript file.
+pub(crate) fn emit_model_schema(
+    graph: &ApiGraph,
+    schema: &crate::graph::Schema,
+) -> Result<String, CoreError> {
+    check_unique_schema_names(graph)?;
+    let mut out = String::new();
+    out.push_str("import type * as models from \"./index\";\n\n");
+    match &schema.body {
+        Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
+        Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "models.")?,
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Named(_)
+        | Type::Union(_)
+        | Type::Any {} => {
+            let alias = ts_type(&schema.body, false, graph, "models.")?;
+            writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Emit a split-model compatibility alias shim.
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+    format!(
+        "import type {{ {} }} from \"./{}\";\n\nexport type {} = {};\n",
+        alias.canonical,
+        file_stem(&alias.canonical),
+        alias.alias,
+        alias.canonical
+    )
 }
 
 /// Emit a named enum alias: `export type {name} = "a" | "b";` (members in graph order). The wire string
@@ -326,6 +379,7 @@ fn emit_interface(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    ns: &str,
 ) -> Result<(), CoreError> {
     if fields.is_empty() {
         // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
@@ -345,7 +399,7 @@ fn emit_interface(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let hint = ts_type(&field.schema, field.nullable, graph, "")?;
+        let hint = ts_type(&field.schema, field.nullable, graph, ns)?;
         let opt = if field.optional { "?" } else { "" };
         writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
@@ -381,26 +435,53 @@ export class ApiError extends Error {
 /// the platform `fetch` — the swappable injectable transport seam (RESEARCH Pattern 3). No `axios` /
 /// `node-fetch` import; `typeof fetch` needs the DOM lib at typecheck time (handled by the test's
 /// `--lib es2022,dom`).
-pub(crate) fn emit_client(_package: &str) -> String {
-    "\
-import { ApiError } from \"./errors\";
-import * as models from \"./models\";
-
-export interface ClientOptions {
-  baseUrl: string;
-  fetch?: typeof fetch;
+#[cfg(test)]
+pub(crate) fn emit_client(package: &str) -> String {
+    emit_client_with_models(package, "models", None)
 }
 
-export class Client {
+/// Emit `client.ts` with a configurable model-barrel import path.
+pub(crate) fn emit_client_with_models(
+    _package: &str,
+    model_module: &str,
+    auth_header: Option<&str>,
+) -> String {
+    let api_key_option = if auth_header.is_some() {
+        "  apiKey?: string;\n"
+    } else {
+        ""
+    };
+    let api_key_field = if auth_header.is_some() {
+        "  private readonly apiKey?: string;\n"
+    } else {
+        ""
+    };
+    let api_key_assign = if auth_header.is_some() {
+        "    this.apiKey = opts.apiKey;\n"
+    } else {
+        ""
+    };
+    format!(
+        "\
+import {{ ApiError }} from \"./errors\";
+import * as models from \"./{model_module}\";
+
+export interface ClientOptions {{
+  baseUrl: string;
+  fetch?: typeof fetch;
+{api_key_option}}}
+
+export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
+{api_key_field}
 
-  constructor(opts: ClientOptions) {
+  constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
-  }
+{api_key_assign}  }}
 "
-    .to_string()
+    )
 }
 
 /// Emit `client.ts`'s operation methods (appended to the client file by [`generate`]).
@@ -423,11 +504,12 @@ pub(crate) fn emit_operations(
     _package: &str,
     base_path: &str,
     ops: &[&Operation],
+    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
     let mut out = String::new();
     for op in ops {
         out.push('\n');
-        emit_operation(&mut out, op, graph, base_path)?;
+        emit_operation(&mut out, op, graph, base_path, auth_header)?;
     }
     // Close the `class Client {` opened by emit_client.
     out.push_str("}\n");
@@ -531,6 +613,7 @@ fn emit_operation(
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
+    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     let method_name = camel(&op.handler);
     let abs = join_path(base_path, &op.path);
@@ -620,6 +703,7 @@ fn emit_operation(
         success_status,
         body_model.is_some(),
         return_model.as_deref(),
+        auth_header,
     )?;
     writeln!(out, "  }}").map_err(sink)?;
     Ok(())
@@ -668,16 +752,26 @@ fn emit_op_query(
     if query_params.is_empty() {
         return Ok(());
     }
-    writeln!(out, "    const query = new URLSearchParams();").map_err(sink)?;
+    writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        writeln!(out, "    query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+        writeln!(
+            out,
+            "    searchParams.set(\"{}\", String({ident}));",
+            p.name
+        )
+        .map_err(sink)?;
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        writeln!(out, "      query.set(\"{}\", String({ident}));", p.name).map_err(sink)?;
+        writeln!(
+            out,
+            "      searchParams.set(\"{}\", String({ident}));",
+            p.name
+        )
+        .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    writeln!(out, "    const qs = query.toString();").map_err(sink)?;
+    writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
     writeln!(out, "    if (qs) {{").map_err(sink)?;
     writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
@@ -693,19 +787,30 @@ fn emit_op_dispatch(
     success_status: u16,
     has_body: bool,
     return_model: Option<&str>,
+    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
+    writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
+    if let Some(header) = auth_header {
+        writeln!(out, "    if (this.apiKey) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      headers[{}] = this.apiKey;",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    if has_body {
+        writeln!(out, "    headers[\"Content-Type\"] = \"application/json\";").map_err(sink)?;
+    }
     writeln!(
         out,
         "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{"
     )
     .map_err(sink)?;
     writeln!(out, "      method: \"{method}\",").map_err(sink)?;
+    writeln!(out, "      headers,").map_err(sink)?;
     if has_body {
-        writeln!(
-            out,
-            "      headers: {{ \"Content-Type\": \"application/json\" }},"
-        )
-        .map_err(sink)?;
         writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
     }
     writeln!(out, "    }});").map_err(sink)?;
@@ -734,7 +839,18 @@ fn emit_op_dispatch(
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] when two schemas map to the same TypeScript symbol name.
-pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> Result<String, CoreError> {
+#[cfg(test)]
+pub(crate) fn emit_index(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
+    emit_index_with_models(graph, package, "models", &[])
+}
+
+/// Emit `index.ts` with a configurable model-barrel export path.
+pub(crate) fn emit_index_with_models(
+    graph: &ApiGraph,
+    _package: &str,
+    model_module: &str,
+    aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
     check_unique_schema_names(graph)?;
 
     let mut out = String::new();
@@ -744,13 +860,30 @@ pub(crate) fn emit_index(graph: &ApiGraph, _package: &str) -> Result<String, Cor
 
     // Every named schema becomes a top-level symbol in models.ts (interface or type) — re-export them
     // all as types (interfaces and `type` aliases are type-only re-exports).
-    let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
+    let mut names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
+    names.extend(aliases.iter().map(|alias| alias.alias.as_str()));
     if !names.is_empty() {
         out.push_str("export type {\n");
         for name in &names {
             writeln!(out, "  {name},").map_err(sink)?;
         }
-        out.push_str("} from \"./models\";\n");
+        writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
+    }
+    Ok(out)
+}
+
+/// Emit `models/index.ts` for split-model layout.
+pub(crate) fn emit_models_index(
+    graph: &ApiGraph,
+    aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
+    check_unique_schema_names(graph)?;
+    let mut out = String::new();
+    for schema in &graph.schemas {
+        writeln!(out, "export * from \"./{}\";", file_stem(&schema.name)).map_err(sink)?;
+    }
+    for alias in aliases {
+        writeln!(out, "export * from \"./{}\";", file_stem(&alias.alias)).map_err(sink)?;
     }
     Ok(out)
 }
@@ -858,7 +991,7 @@ mod tests {
             assert_eq!(camel("createBook"), "createBook");
             assert_eq!(camel("list_books"), "listBooks");
             assert_eq!(camel("get-book"), "getBook");
-            assert_eq!(camel("HTTPServer"), "httpserver");
+            assert_eq!(camel("HTTPServer"), "httpServer");
         }
     }
 
@@ -1211,7 +1344,8 @@ mod tests {
         #[test]
         fn body_op_has_camel_method_typed_body_and_typed_return() {
             let g = ops_graph();
-            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            let out =
+                emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook"), None).unwrap();
             assert!(
                 out.contains(
                     "async createBook(body: models.Book): Promise<models.CreatedMessage> {"
@@ -1242,7 +1376,7 @@ mod tests {
         #[test]
         fn templated_path_escapes_each_param_with_encode_uri_component() {
             let g = ops_graph();
-            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook"), None).unwrap();
             assert!(
                 out.contains("let path = `/books/${encodeURIComponent(String(bookId))}`;"),
                 "path param must be percent-escaped (V5) via a backslash-free template literal:\n{out}"
@@ -1256,14 +1390,15 @@ mod tests {
         #[test]
         fn query_op_encodes_present_params_and_has_no_body() {
             let g = ops_graph();
-            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            let out =
+                emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks"), None).unwrap();
             assert!(
                 out.contains("async listBooks(cursor?: string): Promise<void> {"),
                 "{out}"
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("query.set(\"cursor\", String(cursor));"),
+                out.contains("searchParams.set(\"cursor\", String(cursor));"),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -1297,7 +1432,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
+            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
             assert!(
                 err.to_string().contains("do not match its path params"),
                 "{err}"
@@ -1328,14 +1463,14 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
+            let out = emit_operations(&g, "pkg", "/", &ops, None).unwrap();
             // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
             assert!(
                 out.contains("async search(q: string, page?: string): Promise<void> {"),
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(out.contains("query.set(\"q\", String(q));"), "{out}");
+            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 
@@ -1362,7 +1497,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            let err = emit_operations(&g, "pkg", "/", &ops, None).unwrap_err();
             assert!(
                 err.to_string().contains("empty TypeScript identifier"),
                 "{err}"
@@ -1394,7 +1529,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            let err = emit_operations(&g, "pkg", "/", &ops, None).unwrap_err();
             assert!(err.to_string().contains("collides"), "{err}");
         }
     }

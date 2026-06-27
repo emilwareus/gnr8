@@ -1,10 +1,10 @@
-//! Python SDK generation seam (Phase 3): generates a dependency-free Python SDK from the API graph.
+//! Python SDK generation from the API graph.
 //!
 //! [`generate`] turns the Phase-2 [`crate::graph::ApiGraph`] into a single deterministic,
-//! dependency-free Python SDK bundle String (D-06): an `__init__.py` re-export surface, a `client.py`
+//! Python SDK bundle String (D-06): an `__init__.py` re-export surface, a `client.py`
 //! (an injectable `urllib.request.OpenerDirector`-backed `Client` plus one method per operation), a
-//! typed `errors.py` (`ApiError`), and a `models.py` (`@dataclass` request/response models +
-//! `enum.Enum` named enums).
+//! typed `errors.py` (`ApiError`), and model files (`pydantic.BaseModel` by default, or stdlib
+//! dataclasses when explicitly configured, plus `enum.Enum` named enums).
 //!
 //! This is the structural twin of [`crate::gosdk`], MINUS the `gofmt` normalization step: Python has no
 //! stdlib formatter, so [`emit`] produces already-correct significant-whitespace Python directly. Each
@@ -14,15 +14,19 @@
 mod emit;
 
 use crate::graph::{ApiGraph, Operation};
-use crate::sdk::bundle::{self, SdkBundle, SdkFile};
+use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::emit_common::{api_key_header_name, file_stem, model_file_name};
+use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::surface::SdkTypeAliases;
 
-/// Generate the Python SDK as a deterministic, dependency-free multi-file bundle String (D-06, PYSDK-01).
+/// Generate the Python SDK as a deterministic multi-file bundle String (D-06, PYSDK-01).
 ///
 /// Emits `__init__.py` (re-exports), `client.py` (the `urllib`-backed `Client` + one method per
-/// operation), `errors.py` (typed `ApiError`), and `models.py` (`@dataclass` models + `enum.Enum`
-/// enums), then frames them into a single [`bundle::SdkBundle`] String. Generating twice over the same
-/// graph is byte-identical (PYSDK-03). There is NO `gofmt`-style normalization step (Python has no
-/// stdlib formatter) — the emitters produce correct significant-whitespace Python directly.
+/// operation), `errors.py` (typed `ApiError`), and model files (Pydantic v2 by default, dataclasses
+/// when configured), then frames them into a single [`bundle::SdkBundle`] String. Generating twice over
+/// the same graph is byte-identical (PYSDK-03). There is NO `gofmt`-style normalization step (Python
+/// has no stdlib formatter) — the emitters produce correct significant-whitespace Python directly.
 ///
 /// `package` is the SDK's Python package name (derived from the `PySdk` target's module path, the single
 /// source of truth — wired in plan 03-02). `base_path` is the API base/mount path joined to each
@@ -39,18 +43,89 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
+    generate_with_options(
+        graph,
+        package,
+        base_path,
+        &SdkFileLayout::compact(),
+        PyModelStyle::default(),
+        &SdkTypeAliases::default(),
+    )
+}
+
+/// Generate the Python SDK with a configurable file layout.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`].
+pub fn generate_with_layout(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+) -> Result<String, crate::CoreError> {
+    generate_with_options(
+        graph,
+        package,
+        base_path,
+        layout,
+        PyModelStyle::default(),
+        &SdkTypeAliases::default(),
+    )
+}
+
+/// Generate the Python SDK with configurable file layout and model style.
+///
+/// # Errors
+///
+/// Returns the same errors as [`generate`], plus configuration errors for invalid compatibility
+/// aliases.
+pub fn generate_with_options(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    model_style: PyModelStyle,
+    aliases: &SdkTypeAliases,
+) -> Result<String, crate::CoreError> {
+    let files =
+        generate_files_with_options(graph, package, base_path, layout, model_style, aliases)?;
+    let bundle = SdkBundle { files };
+    Ok(bundle.to_string())
+}
+
+pub(crate) fn generate_files_with_options(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    model_style: PyModelStyle,
+    aliases: &SdkTypeAliases,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
     let mut files: Vec<SdkFile> = Vec::new();
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
     // order the bundle locks. client.py is the client skeleton followed by the operation methods.
+    let model_dir = layout.model_dir_ref().unwrap_or("models");
+    let model_module = model_dir.trim_matches('/').replace('/', ".");
+
     files.push(SdkFile {
         name: "__init__.py".to_string(),
-        contents: emit::emit_init(graph, package),
+        contents: emit::emit_init_with_models(graph, package, &model_module),
     });
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let mut client = emit::emit_client(package);
-    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    let mut client =
+        emit::emit_client_with_models(package, &model_module, model_style, auth_header.as_deref());
+    client.push_str(&emit::emit_operations_with_style(
+        graph,
+        package,
+        base_path,
+        &ops,
+        model_style,
+    )?);
     files.push(SdkFile {
         name: "client.py".to_string(),
         contents: client,
@@ -61,14 +136,49 @@ pub fn generate(
         contents: emit::emit_errors(package),
     });
 
-    files.push(SdkFile {
-        name: "models.py".to_string(),
-        contents: emit::emit_models(graph, package)?,
-    });
+    if layout.is_split() {
+        files.push(SdkFile {
+            name: crate::sdk::emit_common::file_in_dir(Some(model_dir), "__init__.py"),
+            contents: emit::emit_models_init(graph, &resolved_aliases),
+        });
+        for schema in &graph.schemas {
+            let default_name = crate::sdk::emit_common::file_in_dir(
+                Some(model_dir),
+                &format!("{}.py", file_stem(&schema.name)),
+            );
+            let name = if layout.model_file_template_ref().is_some() {
+                model_file_name(layout, schema, &format!("{}.py", file_stem(&schema.name)))?
+            } else {
+                default_name
+            };
+            files.push(SdkFile {
+                name,
+                contents: emit::emit_model_schema(graph, schema, model_style)?,
+            });
+        }
+        for alias in &resolved_aliases {
+            files.push(SdkFile {
+                name: crate::sdk::emit_common::file_in_dir(
+                    Some(model_dir),
+                    &format!("{}.py", file_stem(&alias.alias)),
+                ),
+                contents: emit::emit_model_alias(alias),
+            });
+        }
+    } else {
+        files.push(SdkFile {
+            name: "models.py".to_string(),
+            contents: emit::emit_models_with_style_and_aliases(
+                graph,
+                package,
+                model_style,
+                &resolved_aliases,
+            )?,
+        });
+    }
 
-    // The bundle's fixed sorted order is established by push order above.
-    let bundle = SdkBundle { files };
-    Ok(bundle.to_string())
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
 }
 
 /// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
@@ -76,8 +186,9 @@ pub fn generate(
 /// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
 /// per-file outputs without re-implementing the marker split. Single source of truth for the framing —
 /// the same one [`write_to_dir`] uses. (Consumed by the `PySdk` target in `sdk::builtins`.)
+#[cfg(test)]
 pub(crate) fn split_bundle(bundle: &str) -> Vec<(String, String)> {
-    bundle::parse(bundle)
+    crate::sdk::bundle::parse(bundle)
 }
 
 #[cfg(test)]
@@ -87,9 +198,10 @@ mod tests {
     // require NO toolchain — `generate` is pure string emission with no `python3` subprocess.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, split_bundle};
+    use super::{generate, generate_with_layout, split_bundle};
     use crate::graph::ApiGraph;
     use crate::sdk::bundle::write_to_dir;
+    use crate::sdk::layout::SdkFileLayout;
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.
@@ -183,7 +295,8 @@ mod tests {
         assert!(out.contains("def create_book(self, body: Book)"), "{out}");
         assert!(out.contains("def list_books(self, cursor=None)"), "{out}");
         assert!(out.contains("class BookFormat(str, enum.Enum):"), "{out}");
-        assert!(out.contains("@dataclass"), "{out}");
+        assert!(out.contains("class Book(BaseModel):"), "{out}");
+        assert!(out.contains("from pydantic import BaseModel"), "{out}");
     }
 
     #[test]
@@ -206,7 +319,7 @@ mod tests {
 
     #[test]
     fn write_to_dir_rejects_an_unsafe_frame_name() {
-        // A hand-forged bundle whose frame name contains a path separator must be refused (T-03-01-01).
+        // A hand-forged bundle whose frame name escapes the target dir must be refused (T-03-01-01).
         let evil = "// ==== gnr8:file ../escape.py ====\npass\n";
         let dir = std::env::temp_dir();
         let err = write_to_dir(evil, &dir).unwrap_err();
@@ -229,5 +342,58 @@ mod tests {
             assert!(dir.join(name).is_file(), "missing materialized {name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_emits_models_package_with_init_file() {
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &SdkFileLayout::split())
+            .unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "__init__.py",
+                "client.py",
+                "errors.py",
+                "models/__init__.py",
+                "models/book.py",
+                "models/book_format.py",
+                "models/created_message.py",
+            ]
+        );
+        assert!(
+            !names.contains(&"models.py"),
+            "split layout must not emit compact models.py"
+        );
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("gnr8-pysdk-split-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_to_dir(&out, &dir).unwrap();
+        assert!(dir.join("models/book.py").is_file());
+        assert!(dir.join("models/__init__.py").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_can_place_models_in_a_configured_package_directory() {
+        let layout = SdkFileLayout::split().model_dir("schemas");
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"schemas/book.py"));
+        assert!(names.contains(&"schemas/__init__.py"));
+        assert!(
+            out.contains("from .schemas import *"),
+            "client.py should import the configured model package:\n{out}"
+        );
+        assert!(
+            out.contains("from .schemas import ("),
+            "__init__.py should re-export from the configured model package:\n{out}"
+        );
     }
 }
