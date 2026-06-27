@@ -2,13 +2,13 @@
 //! (WS-01, WS-02, D-01, D-02).
 //!
 //! `gnr8 init` creates a project-local `.gnr8/` directory holding a small Rust **binary crate** that
-//! depends on `gnr8-core` and drives the generation lifecycle. THIS CRATE IS THE CONFIG — there is no
+//! depends on the public `gnr8` crate and drives the generation lifecycle. THIS CRATE IS THE CONFIG — there is no
 //! TOML (`docs/code-as-config.md`). gnr8 does not run without it: every other command requires it and
 //! errors with "run `gnr8 init`" when it is absent. `init` writes three files (each only if absent):
 //!
 //! - `.gnr8/Cargo.toml` — a standalone-workspace crate (`name = "<dir>-gnr8-gen"`, edition 2021,
 //!   `publish = false`, an empty `[workspace]` table so it builds independently via `--manifest-path`,
-//!   and a `gnr8-core` dependency).
+//!   and a `gnr8` dependency).
 //! - `.gnr8/src/main.rs` — the default pipeline, in code; the user edits this to adapt parsing +
 //!   generation.
 //! - `.gnr8/.gitignore` — ignores the git-ignored lifecycle subtree (`target/`, `cache/`).
@@ -16,14 +16,14 @@
 //! The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at the paths the pipeline's targets
 //! declare (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
 //!
-//! ## The `gnr8-core` dependency: path (in-repo) vs version (published)
+//! ## The `gnr8` dependency: path (in-repo) vs version (published)
 //!
-//! `gnr8-core` is not published yet. When `init` runs INSIDE the gnr8 repo (detected by walking up for
+//! When `init` runs INSIDE the gnr8 repo (detected by walking up for
 //! `crates/gnr8-core`), it emits a `path = "…/crates/gnr8-core"` dependency so the example + integration
 //! tests build against the in-repo crate. Outside the repo, an installed release archive can provide
 //! `share/gnr8/crates/gnr8-core`; `init` then emits a `path = "…"` dependency to that installed source
-//! so the generated `.gnr8` crate builds without crates.io publication. If neither source exists it
-//! emits the future published dependency with an actionable TODO.
+//! so the generated `.gnr8` crate builds without network access. If neither source exists it emits the
+//! published `gnr8 = "0.1"` dependency.
 //!
 //! Idempotency (D-01): every workspace file is written *only if absent*, via
 //! `OpenOptions::create_new(true)` — atomically failing with [`std::io::ErrorKind::AlreadyExists`] if
@@ -72,7 +72,7 @@ pub struct InitOutcome {
 /// (files recorded in [`InitOutcome::skipped`]), never an error and never an overwrite (D-01).
 ///
 /// The crate name is `<dirname>-gnr8-gen` where `<dirname>` is `root`'s final component sanitized to a
-/// valid Cargo package name; the `gnr8-core` dependency is a path dep when `root` is inside the gnr8
+/// valid Cargo package name; the `gnr8` dependency is a path dep when `root` is inside the gnr8
 /// repo and a version dep otherwise (see the module docs).
 ///
 /// # Errors
@@ -112,10 +112,10 @@ pub const MAIN_RS_BODY: &str = r#"//! This file IS your gnr8 configuration — e
 //! protection). Adapting = ordinary Rust: change an argument, add a `.transform(...)`, write your own
 //! `Source`/`Target`/`Transform`, or wrap a built-in.
 
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/"))
@@ -129,11 +129,11 @@ fn main() -> std::process::ExitCode {
 }
 "#;
 
-/// Build the `.gnr8/Cargo.toml` body for `crate_name` with the given `gnr8-core` `dependency` line.
+/// Build the `.gnr8/Cargo.toml` body for `crate_name` with the given `gnr8` `dependency` line.
 ///
 /// A standalone-workspace crate (the empty `[workspace]` table makes it its own workspace root so it
 /// builds independently via `cargo run --manifest-path .gnr8/Cargo.toml`), `publish = false` (it is a
-/// project-local tool, never published), edition 2021 (matches the gnr8-core workspace).
+/// project-local tool, never published), edition 2021 (matches the gnr8 workspace).
 fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
     format!(
         "# gnr8 generation crate — this crate IS your config (edit src/main.rs). Built + run by `gnr8`.\n\
@@ -152,21 +152,18 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
     )
 }
 
-/// The `gnr8-core` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
+/// The `gnr8` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
 ///
-/// In-repo (a `crates/gnr8-core` exists at or above `root`) ⇒ a `path` dep pointing at it (the only
-/// form that works until `gnr8-core` is published). Otherwise ⇒ a version dep with a TODO comment.
+/// In-repo (a `crates/gnr8-core` exists at or above `root`) ⇒ a `path` dep pointing at it.
+/// Otherwise ⇒ the published public crate.
 /// This is a single presence check, not a dual-source fallback (CLAUDE.md rule 3): the path is computed
 /// from one fact (the located in-repo crate), and when that fact is absent the published form is used.
 fn core_dependency_line(root: &Path) -> String {
     match locate_in_repo_core(root) {
-        Some(rel) => format!("gnr8-core = {{ path = {rel:?} }}"),
+        Some(rel) => format!("gnr8 = {{ path = {rel:?} }}"),
         None => match locate_installed_core(root) {
-            Some(path) => format!("gnr8-core = {{ path = {path:?} }}"),
-            None => {
-                "gnr8-core = \"0.1\"  # TODO: gnr8-core is not published yet — set the real version once it is"
-                    .to_string()
-            }
+            Some(path) => format!("gnr8 = {{ path = {path:?} }}"),
+            None => "gnr8 = \"0.1\"".to_string(),
         },
     }
 }

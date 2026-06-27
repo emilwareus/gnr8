@@ -55,7 +55,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// Run `go <args>` in `dir`, mapping a non-zero exit to `CoreError::GoBuild` (never a panic — the
 /// harness uses NO `unwrap`/`expect` on the subprocess `Result`, threat T-03-03-04). A spawn failure
 /// (missing toolchain) maps to `CoreError::GoToolchainMissing`.
-fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError> {
+fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     let output = Command::new("go")
         // Discrete args + `current_dir` — never a shell string (threat T-03-03-01).
         .args(args)
@@ -65,9 +65,9 @@ fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError> {
         .env("GOPROXY", "off")
         .env("GOFLAGS", "-mod=mod")
         .output()
-        .map_err(|source| gnr8_core::CoreError::GoToolchainMissing { source })?;
+        .map_err(|source| gnr8::CoreError::GoToolchainMissing { source })?;
     if !output.status.success() {
-        return Err(gnr8_core::CoreError::GoBuild {
+        return Err(gnr8::CoreError::GoBuild {
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
@@ -95,12 +95,12 @@ fn write_go_mod(dir: &Path) {
 
 /// Materialize the generated SDK + a hermetic go.mod into a fresh temp dir, returning the dir.
 fn materialize_sdk() -> PathBuf {
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let bundle = gnr8_core::gosdk::generate(&graph, "goalservice", "/goal")
+    let bundle = gnr8::gosdk::generate(&graph, "goalservice", "/goal")
         .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir("ok");
-    gnr8_core::sdk::bundle::write_to_dir(&bundle, &dir)
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");
     write_go_mod(&dir);
     dir
@@ -259,7 +259,7 @@ fn invalid_go_build_maps_to_go_build_error_not_panic() {
 
     let result = run_go(&["build", "./..."], &dir);
     match result {
-        Err(gnr8_core::CoreError::GoBuild { code, stderr }) => {
+        Err(gnr8::CoreError::GoBuild { code, stderr }) => {
             assert!(
                 code != Some(0),
                 "a failed build must not report exit code 0"

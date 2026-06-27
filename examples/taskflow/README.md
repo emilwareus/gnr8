@@ -66,9 +66,9 @@ from four kinds of stage and hands it to the gnr8 runner. `gnr8 generate` **comp
 Built-ins and your own Rust compose freely:
 
 ```rust
-use gnr8_core::graph::ApiGraph;
-use gnr8_core::sdk::prelude::*;
-use gnr8_core::CoreError;
+use gnr8::graph::ApiGraph;
+use gnr8::sdk::prelude::*;
+use gnr8::CoreError;
 
 // 1) A custom Transform — edit the IR in Rust before generation.
 struct DropDebugRoutes;
@@ -93,7 +93,7 @@ impl Target for ApiMarkdown {
 }
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))                                   // built-in source
             .transform(SetBasePath::new("/tasks"))                               // built-in transforms

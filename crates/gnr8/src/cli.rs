@@ -2,7 +2,7 @@
 //!
 //! Six top-level commands plus a nested `inspect` subcommand, with a global `--json` flag and a
 //! repeatable `-v/--verbose` count. Phase 1 only parses the surface; every command dispatches to a
-//! `gnr8-core` seam that returns a typed `NotYetImplemented` error (see `main.rs`).
+//! `gnr8` library seam that returns a typed `NotYetImplemented` error (see `main.rs`).
 
 use clap::{Parser, Subcommand};
 

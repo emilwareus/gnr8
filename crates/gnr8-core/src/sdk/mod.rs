@@ -791,7 +791,7 @@ pub struct RunOutcome {
     pub artifact_cache_hit: bool,
 }
 
-/// The composition surface a `.gnr8/` lifecycle imports: `use gnr8_core::sdk::prelude::*;`.
+/// The composition surface a `.gnr8/` lifecycle imports: `use gnr8::sdk::prelude::*;`.
 ///
 /// Re-exports everything a user composes — [`Pipeline`], the four traits, [`Cx`], [`Artifacts`]/
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].

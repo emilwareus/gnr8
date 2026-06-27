@@ -22,8 +22,8 @@ const FIXTURE_DIR: &str = concat!(
 /// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4):
 /// security is SUPPLIED by code-as-config, never scraped from the source. One `ApiKeyAuth` /
 /// `X-API-Key` scheme, mirroring the goalservice OpenAPI contract test.
-fn fixture_security() -> Vec<gnr8_core::graph::SecurityScheme> {
-    vec![gnr8_core::graph::SecurityScheme {
+fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
+    vec![gnr8::graph::SecurityScheme {
         id: "ApiKeyAuth".to_string(),
         kind: "apiKey".to_string(),
         location: "header".to_string(),
@@ -35,9 +35,9 @@ fn fixture_security() -> Vec<gnr8_core::graph::SecurityScheme> {
 fn openapi_matches_expected_for_fastapi() {
     // 02-03: build_graph runs pyextract, then the reused lowering produces the OpenAPI document the
     // committed .snap locks (byte-identical against the reconciled fixture).
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
-    let openapi = gnr8_core::lower::to_openapi(&graph, "bookstore", "/books", &fixture_security())
+    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "/books", &fixture_security())
         .expect("lower::to_openapi must succeed");
     insta::assert_snapshot!("fastapi_openapi", openapi);
 }

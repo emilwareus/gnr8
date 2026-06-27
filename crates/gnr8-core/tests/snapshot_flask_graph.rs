@@ -26,7 +26,7 @@ fn graph_matches_expected_for_flask() {
     // 02-04: build_graph runs the pyextract helper and returns the real router-agnostic graph for the
     // Flask typed envelope; the committed .snap locks its reviewed YAML shape (byte-identical against
     // the reconciled fixture, diagnostics anchored at lines 42/69/78).
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
     insta::assert_yaml_snapshot!("flask_graph", graph);
 }

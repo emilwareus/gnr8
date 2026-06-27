@@ -88,7 +88,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// non-zero exit maps to the generic captured-stderr `GoBuild { code, stderr }` carrier (reused, no new
 /// variant — the plan's interfaces note). The helper uses NO `unwrap`/`expect` on the subprocess
 /// `Result` (no panic, threat T-05-03-04).
-fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError> {
+fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     // The `--lib es2022,dom` is LOAD-BEARING: lib.dom.d.ts declares the `fetch` global so the SDK needs
     // no `@types/node` (omit `,dom` → error TS2304: Cannot find name 'fetch', RESEARCH Pitfall 3).
     let mut args: Vec<&str> = vec![
@@ -111,14 +111,14 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError
         .current_dir(dir)
         .output()
         // Spawn failure (e.g. node absent) → the dedicated toolchain-missing variant (error.rs:59).
-        .map_err(|source| gnr8_core::CoreError::TypeScriptToolchainMissing { source })?;
+        .map_err(|source| gnr8::CoreError::TypeScriptToolchainMissing { source })?;
     if !output.status.success() {
         // Reuse the generic captured-stderr carrier (no new error variant — the plan's interfaces note:
         // GoBuild is the generic exit-code+stderr carrier the harness reuses, T-05-03-04). tsc prints
         // diagnostics to stdout, so fold both streams into the carrier for a useful message.
         let mut captured = String::from_utf8_lossy(&output.stdout).into_owned();
         captured.push_str(&String::from_utf8_lossy(&output.stderr));
-        return Err(gnr8_core::CoreError::GoBuild {
+        return Err(gnr8::CoreError::GoBuild {
             code: output.status.code(),
             stderr: captured,
         });
@@ -130,15 +130,14 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError
 /// dir. Unlike the Python twin (which nests a `bookstore/` package), `tssdk::write_to_dir` writes the
 /// four files FLAT (the bundle's fixed frame names), so there is no package subdir.
 fn materialize_sdk() -> PathBuf {
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
     // `base_path` is the graph's single source of truth; pass it through exactly as a Pipeline would
     // (CLAUDE.md rules 3 & 4) — the same way pysdk_compile/the SDK targets take it.
-    let bundle = gnr8_core::tssdk::generate(&graph, PACKAGE, &graph.base_path)
+    let bundle = gnr8::tssdk::generate(&graph, PACKAGE, &graph.base_path)
         .expect("tssdk::generate must succeed");
     let dir = unique_temp_dir("ok");
-    gnr8_core::sdk::bundle::write_to_dir(&bundle, &dir)
-        .expect("write_to_dir must materialize the SDK");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("write_to_dir must materialize the SDK");
     dir
 }
 
@@ -223,7 +222,7 @@ fn invalid_ts_typecheck_maps_to_captured_error_not_panic() {
 
     let result = run_tsc(&["broken.ts"], &dir);
     match result {
-        Err(gnr8_core::CoreError::GoBuild { code, stderr }) => {
+        Err(gnr8::CoreError::GoBuild { code, stderr }) => {
             assert!(
                 code != Some(0),
                 "a failed typecheck must not report exit code 0"

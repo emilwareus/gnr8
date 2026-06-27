@@ -25,7 +25,7 @@ const FIXTURE_DIR: &str = concat!(
 fn graph_matches_expected_for_fastapi() {
     // 02-03: build_graph runs the pyextract helper and returns the real router-agnostic graph; the
     // committed .snap locks its reviewed YAML shape (byte-identical against the reconciled fixture).
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
     insta::assert_yaml_snapshot!("fastapi_graph", graph);
 }

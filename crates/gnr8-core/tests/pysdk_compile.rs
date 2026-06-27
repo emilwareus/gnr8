@@ -72,7 +72,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// panic — the harness uses NO `unwrap`/`expect` on the subprocess `Result`, threat T-03-03-05). A spawn
 /// failure (missing toolchain) maps to `CoreError::PythonToolchainMissing`. Discrete args + `current_dir`
 /// only — NEVER a shell string (threat T-03-03-01 / V13).
-fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError> {
+fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     let output = Command::new("python3")
         .args(args)
         .current_dir(dir)
@@ -82,11 +82,11 @@ fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError>
         .env("PYTHONNOUSERSITE", "1")
         .output()
         // Spawn failure (e.g. python3 absent) → the dedicated toolchain-missing variant (error.rs:45).
-        .map_err(|source| gnr8_core::CoreError::PythonToolchainMissing { source })?;
+        .map_err(|source| gnr8::CoreError::PythonToolchainMissing { source })?;
     if !output.status.success() {
         // Reuse the generic captured-stderr carrier (no new error variant added — the plan's interfaces
         // note: GoBuild is the generic exit-code+stderr carrier the harness reuses, T-03-03-05).
-        return Err(gnr8_core::CoreError::GoBuild {
+        return Err(gnr8::CoreError::GoBuild {
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
@@ -100,16 +100,16 @@ fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8_core::CoreError>
 /// The four files go under `<dir>/bookstore/` so `__init__.py`'s relative imports (`from .client import
 /// Client`) resolve and `python3 -c "import bookstore"` works with `<dir>` as the current dir.
 fn materialize_sdk() -> PathBuf {
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires python3 for the pyextract sidecar)");
     // `base_path` is the graph's single source of truth (the FastAPI fixture's is "/"); pass it through
     // exactly as a Pipeline would (CLAUDE.md rules 3 & 4).
-    let bundle = gnr8_core::pysdk::generate(&graph, PACKAGE, &graph.base_path)
+    let bundle = gnr8::pysdk::generate(&graph, PACKAGE, &graph.base_path)
         .expect("pysdk::generate must succeed");
     let dir = unique_temp_dir("ok");
     let pkg_dir = dir.join(PACKAGE);
     std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
-    gnr8_core::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
+    gnr8::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
         .expect("write_to_dir must materialize the SDK");
     std::fs::write(
         dir.join("pydantic.py"),
@@ -259,7 +259,7 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
         &dir,
     );
     match result {
-        Err(gnr8_core::CoreError::GoBuild { code, stderr }) => {
+        Err(gnr8::CoreError::GoBuild { code, stderr }) => {
             assert!(
                 code != Some(0),
                 "a failed compile must not report exit code 0"

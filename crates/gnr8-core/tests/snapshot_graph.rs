@@ -21,7 +21,7 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 fn graph_matches_expected_for_goalservice() {
     // 02-03: build_graph runs the goextract helper and returns the real router-agnostic graph; the
     // snapshot below locks its reviewed YAML shape (byte-identical across unchanged source, GRAPH-02).
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the Go toolchain)");
     insta::assert_yaml_snapshot!("goalservice_graph", graph);
 }

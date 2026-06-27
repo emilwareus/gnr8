@@ -25,7 +25,7 @@ test:
 	cargo test --all-features
 
 # Blocking gate test set: green unit + CLI parse tests (incl. the pure `watch::tests` loop-safety
-# filter tests and the host→child→write `generate_e2e` integration test in `cargo test -p gnr8`), ALL
+# filter tests and the host→child→write `generate_e2e` integration test in `cargo test -p gnr8-cli`), ALL
 # FOUR contract tests (snapshot_graph/diagnostics/openapi/sdk), determinism (graph + OpenAPI + SDK
 # byte-identical), sdk_compile (temp dir + zero-require go.mod + go build + httptest smoke, SDK-05),
 # pysdk_compile (temp dir + bookstore package + py_compile + import + stdlib http.server round-trip:
@@ -41,12 +41,12 @@ test:
 # `gofmt`, run `go build`/`go test`, and (for `generate_e2e`) cargo-compile + run the scaffolded child
 # crate, so the Go + cargo toolchains must be present. The timing-tolerant `watch_smoke` smoke is
 # `#[ignore]`d (FS-event flakiness) and is therefore NOT in this blocking line — run it opt-in with
-# `cargo test -p gnr8 --test watch_smoke -- --ignored`. Mirrors the CI `gates` job (RUST-03 / D-07).
+# `cargo test -p gnr8-cli --test watch_smoke -- --ignored`. Mirrors the CI `gates` job (RUST-03 / D-07).
 gates:
-	cargo test -p gnr8-core --lib
 	cargo test -p gnr8
-	cargo test -p gnr8-core --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test tssdk_compile --test sdk_pipeline --test lifecycle
-	cargo test -p gnr8-core --test snapshot_nestjs_graph --test snapshot_nestjs_openapi
+	cargo test -p gnr8-cli
+	cargo test -p gnr8 --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test tssdk_compile --test sdk_pipeline --test lifecycle
+	cargo test -p gnr8 --test snapshot_nestjs_graph --test snapshot_nestjs_openapi
 
 # Restore the `typescript` toolchain for gnr8's OWN test suite (the nestjs snapshot extraction +
 # the tssdk_compile typecheck). gnr8 ships NO typescript — in real use `tsextract` borrows the user's
@@ -94,7 +94,7 @@ red:
 GNR8_BIN := target/release/gnr8
 GO_BIN := /home/vercel-sandbox/.local/go-install/go/bin
 examples-check: tsextract-deps
-	cargo build --release -p gnr8
+	cargo build --release -p gnr8-cli
 	@set -e; \
 	tmp="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp"' EXIT; \

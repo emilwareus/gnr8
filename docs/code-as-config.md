@@ -217,7 +217,7 @@ rustc / compile error) into actionable messages (`cli/rules_host_error.rs`).
 ### 5. The dev-vs-published `gnr8` dependency
 
 The `.gnr8` crate depends on `gnr8` (the SDK). Two cases, exactly as polint handles it:
-- **User repo:** `gnr8 = "x.y.z"` from crates.io (requires publishing `gnr8-core` as `gnr8`).
+- **User repo:** `gnr8 = "x.y.z"` from crates.io.
 - **Inside this repo (examples/tests/dev):** auto-substitute a `path = "…/crates/gnr8-core"` dep by
   walking up for the workspace (polint `polint_deps_path_prefix`). Until we publish, the path form is
   the only one that works — so the example + tests use it, and the scaffolder emits the crates.io form

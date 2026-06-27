@@ -36,7 +36,7 @@ fn graph_matches_expected_for_nestjs() {
     }
     // 04-03: build_graph runs the tsextract helper and returns the real router-agnostic graph; the
     // committed .snap locks its reviewed YAML shape (byte-identical against the reconciled fixture).
-    let graph = gnr8_core::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires node + the vendored typescript)");
     insta::assert_yaml_snapshot!("nestjs_graph", graph);
 }

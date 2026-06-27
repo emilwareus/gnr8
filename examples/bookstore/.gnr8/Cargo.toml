@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-gnr8-core = { path = "../../../crates/gnr8-core" }
+gnr8 = { path = "../../../crates/gnr8-core" }
 
 [workspace]

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Bump the patch version in root Cargo.toml.
+"""Bump the release version in root Cargo.toml.
 
-Updates [workspace.package] version and the gnr8-core workspace dependency version. Prints the new
-version on stdout.
+Updates [workspace.package] version and the public gnr8 workspace dependency version. Prints the
+new version on stdout.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ import sys
 from pathlib import Path
 
 
-def bump_patch(version: str) -> str:
+def bump_release(version: str) -> str:
     parts = version.strip().split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
         raise ValueError(f"expected VERSION like 0.1.0, got {version!r}")
     major, minor, patch = (int(parts[0]), int(parts[1]), int(parts[2]))
+    if major == 0 and minor == 0:
+        return "0.1.0"
     return f"{major}.{minor}.{patch + 1}"
 
 
@@ -34,7 +36,7 @@ def main() -> None:
         sys.exit(1)
 
     current = match.group(1)
-    new_ver = bump_patch(current)
+    new_ver = bump_release(current)
 
     def replace_workspace_package_block(match: re.Match[str]) -> str:
         block = match.group(0)
@@ -57,14 +59,14 @@ def main() -> None:
         sys.exit(1)
 
     text, count = re.subn(
-        r'^(gnr8-core = \{ path = "crates/gnr8-core", version = ")[^"]+("\s*\})',
+        r'^(gnr8 = \{ path = "crates/gnr8-core", version = ")[^"]+("\s*\})',
         rf"\g<1>{new_ver}\2",
         text,
         count=1,
         flags=re.MULTILINE,
     )
     if count != 1:
-        print("error: expected exactly one gnr8-core workspace dependency version", file=sys.stderr)
+        print("error: expected exactly one gnr8 workspace dependency version", file=sys.stderr)
         sys.exit(1)
 
     cargo_path.write_text(text, encoding="utf-8")
@@ -73,4 +75,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

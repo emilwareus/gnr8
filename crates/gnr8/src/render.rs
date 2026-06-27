@@ -1,6 +1,6 @@
 //! `inspect routes|schemas|graph` renderers (D-09 / GRAPH-03).
 //!
-//! Each renderer consumes the `gnr8_core::graph::ApiGraph` (the analyzer's source of truth) and prints
+//! Each renderer consumes the `gnr8::graph::ApiGraph` (the analyzer's source of truth) and prints
 //! either a human-readable aligned table (default) or machine JSON (under the global `--json` flag).
 //! Every report also lists the analysis diagnostics, so the reports "explain inferred facts and list
 //! diagnostics" (D-09). No table crate is pulled in (RESEARCH "no new Rust crates") — plain `{:<width}`
@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use gnr8_core::graph::{ApiGraph, Operation, Schema, Type};
+use gnr8::graph::{ApiGraph, Operation, Schema, Type};
 
 /// Render `inspect routes`: a METHOD/PATH/OPERATION/REQUEST/RESPONSES table (or JSON).
 ///
@@ -210,14 +210,14 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{render_graph, render_routes, render_schemas};
-    use gnr8_core::analyze::build_graph;
+    use gnr8::analyze::build_graph;
 
     /// Resolve the goalservice fixture the same way the CLI default + contract tests do.
     const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
     /// Build the real graph once. Returns `None` (skip) if the Go toolchain is unavailable so the
     /// test never fails for a missing dependency — but on dev + CI (go 1.26) it runs.
-    fn graph_or_skip() -> Option<gnr8_core::graph::ApiGraph> {
+    fn graph_or_skip() -> Option<gnr8::graph::ApiGraph> {
         build_graph(FIXTURE_DIR).ok()
     }
 
