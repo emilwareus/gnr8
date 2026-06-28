@@ -22,6 +22,9 @@ use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
+use crate::sdk::typescript::{
+    TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
+};
 use crate::CoreError;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1780,6 +1783,9 @@ pub struct TsSdk {
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
+    model_property_policy: Option<TsModelPropertyPolicy>,
+    nullable_policy: Option<TsNullablePolicy>,
+    response_policy: Option<TsResponsePolicy>,
 }
 
 impl TsSdk {
@@ -1792,6 +1798,9 @@ impl TsSdk {
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
+            model_property_policy: None,
+            nullable_policy: None,
+            response_policy: None,
         }
     }
 
@@ -1838,11 +1847,46 @@ impl TsSdk {
         self
     }
 
+    /// Set how model interface properties use `?:`.
+    #[must_use]
+    pub const fn model_property_policy(mut self, policy: TsModelPropertyPolicy) -> Self {
+        self.model_property_policy = Some(policy);
+        self
+    }
+
+    /// Set how model interface properties include `| null`.
+    #[must_use]
+    pub const fn nullable_policy(mut self, policy: TsNullablePolicy) -> Self {
+        self.nullable_policy = Some(policy);
+        self
+    }
+
+    /// Set how operation methods return response bodies.
+    #[must_use]
+    pub const fn response_policy(mut self, policy: TsResponsePolicy) -> Self {
+        self.response_policy = Some(policy);
+        self
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
         let aliases = self.aliases.clone().type_alias(schema, alias);
         self.aliases(aliases)
+    }
+
+    fn effective_options(&self) -> TsSdkOptions {
+        let mut options = TsSdkOptions::for_profile(&self.profile);
+        if let Some(policy) = self.model_property_policy {
+            options.model_properties = policy;
+        }
+        if let Some(policy) = self.nullable_policy {
+            options.nullable = policy;
+        }
+        if let Some(policy) = self.response_policy {
+            options.response = policy;
+        }
+        options
     }
 }
 
@@ -1878,13 +1922,14 @@ impl Target for TsSdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::tssdk::generate_files_with_profile(
+        let files = crate::tssdk::generate_files_with_profile_options(
             ir,
             &package,
             &ir.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
+            self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "TypeScript", &package, ir);

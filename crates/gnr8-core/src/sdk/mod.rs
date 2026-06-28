@@ -36,6 +36,7 @@ pub mod model;
 pub mod model_style;
 pub mod profile;
 pub mod surface;
+pub mod typescript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -860,6 +861,7 @@ pub mod prelude {
     pub use super::model_style::PyModelStyle;
     pub use super::profile::SdkProfile;
     pub use super::surface::SdkTypeAliases;
+    pub use super::typescript::{TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy};
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,

@@ -29,6 +29,41 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
+## OpenAPI Generator Compatibility
+
+For migrations from an existing `typescript-axios` OpenAPI Generator SDK, use the compatibility profile.
+It emits Axios transport files, runtime enum objects, request aliases, loose model properties, and
+Axios response wrappers by default:
+
+```rust
+use gnr8::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8::runner::run(
+        Pipeline::new()
+            .source(NestJs::new().inputs(["src"]))
+            .target(
+                TsSdk::new()
+                    .module("example.com/nestjs-service/sdk")
+                    .to("generated/sdk")
+                    .profile(SdkProfile::openapi_generator_compat()),
+            ),
+    )
+}
+```
+
+The compatibility defaults can be overridden per target:
+
+```rust
+TsSdk::new()
+    .module("example.com/nestjs-service/sdk")
+    .to("generated/sdk")
+    .profile(SdkProfile::openapi_generator_compat())
+    .model_property_policy(TsModelPropertyPolicy::Strict)
+    .nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)
+    .response_policy(TsResponsePolicy::DataOnly)
+```
+
 ## Agent Checklist
 
 - Ensure the project has `typescript` installed where the NestJS app already builds. gnr8 uses the

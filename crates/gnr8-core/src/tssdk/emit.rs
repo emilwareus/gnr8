@@ -34,6 +34,7 @@ use crate::sdk::emit_common::{
     path_tokens, path_tokens_match, quoted_string_literal, split_words, success_responses_of,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
+use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -248,10 +249,25 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     emit_models_with_aliases(graph, package, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn emit_models_with_aliases(
     graph: &ApiGraph,
     _package: &str,
     aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
+    emit_models_with_aliases_and_policies(
+        graph,
+        aliases,
+        TsModelPropertyPolicy::Strict,
+        TsNullablePolicy::ExplicitNull,
+    )
+}
+
+pub(crate) fn emit_models_with_aliases_and_policies(
+    graph: &ApiGraph,
+    aliases: &[ResolvedTypeAlias],
+    model_property_policy: TsModelPropertyPolicy,
+    nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     let mut out = String::new();
 
@@ -266,7 +282,15 @@ pub(crate) fn emit_models_with_aliases(
             // Python's `class X(str, enum.Enum)` and Go's `type X string`.
             Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
             // A named object → an `interface`.
-            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
+            Type::Object(fields) => emit_interface_with_policies(
+                &mut out,
+                &schema.name,
+                fields,
+                graph,
+                "",
+                model_property_policy,
+                nullable_policy,
+            )?,
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
             // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
             // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
@@ -300,6 +324,8 @@ pub(crate) fn emit_models_openapi_generator_compat(
     graph: &ApiGraph,
     _package: &str,
     aliases: &[ResolvedTypeAlias],
+    model_property_policy: TsModelPropertyPolicy,
+    nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     let mut out = String::new();
 
@@ -311,7 +337,15 @@ pub(crate) fn emit_models_openapi_generator_compat(
         }
         match &schema.body {
             Type::Enum(members) => emit_runtime_enum_alias(&mut out, &schema.name, members)?,
-            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
+            Type::Object(fields) => emit_interface_with_policies(
+                &mut out,
+                &schema.name,
+                fields,
+                graph,
+                "",
+                model_property_policy,
+                nullable_policy,
+            )?,
             Type::Primitive(_)
             | Type::WellKnown(_)
             | Type::Array(_)
@@ -334,16 +368,26 @@ pub(crate) fn emit_models_openapi_generator_compat(
 }
 
 /// Emit one model schema into its own TypeScript file.
-pub(crate) fn emit_model_schema(
+pub(crate) fn emit_model_schema_with_policies(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
+    model_property_policy: TsModelPropertyPolicy,
+    nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut out = String::new();
     out.push_str("import type * as models from \"./index\";\n\n");
     match &schema.body {
         Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
-        Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "models.")?,
+        Type::Object(fields) => emit_interface_with_policies(
+            &mut out,
+            &schema.name,
+            fields,
+            graph,
+            "models.",
+            model_property_policy,
+            nullable_policy,
+        )?,
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
@@ -454,12 +498,14 @@ fn pascal_identifier(value: &str) -> String {
 /// RESEARCH Pitfall 6) and NO runtime decoder: an `interface` is zero-runtime and `await res.json() as X`
 /// suffices (Assumption A1). The two independent axes are: `optional` → `?:` at the field site;
 /// `nullable` → `| null` inside [`ts_type`]. All four combinations are representable.
-fn emit_interface(
+fn emit_interface_with_policies(
     out: &mut String,
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
     ns: &str,
+    model_property_policy: TsModelPropertyPolicy,
+    nullable_policy: TsNullablePolicy,
 ) -> Result<(), CoreError> {
     if fields.is_empty() {
         // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
@@ -479,8 +525,10 @@ fn emit_interface(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let hint = ts_type(&field.schema, field.nullable, graph, ns)?;
-        let opt = if field.optional { "?" } else { "" };
+        let effective_optional = model_property_policy.field_optional(field.optional);
+        let effective_nullable = nullable_policy.field_nullable(effective_optional, field.nullable);
+        let hint = ts_type(&field.schema, effective_nullable, graph, ns)?;
+        let opt = if effective_optional { "?" } else { "" };
         writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
     writeln!(out, "}}").map_err(sink)?;

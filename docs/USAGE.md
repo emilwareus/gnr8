@@ -214,6 +214,13 @@ the built-in `fetch`. PySdk emits Pydantic v2 `BaseModel` models by default, wit
 **project's own `typescript`** toolchain (required, not shipped — see CLAUDE.md); every other sidecar is
 stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small Rust dependency set.
 
+TypeScript migration compatibility is explicit. `TsSdk::new().profile(SdkProfile::openapi_generator_compat())`
+emits an Axios-style TypeScript SDK with runtime enum objects, request aliases, loose model interface
+properties, explicit `T | null` nullability, and `Promise<AxiosResponse<T>>` operation returns. Override
+the pieces independently with `.model_property_policy(TsModelPropertyPolicy::Strict)`,
+`.nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)`, or
+`.response_policy(TsResponsePolicy::DataOnly)`.
+
 ## Recognized Go/Gin patterns (code-first)
 Resolution is via `go/types` (alias/import-robust), not string matching.
 
