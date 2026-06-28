@@ -1,12 +1,12 @@
 [package]
-name = "gnr8-core"
+name = "gnr8"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-description = "Core library for gnr8 code-first API extraction, OpenAPI lowering, and SDK generation"
+description = "Code-first API extraction to OpenAPI 3.1 and generated client SDKs"
 
 [lints]
 workspace = true

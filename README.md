@@ -89,10 +89,10 @@ gnr8 init        # scaffold the .gnr8/ Rust crate (this is your config)
 API is parsed and generated (no TOML, no flags file):
 
 ```rust
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/books"))
@@ -138,7 +138,7 @@ side-by-side.
 ## Try the example
 
 ```bash
-cargo build --release -p gnr8
+cargo build --release -p gnr8-cli
 cd examples/bookstore
 ../../target/release/gnr8 generate
 # see generated/openapi.yaml and generated/sdk/

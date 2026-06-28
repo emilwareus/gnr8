@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       publish_crates:
-        description: Publish workspace crates to crates.io after tag (off by default until cargo-install sidecars are finalized)
+        description: Publish the public gnr8 crate to crates.io after tag
         type: boolean
-        default: false
+        default: true
       publish_cli:
         description: Build CLI and upload archives to the GitHub Release for this tag
         type: boolean
@@ -42,7 +42,7 @@ jobs:
       - name: Sync main
         run: git pull --rebase origin main
 
-      - name: Bump patch version
+      - name: Bump release version
         id: bump
         run: |
           new="$(python3 scripts/bump-workspace-version.py)"

@@ -12,7 +12,7 @@
 //! target pipes Go through gofmt). It SKIPS gracefully (early return) when Go or cargo is unavailable,
 //! mirroring the Go-dependent contract tests. The staging dir lives under `CARGO_TARGET_TMPDIR`
 //! (`<repo>/target/tmp`), which is INSIDE the gnr8 repo, so `gnr8 init` detects `crates/gnr8-core` and
-//! scaffolds a working `path` dependency (the published `gnr8-core` does not exist yet).
+//! scaffolds a working `path` dependency to the public `gnr8` package source.
 
 // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4); scope the allow to this
 // test target so the workspace-wide RUST-04 deny stays intact for production code. `doc_markdown` is

@@ -35,8 +35,8 @@ trap 'rm -rf "$WORK"' EXIT
 cp -R "$REPO/fixtures/goalservice" "$WORK/svc"
 
 # Build the real release binary once (the thing the benchmark measures).
-echo "building release binary (cargo build --release -p gnr8) ..." >&2
-cargo build --release -p gnr8 --manifest-path "$REPO/Cargo.toml" >&2
+echo "building release binary (cargo build --release -p gnr8-cli) ..." >&2
+cargo build --release -p gnr8-cli --manifest-path "$REPO/Cargo.toml" >&2
 GNR8="$REPO/target/release/gnr8"
 
 cd "$WORK/svc"

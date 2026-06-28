@@ -6,7 +6,7 @@ members = ["crates/gnr8-core", "crates/gnr8"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.10"
+version = "0.1.0"
 edition = "2021"        # D-08
 rust-version = "1.85"   # MSRV floor: clap 4.6 requires 1.85
 license = "MIT"         # matches repo LICENSE
@@ -18,7 +18,7 @@ description = "Code-first API extraction to OpenAPI 3.1 and generated client SDK
 # `priority` resolves conflicts: a lower priority is overridden by a higher one;
 # group-level lints use priority -1 so individual lints below them win.
 [workspace.lints.rust]
-unsafe_code = "forbid"      # T-01-02: no unsafe memory in gnr8-core/gnr8
+unsafe_code = "forbid"      # T-01-02: no unsafe memory in gnr8 internals
 unreachable_pub = "warn"
 
 [workspace.lints.clippy]
@@ -47,4 +47,4 @@ notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consume
 ctrlc = "3.5"                   # graceful Ctrl-C → AtomicBool for the watch loop (consumed in 04-03;
                                 # the FSEvents backend suppresses the default SIGINT disposition, so the
                                 # std-only approach proved insufficient — RESEARCH A5 sanctioned fallback)
-gnr8-core = { path = "crates/gnr8-core", version = "0.0.10" }
+gnr8 = { path = "crates/gnr8-core", version = "0.1.0" }

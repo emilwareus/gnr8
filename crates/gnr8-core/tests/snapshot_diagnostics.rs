@@ -21,7 +21,7 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/g
 fn diagnostics_match_expected_for_goalservice() {
     // 02-03: collect runs the goextract helper and renders the canonical 7-line WARN text; the
     // snapshot below locks it (reconciled with expected/diagnostics.txt).
-    let diags = gnr8_core::diagnostics::collect(FIXTURE_DIR)
+    let diags = gnr8::diagnostics::collect(FIXTURE_DIR)
         .expect("diagnostics::collect must succeed (requires the Go toolchain)");
     insta::assert_snapshot!("goalservice_diagnostics", diags);
 }

@@ -24,10 +24,10 @@
 //! The FastAPI app is parsed STATICALLY (pyextract reads the `ast` — it never imports or runs the
 //! app), so no `pip install` is needed. There is no auth in the source, so no `ApplySecurity` stage.
 
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
             .transform(SetBasePath::new("/books"))

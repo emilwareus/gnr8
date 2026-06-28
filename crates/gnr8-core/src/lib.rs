@@ -24,7 +24,7 @@ pub mod workspace;
 
 /// Convenience re-export of the code-as-config composition surface (the four traits, `Pipeline`,
 /// `Cx`, `Artifacts`, every built-in, and `SecurityScheme`). The user's `.gnr8` lifecycle imports
-/// `use gnr8_core::sdk::prelude::*;` (or this alias) and composes a [`sdk::Pipeline`].
+/// `use gnr8::sdk::prelude::*;` (or this alias) and composes a [`sdk::Pipeline`].
 pub use sdk::prelude;
 
 /// Stub used by Phase-1 CLI arms and unimplemented seams.

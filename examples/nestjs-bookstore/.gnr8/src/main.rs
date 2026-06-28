@@ -24,10 +24,10 @@
 //! are treated as unresolved framework decorators by design. There is no auth in the source, so no
 //! `ApplySecurity` stage.
 
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))
             .transform(SetBasePath::new("/books"))

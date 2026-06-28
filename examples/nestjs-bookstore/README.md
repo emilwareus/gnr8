@@ -60,10 +60,10 @@ There is no `config.toml`. The base path, title, and output paths are all method
 calls in a small Rust `Pipeline` that gnr8 compiles + runs:
 
 ```rust
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8_core::runner::run(
+    gnr8::runner::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))             // analyze the src/ tree
             .transform(SetBasePath::new("/books"))             // mount path (the @Controller prefix)

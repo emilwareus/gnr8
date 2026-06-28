@@ -1,4 +1,4 @@
-//! Integration test for the code-as-config SDK (`gnr8_core::sdk`): a `Pipeline` composed from the
+//! Integration test for the code-as-config SDK (`gnr8::sdk`): a `Pipeline` composed from the
 //! built-in stages over the goalservice fixture produces an `OpenAPI` artifact + the Go SDK artifacts,
 //! and the key generation facts (title, base path, an operationId, a security scheme, the generated
 //! header) all flow through the built-ins exactly as the host path produces them.
@@ -13,7 +13,7 @@
 // to this test target so the workspace-wide RUST-04 deny stays intact for production code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use gnr8_core::sdk::prelude::*;
+use gnr8::sdk::prelude::*;
 
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
@@ -30,7 +30,7 @@ fn go_available() -> bool {
 
 /// Build the goalservice pipeline (the same shape the bookstore `.gnr8` uses) and run it, rooted at
 /// the fixture dir so `GoGin::new().inputs(["."])` analyzes the fixture module.
-fn run_goalservice_pipeline() -> Option<gnr8_core::sdk::RunOutcome> {
+fn run_goalservice_pipeline() -> Option<gnr8::sdk::RunOutcome> {
     if !go_available() {
         eprintln!("skipping sdk_pipeline: go toolchain unavailable");
         return None;

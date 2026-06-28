@@ -16,8 +16,8 @@
 //! - the child exited non-zero ⇒ the child's stderr is surfaced verbatim (a compile error in the
 //!   user's pipeline, or a runtime/toolchain error from the pipeline itself);
 //! - the child's stdout is not a parseable bundle ⇒ a parse error with a hint;
-//! - the bundle's schema `version` differs from this gnr8's ⇒ an actionable "realign gnr8-core" error
-//!   (the `.gnr8/` crate links a skewed `gnr8-core`).
+//! - the bundle's schema `version` differs from this gnr8's ⇒ an actionable "realign gnr8" error
+//!   (the `.gnr8/` crate links a skewed `gnr8` library).
 //!
 //! `cargo` itself is the build cache: incremental rebuilds of `.gnr8/` are fast after the first build.
 
@@ -29,8 +29,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use gnr8_core::runner::ArtifactBundle;
-use gnr8_core::CoreError;
+use gnr8::runner::ArtifactBundle;
+use gnr8::CoreError;
 
 /// The env var that overrides the cargo binary used to build/run the child (checked before `CARGO`).
 const GNR8_CARGO_ENV: &str = "GNR8_CARGO";
@@ -62,7 +62,7 @@ pub(crate) fn run_child(
     project_root: &Path,
     subcommand: &str,
 ) -> Result<ArtifactBundle, CoreError> {
-    let manifest = gnr8_core::workspace::manifest_path(project_root);
+    let manifest = gnr8::workspace::manifest_path(project_root);
     if !manifest.is_file() {
         return Err(CoreError::ChildRun {
             message: format!(
@@ -101,17 +101,17 @@ pub(crate) fn run_child(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let bundle = parse_bundle(stdout.trim(), &output.stderr)?;
 
-    // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8-core`, so a
-    // version skew (e.g. a pinned published `gnr8-core` vs a newer host) must fail with an actionable
+    // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8`, so a
+    // version skew (e.g. a pinned published `gnr8` vs a newer host) must fail with an actionable
     // message rather than a confusing parse error or silently-wrong output.
-    if bundle.version != gnr8_core::runner::BUNDLE_VERSION {
+    if bundle.version != gnr8::runner::BUNDLE_VERSION {
         return Err(CoreError::ChildRun {
             message: format!(
                 "the .gnr8 generation crate emitted artifact-bundle schema version {}, but this gnr8 \
-                 supports version {}. Realign the gnr8-core your .gnr8/ crate depends on with this \
+                 supports version {}. Realign the gnr8 crate your .gnr8/ crate depends on with this \
                  gnr8 binary (update .gnr8/Cargo.toml), then re-run.",
                 bundle.version,
-                gnr8_core::runner::BUNDLE_VERSION
+                gnr8::runner::BUNDLE_VERSION
             ),
         });
     }
@@ -195,8 +195,8 @@ impl ChildInvocation {
                 command
             }
         };
-        if let Some(resource_dir) = gnr8_core::resource::resource_dir() {
-            command.env(gnr8_core::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
+        if let Some(resource_dir) = gnr8::resource::resource_dir() {
+            command.env(gnr8::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
         }
         command
     }

@@ -2,7 +2,7 @@
 //!
 //! Six top-level commands plus a nested `inspect` subcommand, with a global `--json` flag and a
 //! repeatable `-v/--verbose` count. Execution lives in the binary modules; core library failures stay
-//! typed as `gnr8_core::CoreError` until the final CLI reporting boundary.
+//! typed as `gnr8::CoreError` until the final CLI reporting boundary.
 
 use clap::{Parser, Subcommand};
 
