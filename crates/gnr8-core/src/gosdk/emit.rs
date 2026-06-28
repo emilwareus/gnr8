@@ -3183,6 +3183,7 @@ mod tests {
     mod models {
         use super::super::{emit_models, go_field_emissions, GoEmitOptions};
         use super::sample_graph;
+        use crate::analyze::facts::FieldMeta;
         use crate::graph::{Field, Prim, Type};
 
         #[test]
@@ -3211,6 +3212,7 @@ mod tests {
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
+                    meta: FieldMeta::default(),
                 },
                 Field {
                     json_name: "authorized_by_workspace_member_id".to_string(),
@@ -3220,6 +3222,7 @@ mod tests {
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
+                    meta: FieldMeta::default(),
                 },
             ];
 
@@ -3652,6 +3655,7 @@ mod tests {
     /// cases prove the conflation is fixed end-to-end through `emit_models`.
     mod optional_vs_nullable {
         use super::emit_models;
+        use crate::analyze::facts::FieldMeta;
         use crate::graph::{ApiGraph, Field, Prim, Type};
 
         /// A one-object graph with a single value field carrying the given optional/nullable axes.
@@ -3669,7 +3673,9 @@ mod tests {
                     schema: Type::Primitive(Prim::Float { bits: 32 }),
                     description: None,
                     example: None,
+                    meta: FieldMeta::default(),
                 }]),
+                enum_source_order: Vec::new(),
                 provenance: crate::graph::SourceSpan {
                     file: "s.go".to_string(),
                     start_line: 1,

@@ -55,6 +55,9 @@ pub(crate) enum Commands {
         /// Overwrite generated files a user has hand-edited (D-04 / A4 override verb).
         #[arg(long)]
         force: bool,
+        /// Explicitly adopt current generated baselines, overwriting migration drift intentionally.
+        #[arg(long)]
+        accept_generated_baseline: bool,
     },
     /// Watch source and regenerate on change.
     Watch {
@@ -73,6 +76,29 @@ pub(crate) enum Commands {
     },
     /// Summarize unsupported patterns and lifecycle issues.
     Doctor,
+    /// Compare generated SDK public surfaces for compatibility.
+    Compat {
+        /// Compatibility check to run.
+        #[command(subcommand)]
+        action: CompatAction,
+    },
+}
+
+/// SDK compatibility subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum CompatAction {
+    /// Compare two generated TypeScript SDK directories.
+    Typescript {
+        /// Old/baseline SDK directory.
+        #[arg(long)]
+        old: String,
+        /// New/candidate SDK directory.
+        #[arg(long)]
+        new: String,
+        /// Optional compatibility contract TOML path.
+        #[arg(long)]
+        contract: Option<String>,
+    },
 }
 
 /// Source frontend presets for `gnr8 init`.
@@ -147,7 +173,7 @@ mod tests {
     // the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+    use super::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
     use clap::Parser;
 
     #[test]
@@ -171,14 +197,29 @@ mod tests {
         // `generate` defaults `--force` to false.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "generate"]).unwrap().command,
-            Commands::Generate { force: false }
+            Commands::Generate {
+                force: false,
+                accept_generated_baseline: false
+            }
         ));
         // `generate --force` sets the flag.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "generate", "--force"])
                 .unwrap()
                 .command,
-            Commands::Generate { force: true }
+            Commands::Generate {
+                force: true,
+                accept_generated_baseline: false
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "generate", "--accept-generated-baseline"])
+                .unwrap()
+                .command,
+            Commands::Generate {
+                force: false,
+                accept_generated_baseline: true
+            }
         ));
         // `watch` defaults `--debounce-ms` to 200.
         assert!(matches!(
@@ -199,6 +240,22 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
             Commands::Doctor
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "gnr8",
+                "compat",
+                "typescript",
+                "--old",
+                "old-sdk",
+                "--new",
+                "new-sdk"
+            ])
+            .unwrap()
+            .command,
+            Commands::Compat {
+                action: CompatAction::Typescript { .. }
+            }
         ));
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "guide"]).unwrap().command,

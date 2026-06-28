@@ -14,9 +14,13 @@
 use super::{
     collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
 };
+use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{ApiGraph, Response, SchemaRef, SecurityScheme, Type};
+use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::CoreError;
 use std::fmt::Write as _;
@@ -640,6 +644,180 @@ impl Transform for SetSchemaFieldType {
     }
 }
 
+/// Enum ordering policy for generated OpenAPI/SDK surfaces.
+#[derive(Debug, Clone)]
+pub enum EnumOrder {
+    /// Lexical ordering (the default graph normalization behavior).
+    Lexical,
+    /// Restore source declaration order when the source sidecar provided it.
+    Source,
+    /// Apply explicit overrides. Targets are schema id/name or `Schema.field` for inline enum fields.
+    Explicit(Vec<(String, Vec<String>)>),
+}
+
+/// Apply enum ordering controls to the graph before targets render it.
+#[derive(Debug, Clone)]
+pub struct SetEnumOrder {
+    order: EnumOrder,
+}
+
+impl SetEnumOrder {
+    /// Create an enum-order transform.
+    #[must_use]
+    pub fn new(order: EnumOrder) -> Self {
+        Self { order }
+    }
+
+    /// Restore source declaration order for named enums where available.
+    #[must_use]
+    pub fn source() -> Self {
+        Self::new(EnumOrder::Source)
+    }
+
+    /// Sort every enum lexically.
+    #[must_use]
+    pub fn lexical() -> Self {
+        Self::new(EnumOrder::Lexical)
+    }
+
+    /// Apply one explicit override.
+    #[must_use]
+    pub fn explicit<I, S>(target: impl Into<String>, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(EnumOrder::Explicit(vec![(
+            target.into(),
+            values.into_iter().map(Into::into).collect(),
+        )]))
+    }
+}
+
+impl Transform for SetEnumOrder {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        match &self.order {
+            EnumOrder::Lexical => {
+                for schema in &mut ir.schemas {
+                    sort_enums_in_type(&mut schema.body);
+                }
+            }
+            EnumOrder::Source => {
+                for schema in &mut ir.schemas {
+                    if let Type::Enum(members) = &mut schema.body {
+                        if !schema.enum_source_order.is_empty() {
+                            ensure_same_enum_members(
+                                &schema.name,
+                                members,
+                                &schema.enum_source_order,
+                            )?;
+                            members.clone_from(&schema.enum_source_order);
+                        }
+                    }
+                }
+            }
+            EnumOrder::Explicit(overrides) => {
+                for (target, values) in overrides {
+                    apply_explicit_enum_order(ir, target, values)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sort_enums_in_type(ty: &mut Type) {
+    match ty {
+        Type::Enum(members) => members.sort(),
+        Type::Object(fields) => {
+            for field in fields {
+                sort_enums_in_type(&mut field.schema);
+            }
+        }
+        Type::Array(inner) => sort_enums_in_type(inner),
+        Type::Map { key, value } => {
+            sort_enums_in_type(key);
+            sort_enums_in_type(value);
+        }
+        Type::Union(variants) => {
+            for variant in variants {
+                sort_enums_in_type(variant);
+            }
+        }
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Named(_) | Type::Any {} => {}
+    }
+}
+
+fn apply_explicit_enum_order(
+    ir: &mut ApiGraph,
+    target: &str,
+    values: &[String],
+) -> Result<(), CoreError> {
+    if let Some((schema_name, field_name)) = target.split_once('.') {
+        let schema = ir
+            .schemas
+            .iter_mut()
+            .find(|schema| schema.id == schema_name || schema.name == schema_name)
+            .ok_or_else(|| CoreError::Config {
+                message: format!("enum order override references unknown schema {schema_name:?}"),
+            })?;
+        let Type::Object(fields) = &mut schema.body else {
+            return Err(CoreError::Config {
+                message: format!("enum order override target {schema_name:?} is not an object"),
+            });
+        };
+        let field = fields
+            .iter_mut()
+            .find(|field| field.json_name == field_name)
+            .ok_or_else(|| CoreError::Config {
+                message: format!("enum order override references unknown field {target:?}"),
+            })?;
+        let Type::Enum(members) = &mut field.schema else {
+            return Err(CoreError::Config {
+                message: format!("enum order override target {target:?} is not an inline enum"),
+            });
+        };
+        ensure_same_enum_members(target, members, values)?;
+        *members = values.to_vec();
+        return Ok(());
+    }
+
+    let schema = ir
+        .schemas
+        .iter_mut()
+        .find(|schema| schema.id == target || schema.name == target)
+        .ok_or_else(|| CoreError::Config {
+            message: format!("enum order override references unknown schema {target:?}"),
+        })?;
+    let Type::Enum(members) = &mut schema.body else {
+        return Err(CoreError::Config {
+            message: format!("enum order override target {target:?} is not a named enum"),
+        });
+    };
+    ensure_same_enum_members(target, members, values)?;
+    *members = values.to_vec();
+    Ok(())
+}
+
+fn ensure_same_enum_members(
+    target: &str,
+    existing: &[String],
+    requested: &[String],
+) -> Result<(), CoreError> {
+    let mut existing = existing.to_vec();
+    let mut requested = requested.to_vec();
+    existing.sort();
+    requested.sort();
+    if existing == requested {
+        return Ok(());
+    }
+    Err(CoreError::Config {
+        message: format!(
+            "enum order override for {target:?} must contain exactly the existing enum members"
+        ),
+    })
+}
+
 /// Push a security scheme onto [`ApiGraph::security`] — the single source of truth for the generated
 /// `security` requirement + `components.securitySchemes` (replaces the `[[security.schemes]]` knob,
 /// CLAUDE.md rule 4).
@@ -806,6 +984,240 @@ impl Transform for GroupOperations {
 // Targets
 // ---------------------------------------------------------------------------------------------------
 
+/// Typed OpenAPI component aliases. Aliases are added as component schemas whose body is a `$ref` to
+/// the canonical component.
+#[derive(Debug, Clone, Default)]
+pub struct OpenApiSchemaAliases {
+    aliases: Vec<(String, String)>,
+}
+
+impl OpenApiSchemaAliases {
+    /// Create an empty alias set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one component alias (`alias` points at `canonical`).
+    #[must_use]
+    pub fn alias(mut self, canonical: impl Into<String>, alias: impl Into<String>) -> Self {
+        self.aliases.push((canonical.into(), alias.into()));
+        self
+    }
+}
+
+/// Typed OpenAPI schema patch. Field patches mutate properties on the named object schema.
+#[derive(Debug, Clone)]
+pub struct OpenApiSchemaPatch {
+    schema: String,
+    field_patches: Vec<OpenApiFieldPatch>,
+}
+
+impl OpenApiSchemaPatch {
+    /// Patch an existing named component schema.
+    #[must_use]
+    pub fn new(schema: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            field_patches: Vec::new(),
+        }
+    }
+
+    /// Add a field patch for a property on this object schema.
+    #[must_use]
+    pub fn field(mut self, patch: OpenApiFieldPatch) -> Self {
+        self.field_patches.push(patch);
+        self
+    }
+}
+
+/// Typed OpenAPI field patch builder for constraints/defaults/extensions.
+#[derive(Debug, Clone)]
+pub struct OpenApiFieldPatch {
+    field: String,
+    constraints: Constraints,
+    default: Option<LiteralValue>,
+    extensions: Vec<Extension>,
+}
+
+impl OpenApiFieldPatch {
+    /// Patch an existing object property.
+    #[must_use]
+    pub fn new(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            constraints: Constraints::default(),
+            default: None,
+            extensions: Vec::new(),
+        }
+    }
+
+    /// Set `minLength`.
+    #[must_use]
+    pub fn min_length(mut self, value: u64) -> Self {
+        self.constraints.min_length = Some(value);
+        self
+    }
+
+    /// Set `maxLength`.
+    #[must_use]
+    pub fn max_length(mut self, value: u64) -> Self {
+        self.constraints.max_length = Some(value);
+        self
+    }
+
+    /// Set inclusive numeric `minimum`.
+    #[must_use]
+    pub fn minimum(mut self, value: impl Into<String>) -> Self {
+        self.constraints.minimum = Some(value.into());
+        self
+    }
+
+    /// Set inclusive numeric `maximum`.
+    #[must_use]
+    pub fn maximum(mut self, value: impl Into<String>) -> Self {
+        self.constraints.maximum = Some(value.into());
+        self
+    }
+
+    /// Set a field-level enum.
+    #[must_use]
+    pub fn enum_values<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.constraints.enum_values = values.into_iter().map(Into::into).collect();
+        self.constraints.enum_values.sort();
+        self
+    }
+
+    /// Set a string default.
+    #[must_use]
+    pub fn default_string(mut self, value: impl Into<String>) -> Self {
+        self.default = Some(LiteralValue::String(value.into()));
+        self
+    }
+
+    /// Set a numeric default.
+    #[must_use]
+    pub fn default_number(mut self, value: impl Into<String>) -> Self {
+        self.default = Some(LiteralValue::Number(value.into()));
+        self
+    }
+
+    /// Set a boolean default.
+    #[must_use]
+    pub fn default_bool(mut self, value: bool) -> Self {
+        self.default = Some(LiteralValue::Bool(value));
+        self
+    }
+
+    /// Add or replace a string vendor extension.
+    #[must_use]
+    pub fn extension_string(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extensions.push(Extension {
+            name: name.into(),
+            value: LiteralValue::String(value.into()),
+        });
+        self
+    }
+}
+
+fn apply_openapi_customizations(
+    doc: &mut OpenApiDoc,
+    aliases: &OpenApiSchemaAliases,
+    patches: &[OpenApiSchemaPatch],
+) -> Result<(), CoreError> {
+    for (canonical, alias) in &aliases.aliases {
+        if !doc
+            .components
+            .schemas
+            .iter()
+            .any(|(name, _)| name == canonical)
+        {
+            return Err(CoreError::Config {
+                message: format!("OpenAPI schema alias references unknown schema {canonical:?}"),
+            });
+        }
+        if doc.components.schemas.iter().any(|(name, _)| name == alias) {
+            return Err(CoreError::Config {
+                message: format!("OpenAPI schema alias {alias:?} collides with an existing schema"),
+            });
+        }
+        doc.components
+            .schemas
+            .push((alias.clone(), SchemaObject::reference(canonical.clone())));
+    }
+    doc.components.schemas.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for patch in patches {
+        let Some((_, schema)) = doc
+            .components
+            .schemas
+            .iter_mut()
+            .find(|(name, _)| name == &patch.schema)
+        else {
+            return Err(CoreError::Config {
+                message: format!(
+                    "OpenAPI schema patch references unknown schema {:?}",
+                    patch.schema
+                ),
+            });
+        };
+        for field_patch in &patch.field_patches {
+            apply_openapi_field_patch(&patch.schema, schema, field_patch)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_openapi_field_patch(
+    schema_name: &str,
+    schema: &mut SchemaObject,
+    patch: &OpenApiFieldPatch,
+) -> Result<(), CoreError> {
+    let Some((_, prop)) = schema
+        .properties
+        .iter_mut()
+        .find(|(field, _)| field == &patch.field)
+    else {
+        return Err(CoreError::Config {
+            message: format!(
+                "OpenAPI schema patch references unknown field {schema_name}.{}",
+                patch.field
+            ),
+        });
+    };
+
+    prop.min_length = patch.constraints.min_length;
+    prop.max_length = patch.constraints.max_length;
+    prop.minimum.clone_from(&patch.constraints.minimum);
+    prop.maximum.clone_from(&patch.constraints.maximum);
+    prop.exclusive_minimum
+        .clone_from(&patch.constraints.exclusive_minimum);
+    prop.exclusive_maximum
+        .clone_from(&patch.constraints.exclusive_maximum);
+    prop.pattern.clone_from(&patch.constraints.pattern);
+    if !patch.constraints.enum_values.is_empty() {
+        prop.enum_values.clone_from(&patch.constraints.enum_values);
+    }
+    prop.default_value.clone_from(&patch.default);
+    for extension in &patch.extensions {
+        if let Some(existing) = prop
+            .extensions
+            .iter_mut()
+            .find(|existing| existing.name == extension.name)
+        {
+            *existing = extension.clone();
+        } else {
+            prop.extensions.push(extension.clone());
+        }
+    }
+    prop.extensions.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(())
+}
+
 /// The OpenAPI 3.1 target: lowers the frozen IR to an OpenAPI document and writes it at [`OpenApi31::to`].
 ///
 /// Reads `ir.title` / `ir.base_path` / `ir.security` (the metadata transforms set) and calls the
@@ -814,6 +1226,8 @@ impl Transform for GroupOperations {
 #[derive(Debug, Clone)]
 pub struct OpenApi31 {
     path: String,
+    schema_aliases: OpenApiSchemaAliases,
+    schema_patches: Vec<OpenApiSchemaPatch>,
 }
 
 impl OpenApi31 {
@@ -822,6 +1236,8 @@ impl OpenApi31 {
     pub fn new() -> Self {
         Self {
             path: String::new(),
+            schema_aliases: OpenApiSchemaAliases::default(),
+            schema_patches: Vec::new(),
         }
     }
 
@@ -829,6 +1245,20 @@ impl OpenApi31 {
     #[must_use]
     pub fn to(mut self, path: impl Into<String>) -> Self {
         self.path = path.into();
+        self
+    }
+
+    /// Add typed component aliases.
+    #[must_use]
+    pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
+        self.schema_aliases.aliases.extend(aliases.aliases);
+        self
+    }
+
+    /// Add a typed schema patch.
+    #[must_use]
+    pub fn schema_patch(mut self, patch: OpenApiSchemaPatch) -> Self {
+        self.schema_patches.push(patch);
         self
     }
 }
@@ -849,8 +1279,9 @@ impl Target for OpenApi31 {
         }
         // Pass the graph's security schemes straight to the existing lowering (the single source of
         // truth — an `ApplySecurity` transform set them); never a re-implementation (CLAUDE.md rule 3).
-        let doc = crate::lower::to_openapi(ir, &ir.title, &ir.base_path, &ir.security)?;
-        out.write(self.path.clone(), doc);
+        let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
+        apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
+        out.write(self.path.clone(), crate::lower::write_openapi_yaml(&doc));
         Ok(())
     }
 
@@ -869,6 +1300,8 @@ impl Target for OpenApi31 {
 #[derive(Debug, Clone)]
 pub struct OpenApi31Json {
     path: String,
+    schema_aliases: OpenApiSchemaAliases,
+    schema_patches: Vec<OpenApiSchemaPatch>,
 }
 
 impl OpenApi31Json {
@@ -877,6 +1310,8 @@ impl OpenApi31Json {
     pub fn new() -> Self {
         Self {
             path: String::new(),
+            schema_aliases: OpenApiSchemaAliases::default(),
+            schema_patches: Vec::new(),
         }
     }
 
@@ -884,6 +1319,20 @@ impl OpenApi31Json {
     #[must_use]
     pub fn to(mut self, path: impl Into<String>) -> Self {
         self.path = path.into();
+        self
+    }
+
+    /// Add typed component aliases.
+    #[must_use]
+    pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
+        self.schema_aliases.aliases.extend(aliases.aliases);
+        self
+    }
+
+    /// Add a typed schema patch.
+    #[must_use]
+    pub fn schema_patch(mut self, patch: OpenApiSchemaPatch) -> Self {
+        self.schema_patches.push(patch);
         self
     }
 }
@@ -902,8 +1351,9 @@ impl Target for OpenApi31Json {
                     .to_string(),
             });
         }
-        let doc = crate::lower::to_openapi_json(ir, &ir.title, &ir.base_path, &ir.security)?;
-        out.write(self.path.clone(), doc);
+        let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
+        apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
+        out.write(self.path.clone(), crate::lower::write_openapi_json(&doc)?);
         Ok(())
     }
 
@@ -1033,6 +1483,7 @@ pub struct GoSdk {
     dir: String,
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
+    profile: SdkProfile,
 }
 
 impl GoSdk {
@@ -1044,6 +1495,7 @@ impl GoSdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
+            profile: SdkProfile::default(),
         }
     }
 
@@ -1082,6 +1534,13 @@ impl GoSdk {
         self
     }
 
+    /// Set the SDK profile. The minimal profile preserves the historical Go SDK output.
+    #[must_use]
+    pub fn profile(mut self, profile: SdkProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1112,6 +1571,14 @@ impl Target for GoSdk {
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
+        let _model = SdkModel::build(
+            ir,
+            &package,
+            &ir.base_path,
+            &self.layout,
+            &self.aliases,
+            &self.profile,
+        )?;
         let files = crate::gosdk::generate_files_with_layout(
             ir,
             &package,
@@ -1157,6 +1624,7 @@ pub struct PySdk {
     layout: SdkFileLayout,
     model_style: PyModelStyle,
     aliases: SdkTypeAliases,
+    profile: SdkProfile,
 }
 
 impl PySdk {
@@ -1169,6 +1637,7 @@ impl PySdk {
             layout: SdkFileLayout::compact(),
             model_style: PyModelStyle::default(),
             aliases: SdkTypeAliases::default(),
+            profile: SdkProfile::default(),
         }
     }
 
@@ -1222,6 +1691,13 @@ impl PySdk {
         self
     }
 
+    /// Set the SDK profile. The minimal profile preserves the historical Python SDK output.
+    #[must_use]
+    pub fn profile(mut self, profile: SdkProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1254,6 +1730,14 @@ impl Target for PySdk {
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
         // OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
+        let _model = SdkModel::build(
+            ir,
+            &package,
+            &ir.base_path,
+            &self.layout,
+            &self.aliases,
+            &self.profile,
+        )?;
         let files = crate::pysdk::generate_files_with_options(
             ir,
             &package,
@@ -1295,6 +1779,7 @@ pub struct TsSdk {
     dir: String,
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
+    profile: SdkProfile,
 }
 
 impl TsSdk {
@@ -1306,6 +1791,7 @@ impl TsSdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
+            profile: SdkProfile::default(),
         }
     }
 
@@ -1345,6 +1831,13 @@ impl TsSdk {
         self
     }
 
+    /// Set the SDK profile.
+    #[must_use]
+    pub fn profile(mut self, profile: SdkProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1377,12 +1870,21 @@ impl Target for TsSdk {
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
         // the OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let files = crate::tssdk::generate_files_with_layout(
+        let _model = SdkModel::build(
             ir,
             &package,
             &ir.base_path,
             &self.layout,
             &self.aliases,
+            &self.profile,
+        )?;
+        let files = crate::tssdk::generate_files_with_profile(
+            ir,
+            &package,
+            &ir.base_path,
+            &self.layout,
+            &self.aliases,
+            &self.profile,
         )?;
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "TypeScript", &package, ir);
@@ -1726,10 +2228,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApplySecurity, Cx, FastApi, Flask, GoSdk, Header, NestJs, OpenApi31,
-        OpenApi31Json, PostProcess, PySdk, SetBasePath, SetOperationSuccessResponse,
+        sdk_package, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk, Header, NestJs,
+        OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases, OpenApiSchemaPatch,
+        PostProcess, PySdk, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
         SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
+    use crate::analyze::facts::FieldMeta;
     use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SourceSpan, Type};
     use crate::sdk::Artifacts;
 
@@ -1795,6 +2299,7 @@ mod tests {
                 id: "app.CreateBookResponse".to_string(),
                 name: "CreateBookResponse".to_string(),
                 body: Type::Object(vec![]),
+                enum_source_order: Vec::new(),
                 provenance: span(),
             }],
             operations: vec![Operation {
@@ -1850,6 +2355,7 @@ mod tests {
                 id: "app.CreateBookResponse".to_string(),
                 name: "CreateBookResponse".to_string(),
                 body: Type::Object(vec![]),
+                enum_source_order: Vec::new(),
                 provenance: span(),
             }],
             operations: vec![Operation {
@@ -1888,7 +2394,9 @@ mod tests {
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
+                    meta: FieldMeta::default(),
                 }]),
+                enum_source_order: Vec::new(),
                 provenance: span(),
             }],
             ..ApiGraph::default()
@@ -1905,6 +2413,136 @@ mod tests {
             fields[0].schema,
             Type::Array(ref inner) if matches!(**inner, Type::Any {})
         ));
+    }
+
+    #[test]
+    fn enum_order_transform_supports_source_and_explicit_inline_overrides() {
+        let mut ir = ApiGraph {
+            schemas: vec![
+                Schema {
+                    id: "app.Direction".to_string(),
+                    name: "Direction".to_string(),
+                    body: Type::Enum(vec!["gte".to_string(), "lte".to_string()]),
+                    enum_source_order: vec!["lte".to_string(), "gte".to_string()],
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.Filter".to_string(),
+                    name: "Filter".to_string(),
+                    body: Type::Object(vec![Field {
+                        json_name: "sort".to_string(),
+                        required: false,
+                        optional: true,
+                        nullable: false,
+                        schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    }]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        SetEnumOrder::source().apply(&mut ir, &cx()).unwrap();
+        let Type::Enum(direction) = &ir.schemas[0].body else {
+            panic!("expected named enum");
+        };
+        assert_eq!(direction, &vec!["lte".to_string(), "gte".to_string()]);
+
+        SetEnumOrder::new(EnumOrder::Explicit(vec![(
+            "Filter.sort".to_string(),
+            vec!["desc".to_string(), "asc".to_string()],
+        )]))
+        .apply(&mut ir, &cx())
+        .unwrap();
+        let Type::Object(fields) = &ir.schemas[1].body else {
+            panic!("expected object");
+        };
+        let Type::Enum(sort) = &fields[0].schema else {
+            panic!("expected inline enum");
+        };
+        assert_eq!(sort, &vec!["desc".to_string(), "asc".to_string()]);
+    }
+
+    #[test]
+    fn openapi_helpers_patch_typed_doc_before_yaml_and_json_serialization() {
+        let ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.CreateBookInput".to_string(),
+                name: "CreateBookInput".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "title".to_string(),
+                    required: true,
+                    optional: false,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let aliases = OpenApiSchemaAliases::new().alias("CreateBookInput", "CreateBookRequest");
+        let patch = OpenApiSchemaPatch::new("CreateBookInput").field(
+            OpenApiFieldPatch::new("title")
+                .min_length(3)
+                .default_string("Untitled")
+                .extension_string("x-gnr8-render", "input"),
+        );
+
+        let mut yaml_out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_aliases(aliases.clone())
+            .schema_patch(patch.clone())
+            .generate(&ir, &mut yaml_out, &cx())
+            .unwrap();
+        let yaml = yaml_out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "openapi.yaml")
+            .unwrap()
+            .text
+            .as_str();
+        assert!(yaml.contains("CreateBookRequest:"), "{yaml}");
+        assert!(
+            yaml.contains("$ref: '#/components/schemas/CreateBookInput'"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("minLength: 3"), "{yaml}");
+        assert!(yaml.contains("default: Untitled"), "{yaml}");
+        assert!(yaml.contains("x-gnr8-render: input"), "{yaml}");
+
+        let mut json_out = Artifacts::new();
+        OpenApi31Json::new()
+            .to("openapi.json")
+            .schema_aliases(aliases)
+            .schema_patch(patch)
+            .generate(&ir, &mut json_out, &cx())
+            .unwrap();
+        let json = json_out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "openapi.json")
+            .unwrap()
+            .text
+            .as_str();
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookRequest"]["$ref"],
+            "#/components/schemas/CreateBookInput"
+        );
+        let title = &value["components"]["schemas"]["CreateBookInput"]["properties"]["title"];
+        assert_eq!(title["minLength"], 3);
+        assert_eq!(title["default"], "Untitled");
+        assert_eq!(title["x-gnr8-render"], "input");
     }
 
     #[test]

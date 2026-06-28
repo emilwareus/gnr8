@@ -134,7 +134,10 @@ var canonicalFieldNames = []string{
 	// SchemaFact (id/name/body/span)
 	"id",
 	// FieldFact
-	"json_name", "optional", "nullable", "description", "example",
+	"json_name", "optional", "nullable", "description", "example", "meta",
+	// FieldMeta / Constraints / Extension / LiteralValue
+	"constraints", "default", "extensions", "min_length", "max_length", "minimum", "maximum",
+	"exclusive_minimum", "exclusive_maximum", "pattern", "enum_values",
 	// Type (adjacent tag/content)
 	"type", "of",
 	// MapType payload
@@ -155,11 +158,31 @@ var canonicalFieldNames = []string{
 // route. Used by the drift guard to harvest the complete emitted key set.
 func fullyPopulatedDoc() facts.GoFacts {
 	desc, ex := "a description", "an example"
+	minLen, maxLen := uint64(1), uint64(120)
+	minimum, maximum := "0", "100"
+	exclusiveMinimum, exclusiveMaximum := "-1", "101"
+	pattern := "^[a-z]+$"
 	objectFields := []facts.FieldFact{
 		{
 			JSONName: "ratio", Required: true, Optional: true, Nullable: true,
 			Schema:      facts.PrimitiveType(facts.FloatPrim(32)),
 			Description: &desc, Example: &ex,
+			Meta: &facts.FieldMeta{
+				Constraints: &facts.Constraints{
+					MinLength:        &minLen,
+					MaxLength:        &maxLen,
+					Minimum:          &minimum,
+					Maximum:          &maximum,
+					ExclusiveMinimum: &exclusiveMinimum,
+					ExclusiveMaximum: &exclusiveMaximum,
+					Pattern:          &pattern,
+					EnumValues:       []string{"low", "high"},
+				},
+				Default: &facts.LiteralValue{Type: "number", Value: "3.14"},
+				Extensions: []facts.Extension{
+					{Name: "x-gnr8-render", Value: facts.LiteralValue{Type: "string", Value: "slider"}},
+				},
+			},
 		},
 		{
 			JSONName: "count", Required: true, Optional: false, Nullable: false,

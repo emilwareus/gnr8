@@ -12,6 +12,8 @@ import (
 	"go/token"
 	gotypes "go/types"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -160,12 +162,13 @@ func extractFields(
 			diags:        diags,
 		}
 		schema := mapType(f.Type(), ctx)
-		required := strings.Contains(tag.Get("binding"), "required")
+		required := bindingHasRequired(tag.Get("binding"))
 		// The two independent axes: optional = the key may be absent (a pointer or
 		// `,omitempty`); nullable = the value may be explicitly null (a pointer can
 		// hold nil). A non-pointer `,omitempty` field is optional-but-not-nullable.
 		optional := isPointer(f.Type()) || omitempty
 		nullable := isPointer(f.Type())
+		meta := fieldMetaFromTags(structName, f.Name(), tag, st.Tag(i), schema, file, line, diags)
 
 		fields = append(fields, facts.FieldFact{
 			JSONName:    jsonName,
@@ -175,9 +178,355 @@ func extractFields(
 			Schema:      schema,
 			Description: optString(tag.Get("description")),
 			Example:     optString(tag.Get("example")),
+			Meta:        meta,
 		})
 	}
 	return fields
+}
+
+func bindingHasRequired(binding string) bool {
+	for _, token := range strings.Split(binding, ",") {
+		if strings.TrimSpace(token) == "required" {
+			return true
+		}
+	}
+	return false
+}
+
+func fieldMetaFromTags(
+	structName string,
+	fieldName string,
+	tag reflect.StructTag,
+	rawTag string,
+	schema facts.Type,
+	file string,
+	line uint32,
+	diags *diag.Accumulator,
+) *facts.FieldMeta {
+	meta := &facts.FieldMeta{}
+
+	if constraints := constraintsFromBinding(structName, fieldName, tag.Get("binding"), schema, file, line, diags); !constraintsEmpty(constraints) {
+		meta.Constraints = constraints
+	}
+
+	if rawDefault, ok := tag.Lookup("default"); ok {
+		meta.Default = literalForSchema(rawDefault, schema, structName, fieldName, file, line, diags)
+	}
+
+	extensions := make([]facts.Extension, 0)
+	if placeholder, ok := tag.Lookup("placeholder"); ok {
+		extensions = append(extensions, facts.Extension{
+			Name:  "x-gnr8-placeholder",
+			Value: stringLiteral(placeholder),
+		})
+	}
+	if render, ok := tag.Lookup("render"); ok {
+		extensions = append(extensions, facts.Extension{
+			Name:  "x-gnr8-render",
+			Value: stringLiteral(render),
+		})
+	}
+
+	rawTags := parseStructTag(rawTag)
+	keys := make([]string, 0, len(rawTags))
+	for key := range rawTags {
+		if strings.HasPrefix(key, "x-") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		extensions = append(extensions, facts.Extension{
+			Name:  key,
+			Value: inferLiteral(rawTags[key]),
+		})
+	}
+	if len(extensions) > 0 {
+		meta.Extensions = extensions
+	}
+
+	if meta.Constraints == nil && meta.Default == nil && len(meta.Extensions) == 0 {
+		return nil
+	}
+	return meta
+}
+
+func constraintsFromBinding(
+	structName string,
+	fieldName string,
+	binding string,
+	schema facts.Type,
+	file string,
+	line uint32,
+	diags *diag.Accumulator,
+) *facts.Constraints {
+	constraints := &facts.Constraints{}
+	if binding == "" {
+		return constraints
+	}
+	for _, token := range strings.Split(binding, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" || token == "required" || token == "omitempty" || token == "dive" {
+			continue
+		}
+		name, value, hasValue := strings.Cut(token, "=")
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		switch name {
+		case "min":
+			if !hasValue || !applyMinMaxConstraint(constraints, "min", value, schema) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+			}
+		case "max":
+			if !hasValue || !applyMinMaxConstraint(constraints, "max", value, schema) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+			}
+		case "gte":
+			if !hasValue || !validNumber(value) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			constraints.Minimum = stringPtr(value)
+		case "lte":
+			if !hasValue || !validNumber(value) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			constraints.Maximum = stringPtr(value)
+		case "gt":
+			if !hasValue || !validNumber(value) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			constraints.ExclusiveMinimum = stringPtr(value)
+		case "lt":
+			if !hasValue || !validNumber(value) {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			constraints.ExclusiveMaximum = stringPtr(value)
+		case "oneof":
+			if !hasValue {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			values := strings.Fields(value)
+			if len(values) == 0 {
+				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				continue
+			}
+			constraints.EnumValues = values
+		default:
+			unsupportedBinding(diags, structName, fieldName, token, file, line)
+		}
+	}
+	return constraints
+}
+
+func applyMinMaxConstraint(c *facts.Constraints, name string, value string, schema facts.Type) bool {
+	if schemaIsStringLike(schema) {
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return false
+		}
+		if name == "min" {
+			c.MinLength = &parsed
+		} else {
+			c.MaxLength = &parsed
+		}
+		return true
+	}
+	if schemaIsNumeric(schema) {
+		if !validNumber(value) {
+			return false
+		}
+		if name == "min" {
+			c.Minimum = stringPtr(value)
+		} else {
+			c.Maximum = stringPtr(value)
+		}
+		return true
+	}
+	return false
+}
+
+func constraintsEmpty(c *facts.Constraints) bool {
+	return c == nil ||
+		(c.MinLength == nil &&
+			c.MaxLength == nil &&
+			c.Minimum == nil &&
+			c.Maximum == nil &&
+			c.ExclusiveMinimum == nil &&
+			c.ExclusiveMaximum == nil &&
+			c.Pattern == nil &&
+			len(c.EnumValues) == 0)
+}
+
+func unsupportedBinding(diags *diag.Accumulator, structName, fieldName, token, file string, line uint32) {
+	diags.Warn(
+		"unsupported binding tag on "+structName+"."+fieldName+": "+strconv.Quote(token)+
+			" ignored by gnr8 metadata extraction (GO-06)",
+		file,
+		line,
+	)
+}
+
+func literalForSchema(
+	value string,
+	schema facts.Type,
+	structName string,
+	fieldName string,
+	file string,
+	line uint32,
+	diags *diag.Accumulator,
+) *facts.LiteralValue {
+	if value == "null" {
+		lit := nullLiteral()
+		return &lit
+	}
+	if schemaIsBool(schema) {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			diags.Warn(
+				"default tag on "+structName+"."+fieldName+" is not a valid bool: "+strconv.Quote(value),
+				file,
+				line,
+			)
+			lit := stringLiteral(value)
+			return &lit
+		}
+		lit := boolLiteral(parsed)
+		return &lit
+	}
+	if schemaIsNumeric(schema) {
+		if !validNumber(value) {
+			diags.Warn(
+				"default tag on "+structName+"."+fieldName+" is not a valid number: "+strconv.Quote(value),
+				file,
+				line,
+			)
+			lit := stringLiteral(value)
+			return &lit
+		}
+		lit := numberLiteral(value)
+		return &lit
+	}
+	lit := stringLiteral(value)
+	return &lit
+}
+
+func inferLiteral(value string) facts.LiteralValue {
+	switch value {
+	case "null":
+		return nullLiteral()
+	case "true":
+		return boolLiteral(true)
+	case "false":
+		return boolLiteral(false)
+	default:
+		if validNumber(value) {
+			return numberLiteral(value)
+		}
+		return stringLiteral(value)
+	}
+}
+
+func stringLiteral(value string) facts.LiteralValue {
+	return facts.LiteralValue{Type: "string", Value: value}
+}
+
+func numberLiteral(value string) facts.LiteralValue {
+	return facts.LiteralValue{Type: "number", Value: value}
+}
+
+func boolLiteral(value bool) facts.LiteralValue {
+	return facts.LiteralValue{Type: "bool", Value: value}
+}
+
+func nullLiteral() facts.LiteralValue {
+	return facts.LiteralValue{Type: "null"}
+}
+
+func schemaIsStringLike(schema facts.Type) bool {
+	if schema.Type == facts.TypeWellKnown {
+		return true
+	}
+	if schema.Type != facts.TypePrimitive {
+		return false
+	}
+	if prim, ok := schema.Of.(*facts.Prim); ok && prim != nil {
+		return prim.Prim == facts.PrimString || prim.Prim == facts.PrimBytes
+	}
+	return false
+}
+
+func schemaIsNumeric(schema facts.Type) bool {
+	if schema.Type != facts.TypePrimitive {
+		return false
+	}
+	if prim, ok := schema.Of.(*facts.Prim); ok && prim != nil {
+		return prim.Prim == facts.PrimInt || prim.Prim == facts.PrimFloat
+	}
+	return false
+}
+
+func schemaIsBool(schema facts.Type) bool {
+	if schema.Type != facts.TypePrimitive {
+		return false
+	}
+	if prim, ok := schema.Of.(*facts.Prim); ok && prim != nil {
+		return prim.Prim == facts.PrimBool
+	}
+	return false
+}
+
+func validNumber(value string) bool {
+	_, err := strconv.ParseFloat(value, 64)
+	return err == nil
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func parseStructTag(raw string) map[string]string {
+	out := map[string]string{}
+	for raw != "" {
+		raw = strings.TrimLeft(raw, " ")
+		if raw == "" {
+			break
+		}
+		i := 0
+		for i < len(raw) && raw[i] > ' ' && raw[i] != ':' && raw[i] != '"' && raw[i] != 0x7f {
+			i++
+		}
+		if i == 0 || i+1 >= len(raw) || raw[i] != ':' || raw[i+1] != '"' {
+			break
+		}
+		key := raw[:i]
+		raw = raw[i+1:]
+		i = 1
+		for i < len(raw) {
+			if raw[i] == '\\' {
+				i += 2
+				continue
+			}
+			if raw[i] == '"' {
+				break
+			}
+			i++
+		}
+		if i >= len(raw) {
+			break
+		}
+		quoted := raw[:i+1]
+		value, err := strconv.Unquote(quoted)
+		if err == nil {
+			out[key] = value
+		}
+		raw = raw[i+1:]
+	}
+	return out
 }
 
 // mapCtx carries the per-field diagnostic identity (owning struct, field name,

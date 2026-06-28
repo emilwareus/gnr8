@@ -471,6 +471,9 @@ schemas:
       of:
         - gte
         - lte
+    enum_source_order:
+      - gte
+      - lte
     provenance:
       file: internal/common/dto/common.go
       start_line: 39

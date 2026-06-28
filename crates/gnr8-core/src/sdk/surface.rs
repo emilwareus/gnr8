@@ -189,6 +189,7 @@ mod tests {
                 id: "internal/common/dto.CreateBookInput".to_string(),
                 name: "CreateBookInput".to_string(),
                 body: Type::Object(vec![]),
+                enum_source_order: Vec::new(),
                 provenance: SourceSpan {
                     file: "models.go".to_string(),
                     start_line: 1,

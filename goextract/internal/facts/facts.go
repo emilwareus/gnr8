@@ -80,13 +80,45 @@ type SchemaFact struct {
 // FieldFact is one field of an object schema. Optional (presence) and Nullable
 // (value-may-be-null) are two independent axes; all four combinations are valid.
 type FieldFact struct {
-	JSONName    string  `json:"json_name"`
-	Required    bool    `json:"required"`
-	Optional    bool    `json:"optional"`
-	Nullable    bool    `json:"nullable"`
-	Schema      Type    `json:"schema"`
-	Description *string `json:"description"`
-	Example     *string `json:"example"`
+	JSONName    string     `json:"json_name"`
+	Required    bool       `json:"required"`
+	Optional    bool       `json:"optional"`
+	Nullable    bool       `json:"nullable"`
+	Schema      Type       `json:"schema"`
+	Description *string    `json:"description"`
+	Example     *string    `json:"example"`
+	Meta        *FieldMeta `json:"meta,omitempty"`
+}
+
+// FieldMeta carries optional field-level constraints, defaults, and extensions.
+type FieldMeta struct {
+	Constraints *Constraints  `json:"constraints,omitempty"`
+	Default     *LiteralValue `json:"default,omitempty"`
+	Extensions  []Extension   `json:"extensions,omitempty"`
+}
+
+// Constraints carries JSON Schema/OpenAPI validation constraints.
+type Constraints struct {
+	MinLength        *uint64  `json:"min_length,omitempty"`
+	MaxLength        *uint64  `json:"max_length,omitempty"`
+	Minimum          *string  `json:"minimum,omitempty"`
+	Maximum          *string  `json:"maximum,omitempty"`
+	ExclusiveMinimum *string  `json:"exclusive_minimum,omitempty"`
+	ExclusiveMaximum *string  `json:"exclusive_maximum,omitempty"`
+	Pattern          *string  `json:"pattern,omitempty"`
+	EnumValues       []string `json:"enum_values,omitempty"`
+}
+
+// LiteralValue is an adjacently-tagged literal value mirrored by Rust serde.
+type LiteralValue struct {
+	Type  string `json:"type"`
+	Value any    `json:"value,omitempty"`
+}
+
+// Extension carries a vendor extension.
+type Extension struct {
+	Name  string       `json:"name"`
+	Value LiteralValue `json:"value"`
 }
 
 // Type kind tags — the adjacently-tagged Type discriminant values. These strings are
@@ -299,6 +331,7 @@ func sortType(t *Type) {
 		})
 		for i := range payload {
 			sortType(&payload[i].Schema)
+			sortFieldMeta(payload[i].Meta)
 		}
 	case []string:
 		sort.Strings(payload)
@@ -316,6 +349,15 @@ func sortType(t *Type) {
 			sortType(&payload.Value)
 		}
 	}
+}
+
+func sortFieldMeta(meta *FieldMeta) {
+	if meta == nil {
+		return
+	}
+	sort.Slice(meta.Extensions, func(i, j int) bool {
+		return meta.Extensions[i].Name < meta.Extensions[j].Name
+	})
 }
 
 // sortRoute stably orders every sub-slice of a route so two runs on unchanged source

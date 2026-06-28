@@ -177,6 +177,9 @@ pub struct Schema {
     /// The schema body — typically [`Type::Object`] or [`Type::Enum`]. Object fields are sorted by
     /// name and enum members lexically (determinism).
     pub body: Type,
+    /// Original source-order enum members, captured before graph normalization. Empty for non-enums.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_source_order: Vec<String>,
     /// Source provenance for the type declaration (D-07).
     pub provenance: SourceSpan,
 }
@@ -339,10 +342,15 @@ impl Response {
 
 impl Schema {
     fn from_fact(schema: SchemaFact, root: &str) -> Self {
+        let enum_source_order = match &schema.body {
+            Type::Enum(members) => members.clone(),
+            _ => Vec::new(),
+        };
         Self {
             id: schema.id,
             name: schema.name,
             body: normalize_type(schema.body),
+            enum_source_order,
             provenance: relativize_span(&schema.span, root),
         }
     }
@@ -392,6 +400,7 @@ fn normalize_fields(fields: Vec<FieldFact>) -> Vec<FieldFact> {
             schema: normalize_type(f.schema),
             description: f.description,
             example: f.example,
+            meta: f.meta,
         })
         .collect();
     fields.sort_by(|a, b| a.json_name.cmp(&b.json_name));
@@ -581,6 +590,7 @@ mod tests {
             Type::Enum(members) => assert_eq!(members, &vec!["gte", "lte"]),
             other => panic!("expected enum body, got {other:?}"),
         }
+        assert_eq!(target.enum_source_order, vec!["lte", "gte"]);
     }
 
     #[test]

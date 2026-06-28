@@ -132,6 +132,104 @@ pub struct FieldFact {
     pub description: Option<String>,
     /// Optional example value.
     pub example: Option<String>,
+    /// Optional field-level generation/schema metadata (constraints, defaults, extensions). Older
+    /// sidecars may omit it; an empty value is skipped when the graph is serialized so existing
+    /// default surfaces remain stable.
+    #[serde(default, skip_serializing_if = "FieldMeta::is_empty")]
+    pub meta: FieldMeta,
+}
+
+/// Optional field-level metadata used by OpenAPI/SDK generators.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldMeta {
+    /// JSON Schema/OpenAPI validation constraints.
+    #[serde(default, skip_serializing_if = "Constraints::is_empty")]
+    pub constraints: Constraints,
+    /// A source-declared default value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<LiteralValue>,
+    /// Source-declared vendor extensions (`x-*` tags and normalized UI hints).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<Extension>,
+}
+
+impl FieldMeta {
+    /// Whether this metadata object carries no effective data.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.constraints.is_empty() && self.default.is_none() && self.extensions.is_empty()
+    }
+}
+
+/// JSON Schema/OpenAPI validation constraints. Numeric values are stored as strings so the metadata
+/// stays `Eq`/deterministic while writers can still render them as JSON/YAML numbers.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Constraints {
+    /// String minimum length (`minLength`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    /// String maximum length (`maxLength`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    /// Inclusive numeric minimum (`minimum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<String>,
+    /// Inclusive numeric maximum (`maximum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<String>,
+    /// Exclusive numeric minimum (`exclusiveMinimum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_minimum: Option<String>,
+    /// Exclusive numeric maximum (`exclusiveMaximum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusive_maximum: Option<String>,
+    /// String pattern constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Field-level literal enum members from validation tags such as `oneof`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_values: Vec<String>,
+}
+
+impl Constraints {
+    /// Whether no constraint is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.min_length.is_none()
+            && self.max_length.is_none()
+            && self.minimum.is_none()
+            && self.maximum.is_none()
+            && self.exclusive_minimum.is_none()
+            && self.exclusive_maximum.is_none()
+            && self.pattern.is_none()
+            && self.enum_values.is_empty()
+    }
+}
+
+/// A literal source value carried through to OpenAPI/JSON Schema keywords or extensions.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum LiteralValue {
+    /// String literal.
+    String(String),
+    /// Numeric literal, preserved textually and rendered as a number by spec writers when valid.
+    Number(String),
+    /// Boolean literal.
+    Bool(bool),
+    /// Explicit null.
+    Null,
+}
+
+/// A vendor extension value (`x-*`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extension {
+    /// Extension key. Expected to be an `x-*` name.
+    pub name: String,
+    /// Extension value.
+    pub value: LiteralValue,
 }
 
 /// The closed, language-neutral type vocabulary every sidecar emits and every
