@@ -54,6 +54,16 @@ const PACKAGE: &str = "bookstore";
 /// The four files the `tssdk` bundle always frames (D-06 fixed alpha push order, mod.rs).
 const SDK_FILES: [&str; 4] = ["client.ts", "errors.ts", "index.ts", "models.ts"];
 
+/// Files emitted by the OpenAPI-generator compatibility profile.
+const AXIOS_SDK_FILES: [&str; 6] = [
+    "api.ts",
+    "base.ts",
+    "configuration.ts",
+    "errors.ts",
+    "index.ts",
+    "models.ts",
+];
+
 /// Whether the `node` + vendored `tsc` toolchain is available so this test skips gracefully if it is
 /// absent. Checks BOTH `node` (drives tsextract AND tsc) and the vendored compiler file existing.
 fn toolchain_available() -> bool {
@@ -141,6 +151,64 @@ fn materialize_sdk() -> PathBuf {
     dir
 }
 
+fn materialize_axios_sdk() -> PathBuf {
+    use gnr8::sdk::prelude::*;
+
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+        .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
+    let root = unique_temp_dir("axios-root");
+    let mut artifacts = Artifacts::new();
+    TsSdk::new()
+        .module("example.com/bookstore/sdk")
+        .to("sdk")
+        .profile(SdkProfile::openapi_generator_compat())
+        .generate(&graph, &mut artifacts, &Cx::new(root.clone()))
+        .expect("axios profile SDK generation must succeed");
+    for artifact in artifacts.files() {
+        let path = root.join(&artifact.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create artifact parent");
+        }
+        std::fs::write(path, &artifact.text).expect("write generated artifact");
+    }
+    write_axios_type_stub(&root.join("sdk"));
+    root.join("sdk")
+}
+
+fn write_axios_type_stub(dir: &Path) {
+    let axios_dir = dir.join("node_modules/axios");
+    std::fs::create_dir_all(&axios_dir).expect("create axios stub dir");
+    std::fs::write(
+        axios_dir.join("package.json"),
+        r#"{"name":"axios","version":"1.0.0","types":"index.d.ts"}"#,
+    )
+    .expect("write axios package stub");
+    std::fs::write(
+        axios_dir.join("index.d.ts"),
+        r"
+export interface AxiosRequestConfig {
+  method?: string;
+  url?: string;
+  params?: unknown;
+  data?: unknown;
+  headers?: unknown;
+  validateStatus?: (status: number) => boolean;
+  [key: string]: unknown;
+}
+export interface AxiosResponse<T = unknown> {
+  status: number;
+  data: T;
+}
+export interface AxiosInstance {
+  request<T = unknown>(config: AxiosRequestConfig): Promise<AxiosResponse<T>>;
+}
+declare const axios: AxiosInstance;
+export default axios;
+",
+    )
+    .expect("write axios type stub");
+}
+
 /// TSSDK-02 + the supply-chain gate: the generated SDK type-checks under `tsc --noEmit --strict --lib
 /// es2022,dom` (exit 0) using ONLY the vendored compiler, and carries ZERO third-party runtime imports
 /// (grepped over the written files — `axios`/`node-fetch`/`@types`/`from "http"`).
@@ -182,6 +250,41 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn openapi_generator_axios_profile_typechecks_with_test_local_axios_stub() {
+    if !toolchain_available() {
+        eprintln!("skipping tssdk axios compile: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_axios_sdk();
+
+    for name in AXIOS_SDK_FILES {
+        assert!(
+            dir.join(name).exists(),
+            "expected {name} in {}",
+            dir.display()
+        );
+    }
+    let api = std::fs::read_to_string(dir.join("api.ts")).expect("read api.ts");
+    assert!(
+        api.contains("from \"axios\""),
+        "axios profile must use axios imports:\n{api}"
+    );
+    let package = std::fs::read_to_string(dir.join("package.json")).expect("read package.json");
+    assert!(
+        package.contains("\"axios\""),
+        "axios profile package.json must declare axios:\n{package}"
+    );
+
+    let result = run_tsc(&AXIOS_SDK_FILES, &dir);
+    assert!(
+        result.is_ok(),
+        "axios profile must type-check against the test-local axios stub: {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
 }
 
 /// TSSDK-03: the materialized SDK is byte-identical across two independent generate->write runs

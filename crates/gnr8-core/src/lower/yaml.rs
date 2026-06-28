@@ -19,6 +19,7 @@ use super::model::{
     Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
     SchemaObject, SecurityRequirement, SecurityScheme,
 };
+use crate::analyze::facts::LiteralValue;
 use std::fmt::Write as _;
 
 /// Two spaces — the block-style indentation unit.
@@ -218,7 +219,6 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
             // `- ` opens each variant; the first key of the variant goes on the dash line.
             write_schema_seq_item(out, variant, depth);
         }
-        return;
     }
     if let Some(type_name) = &schema.type_name {
         // 3.1 nullability: render `type: ["<type>", "null"]` instead of the scalar form.
@@ -226,7 +226,7 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
             let _ = writeln!(
                 out,
                 "{pad}type: {}",
-                flow_seq(&[type_name.clone(), "null".to_string()])
+                flow_type_seq(&[type_name.clone(), "null".to_string()])
             );
         } else {
             let _ = writeln!(out, "{pad}type: {type_name}");
@@ -240,6 +240,46 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     }
     if !schema.enum_values.is_empty() {
         let _ = writeln!(out, "{pad}enum: {}", flow_seq(&schema.enum_values));
+    }
+    if let Some(min_length) = schema.min_length {
+        let _ = writeln!(out, "{pad}minLength: {min_length}");
+    }
+    if let Some(max_length) = schema.max_length {
+        let _ = writeln!(out, "{pad}maxLength: {max_length}");
+    }
+    if let Some(minimum) = &schema.minimum {
+        let _ = writeln!(out, "{pad}minimum: {}", number_or_scalar(minimum));
+    }
+    if let Some(maximum) = &schema.maximum {
+        let _ = writeln!(out, "{pad}maximum: {}", number_or_scalar(maximum));
+    }
+    if let Some(exclusive_minimum) = &schema.exclusive_minimum {
+        let _ = writeln!(
+            out,
+            "{pad}exclusiveMinimum: {}",
+            number_or_scalar(exclusive_minimum)
+        );
+    }
+    if let Some(exclusive_maximum) = &schema.exclusive_maximum {
+        let _ = writeln!(
+            out,
+            "{pad}exclusiveMaximum: {}",
+            number_or_scalar(exclusive_maximum)
+        );
+    }
+    if let Some(pattern) = &schema.pattern {
+        let _ = writeln!(out, "{pad}pattern: {}", scalar(pattern));
+    }
+    if let Some(default_value) = &schema.default_value {
+        let _ = writeln!(out, "{pad}default: {}", literal(default_value));
+    }
+    for extension in &schema.extensions {
+        let _ = writeln!(
+            out,
+            "{pad}{}: {}",
+            map_key(&extension.name),
+            literal(&extension.value)
+        );
     }
     if !schema.required.is_empty() {
         let _ = writeln!(out, "{pad}required: {}", flow_seq(&schema.required));
@@ -294,6 +334,27 @@ fn flow_seq(items: &[String]) -> String {
     format!("[{}]", rendered.join(", "))
 }
 
+fn flow_type_seq(items: &[String]) -> String {
+    format!("[{}]", items.join(", "))
+}
+
+fn literal(value: &LiteralValue) -> String {
+    match value {
+        LiteralValue::String(value) => scalar(value),
+        LiteralValue::Number(value) => number_or_scalar(value),
+        LiteralValue::Bool(value) => value.to_string(),
+        LiteralValue::Null => "null".to_string(),
+    }
+}
+
+fn number_or_scalar(value: &str) -> String {
+    if value.parse::<f64>().is_ok() {
+        value.to_string()
+    } else {
+        scalar(value)
+    }
+}
+
 /// Render a scalar value, quoting only when YAML would otherwise mis-parse it (keeps the output close
 /// to the hand-authored fixture, which leaves plain scalars unquoted).
 fn scalar(value: &str) -> String {
@@ -336,7 +397,10 @@ fn needs_quoting(value: &str) -> bool {
         return true;
     }
     // A `: ` or trailing `:` would start a mapping; `#` mid-value starts a comment.
-    value.contains(": ") || value.ends_with(':') || value.contains(" #")
+    value.contains(": ")
+        || value.ends_with(':')
+        || value.contains(" #")
+        || looks_like_yaml_non_string(value)
 }
 
 fn needs_key_quoting(value: &str) -> bool {
@@ -344,6 +408,14 @@ fn needs_key_quoting(value: &str) -> bool {
         || value
             .chars()
             .any(|ch| matches!(ch, ':' | '#' | '{' | '}' | '[' | ']' | ','))
+}
+
+fn looks_like_yaml_non_string(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    matches!(lower.as_str(), "true" | "false" | "null" | "~")
+        || value.parse::<i64>().is_ok()
+        || value.parse::<u64>().is_ok()
+        || value.parse::<f64>().is_ok()
 }
 
 #[cfg(test)]

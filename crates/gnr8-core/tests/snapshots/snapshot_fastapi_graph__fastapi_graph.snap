@@ -299,6 +299,9 @@ schemas:
       of:
         - hardcover
         - paperback
+    enum_source_order:
+      - hardcover
+      - paperback
     provenance:
       file: app/models.py
       start_line: 33

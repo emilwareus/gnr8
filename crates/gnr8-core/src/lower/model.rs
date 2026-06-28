@@ -11,6 +11,8 @@
 //! form (D-01 "support JSON form"), but the PRIMARY emitter is the hand-rolled YAML writer — no YAML
 //! crate is in the tree (`serde_yaml` is deprecated/absent — RESEARCH Alternatives).
 
+use crate::analyze::facts::{Extension, LiteralValue};
+
 /// A complete `OpenAPI` 3.1.0 document, ready to serialize via [`super::yaml::write`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct OpenApiDoc {
@@ -154,6 +156,24 @@ pub(crate) struct SchemaObject {
     pub description: Option<String>,
     /// Closed value set for string enums, in sorted order; empty otherwise.
     pub enum_values: Vec<String>,
+    /// String minimum length (`minLength`).
+    pub min_length: Option<u64>,
+    /// String maximum length (`maxLength`).
+    pub max_length: Option<u64>,
+    /// Inclusive numeric minimum (`minimum`).
+    pub minimum: Option<String>,
+    /// Inclusive numeric maximum (`maximum`).
+    pub maximum: Option<String>,
+    /// Exclusive numeric minimum (`exclusiveMinimum`).
+    pub exclusive_minimum: Option<String>,
+    /// Exclusive numeric maximum (`exclusiveMaximum`).
+    pub exclusive_maximum: Option<String>,
+    /// String pattern.
+    pub pattern: Option<String>,
+    /// Source-declared default value.
+    pub default_value: Option<LiteralValue>,
+    /// Vendor extension values.
+    pub extensions: Vec<Extension>,
     /// Required field names for object schemas, in sorted order; empty otherwise.
     pub required: Vec<String>,
     /// Object properties, keyed by json name, in sorted order; empty otherwise.

@@ -93,6 +93,24 @@ pub(crate) struct DoctorSummary {
     pub(crate) informational_diagnostics: usize,
 }
 
+/// Runtime facts collected by the impure doctor shell.
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct DoctorRuntime {
+    /// Current gnr8 binary path.
+    pub(crate) binary_path: Option<String>,
+    /// Resolved resource directory, if any.
+    pub(crate) resource_dir: Option<String>,
+    /// Output anchors reported by the generation pipeline.
+    pub(crate) output_anchors: Vec<String>,
+}
+
+/// Doctor timings in milliseconds.
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct DoctorTimings {
+    /// Total command runtime.
+    pub(crate) total: u128,
+}
+
 /// The full `gnr8 doctor` report: lifecycle health, output staleness, analysis diagnostics, and a
 /// header summary. `healthy` is the top-level boolean a CI gate reads (== `!has_actionable_problem()`).
 #[derive(Debug, serde::Serialize)]
@@ -107,6 +125,10 @@ pub(crate) struct DoctorReport {
     pub(crate) diagnostics: Vec<DoctorDiagnostic>,
     /// The informational-vs-actionable header counts.
     pub(crate) summary: DoctorSummary,
+    /// Runtime resolution facts.
+    pub(crate) runtime: DoctorRuntime,
+    /// Timings in milliseconds.
+    pub(crate) timings_ms: DoctorTimings,
 }
 
 /// Map a structured analysis [`Diagnostic`] to a short (why, fix) explanation by matching the message
@@ -219,6 +241,8 @@ impl DoctorReport {
                 actionable_problems: 0,
                 informational_diagnostics: 0,
             },
+            runtime: DoctorRuntime::default(),
+            timings_ms: DoctorTimings::default(),
         };
         let actionable = report.actionable_problem_count();
         report.summary = DoctorSummary {
@@ -227,6 +251,18 @@ impl DoctorReport {
         };
         report.healthy = !report.has_actionable_problem();
         report
+    }
+
+    /// Attach runtime/timing facts collected by the `run_doctor` shell.
+    #[must_use]
+    pub(crate) fn with_runtime(
+        mut self,
+        runtime: DoctorRuntime,
+        timings_ms: DoctorTimings,
+    ) -> Self {
+        self.runtime = runtime;
+        self.timings_ms = timings_ms;
+        self
     }
 
     /// The number of ACTIONABLE problems (each contributing lifecycle/staleness issue counts once;
@@ -553,9 +589,17 @@ mod tests {
             .expect("doctor report serializes to a JSON object");
 
         let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
-        let expected: HashSet<&str> = ["healthy", "lifecycle", "outputs", "diagnostics", "summary"]
-            .into_iter()
-            .collect();
+        let expected: HashSet<&str> = [
+            "healthy",
+            "lifecycle",
+            "outputs",
+            "diagnostics",
+            "summary",
+            "runtime",
+            "timings_ms",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(keys, expected, "doctor --json field set drifted");
 
         assert_eq!(

@@ -15,7 +15,7 @@ mod watch;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -29,10 +29,14 @@ fn main() -> Result<()> {
         Commands::Inspect { action } => run_inspect(action, output),
         Commands::Init { source, sdk } => run_init(*source, *sdk, output),
         Commands::Guide { topic } => run_guide(*topic, output),
-        Commands::Generate { force } => run_generate(*force, output),
+        Commands::Generate {
+            force,
+            accept_generated_baseline,
+        } => run_generate(*force, *accept_generated_baseline, output),
         Commands::Check => run_check(output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
         Commands::Doctor => run_doctor(output),
+        Commands::Compat { action } => run_compat(action, output),
     }
 }
 
@@ -223,6 +227,74 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
     Ok(())
 }
 
+fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
+    match action {
+        CompatAction::Typescript { old, new, contract } => {
+            if let Some(contract) = contract {
+                let path = std::path::Path::new(contract);
+                if !path.exists() {
+                    anyhow::bail!("compat contract does not exist: {contract}");
+                }
+            }
+            let diff = gnr8::sdk::compat::diff_typescript_dirs(old, new)?;
+            let breaking = diff.is_breaking();
+            if output.json {
+                #[derive(serde::Serialize)]
+                struct CompatReport<'a> {
+                    language: &'static str,
+                    old: &'a str,
+                    new: &'a str,
+                    contract: Option<&'a str>,
+                    breaking: bool,
+                    diff: gnr8::sdk::compat::TypeScriptSurfaceDiff,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CompatReport {
+                        language: "typescript",
+                        old,
+                        new,
+                        contract: contract.as_deref(),
+                        breaking,
+                        diff,
+                    })?
+                );
+            } else if breaking {
+                output.progress("compat typescript: breaking changes detected");
+                print_compat_list("missing root exports", &diff.missing_root_exports);
+                print_compat_list("missing model exports", &diff.missing_model_exports);
+                print_compat_list("missing API classes", &diff.missing_api_classes);
+                print_compat_list("missing API factories", &diff.missing_api_factories);
+                print_compat_list("missing operation methods", &diff.missing_operation_methods);
+                print_compat_list("missing request aliases", &diff.missing_request_aliases);
+                print_compat_list("package entry changes", &diff.package_entry_point_changes);
+                for mismatch in &diff.export_kind_mismatches {
+                    println!(
+                        "  export kind mismatch: {} ({:?} -> {:?})",
+                        mismatch.symbol, mismatch.old, mismatch.new
+                    );
+                }
+            } else {
+                output.progress("compat typescript: compatible");
+            }
+            if breaking {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_compat_list(label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for value in values {
+        println!("    {value}");
+    }
+}
+
 fn guide_for(topic: Option<GuideTopic>) -> Guide {
     match topic {
         None => Guide {
@@ -279,6 +351,43 @@ struct LifecycleReport {
     skipped: Vec<String>,
     /// Stale generated-output files deleted during this generation.
     deleted: Vec<String>,
+    /// Per-bucket path counts.
+    counts: LifecycleCounts,
+    /// Timing buckets in milliseconds.
+    timings_ms: LifecycleTimings,
+    /// Diagnostic counts from the pipeline.
+    diagnostics: DiagnosticCounts,
+    /// Cache/write mode used for the run.
+    cache_mode: String,
+    /// Number of source/input files considered.
+    source_files: usize,
+    /// Number of generated artifact files considered.
+    artifact_files: usize,
+    /// Whether `--accept-generated-baseline` was used.
+    baseline_adopted: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LifecycleCounts {
+    written: usize,
+    unchanged: usize,
+    skipped: usize,
+    deleted: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LifecycleTimings {
+    hot_noop: u128,
+    pipeline: Option<u128>,
+    write: Option<u128>,
+    total: u128,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DiagnosticCounts {
+    total: usize,
+    warn: usize,
+    error: usize,
 }
 
 /// Run `gnr8 generate` (+ `--force`): run the user's `.gnr8/` pipeline (child process), then write only
@@ -286,7 +395,7 @@ struct LifecycleReport {
 /// the "no silent clobbering" protection is VISIBLE (T-04-02-04). Pipeline diagnostics the child carried
 /// are surfaced too. `--json` serializes the counts. A missing `.gnr8/` (run `gnr8 init`), a compile
 /// error in the user's pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
-fn run_generate(force: bool, output: Output) -> Result<()> {
+fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) -> Result<()> {
     let root = project_root()?;
     let total_start = Instant::now();
     let hot_start = Instant::now();
@@ -294,38 +403,39 @@ fn run_generate(force: bool, output: Output) -> Result<()> {
     let hot_elapsed = hot_start.elapsed();
     let mut pipeline_elapsed = None;
     let mut write_elapsed = None;
-    let (outcome, diagnostics, cache_label, source_files, artifact_files) =
-        if let Some(noop) = hot_noop {
-            (
-                noop.outcome,
-                noop.diagnostics,
-                "verified hot no-op",
-                noop.source_files,
-                noop.artifact_files,
-            )
-        } else {
-            output.progress("generate: running pipeline");
-            let pipeline_start = Instant::now();
-            let mut bundle = child::run_child(&root, "__emit")?;
-            pipeline_elapsed = Some(pipeline_start.elapsed());
-            let source_files = bundle.cache_input_stamps.len();
-            let mut artifact_files = bundle.artifacts.len();
-            output.progress("generate: writing outputs");
-            let write_start = Instant::now();
-            let outcome = regenerate_bundle(&root, &mut bundle, force)?;
-            write_elapsed = Some(write_start.elapsed());
-            if artifact_files == 0 {
-                artifact_files =
-                    outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
-            }
-            (
-                outcome,
-                bundle.diagnostics.clone(),
-                "pipeline",
-                source_files,
-                artifact_files,
-            )
-        };
+    let (outcome, diagnostics, cache_label, source_files, artifact_files) = if let Some(noop) =
+        hot_noop
+    {
+        (
+            noop.outcome,
+            noop.diagnostics,
+            "verified hot no-op",
+            noop.source_files,
+            noop.artifact_files,
+        )
+    } else {
+        output.progress("generate: running pipeline");
+        let pipeline_start = Instant::now();
+        let mut bundle = child::run_child(&root, "__emit")?;
+        pipeline_elapsed = Some(pipeline_start.elapsed());
+        let source_files = bundle.cache_input_stamps.len();
+        let mut artifact_files = bundle.artifacts.len();
+        output.progress("generate: writing outputs");
+        let write_start = Instant::now();
+        let outcome = regenerate_bundle(&root, &mut bundle, force || accept_generated_baseline)?;
+        write_elapsed = Some(write_start.elapsed());
+        if artifact_files == 0 {
+            artifact_files =
+                outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
+        }
+        (
+            outcome,
+            bundle.diagnostics.clone(),
+            "pipeline",
+            source_files,
+            artifact_files,
+        )
+    };
 
     print_diagnostics(output, &diagnostics);
     // Warn (stderr) for every protected file so the user SEES which outputs were not clobbered.
@@ -336,11 +446,29 @@ fn run_generate(force: bool, output: Output) -> Result<()> {
     }
 
     if output.json {
+        let counts = LifecycleCounts {
+            written: outcome.written.len(),
+            unchanged: outcome.unchanged.len(),
+            skipped: outcome.skipped.len(),
+            deleted: outcome.deleted.len(),
+        };
         let report = LifecycleReport {
             written: outcome.written,
             unchanged: outcome.unchanged,
             skipped: outcome.skipped,
             deleted: outcome.deleted,
+            counts,
+            timings_ms: LifecycleTimings {
+                hot_noop: duration_ms(hot_elapsed),
+                pipeline: pipeline_elapsed.map(duration_ms),
+                write: write_elapsed.map(duration_ms),
+                total: duration_ms(total_start.elapsed()),
+            },
+            diagnostics: diagnostic_counts(&diagnostics),
+            cache_mode: cache_label.to_string(),
+            source_files,
+            artifact_files,
+            baseline_adopted: accept_generated_baseline,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -369,6 +497,7 @@ fn run_generate(force: bool, output: Output) -> Result<()> {
 /// (`UserEdited`); exits 0 when every output is `Unchanged`. Reuses the exact pure decision function —
 /// zero new policy. `--json` emits the stale/drifted path lists. Pipeline errors flow through the anyhow
 /// boundary, never a panic.
+#[allow(clippy::too_many_lines)]
 fn run_check(output: Output) -> Result<()> {
     let root = project_root()?;
     let total_start = Instant::now();
@@ -377,23 +506,30 @@ fn run_check(output: Output) -> Result<()> {
     let hot_elapsed = hot_start.elapsed();
     let mut pipeline_elapsed = None;
     let mut plan_elapsed = None;
-    let (plan, source_files) = if let Some(noop) = hot_noop {
-        (
-            clean_plan_from_paths(noop.outcome.unchanged),
-            noop.source_files,
-        )
-    } else {
-        output.progress("check: running pipeline");
-        let pipeline_start = Instant::now();
-        let mut bundle = child::run_child(&root, "__emit")?;
-        pipeline_elapsed = Some(pipeline_start.elapsed());
-        let source_files = bundle.cache_input_stamps.len();
-        output.progress("check: planning writes");
-        let plan_start = Instant::now();
-        let plan = plan_bundle(&root, &mut bundle)?;
-        plan_elapsed = Some(plan_start.elapsed());
-        (plan, source_files)
-    };
+    let (plan, diagnostics, cache_label, source_files, artifact_files) =
+        if let Some(noop) = hot_noop {
+            let artifact_files = noop.artifact_files;
+            (
+                clean_plan_from_paths(noop.outcome.unchanged),
+                noop.diagnostics,
+                "verified hot no-op",
+                noop.source_files,
+                artifact_files,
+            )
+        } else {
+            output.progress("check: running pipeline");
+            let pipeline_start = Instant::now();
+            let mut bundle = child::run_child(&root, "__emit")?;
+            pipeline_elapsed = Some(pipeline_start.elapsed());
+            let source_files = bundle.cache_input_stamps.len();
+            let artifact_files = bundle.artifacts.len();
+            let diagnostics = bundle.diagnostics.clone();
+            output.progress("check: planning writes");
+            let plan_start = Instant::now();
+            let plan = plan_bundle(&root, &mut bundle)?;
+            plan_elapsed = Some(plan_start.elapsed());
+            (plan, diagnostics, "pipeline", source_files, artifact_files)
+        };
 
     // Partition the plan into stale (would be written) vs drifted (user-edited) vs clean (unchanged).
     let mut stale: Vec<String> = Vec::new();
@@ -415,12 +551,39 @@ fn run_check(output: Output) -> Result<()> {
             stale: Vec<String>,
             drifted: Vec<String>,
             unchanged: Vec<String>,
+            counts: CheckCounts,
+            timings_ms: LifecycleTimings,
+            diagnostics: DiagnosticCounts,
+            cache_mode: String,
+            source_files: usize,
+            artifact_files: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct CheckCounts {
+            stale: usize,
+            drifted: usize,
+            unchanged: usize,
         }
         let report = CheckReport {
             up_to_date: !has_drift,
             stale: stale.clone(),
             drifted: drifted.clone(),
-            unchanged: clean,
+            unchanged: clean.clone(),
+            counts: CheckCounts {
+                stale: stale.len(),
+                drifted: drifted.len(),
+                unchanged: clean.len(),
+            },
+            timings_ms: LifecycleTimings {
+                hot_noop: duration_ms(hot_elapsed),
+                pipeline: pipeline_elapsed.map(duration_ms),
+                write: plan_elapsed.map(duration_ms),
+                total: duration_ms(total_start.elapsed()),
+            },
+            diagnostics: diagnostic_counts(&diagnostics),
+            cache_mode: cache_label.to_string(),
+            source_files,
+            artifact_files,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if has_drift {
@@ -878,6 +1041,10 @@ fn run_doctor(output: Output) -> Result<()> {
     };
     let pipeline_ran = bundle.is_some();
     let diagnostics = bundle.as_ref().map(|b| b.diagnostics.clone());
+    let output_anchors = bundle
+        .as_ref()
+        .map(|bundle| bundle.output_anchors.clone())
+        .unwrap_or_default();
     let drift = bundle.as_mut().and_then(|b| plan_bundle(&root, b).ok());
 
     let report = doctor::DoctorReport::assemble(
@@ -887,6 +1054,19 @@ fn run_doctor(output: Output) -> Result<()> {
         pipeline_ran,
         diagnostics,
         drift.as_ref(),
+    )
+    .with_runtime(
+        doctor::DoctorRuntime {
+            binary_path: std::env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            resource_dir: gnr8::resource::resource_dir()
+                .map(|path| path.to_string_lossy().into_owned()),
+            output_anchors,
+        },
+        doctor::DoctorTimings {
+            total: duration_ms(total_start.elapsed()),
+        },
     );
 
     if output.json {
@@ -984,6 +1164,26 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
             diag.severity, diag.message, diag.file, diag.line
         );
     }
+}
+
+fn diagnostic_counts(diagnostics: &[gnr8::graph::Diagnostic]) -> DiagnosticCounts {
+    let warn = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("WARN"))
+        .count();
+    let error = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("ERROR"))
+        .count();
+    DiagnosticCounts {
+        total: diagnostics.len(),
+        warn,
+        error,
+    }
+}
+
+fn duration_ms(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 fn fmt_duration(duration: Duration) -> String {

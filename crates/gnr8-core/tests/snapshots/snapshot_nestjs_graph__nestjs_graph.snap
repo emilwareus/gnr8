@@ -288,6 +288,9 @@ schemas:
       of:
         - hardcover
         - paperback
+    enum_source_order:
+      - hardcover
+      - paperback
     provenance:
       file: src/books.dto.ts
       start_line: 36

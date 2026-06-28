@@ -90,6 +90,9 @@ schemas:
       of:
         - in_stock
         - out_of_stock
+    enum_source_order:
+      - in_stock
+      - out_of_stock
     provenance:
       file: app/dto.py
       start_line: 31

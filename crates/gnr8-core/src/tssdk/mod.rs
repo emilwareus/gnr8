@@ -16,13 +16,18 @@
 
 mod emit;
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_name, check_unique_schema_names, file_in_dir, file_stem, model_file_name,
-    validate_sdk_base_path,
+    api_key_header_name, body_model_of, check_unique_schema_names, file_in_dir, file_stem,
+    join_path, model_file_name, path_tokens, path_tokens_match, quoted_string_literal, split_words,
+    success_responses_of, validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
@@ -151,6 +156,572 @@ pub(crate) fn generate_files_with_layout(
     Ok(files)
 }
 
+pub(crate) fn generate_files_with_profile(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+    profile: &SdkProfile,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    if profile.is_minimal() {
+        return generate_files_with_layout(graph, package, base_path, layout, aliases);
+    }
+    if profile.is_openapi_generator_compat() {
+        return generate_openapi_generator_compat_files(graph, package, base_path, aliases);
+    }
+    generate_files_with_layout(graph, package, base_path, layout, aliases)
+}
+
+fn generate_openapi_generator_compat_files(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    aliases: &SdkTypeAliases,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    validate_sdk_base_path(base_path)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
+
+    let auth_header = api_key_header_name(graph)?;
+    let resolved_aliases = aliases.resolve(graph)?;
+    let mut files = vec![
+        SdkFile {
+            name: "api.ts".to_string(),
+            contents: emit_axios_api(graph, base_path, auth_header.as_deref())?,
+        },
+        SdkFile {
+            name: "base.ts".to_string(),
+            contents: emit_axios_base(),
+        },
+        SdkFile {
+            name: "configuration.ts".to_string(),
+            contents: emit_axios_configuration(),
+        },
+        SdkFile {
+            name: "errors.ts".to_string(),
+            contents: emit::emit_errors(package),
+        },
+        SdkFile {
+            name: "index.ts".to_string(),
+            contents: emit_axios_index(),
+        },
+        SdkFile {
+            name: "models.ts".to_string(),
+            contents: emit::emit_models_openapi_generator_compat(
+                graph,
+                package,
+                &resolved_aliases,
+            )?,
+        },
+        SdkFile {
+            name: "package.json".to_string(),
+            contents: emit_axios_package_json(package),
+        },
+    ];
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
+fn emit_axios_configuration() -> String {
+    "\
+import type { AxiosRequestConfig } from \"axios\";
+
+export type ApiKey = string | (() => string | Promise<string>);
+
+export interface ConfigurationParameters {
+  basePath?: string;
+  apiKey?: ApiKey;
+  baseOptions?: AxiosRequestConfig;
+}
+
+export class Configuration {
+  public readonly basePath: string;
+  public readonly apiKey?: ApiKey;
+  public readonly baseOptions?: AxiosRequestConfig;
+
+  constructor(parameters: ConfigurationParameters = {}) {
+    this.basePath = (parameters.basePath ?? \"\").replace(/\\/+$/, \"\");
+    this.apiKey = parameters.apiKey;
+    this.baseOptions = parameters.baseOptions;
+  }
+
+  async getApiKey(): Promise<string | undefined> {
+    if (typeof this.apiKey === \"function\") {
+      return await this.apiKey();
+    }
+    return this.apiKey;
+  }
+}
+"
+    .to_string()
+}
+
+fn emit_axios_base() -> String {
+    "\
+import axios, { AxiosInstance } from \"axios\";
+import { Configuration } from \"./configuration\";
+
+export const BASE_PATH = \"\";
+
+export class BaseAPI {
+  protected configuration: Configuration;
+  protected axios: AxiosInstance;
+  protected basePath: string;
+
+  constructor(
+    configuration: Configuration = new Configuration(),
+    basePath: string = configuration.basePath,
+    axiosInstance: AxiosInstance = axios,
+  ) {
+    this.configuration = configuration;
+    this.basePath = basePath.replace(/\\/+$/, \"\");
+    this.axios = axiosInstance;
+  }
+}
+"
+    .to_string()
+}
+
+fn emit_axios_index() -> String {
+    "\
+export * from \"./api\";
+export * from \"./base\";
+export * from \"./configuration\";
+export * from \"./errors\";
+export * from \"./models\";
+"
+    .to_string()
+}
+
+fn emit_axios_package_json(package: &str) -> String {
+    format!(
+        "{{
+  \"name\": {},
+  \"version\": \"0.1.0\",
+  \"type\": \"module\",
+  \"main\": \"./index.js\",
+  \"types\": \"./index.d.ts\",
+  \"dependencies\": {{
+    \"axios\": \"^1.0.0\"
+  }}
+}}
+",
+        quoted_string_literal(package)
+    )
+}
+
+fn emit_axios_api(
+    graph: &ApiGraph,
+    base_path: &str,
+    auth_header: Option<&str>,
+) -> Result<String, crate::CoreError> {
+    let mut out = String::new();
+    out.push_str(
+        "\
+import type { AxiosInstance, AxiosRequestConfig } from \"axios\";
+import { BaseAPI } from \"./base\";
+import { Configuration } from \"./configuration\";
+import { ApiError } from \"./errors\";
+import * as models from \"./models\";
+
+",
+    );
+
+    let grouped = grouped_operations(graph);
+    for (service, ops) in grouped {
+        let class_name = api_class_name(&service);
+        for op in &ops {
+            emit_axios_request_alias(&mut out, graph, op)?;
+        }
+        writeln!(out, "export class {class_name} extends BaseAPI {{").map_err(ts_mod_sink)?;
+        for op in &ops {
+            emit_axios_operation_method(&mut out, graph, base_path, op, auth_header)?;
+        }
+        writeln!(out, "}}\n").map_err(ts_mod_sink)?;
+        emit_axios_factory(&mut out, graph, &class_name, &ops)?;
+        for op in &ops {
+            writeln!(
+                out,
+                "export type {}Operation = {class_name}[{}];",
+                pascal(&op.handler),
+                quoted_string_literal(&emit::camel(&op.handler))
+            )
+            .map_err(ts_mod_sink)?;
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn grouped_operations(graph: &ApiGraph) -> BTreeMap<String, Vec<&Operation>> {
+    let mut grouped: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in &graph.operations {
+        grouped
+            .entry(op.group.clone().unwrap_or_else(|| "default".to_string()))
+            .or_default()
+            .push(op);
+    }
+    grouped
+}
+
+fn emit_axios_request_alias(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    let request_name = request_alias_name(op);
+    let fields = request_fields(graph, op)?;
+    if fields.is_empty() {
+        writeln!(out, "export interface {request_name} {{}}\n").map_err(ts_mod_sink)?;
+        return Ok(());
+    }
+    writeln!(out, "export interface {request_name} {{").map_err(ts_mod_sink)?;
+    for field in fields {
+        let optional = if field.required { "" } else { "?" };
+        writeln!(out, "  {}{optional}: {};", field.name, field.ty).map_err(ts_mod_sink)?;
+    }
+    writeln!(out, "}}\n").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn emit_axios_operation_method(
+    out: &mut String,
+    graph: &ApiGraph,
+    base_path: &str,
+    op: &Operation,
+    auth_header: Option<&str>,
+) -> Result<(), crate::CoreError> {
+    let method_name = emit::camel(&op.handler);
+    let request_name = request_alias_name(op);
+    let request_fields = request_fields(graph, op)?;
+    let request_default = if request_fields.iter().any(|field| field.required) {
+        ""
+    } else {
+        " = {}"
+    };
+    let success = success_responses_of(op, graph)?;
+    let return_ty = success.body_model.as_ref().map_or_else(
+        || "void".to_string(),
+        |model| {
+            if success.has_bodyless_alternative() {
+                format!("models.{model} | undefined")
+            } else {
+                format!("models.{model}")
+            }
+        },
+    );
+
+    writeln!(
+        out,
+        "  async {method_name}(requestParameters: {request_name}{request_default}, options: AxiosRequestConfig = {{}}): Promise<{return_ty}> {{"
+    )
+    .map_err(ts_mod_sink)?;
+    emit_axios_path(out, base_path, op)?;
+    emit_axios_query(out, op)?;
+    if let Some(header) = auth_header {
+        writeln!(
+            out,
+            "    const localVarHeaderParameter: Record<string, string> = {{}};"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "    const apiKey = await this.configuration.getApiKey();"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    if (apiKey !== undefined) {{").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      localVarHeaderParameter[{}] = apiKey;",
+            quoted_string_literal(header)
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    } else {
+        writeln!(
+            out,
+            "    const localVarHeaderParameter: Record<string, string> = {{}};"
+        )
+        .map_err(ts_mod_sink)?;
+    }
+    let body_model = body_model_of(op, graph)?;
+    if body_model.is_some() {
+        writeln!(
+            out,
+            "    const localVarRequestOptions: AxiosRequestConfig = {{"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "      ...(this.configuration.baseOptions || {{}}),").map_err(ts_mod_sink)?;
+        writeln!(out, "      ...options,").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      method: {},",
+            quoted_string_literal(&op.method.to_uppercase())
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "      url: this.basePath + localVarPath,").map_err(ts_mod_sink)?;
+        writeln!(out, "      params: localVarQueryParameter,").map_err(ts_mod_sink)?;
+        writeln!(out, "      data: requestParameters.body,").map_err(ts_mod_sink)?;
+    } else {
+        writeln!(
+            out,
+            "    const localVarRequestOptions: AxiosRequestConfig = {{"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "      ...(this.configuration.baseOptions || {{}}),").map_err(ts_mod_sink)?;
+        writeln!(out, "      ...options,").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      method: {},",
+            quoted_string_literal(&op.method.to_uppercase())
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "      url: this.basePath + localVarPath,").map_err(ts_mod_sink)?;
+        writeln!(out, "      params: localVarQueryParameter,").map_err(ts_mod_sink)?;
+    }
+    writeln!(out, "      headers: {{").map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "        ...((this.configuration.baseOptions?.headers as Record<string, string> | undefined) || {{}}),"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "        ...((options.headers as Record<string, string> | undefined) || {{}}),"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "        ...localVarHeaderParameter,").map_err(ts_mod_sink)?;
+    writeln!(out, "      }},").map_err(ts_mod_sink)?;
+    writeln!(out, "      validateStatus: () => true,").map_err(ts_mod_sink)?;
+    writeln!(out, "    }};").map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "    const response = await this.axios.request(localVarRequestOptions);"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "    if (response.status < 200 || response.status >= 300) {{"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "      throw new ApiError(response.status, response.data);"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    if let Some(model) = &success.body_model {
+        if success.has_bodyless_alternative() {
+            writeln!(
+                out,
+                "    if (![{}].includes(response.status)) {{",
+                success
+                    .body_statuses
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "      return undefined;").map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+        writeln!(out, "    return response.data as models.{model};").map_err(ts_mod_sink)?;
+    } else {
+        writeln!(out, "    return;").map_err(ts_mod_sink)?;
+    }
+    writeln!(out, "  }}").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_axios_factory(
+    out: &mut String,
+    graph: &ApiGraph,
+    class_name: &str,
+    ops: &[&Operation],
+) -> Result<(), crate::CoreError> {
+    writeln!(
+        out,
+        "export const {class_name}Factory = function (configuration?: Configuration, basePath?: string, axiosInstance?: AxiosInstance) {{"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "  const api = new {class_name}(configuration, basePath, axiosInstance);"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "  return {{").map_err(ts_mod_sink)?;
+    for op in ops {
+        let method = emit::camel(&op.handler);
+        let request_name = request_alias_name(op);
+        let request_fields = request_fields(graph, op)?;
+        let request_default = if request_fields.iter().any(|field| field.required) {
+            ""
+        } else {
+            " = {}"
+        };
+        writeln!(
+            out,
+            "    {method}(requestParameters: {request_name}{request_default}, options?: AxiosRequestConfig) {{"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      return api.{method}(requestParameters, options);"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    }},").map_err(ts_mod_sink)?;
+    }
+    writeln!(out, "  }};").map_err(ts_mod_sink)?;
+    writeln!(out, "}};\n").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_axios_path(
+    out: &mut String,
+    base_path: &str,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    let mut template = join_path(base_path, &op.path);
+    let tokens = path_tokens(&template);
+    let mut param_set: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|param| param.location == "path")
+        .map(|param| param.name.as_str())
+        .collect();
+    param_set.sort_unstable();
+    if !path_tokens_match(&tokens, &param_set) {
+        return Err(crate::CoreError::SdkGen {
+            message: format!(
+                "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
+                op.id, template, tokens, param_set
+            ),
+        });
+    }
+    for param in op.params.iter().filter(|param| param.location == "path") {
+        let ident = emit::camel(&param.name);
+        template = template.replace(
+            &format!("{{{}}}", param.name),
+            &format!("${{encodeURIComponent(String(requestParameters.{ident}))}}"),
+        );
+    }
+    writeln!(out, "    const localVarPath = `{template}`;").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_axios_query(out: &mut String, op: &Operation) -> Result<(), crate::CoreError> {
+    writeln!(
+        out,
+        "    const localVarQueryParameter: Record<string, unknown> = {{}};"
+    )
+    .map_err(ts_mod_sink)?;
+    for param in op.params.iter().filter(|param| param.location == "query") {
+        let ident = emit::camel(&param.name);
+        if param.required {
+            writeln!(
+                out,
+                "    localVarQueryParameter[{}] = requestParameters.{ident};",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(ts_mod_sink)?;
+        } else {
+            writeln!(out, "    if (requestParameters.{ident} !== undefined) {{")
+                .map_err(ts_mod_sink)?;
+            writeln!(
+                out,
+                "      localVarQueryParameter[{}] = requestParameters.{ident};",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+    }
+    Ok(())
+}
+
+struct RequestField {
+    name: String,
+    ty: String,
+    required: bool,
+}
+
+fn request_fields(graph: &ApiGraph, op: &Operation) -> Result<Vec<RequestField>, crate::CoreError> {
+    let mut fields = Vec::new();
+    let body_model = body_model_of(op, graph)?;
+    let mut used_names: Vec<String> = if body_model.is_some() {
+        vec!["body".to_string()]
+    } else {
+        Vec::new()
+    };
+    for param in &op.params {
+        let name = emit::camel(&param.name);
+        if name.is_empty() {
+            return Err(crate::CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter named '{}' that yields an empty TypeScript \
+                     request field name",
+                    op.id, param.name
+                ),
+            });
+        }
+        if used_names.contains(&name) {
+            return Err(crate::CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter whose TypeScript request field name '{name}' \
+                     collides with another request field",
+                    op.id
+                ),
+            });
+        }
+        used_names.push(name.clone());
+        fields.push(RequestField {
+            name,
+            ty: emit::ts_type(&param.schema, false, graph, "models.")?,
+            required: param.required || param.location == "path",
+        });
+    }
+    if let Some(model) = body_model {
+        fields.push(RequestField {
+            name: "body".to_string(),
+            ty: format!("models.{model}"),
+            required: true,
+        });
+    }
+    Ok(fields)
+}
+
+fn request_alias_name(op: &Operation) -> String {
+    format!("{}Request", pascal(&op.handler))
+}
+
+fn api_class_name(service: &str) -> String {
+    format!("{}Api", pascal(service))
+}
+
+fn pascal(value: &str) -> String {
+    let mut out = String::new();
+    for word in split_words(value) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            out.push_str(&chars.as_str().to_ascii_lowercase());
+        }
+    }
+    if out.is_empty() {
+        "Default".to_string()
+    } else {
+        out
+    }
+}
+
+fn ts_mod_sink(err: std::fmt::Error) -> crate::CoreError {
+    crate::CoreError::SdkGen {
+        message: format!("failed to format TypeScript axios source: {err}"),
+    }
+}
+
 /// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
 ///
 /// Wraps the crate-private [`bundle::parse`] framing so the lifecycle layer can enumerate the SDK's
@@ -169,10 +740,12 @@ mod tests {
     // hermetic typecheck lands in plan 03's tests/tssdk_compile.rs).
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, generate_with_layout, split_bundle};
-    use crate::graph::ApiGraph;
+    use super::{generate, generate_files_with_profile, generate_with_layout, split_bundle};
+    use crate::graph::{ApiGraph, Param, Prim, SourceSpan, Type};
     use crate::sdk::bundle::write_to_dir;
     use crate::sdk::layout::SdkFileLayout;
+    use crate::sdk::profile::SdkProfile;
+    use crate::sdk::surface::SdkTypeAliases;
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.
@@ -275,6 +848,121 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("export interface Book {"), "{out}");
+    }
+
+    #[test]
+    fn openapi_generator_compat_profile_emits_axios_surface() {
+        let files = generate_files_with_profile(
+            &sample_graph(),
+            "bookstore",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+        )
+        .unwrap();
+        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "api.ts",
+                "base.ts",
+                "configuration.ts",
+                "errors.ts",
+                "index.ts",
+                "models.ts",
+                "package.json",
+            ]
+        );
+        let api = files
+            .iter()
+            .find(|file| file.name == "api.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            api.contains("export class DefaultApi extends BaseAPI"),
+            "{api}"
+        );
+        assert!(api.contains("export const DefaultApiFactory"), "{api}");
+        assert!(api.contains("export interface CreateBookRequest"), "{api}");
+        assert!(api.contains("export type CreateBookOperation"), "{api}");
+        assert!(
+            api.contains(
+                "listBooks(requestParameters: ListBooksRequest = {}, options?: AxiosRequestConfig)"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("import type { AxiosInstance, AxiosRequestConfig } from \"axios\";"),
+            "{api}"
+        );
+
+        let models = files
+            .iter()
+            .find(|file| file.name == "models.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(models.contains("export const BookFormat = {"), "{models}");
+        assert!(
+            models.contains("export type BookFormat = typeof BookFormat[keyof typeof BookFormat];"),
+            "{models}"
+        );
+
+        let package = files
+            .iter()
+            .find(|file| file.name == "package.json")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(package.contains("\"axios\": \"^1.0.0\""), "{package}");
+    }
+
+    #[test]
+    fn openapi_generator_compat_profile_rejects_path_param_mismatches() {
+        let mut graph = sample_graph();
+        graph.operations[0].path = "/books/{bookId}".to_string();
+
+        let err = generate_files_with_profile(
+            &graph,
+            "bookstore",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("templated tokens"), "{err}");
+    }
+
+    #[test]
+    fn openapi_generator_compat_profile_rejects_request_field_collisions() {
+        let mut graph = sample_graph();
+        graph.operations[0].params.push(Param {
+            name: "body".to_string(),
+            location: "query".to_string(),
+            required: false,
+            schema: Type::Primitive(Prim::String),
+            provenance: SourceSpan {
+                file: "/root/main.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let err = generate_files_with_profile(
+            &graph,
+            "bookstore",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("collides"), "{err}");
     }
 
     #[test]

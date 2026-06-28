@@ -294,6 +294,45 @@ pub(crate) fn emit_models_with_aliases(
     Ok(out)
 }
 
+/// Emit OpenAPI-generator-compatible `models.ts`, including runtime enum const objects plus matching
+/// type aliases.
+pub(crate) fn emit_models_openapi_generator_compat(
+    graph: &ApiGraph,
+    _package: &str,
+    aliases: &[ResolvedTypeAlias],
+) -> Result<String, CoreError> {
+    let mut out = String::new();
+
+    check_unique_schema_names(graph, "TypeScript SDK")?;
+
+    for (i, schema) in graph.schemas.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match &schema.body {
+            Type::Enum(members) => emit_runtime_enum_alias(&mut out, &schema.name, members)?,
+            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Union(_)
+            | Type::Any {} => {
+                let alias = ts_type(&schema.body, false, graph, "")?;
+                writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
+            }
+        }
+    }
+    for alias in aliases {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
+    }
+    Ok(out)
+}
+
 /// Emit one model schema into its own TypeScript file.
 pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
@@ -344,6 +383,69 @@ fn emit_enum_alias(out: &mut String, name: &str, members: &[String]) -> Result<(
     let lits: Vec<String> = members.iter().map(|m| ts_string_literal(m)).collect();
     writeln!(out, "export type {name} = {};", lits.join(" | ")).map_err(sink)?;
     Ok(())
+}
+
+fn emit_runtime_enum_alias(
+    out: &mut String,
+    name: &str,
+    members: &[String],
+) -> Result<(), CoreError> {
+    if members.is_empty() {
+        writeln!(out, "export const {name} = {{}} as const;").map_err(sink)?;
+        writeln!(out, "export type {name} = never;").map_err(sink)?;
+        return Ok(());
+    }
+    writeln!(out, "export const {name} = {{").map_err(sink)?;
+    let keys = enum_member_keys(members);
+    for (key, value) in keys.iter().zip(members.iter()) {
+        writeln!(out, "  {key}: {},", ts_string_literal(value)).map_err(sink)?;
+    }
+    writeln!(out, "}} as const;").map_err(sink)?;
+    writeln!(
+        out,
+        "export type {name} = typeof {name}[keyof typeof {name}];"
+    )
+    .map_err(sink)?;
+    Ok(())
+}
+
+fn enum_member_keys(members: &[String]) -> Vec<String> {
+    let mut used = Vec::new();
+    members
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let mut candidate = pascal_identifier(value);
+            if candidate.is_empty() {
+                candidate = format!("Value{index}");
+            }
+            if used.contains(&candidate) {
+                let base = candidate.clone();
+                let mut suffix = 2;
+                while used.contains(&candidate) {
+                    candidate = format!("{base}{suffix}");
+                    suffix += 1;
+                }
+            }
+            used.push(candidate.clone());
+            candidate
+        })
+        .collect()
+}
+
+fn pascal_identifier(value: &str) -> String {
+    let mut out = String::new();
+    for word in split_words(value) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.push(first.to_ascii_uppercase());
+            out.push_str(&chars.as_str().to_ascii_lowercase());
+        }
+    }
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        out.insert(0, 'V');
+    }
+    out
 }
 
 /// Emit an `export interface` for an object schema, one field line per field in GRAPH ORDER.

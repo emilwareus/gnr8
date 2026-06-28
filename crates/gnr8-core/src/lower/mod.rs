@@ -26,7 +26,8 @@
 //! — and it never drops or recomputes them. The representational decision the diagnostics describe
 //! (a free-form map → `additionalProperties: true`) is applied here.
 
-mod model;
+mod json;
+pub(crate) mod model;
 mod yaml;
 
 use crate::graph::{
@@ -73,6 +74,16 @@ pub fn to_openapi(
     Ok(yaml::write(&doc))
 }
 
+pub(crate) fn write_openapi_yaml(doc: &OpenApiDoc) -> String {
+    yaml::write(doc)
+}
+
+pub(crate) fn write_openapi_json(doc: &OpenApiDoc) -> Result<String, crate::CoreError> {
+    serde_json::to_string_pretty(&json::write(doc)).map_err(|err| crate::CoreError::Lowering {
+        message: format!("failed to serialize OpenAPI JSON: {err}"),
+    })
+}
+
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document serialized as pretty JSON.
 ///
 /// # Errors
@@ -86,12 +97,10 @@ pub fn to_openapi_json(
     security: &[GraphSecurityScheme],
 ) -> Result<String, crate::CoreError> {
     let doc = build_openapi_doc(graph, title, base_path, security)?;
-    serde_json::to_string_pretty(&doc).map_err(|err| crate::CoreError::Lowering {
-        message: format!("failed to serialize OpenAPI JSON: {err}"),
-    })
+    write_openapi_json(&doc)
 }
 
-fn build_openapi_doc(
+pub(crate) fn build_openapi_doc(
     graph: &ApiGraph,
     title: &str,
     base_path: &str,
@@ -336,15 +345,11 @@ fn lower_named_schema(
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<SchemaObject, crate::CoreError> {
     match &schema.body {
-        Type::Enum(members) => {
-            let mut enum_values = members.clone();
-            enum_values.sort();
-            Ok(SchemaObject {
-                type_name: Some("string".to_string()),
-                enum_values,
-                ..SchemaObject::default()
-            })
-        }
+        Type::Enum(members) => Ok(SchemaObject {
+            type_name: Some("string".to_string()),
+            enum_values: members.clone(),
+            ..SchemaObject::default()
+        }),
         Type::Object(fields) => lower_object(fields, ref_to_name),
         // Named aliases lower exactly like inline field schemas, but live under components so other
         // schemas and SDK model split layouts can reference them by name.
@@ -376,12 +381,14 @@ fn lower_object(
         .map(|field| {
             // The NULLABLE axis (independent of optional) renders on the property schema.
             let mut prop = lower_field_schema(&field.schema, field.nullable, ref_to_name)?;
-            // Attach a field description when the graph carries one and the schema is not a bare $ref
-            // / oneOf (a $ref node ignores sibling keys per JSON Schema).
-            if prop.schema_ref.is_none() && prop.one_of.is_empty() {
+            // Attach field-owned keywords when the schema is not a bare `$ref`. A composed schema
+            // (`oneOf`, including nullable references) may carry sibling JSON Schema keywords such
+            // as `description`, `default`, and vendor extensions, so do not drop metadata there.
+            if prop.schema_ref.is_none() {
                 if let Some(desc) = &field.description {
                     prop.description = Some(desc.clone());
                 }
+                apply_field_meta(field, &mut prop);
             }
             Ok((field.json_name.clone(), prop))
         })
@@ -393,6 +400,27 @@ fn lower_object(
         properties,
         ..SchemaObject::default()
     })
+}
+
+fn apply_field_meta(field: &Field, prop: &mut SchemaObject) {
+    let constraints = &field.meta.constraints;
+    prop.min_length = constraints.min_length;
+    prop.max_length = constraints.max_length;
+    prop.minimum.clone_from(&constraints.minimum);
+    prop.maximum.clone_from(&constraints.maximum);
+    prop.exclusive_minimum
+        .clone_from(&constraints.exclusive_minimum);
+    prop.exclusive_maximum
+        .clone_from(&constraints.exclusive_maximum);
+    prop.pattern.clone_from(&constraints.pattern);
+    if !constraints.enum_values.is_empty() {
+        let mut enum_values = constraints.enum_values.clone();
+        enum_values.sort();
+        prop.enum_values = enum_values;
+    }
+    prop.default_value.clone_from(&field.meta.default);
+    prop.extensions.clone_from(&field.meta.extensions);
+    prop.extensions.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// Lower a field's neutral [`Type`] applying the field's `nullable` axis: a nullable scalar/array/map
@@ -476,15 +504,11 @@ fn lower_schema_type(
         Type::Named(ref_id) => Ok(SchemaObject::reference(resolve_ref(ref_id, ref_to_name)?)),
         // An inline (anonymous) object lowers to a full object schema with its own properties.
         Type::Object(fields) => lower_object(fields, ref_to_name),
-        Type::Enum(members) => {
-            let mut enum_values = members.clone();
-            enum_values.sort();
-            Ok(SchemaObject {
-                type_name: Some("string".to_string()),
-                enum_values,
-                ..SchemaObject::default()
-            })
-        }
+        Type::Enum(members) => Ok(SchemaObject {
+            type_name: Some("string".to_string()),
+            enum_values: members.clone(),
+            ..SchemaObject::default()
+        }),
         // A sum type lowers to the 3.1 `oneOf` of its lowered variants.
         Type::Union(variants) => {
             let one_of = variants
@@ -610,7 +634,8 @@ mod tests {
     // allow to the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{join_base, to_openapi};
+    use super::{join_base, to_openapi, to_openapi_json};
+    use crate::analyze::facts::{Constraints, Extension, FieldMeta, LiteralValue};
     use crate::graph::{ApiGraph, SecurityScheme};
 
     /// The fixture's security schemes (the SINGLE source of truth for security — CLAUDE.md rule 4):
@@ -904,6 +929,7 @@ mod tests {
             schema: Type::Primitive(crate::graph::Prim::String),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -932,6 +958,7 @@ mod tests {
             schema: Type::Primitive(crate::graph::Prim::String),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -966,6 +993,7 @@ mod tests {
             schema: Type::Named("internal/dto.TargetDirection".to_string()),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -999,6 +1027,7 @@ mod tests {
             ]),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -1035,6 +1064,7 @@ mod tests {
             ]),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -1064,6 +1094,7 @@ mod tests {
             schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
@@ -1121,6 +1152,7 @@ mod tests {
             },
             description: None,
             example: None,
+            meta: FieldMeta::default(),
         }]);
         let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
         assert!(
@@ -1189,6 +1221,160 @@ mod tests {
             yaml.contains("additionalProperties: true"),
             "free-form map must lower to additionalProperties: true:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn field_metadata_lowers_to_yaml_and_json_schema_keywords() {
+        use crate::graph::{Field, Type};
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "name".to_string(),
+            required: true,
+            optional: false,
+            nullable: false,
+            schema: Type::Primitive(crate::graph::Prim::String),
+            description: Some("Goal name".to_string()),
+            example: None,
+            meta: FieldMeta {
+                constraints: Constraints {
+                    min_length: Some(3),
+                    max_length: Some(80),
+                    enum_values: vec!["beta".to_string(), "alpha".to_string()],
+                    ..Constraints::default()
+                },
+                default: Some(LiteralValue::String("alpha".to_string())),
+                extensions: vec![Extension {
+                    name: "x-gnr8-render".to_string(),
+                    value: LiteralValue::String("textarea".to_string()),
+                }],
+            },
+        }]);
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("minLength: 3"), "{block}");
+        assert!(block.contains("maxLength: 80"), "{block}");
+        assert!(block.contains("enum: [alpha, beta]"), "{block}");
+        assert!(block.contains("default: alpha"), "{block}");
+        assert!(block.contains("x-gnr8-render: textarea"), "{block}");
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        let prop = &json["components"]["schemas"]["CreateGoalInput"]["properties"]["name"];
+        assert_eq!(prop["minLength"], 3);
+        assert_eq!(prop["maxLength"], 80);
+        assert_eq!(prop["enum"][0], "alpha");
+        assert_eq!(prop["default"], "alpha");
+        assert_eq!(prop["x-gnr8-render"], "textarea");
+        assert!(
+            !json_text.contains("min_length"),
+            "internal metadata key leaked into JSON:\n{json_text}"
+        );
+    }
+
+    #[test]
+    fn metadata_on_nullable_ref_lowers_as_oneof_siblings() {
+        use crate::graph::{Field, Type};
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "direction".to_string(),
+            required: false,
+            optional: false,
+            nullable: true,
+            schema: Type::Named("internal/dto.TargetDirection".to_string()),
+            description: Some("Preferred target direction".to_string()),
+            example: None,
+            meta: FieldMeta {
+                constraints: Constraints::default(),
+                default: Some(LiteralValue::String("gte".to_string())),
+                extensions: vec![Extension {
+                    name: "x-gnr8-render".to_string(),
+                    value: LiteralValue::String("select".to_string()),
+                }],
+            },
+        }]);
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("oneOf:"), "{block}");
+        assert!(
+            block.contains("description: Preferred target direction"),
+            "{block}"
+        );
+        assert!(block.contains("default: gte"), "{block}");
+        assert!(block.contains("x-gnr8-render: select"), "{block}");
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        let prop = &json["components"]["schemas"]["CreateGoalInput"]["properties"]["direction"];
+        assert!(prop["oneOf"].is_array(), "{json_text}");
+        assert_eq!(prop["description"], "Preferred target direction");
+        assert_eq!(prop["default"], "gte");
+        assert_eq!(prop["x-gnr8-render"], "select");
+    }
+
+    #[test]
+    fn literal_rendering_preserves_json_numbers_and_yaml_strings() {
+        use crate::graph::{Field, Type};
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![
+            Field {
+                json_name: "window".to_string(),
+                required: false,
+                optional: true,
+                nullable: false,
+                schema: Type::Primitive(crate::graph::Prim::Int {
+                    bits: 64,
+                    signed: true,
+                }),
+                description: None,
+                example: None,
+                meta: FieldMeta {
+                    constraints: Constraints::default(),
+                    default: Some(LiteralValue::Number("30".to_string())),
+                    extensions: vec![],
+                },
+            },
+            Field {
+                json_name: "flag_text".to_string(),
+                required: false,
+                optional: true,
+                nullable: false,
+                schema: Type::Primitive(crate::graph::Prim::String),
+                description: None,
+                example: None,
+                meta: FieldMeta {
+                    constraints: Constraints {
+                        enum_values: vec!["123".to_string(), "true".to_string()],
+                        ..Constraints::default()
+                    },
+                    default: Some(LiteralValue::String("true".to_string())),
+                    extensions: vec![Extension {
+                        name: "x-gnr8-placeholder".to_string(),
+                        value: LiteralValue::String("123".to_string()),
+                    }],
+                },
+            },
+        ]);
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            json["components"]["schemas"]["CreateGoalInput"]["properties"]["window"]["default"],
+            serde_json::json!(30)
+        );
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
+        let block = block.split("GoalResponse:").next().unwrap_or(block);
+        assert!(block.contains("default: 'true'"), "{block}");
+        assert!(block.contains("enum: ['123', 'true']"), "{block}");
+        assert!(block.contains("x-gnr8-placeholder: '123'"), "{block}");
     }
 
     #[test]

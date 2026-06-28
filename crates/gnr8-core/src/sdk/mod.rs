@@ -29,9 +29,12 @@
 
 pub mod builtins;
 pub mod bundle;
+pub mod compat;
 pub(crate) mod emit_common;
 pub mod layout;
+pub mod model;
 pub mod model_style;
+pub mod profile;
 pub mod surface;
 
 use std::collections::{BTreeMap, HashMap};
@@ -847,12 +850,15 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApplySecurity, FastApi, Flask, GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31,
-        OpenApi31Json, PySdk, RenameOperation, RenameType, SetBasePath,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        ApplySecurity, EnumOrder, FastApi, Flask, GoGin, GoSdk, GroupOperations, Header, NestJs,
+        OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases, OpenApiSchemaPatch,
+        PySdk, RenameOperation, RenameType, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
     pub use super::layout::SdkFileLayout;
+    pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
+    pub use super::profile::SdkProfile;
     pub use super::surface::SdkTypeAliases;
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
