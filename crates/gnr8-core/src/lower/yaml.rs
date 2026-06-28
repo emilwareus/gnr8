@@ -56,7 +56,12 @@ fn write_security(out: &mut String, security: &[SecurityRequirement]) {
     }
     let _ = writeln!(out, "security:");
     for req in security {
-        let _ = writeln!(out, "{INDENT}- {}: {}", req.scheme, flow_seq(&req.scopes));
+        let _ = writeln!(
+            out,
+            "{INDENT}- {}: {}",
+            map_key(&req.scheme),
+            flow_seq(&req.scopes)
+        );
     }
 }
 
@@ -134,10 +139,12 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
 /// Emit the `responses` map keyed by quoted status code.
 fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth: usize) {
     let pad = INDENT.repeat(depth);
-    // The `responses` object is REQUIRED in OpenAPI; a response-less operation renders the explicit
-    // empty map `{}` (valid, deterministic) — NEVER a bare `responses:` line, which is a YAML null.
+    // The `responses` object is REQUIRED in OpenAPI. If a caller bypasses the lowering invariant,
+    // keep the document executable by emitting an explicit default response.
     if responses.is_empty() {
-        let _ = writeln!(out, "{pad}responses: {{}}");
+        let _ = writeln!(out, "{pad}responses:");
+        let _ = writeln!(out, "{pad}{INDENT}default:");
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}description: Default response");
         return;
     }
     let _ = writeln!(out, "{pad}responses:");
@@ -173,14 +180,14 @@ fn write_components(out: &mut String, components: &Components) {
     }
     let _ = writeln!(out, "{INDENT}schemas:");
     for (name, schema) in &components.schemas {
-        let _ = writeln!(out, "{INDENT}{INDENT}{name}:");
+        let _ = writeln!(out, "{INDENT}{INDENT}{}:", map_key(name));
         write_schema(out, schema, 3);
     }
 }
 
 /// Emit one named `apiKey`/`header`/`<name>` security scheme.
 fn write_security_scheme(out: &mut String, name: &str, scheme: &SecurityScheme) {
-    let _ = writeln!(out, "{INDENT}{INDENT}{name}:");
+    let _ = writeln!(out, "{INDENT}{INDENT}{}:", map_key(name));
     let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}type: {}", scheme.kind);
     let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}in: {}", scheme.location);
     let _ = writeln!(
@@ -240,7 +247,7 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     if !schema.properties.is_empty() {
         let _ = writeln!(out, "{pad}properties:");
         for (prop_name, prop) in &schema.properties {
-            let _ = writeln!(out, "{pad}{INDENT}{prop_name}:");
+            let _ = writeln!(out, "{pad}{INDENT}{}:", map_key(prop_name));
             write_schema(out, prop, depth + 2);
         }
     }
@@ -302,6 +309,14 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn map_key(value: &str) -> String {
+    if needs_key_quoting(value) {
+        quote(value)
+    } else {
+        value.to_string()
+    }
+}
+
 /// Indicator characters that begin a non-plain scalar in YAML and so force quoting.
 const LEADING_INDICATORS: &[u8] = b"!&*-?:,[]{}#|>@`\"'%";
 
@@ -322,6 +337,13 @@ fn needs_quoting(value: &str) -> bool {
     }
     // A `: ` or trailing `:` would start a mapping; `#` mid-value starts a comment.
     value.contains(": ") || value.ends_with(':') || value.contains(" #")
+}
+
+fn needs_key_quoting(value: &str) -> bool {
+    needs_quoting(value)
+        || value
+            .chars()
+            .any(|ch| matches!(ch, ':' | '#' | '{' | '}' | '[' | ']' | ','))
 }
 
 #[cfg(test)]
@@ -430,6 +452,22 @@ mod tests {
             yaml.contains("$ref: '#/components/schemas/CreateGoalInput'"),
             "expected quoted JSON-pointer ref:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn source_derived_mapping_keys_are_quoted_when_needed() {
+        let mut doc = sample_doc();
+        doc.security[0].scheme = "Api:Key".to_string();
+        doc.components.security_schemes[0].0 = "Api:Key".to_string();
+        doc.components.schemas[0].0 = "Foo#{id}".to_string();
+        doc.components.schemas[0].1.properties[0].0 = "x:y".to_string();
+
+        let yaml = write(&doc);
+
+        assert!(yaml.contains("- 'Api:Key': []"), "{yaml}");
+        assert!(yaml.contains("  'Api:Key':"), "{yaml}");
+        assert!(yaml.contains("  'Foo#{id}':"), "{yaml}");
+        assert!(yaml.contains("      'x:y':"), "{yaml}");
     }
 
     #[test]

@@ -37,7 +37,7 @@ use model::{
     Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
     SchemaObject, SecurityRequirement, SecurityScheme,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
 const SUPPORTED_API_KEY_LOCATION: &str = "header";
@@ -97,6 +97,8 @@ fn build_openapi_doc(
     base_path: &str,
     security: &[GraphSecurityScheme],
 ) -> Result<OpenApiDoc, crate::CoreError> {
+    validate_base_path(base_path)?;
+    ensure_unique_component_names(&graph.schemas)?;
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
     let ref_to_name: BTreeMap<&str, &str> = graph
         .schemas
@@ -199,7 +201,7 @@ fn build_paths(
     // simple ordered accumulator keeps the output deterministic without re-sorting.
     let mut paths: Vec<(String, PathItem)> = Vec::new();
     for op in &graph.operations {
-        let abs_path = join_base(base_path, &op.path);
+        let abs_path = join_base(base_path, &op.path)?;
         let operation = lower_operation(op, ref_to_name)?;
         // Find the existing path-item index (the graph's (path, method) sort keeps same-path
         // operations adjacent, so this stays deterministic), else append a fresh one.
@@ -276,7 +278,7 @@ fn lower_operation(
         None => None,
     };
 
-    let responses = op
+    let mut responses = op
         .responses
         .iter()
         .map(|resp| {
@@ -293,6 +295,15 @@ fn lower_operation(
             ))
         })
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
+    if responses.is_empty() {
+        responses.push((
+            "default".to_string(),
+            ResponseObj {
+                description: "Default response".to_string(),
+                schema_ref: None,
+            },
+        ));
+    }
 
     Ok(Operation {
         operation_id: op.id.clone(),
@@ -442,13 +453,26 @@ fn lower_schema_type(
             items: Some(Box::new(lower_schema_type(items, ref_to_name)?)),
             ..SchemaObject::default()
         }),
-        // A keyed map lowers to an object whose additionalProperties is the lowered value schema.
-        Type::Map { value, .. } => Ok(SchemaObject {
-            type_name: Some("object".to_string()),
-            items: None,
-            additional_properties_schema: Some(Box::new(lower_schema_type(value, ref_to_name)?)),
-            ..SchemaObject::default()
-        }),
+        // OpenAPI object keys are strings. Reject maps whose source key cannot be represented rather
+        // than silently widening them to string-keyed objects.
+        Type::Map { key, value } => {
+            if !is_openapi_map_key(key) {
+                return Err(crate::CoreError::Lowering {
+                    message: format!(
+                        "map key type {key:?} cannot be represented as an OpenAPI object key"
+                    ),
+                });
+            }
+            Ok(SchemaObject {
+                type_name: Some("object".to_string()),
+                items: None,
+                additional_properties_schema: Some(Box::new(lower_schema_type(
+                    value,
+                    ref_to_name,
+                )?)),
+                ..SchemaObject::default()
+            })
+        }
         Type::Named(ref_id) => Ok(SchemaObject::reference(resolve_ref(ref_id, ref_to_name)?)),
         // An inline (anonymous) object lowers to a full object schema with its own properties.
         Type::Object(fields) => lower_object(fields, ref_to_name),
@@ -524,13 +548,54 @@ fn resolve_ref(
 /// Join the `base_path` prefix with a group-relative operation path, collapsing the seam slash:
 /// `/goal` + `/` → `/goal/`, `/goal` + `/list` → `/goal/list`, `/goal` + `/{uuid}` → `/goal/{uuid}`
 /// (never `/goal//list`, never a dropped prefix). Open Q A3.
-fn join_base(base: &str, relative: &str) -> String {
+fn join_base(base: &str, relative: &str) -> Result<String, crate::CoreError> {
+    validate_base_path(base)?;
     let base = base.trim_end_matches('/');
     if relative == "/" {
-        return format!("{base}/");
+        return Ok(format!("{base}/"));
     }
     let suffix = relative.strip_prefix('/').unwrap_or(relative);
-    format!("{base}/{suffix}")
+    Ok(format!("{base}/{suffix}"))
+}
+
+fn validate_base_path(base: &str) -> Result<(), crate::CoreError> {
+    if base.is_empty() || base == "/" {
+        return Ok(());
+    }
+    if !base.starts_with('/') {
+        return Err(crate::CoreError::Lowering {
+            message: format!("base path {base:?} must be empty, '/', or start with '/'"),
+        });
+    }
+    if base.chars().any(|ch| matches!(ch, '?' | '#' | '\\'))
+        || base.split('/').any(|part| part == "..")
+    {
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "base path {base:?} must be a clean path prefix without query, fragment, backslash, or '..'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_unique_component_names(schemas: &[Schema]) -> Result<(), crate::CoreError> {
+    let mut seen = BTreeSet::new();
+    for schema in schemas {
+        if !seen.insert(schema.name.as_str()) {
+            return Err(crate::CoreError::Lowering {
+                message: format!(
+                    "two schemas share the OpenAPI component name '{}' (distinct ids map to one component)",
+                    schema.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+const fn is_openapi_map_key(key: &Type) -> bool {
+    matches!(key, Type::Primitive(Prim::String))
 }
 
 /// A stable default response description used when the graph carries none, so the document never
@@ -691,11 +756,17 @@ mod tests {
 
     #[test]
     fn join_base_collapses_the_seam_slash() {
-        assert_eq!(join_base("/goal", "/"), "/goal/");
-        assert_eq!(join_base("/goal", "/list"), "/goal/list");
-        assert_eq!(join_base("/goal", "/{uuid}"), "/goal/{uuid}");
+        assert_eq!(join_base("/goal", "/").unwrap(), "/goal/");
+        assert_eq!(join_base("/goal", "/list").unwrap(), "/goal/list");
+        assert_eq!(join_base("/goal", "/{uuid}").unwrap(), "/goal/{uuid}");
         // A trailing slash on the base is collapsed, never doubled.
-        assert_eq!(join_base("/goal/", "/list"), "/goal/list");
+        assert_eq!(join_base("/goal/", "/list").unwrap(), "/goal/list");
+    }
+
+    #[test]
+    fn join_base_rejects_relative_base_paths() {
+        let err = join_base("goal", "/list").unwrap_err();
+        assert!(err.to_string().contains("must be empty"), "{err}");
     }
 
     #[test]
@@ -1004,22 +1075,58 @@ mod tests {
     }
 
     #[test]
-    fn response_less_operation_renders_empty_responses_map() {
+    fn response_less_operation_renders_default_response() {
         use crate::graph::Operation;
-        // An operation with NO responses must render a valid, deterministic `responses: {}` (the empty
-        // OpenAPI responses object) — never a bare `responses:` (a YAML null, which is invalid OpenAPI).
-        // Locks CR-03's writer fix.
+        // An operation with NO responses still renders a non-empty OpenAPI responses object.
         let mut graph = sample_graph();
         let op: &mut Operation = &mut graph.operations[0];
         op.responses.clear();
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         assert!(
-            yaml.contains("responses: {}"),
-            "a response-less operation must render `responses: {{}}`:\n{yaml}"
+            yaml.contains("'default':\n          description: Default response"),
+            "a response-less operation must render a default response:\n{yaml}"
         );
         assert!(
-            !yaml.contains("responses:\n      content"),
-            "must not emit a bare null responses:\n{yaml}"
+            !yaml.contains("responses: {}"),
+            "must not emit an empty responses object:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn duplicate_schema_names_are_rejected_before_openapi_components() {
+        let mut graph = sample_graph();
+        graph.schemas[1].name = graph.schemas[0].name.clone();
+        let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
+        assert!(
+            err.to_string().contains("share the OpenAPI component name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_string_map_keys_are_rejected_for_openapi() {
+        use crate::graph::{Field, Prim, Type};
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(vec![Field {
+            json_name: "by_id".to_string(),
+            required: true,
+            optional: false,
+            nullable: false,
+            schema: Type::Map {
+                key: Box::new(Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                })),
+                value: Box::new(Type::Primitive(Prim::String)),
+            },
+            description: None,
+            example: None,
+        }]);
+        let err = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be represented as an OpenAPI object key"),
+            "{err}"
         );
     }
 

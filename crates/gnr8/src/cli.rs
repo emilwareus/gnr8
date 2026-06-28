@@ -1,8 +1,8 @@
 //! The gnr8 command-line surface (RUST-02 / D-10..D-12), defined with the clap derive API.
 //!
 //! Six top-level commands plus a nested `inspect` subcommand, with a global `--json` flag and a
-//! repeatable `-v/--verbose` count. Phase 1 only parses the surface; every command dispatches to a
-//! `gnr8` library seam that returns a typed `NotYetImplemented` error (see `main.rs`).
+//! repeatable `-v/--verbose` count. Execution lives in the binary modules; core library failures stay
+//! typed as `gnr8::CoreError` until the final CLI reporting boundary.
 
 use clap::{Parser, Subcommand};
 

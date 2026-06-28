@@ -25,8 +25,8 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    body_model_of, join_path, path_tokens, path_tokens_match, quoted_string_literal, split_words,
-    success_of,
+    body_model_of, check_unique_schema_names, join_path, path_tokens, path_tokens_match,
+    quoted_string_literal, split_words, success_responses_of, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
@@ -317,6 +317,8 @@ pub(crate) fn emit_models_with_options(
     package: &str,
     options: GoEmitOptions,
 ) -> Result<String, CoreError> {
+    check_unique_schema_names(graph, "Go SDK")?;
+
     let mut body = String::new();
     let mut needs_time = false;
 
@@ -444,7 +446,7 @@ fn emit_struct(
     graph: &ApiGraph,
     options: GoEmitOptions,
 ) -> Result<(), CoreError> {
-    let fields = go_field_emissions(name, fields, options);
+    let fields = go_field_emissions(name, fields, options)?;
     writeln!(body, "type {name} struct {{").map_err(sink)?;
     for field in &fields {
         emit_struct_field(body, name, field.field, &field.go_name, graph, options)?;
@@ -466,34 +468,36 @@ fn go_field_emissions<'a>(
     _owner_name: &str,
     fields: &'a [Field],
     options: GoEmitOptions,
-) -> Vec<GoFieldEmission<'a>> {
+) -> Result<Vec<GoFieldEmission<'a>>, CoreError> {
     let mut used_go = BTreeSet::new();
     let mut used_args = BTreeSet::new();
-    fields
-        .iter()
-        .map(|field| {
-            let go_base = go_field_name(&field.json_name, options);
-            let arg_base = lower_camel(&field.json_name);
-            GoFieldEmission {
-                field,
-                go_name: unique_ident(go_base, &mut used_go),
-                arg_name: unique_ident(arg_base, &mut used_args),
-            }
-        })
-        .collect()
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        let go_base = go_field_name(&field.json_name, options);
+        let arg_base = lower_camel(&field.json_name);
+        out.push(GoFieldEmission {
+            field,
+            go_name: unique_ident(go_base, &mut used_go)?,
+            arg_name: unique_ident(arg_base, &mut used_args)?,
+        });
+    }
+    Ok(out)
 }
 
-fn unique_ident(base: String, used: &mut BTreeSet<String>) -> String {
+fn unique_ident(base: String, used: &mut BTreeSet<String>) -> Result<String, CoreError> {
     if used.insert(base.clone()) {
-        return base;
+        return Ok(base);
     }
-    for suffix in 2.. {
+    let mut suffix = 2_u64;
+    loop {
         let candidate = format!("{base}{suffix}");
         if used.insert(candidate.clone()) {
-            return candidate;
+            return Ok(candidate);
         }
+        suffix = suffix.checked_add(1).ok_or_else(|| CoreError::SdkGen {
+            message: format!("could not make Go identifier {base:?} unique"),
+        })?;
     }
-    unreachable!("unbounded suffix loop must return");
 }
 
 fn emit_type_alias(
@@ -2242,7 +2246,7 @@ const API_ERROR_FIELDS: &[(&str, &str)] =
 
 /// Resolve the per-operation error model (the lowest-status non-2xx response body) from the graph.
 ///
-/// Mirrors [`success_of`] for the error side (CR-01): rather than hard-coding a Go type literally
+/// Mirrors the success-response resolver for the error side (CR-01): rather than hard-coding a Go type literally
 /// named `HttpError`, the non-2xx branch decodes into whatever type the graph's error response
 /// actually references. An operation with no typed non-2xx body yields `None`, and the caller
 /// decodes into a generator-owned anonymous struct instead so the SDK never references a type the
@@ -2350,16 +2354,13 @@ fn emit_operation(
     }
 
     let body_model = body_model_of(op, graph)?;
-    let success = success_of(op, graph)?;
+    let success = success_responses_of(op, graph)?;
     // The return type is the success model when one exists, else an empty struct.
     let return_model = success
-        .as_ref()
-        .and_then(|(_, model)| model.as_deref())
+        .body_model
+        .as_deref()
         .unwrap_or("struct{}")
         .to_string();
-    // WR-01: compare against the operation's REAL success status (e.g. 201/204), not a default 200.
-    // An op with no 2xx response declared falls back to 200 (the conventional default).
-    let success_status = success.as_ref().map_or(200, |(status, _)| *status);
 
     // Build the signature argument list.
     let mut args = vec!["ctx context.Context".to_string()];
@@ -2389,7 +2390,8 @@ fn emit_operation(
     writeln!(body, "var out {return_model}").map_err(sink)?;
 
     let has_body = body_model.is_some();
-    let has_decode = success.as_ref().is_some_and(|(_, model)| model.is_some());
+    let has_decode = success.body_model.is_some();
+    let dispatch_returns = has_decode && !success.has_bodyless_alternative();
     emit_request_dispatch(
         body,
         op,
@@ -2398,11 +2400,13 @@ fn emit_operation(
         &path_params,
         &query_params,
         has_body,
-        success_status,
+        &success,
         has_decode,
         auth_header,
     )?;
-    writeln!(body, "return out, nil").map_err(sink)?;
+    if !dispatch_returns {
+        writeln!(body, "return out, nil").map_err(sink)?;
+    }
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
@@ -2420,7 +2424,7 @@ fn emit_request_dispatch(
     path_params: &[&str],
     query_params: &[&crate::graph::Param],
     has_body: bool,
-    success_status: u16,
+    success: &SuccessResponses,
     has_decode: bool,
     auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
@@ -2498,12 +2502,22 @@ fn emit_request_dispatch(
     writeln!(body, "defer resp.Body.Close()").map_err(sink)?;
 
     // Non-2xx → typed APIError, decoding the graph's actual error model (CR-01).
-    writeln!(body, "if resp.StatusCode != {success_status} {{").map_err(sink)?;
+    writeln!(
+        body,
+        "if resp.StatusCode < 200 || resp.StatusCode >= 300 {{"
+    )
+    .map_err(sink)?;
     emit_error_decode(body, op, graph)?;
     writeln!(body, "}}").map_err(sink)?;
 
-    // 2xx → decode the success model (skip when there is no body type).
+    // 2xx → decode the success model only for statuses that declare that body.
     if has_decode {
+        writeln!(
+            body,
+            "if {} {{",
+            go_status_match("resp.StatusCode", &success.body_statuses)
+        )
+        .map_err(sink)?;
         writeln!(
             body,
             "if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {{"
@@ -2511,8 +2525,21 @@ fn emit_request_dispatch(
         .map_err(sink)?;
         writeln!(body, "return out, err").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return out, nil").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        if !success.has_bodyless_alternative() {
+            writeln!(body, "return out, &APIError{{StatusCode: resp.StatusCode}}").map_err(sink)?;
+        }
     }
     Ok(())
+}
+
+fn go_status_match(expr: &str, statuses: &[u16]) -> String {
+    statuses
+        .iter()
+        .map(|status| format!("{expr} == {status}"))
+        .collect::<Vec<_>>()
+        .join(" || ")
 }
 
 /// Emit the non-2xx error-decode block: decode the response body into the operation's error model
@@ -3070,7 +3097,7 @@ mod tests {
     }
 
     /// A minimal graph with ONE POST operation whose only success response is a body-less `{status}`
-    /// (no response body) — used to prove WR-01 compares against the operation's real success status.
+    /// (no response body) — used to prove WR-01 accepts successful statuses without decoding a body.
     fn body_less_success_graph(status: u16) -> ApiGraph {
         let facts = format!(
             r#"{{
@@ -3202,7 +3229,8 @@ mod tests {
                 GoEmitOptions {
                     compat_model_helpers: true,
                 },
-            );
+            )
+            .unwrap();
 
             assert_eq!(emitted[0].go_name, "AuthorizedByWorkspaceMemberId");
             assert_eq!(emitted[1].go_name, "AuthorizedByWorkspaceMemberId2");
@@ -3456,20 +3484,18 @@ mod tests {
         }
 
         #[test]
-        fn body_less_201_compares_against_its_real_status_not_a_default_200() {
-            // WR-01: an operation whose only success response is a body-less `201` must compare
-            // `resp.StatusCode != 201`, not the previous hard-coded `!= 200` (which treated the real
-            // 201 success as an error). The method also returns an empty `struct{}` (no body model).
+        fn body_less_201_accepts_the_2xx_range() {
+            // WR-01: body-less 2xx responses must not be rejected just because they are not 200.
             let graph = super::body_less_success_graph(201);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
-                out.contains("if resp.StatusCode != 201 {"),
-                "body-less 201 must compare against 201:\n{out}"
+                out.contains("if resp.StatusCode < 200 || resp.StatusCode >= 300 {"),
+                "body-less success must reject only non-2xx responses:\n{out}"
             );
             assert!(
-                !out.contains("if resp.StatusCode != 200 {"),
-                "body-less 201 must NOT default to 200:\n{out}"
+                !out.contains("resp.StatusCode !="),
+                "body-less success must not compare one exact status:\n{out}"
             );
             assert!(
                 out.contains("(struct{}, error)"),
@@ -3478,14 +3504,31 @@ mod tests {
         }
 
         #[test]
-        fn body_less_204_compares_against_its_real_status() {
-            // WR-01: a body-less `204 No Content` must likewise compare against 204.
+        fn body_less_204_accepts_the_2xx_range() {
             let graph = super::body_less_success_graph(204);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
             assert!(
-                out.contains("if resp.StatusCode != 204 {"),
-                "body-less 204 must compare against 204:\n{out}"
+                out.contains("if resp.StatusCode < 200 || resp.StatusCode >= 300 {"),
+                "body-less 204 must reject only non-2xx responses:\n{out}"
+            );
+        }
+
+        #[test]
+        fn typed_success_with_bodyless_alternate_decodes_only_body_status() {
+            let mut graph = super::no_error_response_graph();
+            graph.operations[0].responses.push(crate::graph::Response {
+                status: 204,
+                body: None,
+            });
+            graph.operations[0]
+                .responses
+                .sort_by_key(|response| response.status);
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            assert!(
+                out.contains("if resp.StatusCode == 200 {"),
+                "only the body-bearing success status should decode:\n{out}"
             );
         }
 

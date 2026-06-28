@@ -5,14 +5,8 @@
 
 /// Errors produced by gnr8-core.
 ///
-/// Phase 1 ships only the `NotYetImplemented` variant — every module seam returns it until the
-/// owning phase fills the seam in. Real variants (e.g. Go package-load failures) are added as
-/// Phases 2–3 land:
-///
-/// ```ignore
-/// // #[error("failed to load Go packages at {path}: {source}")]
-/// // PackageLoad { path: String, #[source] source: std::io::Error },
-/// ```
+/// Variants are deliberately domain-specific so library callers can distinguish configuration,
+/// extraction, lowering, SDK emission, lifecycle, and child-process failures without parsing strings.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// A command or seam recognized by the CLI but not yet built; names the implementing phase.
@@ -98,12 +92,11 @@ pub enum CoreError {
         message: String,
     },
 
-    /// The Go SDK could not be emitted from the graph (Phase 3 / SDK seam).
+    /// An SDK target could not be emitted from the graph.
     ///
-    /// Defined here in Phase 3-01 so plan 03-02 (Go SDK emission) needs no `error.rs` edit and the
-    /// two plans stay file-disjoint for parallel execution. Carries an owned `message` describing
-    /// the emission failure.
-    #[error("Go SDK generation failed: {message}")]
+    /// Carries an owned `message` describing the target-specific emission failure. This variant is
+    /// shared by the Go, Python, and TypeScript emitters.
+    #[error("SDK generation failed: {message}")]
     SdkGen {
         /// Human-readable failure detail.
         message: String,

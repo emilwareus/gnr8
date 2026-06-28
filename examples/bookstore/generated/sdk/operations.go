@@ -36,7 +36,7 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams) (BookLis
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
 			Message string   `json:"message"`
 			Slug    string   `json:"slug"`
@@ -50,10 +50,13 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams) (BookLis
 			Hints:      apiErr.Hints,
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // CreateBook -> POST /books/
@@ -78,7 +81,7 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 201 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -86,10 +89,13 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 201 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // DeleteBook -> DELETE /books/{id}
@@ -108,7 +114,7 @@ func (c *Client) DeleteBook(ctx context.Context, id string) (ErrorResponse, erro
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
 			Message string   `json:"message"`
 			Slug    string   `json:"slug"`
@@ -122,10 +128,13 @@ func (c *Client) DeleteBook(ctx context.Context, id string) (ErrorResponse, erro
 			Hints:      apiErr.Hints,
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // GetBook -> GET /books/{id}
@@ -144,7 +153,7 @@ func (c *Client) GetBook(ctx context.Context, id string) (Book, error) {
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -152,10 +161,13 @@ func (c *Client) GetBook(ctx context.Context, id string) (Book, error) {
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // UpdateBook -> PUT /books/{id}
@@ -180,7 +192,7 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -188,8 +200,11 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }

@@ -27,8 +27,8 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, file_stem, join_path, path_tokens, path_tokens_match, quoted_string_literal,
-    split_words, success_of,
+    body_model_of, check_unique_schema_names, file_stem, is_json_object_key, join_path,
+    path_tokens, path_tokens_match, quoted_string_literal, split_words, success_responses_of,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -236,8 +236,16 @@ pub(crate) fn py_type(
         // marshal cleanly through `json`.
         Type::WellKnown(_) => "str".to_string(),
         Type::Array(items) => format!("List[{}]", py_type(items, false, graph)?),
-        // A keyed map and a free-form value map to `Dict[str, Any]` / `Any`.
-        Type::Map { .. } => "Dict[str, Any]".to_string(),
+        Type::Map { key, value } => {
+            if !is_json_object_key(key) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "map key type {key:?} cannot be represented as a Python JSON object key"
+                    ),
+                });
+            }
+            format!("Dict[str, {}]", py_type(value, false, graph)?)
+        }
         Type::Any {} => "Any".to_string(),
         Type::Named(ref_id) => {
             let target = graph
@@ -328,24 +336,7 @@ pub(crate) fn emit_models_with_style_and_aliases(
     let mut out = String::new();
     out.push_str(models_header(model_style));
 
-    // Schema NAMES (not ids) become the Python top-level symbols (class/alias) and the __init__
-    // re-export surface. Two distinct ids that share a name would emit two `class Book` definitions
-    // (the second silently shadowing the first) and a duplicated re-export (WR-05). The graph does not
-    // guarantee name-uniqueness across ids, so reject a true collision with a typed error rather than
-    // emit silently-broken Python. One deterministic check; no fallback (rule 3).
-    let mut seen_names: Vec<&str> = Vec::with_capacity(graph.schemas.len());
-    for schema in &graph.schemas {
-        if seen_names.contains(&schema.name.as_str()) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "two schemas share the Python name '{}' (distinct ids map to one class) — the \
-                     SDK cannot emit two top-level `{}` symbols",
-                    schema.name, schema.name
-                ),
-            });
-        }
-        seen_names.push(schema.name.as_str());
-    }
+    check_unique_schema_names(graph, "Python SDK")?;
 
     for schema in &graph.schemas {
         out.push('\n');
@@ -894,8 +885,8 @@ class Client:
 /// - interpolates each path param through `urllib.parse.quote(str(value), safe="")` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
 ///   present optional params; joins `base_path` + `op.path`;
-/// - calls `self._do`, and on a status != the operation's real success status raises `ApiError` via
-///   `self._raise`; on success decodes JSON into the response model (or returns the raw dict).
+/// - calls `self._do`, raises `ApiError` via `self._raise` for non-2xx responses, and decodes JSON only
+///   for success statuses that declare a body model.
 ///
 /// # Errors
 ///
@@ -1033,10 +1024,18 @@ fn emit_operation(
     }
 
     let body_model = body_model_of(op, graph)?;
-    let success = success_of(op, graph)?;
-    let success_status = success.as_ref().map_or(200, |(s, _)| *s);
-    let return_model = success.as_ref().and_then(|(_, m)| m.clone());
-    let return_hint = return_model.clone().unwrap_or_else(|| "Any".to_string());
+    let success = success_responses_of(op, graph)?;
+    let return_model = success.body_model.clone();
+    let return_hint = return_model.as_ref().map_or_else(
+        || "Any".to_string(),
+        |model| {
+            if success.has_bodyless_alternative() {
+                format!("Optional[{model}]")
+            } else {
+                model.clone()
+            }
+        },
+    );
 
     // Resolve every emitted argument's keyword/digit-safe Python identifier ONCE, collision-checked
     // against `self`/`body` and each other (CR-02 / WR-03 / WR-01 ordering); see [`resolve_op_args`].
@@ -1114,7 +1113,7 @@ fn emit_operation(
         .map_err(sink)?;
     }
 
-    // Dispatch: call _do, compare the real success status, raise ApiError otherwise, decode on success.
+    // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
     let body_arg = if body_model.is_some() {
         ", body=body"
     } else {
@@ -1126,22 +1125,52 @@ fn emit_operation(
         op.method
     )
     .map_err(sink)?;
-    writeln!(out, "        if _status != {success_status}:").map_err(sink)?;
+    writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
     writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
     if let Some(model) = &return_model {
-        writeln!(out, "        _data = json.loads(_raw) if _raw else {{}}").map_err(sink)?;
+        writeln!(
+            out,
+            "        if _status in {}:",
+            py_status_tuple(&success.body_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(
+            out,
+            "            _data = json.loads(_raw) if _raw else {{}}"
+        )
+        .map_err(sink)?;
         match model_style {
             PyModelStyle::Pydantic => {
-                writeln!(out, "        return {model}.model_validate(_data)").map_err(sink)?;
+                writeln!(out, "            return {model}.model_validate(_data)").map_err(sink)?;
             }
             PyModelStyle::Dataclass => {
-                writeln!(out, "        return {model}.from_dict(_data)").map_err(sink)?;
+                writeln!(out, "            return {model}.from_dict(_data)").map_err(sink)?;
             }
+        }
+        if success.has_bodyless_alternative() {
+            writeln!(out, "        return None").map_err(sink)?;
+        } else {
+            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
     }
     Ok(())
+}
+
+fn py_status_tuple(statuses: &[u16]) -> String {
+    match statuses {
+        [] => "()".to_string(),
+        [single] => format!("({single},)"),
+        many => {
+            let joined = many
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({joined})")
+        }
+    }
 }
 
 /// Emit `__init__.py`: re-export `Client`, `ApiError`, and every model/enum class so `import <pkg>`
@@ -1401,8 +1430,26 @@ mod tests {
                 key: Box::new(Type::Primitive(Prim::String)),
                 value: Box::new(Type::Primitive(Prim::String)),
             };
-            assert_eq!(py_type(&map, false, &g).unwrap(), "Dict[str, Any]");
+            assert_eq!(py_type(&map, false, &g).unwrap(), "Dict[str, str]");
             assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "Any");
+        }
+
+        #[test]
+        fn non_string_map_key_is_a_typed_error() {
+            let g = ApiGraph::default();
+            let map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                })),
+                value: Box::new(Type::Primitive(Prim::String)),
+            };
+            let err = py_type(&map, false, &g).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be represented as a Python JSON object key"),
+                "{err}"
+            );
         }
 
         #[test]
@@ -1661,10 +1708,9 @@ mod tests {
                 out.contains("def create_book(self, body: Book) -> CreatedMessage:"),
                 "snake method, typed body, typed return:\n{out}"
             );
-            // success status is the real 201, not a default 200.
             assert!(
-                out.contains("if _status != 201:"),
-                "compares real 201:\n{out}"
+                out.contains("if _status < 200 or _status >= 300:"),
+                "rejects only non-2xx statuses:\n{out}"
             );
             assert!(out.contains("self._raise(_status, _raw)"), "{out}");
             assert!(
@@ -1675,6 +1721,28 @@ mod tests {
                 out.contains("self._do(\"POST\", path, body=body)"),
                 "body op passes body to _do:\n{out}"
             );
+        }
+
+        #[test]
+        fn typed_success_with_bodyless_alternate_returns_optional_and_decodes_only_body_status() {
+            let mut g = ops_graph();
+            g.operations[0].responses.push(crate::graph::Response {
+                status: 204,
+                body: None,
+            });
+            g.operations[0]
+                .responses
+                .sort_by_key(|response| response.status);
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("def create_book(self, body: Book) -> Optional[CreatedMessage]:"),
+                "bodyless alternate success should make the return hint optional:\n{out}"
+            );
+            assert!(
+                out.contains("if _status in (201,):"),
+                "only the body-bearing status should decode:\n{out}"
+            );
+            assert!(out.contains("return None"), "{out}");
         }
 
         #[test]
@@ -2015,7 +2083,10 @@ mod tests {
               "diagnostics": [] }"#;
             let g = graph_from(facts);
             let err = emit_models(&g, "pkg").unwrap_err();
-            assert!(err.to_string().contains("share the Python name"), "{err}");
+            assert!(
+                err.to_string().contains("share the Python SDK name"),
+                "{err}"
+            );
         }
     }
 }

@@ -18,7 +18,10 @@ mod emit;
 
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
-use crate::sdk::emit_common::{api_key_header_name, file_in_dir, file_stem, model_file_name};
+use crate::sdk::emit_common::{
+    api_key_header_name, check_unique_schema_names, file_in_dir, file_stem, model_file_name,
+    validate_sdk_base_path,
+};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::surface::SdkTypeAliases;
 
@@ -73,6 +76,9 @@ pub(crate) fn generate_files_with_layout(
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    validate_sdk_base_path(base_path)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
+
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_header = api_key_header_name(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
