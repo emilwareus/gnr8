@@ -193,7 +193,7 @@ func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMes
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 201 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr HttpError
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -203,10 +203,13 @@ func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMes
 			Hints:      apiErrorStringSliceValue(apiErr.Hints),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 201 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // ListGoalsParams carries the query parameters for ListGoals.
@@ -240,7 +243,7 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoa
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
 			Message string   `json:"message"`
 			Slug    string   `json:"slug"`
@@ -254,10 +257,13 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (ListGoa
 			Hints:      apiErr.Hints,
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // DeleteGoal -> DELETE /goal/{uuid}
@@ -273,7 +279,7 @@ func (c *Client) DeleteGoal(ctx context.Context, uuid string) (CommandMessage, e
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr HttpError
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -283,10 +289,13 @@ func (c *Client) DeleteGoal(ctx context.Context, uuid string) (CommandMessage, e
 			Hints:      apiErrorStringSliceValue(apiErr.Hints),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // UpdateGoal -> PUT /goal/{uuid}
@@ -308,7 +317,7 @@ func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr HttpError
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -318,8 +327,11 @@ func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput
 			Hints:      apiErrorStringSliceValue(apiErr.Hints),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }

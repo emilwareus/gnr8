@@ -67,18 +67,22 @@ class Client:
         if _query:
             path = path + "?" + urllib.parse.urlencode(_query)
         _status, _raw = self._do("GET", path)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return ListBooksResponse.model_validate(_data)
+        if _status in (200,):
+            _data = json.loads(_raw) if _raw else {}
+            return ListBooksResponse.model_validate(_data)
+        self._raise(_status, _raw)
 
     def create_book(self, body: Book) -> CreatedMessage:
         path = "/books/"
         _status, _raw = self._do("POST", path, body=body)
-        if _status != 201:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return CreatedMessage.model_validate(_data)
+        if _status in (201,):
+            _data = json.loads(_raw) if _raw else {}
+            return CreatedMessage.model_validate(_data)
+        self._raise(_status, _raw)
 
     def get_book(self, book_id, fmt=None) -> BookOrError:
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
@@ -88,15 +92,19 @@ class Client:
         if _query:
             path = path + "?" + urllib.parse.urlencode(_query)
         _status, _raw = self._do("GET", path)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return BookOrError.model_validate(_data)
+        if _status in (200,):
+            _data = json.loads(_raw) if _raw else {}
+            return BookOrError.model_validate(_data)
+        self._raise(_status, _raw)
 
     def update_book(self, book_id, body: BookFilters) -> CreatedMessage:
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
         _status, _raw = self._do("PUT", path, body=body)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return CreatedMessage.model_validate(_data)
+        if _status in (200,):
+            _data = json.loads(_raw) if _raw else {}
+            return CreatedMessage.model_validate(_data)
+        self._raise(_status, _raw)

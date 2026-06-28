@@ -527,7 +527,7 @@ fn collect_verified_file_stamps(
         collect_anchor_stamp_paths(root, anchor, &mut paths)?;
     }
     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(|path| root.join(path)).collect();
-    gnr8_core::sdk::stamp_project_paths(root, &paths)
+    gnr8_core::sdk::stamp_project_output_paths(root, &paths)
 }
 
 fn artifact_paths(metadata: &[gnr8_core::sdk::ArtifactMetadata]) -> Vec<String> {

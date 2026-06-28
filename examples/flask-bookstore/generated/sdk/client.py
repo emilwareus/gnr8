@@ -64,30 +64,36 @@ class Client:
         if _query:
             path = path + "?" + urllib.parse.urlencode(_query)
         _status, _raw = self._do("GET", path)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.model_validate(_data)
+        if _status in (200,):
+            _data = json.loads(_raw) if _raw else {}
+            return OrderConfirmation.model_validate(_data)
+        self._raise(_status, _raw)
 
     def create_order(self, body: OrderInput) -> OrderConfirmation:
         path = "/orders/"
         _status, _raw = self._do("POST", path, body=body)
-        if _status != 201:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.model_validate(_data)
+        if _status in (201,):
+            _data = json.loads(_raw) if _raw else {}
+            return OrderConfirmation.model_validate(_data)
+        self._raise(_status, _raw)
 
     def create_order_raw(self) -> Any:
         path = "/orders/raw"
         _status, _raw = self._do("POST", path)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
         return json.loads(_raw) if _raw else None
 
     def get_order(self, order_id) -> OrderConfirmation:
         path = f"/orders/{urllib.parse.quote(str(order_id), safe='')}"
         _status, _raw = self._do("GET", path)
-        if _status != 200:
+        if _status < 200 or _status >= 300:
             self._raise(_status, _raw)
-        _data = json.loads(_raw) if _raw else {}
-        return OrderConfirmation.model_validate(_data)
+        if _status in (200,):
+            _data = json.loads(_raw) if _raw else {}
+            return OrderConfirmation.model_validate(_data)
+        self._raise(_status, _raw)

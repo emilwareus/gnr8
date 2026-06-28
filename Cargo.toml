@@ -36,6 +36,7 @@ thiserror = "2.0"           # NOTE: v2, not v1
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 insta = { version = "1.48", features = ["yaml"] }
 # Phase-4 lifecycle/watch runtime crates — versions verified 2026-06-24 against the
 # crates.io sparse index (04-RESEARCH.md). Pinned here as the single source of truth;

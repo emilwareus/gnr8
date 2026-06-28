@@ -2,7 +2,8 @@
 //!
 //! These are the pure, byte-identical pieces of `gosdk::emit`/`pysdk::emit`/`tssdk::emit`: identifier
 //! tokenization ([`split_words`]), path joining ([`join_path`]) and templating ([`path_tokens`] +
-//! [`path_tokens_match`]), and the graph-walking model resolvers ([`success_of`], [`body_model_of`]).
+//! [`path_tokens_match`]), and graph-walking model/response resolvers ([`success_responses_of`],
+//! [`body_model_of`]).
 //! They contain NO per-language formatting — the casers (`exported`/`snake`/`camel`/…) and the type
 //! mappers (`go_type`/`py_type`/`ts_type`) stay in each emitter, where they genuinely diverge. One
 //! definition per fact (CLAUDE.md rule 3).
@@ -10,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Operation, Schema};
+use crate::graph::{ApiGraph, Operation, Prim, Schema, Type};
 use crate::sdk::layout::SdkFileLayout;
 use crate::CoreError;
 
@@ -116,6 +117,30 @@ pub(crate) fn api_key_header_name(graph: &ApiGraph) -> Result<Option<String>, Co
             ),
         }),
     }
+}
+
+/// Reject duplicate graph schema names before a target turns them into top-level symbols.
+///
+/// Schema ids can be package-qualified while schema names are local. The local name is what OpenAPI
+/// components and SDK model symbols use, so two ids with the same name must be handled before emission.
+pub(crate) fn check_unique_schema_names(graph: &ApiGraph, target: &str) -> Result<(), CoreError> {
+    let mut seen = BTreeSet::new();
+    for schema in &graph.schemas {
+        if !seen.insert(schema.name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "two schemas share the {target} name '{}' (distinct ids map to one emitted symbol)",
+                    schema.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a neutral map key can be represented as a JSON/OpenAPI object key.
+pub(crate) const fn is_json_object_key(ty: &Type) -> bool {
+    matches!(ty, Type::Primitive(Prim::String))
 }
 
 /// Escape a Rust string as a double-quoted Go/Python/TypeScript-compatible string literal.
@@ -237,6 +262,27 @@ pub(crate) fn join_path(base_path: &str, path: &str) -> String {
     }
 }
 
+pub(crate) fn validate_sdk_base_path(base_path: &str) -> Result<(), CoreError> {
+    if base_path.is_empty() || base_path == "/" {
+        return Ok(());
+    }
+    if !base_path.starts_with('/') {
+        return Err(CoreError::SdkGen {
+            message: format!("base path {base_path:?} must be empty, '/', or start with '/'"),
+        });
+    }
+    if base_path.chars().any(|ch| matches!(ch, '?' | '#' | '\\'))
+        || base_path.split('/').any(|part| part == "..")
+    {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "base path {base_path:?} must be a clean path prefix without query, fragment, backslash, or '..'"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Extract the set of `{token}` placeholder names from a path template, in first-seen order.
 ///
 /// `"/goal/{uuid}/sub/{kind}"` → `["uuid", "kind"]`. Used to assert the path's templated tokens exactly
@@ -265,42 +311,72 @@ pub(crate) fn path_tokens_match(tokens: &[String], params: &[&str]) -> bool {
     token_set == param_set
 }
 
-/// Resolve an operation's primary success (lowest 2xx) response status + model name.
+/// The success-response shape an SDK can represent for one operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SuccessResponses {
+    /// Declared successful statuses, sorted by status code. Empty means no explicit 2xx response.
+    pub(crate) statuses: Vec<u16>,
+    /// The single success body model, when all body-bearing 2xx responses share one model.
+    pub(crate) body_model: Option<String>,
+    /// The statuses that carry [`Self::body_model`].
+    pub(crate) body_statuses: Vec<u16>,
+}
+
+impl SuccessResponses {
+    /// Whether at least one declared success has no body while another has a typed body.
+    pub(crate) fn has_bodyless_alternative(&self) -> bool {
+        self.body_model.is_some() && self.body_statuses.len() < self.statuses.len()
+    }
+}
+
+/// Resolve all 2xx responses for one operation.
 ///
-/// Returns the first 2xx response's status regardless of whether it carries a body (WR-01); the model is
-/// `Some` only when that response has a typed body. The graph sorts each operation's responses by status
-/// at build time, so "first 2xx in order" IS "lowest 2xx" (rule 3: one source of truth, no second sort).
-/// An operation with no 2xx response at all yields `None`.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the success body `$ref` is dangling.
-pub(crate) fn success_of(
+/// SDK methods have one return type, so multiple body-bearing success responses are accepted only when
+/// they point to the same model. Body-less alternate 2xx responses are represented by returning the
+/// language's empty/default success value rather than surfacing an API error.
+pub(crate) fn success_responses_of(
     op: &Operation,
     graph: &ApiGraph,
-) -> Result<Option<(u16, Option<String>)>, CoreError> {
+) -> Result<SuccessResponses, CoreError> {
+    let mut statuses = Vec::new();
+    let mut body_statuses = Vec::new();
+    let mut body_model: Option<String> = None;
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
-            let model = match &resp.body {
-                Some(body) => {
-                    let model = graph
-                        .schemas
-                        .iter()
-                        .find(|s| s.id == body.ref_id)
-                        .ok_or_else(|| CoreError::SdkGen {
+            statuses.push(resp.status);
+            if let Some(body) = &resp.body {
+                let model = graph
+                    .schemas
+                    .iter()
+                    .find(|s| s.id == body.ref_id)
+                    .ok_or_else(|| CoreError::SdkGen {
+                        message: format!(
+                            "operation '{}' success response references dangling $ref '{}'",
+                            op.id, body.ref_id
+                        ),
+                    })?;
+                match &body_model {
+                    Some(existing) if existing != &model.name => {
+                        return Err(CoreError::SdkGen {
                             message: format!(
-                                "operation '{}' success response references dangling $ref '{}'",
-                                op.id, body.ref_id
+                                "operation '{}' has multiple success body models ('{}' and '{}'); \
+                                 SDK targets require one return model",
+                                op.id, existing, model.name
                             ),
-                        })?;
-                    Some(model.name.clone())
+                        });
+                    }
+                    Some(_) => {}
+                    None => body_model = Some(model.name.clone()),
                 }
-                None => None,
-            };
-            return Ok(Some((resp.status, model)));
+                body_statuses.push(resp.status);
+            }
         }
     }
-    Ok(None)
+    Ok(SuccessResponses {
+        statuses,
+        body_model,
+        body_statuses,
+    })
 }
 
 /// Resolve an operation's request-body model name, if it has a typed body.

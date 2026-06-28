@@ -98,6 +98,8 @@ pub struct FileStamp {
     pub len: u64,
     /// File modification timestamp as nanoseconds since the Unix epoch.
     pub modified_ns: u128,
+    /// The blake3 hash of the file bytes.
+    pub hash: String,
 }
 
 /// The accumulating set of generated files, kept **sorted by path** for determinism.
@@ -208,6 +210,19 @@ pub trait Target {
     /// Returns a typed [`CoreError`] if the IR carries a fact this target cannot represent (a dangling
     /// `$ref`, an unsupported scheme, …) or generation otherwise fails. Never panics.
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
+
+    /// Project files this target reads while generating artifacts.
+    ///
+    /// These files are folded into the artifact-cache key. Targets that only depend on the frozen IR
+    /// and `.gnr8/` config can use the empty default; targets that copy or template project files must
+    /// return every concrete source file so cache hits cannot hide changed target inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when a configured input path is invalid or cannot be enumerated.
+    fn cache_input_files(&self, _cx: &Cx) -> Result<Vec<PathBuf>, CoreError> {
+        Ok(Vec::new())
+    }
 
     /// The project-relative output path(s) this target writes — its **loop-safety anchors**.
     ///
@@ -400,7 +415,8 @@ impl Pipeline {
         let ir = self.build_ir(cx)?;
         // Collect diagnostics off the frozen IR (clone so the borrow ends before targets read `ir`).
         let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
-        let cache_key = artifact_cache_key(&ir, cx)?;
+        let target_inputs = self.target_cache_input_files(cx)?;
+        let cache_key = artifact_cache_key(&ir, cx, &target_inputs)?;
         if compact_cache_hit && artifact_cache_exists(cx, &cache_key) {
             return Ok(RunOutcome {
                 artifacts: Artifacts::new(),
@@ -433,6 +449,16 @@ impl Pipeline {
             artifact_cache_hit: false,
         })
     }
+
+    fn target_cache_input_files(&self, cx: &Cx) -> Result<Vec<PathBuf>, CoreError> {
+        let mut files = Vec::new();
+        for target in &self.targets {
+            files.extend(target.cache_input_files(cx)?);
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -445,9 +471,13 @@ struct ArtifactMetadataCache {
     artifacts: Vec<ArtifactMetadata>,
 }
 
-fn artifact_cache_key(ir: &ApiGraph, cx: &Cx) -> Result<String, CoreError> {
+fn artifact_cache_key(
+    ir: &ApiGraph,
+    cx: &Cx,
+    target_inputs: &[PathBuf],
+) -> Result<String, CoreError> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-artifact-cache-v2\n");
+    hasher.update(b"gnr8-artifact-cache-v3\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
     let ir_json = serde_json::to_vec(ir).map_err(|source| CoreError::SdkGen {
@@ -456,6 +486,8 @@ fn artifact_cache_key(ir: &ApiGraph, cx: &Cx) -> Result<String, CoreError> {
     hasher.update(blake3_hex(&ir_json).as_bytes());
     hasher.update(b"\n");
     hasher.update(config_surface_fingerprint(cx).as_bytes());
+    hasher.update(b"\n");
+    hasher.update(hash_files(target_inputs, &cx.project_root).as_bytes());
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -627,18 +659,36 @@ pub(crate) fn hash_project_files(root: &Path, paths: &[String]) -> HashMap<Strin
 /// Build metadata-only stamps for project files.
 #[must_use]
 pub fn stamp_project_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
+    stamp_project_paths_with_scope(root, paths, FileHashCacheScope::Inputs)
+}
+
+/// Build content-hashed stamps for generated output files.
+#[must_use]
+pub fn stamp_project_output_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
+    stamp_project_paths_with_scope(root, paths, FileHashCacheScope::Outputs)
+}
+
+fn stamp_project_paths_with_scope(
+    root: &Path,
+    paths: &[PathBuf],
+    scope: FileHashCacheScope,
+) -> Option<Vec<FileStamp>> {
     let mut stamps = Vec::with_capacity(paths.len());
+    let mut cache = FileHashCacheState::load(root, scope);
     for path in paths {
         let metadata = path.metadata().ok()?;
         if !metadata.is_file() {
             return None;
         }
+        let hash = cache.hash_path(path);
         stamps.push(FileStamp {
             path: project_relative_path(root, path),
             len: metadata.len(),
             modified_ns: modified_ns(&metadata),
+            hash,
         });
     }
+    cache.save();
     stamps.sort();
     Some(stamps)
 }
@@ -817,7 +867,7 @@ mod tests {
     // so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{Artifacts, Cx, Pipeline, Source, Transform};
+    use super::{stamp_project_paths, Artifacts, Cx, Pipeline, Source, Target, Transform};
     use crate::graph::ApiGraph;
     use crate::CoreError;
 
@@ -836,6 +886,37 @@ mod tests {
             ir.title = self.0.to_string();
             Ok(())
         }
+    }
+
+    struct CopyFileTarget {
+        source: &'static str,
+        dest: &'static str,
+    }
+
+    impl Target for CopyFileTarget {
+        fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
+            let path = cx.project_root.join(self.source);
+            let text = std::fs::read_to_string(&path).map_err(|err| CoreError::Io {
+                message: format!("failed to read {}: {err}", path.display()),
+            })?;
+            out.write(self.dest, text);
+            Ok(())
+        }
+
+        fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
+            Ok(vec![cx.project_root.join(self.source)])
+        }
+    }
+
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("gnr8-sdk-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -876,5 +957,52 @@ mod tests {
             .unwrap();
         // The later transform wins → ordered application.
         assert_eq!(ir.title, "Second");
+    }
+
+    #[test]
+    fn artifact_cache_key_includes_target_cache_inputs() {
+        let root = temp_project("target-input-cache");
+        std::fs::create_dir_all(root.join("static")).unwrap();
+        std::fs::write(root.join("static/runtime.txt"), "one\n").unwrap();
+        let cx = Cx::new(&root);
+
+        let first = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "generated/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
+        assert_eq!(first.artifacts.files()[0].text, "one\n");
+
+        std::fs::write(root.join("static/runtime.txt"), "two\n").unwrap();
+        let second = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "generated/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
+
+        assert!(
+            !second.artifact_cache_hit,
+            "target input changes must invalidate artifact cache"
+        );
+        assert_eq!(second.artifacts.files()[0].text, "two\n");
+    }
+
+    #[test]
+    fn file_stamps_include_content_hashes() {
+        let root = temp_project("file-stamp-hash");
+        let path = root.join("input.txt");
+        std::fs::write(&path, "aaaa").unwrap();
+        let first = stamp_project_paths(&root, std::slice::from_ref(&path)).unwrap();
+
+        std::fs::write(&path, "bbbb").unwrap();
+        let second = stamp_project_paths(&root, &[path]).unwrap();
+
+        assert_ne!(first[0].hash, second[0].hash);
     }
 }

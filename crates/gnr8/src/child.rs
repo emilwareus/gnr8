@@ -294,25 +294,12 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn package_name(manifest: &Path) -> Option<String> {
     let body = std::fs::read_to_string(manifest).ok()?;
-    let mut in_package = false;
-    for line in body.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "name" {
-            continue;
-        }
-        return Some(value.trim().trim_matches('"').to_string());
-    }
-    None
+    let parsed: toml::Value = toml::from_str(&body).ok()?;
+    parsed
+        .get("package")?
+        .get("name")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 /// Render an [`std::process::ExitStatus`] as a short string for the error message (the numeric code,
@@ -323,4 +310,39 @@ fn describe_status(status: std::process::ExitStatus) -> String {
         || "no exit code (terminated by signal)".to_string(),
         |c| format!("code {c}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::package_name;
+
+    fn temp_manifest(body: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-child-manifest-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, body).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn package_name_reads_toml_package_name() {
+        let manifest = temp_manifest(
+            r#"
+[package]
+name = 'quoted-child' # comments are valid TOML
+version = "0.1.0"
+"#,
+        );
+
+        assert_eq!(package_name(&manifest), Some("quoted-child".to_string()));
+    }
 }

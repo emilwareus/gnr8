@@ -1,6 +1,9 @@
-//! gnr8-core — extraction, graph, lowering, SDK generation, and diagnostics live here as
-//! module seams. Phase 1 only stubs the seams; each returns a typed `CoreError::NotYetImplemented`
-//! until the owning phase fills it in.
+//! gnr8-core — extraction, graph construction, `OpenAPI` lowering, SDK generation, lifecycle planning,
+//! and diagnostics for the `gnr8` CLI.
+//!
+//! The crate is the typed library boundary: production paths return [`CoreError`], generated artifacts
+//! are deterministic, and language-specific extractors feed one neutral API graph that every target
+//! lowers from.
 
 pub mod error;
 pub use error::CoreError;

@@ -365,9 +365,31 @@ impl SetBasePath {
 
 impl Transform for SetBasePath {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        validate_base_path(&self.base_path)?;
         ir.base_path.clone_from(&self.base_path);
         Ok(())
     }
+}
+
+fn validate_base_path(base_path: &str) -> Result<(), CoreError> {
+    if base_path.is_empty() || base_path == "/" {
+        return Ok(());
+    }
+    if !base_path.starts_with('/') {
+        return Err(CoreError::Config {
+            message: format!("base path {base_path:?} must be empty, '/', or start with '/'"),
+        });
+    }
+    if base_path.chars().any(|ch| matches!(ch, '?' | '#' | '\\'))
+        || base_path.split('/').any(|part| part == "..")
+    {
+        return Err(CoreError::Config {
+            message: format!(
+                "base path {base_path:?} must be a clean path prefix without query, fragment, backslash, or '..'"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Set [`ApiGraph::title`] — the OpenAPI document title (`info.title`) (replaces the `title` knob).
@@ -449,6 +471,15 @@ impl SetOperationSuccessResponse {
 
 impl Transform for SetOperationSuccessResponse {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if !(200..300).contains(&self.status) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "success response status {} is not a 2xx status",
+                    self.status
+                ),
+            });
+        }
+
         let schema_matches: Vec<_> = ir
             .schemas
             .iter()
@@ -513,7 +544,7 @@ impl Transform for SetOperationSuccessResponse {
 
         let op = &mut ir.operations[op_index];
         op.responses
-            .retain(|response| response.status != self.status);
+            .retain(|response| !(200..300).contains(&response.status));
         op.responses.push(Response {
             status: self.status,
             body: Some(SchemaRef { ref_id: schema_id }),
@@ -932,26 +963,8 @@ impl StaticFiles {
 
 impl Target for StaticFiles {
     fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
-        if self.from_dir.is_empty() {
-            return Err(CoreError::Config {
-                message: "StaticFiles target has no source dir — call .from(\"path\")".to_string(),
-            });
-        }
-        if self.to_dir.is_empty() {
-            return Err(CoreError::Config {
-                message: "StaticFiles target has no output dir — call .to(\"path\")".to_string(),
-            });
-        }
-
-        let source_root = cx.project_root.join(self.from_dir.trim_end_matches('/'));
-        let mut files = Vec::new();
-        for include in &self.includes {
-            collect_static_include(&source_root, include, &mut files)?;
-        }
-        files.sort();
-        files.dedup();
-
-        let to_dir = self.to_dir.trim_end_matches('/');
+        let (source_root, files) = self.static_source_files(cx)?;
+        let to_dir = validate_static_dir("output dir", &self.to_dir)?;
         for rel in files {
             let source_path = source_root.join(&rel);
             let text = std::fs::read_to_string(&source_path).map_err(|err| CoreError::Io {
@@ -963,6 +976,11 @@ impl Target for StaticFiles {
             out.write(format!("{to_dir}/{rel}"), text);
         }
         Ok(())
+    }
+
+    fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
+        let (source_root, files) = self.static_source_files(cx)?;
+        Ok(files.into_iter().map(|rel| source_root.join(rel)).collect())
     }
 
     fn output_anchors(&self) -> Vec<String> {
@@ -983,6 +1001,22 @@ impl Target for StaticFiles {
         anchors.dedup();
         anchors.retain(|anchor| !anchor.ends_with('/'));
         anchors
+    }
+}
+
+impl StaticFiles {
+    fn static_source_files(&self, cx: &Cx) -> Result<(std::path::PathBuf, Vec<String>), CoreError> {
+        let from_dir = validate_static_dir("source dir", &self.from_dir)?;
+        validate_static_dir("output dir", &self.to_dir)?;
+
+        let source_root = cx.project_root.join(from_dir);
+        let mut files = Vec::new();
+        for include in &self.includes {
+            collect_static_include(&source_root, include, &mut files)?;
+        }
+        files.sort();
+        files.dedup();
+        Ok((source_root, files))
     }
 }
 
@@ -1525,6 +1559,21 @@ fn validate_static_rel(path: &str) -> Result<(), CoreError> {
     })
 }
 
+fn validate_static_dir(kind: &str, path: &str) -> Result<String, CoreError> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(CoreError::Config {
+            message: format!(
+                "StaticFiles target has no {kind} — call .from(\"path\")/.to(\"path\")"
+            ),
+        });
+    }
+    super::bundle::safe_frame_name(trimmed).map_err(|err| CoreError::Config {
+        message: format!("invalid StaticFiles {kind} {path:?}: {err}"),
+    })?;
+    Ok(trimmed.to_string())
+}
+
 fn rel_to_slash_string(path: &Path) -> Result<String, CoreError> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -1601,7 +1650,74 @@ mod tests {
     }
 
     #[test]
+    fn set_base_path_rejects_relative_or_url_like_paths() {
+        let mut ir = ApiGraph::default();
+        let err = SetBasePath::new("books").apply(&mut ir, &cx()).unwrap_err();
+        assert!(err.to_string().contains("must be empty"), "{err}");
+
+        let err = SetBasePath::new("/books?draft=true")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(err.to_string().contains("clean path prefix"), "{err}");
+    }
+
+    #[test]
     fn transform_sets_operation_success_response_by_route() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.CreateBookResponse".to_string(),
+                name: "CreateBookResponse".to_string(),
+                body: Type::Object(vec![]),
+                provenance: span(),
+            }],
+            operations: vec![Operation {
+                id: "createBook".to_string(),
+                method: "POST".to_string(),
+                path: "/books".to_string(),
+                handler: "createBook".to_string(),
+                group: None,
+                params: vec![],
+                request_body: None,
+                responses: vec![
+                    crate::graph::Response {
+                        status: 200,
+                        body: None,
+                    },
+                    crate::graph::Response {
+                        status: 404,
+                        body: None,
+                    },
+                ],
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        SetOperationSuccessResponse::for_route("post", "/books", "CreateBookResponse")
+            .status(201)
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].responses.len(), 2);
+        assert_eq!(
+            ir.operations[0]
+                .responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            vec![201, 404]
+        );
+        assert_eq!(
+            ir.operations[0].responses[0]
+                .body
+                .as_ref()
+                .map(|body| body.ref_id.as_str()),
+            Some("app.CreateBookResponse")
+        );
+    }
+
+    #[test]
+    fn transform_rejects_non_success_status_override() {
         let mut ir = ApiGraph {
             schemas: vec![Schema {
                 id: "app.CreateBookResponse".to_string(),
@@ -1623,20 +1739,12 @@ mod tests {
             ..ApiGraph::default()
         };
 
-        SetOperationSuccessResponse::for_route("post", "/books", "CreateBookResponse")
-            .status(201)
+        let err = SetOperationSuccessResponse::for_operation("createBook", "CreateBookResponse")
+            .status(404)
             .apply(&mut ir, &cx())
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(ir.operations[0].responses.len(), 1);
-        assert_eq!(ir.operations[0].responses[0].status, 201);
-        assert_eq!(
-            ir.operations[0].responses[0]
-                .body
-                .as_ref()
-                .map(|body| body.ref_id.as_str()),
-            Some("app.CreateBookResponse")
-        );
+        assert!(err.to_string().contains("is not a 2xx status"), "{err}");
     }
 
     #[test]
@@ -1763,6 +1871,32 @@ mod tests {
     }
 
     #[test]
+    fn static_files_target_reports_cache_inputs() {
+        let root = temp_project("cache-inputs");
+        std::fs::create_dir_all(root.join("static/runtime")).unwrap();
+        std::fs::write(root.join("static/runtime/__init__.py"), "ROOT\n").unwrap();
+        std::fs::write(root.join("static/README.md"), "README\n").unwrap();
+
+        let files = StaticFiles::new()
+            .from("static")
+            .to("pkg")
+            .include(["runtime/**", "README.md"])
+            .cache_input_files(&Cx::new(&root))
+            .unwrap();
+        let rels: Vec<_> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(rels, vec!["static/README.md", "static/runtime/__init__.py"]);
+    }
+
+    #[test]
     fn static_files_target_rejects_unsafe_includes() {
         let mut out = Artifacts::new();
         let err = StaticFiles::new()
@@ -1772,6 +1906,32 @@ mod tests {
             .generate(&ApiGraph::default(), &mut out, &cx())
             .unwrap_err();
         assert!(err.to_string().contains("invalid StaticFiles include"));
+    }
+
+    #[test]
+    fn static_files_target_rejects_unsafe_source_and_output_dirs() {
+        let mut out = Artifacts::new();
+        let err = StaticFiles::new()
+            .from("../static")
+            .to("pkg")
+            .include(["README.md"])
+            .generate(&ApiGraph::default(), &mut out, &cx())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid StaticFiles source dir"),
+            "{err}"
+        );
+
+        let err = StaticFiles::new()
+            .from("static")
+            .to("/pkg")
+            .include(["README.md"])
+            .generate(&ApiGraph::default(), &mut out, &cx())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid StaticFiles output dir"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -43,7 +43,9 @@ paths:
   '/orders/raw':
     post:
       operationId: create_order_raw
-      responses: {}
+      responses:
+        'default':
+          description: Default response
   '/orders/{order_id}':
     get:
       operationId: get_order

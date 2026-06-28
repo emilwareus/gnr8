@@ -36,10 +36,13 @@ export class Client {
       method: "GET",
       headers,
     });
-    if (res.status !== 200) {
+    if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
-    return (await res.json()) as models.ListBooksResponse;
+    if (res.status === 200) {
+      return (await res.json()) as models.ListBooksResponse;
+    }
+    throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
 
@@ -52,10 +55,13 @@ export class Client {
       headers,
       body: JSON.stringify(body),
     });
-    if (res.status !== 201) {
+    if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
-    return (await res.json()) as models.CreatedMessage;
+    if (res.status === 201) {
+      return (await res.json()) as models.CreatedMessage;
+    }
+    throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
 
@@ -74,10 +80,13 @@ export class Client {
       method: "GET",
       headers,
     });
-    if (res.status !== 200) {
+    if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
-    return (await res.json()) as models.BookOrError;
+    if (res.status === 200) {
+      return (await res.json()) as models.BookOrError;
+    }
+    throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
 
@@ -90,9 +99,12 @@ export class Client {
       headers,
       body: JSON.stringify(body),
     });
-    if (res.status !== 200) {
+    if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
-    return (await res.json()) as models.CreatedMessage;
+    if (res.status === 200) {
+      return (await res.json()) as models.CreatedMessage;
+    }
+    throw new ApiError(res.status, await res.json().catch(() => null));
   }
 }

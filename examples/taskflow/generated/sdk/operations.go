@@ -36,7 +36,7 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
 			Message string   `json:"message"`
 			Slug    string   `json:"slug"`
@@ -50,10 +50,13 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 			Hints:      apiErr.Hints,
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // CreateTask -> POST /tasks/
@@ -78,7 +81,7 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 201 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -86,10 +89,13 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 201 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // DeleteTask -> DELETE /tasks/{id}
@@ -108,7 +114,7 @@ func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, erro
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr struct {
 			Message string   `json:"message"`
 			Slug    string   `json:"slug"`
@@ -122,10 +128,13 @@ func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, erro
 			Hints:      apiErr.Hints,
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // GetTask -> GET /tasks/{id}
@@ -144,7 +153,7 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -152,10 +161,13 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
 // UpdateTask -> PUT /tasks/{id}
@@ -180,7 +192,7 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 		return out, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiErr ErrorResponse
 		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
 		return out, &APIError{
@@ -188,8 +200,11 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 			Message:    apiErrorStringValue(apiErr.Message),
 		}
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, err
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
 	}
-	return out, nil
+	return out, &APIError{StatusCode: resp.StatusCode}
 }

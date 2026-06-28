@@ -30,8 +30,8 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, file_stem, join_path, path_tokens, path_tokens_match, quoted_string_literal,
-    split_words, success_of,
+    body_model_of, check_unique_schema_names, file_stem, is_json_object_key, join_path,
+    path_tokens, path_tokens_match, quoted_string_literal, split_words, success_responses_of,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
@@ -152,9 +152,16 @@ pub(crate) fn ts_type(
         // date-time is an RFC-3339 `string`; a uuid/email/uri is a `string`) — A7. No `Date` import.
         Type::WellKnown(_) => "string".to_string(),
         Type::Array(items) => format!("{}[]", ts_type(items, false, graph, ns)?),
-        // A keyed map maps to the stricter typed `Record<string, V>` (Open Q1 resolution): the value
-        // type is preserved rather than widened to `unknown`.
-        Type::Map { value, .. } => format!("Record<string, {}>", ts_type(value, false, graph, ns)?),
+        Type::Map { key, value } => {
+            if !is_json_object_key(key) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "map key type {key:?} cannot be represented as a TypeScript JSON object key"
+                    ),
+                });
+            }
+            format!("Record<string, {}>", ts_type(value, false, graph, ns)?)
+        }
         Type::Any {} => "unknown".to_string(),
         Type::Named(ref_id) => {
             let target = graph
@@ -236,35 +243,6 @@ fn ts_primitive(prim: &Prim) -> &'static str {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if a field's schema cannot be mapped or two schemas collide on a name.
-/// Reject a graph in which two distinct schema ids map to the SAME TypeScript symbol name.
-///
-/// Schema NAMES (not ids) become the TypeScript top-level symbols (interface/type) in `models.ts` AND
-/// the `index.ts` re-export surface. Two distinct ids sharing a name would emit two `interface Book`
-/// definitions (a TS redeclaration error) and a duplicated re-export (WR-05). The graph does not
-/// guarantee name-uniqueness across ids, so this is the SINGLE shared check both `emit_models` and
-/// `emit_index` call, so the two passes can never drift on which names are legal (rule 3: one source of
-/// truth, no fallback). One deterministic pass over the graph-sorted schemas.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] on the first duplicated TypeScript name.
-fn check_unique_schema_names(graph: &ApiGraph) -> Result<(), CoreError> {
-    let mut seen_names: Vec<&str> = Vec::with_capacity(graph.schemas.len());
-    for schema in &graph.schemas {
-        if seen_names.contains(&schema.name.as_str()) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "two schemas share the TypeScript name '{}' (distinct ids map to one symbol) — \
-                     the SDK cannot emit two top-level `{}` declarations",
-                    schema.name, schema.name
-                ),
-            });
-        }
-        seen_names.push(schema.name.as_str());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
     emit_models_with_aliases(graph, package, &[])
@@ -277,7 +255,7 @@ pub(crate) fn emit_models_with_aliases(
 ) -> Result<String, CoreError> {
     let mut out = String::new();
 
-    check_unique_schema_names(graph)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
 
     for (i, schema) in graph.schemas.iter().enumerate() {
         if i > 0 {
@@ -321,7 +299,7 @@ pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut out = String::new();
     out.push_str("import type * as models from \"./index\";\n\n");
     match &schema.body {
@@ -492,8 +470,8 @@ export class Client {{
 /// - interpolates each path param through `encodeURIComponent(String(value))` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape` / Python `urllib.quote(safe='')`); builds the query with a
 ///   `URLSearchParams`; joins `base_path` + `op.path`;
-/// - `await`s `this.fetchFn`, throws `ApiError` on a status != the operation's real success status, and
-///   on success returns the JSON cast to the response interface (or `void`/`unknown`).
+/// - `await`s `this.fetchFn`, throws `ApiError` for non-2xx responses, and returns decoded JSON only
+///   for success statuses that declare a body model.
 ///
 /// # Errors
 ///
@@ -637,14 +615,20 @@ fn emit_operation(
     }
 
     let body_model = body_model_of(op, graph)?;
-    let success = success_of(op, graph)?;
-    let success_status = success.as_ref().map_or(200, |(s, _)| *s);
-    let return_model = success.as_ref().and_then(|(_, m)| m.clone());
+    let success = success_responses_of(op, graph)?;
+    let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
-    let return_ty = return_model
-        .as_ref()
-        .map_or_else(|| "void".to_string(), |m| format!("models.{m}"));
+    let return_ty = return_model.as_ref().map_or_else(
+        || "void".to_string(),
+        |m| {
+            if success.has_bodyless_alternative() {
+                format!("models.{m} | undefined")
+            } else {
+                format!("models.{m}")
+            }
+        },
+    );
 
     let ResolvedArgs {
         path_idents,
@@ -700,7 +684,8 @@ fn emit_operation(
     emit_op_dispatch(
         out,
         &op.method,
-        success_status,
+        &success.body_statuses,
+        success.has_bodyless_alternative(),
         body_model.is_some(),
         return_model.as_deref(),
         auth_header,
@@ -778,13 +763,13 @@ fn emit_op_query(
     Ok(())
 }
 
-/// Emit the fetch dispatch block: await fetch, compare the real success status, throw `ApiError`
-/// otherwise, cast the decoded JSON on success. The request carries a JSON body only for body-bearing
-/// ops.
+/// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
+/// body-bearing success statuses. The request carries a JSON body only for body-bearing ops.
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
-    success_status: u16,
+    body_statuses: &[u16],
+    has_bodyless_success: bool,
     has_body: bool,
     return_model: Option<&str>,
     auth_header: Option<&str>,
@@ -814,7 +799,7 @@ fn emit_op_dispatch(
         writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
     }
     writeln!(out, "    }});").map_err(sink)?;
-    writeln!(out, "    if (res.status !== {success_status}) {{").map_err(sink)?;
+    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
     writeln!(
         out,
         "      throw new ApiError(res.status, await res.json().catch(() => null));"
@@ -822,9 +807,31 @@ fn emit_op_dispatch(
     .map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
     if let Some(model) = return_model {
-        writeln!(out, "    return (await res.json()) as models.{model};").map_err(sink)?;
+        writeln!(
+            out,
+            "    if ({}) {{",
+            ts_status_match("res.status", body_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(out, "      return (await res.json()) as models.{model};").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+        if !has_bodyless_success {
+            writeln!(
+                out,
+                "    throw new ApiError(res.status, await res.json().catch(() => null));"
+            )
+            .map_err(sink)?;
+        }
     }
     Ok(())
+}
+
+fn ts_status_match(expr: &str, statuses: &[u16]) -> String {
+    statuses
+        .iter()
+        .map(|status| format!("{expr} === {status}"))
+        .collect::<Vec<_>>()
+        .join(" || ")
 }
 
 /// Emit `index.ts`: re-export `Client`, `ApiError`, and every named model/enum symbol so a consumer can
@@ -851,7 +858,7 @@ pub(crate) fn emit_index_with_models(
     model_module: &str,
     aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
 
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
@@ -877,7 +884,7 @@ pub(crate) fn emit_models_index(
     graph: &ApiGraph,
     aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut out = String::new();
     for schema in &graph.schemas {
         writeln!(out, "export * from \"./{}\";", file_stem(&schema.name)).map_err(sink)?;
@@ -1140,6 +1147,24 @@ mod tests {
         }
 
         #[test]
+        fn non_string_map_key_is_a_typed_error() {
+            let g = ApiGraph::default();
+            let map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::Int {
+                    bits: 64,
+                    signed: true,
+                })),
+                value: Box::new(Type::Primitive(Prim::String)),
+            };
+            let err = ts_type(&map, false, &g, "").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be represented as a TypeScript JSON object key"),
+                "{err}"
+            );
+        }
+
+        #[test]
         fn inline_object_is_a_typed_error_parity_with_go_and_python() {
             let g = ApiGraph::default();
             let obj = Type::Object(vec![]);
@@ -1352,10 +1377,9 @@ mod tests {
                 ),
                 "camel method, typed body, typed return:\n{out}"
             );
-            // success status is the real 201, not a default 200.
             assert!(
-                out.contains("if (res.status !== 201) {"),
-                "compares real 201:\n{out}"
+                out.contains("if (res.status < 200 || res.status >= 300) {"),
+                "rejects only non-2xx statuses:\n{out}"
             );
             assert!(
                 out.contains("throw new ApiError(res.status, await res.json().catch(() => null));"),
@@ -1371,6 +1395,31 @@ mod tests {
                 "body op serializes the body:\n{out}"
             );
             assert!(out.contains("method: \"POST\","), "{out}");
+        }
+
+        #[test]
+        fn typed_success_with_bodyless_alternate_returns_undefined_union_and_decodes_only_body_status(
+        ) {
+            let mut g = ops_graph();
+            g.operations[0].responses.push(crate::graph::Response {
+                status: 204,
+                body: None,
+            });
+            g.operations[0]
+                .responses
+                .sort_by_key(|response| response.status);
+            let out =
+                emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook"), None).unwrap();
+            assert!(
+                out.contains(
+                    "async createBook(body: models.Book): Promise<models.CreatedMessage | undefined> {"
+                ),
+                "bodyless alternate success should make the return type optional:\n{out}"
+            );
+            assert!(
+                out.contains("if (res.status === 201) {"),
+                "only the body-bearing status should decode:\n{out}"
+            );
         }
 
         #[test]
@@ -1700,7 +1749,7 @@ mod tests {
             let g = graph_from(facts);
             let err = emit_models(&g, "pkg").unwrap_err();
             assert!(
-                err.to_string().contains("share the TypeScript name"),
+                err.to_string().contains("share the TypeScript SDK name"),
                 "{err}"
             );
         }
