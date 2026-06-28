@@ -10,6 +10,11 @@ code**, so you, or an AI agent, can adapt exactly how it parses and generates fo
 > **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**, with OpenAPI 3.1 plus
 > Go/Python/TypeScript SDK generation.
 
+> **Agents using gnr8 in an application repo:** start with
+> [`docs/AGENT-USAGE.md`](https://github.com/emilwareus/gnr8/blob/main/docs/AGENT-USAGE.md)
+> or run `gnr8 guide`. For machine-readable source/target snippets, run
+> `gnr8 capabilities --json`.
+
 > **Full reference (CLI, config, type mapping, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
 
 ---
@@ -137,6 +142,18 @@ side-by-side.
 
 ## Try the example
 
+Install the CLI from the GitHub release archive:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+```
+
+The crates.io package named `gnr8` is the Rust API that `.gnr8/Cargo.toml` depends on; it is not the
+primary CLI install path yet. The release archive includes the `gnr8` binary plus the extractor
+resources needed by `gnr8 init`/`gnr8 generate`.
+
+For local development from this checkout:
+
 ```bash
 cargo build --release -p gnr8-cli
 cd examples/bookstore
@@ -183,7 +200,9 @@ implements one trait and composes into the same pipeline.
 | `examples/bookstore/` | a runnable example + its real generated output (the basic `.gnr8/` lifecycle) |
 | `examples/taskflow/` | a richer example: a custom `Transform` + a custom `Target` (writes `API.md`) in `.gnr8/` |
 | `fixtures/goalservice/` | the test fixture (a realistic Gin service) driving the contract tests |
+| `docs/AGENT-USAGE.md` | agent-facing install, init, generation, SDK usage, and recovery guide |
 | `docs/USAGE.md` | full reference: CLI, config, patterns, type mapping, recipes |
+| `llms.txt` / `llms-full.txt` | agent-readable docs index and compact full-context export |
 | `docs/` | `demo.md` (walkthrough), `evidence.md` (what's verified) |
 
 Build & verify: `make check` (format, lint, tests) · `make gates` (the full contract suite).

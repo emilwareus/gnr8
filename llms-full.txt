@@ -1,0 +1,95 @@
+# gnr8 Agent Context
+
+gnr8 reads service source code, builds a language-neutral API graph, and generates OpenAPI 3.1 plus
+typed SDKs. The main users are coding agents and developers working inside application repositories.
+
+## Install
+
+Install the CLI from GitHub release assets:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+```
+
+The crates.io package named `gnr8` is the Rust dependency used by generated `.gnr8/Cargo.toml` files.
+The CLI release archive also includes resources required by source extractors.
+
+## Core Workflow
+
+```bash
+gnr8 init --source go-gin --sdk go
+gnr8 generate
+gnr8 doctor
+gnr8 check
+```
+
+Use explicit presets:
+
+```bash
+gnr8 init --source fastapi --sdk python
+gnr8 init --source flask --sdk python
+gnr8 init --source nestjs --sdk typescript
+```
+
+`gnr8 init` writes `.gnr8/src/main.rs` and `.gnr8/README.md`. The Rust file is the configuration.
+`gnr8 generate` compiles and runs that local crate, then writes outputs declared by target stages.
+
+## Pipeline Example
+
+```rust
+use gnr8::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8::runner::run(
+        Pipeline::new()
+            .source(FastApi::new().inputs(["."]))
+            .transform(SetBasePath::new("/api"))
+            .transform(SetTitle::new("Public API"))
+            .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
+            .target(OpenApi31::new().to("generated/openapi.yaml"))
+            .target(PySdk::new().module("example.com/public/sdk").to("generated/sdk"))
+            .post(Header::generated()),
+    )
+}
+```
+
+## Supported Sources
+
+- Go + Gin: `GoGin::new().inputs(["."])`; requires `go`; recognizes Gin routes, params, JSON bodies,
+  typed responses, structs, and enums.
+- FastAPI: `FastApi::new().inputs(["."])`; requires `python3`; static AST only; recognizes typed params,
+  Pydantic/dataclass bodies, response models, enums, literals, and unions.
+- Flask: `Flask::new().inputs(["."])`; requires `python3`; typed-envelope only; untyped request/query
+  surfaces become diagnostics.
+- NestJS: `NestJs::new().inputs(["src"])`; requires `node` and target project `typescript`; recognizes
+  controllers, decorators, DTO classes, enums, and unions; ignores swagger/zod/class-validator metadata.
+
+## Supported Targets
+
+- OpenAPI 3.1 YAML: `OpenApi31::new().to("openapi.yaml")`.
+- Go SDK: `GoSdk::new().module("example.com/yourservice/sdk").to("sdk")`.
+- Python SDK: `PySdk::new().module("example.com/yourservice/sdk").to("sdk")`.
+- TypeScript SDK: `TsSdk::new().module("example.com/yourservice/sdk").to("sdk")`.
+
+SDK outputs include `README.md` and `reference.md` with operation/schema summaries for later agents.
+
+## Commands
+
+- `gnr8 guide`: prints agent usage guidance.
+- `gnr8 capabilities --json`: prints supported sources, targets, snippets, toolchains, and workflow.
+- `gnr8 init`: scaffolds `.gnr8`.
+- `gnr8 generate`: writes outputs and updates ownership manifest.
+- `gnr8 check`: exits 1 if outputs are stale or user-edited.
+- `gnr8 doctor`: reports initialization, source toolchain, pipeline health, diagnostics, and drift.
+- `gnr8 inspect routes|schemas|graph`: inspect source facts directly.
+
+## Recovery Rules
+
+- Missing `.gnr8`: run `gnr8 init --source ... --sdk ...`.
+- Pipeline compile error: edit `.gnr8/src/main.rs`.
+- Missing toolchain: install `go`, `python3`, or `node` plus `typescript`.
+- User-edited generated file: inspect the edit; use `gnr8 generate --force` only when overwriting is
+  intended.
+- Stale output: run `gnr8 generate`, then commit generated artifacts.
+
+For more detail, read `docs/AGENT-USAGE.md` and `docs/USAGE.md`.

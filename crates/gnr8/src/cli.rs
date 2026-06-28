@@ -1,20 +1,20 @@
-//! The gnr8 command-line surface (RUST-02 / D-10..D-12), defined with the clap derive API.
+//! The gnr8 command-line surface, defined with the clap derive API.
 //!
-//! Six top-level commands plus a nested `inspect` subcommand, with a global `--json` flag and a
-//! repeatable `-v/--verbose` count. Execution lives in the binary modules; core library failures stay
-//! typed as `gnr8::CoreError` until the final CLI reporting boundary.
+//! Commands either scaffold/teach (`init`, `guide`), run the project-local `.gnr8` pipeline
+//! (`generate`, `check`, `watch`, `doctor`), or inspect source facts directly (`inspect`). The global
+//! `--json` flag gives agents machine-readable output where useful.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 // `doc_markdown` flags "OpenAPI" (a proper noun, not a code item); backticks would leak into clap
 // help text, so allow it locally on the doc comments that double as user-facing help (skill ch.2.4).
-/// Code-first OpenAPI + Go SDK generator.
+/// Code-first API extraction to OpenAPI 3.1 and generated client SDKs.
 #[allow(clippy::doc_markdown)]
 #[derive(Debug, Parser)]
 #[command(
     name = "gnr8",
     version,
-    about = "Code-first OpenAPI + Go SDK generator"
+    about = "Code-first API extraction to OpenAPI 3.1 and generated client SDKs"
 )]
 pub(crate) struct Cli {
     /// Emit machine-readable JSON instead of human-readable output.
@@ -33,9 +33,23 @@ pub(crate) struct Cli {
 /// Top-level gnr8 commands (D-11).
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
-    /// Scaffold a project-local .gnr8/ workspace.
-    Init,
-    /// Generate OpenAPI + Go SDK from Go source.
+    /// Scaffold a project-local .gnr8/ generation workspace.
+    Init {
+        /// Source frontend to scaffold in .gnr8/src/main.rs.
+        #[arg(long, value_enum)]
+        source: Option<SourcePreset>,
+
+        /// SDK target to scaffold in .gnr8/src/main.rs.
+        #[arg(long, value_enum)]
+        sdk: Option<SdkPreset>,
+    },
+    /// Print an agent-oriented usage guide.
+    Guide {
+        /// Optional scenario guide to print.
+        #[arg(value_enum)]
+        topic: Option<GuideTopic>,
+    },
+    /// Generate OpenAPI and configured SDK artifacts.
     #[allow(clippy::doc_markdown)] // "OpenAPI" is a proper noun; keep clap help text clean.
     Generate {
         /// Overwrite generated files a user has hand-edited (D-04 / A4 override verb).
@@ -59,6 +73,41 @@ pub(crate) enum Commands {
     },
     /// Summarize unsupported patterns and lifecycle issues.
     Doctor,
+}
+
+/// Source frontend presets for `gnr8 init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SourcePreset {
+    /// Go + Gin source extraction.
+    GoGin,
+    /// Python `FastAPI` source extraction.
+    Fastapi,
+    /// Python Flask typed-envelope source extraction.
+    Flask,
+    /// TypeScript `NestJS` class-DTO source extraction.
+    Nestjs,
+}
+
+/// SDK target presets for `gnr8 init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SdkPreset {
+    /// Generate a dependency-free Go SDK.
+    Go,
+    /// Generate a Python SDK.
+    Python,
+    /// Generate a dependency-free TypeScript SDK.
+    Typescript,
+}
+
+/// Scenario guides available through `gnr8 guide <topic>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum GuideTopic {
+    /// Complex Go/Gin backend to Python and TypeScript SDKs.
+    GoGinToPythonTypescript,
+    /// `FastAPI` or Flask backend to a Python SDK.
+    PythonApisToPythonSdk,
+    /// `NestJS` backend to a TypeScript SDK.
+    NestjsToTypescriptSdk,
 }
 
 /// The default analysis target when `inspect` is run without an explicit path: the goalservice Gin
@@ -98,14 +147,26 @@ mod tests {
     // the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{Cli, Commands, InspectAction};
+    use super::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
     use clap::Parser;
 
     #[test]
     fn cli_parses_all_top_level_commands() {
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "init"]).unwrap().command,
-            Commands::Init
+            Commands::Init {
+                source: None,
+                sdk: None
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "init", "--source", "fastapi", "--sdk", "python"])
+                .unwrap()
+                .command,
+            Commands::Init {
+                source: Some(SourcePreset::Fastapi),
+                sdk: Some(SdkPreset::Python)
+            }
         ));
         // `generate` defaults `--force` to false.
         assert!(matches!(
@@ -138,6 +199,18 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
             Commands::Doctor
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "guide"]).unwrap().command,
+            Commands::Guide { topic: None }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "guide", "go-gin-to-python-typescript"])
+                .unwrap()
+                .command,
+            Commands::Guide {
+                topic: Some(GuideTopic::GoGinToPythonTypescript)
+            }
         ));
     }
 

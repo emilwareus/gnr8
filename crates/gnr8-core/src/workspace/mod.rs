@@ -4,7 +4,7 @@
 //! `gnr8 init` creates a project-local `.gnr8/` directory holding a small Rust **binary crate** that
 //! depends on the public `gnr8` crate and drives the generation lifecycle. THIS CRATE IS THE CONFIG — there is no
 //! TOML (`docs/code-as-config.md`). gnr8 does not run without it: every other command requires it and
-//! errors with "run `gnr8 init`" when it is absent. `init` writes three files (each only if absent):
+//! errors with "run `gnr8 init`" when it is absent. `init` writes four files (each only if absent):
 //!
 //! - `.gnr8/Cargo.toml` — a standalone-workspace crate (`name = "<dir>-gnr8-gen"`, edition 2021,
 //!   `publish = false`, an empty `[workspace]` table so it builds independently via `--manifest-path`,
@@ -12,6 +12,7 @@
 //! - `.gnr8/src/main.rs` — the default pipeline, in code; the user edits this to adapt parsing +
 //!   generation.
 //! - `.gnr8/.gitignore` — ignores the git-ignored lifecycle subtree (`target/`, `cache/`).
+//! - `.gnr8/README.md` — project-local instructions for agents and humans editing the pipeline.
 //!
 //! The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at the paths the pipeline's targets
 //! declare (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
@@ -65,6 +66,76 @@ pub struct InitOutcome {
     pub skipped: Vec<String>,
 }
 
+/// Source frontend preset for the scaffolded `.gnr8/src/main.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePreset {
+    /// Go + Gin source extraction.
+    GoGin,
+    /// Python FastAPI source extraction.
+    FastApi,
+    /// Python Flask typed-envelope source extraction.
+    Flask,
+    /// TypeScript NestJS class-DTO source extraction.
+    NestJs,
+}
+
+impl SourcePreset {
+    fn stage(self) -> &'static str {
+        match self {
+            Self::GoGin => "GoGin::new().inputs([\".\"])",
+            Self::FastApi => "FastApi::new().inputs([\".\"])",
+            Self::Flask => "Flask::new().inputs([\".\"])",
+            Self::NestJs => "NestJs::new().inputs([\"src\"])",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::GoGin => "Go + Gin",
+            Self::FastApi => "Python FastAPI",
+            Self::Flask => "Python Flask typed-envelope",
+            Self::NestJs => "TypeScript NestJS class DTOs",
+        }
+    }
+
+    fn toolchain(self) -> &'static str {
+        match self {
+            Self::GoGin => "go",
+            Self::FastApi | Self::Flask => "python3",
+            Self::NestJs => "node plus the target project's own typescript package",
+        }
+    }
+}
+
+/// SDK target preset for the scaffolded `.gnr8/src/main.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkPreset {
+    /// Dependency-free Go SDK.
+    Go,
+    /// Python SDK.
+    Python,
+    /// Dependency-free TypeScript SDK.
+    TypeScript,
+}
+
+impl SdkPreset {
+    fn stage(self) -> &'static str {
+        match self {
+            Self::Go => "GoSdk::new().module(\"example.com/yourservice/sdk\").to(\"sdk\")",
+            Self::Python => "PySdk::new().module(\"example.com/yourservice/sdk\").to(\"sdk\")",
+            Self::TypeScript => "TsSdk::new().module(\"example.com/yourservice/sdk\").to(\"sdk\")",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Go => "Go",
+            Self::Python => "Python",
+            Self::TypeScript => "TypeScript",
+        }
+    }
+}
+
 /// Scaffold the mandatory `.gnr8/` code-as-config crate idempotently under `root`.
 ///
 /// Creates `.gnr8/src/` (mkdir -p is idempotent), then writes `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`,
@@ -80,6 +151,21 @@ pub struct InitOutcome {
 /// Returns [`CoreError::Workspace`] if `.gnr8/src/` cannot be created or a workspace file cannot be
 /// written for any reason other than already existing. No production panic (RUST-04).
 pub fn init(root: &Path) -> Result<InitOutcome, CoreError> {
+    init_with_presets(root, SourcePreset::GoGin, SdkPreset::Go)
+}
+
+/// Scaffold the mandatory `.gnr8/` code-as-config crate with explicit source and SDK presets.
+///
+/// Existing files are still preserved byte-for-byte. Presets only affect files that do not exist yet.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Workspace`] on filesystem failures.
+pub fn init_with_presets(
+    root: &Path,
+    source: SourcePreset,
+    sdk: SdkPreset,
+) -> Result<InitOutcome, CoreError> {
     let gnr8 = root.join(".gnr8");
     let src = gnr8.join("src");
     std::fs::create_dir_all(&src).map_err(|e| CoreError::Workspace {
@@ -89,11 +175,14 @@ pub fn init(root: &Path) -> Result<InitOutcome, CoreError> {
     let crate_name = crate_name_for(root);
     let core_dep = core_dependency_line(root);
     let cargo_toml = cargo_toml_body(&crate_name, &core_dep);
+    let main_rs = main_rs_body(source, sdk);
+    let readme = readme_body(source, sdk);
 
     let mut outcome = InitOutcome::default();
     write_if_absent(root, &gnr8.join("Cargo.toml"), &cargo_toml, &mut outcome)?;
-    write_if_absent(root, &src.join("main.rs"), MAIN_RS_BODY, &mut outcome)?;
+    write_if_absent(root, &src.join("main.rs"), &main_rs, &mut outcome)?;
     write_if_absent(root, &gnr8.join(".gitignore"), GITIGNORE_BODY, &mut outcome)?;
+    write_if_absent(root, &gnr8.join("README.md"), &readme, &mut outcome)?;
     Ok(outcome)
 }
 
@@ -103,7 +192,9 @@ pub fn init(root: &Path) -> Result<InitOutcome, CoreError> {
 /// (one Go+Gin source, a root base path, an `API` title, an OpenAPI 3.1 target, a Go SDK target, and
 /// the generated-header post-process) and hands it to [`crate::runner::run`]. The user edits it to
 /// adapt parsing + generation; `gnr8 generate` compiles and runs it.
-pub const MAIN_RS_BODY: &str = r#"//! This file IS your gnr8 configuration — edit it to adapt parsing + generation.
+fn main_rs_body(source: SourcePreset, sdk: SdkPreset) -> String {
+    format!(
+        r#"//! This file IS your gnr8 configuration — edit it to adapt parsing + generation.
 //! `gnr8 generate` compiles and runs it.
 //!
 //! It is an ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 runner. The
@@ -114,20 +205,59 @@ pub const MAIN_RS_BODY: &str = r#"//! This file IS your gnr8 configuration — e
 
 use gnr8::sdk::prelude::*;
 
-fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {{
     gnr8::runner::run(
         Pipeline::new()
-            .source(GoGin::new().inputs(["."]))
+            .source({source_stage})
             .transform(SetBasePath::new("/"))
             .transform(SetTitle::new("API"))
             // .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
             // .transform(RenameOperation::new("listGoals", "List"))
             .target(OpenApi31::new().to("openapi.yaml"))
-            .target(GoSdk::new().module("example.com/yourservice/sdk").to("sdk"))
+            .target({sdk_stage})
             .post(Header::generated()),
     )
+}}
+"#,
+        source_stage = source.stage(),
+        sdk_stage = sdk.stage()
+    )
 }
-"#;
+
+fn readme_body(source: SourcePreset, sdk: SdkPreset) -> String {
+    format!(
+        "# gnr8 generation workspace\n\n\
+         This directory is the project-local gnr8 configuration. Agents and humans should edit \
+         `src/main.rs`, then run `gnr8 generate` from the project root.\n\n\
+         ## Current preset\n\n\
+         - Source: {source}\n\
+         - SDK target: {sdk}\n\
+         - Required source toolchain: {toolchain}\n\n\
+         ## Commands\n\n\
+         ```bash\n\
+         gnr8 generate      # compile and run .gnr8/src/main.rs, then write outputs\n\
+         gnr8 check         # fail if generated outputs are stale or user-edited\n\
+         gnr8 doctor        # summarize toolchain, pipeline, diagnostics, and drift\n\
+         gnr8 guide         # print the full usage guide\n\
+         gnr8 capabilities --json\n\
+         ```\n\n\
+         ## Editing `src/main.rs`\n\n\
+         The `Pipeline` is the configuration. Change the `Source` to select the service frontend, \
+         transforms to set metadata such as title/base path/security, and targets to choose generated \
+         artifacts.\n\n\
+         Common edits:\n\n\
+         ```rust\n\
+         .transform(SetBasePath::new(\"/api\"))\n\
+         .transform(SetTitle::new(\"Public API\"))\n\
+         .transform(ApplySecurity::api_key(\"ApiKeyAuth\", \"X-API-Key\"))\n\
+         .target(OpenApi31::new().to(\"generated/openapi.yaml\"))\n\
+         ```\n\n\
+         Generated SDKs include their own README/reference files under the SDK output directory.\n",
+        source = source.label(),
+        sdk = sdk.label(),
+        toolchain = source.toolchain()
+    )
+}
 
 /// Build the `.gnr8/Cargo.toml` body for `crate_name` with the given `gnr8` `dependency` line.
 ///
