@@ -6,7 +6,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test red check all examples-check
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test red check all examples-check install
 
 # Auto-format the workspace in place.
 fmt:
@@ -15,6 +15,12 @@ fmt:
 # Verify formatting without modifying files (CI-equivalent).
 fmt-check:
 	cargo fmt --all -- --check
+
+# Install the gnr8 CLI from this checkout into Cargo's bin directory.
+install:
+	cargo install --path crates/gnr8 --locked --force
+	@echo "installed: $$(command -v gnr8 || echo "$${CARGO_HOME:-$$HOME/.cargo}/bin/gnr8")"
+	@echo "try: gnr8 --help"
 
 # Lint with warnings denied; --locked requires a committed, up-to-date Cargo.lock (Pitfall 4).
 clippy:
