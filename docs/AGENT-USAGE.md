@@ -26,18 +26,6 @@ Supported targets:
 | Python SDK | `--sdk python` | `PySdk::new().module("example.com/yourservice/sdk").to("sdk")` |
 | TypeScript SDK | `--sdk typescript` | `TsSdk::new().module("example.com/yourservice/sdk").to("sdk")` |
 
-## Install
-
-Install the CLI from GitHub release assets:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
-```
-
-The crates.io package named `gnr8` is the Rust API used by `.gnr8/Cargo.toml`. It is not currently the
-primary CLI install path. After `gnr8 init`, the generated `.gnr8/Cargo.toml` will depend on either an
-installed local resource copy or `gnr8 = "0.1"`.
-
 ## Standard Workflow
 
 Run these commands from the root of the service repository:
