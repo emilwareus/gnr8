@@ -12,7 +12,11 @@ rust-version = "1.85"   # MSRV floor: clap 4.6 requires 1.85
 license = "MIT"         # matches repo LICENSE
 readme = "README.md"
 repository = "https://github.com/emilwareus/gnr8"
+homepage = "https://github.com/emilwareus/gnr8"
+documentation = "https://docs.rs/gnr8"
 description = "Code-first API extraction to OpenAPI 3.1 and generated client SDKs"
+keywords = ["openapi", "sdk", "codegen", "agents", "api"]
+categories = ["development-tools"]
 
 # Shared lint policy (rust-best-practices skill ch.2 + D-08).
 # `priority` resolves conflicts: a lower priority is overridden by a higher one;

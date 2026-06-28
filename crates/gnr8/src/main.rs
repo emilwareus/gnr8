@@ -15,7 +15,7 @@ mod watch;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands, InspectAction};
+use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -27,7 +27,8 @@ fn main() -> Result<()> {
     // or delegate to the user's `.gnr8/` child crate and own writing/policy.
     match &cli.command {
         Commands::Inspect { action } => run_inspect(action, output),
-        Commands::Init => run_init(output),
+        Commands::Init { source, sdk } => run_init(*source, *sdk, output),
+        Commands::Guide { topic } => run_guide(*topic, output),
         Commands::Generate { force } => run_generate(*force, output),
         Commands::Check => run_check(output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
@@ -81,19 +82,25 @@ fn project_root() -> Result<std::path::PathBuf, gnr8::CoreError> {
 /// Scaffold the mandatory `.gnr8/` generation crate in the working directory (idempotent) and summarize
 /// the outcome. Re-running over an existing crate preserves the user's `src/main.rs` and reports
 /// "nothing to do" (D-01). `--json` emits the created/skipped lists.
-fn run_init(output: Output) -> Result<()> {
+fn run_init(source: Option<SourcePreset>, sdk: Option<SdkPreset>, output: Output) -> Result<()> {
     let root = project_root()?;
-    let outcome = gnr8::workspace::init(&root)?;
+    let source = source.unwrap_or(SourcePreset::GoGin);
+    let sdk = sdk.unwrap_or_else(|| default_sdk_for_source(source));
+    let outcome = gnr8::workspace::init_with_presets(&root, map_source(source), map_sdk(sdk))?;
 
     if output.json {
         #[derive(serde::Serialize)]
         struct InitReport {
             created: Vec<String>,
             skipped: Vec<String>,
+            source: &'static str,
+            sdk: &'static str,
         }
         let report = InitReport {
             created: outcome.created.clone(),
             skipped: outcome.skipped.clone(),
+            source: source_name(source),
+            sdk: sdk_name(sdk),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -120,8 +127,144 @@ fn run_init(output: Output) -> Result<()> {
         output.progress(
             "edit .gnr8/src/main.rs to adapt parsing + generation, then run `gnr8 generate`.",
         );
+        output.progress("see .gnr8/README.md for project-local gnr8 guidance.");
     }
     Ok(())
+}
+
+fn default_sdk_for_source(source: SourcePreset) -> SdkPreset {
+    match source {
+        SourcePreset::GoGin => SdkPreset::Go,
+        SourcePreset::Fastapi | SourcePreset::Flask => SdkPreset::Python,
+        SourcePreset::Nestjs => SdkPreset::Typescript,
+    }
+}
+
+fn map_source(source: SourcePreset) -> gnr8::workspace::SourcePreset {
+    match source {
+        SourcePreset::GoGin => gnr8::workspace::SourcePreset::GoGin,
+        SourcePreset::Fastapi => gnr8::workspace::SourcePreset::FastApi,
+        SourcePreset::Flask => gnr8::workspace::SourcePreset::Flask,
+        SourcePreset::Nestjs => gnr8::workspace::SourcePreset::NestJs,
+    }
+}
+
+fn map_sdk(sdk: SdkPreset) -> gnr8::workspace::SdkPreset {
+    match sdk {
+        SdkPreset::Go => gnr8::workspace::SdkPreset::Go,
+        SdkPreset::Python => gnr8::workspace::SdkPreset::Python,
+        SdkPreset::Typescript => gnr8::workspace::SdkPreset::TypeScript,
+    }
+}
+
+fn source_name(source: SourcePreset) -> &'static str {
+    match source {
+        SourcePreset::GoGin => "go-gin",
+        SourcePreset::Fastapi => "fastapi",
+        SourcePreset::Flask => "flask",
+        SourcePreset::Nestjs => "nestjs",
+    }
+}
+
+fn sdk_name(sdk: SdkPreset) -> &'static str {
+    match sdk {
+        SdkPreset::Go => "go",
+        SdkPreset::Python => "python",
+        SdkPreset::Typescript => "typescript",
+    }
+}
+
+const BASIC_GUIDE: &str = include_str!("../../../docs/AGENT-USAGE.md");
+const GO_GIN_PY_TS_GUIDE: &str =
+    include_str!("../../../docs/guides/go-gin-to-python-typescript.md");
+const PYTHON_API_PY_SDK_GUIDE: &str =
+    include_str!("../../../docs/guides/python-apis-to-python-sdk.md");
+const NESTJS_TS_GUIDE: &str = include_str!("../../../docs/guides/nestjs-to-typescript-sdk.md");
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct GuideSummary {
+    id: &'static str,
+    title: &'static str,
+    summary: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct Guide {
+    id: &'static str,
+    title: &'static str,
+    summary: &'static str,
+    markdown: &'static str,
+}
+
+fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
+    let guide = guide_for(topic);
+    if output.json {
+        #[derive(serde::Serialize)]
+        struct GuideReport {
+            id: &'static str,
+            title: &'static str,
+            summary: &'static str,
+            markdown: &'static str,
+            available: Vec<GuideSummary>,
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&GuideReport {
+                id: guide.id,
+                title: guide.title,
+                summary: guide.summary,
+                markdown: guide.markdown,
+                available: guide_summaries(),
+            })?
+        );
+    } else {
+        print!("{}", guide.markdown);
+    }
+    Ok(())
+}
+
+fn guide_for(topic: Option<GuideTopic>) -> Guide {
+    match topic {
+        None => Guide {
+            id: "basic",
+            title: "Basic gnr8 Agent Guide",
+            summary: "Default workflow, supported source/SDK presets, common edits, recovery, and CI.",
+            markdown: BASIC_GUIDE,
+        },
+        Some(GuideTopic::GoGinToPythonTypescript) => Guide {
+            id: "go-gin-to-python-typescript",
+            title: "Go/Gin Backend to Python and TypeScript SDKs",
+            summary: "Complex Go/Gin setup with OpenAPI plus two SDK targets and compatibility transforms.",
+            markdown: GO_GIN_PY_TS_GUIDE,
+        },
+        Some(GuideTopic::PythonApisToPythonSdk) => Guide {
+            id: "python-apis-to-python-sdk",
+            title: "FastAPI or Flask Backend to Python SDK",
+            summary: "Python API source extraction with typed models, diagnostics, and Python SDK output.",
+            markdown: PYTHON_API_PY_SDK_GUIDE,
+        },
+        Some(GuideTopic::NestjsToTypescriptSdk) => Guide {
+            id: "nestjs-to-typescript-sdk",
+            title: "NestJS Backend to TypeScript SDK",
+            summary: "NestJS controller and DTO extraction using the project TypeScript toolchain.",
+            markdown: NESTJS_TS_GUIDE,
+        },
+    }
+}
+
+fn guide_summaries() -> Vec<GuideSummary> {
+    vec![
+        guide_for(Some(GuideTopic::GoGinToPythonTypescript)),
+        guide_for(Some(GuideTopic::PythonApisToPythonSdk)),
+        guide_for(Some(GuideTopic::NestjsToTypescriptSdk)),
+    ]
+    .into_iter()
+    .map(|guide| GuideSummary {
+        id: guide.id,
+        title: guide.title,
+        summary: guide.summary,
+    })
+    .collect()
 }
 
 /// A serializable generate/check report: the per-bucket counts + paths. The human render summarizes the

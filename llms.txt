@@ -1,0 +1,39 @@
+# gnr8
+
+> gnr8 is a code-first API extraction tool for agents and developers. It generates OpenAPI 3.1 and
+> typed Go/Python/TypeScript SDKs from Go Gin, FastAPI, Flask typed-envelope, and NestJS class DTO
+> source code. Configuration lives in `.gnr8/src/main.rs`.
+
+Start here when using gnr8 from an AI coding agent:
+
+- [Agent Usage Guide](docs/AGENT-USAGE.md): initialize, configure `.gnr8`, generate, check, recover
+  from errors, consume generated SDKs, and choose scenario guides.
+- [Go/Gin to Python and TypeScript SDKs](docs/guides/go-gin-to-python-typescript.md): complex Go
+  backend to OpenAPI plus two SDK targets.
+- [Python APIs to Python SDK](docs/guides/python-apis-to-python-sdk.md): FastAPI or Flask typed
+  backend to OpenAPI plus a Python SDK.
+- [NestJS to TypeScript SDK](docs/guides/nestjs-to-typescript-sdk.md): NestJS class DTO backend to
+  OpenAPI plus a TypeScript SDK.
+- [Full Usage Reference](docs/USAGE.md): dense command, pipeline, source-envelope, type-mapping, and
+  diagnostics reference.
+- [README](README.md): product overview and quick example.
+- [Release and Install](docs/RELEASE.md): GitHub release archive layout and install script.
+- [Bookstore Go Example](examples/bookstore/README.md): Go/Gin source to OpenAPI and Go SDK.
+- [FastAPI Example](examples/fastapi-bookstore/README.md): FastAPI source to OpenAPI and Python SDK.
+- [Flask Example](examples/flask-bookstore/README.md): Flask typed-envelope source to OpenAPI and
+  Python SDK.
+- [NestJS Example](examples/nestjs-bookstore/README.md): NestJS source to OpenAPI and TypeScript SDK.
+- [Taskflow Example](examples/taskflow/README.md): custom Rust transform and custom target.
+
+Runtime guide entry points:
+
+```bash
+gnr8 guide
+gnr8 guide go-gin-to-python-typescript
+gnr8 guide python-apis-to-python-sdk
+gnr8 guide nestjs-to-typescript-sdk
+```
+
+Full context file:
+
+- [llms-full.txt](llms-full.txt): compact combined documentation for larger context windows.

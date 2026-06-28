@@ -1,9 +1,40 @@
-//! gnr8-core — extraction, graph construction, `OpenAPI` lowering, SDK generation, lifecycle planning,
-//! and diagnostics for the `gnr8` CLI.
+//! gnr8 — the generation API used by project-local `.gnr8/` crates.
 //!
-//! The crate is the typed library boundary: production paths return [`CoreError`], generated artifacts
-//! are deterministic, and language-specific extractors feed one neutral API graph that every target
-//! lowers from.
+//! The installed `gnr8` CLI scaffolds a small Rust binary crate at `.gnr8/`. That crate depends on
+//! this package, imports [`sdk::prelude`], builds a [`sdk::Pipeline`], and hands it to
+//! [`runner::run`]. The CLI then compiles and runs the local crate, receives the artifact bundle, and
+//! owns writing generated files.
+//!
+//! A typical `.gnr8/src/main.rs`:
+//!
+//! ```no_run
+//! use gnr8::sdk::prelude::*;
+//!
+//! fn main() -> std::process::ExitCode {
+//!     gnr8::runner::run(
+//!         Pipeline::new()
+//!             .source(FastApi::new().inputs(["."]))
+//!             .transform(SetBasePath::new("/api"))
+//!             .transform(SetTitle::new("Public API"))
+//!             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
+//!             .target(OpenApi31::new().to("generated/openapi.yaml"))
+//!             .target(PySdk::new().module("example.com/public/sdk").to("generated/sdk"))
+//!             .post(Header::generated()),
+//!     )
+//! }
+//! ```
+//!
+//! Supported source stages include [`sdk::builtins::GoGin`], [`sdk::builtins::FastApi`],
+//! [`sdk::builtins::Flask`], and [`sdk::builtins::NestJs`]. Supported generation targets include
+//! [`sdk::builtins::OpenApi31`], [`sdk::builtins::GoSdk`], [`sdk::builtins::PySdk`], and
+//! [`sdk::builtins::TsSdk`].
+//!
+//! For agent-facing CLI workflows, run `gnr8 guide` or read
+//! <https://github.com/emilwareus/gnr8/blob/main/docs/AGENT-USAGE.md>.
+
+// Existing module docs intentionally link some private implementation seams. Keep docs.rs builds
+// warning-free while the public crate root and SDK prelude remain the stable entry points.
+#![allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 
 pub mod error;
 pub use error::CoreError;

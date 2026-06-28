@@ -29,10 +29,21 @@ matters is the one the analyzed project is written in: a Go service needs `go`, 
 needs `python3`, a NestJS service needs `node` + the project's own `typescript` (see CLAUDE.md
 "TypeScript toolchain (required, not shipped)").
 
+## Install
+
+The CLI install path is the GitHub release archive:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+```
+
+The crates.io package named `gnr8` is the Rust API used by generated `.gnr8/Cargo.toml` files. The
+generated project-local crate depends on `gnr8 = "0.1"` when no release-archive resource copy is found.
+
 ## Canonical workflow
 ```
 cd <your-go-service>      # the dir whose .gnr8/ crate drives generation; inputs resolve from here
-gnr8 init                 # scaffold the .gnr8/ Rust crate (Cargo.toml + src/main.rs + .gitignore)
+gnr8 init --source go-gin --sdk go
 # edit .gnr8/src/main.rs: the Pipeline IS the config — source, transforms, targets, post-process
 gnr8 generate             # compile + run .gnr8/, write OpenAPI + Go SDK; track ownership; skip unchanged
 gnr8 check                # CI gate: exit 1 if any output is stale/drifted, else 0
@@ -47,7 +58,8 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 
 | Command | Args/flags | Reads | Writes | Exit |
 |---|---|---|---|---|
-| `gnr8 init` | — | — | `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`, `.gnr8/.gitignore` (skips existing — idempotent) | 0; 1 on error |
+| `gnr8 guide` | `[go-gin-to-python-typescript\|python-apis-to-python-sdk\|nestjs-to-typescript-sdk]` | bundled docs | — (prints basic or scenario-specific agent guide) | 0 |
+| `gnr8 init` | `--source go-gin\|fastapi\|flask\|nestjs`, `--sdk go\|python\|typescript` | — | `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`, `.gnr8/README.md`, `.gnr8/.gitignore` (skips existing — idempotent) | 0; 1 on error |
 | `gnr8 generate` | `--force` | `.gnr8/` crate, the source dirs its `Source` reads | the paths the pipeline's targets declare, `.gnr8/cache/manifest.json` | 0; 1 on error |
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |

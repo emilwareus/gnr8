@@ -41,7 +41,7 @@ wait_for_crate_version() {
     sleep 10
   done
 
-  echo "error: ${name} ${version} was not visible in Cargo registry metadata after publishing" >&2
+  echo "warning: ${name} ${version} was published, but was not visible in Cargo registry metadata yet" >&2
   return 1
 }
 
@@ -57,7 +57,9 @@ publish_crate() {
 
   echo "Publishing ${name}..."
   cargo publish -p "$name" --locked
-  wait_for_crate_version "$name" "$version"
+  if ! wait_for_crate_version "$name" "$version"; then
+    echo "warning: crates.io registry metadata can lag behind successful uploads; continuing" >&2
+  fi
 }
 
 if [[ "${DRY_RUN:-}" == "1" || "${DRY_RUN:-}" == "true" ]]; then
