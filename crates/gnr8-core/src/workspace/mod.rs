@@ -238,9 +238,11 @@ fn readme_body(source: SourcePreset, sdk: SdkPreset) -> String {
          gnr8 generate      # compile and run .gnr8/src/main.rs, then write outputs\n\
          gnr8 check         # fail if generated outputs are stale or user-edited\n\
          gnr8 doctor        # summarize toolchain, pipeline, diagnostics, and drift\n\
-         gnr8 guide         # print the full usage guide\n\
-         gnr8 capabilities --json\n\
+         gnr8 guide         # print the basic agent guide and available scenario guides\n\
+         gnr8 guide <topic> # print a concrete scenario guide\n\
          ```\n\n\
+         Scenario topics: `go-gin-to-python-typescript`, `python-apis-to-python-sdk`, \
+         `nestjs-to-typescript-sdk`.\n\n\
          ## Editing `src/main.rs`\n\n\
          The `Pipeline` is the configuration. Change the `Source` to select the service frontend, \
          transforms to set metadata such as title/base path/security, and targets to choose generated \

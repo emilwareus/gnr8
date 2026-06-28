@@ -75,8 +75,10 @@ SDK outputs include `README.md` and `reference.md` with operation/schema summari
 
 ## Commands
 
-- `gnr8 guide`: prints agent usage guidance.
-- `gnr8 capabilities --json`: prints supported sources, targets, snippets, toolchains, and workflow.
+- `gnr8 guide`: prints basic agent usage guidance and lists scenario guides.
+- `gnr8 guide go-gin-to-python-typescript`: complex Go/Gin backend to Python and TypeScript SDKs.
+- `gnr8 guide python-apis-to-python-sdk`: FastAPI or Flask backend to a Python SDK.
+- `gnr8 guide nestjs-to-typescript-sdk`: NestJS backend to a TypeScript SDK.
 - `gnr8 init`: scaffolds `.gnr8`.
 - `gnr8 generate`: writes outputs and updates ownership manifest.
 - `gnr8 check`: exits 1 if outputs are stale or user-edited.

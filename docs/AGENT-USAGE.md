@@ -38,7 +38,15 @@ gnr8 doctor
 gnr8 check
 ```
 
-Use `gnr8 capabilities --json` when you need machine-readable source/target snippets.
+## Scenario Guides
+
+Run `gnr8 guide <topic>` for concrete examples beyond this basic workflow:
+
+| Topic | Use When |
+|--|--|
+| `go-gin-to-python-typescript` | Complex Go/Gin backend that should publish OpenAPI plus Python and TypeScript SDKs. |
+| `python-apis-to-python-sdk` | FastAPI or Flask service that should publish a Python SDK. |
+| `nestjs-to-typescript-sdk` | NestJS service with class DTOs that should publish a TypeScript SDK. |
 
 ## Editing `.gnr8/src/main.rs`
 
