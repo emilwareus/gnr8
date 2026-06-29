@@ -162,7 +162,7 @@ func extractFields(
 			diags:        diags,
 		}
 		schema := mapType(f.Type(), ctx)
-		required := bindingHasRequired(tag.Get("binding"))
+		required := bindingHasRequired(tag.Get("binding")) || validateHasRequired(tag.Get("validate"))
 		// The two independent axes: optional = the key may be absent (a pointer or
 		// `,omitempty`); nullable = the value may be explicitly null (a pointer can
 		// hold nil). A non-pointer `,omitempty` field is optional-but-not-nullable.
@@ -185,7 +185,15 @@ func extractFields(
 }
 
 func bindingHasRequired(binding string) bool {
-	for _, token := range strings.Split(binding, ",") {
+	return tagHasRequired(binding)
+}
+
+func validateHasRequired(validate string) bool {
+	return tagHasRequired(validate)
+}
+
+func tagHasRequired(value string) bool {
+	for _, token := range strings.Split(value, ",") {
 		if strings.TrimSpace(token) == "required" {
 			return true
 		}

@@ -214,12 +214,24 @@ the built-in `fetch`. PySdk emits Pydantic v2 `BaseModel` models by default, wit
 **project's own `typescript`** toolchain (required, not shipped — see CLAUDE.md); every other sidecar is
 stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small Rust dependency set.
 
-TypeScript migration compatibility is explicit. `TsSdk::new().profile(SdkProfile::openapi_generator_compat())`
-emits an Axios-style TypeScript SDK with runtime enum objects, request aliases, loose model interface
-properties, explicit `T | null` nullability, and `Promise<AxiosResponse<T>>` operation returns. Override
-the pieces independently with `.model_property_policy(TsModelPropertyPolicy::Strict)`,
+TypeScript migration compatibility is explicit. `TsSdk::new().compatibility(TsCompatibility::OpenApiGenerator)`
+is a concise alias for `TsSdk::new().profile(SdkProfile::openapi_generator_compat())`. It emits an
+Axios-style TypeScript SDK with runtime enum objects, request aliases, model `?` markers derived from
+schema `required`, explicit `T | null` nullability, and `Promise<AxiosResponse<T>>` operation returns.
+Override the pieces independently with `.model_property_policy(TsModelPropertyPolicy::Strict)`,
+`.model_property_policy(TsModelPropertyPolicy::OpenApiGeneratorLoose)`,
 `.nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)`, or
 `.response_policy(TsResponsePolicy::DataOnly)`.
+
+Graph-level field requiredness overrides are available for source quirks and legacy migration patches:
+
+```rust
+ApiOverrides::new()
+    .force_optional("User", "settings")
+    .force_required("Event", "id")
+```
+
+These overrides mutate the graph before OpenAPI or SDK targets render, so all generated surfaces agree.
 
 ## Recognized Go/Gin patterns (code-first)
 Resolution is via `go/types` (alias/import-robust), not string matching.
@@ -232,8 +244,8 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | request body | `c.ShouldBindJSON(&x)` where `x: T` | T → request schema. |
 | response | `c.JSON(http.StatusXxx, v)` where `v: T` | status→T. Unresolved/dynamic → diagnostic. |
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
-| required field | struct tag `binding:"required"` | → schema `required`. |
-| optional field | pointer `*T` and/or `json:",omitempty"` | not in `required`. |
+| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. |
+| source-optional field | pointer `*T` and/or `json:",omitempty"` | source optionality signal; schema `required` still comes from required tags. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
 
@@ -246,7 +258,8 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | `float64` | `number` | **`float32`** | ⚠ narrows precision → diagnostic emitted |
 | `time.Time` | `string`/`date-time` | `time.Time` | |
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
-| `*T` or `,omitempty` | optional (not required) | **value `T` + `,omitempty`** (pointer dropped) | can't distinguish null vs zero |
+| `*T` | nullable, source-optional | **value `T` + `,omitempty`** (pointer dropped) | schema `required` is still tag-driven. |
+| `,omitempty` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability. |
 | `[]T` | `array` | `[]T` | |
 | `map[string]T` | `object`,`additionalProperties:true` | `map[string]T` | free-form → diagnostic |
 | named-string+consts | string `enum` | typed newtype | |
@@ -282,7 +295,8 @@ inspect graph <dir>` lists them.
 - **One route group only.** Multiple groups (distinct base paths) → `duplicate <METHOD> operation on a
   single path` (lowering). This is the headline gap.
 - `float64` → SDK `float32` (precision narrowing).
-- Optional pointer fields → value type + `,omitempty` (pointer-ness lost).
+- Optional pointer fields → value type + `,omitempty` in the Go SDK (pointer-ness lost there), while
+  the graph still carries nullability for OpenAPI and TypeScript targets.
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - Gin-only, Go-only.

@@ -8,6 +8,9 @@ pub enum TsModelPropertyPolicy {
     /// Preserve the graph's presence facts exactly: optional fields use `?:`, required fields do not.
     #[default]
     Strict,
+    /// Match OpenAPI Generator model shape: schema-required fields are required, and fields omitted
+    /// from the schema `required` list use `?:`.
+    OpenApiRequired,
     /// Emit every generated model property as optional for legacy OpenAPI Generator assignment
     /// compatibility.
     OpenApiGeneratorLoose,
@@ -26,12 +29,26 @@ impl TsModelPropertyPolicy {
         Self::OpenApiGeneratorLoose
     }
 
-    pub(crate) const fn field_optional(self, graph_optional: bool) -> bool {
+    /// OpenAPI Generator-style property declarations.
+    #[must_use]
+    pub const fn openapi_required() -> Self {
+        Self::OpenApiRequired
+    }
+
+    pub(crate) const fn field_optional(self, graph_required: bool, graph_optional: bool) -> bool {
         match self {
             Self::Strict => graph_optional,
+            Self::OpenApiRequired => !graph_required,
             Self::OpenApiGeneratorLoose => true,
         }
     }
+}
+
+/// TypeScript compatibility profiles exposed as a concise target-level API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsCompatibility {
+    /// OpenAPI Generator-compatible TypeScript SDK surface.
+    OpenApiGenerator,
 }
 
 /// How generated TypeScript model/interface properties represent nullable values.
@@ -127,7 +144,7 @@ impl TsSdkOptions {
 
     pub(crate) const fn openapi_generator_compat() -> Self {
         Self {
-            model_properties: TsModelPropertyPolicy::OpenApiGeneratorLoose,
+            model_properties: TsModelPropertyPolicy::OpenApiRequired,
             nullable: TsNullablePolicy::ExplicitNull,
             response: TsResponsePolicy::AxiosResponseWrapper,
         }

@@ -1,6 +1,7 @@
 package types_test
 
 import (
+	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -194,6 +195,72 @@ func TestCreateGoalInputFields(t *testing.T) {
 	}
 	if id, _ := aq.Schema.Of.(string); id != "internal/common/dto.GoalAnalyticsQuery" {
 		t.Errorf("analyticsQuery named id: want internal/common/dto.GoalAnalyticsQuery, got %v", aq.Schema.Of)
+	}
+}
+
+func TestValidateRequiredTagsMarkFieldsRequired(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/validatefixture\n\ngo 1.22\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package validatefixture
+
+type FileRef struct {
+	FileID   string  `+"`json:\"fileId\" validate:\"required\"`"+`
+	Filename string  `+"`json:\"filename\" validate:\"required,email\"`"+`
+	Label    string  `+"`json:\"label,omitempty\"`"+`
+	Note     *string `+"`json:\"note\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load validate fixture: %v", err)
+	}
+	diags := diag.New()
+	schemas := types.Extract(res, diags)
+	s, ok := schemaByName(schemas, "FileRef")
+	if !ok {
+		t.Fatal("FileRef not found")
+	}
+
+	fileID, ok := fieldByJSON(s, "fileId")
+	if !ok {
+		t.Fatal("field 'fileId' not found")
+	}
+	if !fileID.Required {
+		t.Fatal("validate:\"required\" should mark fileId required")
+	}
+	filename, ok := fieldByJSON(s, "filename")
+	if !ok {
+		t.Fatal("field 'filename' not found")
+	}
+	if !filename.Required {
+		t.Fatal("validate:\"required,email\" should mark filename required")
+	}
+	label, ok := fieldByJSON(s, "label")
+	if !ok {
+		t.Fatal("field 'label' not found")
+	}
+	if !label.Optional || label.Nullable {
+		t.Fatalf("omitempty should be optional but not nullable, got optional=%v nullable=%v", label.Optional, label.Nullable)
+	}
+	note, ok := fieldByJSON(s, "note")
+	if !ok {
+		t.Fatal("field 'note' not found")
+	}
+	if !note.Nullable || note.Required {
+		t.Fatalf("pointer should be nullable without forcing required, got nullable=%v required=%v", note.Nullable, note.Required)
 	}
 }
 

@@ -23,7 +23,7 @@ use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::sdk::typescript::{
-    TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
+    TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
 };
 use crate::CoreError;
 use std::fmt::Write as _;
@@ -645,6 +645,120 @@ impl Transform for SetSchemaFieldType {
         field.schema = self.ty.clone();
         Ok(())
     }
+}
+
+/// Graph-level API fact overrides for source patterns that need explicit correction.
+///
+/// These overrides mutate the neutral IR before targets render, so OpenAPI and every SDK target read
+/// the same corrected API facts.
+#[derive(Debug, Clone, Default)]
+pub struct ApiOverrides {
+    field_presence: Vec<FieldPresenceOverride>,
+}
+
+#[derive(Debug, Clone)]
+struct FieldPresenceOverride {
+    schema: String,
+    field: String,
+    required: bool,
+}
+
+impl ApiOverrides {
+    /// Create an empty override set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Force one schema field into the OpenAPI/schema required set.
+    #[must_use]
+    pub fn force_required(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
+        self.field_presence.push(FieldPresenceOverride {
+            schema: schema.into(),
+            field: field.into(),
+            required: true,
+        });
+        self
+    }
+
+    /// Force one schema field out of the OpenAPI/schema required set.
+    #[must_use]
+    pub fn force_optional(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
+        self.field_presence.push(FieldPresenceOverride {
+            schema: schema.into(),
+            field: field.into(),
+            required: false,
+        });
+        self
+    }
+}
+
+impl Transform for ApiOverrides {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        for override_ in &self.field_presence {
+            apply_field_presence_override(
+                ir,
+                &override_.schema,
+                &override_.field,
+                override_.required,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn apply_field_presence_override(
+    ir: &mut ApiGraph,
+    schema_match: &str,
+    field_name: &str,
+    required: bool,
+) -> Result<(), CoreError> {
+    let matches: Vec<usize> = ir
+        .schemas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            (schema.id == schema_match || schema.name == schema_match).then_some(index)
+        })
+        .collect();
+    let schema_index = match matches.as_slice() {
+        [single] => *single,
+        [] => {
+            return Err(CoreError::Config {
+                message: format!(
+                    "field presence override schema {schema_match:?} does not match any graph schema id or name"
+                ),
+            });
+        }
+        many => {
+            return Err(CoreError::Config {
+                message: format!(
+                    "field presence override schema {schema_match:?} matches {} schemas; use the full schema id",
+                    many.len()
+                ),
+            });
+        }
+    };
+
+    let schema = &mut ir.schemas[schema_index];
+    let Type::Object(fields) = &mut schema.body else {
+        return Err(CoreError::Config {
+            message: format!(
+                "field presence override schema {schema_match:?} is not an object schema"
+            ),
+        });
+    };
+
+    let field = fields
+        .iter_mut()
+        .find(|field| field.json_name == field_name)
+        .ok_or_else(|| CoreError::Config {
+            message: format!(
+                "field presence override did not find field {field_name:?} on schema {schema_match:?}"
+            ),
+        })?;
+    field.required = required;
+    Ok(())
 }
 
 /// Enum ordering policy for generated OpenAPI/SDK surfaces.
@@ -1847,6 +1961,16 @@ impl TsSdk {
         self
     }
 
+    /// Set a TypeScript compatibility profile.
+    #[must_use]
+    pub fn compatibility(self, compatibility: TsCompatibility) -> Self {
+        match compatibility {
+            TsCompatibility::OpenApiGenerator => {
+                self.profile(SdkProfile::openapi_generator_compat())
+            }
+        }
+    }
+
     /// Set how model interface properties use `?:`.
     #[must_use]
     pub const fn model_property_policy(mut self, policy: TsModelPropertyPolicy) -> Self {
@@ -2273,13 +2397,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk, Header, NestJs,
-        OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases, OpenApiSchemaPatch,
-        PostProcess, PySdk, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
+        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk, Header,
+        NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        OpenApiSchemaPatch, PostProcess, PySdk, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SourceSpan, Type};
+    use crate::sdk::profile::SdkProfile;
+    use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
 
     fn cx() -> Cx {
@@ -2458,6 +2585,146 @@ mod tests {
             fields[0].schema,
             Type::Array(ref inner) if matches!(**inner, Type::Any {})
         ));
+    }
+
+    #[test]
+    fn api_overrides_force_field_presence_for_openapi_and_typescript() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.User".to_string(),
+                name: "User".to_string(),
+                body: Type::Object(vec![
+                    Field {
+                        json_name: "settings".to_string(),
+                        required: false,
+                        optional: true,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    },
+                    Field {
+                        json_name: "stable".to_string(),
+                        required: true,
+                        optional: false,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    },
+                ]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .force_required("User", "settings")
+            .force_optional("User", "stable")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let mut openapi_out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .generate(&ir, &mut openapi_out, &cx())
+            .unwrap();
+        let yaml = openapi_out.files()[0].text.as_str();
+        assert!(yaml.contains("required: [settings]"), "{yaml}");
+
+        let mut ts_out = Artifacts::new();
+        TsSdk::new()
+            .module("example.com/user/sdk")
+            .to("sdk")
+            .profile(SdkProfile::openapi_generator_compat())
+            .generate(&ir, &mut ts_out, &cx())
+            .unwrap();
+        let models = ts_out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "sdk/models.ts")
+            .unwrap()
+            .text
+            .as_str();
+        assert!(models.contains("settings: string;"), "{models}");
+        assert!(models.contains("stable?: string;"), "{models}");
+    }
+
+    #[test]
+    fn api_overrides_unknown_field_is_a_config_error() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.User".to_string(),
+                name: "User".to_string(),
+                body: Type::Object(vec![]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let err = ApiOverrides::new()
+            .force_required("User", "missing")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+
+        assert!(err.to_string().contains("did not find field"), "{err}");
+    }
+
+    #[test]
+    fn api_overrides_unknown_schema_is_a_config_error() {
+        let mut ir = ApiGraph::default();
+
+        let err = ApiOverrides::new()
+            .force_required("User", "id")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not match any graph schema"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ts_sdk_compatibility_alias_uses_openapi_generator_profile() {
+        let ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.User".to_string(),
+                name: "User".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "id".to_string(),
+                    required: true,
+                    optional: false,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+        let mut out = Artifacts::new();
+
+        TsSdk::new()
+            .module("example.com/user/sdk")
+            .to("sdk")
+            .compatibility(TsCompatibility::OpenApiGenerator)
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+
+        assert!(
+            out.files()
+                .iter()
+                .any(|artifact| artifact.path == "sdk/api.ts"),
+            "compatibility alias should emit OpenAPI Generator API surface"
+        );
     }
 
     #[test]
