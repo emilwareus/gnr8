@@ -60,6 +60,14 @@ pub struct TypeScriptSurfaceDiff {
     pub missing_interface_properties: Vec<TsMissingInterfaceProperty>,
     /// Interface properties whose optionality, nullability, or type changed.
     pub interface_property_changes: Vec<TsInterfacePropertyChange>,
+    /// Interface properties that changed from required to optional.
+    pub interface_required_to_optional: Vec<TsInterfacePropertyChange>,
+    /// Interface properties that changed from optional to required.
+    pub interface_optional_to_required: Vec<TsInterfacePropertyChange>,
+    /// Interface properties whose nullability changed.
+    pub interface_nullable_changes: Vec<TsInterfacePropertyChange>,
+    /// Interface properties whose non-null type annotation changed.
+    pub interface_type_changes: Vec<TsInterfacePropertyChange>,
     /// Operation/factory return type annotations changed or were removed.
     pub operation_return_type_changes: Vec<TsOperationReturnTypeChange>,
     /// Package entry points changed or removed.
@@ -79,6 +87,10 @@ impl TypeScriptSurfaceDiff {
             || !self.missing_request_aliases.is_empty()
             || !self.missing_interface_properties.is_empty()
             || !self.interface_property_changes.is_empty()
+            || !self.interface_required_to_optional.is_empty()
+            || !self.interface_optional_to_required.is_empty()
+            || !self.interface_nullable_changes.is_empty()
+            || !self.interface_type_changes.is_empty()
             || !self.operation_return_type_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
     }
@@ -208,6 +220,8 @@ pub fn diff_typescript_surfaces(
     old: &TypeScriptSurface,
     new: &TypeScriptSurface,
 ) -> TypeScriptSurfaceDiff {
+    let interface_property_changes =
+        interface_property_changes(&old.interface_properties, &new.interface_properties);
     TypeScriptSurfaceDiff {
         missing_root_exports: missing_keys(&old.root_exports, &new.root_exports),
         missing_model_exports: missing_keys(&old.model_exports, &new.model_exports),
@@ -220,10 +234,11 @@ pub fn diff_typescript_surfaces(
             &old.interface_properties,
             &new.interface_properties,
         ),
-        interface_property_changes: interface_property_changes(
-            &old.interface_properties,
-            &new.interface_properties,
-        ),
+        interface_required_to_optional: interface_required_to_optional(&interface_property_changes),
+        interface_optional_to_required: interface_optional_to_required(&interface_property_changes),
+        interface_nullable_changes: interface_nullable_changes(&interface_property_changes),
+        interface_type_changes: interface_type_changes(&interface_property_changes),
+        interface_property_changes,
         operation_return_type_changes: operation_return_type_changes(
             &old.operation_return_types,
             &new.operation_return_types,
@@ -795,6 +810,52 @@ fn interface_property_changes(
     changes
 }
 
+fn interface_required_to_optional(
+    changes: &[TsInterfacePropertyChange],
+) -> Vec<TsInterfacePropertyChange> {
+    changes
+        .iter()
+        .filter(|change| !change.old.optional && change.new.optional)
+        .cloned()
+        .collect()
+}
+
+fn interface_optional_to_required(
+    changes: &[TsInterfacePropertyChange],
+) -> Vec<TsInterfacePropertyChange> {
+    changes
+        .iter()
+        .filter(|change| change.old.optional && !change.new.optional)
+        .cloned()
+        .collect()
+}
+
+fn interface_nullable_changes(
+    changes: &[TsInterfacePropertyChange],
+) -> Vec<TsInterfacePropertyChange> {
+    changes
+        .iter()
+        .filter(|change| change.old.nullable != change.new.nullable)
+        .cloned()
+        .collect()
+}
+
+fn interface_type_changes(changes: &[TsInterfacePropertyChange]) -> Vec<TsInterfacePropertyChange> {
+    changes
+        .iter()
+        .filter(|change| non_null_ts_type(&change.old.ty) != non_null_ts_type(&change.new.ty))
+        .cloned()
+        .collect()
+}
+
+fn non_null_ts_type(ty: &str) -> String {
+    ty.split('|')
+        .map(str::trim)
+        .filter(|part| *part != "null")
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn operation_return_type_changes(
     old: &BTreeMap<String, String>,
     new: &BTreeMap<String, String>,
@@ -938,6 +999,13 @@ mod tests {
         assert!(!diff.interface_property_changes[0].new.optional);
         assert!(diff.interface_property_changes[0].old.nullable);
         assert!(!diff.interface_property_changes[0].new.nullable);
+        assert_eq!(diff.interface_optional_to_required[0].property, "title");
+        assert!(diff.interface_required_to_optional.is_empty());
+        assert_eq!(diff.interface_nullable_changes[0].property, "title");
+        assert!(
+            diff.interface_type_changes.is_empty(),
+            "nullability-only type text changes should not be reported as base type changes"
+        );
         assert_eq!(
             diff.operation_return_type_changes[0].old,
             "Promise<AxiosResponse<Book>>"

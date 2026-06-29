@@ -32,8 +32,8 @@ fn main() -> std::process::ExitCode {
 ## OpenAPI Generator Compatibility
 
 For migrations from an existing `typescript-axios` OpenAPI Generator SDK, use the compatibility profile.
-It emits Axios transport files, runtime enum objects, request aliases, loose model properties, and
-Axios response wrappers by default:
+It emits Axios transport files, runtime enum objects, request aliases, schema-required model
+properties, and Axios response wrappers by default:
 
 ```rust
 use gnr8::sdk::prelude::*;
@@ -46,7 +46,7 @@ fn main() -> std::process::ExitCode {
                 TsSdk::new()
                     .module("example.com/nestjs-service/sdk")
                     .to("generated/sdk")
-                    .profile(SdkProfile::openapi_generator_compat()),
+                    .compatibility(TsCompatibility::OpenApiGenerator),
             ),
     )
 }
@@ -58,7 +58,7 @@ The compatibility defaults can be overridden per target:
 TsSdk::new()
     .module("example.com/nestjs-service/sdk")
     .to("generated/sdk")
-    .profile(SdkProfile::openapi_generator_compat())
+    .compatibility(TsCompatibility::OpenApiGenerator)
     .model_property_policy(TsModelPropertyPolicy::Strict)
     .nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)
     .response_policy(TsResponsePolicy::DataOnly)

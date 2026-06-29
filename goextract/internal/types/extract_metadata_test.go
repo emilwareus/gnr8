@@ -94,6 +94,18 @@ func TestBindingHasRequiredRequiresExactToken(t *testing.T) {
 	}
 }
 
+func TestValidateHasRequiredRequiresExactToken(t *testing.T) {
+	if !validateHasRequired("required,email") {
+		t.Fatal("expected validate required token to mark field required")
+	}
+	if validateHasRequired("required_without=Name") {
+		t.Fatal("required_without must not mark the field strictly required")
+	}
+	if validateHasRequired("notrequired") {
+		t.Fatal("substring matches must not mark the field required")
+	}
+}
+
 func hasMetadataDiag(diags []facts.DiagnosticFact, rule string, token string) bool {
 	for _, d := range diags {
 		if strings.Contains(d.Message, rule) && strings.Contains(d.Message, token) {

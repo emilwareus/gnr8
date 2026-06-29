@@ -1037,7 +1037,8 @@ mod tests {
             models.contains("export type BookFormat = typeof BookFormat[keyof typeof BookFormat];"),
             "{models}"
         );
-        assert!(models.contains("title?: string;"), "{models}");
+        assert!(models.contains("title: string;"), "{models}");
+        assert!(models.contains("format?: BookFormat;"), "{models}");
 
         let package = files
             .iter()
@@ -1054,11 +1055,11 @@ mod tests {
         let Type::Object(fields) = &mut graph.schemas[0].body else {
             panic!("sample Book schema must be an object");
         };
-        let title = fields
+        let format = fields
             .iter_mut()
-            .find(|field| field.json_name == "title")
-            .expect("sample title field");
-        title.nullable = true;
+            .find(|field| field.json_name == "format")
+            .expect("sample format field");
+        format.nullable = true;
 
         let mut options = TsSdkOptions::for_profile(&SdkProfile::openapi_generator_compat());
         options.nullable = TsNullablePolicy::OmitNullFromOptionalProperties;
@@ -1080,7 +1081,7 @@ mod tests {
             .contents
             .as_str();
 
-        assert!(models.contains("title?: string;"), "{models}");
+        assert!(models.contains("format?: BookFormat;"), "{models}");
     }
 
     #[test]
@@ -1111,7 +1112,7 @@ mod tests {
             .contents
             .as_str();
 
-        assert!(models.contains("title?: string | null;"), "{models}");
+        assert!(models.contains("title: string | null;"), "{models}");
     }
 
     #[test]

@@ -851,17 +851,19 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApplySecurity, EnumOrder, FastApi, Flask, GoGin, GoSdk, GroupOperations, Header, NestJs,
-        OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases, OpenApiSchemaPatch,
-        PySdk, RenameOperation, RenameType, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, GoGin, GoSdk, GroupOperations,
+        Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        OpenApiSchemaPatch, PySdk, RenameOperation, RenameType, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
     pub use super::layout::SdkFileLayout;
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::profile::SdkProfile;
     pub use super::surface::SdkTypeAliases;
-    pub use super::typescript::{TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy};
+    pub use super::typescript::{
+        TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
+    };
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,

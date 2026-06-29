@@ -525,7 +525,8 @@ fn emit_interface_with_policies(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let effective_optional = model_property_policy.field_optional(field.optional);
+        let effective_optional =
+            model_property_policy.field_optional(field.required, field.optional);
         let effective_nullable = nullable_policy.field_nullable(effective_optional, field.nullable);
         let hint = ts_type(&field.schema, effective_nullable, graph, ns)?;
         let opt = if effective_optional { "?" } else { "" };
@@ -1335,7 +1336,9 @@ mod tests {
     }
 
     mod models {
-        use super::{emit_models, sample_graph};
+        use super::{emit_models, sample_graph, Type};
+        use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
+        use crate::tssdk::emit::emit_models_with_aliases_and_policies;
 
         #[test]
         fn named_enum_emits_string_literal_union_type_alias_in_graph_order() {
@@ -1410,6 +1413,33 @@ mod tests {
             assert!(
                 out.contains("  rating?: number | number | null;"),
                 "inline union field optional+nullable:\n{out}"
+            );
+        }
+
+        #[test]
+        fn openapi_required_policy_uses_schema_required_not_source_optional_axis() {
+            let mut graph = sample_graph();
+            let Type::Object(fields) = &mut graph.schemas[1].body else {
+                panic!("Book must be an object");
+            };
+            let title = fields
+                .iter_mut()
+                .find(|field| field.json_name == "title")
+                .expect("Book.title field");
+            title.required = false;
+            title.optional = false;
+
+            let out = emit_models_with_aliases_and_policies(
+                &graph,
+                &[],
+                TsModelPropertyPolicy::OpenApiRequired,
+                TsNullablePolicy::ExplicitNull,
+            )
+            .unwrap();
+
+            assert!(
+                out.contains("  title?: string;"),
+                "schema-non-required field should emit `?` even when source optional axis is false:\n{out}"
             );
         }
 
