@@ -197,6 +197,7 @@ export interface AxiosRequestConfig {
 }
 export interface AxiosResponse<T = unknown> {
   status: number;
+  headers: Record<string, unknown>;
   data: T;
 }
 export interface AxiosInstance {
@@ -277,8 +278,29 @@ fn openapi_generator_axios_profile_typechecks_with_test_local_axios_stub() {
         package.contains("\"axios\""),
         "axios profile package.json must declare axios:\n{package}"
     );
+    std::fs::write(
+        dir.join("consumer.ts"),
+        r#"
+import { BookFormat, DefaultApiFactory } from "./index";
 
-    let result = run_tsc(&AXIOS_SDK_FILES, &dir);
+async function smoke(): Promise<void> {
+  const api = DefaultApiFactory();
+  const response = await api.listBooks({ genre: "fiction" });
+  response.status.toFixed();
+  response.headers;
+  response.data.books;
+  const format: BookFormat = BookFormat.Hardcover;
+  void format;
+}
+
+void smoke;
+"#,
+    )
+    .expect("write axios consumer smoke test");
+
+    let mut ts_files = AXIOS_SDK_FILES.to_vec();
+    ts_files.push("consumer.ts");
+    let result = run_tsc(&ts_files, &dir);
     assert!(
         result.is_ok(),
         "axios profile must type-check against the test-local axios stub: {result:?}"

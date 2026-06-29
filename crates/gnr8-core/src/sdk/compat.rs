@@ -31,6 +31,10 @@ pub struct TypeScriptSurface {
     pub operation_methods: Vec<String>,
     /// Request alias names.
     pub request_aliases: Vec<String>,
+    /// Exported interface properties keyed by interface name, then property name.
+    pub interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    /// Operation/factory return types keyed by `Class.method` or `Factory.method`.
+    pub operation_return_types: BTreeMap<String, String>,
     /// Package entry point fields.
     pub package_entry_points: BTreeMap<String, String>,
 }
@@ -52,6 +56,12 @@ pub struct TypeScriptSurfaceDiff {
     pub missing_operation_methods: Vec<String>,
     /// Request aliases present in old but missing in new.
     pub missing_request_aliases: Vec<String>,
+    /// Interface properties present in old but missing in new.
+    pub missing_interface_properties: Vec<TsMissingInterfaceProperty>,
+    /// Interface properties whose optionality, nullability, or type changed.
+    pub interface_property_changes: Vec<TsInterfacePropertyChange>,
+    /// Operation/factory return type annotations changed or were removed.
+    pub operation_return_type_changes: Vec<TsOperationReturnTypeChange>,
     /// Package entry points changed or removed.
     pub package_entry_point_changes: Vec<String>,
 }
@@ -67,6 +77,9 @@ impl TypeScriptSurfaceDiff {
             || !self.missing_api_factories.is_empty()
             || !self.missing_operation_methods.is_empty()
             || !self.missing_request_aliases.is_empty()
+            || !self.missing_interface_properties.is_empty()
+            || !self.interface_property_changes.is_empty()
+            || !self.operation_return_type_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
     }
 }
@@ -80,6 +93,50 @@ pub struct TsExportKindMismatch {
     pub old: TsExportKind,
     /// New namespace kind.
     pub new: TsExportKind,
+}
+
+/// A TypeScript interface property declaration shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsInterfaceProperty {
+    /// Whether the property is declared with `?:`.
+    pub optional: bool,
+    /// Whether the property type includes `null`.
+    pub nullable: bool,
+    /// Normalized type annotation text.
+    pub ty: String,
+}
+
+/// An interface property present in the old surface but missing in the new surface.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsMissingInterfaceProperty {
+    /// Interface name.
+    pub interface: String,
+    /// Property name.
+    pub property: String,
+}
+
+/// A changed TypeScript interface property declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsInterfacePropertyChange {
+    /// Interface name.
+    pub interface: String,
+    /// Property name.
+    pub property: String,
+    /// Old property shape.
+    pub old: TsInterfaceProperty,
+    /// New property shape.
+    pub new: TsInterfaceProperty,
+}
+
+/// A changed TypeScript operation or factory return type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsOperationReturnTypeChange {
+    /// Operation key, e.g. `DefaultApi.listBooks`.
+    pub operation: String,
+    /// Old return type annotation.
+    pub old: String,
+    /// New return type annotation.
+    pub new: String,
 }
 
 /// Diff two TypeScript SDK directories.
@@ -113,11 +170,15 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
     let mut api_factories = BTreeSet::new();
     let mut operation_methods = BTreeSet::new();
     let mut request_aliases = BTreeSet::new();
+    let mut interface_properties = BTreeMap::new();
+    let mut operation_return_types = BTreeMap::new();
 
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
         let parsed = parse_ts_file(&text);
         merge_exports(&mut all_exports, &parsed.exports);
+        merge_interface_properties(&mut interface_properties, parsed.interface_properties);
+        merge_operation_return_types(&mut operation_return_types, parsed.operation_return_types);
         if is_model_file(rel) {
             merge_exports(&mut model_exports, &parsed.exports);
         }
@@ -135,6 +196,8 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         api_factories: api_factories.into_iter().collect(),
         operation_methods: operation_methods.into_iter().collect(),
         request_aliases: request_aliases.into_iter().collect(),
+        interface_properties,
+        operation_return_types,
         package_entry_points: package_entry_points(dir)?,
     })
 }
@@ -153,6 +216,18 @@ pub fn diff_typescript_surfaces(
         missing_api_factories: missing_values(&old.api_factories, &new.api_factories),
         missing_operation_methods: missing_values(&old.operation_methods, &new.operation_methods),
         missing_request_aliases: missing_values(&old.request_aliases, &new.request_aliases),
+        missing_interface_properties: missing_interface_properties(
+            &old.interface_properties,
+            &new.interface_properties,
+        ),
+        interface_property_changes: interface_property_changes(
+            &old.interface_properties,
+            &new.interface_properties,
+        ),
+        operation_return_type_changes: operation_return_type_changes(
+            &old.operation_return_types,
+            &new.operation_return_types,
+        ),
         package_entry_point_changes: package_changes(
             &old.package_entry_points,
             &new.package_entry_points,
@@ -167,18 +242,37 @@ struct ParsedTsFile {
     api_factories: Vec<String>,
     operation_methods: Vec<String>,
     request_aliases: Vec<String>,
+    interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    operation_return_types: BTreeMap<String, String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass parser state is easier to audit together"
+)]
 fn parse_ts_file(text: &str) -> ParsedTsFile {
     let mut parsed = ParsedTsFile::default();
     let mut current_api_class: Option<(String, i32)> = None;
+    let mut current_api_factory: Option<(String, i32)> = None;
+    let mut current_interface: Option<(String, i32)> = None;
     for raw in text.lines() {
         let line = raw.trim();
         let mut starts_api_class = false;
+        let mut starts_api_factory = false;
+        let mut starts_interface = false;
         if let Some(name) = strip_export_decl(line, "interface") {
             add_export(&mut parsed.exports, name, TsExportKind::Type);
             if name.ends_with("Request") {
                 parsed.request_aliases.push(name.to_string());
+            }
+            parsed
+                .interface_properties
+                .entry(name.to_string())
+                .or_default();
+            let depth = brace_delta(line);
+            if depth > 0 {
+                current_interface = Some((name.to_string(), depth));
+                starts_interface = true;
             }
         } else if let Some(name) = strip_export_decl(line, "type") {
             add_export(&mut parsed.exports, name, TsExportKind::Type);
@@ -196,6 +290,8 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
             add_export(&mut parsed.exports, name, TsExportKind::Value);
             if name.ends_with("ApiFactory") {
                 parsed.api_factories.push(name.to_string());
+                current_api_factory = Some((name.to_string(), brace_delta(line).max(1)));
+                starts_api_factory = true;
             }
         } else if let Some(exports) = line.strip_prefix("export type {") {
             parse_export_list(exports, TsExportKind::Type, &mut parsed.exports);
@@ -206,10 +302,15 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         let mut close_api_class = false;
         if let Some((class_name, depth)) = &mut current_api_class {
             if !starts_api_class {
-                if let Some(method) = strip_async_method(line) {
+                if let Some((method, return_ty)) = parse_async_method_signature(line) {
                     parsed
                         .operation_methods
                         .push(format!("{class_name}.{method}"));
+                    if let Some(return_ty) = return_ty {
+                        parsed
+                            .operation_return_types
+                            .insert(format!("{class_name}.{method}"), return_ty);
+                    }
                 }
                 *depth += brace_delta(line);
             }
@@ -219,6 +320,44 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         }
         if close_api_class {
             current_api_class = None;
+        }
+
+        let mut close_api_factory = false;
+        if let Some((factory_name, depth)) = &mut current_api_factory {
+            if !starts_api_factory {
+                if let Some((method, Some(return_ty))) = parse_method_signature(line) {
+                    parsed
+                        .operation_return_types
+                        .insert(format!("{factory_name}.{method}"), return_ty);
+                }
+                *depth += brace_delta(line);
+            }
+            if *depth <= 0 {
+                close_api_factory = true;
+            }
+        }
+        if close_api_factory {
+            current_api_factory = None;
+        }
+
+        let mut close_interface = false;
+        if let Some((interface_name, depth)) = &mut current_interface {
+            if !starts_interface {
+                if let Some((property, shape)) = parse_interface_property(line) {
+                    parsed
+                        .interface_properties
+                        .entry(interface_name.clone())
+                        .or_default()
+                        .insert(property, shape);
+                }
+                *depth += brace_delta(line);
+            }
+            if *depth <= 0 {
+                close_interface = true;
+            }
+        }
+        if close_interface {
+            current_interface = None;
         }
     }
     parsed
@@ -239,9 +378,92 @@ fn strip_export_decl<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
     ident_prefix(rest)
 }
 
-fn strip_async_method(line: &str) -> Option<&str> {
+fn parse_async_method_signature(line: &str) -> Option<(&str, Option<String>)> {
     let rest = line.strip_prefix("async ")?;
-    ident_prefix(rest)
+    parse_method_signature(rest)
+}
+
+fn parse_method_signature(line: &str) -> Option<(&str, Option<String>)> {
+    let method = ident_prefix(line)?;
+    let rest = line.get(method.len()..)?.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let return_ty = method_return_type(rest);
+    Some((method, return_ty))
+}
+
+fn method_return_type(signature_tail: &str) -> Option<String> {
+    let close = signature_tail.find(')')?;
+    let after_paren = &signature_tail[close + 1..];
+    let rest = after_paren.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let end = rest
+        .find('{')
+        .or_else(|| rest.find(';'))
+        .unwrap_or(rest.len());
+    let ty = rest[..end].trim();
+    (!ty.is_empty()).then(|| normalize_ts_type(ty))
+}
+
+fn parse_interface_property(line: &str) -> Option<(String, TsInterfaceProperty)> {
+    if line.is_empty() || line.starts_with("//") || line.starts_with('*') || line.starts_with('[') {
+        return None;
+    }
+    let line = line.trim_end_matches(';').trim_end_matches(',').trim();
+    let (left, right) = split_property_decl(line)?;
+    let left = left.trim();
+    let ty = normalize_ts_type(right.trim());
+    if ty.is_empty() {
+        return None;
+    }
+    let (name, optional) = property_name_and_optional(left)?;
+    let nullable = ts_type_contains_null(&ty);
+    Some((
+        name,
+        TsInterfaceProperty {
+            optional,
+            nullable,
+            ty,
+        },
+    ))
+}
+
+fn split_property_decl(line: &str) -> Option<(&str, &str)> {
+    let mut quote = None;
+    for (idx, ch) in line.char_indices() {
+        match (quote, ch) {
+            (Some(active), c) if c == active => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, ':') => return Some((&line[..idx], &line[idx + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn property_name_and_optional(left: &str) -> Option<(String, bool)> {
+    let optional = left.ends_with('?');
+    let name = left.trim_end_matches('?').trim();
+    if name.is_empty() {
+        return None;
+    }
+    let name = if (name.starts_with('"') && name.ends_with('"'))
+        || (name.starts_with('\'') && name.ends_with('\''))
+    {
+        name[1..name.len() - 1].to_string()
+    } else {
+        name.to_string()
+    };
+    Some((name, optional))
+}
+
+fn normalize_ts_type(ty: &str) -> String {
+    ty.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn ts_type_contains_null(ty: &str) -> bool {
+    ty.split('|').any(|part| part.trim() == "null")
 }
 
 fn ident_prefix(value: &str) -> Option<&str> {
@@ -299,6 +521,22 @@ fn merge_exports(
     for (name, kind) in exports {
         add_export(into, name, *kind);
     }
+}
+
+fn merge_interface_properties(
+    into: &mut BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+) {
+    for (interface, fields) in properties {
+        into.entry(interface).or_default().extend(fields);
+    }
+}
+
+fn merge_operation_return_types(
+    into: &mut BTreeMap<String, String>,
+    return_types: BTreeMap<String, String>,
+) {
+    into.extend(return_types);
 }
 
 fn extract_root_exports(
@@ -512,6 +750,72 @@ fn package_changes(old: &BTreeMap<String, String>, new: &BTreeMap<String, String
         .collect()
 }
 
+fn missing_interface_properties(
+    old: &BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    new: &BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+) -> Vec<TsMissingInterfaceProperty> {
+    let mut missing = Vec::new();
+    for (interface, old_props) in old {
+        let new_props = new.get(interface);
+        for property in old_props.keys() {
+            if new_props.is_none_or(|props| !props.contains_key(property)) {
+                missing.push(TsMissingInterfaceProperty {
+                    interface: interface.clone(),
+                    property: property.clone(),
+                });
+            }
+        }
+    }
+    missing
+}
+
+fn interface_property_changes(
+    old: &BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    new: &BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+) -> Vec<TsInterfacePropertyChange> {
+    let mut changes = Vec::new();
+    for (interface, old_props) in old {
+        let Some(new_props) = new.get(interface) else {
+            continue;
+        };
+        for (property, old_shape) in old_props {
+            let Some(new_shape) = new_props.get(property) else {
+                continue;
+            };
+            if old_shape != new_shape {
+                changes.push(TsInterfacePropertyChange {
+                    interface: interface.clone(),
+                    property: property.clone(),
+                    old: old_shape.clone(),
+                    new: new_shape.clone(),
+                });
+            }
+        }
+    }
+    changes
+}
+
+fn operation_return_type_changes(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Vec<TsOperationReturnTypeChange> {
+    old.iter()
+        .filter_map(|(operation, old_ty)| match new.get(operation) {
+            Some(new_ty) if old_ty != new_ty => Some(TsOperationReturnTypeChange {
+                operation: operation.clone(),
+                old: old_ty.clone(),
+                new: new_ty.clone(),
+            }),
+            None => Some(TsOperationReturnTypeChange {
+                operation: operation.clone(),
+                old: old_ty.clone(),
+                new: "<missing>".to_string(),
+            }),
+            Some(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -541,23 +845,33 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("models.ts"),
-            "export interface Book {}\nexport const Format = {} as const;\nexport type Format = typeof Format[keyof typeof Format];\n",
+            "export interface Book {\n  title?: string | null;\n}\nexport const Format = {} as const;\nexport type Format = typeof Format[keyof typeof Format];\n",
         )
         .unwrap();
         std::fs::write(
             dir.join("api.ts"),
-            "export interface CreateBookRequest {}\nexport class DefaultApi {\n  async createBook(): Promise<void> {\n    if (true) {\n      return;\n    }\n  }\n  async listBooks(): Promise<void> { return; }\n}\nexport const DefaultApiFactory = function () {};\n",
+            "export interface CreateBookRequest {}\nexport class DefaultApi {\n  async createBook(): Promise<AxiosResponse<Book>> {\n    if (true) {\n      return response;\n    }\n  }\n  async listBooks(): Promise<void> { return; }\n}\nexport const DefaultApiFactory = function () {\n  return {\n    createBook(): Promise<AxiosResponse<Book>> { return api.createBook(); },\n  };\n};\n",
         )
         .unwrap();
 
         let surface = extract_typescript_surface(&dir).unwrap();
         assert_eq!(surface.root_exports["Book"], TsExportKind::Type);
         assert_eq!(surface.root_exports["Format"], TsExportKind::Both);
+        assert!(surface.interface_properties["Book"]["title"].optional);
+        assert!(surface.interface_properties["Book"]["title"].nullable);
         assert_eq!(surface.api_classes, vec!["DefaultApi"]);
         assert_eq!(surface.api_factories, vec!["DefaultApiFactory"]);
         assert_eq!(
             surface.operation_methods,
             vec!["DefaultApi.createBook", "DefaultApi.listBooks"]
+        );
+        assert_eq!(
+            surface.operation_return_types["DefaultApi.createBook"],
+            "Promise<AxiosResponse<Book>>"
+        );
+        assert_eq!(
+            surface.operation_return_types["DefaultApiFactory.createBook"],
+            "Promise<AxiosResponse<Book>>"
         );
         assert_eq!(surface.request_aliases, vec!["CreateBookRequest"]);
 
@@ -595,26 +909,40 @@ mod tests {
         }
         std::fs::write(
             old.join("models.ts"),
-            "export interface Book {}\nexport const Format = {} as const;\nexport type Format = typeof Format[keyof typeof Format];\n",
+            "export interface Book {\n  title?: string | null;\n  author: Author;\n}\nexport interface Author {\n  name: string;\n}\nexport const Format = {} as const;\nexport type Format = typeof Format[keyof typeof Format];\n",
         )
         .unwrap();
-        std::fs::write(old.join("api.ts"), "export interface CreateBookRequest {}\nexport class DefaultApi {\n  async createBook(): Promise<void> { return; }\n}\nexport const DefaultApiFactory = function () {};\n").unwrap();
+        std::fs::write(old.join("api.ts"), "export interface CreateBookRequest {}\nexport class DefaultApi {\n  async createBook(): Promise<AxiosResponse<Book>> { return response; }\n}\nexport const DefaultApiFactory = function () {\n  return {\n    createBook(): Promise<AxiosResponse<Book>> { return api.createBook(); },\n  };\n};\n").unwrap();
         std::fs::write(
             new.join("models.ts"),
-            "export interface Book {}\nexport type Format = \"hardcover\";\n",
+            "export interface Book {\n  title: string;\n}\nexport type Format = \"hardcover\";\n",
         )
         .unwrap();
-        std::fs::write(new.join("api.ts"), "export class DefaultApi {}\n").unwrap();
+        std::fs::write(
+            new.join("api.ts"),
+            "export class DefaultApi {\n  async createBook(): Promise<Book> { return book; }\n}\n",
+        )
+        .unwrap();
 
         let diff = diff_typescript_dirs(&old, &new).unwrap();
         assert!(diff.is_breaking());
         assert_eq!(diff.export_kind_mismatches[0].symbol, "Format");
         assert_eq!(diff.missing_api_factories, vec!["DefaultApiFactory"]);
-        assert_eq!(
-            diff.missing_operation_methods,
-            vec!["DefaultApi.createBook"]
-        );
         assert_eq!(diff.missing_request_aliases, vec!["CreateBookRequest"]);
+        assert!(diff
+            .missing_interface_properties
+            .iter()
+            .any(|missing| missing.interface == "Book" && missing.property == "author"));
+        assert_eq!(diff.interface_property_changes[0].property, "title");
+        assert!(diff.interface_property_changes[0].old.optional);
+        assert!(!diff.interface_property_changes[0].new.optional);
+        assert!(diff.interface_property_changes[0].old.nullable);
+        assert!(!diff.interface_property_changes[0].new.nullable);
+        assert_eq!(
+            diff.operation_return_type_changes[0].old,
+            "Promise<AxiosResponse<Book>>"
+        );
+        assert_eq!(diff.operation_return_type_changes[0].new, "Promise<Book>");
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);

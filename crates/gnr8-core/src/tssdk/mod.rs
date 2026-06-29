@@ -29,6 +29,7 @@ use crate::sdk::emit_common::{
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
+use crate::sdk::typescript::{TsResponsePolicy, TsSdkOptions};
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
 /// TSSDK-01).
@@ -80,6 +81,24 @@ pub(crate) fn generate_files_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    generate_files_with_layout_options(
+        graph,
+        package,
+        base_path,
+        layout,
+        aliases,
+        TsSdkOptions::strict(),
+    )
+}
+
+fn generate_files_with_layout_options(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+    options: TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -136,7 +155,12 @@ pub(crate) fn generate_files_with_layout(
             };
             files.push(SdkFile {
                 name,
-                contents: emit::emit_model_schema(graph, schema)?,
+                contents: emit::emit_model_schema_with_policies(
+                    graph,
+                    schema,
+                    options.model_properties,
+                    options.nullable,
+                )?,
             });
         }
         for alias in &resolved_aliases {
@@ -148,7 +172,12 @@ pub(crate) fn generate_files_with_layout(
     } else {
         files.push(SdkFile {
             name: "models.ts".to_string(),
-            contents: emit::emit_models_with_aliases(graph, package, &resolved_aliases)?,
+            contents: emit::emit_models_with_aliases_and_policies(
+                graph,
+                &resolved_aliases,
+                options.model_properties,
+                options.nullable,
+            )?,
         });
     }
 
@@ -156,6 +185,7 @@ pub(crate) fn generate_files_with_layout(
     Ok(files)
 }
 
+#[cfg(test)]
 pub(crate) fn generate_files_with_profile(
     graph: &ApiGraph,
     package: &str,
@@ -164,13 +194,43 @@ pub(crate) fn generate_files_with_profile(
     aliases: &SdkTypeAliases,
     profile: &SdkProfile,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    generate_files_with_profile_options(
+        graph,
+        package,
+        base_path,
+        layout,
+        aliases,
+        profile,
+        TsSdkOptions::for_profile(profile),
+    )
+}
+
+pub(crate) fn generate_files_with_profile_options(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+    profile: &SdkProfile,
+    options: TsSdkOptions,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    if !profile.is_openapi_generator_compat() && options.response.is_axios_response_wrapper() {
+        return Err(crate::CoreError::Config {
+            message: "TsResponsePolicy::AxiosResponseWrapper requires SdkProfile::openapi_generator_compat()"
+                .to_string(),
+        });
+    }
     if profile.is_minimal() {
-        return generate_files_with_layout(graph, package, base_path, layout, aliases);
+        return generate_files_with_layout_options(
+            graph, package, base_path, layout, aliases, options,
+        );
     }
     if profile.is_openapi_generator_compat() {
-        return generate_openapi_generator_compat_files(graph, package, base_path, aliases);
+        return generate_openapi_generator_compat_files(
+            graph, package, base_path, aliases, options,
+        );
     }
-    generate_files_with_layout(graph, package, base_path, layout, aliases)
+    generate_files_with_layout_options(graph, package, base_path, layout, aliases, options)
 }
 
 fn generate_openapi_generator_compat_files(
@@ -178,6 +238,7 @@ fn generate_openapi_generator_compat_files(
     package: &str,
     base_path: &str,
     aliases: &SdkTypeAliases,
+    options: TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -187,7 +248,7 @@ fn generate_openapi_generator_compat_files(
     let mut files = vec![
         SdkFile {
             name: "api.ts".to_string(),
-            contents: emit_axios_api(graph, base_path, auth_header.as_deref())?,
+            contents: emit_axios_api(graph, base_path, auth_header.as_deref(), options.response)?,
         },
         SdkFile {
             name: "base.ts".to_string(),
@@ -211,6 +272,8 @@ fn generate_openapi_generator_compat_files(
                 graph,
                 package,
                 &resolved_aliases,
+                options.model_properties,
+                options.nullable,
             )?,
         },
         SdkFile {
@@ -314,11 +377,18 @@ fn emit_axios_api(
     graph: &ApiGraph,
     base_path: &str,
     auth_header: Option<&str>,
+    response_policy: TsResponsePolicy,
 ) -> Result<String, crate::CoreError> {
     let mut out = String::new();
+    let axios_types = match response_policy {
+        TsResponsePolicy::DataOnly => "AxiosInstance, AxiosRequestConfig",
+        TsResponsePolicy::AxiosResponseWrapper => {
+            "AxiosInstance, AxiosRequestConfig, AxiosResponse"
+        }
+    };
+    writeln!(out, "import type {{ {axios_types} }} from \"axios\";").map_err(ts_mod_sink)?;
     out.push_str(
         "\
-import type { AxiosInstance, AxiosRequestConfig } from \"axios\";
 import { BaseAPI } from \"./base\";
 import { Configuration } from \"./configuration\";
 import { ApiError } from \"./errors\";
@@ -335,10 +405,17 @@ import * as models from \"./models\";
         }
         writeln!(out, "export class {class_name} extends BaseAPI {{").map_err(ts_mod_sink)?;
         for op in &ops {
-            emit_axios_operation_method(&mut out, graph, base_path, op, auth_header)?;
+            emit_axios_operation_method(
+                &mut out,
+                graph,
+                base_path,
+                op,
+                auth_header,
+                response_policy,
+            )?;
         }
         writeln!(out, "}}\n").map_err(ts_mod_sink)?;
-        emit_axios_factory(&mut out, graph, &class_name, &ops)?;
+        emit_axios_factory(&mut out, graph, &class_name, &ops, response_policy)?;
         for op in &ops {
             writeln!(
                 out,
@@ -391,6 +468,7 @@ fn emit_axios_operation_method(
     base_path: &str,
     op: &Operation,
     auth_header: Option<&str>,
+    response_policy: TsResponsePolicy,
 ) -> Result<(), crate::CoreError> {
     let method_name = emit::camel(&op.handler);
     let request_name = request_alias_name(op);
@@ -401,7 +479,7 @@ fn emit_axios_operation_method(
         " = {}"
     };
     let success = success_responses_of(op, graph)?;
-    let return_ty = success.body_model.as_ref().map_or_else(
+    let data_ty = success.body_model.as_ref().map_or_else(
         || "void".to_string(),
         |model| {
             if success.has_bodyless_alternative() {
@@ -411,10 +489,11 @@ fn emit_axios_operation_method(
             }
         },
     );
+    let return_ty = axios_operation_return_type(&data_ty, response_policy);
 
     writeln!(
         out,
-        "  async {method_name}(requestParameters: {request_name}{request_default}, options: AxiosRequestConfig = {{}}): Promise<{return_ty}> {{"
+        "  async {method_name}(requestParameters: {request_name}{request_default}, options: AxiosRequestConfig = {{}}): {return_ty} {{"
     )
     .map_err(ts_mod_sink)?;
     emit_axios_path(out, base_path, op)?;
@@ -512,7 +591,7 @@ fn emit_axios_operation_method(
     .map_err(ts_mod_sink)?;
     writeln!(out, "    }}").map_err(ts_mod_sink)?;
     if let Some(model) = &success.body_model {
-        if success.has_bodyless_alternative() {
+        if response_policy == TsResponsePolicy::DataOnly && success.has_bodyless_alternative() {
             writeln!(
                 out,
                 "    if (![{}].includes(response.status)) {{",
@@ -527,9 +606,26 @@ fn emit_axios_operation_method(
             writeln!(out, "      return undefined;").map_err(ts_mod_sink)?;
             writeln!(out, "    }}").map_err(ts_mod_sink)?;
         }
-        writeln!(out, "    return response.data as models.{model};").map_err(ts_mod_sink)?;
+        match response_policy {
+            TsResponsePolicy::DataOnly => {
+                writeln!(out, "    return response.data as models.{model};")
+                    .map_err(ts_mod_sink)?;
+            }
+            TsResponsePolicy::AxiosResponseWrapper => {
+                writeln!(out, "    return response as AxiosResponse<{data_ty}>;")
+                    .map_err(ts_mod_sink)?;
+            }
+        }
     } else {
-        writeln!(out, "    return;").map_err(ts_mod_sink)?;
+        match response_policy {
+            TsResponsePolicy::DataOnly => {
+                writeln!(out, "    return;").map_err(ts_mod_sink)?;
+            }
+            TsResponsePolicy::AxiosResponseWrapper => {
+                writeln!(out, "    return response as AxiosResponse<void>;")
+                    .map_err(ts_mod_sink)?;
+            }
+        }
     }
     writeln!(out, "  }}").map_err(ts_mod_sink)?;
     Ok(())
@@ -540,6 +636,7 @@ fn emit_axios_factory(
     graph: &ApiGraph,
     class_name: &str,
     ops: &[&Operation],
+    response_policy: TsResponsePolicy,
 ) -> Result<(), crate::CoreError> {
     writeln!(
         out,
@@ -561,9 +658,21 @@ fn emit_axios_factory(
         } else {
             " = {}"
         };
+        let success = success_responses_of(op, graph)?;
+        let data_ty = success.body_model.as_ref().map_or_else(
+            || "void".to_string(),
+            |model| {
+                if success.has_bodyless_alternative() {
+                    format!("models.{model} | undefined")
+                } else {
+                    format!("models.{model}")
+                }
+            },
+        );
+        let return_ty = axios_operation_return_type(&data_ty, response_policy);
         writeln!(
             out,
-            "    {method}(requestParameters: {request_name}{request_default}, options?: AxiosRequestConfig) {{"
+            "    {method}(requestParameters: {request_name}{request_default}, options?: AxiosRequestConfig): {return_ty} {{"
         )
         .map_err(ts_mod_sink)?;
         writeln!(
@@ -576,6 +685,13 @@ fn emit_axios_factory(
     writeln!(out, "  }};").map_err(ts_mod_sink)?;
     writeln!(out, "}};\n").map_err(ts_mod_sink)?;
     Ok(())
+}
+
+fn axios_operation_return_type(data_ty: &str, response_policy: TsResponsePolicy) -> String {
+    match response_policy {
+        TsResponsePolicy::DataOnly => format!("Promise<{data_ty}>"),
+        TsResponsePolicy::AxiosResponseWrapper => format!("Promise<AxiosResponse<{data_ty}>>"),
+    }
 }
 
 fn emit_axios_path(
@@ -740,12 +856,16 @@ mod tests {
     // hermetic typecheck lands in plan 03's tests/tssdk_compile.rs).
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, generate_files_with_profile, generate_with_layout, split_bundle};
+    use super::{
+        generate, generate_files_with_profile, generate_files_with_profile_options,
+        generate_with_layout, split_bundle,
+    };
     use crate::graph::{ApiGraph, Param, Prim, SourceSpan, Type};
     use crate::sdk::bundle::write_to_dir;
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
+    use crate::sdk::typescript::{TsNullablePolicy, TsResponsePolicy, TsSdkOptions};
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.
@@ -889,12 +1009,20 @@ mod tests {
         assert!(api.contains("export type CreateBookOperation"), "{api}");
         assert!(
             api.contains(
-                "listBooks(requestParameters: ListBooksRequest = {}, options?: AxiosRequestConfig)"
+                "import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from \"axios\";"
             ),
             "{api}"
         );
         assert!(
-            api.contains("import type { AxiosInstance, AxiosRequestConfig } from \"axios\";"),
+            api.contains("async listBooks(requestParameters: ListBooksRequest = {}, options: AxiosRequestConfig = {}): Promise<AxiosResponse<models.Book>>"),
+            "{api}"
+        );
+        assert!(
+            api.contains("listBooks(requestParameters: ListBooksRequest = {}, options?: AxiosRequestConfig): Promise<AxiosResponse<models.Book>>"),
+            "{api}"
+        );
+        assert!(
+            api.contains("return response as AxiosResponse<models.Book>;"),
             "{api}"
         );
 
@@ -909,6 +1037,7 @@ mod tests {
             models.contains("export type BookFormat = typeof BookFormat[keyof typeof BookFormat];"),
             "{models}"
         );
+        assert!(models.contains("title?: string;"), "{models}");
 
         let package = files
             .iter()
@@ -917,6 +1046,72 @@ mod tests {
             .contents
             .as_str();
         assert!(package.contains("\"axios\": \"^1.0.0\""), "{package}");
+    }
+
+    #[test]
+    fn openapi_generator_compat_profile_can_omit_null_from_optional_model_properties() {
+        let mut graph = sample_graph();
+        let Type::Object(fields) = &mut graph.schemas[0].body else {
+            panic!("sample Book schema must be an object");
+        };
+        let title = fields
+            .iter_mut()
+            .find(|field| field.json_name == "title")
+            .expect("sample title field");
+        title.nullable = true;
+
+        let mut options = TsSdkOptions::for_profile(&SdkProfile::openapi_generator_compat());
+        options.nullable = TsNullablePolicy::OmitNullFromOptionalProperties;
+        options.response = TsResponsePolicy::DataOnly;
+        let files = generate_files_with_profile_options(
+            &graph,
+            "bookstore",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+            options,
+        )
+        .unwrap();
+        let models = files
+            .iter()
+            .find(|file| file.name == "models.ts")
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(models.contains("title?: string;"), "{models}");
+    }
+
+    #[test]
+    fn openapi_generator_compat_profile_defaults_to_explicit_nullability() {
+        let mut graph = sample_graph();
+        let Type::Object(fields) = &mut graph.schemas[0].body else {
+            panic!("sample Book schema must be an object");
+        };
+        let title = fields
+            .iter_mut()
+            .find(|field| field.json_name == "title")
+            .expect("sample title field");
+        title.nullable = true;
+
+        let files = generate_files_with_profile(
+            &graph,
+            "bookstore",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+        )
+        .unwrap();
+        let models = files
+            .iter()
+            .find(|file| file.name == "models.ts")
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(models.contains("title?: string | null;"), "{models}");
     }
 
     #[test]

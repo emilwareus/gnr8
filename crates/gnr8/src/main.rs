@@ -268,6 +268,31 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                 print_compat_list("missing operation methods", &diff.missing_operation_methods);
                 print_compat_list("missing request aliases", &diff.missing_request_aliases);
                 print_compat_list("package entry changes", &diff.package_entry_point_changes);
+                for missing in &diff.missing_interface_properties {
+                    println!(
+                        "  missing interface property: {}.{}",
+                        missing.interface, missing.property
+                    );
+                }
+                for change in &diff.interface_property_changes {
+                    println!(
+                        "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
+                        change.interface,
+                        change.property,
+                        change.old.optional,
+                        change.new.optional,
+                        change.old.nullable,
+                        change.new.nullable,
+                        change.old.ty,
+                        change.new.ty
+                    );
+                }
+                for change in &diff.operation_return_type_changes {
+                    println!(
+                        "  operation return changed: {} ({} -> {})",
+                        change.operation, change.old, change.new
+                    );
+                }
                 for mismatch in &diff.export_kind_mismatches {
                     println!(
                         "  export kind mismatch: {} ({:?} -> {:?})",
