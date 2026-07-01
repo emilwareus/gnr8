@@ -1315,6 +1315,50 @@ fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
     (toolchain.language().to_string(), present)
 }
 
+fn probe_source_lang_toolchain_from_roots(
+    project_root: &Path,
+    input_roots: &[String],
+) -> Option<(String, bool)> {
+    let mut resolved: Option<(String, bool)> = None;
+    for input_root in input_roots {
+        let (language, present) = probe_source_lang_toolchain(&project_root.join(input_root));
+        if language == "unknown" {
+            continue;
+        }
+        match &mut resolved {
+            None => resolved = Some((language, present)),
+            Some((existing_language, existing_present)) if existing_language == &language => {
+                *existing_present = *existing_present && present;
+            }
+            Some(_) => return None,
+        }
+    }
+    resolved
+}
+
+fn reconcile_doctor_source_probe(
+    project_root: &Path,
+    initial: (String, bool),
+    pipeline_ran: bool,
+    input_roots: &[String],
+) -> (String, bool) {
+    if !pipeline_ran {
+        return initial;
+    }
+
+    if let Some((language, present)) =
+        probe_source_lang_toolchain_from_roots(project_root, input_roots)
+    {
+        return (language, present || pipeline_ran);
+    }
+
+    if !initial.1 {
+        return ("configured".to_string(), true);
+    }
+
+    initial
+}
+
 /// Run `gnr8 doctor`: a health aggregator that runs the user's `.gnr8/` pipeline once and reports its
 /// diagnostics + drift (HARD-01 / D-01, D-02). Mirrors `run_check`'s shell-vs-decision split (this is
 /// the impure shell; the pure grouping + exit policy lives in [`doctor::DoctorReport`]).
@@ -1328,7 +1372,7 @@ fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
 fn run_doctor(output: Output) -> Result<()> {
     let root = project_root()?;
     let initialized = gnr8::workspace::manifest_path(&root).is_file();
-    let (language, source_present) = probe_source_lang_toolchain(&root);
+    let initial_source_probe = probe_source_lang_toolchain(&root);
 
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
     // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
@@ -1340,6 +1384,16 @@ fn run_doctor(output: Output) -> Result<()> {
         None
     };
     let pipeline_ran = bundle.is_some();
+    let cache_input_roots = bundle
+        .as_ref()
+        .map(|bundle| bundle.cache_input_roots.clone())
+        .unwrap_or_default();
+    let (language, source_present) = reconcile_doctor_source_probe(
+        &root,
+        initial_source_probe,
+        pipeline_ran,
+        &cache_input_roots,
+    );
     let diagnostics = bundle.as_ref().map(|b| b.diagnostics.clone());
     let output_anchors = bundle
         .as_ref()
@@ -1492,5 +1546,52 @@ fn fmt_duration(duration: Duration) -> String {
         format!("{millis:.1} ms")
     } else {
         format!("{millis:.0} ms")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::reconcile_doctor_source_probe;
+    use std::path::PathBuf;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gnr8-doctor-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn doctor_source_probe_uses_pipeline_input_roots_when_pipeline_runs() {
+        let root = temp_root("input-roots");
+        let src = root.join("service");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("app.py"), "def app():\n    pass\n").unwrap();
+
+        let (language, present) = reconcile_doctor_source_probe(
+            &root,
+            ("unknown".to_string(), false),
+            true,
+            &["service".to_string()],
+        );
+
+        assert_eq!(language, "python");
+        assert!(present);
+    }
+
+    #[test]
+    fn doctor_source_probe_treats_successful_pipeline_as_configured_source() {
+        let root = temp_root("configured");
+        let (language, present) =
+            reconcile_doctor_source_probe(&root, ("unknown".to_string(), false), true, &[]);
+
+        assert_eq!(language, "configured");
+        assert!(present);
     }
 }

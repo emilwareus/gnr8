@@ -82,7 +82,13 @@ class RouteRecognitionTests(unittest.TestCase):
         self.assertFalse(self._param(r, "cursor")["required"])
         self.assertEqual(
             r["responses"],
-            [{"status": 200, "body": {"ref_id": "app.models.ListBooksResponse"}}],
+            [
+                {
+                    "status": 200,
+                    "body": {"ref_id": "app.models.ListBooksResponse"},
+                    "content_types": ["application/json"],
+                }
+            ],
         )
 
     def test_create_book_body_and_201_status(self):
@@ -92,7 +98,13 @@ class RouteRecognitionTests(unittest.TestCase):
         self.assertEqual(r["request_body"], {"ref_id": "app.models.Book"})
         self.assertEqual(
             r["responses"],
-            [{"status": 201, "body": {"ref_id": "app.models.CreatedMessage"}}],
+            [
+                {
+                    "status": 201,
+                    "body": {"ref_id": "app.models.CreatedMessage"},
+                    "content_types": ["application/json"],
+                }
+            ],
         )
 
     def test_get_book_path_param_named_ref_query_and_union_response(self):
@@ -111,7 +123,13 @@ class RouteRecognitionTests(unittest.TestCase):
         )
         self.assertEqual(
             r["responses"],
-            [{"status": 200, "body": {"ref_id": "app.models.BookOrError"}}],
+            [
+                {
+                    "status": 200,
+                    "body": {"ref_id": "app.models.BookOrError"},
+                    "content_types": ["application/json"],
+                }
+            ],
         )
 
     def test_update_book_path_param_and_body(self):
@@ -122,7 +140,13 @@ class RouteRecognitionTests(unittest.TestCase):
         self.assertEqual(r["request_body"], {"ref_id": "app.models.BookFilters"})
         self.assertEqual(
             r["responses"],
-            [{"status": 200, "body": {"ref_id": "app.models.CreatedMessage"}}],
+            [
+                {
+                    "status": 200,
+                    "body": {"ref_id": "app.models.CreatedMessage"},
+                    "content_types": ["application/json"],
+                }
+            ],
         )
 
     def test_router_prefix_never_folded_into_path(self):

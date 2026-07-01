@@ -1771,8 +1771,9 @@ mod tests {
             g.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
-                body_kind: "json".to_string(),
+                body_kind: "empty".to_string(),
                 content_type: None,
+                content_types: Vec::new(),
             });
             g.operations[0]
                 .responses
@@ -1801,6 +1802,31 @@ mod tests {
             assert!(
                 out.contains("async getBook(bookId: number): Promise<models.Book> {"),
                 "{out}"
+            );
+        }
+
+        #[test]
+        fn binary_success_returns_blob_without_success_json_decode() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.handler == "getBook")
+                .unwrap();
+            op.responses[0].body = None;
+            op.responses[0].body_kind = "binary".to_string();
+            op.responses[0].content_type = None;
+            op.responses[0].content_types = vec!["application/pdf".to_string()];
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
+            assert!(
+                out.contains("async getBook(bookId: number): Promise<Blob> {"),
+                "binary success should return Blob:\n{out}"
+            );
+            assert!(out.contains("return await res.blob();"), "{out}");
+            assert!(
+                !out.contains("return (await res.json()) as models.Book;"),
+                "binary success must not decode JSON:\n{out}"
             );
         }
 

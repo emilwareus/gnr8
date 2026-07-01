@@ -178,15 +178,19 @@ pub struct Response {
     pub status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub body: Option<SchemaRef>,
-    /// Response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes.
+    /// Response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes,
+    /// `"sse"` for event streams, and `"empty"` for bodyless responses.
     #[serde(
         default = "default_response_body_kind",
         skip_serializing_if = "is_json_body_kind"
     )]
     pub body_kind: String,
-    /// Optional response media type, used for binary/file responses and future non-JSON responses.
+    /// Optional response media type, kept for compatibility with earlier custom targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// Response media types, stable target-facing metadata for raw/binary responses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_types: Vec<String>,
 }
 
 fn default_response_body_kind() -> String {
@@ -391,12 +395,43 @@ impl Param {
 
 impl Response {
     fn from_fact(response: ResponseFact) -> Self {
+        let body = response.body.map(SchemaRef::from_fact);
+        let content_types =
+            normalize_content_types(response.content_type.as_deref(), response.content_types);
+        let body_kind =
+            normalize_response_body_kind(&response.body_kind, body.is_some(), &content_types);
         Self {
             status: response.status,
-            body: response.body.map(SchemaRef::from_fact),
-            body_kind: response.body_kind,
+            body,
+            body_kind,
             content_type: response.content_type,
+            content_types,
         }
+    }
+}
+
+fn normalize_content_types(content_type: Option<&str>, content_types: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    if let Some(content_type) = content_type {
+        push_unique_content_type(&mut normalized, content_type.to_string());
+    }
+    for content_type in content_types {
+        push_unique_content_type(&mut normalized, content_type);
+    }
+    normalized
+}
+
+fn push_unique_content_type(content_types: &mut Vec<String>, content_type: String) {
+    if !content_type.is_empty() && !content_types.iter().any(|item| item == &content_type) {
+        content_types.push(content_type);
+    }
+}
+
+fn normalize_response_body_kind(kind: &str, has_body: bool, content_types: &[String]) -> String {
+    if kind == "json" && !has_body && content_types.is_empty() {
+        "empty".to_string()
+    } else {
+        kind.to_string()
     }
 }
 
@@ -730,6 +765,48 @@ mod tests {
             !json.contains("content_type"),
             "absent content type should stay omitted: {json}"
         );
+    }
+
+    #[test]
+    fn response_metadata_canonicalizes_empty_and_content_types() {
+        let facts: GoFacts = serde_json::from_slice(
+            br#"{
+              "module": "github.com/acme/svc",
+              "routes": [
+                {
+                  "method": "GET",
+                  "path": "/export",
+                  "handler": "export",
+                  "operation_id": "export",
+                  "params": [],
+                  "request_body": null,
+                  "responses": [
+                    { "status": 204, "body": null },
+                    {
+                      "status": 200,
+                      "body": null,
+                      "body_kind": "binary",
+                      "content_type": "application/json"
+                    }
+                  ],
+                  "span": { "file": "/root/http.go", "start_line": 10, "end_line": 10 }
+                }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#,
+        )
+        .unwrap();
+        let graph = ApiGraph::from_facts(facts, "/root");
+        let responses = &graph.operations[0].responses;
+
+        assert_eq!(responses[0].status, 200);
+        assert_eq!(responses[0].body_kind, "binary");
+        assert_eq!(responses[0].content_types, vec!["application/json"]);
+
+        assert_eq!(responses[1].status, 204);
+        assert_eq!(responses[1].body_kind, "empty");
+        assert!(responses[1].content_types.is_empty());
     }
 
     #[test]

@@ -47,6 +47,8 @@ operations:
       - status: 200
         body:
           ref_id: src/books.dto.ListBooksResponse
+        content_types:
+          - application/json
     provenance:
       file: src/books.controller.ts
       start_line: 41
@@ -62,6 +64,8 @@ operations:
       - status: 201
         body:
           ref_id: src/books.dto.CreatedMessage
+        content_types:
+          - application/json
     provenance:
       file: src/books.controller.ts
       start_line: 51
@@ -98,6 +102,8 @@ operations:
       - status: 200
         body:
           ref_id: src/books.dto.BookOrError
+        content_types:
+          - application/json
     provenance:
       file: src/books.controller.ts
       start_line: 57
@@ -125,6 +131,8 @@ operations:
       - status: 200
         body:
           ref_id: src/books.dto.CreatedMessage
+        content_types:
+          - application/json
     provenance:
       file: src/books.controller.ts
       start_line: 65

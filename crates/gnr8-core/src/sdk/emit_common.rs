@@ -466,6 +466,7 @@ pub(crate) fn success_responses_of(
                         body_statuses.push(resp.status);
                     }
                 }
+                "empty" => {}
                 "binary" | "sse" => {
                     if resp.body.is_some() {
                         if resp.body_kind == "sse" {
@@ -488,6 +489,7 @@ pub(crate) fn success_responses_of(
                     let content_type = resp
                         .content_type
                         .clone()
+                        .or_else(|| resp.content_types.first().cloned())
                         .unwrap_or_else(|| "application/octet-stream".to_string());
                     if binary_content_type.is_none() {
                         binary_content_type = Some(content_type);
@@ -585,12 +587,14 @@ mod tests {
                     body: None,
                     body_kind: "binary".to_string(),
                     content_type: Some("application/pdf".to_string()),
+                    content_types: vec!["application/pdf".to_string()],
                 },
                 Response {
                     status: 206,
                     body: None,
                     body_kind: "binary".to_string(),
                     content_type: Some("application/octet-stream".to_string()),
+                    content_types: vec!["application/octet-stream".to_string()],
                 },
             ],
             security: Vec::new(),
@@ -603,6 +607,10 @@ mod tests {
         };
         let success = success_responses_of(&op, &graph)?;
         assert_eq!(success.binary_statuses, vec![200, 206]);
+        assert_eq!(
+            success.binary_content_type.as_deref(),
+            Some("application/pdf")
+        );
         assert!(success.has_binary_body());
         assert!(!success.has_bodyless_alternative());
         Ok(())

@@ -1032,7 +1032,11 @@ func (a *Analyzer) analyzeJSON(
 		file, line := positionOf(h.fset, call.Pos())
 		diags.DynamicResponse(route.Handler, "response body does not resolve to a named type", file, line)
 	}
-	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{Status: status, Body: body}, false)
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+		Status:       status,
+		Body:         body,
+		ContentTypes: []string{"application/json"},
+	}, false)
 }
 
 func (a *Analyzer) analyzeStatus(
@@ -1065,9 +1069,10 @@ func (a *Analyzer) analyzeBinaryStatus(
 	contentType string,
 ) {
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
-		Status:      status,
-		BodyKind:    "binary",
-		ContentType: responseContentType(contentType),
+		Status:       status,
+		BodyKind:     "binary",
+		ContentType:  responseContentType(contentType),
+		ContentTypes: responseContentTypes(responseContentType(contentType)),
 	}, false)
 }
 
@@ -1077,9 +1082,10 @@ func (a *Analyzer) addSSEResponse(
 	provisionalStatus map[uint16]bool,
 ) {
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
-		Status:      200,
-		BodyKind:    "sse",
-		ContentType: "text/event-stream",
+		Status:       200,
+		BodyKind:     "sse",
+		ContentType:  "text/event-stream",
+		ContentTypes: []string{"text/event-stream"},
 	}, false)
 }
 
@@ -1136,9 +1142,10 @@ func (a *Analyzer) analyzeData(
 		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
-		Status:      status,
-		BodyKind:    "binary",
-		ContentType: contentType,
+		Status:       status,
+		BodyKind:     "binary",
+		ContentType:  contentType,
+		ContentTypes: responseContentTypes(contentType),
 	}, false)
 }
 
@@ -1168,9 +1175,10 @@ func (a *Analyzer) analyzeDataFromReader(
 		diags.Warn("unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
-		Status:      status,
-		BodyKind:    "binary",
-		ContentType: contentType,
+		Status:       status,
+		BodyKind:     "binary",
+		ContentType:  contentType,
+		ContentTypes: responseContentTypes(contentType),
 	}, false)
 }
 
@@ -1203,6 +1211,13 @@ func responseContentType(contentType string) string {
 		return "application/octet-stream"
 	}
 	return contentType
+}
+
+func responseContentTypes(contentType string) []string {
+	if contentType == "" {
+		return nil
+	}
+	return []string{contentType}
 }
 
 func (a *Analyzer) stringValueOf(h handlerDecl, expr ast.Expr) (string, bool) {

@@ -104,12 +104,16 @@ pub(crate) struct ResponseFact {
     pub(crate) status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub(crate) body: Option<TypeRef>,
-    /// The response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes.
+    /// The response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes,
+    /// `"sse"` for event streams, and `"empty"` for bodyless responses.
     #[serde(default = "default_response_body_kind")]
     pub(crate) body_kind: String,
     /// Optional response media type, used primarily for binary/file responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) content_type: Option<String>,
+    /// Response media types, used by custom targets that need first-class raw/binary metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) content_types: Vec<String>,
 }
 
 fn default_response_body_kind() -> String {

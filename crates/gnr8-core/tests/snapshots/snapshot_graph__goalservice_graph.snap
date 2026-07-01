@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_graph.rs
-assertion_line: 26
 expression: graph
 ---
 module: github.com/gnr8/gnr8-fixtures/goalservice
@@ -16,9 +15,13 @@ operations:
       - status: 201
         body:
           ref_id: internal/common/dto.CommandMessageWithUUID
+        content_types:
+          - application/json
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
+        content_types:
+          - application/json
     provenance:
       file: internal/goal/ports/http.go
       start_line: 55
@@ -66,6 +69,8 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.ListGoalsOutput
+        content_types:
+          - application/json
     provenance:
       file: internal/goal/ports/http.go
       start_line: 56
@@ -91,9 +96,13 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.CommandMessage
+        content_types:
+          - application/json
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
+        content_types:
+          - application/json
     provenance:
       file: internal/goal/ports/http.go
       start_line: 58
@@ -120,9 +129,13 @@ operations:
       - status: 200
         body:
           ref_id: internal/common/dto.CommandMessage
+        content_types:
+          - application/json
       - status: 400
         body:
           ref_id: internal/common/dto.HttpError
+        content_types:
+          - application/json
     provenance:
       file: internal/goal/ports/http.go
       start_line: 57

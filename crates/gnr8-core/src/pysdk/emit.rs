@@ -1808,8 +1808,9 @@ mod tests {
             g.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
-                body_kind: "json".to_string(),
+                body_kind: "empty".to_string(),
                 content_type: None,
+                content_types: Vec::new(),
             });
             g.operations[0]
                 .responses
@@ -1877,6 +1878,7 @@ mod tests {
                 .unwrap();
             op.responses[0].body_kind = "binary".to_string();
             op.responses[0].content_type = Some("application/pdf".to_string());
+            op.responses[0].content_types = vec!["application/pdf".to_string()];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("def list_books(self, cursor=None) -> bytes:"),
@@ -1900,11 +1902,13 @@ mod tests {
                 .unwrap();
             op.responses[0].body_kind = "binary".to_string();
             op.responses[0].content_type = Some("application/pdf".to_string());
+            op.responses[0].content_types = vec!["application/pdf".to_string()];
             op.responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
-                body_kind: "json".to_string(),
+                body_kind: "empty".to_string(),
                 content_type: None,
+                content_types: Vec::new(),
             });
             op.responses.sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();

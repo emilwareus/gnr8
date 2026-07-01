@@ -116,11 +116,18 @@ impl Source for GoGin {
     }
 
     fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        let [single] = self.inputs.as_slice() else {
-            return None;
-        };
-        Some(vec![cx.project_root.join(single)])
+        single_input_cache_root(&cx.project_root, &self.inputs)
     }
+}
+
+fn single_input_cache_root(
+    project_root: &Path,
+    inputs: &[String],
+) -> Option<Vec<std::path::PathBuf>> {
+    let [single] = inputs else {
+        return None;
+    };
+    Some(vec![project_root.join(single)])
 }
 
 fn go_gin_cache_key(input: &Path, package_patterns: &[String], cx: &Cx) -> String {
@@ -274,6 +281,10 @@ impl Source for FastApi {
             crate::analyze::Lang::Python,
         )
     }
+
+    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
+        single_input_cache_root(&cx.project_root, &self.inputs)
+    }
 }
 
 /// The Flask (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
@@ -332,6 +343,10 @@ impl Source for Flask {
             &resolved.to_string_lossy(),
             crate::analyze::Lang::Python,
         )
+    }
+
+    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
+        single_input_cache_root(&cx.project_root, &self.inputs)
     }
 }
 
@@ -393,6 +408,10 @@ impl Source for NestJs {
             &resolved.to_string_lossy(),
             crate::analyze::Lang::TypeScript,
         )
+    }
+
+    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
+        single_input_cache_root(&cx.project_root, &self.inputs)
     }
 }
 
@@ -604,6 +623,7 @@ impl Transform for SetOperationSuccessResponse {
             body: Some(SchemaRef { ref_id: schema_id }),
             body_kind: "json".to_string(),
             content_type: None,
+            content_types: vec!["application/json".to_string()],
         });
         op.responses.sort_by_key(|response| response.status);
         Ok(())
@@ -1069,6 +1089,11 @@ fn apply_response_override(
         body,
         body_kind: override_.body_kind.clone(),
         content_type: override_.content_type.clone(),
+        content_types: override_
+            .content_type
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
     });
     op.responses.sort_by_key(|response| response.status);
     Ok(())
@@ -3026,6 +3051,25 @@ mod tests {
     }
 
     #[test]
+    fn language_sources_report_cache_input_roots_for_doctor_probe() {
+        let root = temp_project("source-roots");
+        let cx = Cx::new(&root);
+
+        assert_eq!(
+            FastApi::new().inputs(["api"]).cache_input_roots(&cx),
+            Some(vec![root.join("api")])
+        );
+        assert_eq!(
+            Flask::new().inputs(["flask_app"]).cache_input_roots(&cx),
+            Some(vec![root.join("flask_app")])
+        );
+        assert_eq!(
+            NestJs::new().inputs(["src"]).cache_input_roots(&cx),
+            Some(vec![root.join("src")])
+        );
+    }
+
+    #[test]
     fn apply_security_can_scope_schemes_to_routes_and_methods() {
         let mut ir = ApiGraph {
             base_path: "/v1".to_string(),
@@ -3306,14 +3350,16 @@ mod tests {
                     crate::graph::Response {
                         status: 200,
                         body: None,
-                        body_kind: "json".to_string(),
+                        body_kind: "empty".to_string(),
                         content_type: None,
+                        content_types: Vec::new(),
                     },
                     crate::graph::Response {
                         status: 404,
                         body: None,
-                        body_kind: "json".to_string(),
+                        body_kind: "empty".to_string(),
                         content_type: None,
+                        content_types: Vec::new(),
                     },
                 ],
                 security: Vec::new(),
