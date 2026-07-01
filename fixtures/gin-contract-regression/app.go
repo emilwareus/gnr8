@@ -39,6 +39,8 @@ type MessageResponse struct {
 	Message string `json:"message"`
 }
 
+type FileBytes []byte
+
 func RegisterRoutes(r *gin.Engine, h *Handler) {
 	v1 := r.Group("/v1")
 
@@ -65,6 +67,7 @@ func (h *Handler) login(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
 		return
 	}
+	c.Status(http.StatusOK)
 	c.JSON(http.StatusOK, LoginResponse{Token: "token"})
 }
 
@@ -111,7 +114,8 @@ func (h *Handler) openFile(c *gin.Context) {
 }
 
 func (h *Handler) streamFile(c *gin.Context) {
-	c.Data(http.StatusOK, "application/pdf", []byte("..."))
+	payload := FileBytes("...")
+	c.Data(http.StatusOK, "application/pdf", payload)
 }
 
 func (h *Handler) createJob(c *gin.Context) {

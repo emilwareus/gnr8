@@ -1025,25 +1025,25 @@ fn emit_operation(
 
     let body_model = body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
-    if success.has_binary_body() {
-        return Err(CoreError::SdkGen {
-            message: format!(
-                "operation '{}' has a binary success response, which the Python SDK target does not yet support",
-                op.id
-            ),
-        });
-    }
     let return_model = success.body_model.clone();
-    let return_hint = return_model.as_ref().map_or_else(
-        || "Any".to_string(),
-        |model| {
-            if success.has_bodyless_alternative() {
-                format!("Optional[{model}]")
-            } else {
-                model.clone()
-            }
-        },
-    );
+    let return_hint = if success.has_binary_body() {
+        if success.has_bodyless_alternative() {
+            "Optional[bytes]".to_string()
+        } else {
+            "bytes".to_string()
+        }
+    } else {
+        return_model.as_ref().map_or_else(
+            || "Any".to_string(),
+            |model| {
+                if success.has_bodyless_alternative() {
+                    format!("Optional[{model}]")
+                } else {
+                    model.clone()
+                }
+            },
+        )
+    };
 
     // Resolve every emitted argument's keyword/digit-safe Python identifier ONCE, collision-checked
     // against `self`/`body` and each other (CR-02 / WR-03 / WR-01 ordering); see [`resolve_op_args`].
@@ -1135,7 +1135,20 @@ fn emit_operation(
     .map_err(sink)?;
     writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
     writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
-    if let Some(model) = &return_model {
+    if success.has_binary_body() {
+        writeln!(
+            out,
+            "        if _status in {}:",
+            py_status_tuple(&success.binary_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(out, "            return _raw").map_err(sink)?;
+        if success.has_bodyless_alternative() {
+            writeln!(out, "        return None").map_err(sink)?;
+        } else {
+            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
+        }
+    } else if let Some(model) = &return_model {
         writeln!(
             out,
             "        if _status in {}:",
@@ -1794,6 +1807,55 @@ mod tests {
                 !out.contains(", body=body"),
                 "query op has no body arg:\n{out}"
             );
+        }
+
+        #[test]
+        fn binary_success_returns_bytes_without_json_decode() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.handler == "listBooks")
+                .unwrap();
+            op.responses[0].body_kind = "binary".to_string();
+            op.responses[0].content_type = Some("application/pdf".to_string());
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("def list_books(self, cursor=None) -> bytes:"),
+                "{out}"
+            );
+            assert!(out.contains("if _status in (200,):"), "{out}");
+            assert!(out.contains("return _raw"), "{out}");
+            assert!(
+                !out.contains("return json.loads(_raw) if _raw else None"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn binary_success_with_bodyless_alternate_returns_optional_bytes() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.handler == "listBooks")
+                .unwrap();
+            op.responses[0].body_kind = "binary".to_string();
+            op.responses[0].content_type = Some("application/pdf".to_string());
+            op.responses.push(crate::graph::Response {
+                status: 204,
+                body: None,
+                body_kind: "json".to_string(),
+                content_type: None,
+            });
+            op.responses.sort_by_key(|response| response.status);
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("def list_books(self, cursor=None) -> Optional[bytes]:"),
+                "{out}"
+            );
+            assert!(out.contains("return _raw"), "{out}");
+            assert!(out.contains("return None"), "{out}");
         }
 
         #[test]

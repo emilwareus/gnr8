@@ -20,7 +20,7 @@
 //! fails on them). Every un-representable fact (dangling `$ref`, unknown `kind`) returns
 //! [`crate::CoreError::SdkGen`]; there is no prod `unwrap`/`expect`/`panic` (RUST-04).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
@@ -2301,6 +2301,27 @@ pub(crate) fn emit_operations(
     ops: &[&Operation],
     auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
+    emit_operations_inner(graph, package, base_path, ops, auth_header, true)
+}
+
+pub(crate) fn emit_operations_without_facades(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+    auth_header: Option<&str>,
+) -> Result<String, CoreError> {
+    emit_operations_inner(graph, package, base_path, ops, auth_header, false)
+}
+
+fn emit_operations_inner(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+    auth_header: Option<&str>,
+    include_facades: bool,
+) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut first = true;
     for op in ops {
@@ -2336,13 +2357,39 @@ pub(crate) fn emit_operations(
         imports.push("fmt");
         imports.push("net/url");
     }
-    emit_group_facades(&mut body, ops)?;
+    if include_facades {
+        emit_group_facades(&mut body, graph, ops)?;
+    }
     Ok(file(package, &imports, &body))
 }
 
-fn emit_group_facades(body: &mut String, ops: &[&Operation]) -> Result<(), CoreError> {
-    let mut groups = BTreeSet::new();
+pub(crate) fn emit_facades(
+    graph: &ApiGraph,
+    package: &str,
+    ops: &[&Operation],
+) -> Result<Option<String>, CoreError> {
+    let mut body = String::new();
+    emit_group_facades(&mut body, graph, ops)?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(file(package, &[], &body)))
+}
+
+fn emit_group_facades(
+    body: &mut String,
+    graph: &ApiGraph,
+    ops: &[&Operation],
+) -> Result<(), CoreError> {
+    let mut groups = BTreeMap::new();
+    let mut facade_methods = BTreeMap::new();
+    let mut facade_types = BTreeMap::new();
     let method_names: BTreeSet<String> = ops.iter().map(|op| exported(&op.handler)).collect();
+    let schema_names: BTreeSet<&str> = graph
+        .schemas
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect();
     for op in ops {
         let Some(group) = &op.group else {
             continue;
@@ -2351,6 +2398,14 @@ fn emit_group_facades(body: &mut String, ops: &[&Operation]) -> Result<(), CoreE
             continue;
         }
         let method_name = exported(group);
+        let type_name = format!("{method_name}API");
+        if schema_names.contains(type_name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation group {group:?} cannot be emitted as Go facade type {type_name} because a schema uses that name"
+                ),
+            });
+        }
         if method_names.contains(&method_name) {
             return Err(CoreError::SdkGen {
                 message: format!(
@@ -2358,12 +2413,27 @@ fn emit_group_facades(body: &mut String, ops: &[&Operation]) -> Result<(), CoreE
                 ),
             });
         }
-        if !groups.insert((group.clone(), method_name)) {
-            continue;
+        if let Some(existing) = facade_methods.insert(method_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit Go Client facade method {method_name}"
+                    ),
+                });
+            }
         }
+        if let Some(existing) = facade_types.insert(type_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit Go facade type {type_name}"
+                    ),
+                });
+            }
+        }
+        groups.insert(group.clone(), (method_name, type_name));
     }
-    for (group, method_name) in groups {
-        let type_name = format!("{}API", exported(&group));
+    for (_group, (method_name, type_name)) in groups {
         writeln!(body).map_err(sink)?;
         writeln!(body, "type {type_name} struct {{").map_err(sink)?;
         writeln!(body, "*Client").map_err(sink)?;
@@ -3510,6 +3580,67 @@ mod tests {
             assert!(
                 msg.contains("do not match its path params"),
                 "expected a path-token mismatch SdkGen error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_name_collision_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 } },
+                { "method": "GET", "path": "/b", "handler": "listB",
+                  "operation_id": "listB", "group": "foo_bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("both emit Go Client facade method FooBar"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_type_collision_with_schema_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [
+                {
+                  "id": "app.FooBarAPI",
+                  "name": "FooBarAPI",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/models.go", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            assert!(
+                err.to_string().contains("because a schema uses that name"),
+                "{err}"
             );
         }
 

@@ -31,6 +31,12 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	if err := json.NewDecoder(tmp).Decode(&doc); err != nil {
 		t.Fatalf("decode facts: %v", err)
 	}
+	if len(doc.Diagnostics) != 0 {
+		t.Fatalf("gin contract fixture should not emit diagnostics, got %+v", doc.Diagnostics)
+	}
+
+	login := routeByHandler(t, doc, "login")
+	assertResponseBodyRef(t, login, 200, "LoginResponse")
 
 	getChild := routeByHandler(t, doc, "getChild")
 	assertPathParam(t, getChild, "itemId")
@@ -107,4 +113,18 @@ func assertBodylessStatus(t *testing.T, route facts.RouteFact, status uint16) {
 	if len(route.Responses) != 1 || route.Responses[0].Status != status || route.Responses[0].Body != nil {
 		t.Fatalf("%s should have bodyless status %d, got %+v", route.Handler, status, route.Responses)
 	}
+}
+
+func assertResponseBodyRef(t *testing.T, route facts.RouteFact, status uint16, refID string) {
+	t.Helper()
+	for _, response := range route.Responses {
+		if response.Status != status {
+			continue
+		}
+		if response.Body == nil || response.Body.RefID != refID {
+			t.Fatalf("%s response %d should reference %s, got %+v", route.Handler, status, refID, response)
+		}
+		return
+	}
+	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
 }

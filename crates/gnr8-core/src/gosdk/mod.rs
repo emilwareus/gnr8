@@ -130,10 +130,18 @@ pub(crate) fn generate_files_with_profile(
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
         for op in &ops {
-            let raw =
-                emit::emit_operations(graph, package, base_path, &[*op], auth_header.as_deref())?;
+            let raw = emit::emit_operations_without_facades(
+                graph,
+                package,
+                base_path,
+                &[*op],
+                auth_header.as_deref(),
+            )?;
             let name = operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
             files.push(raw_go_file(name, raw));
+        }
+        if let Some(raw) = emit::emit_facades(graph, package, &ops)? {
+            files.push(raw_go_file("facades.go", raw));
         }
         for schema in &graph.schemas {
             let raw = emit::emit_model_schema_with_options(graph, package, schema, compat_options)?;
@@ -390,6 +398,30 @@ mod tests {
         assert!(
             !out.contains("// ==== gnr8:file models.go ===="),
             "split layout must not emit the compact models file:\n{out}"
+        );
+    }
+
+    #[test]
+    fn split_layout_emits_group_facades_once() {
+        if !gofmt_available() {
+            eprintln!("skipping split facade test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        for op in &mut graph.operations {
+            op.group = Some("Goals".to_string());
+        }
+        let out =
+            generate_with_layout(&graph, "goalservice", "/goal", &SdkFileLayout::split()).unwrap();
+        assert!(
+            out.contains("// ==== gnr8:file facades.go ===="),
+            "split layout should emit a dedicated facade file:\n{out}"
+        );
+        assert_eq!(out.matches("type GoalsAPI struct").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("func (c *Client) Goals() *GoalsAPI").count(),
+            1,
+            "{out}"
         );
     }
 

@@ -191,6 +191,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	cf := CodeFacts{Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	seenParam := map[string]bool{}
 	seenStatus := map[uint16]bool{}
+	provisionalStatus := map[uint16]bool{}
 	formFields := map[string]facts.FieldFact{}
 	formHasFile := false
 	contentTypeHint := ""
@@ -215,9 +216,11 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				cf.RequestBodyContentType = bindContentType(name, h.info, call, bound)
 			}
 		case "JSON":
-			a.analyzeJSON(h, call, route, &cf, seenStatus, diags)
-		case "Status", "AbortWithStatus":
-			a.analyzeStatus(h, call, route, &cf, seenStatus, diags)
+			a.analyzeJSON(h, call, route, &cf, seenStatus, provisionalStatus, diags)
+		case "Status":
+			a.analyzeStatus(h, call, route, &cf, seenStatus, provisionalStatus, true, diags)
+		case "AbortWithStatus":
+			a.analyzeStatus(h, call, route, &cf, seenStatus, provisionalStatus, false, diags)
 		case "Header":
 			if key, ok := stringArg(call, 0); ok && strings.EqualFold(key, "Content-Type") {
 				if value, ok := stringArg(call, 1); ok {
@@ -225,9 +228,9 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				}
 			}
 		case "File", "FileAttachment":
-			a.analyzeBinaryStatus(&cf, seenStatus, 200, contentTypeHint)
+			a.analyzeBinaryStatus(&cf, seenStatus, provisionalStatus, 200, contentTypeHint)
 		case "Data":
-			a.analyzeData(h, call, route, &cf, seenStatus, diags)
+			a.analyzeData(h, call, route, &cf, seenStatus, provisionalStatus, diags)
 		case "Param":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["path/"+pname] {
 				seenParam["path/"+pname] = true
@@ -454,6 +457,7 @@ func (a *Analyzer) analyzeJSON(
 	route routes.Route,
 	cf *CodeFacts,
 	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
 	diags *diag.Accumulator,
 ) {
 	if len(call.Args) < 2 {
@@ -465,10 +469,6 @@ func (a *Analyzer) analyzeJSON(
 		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
-	if seenStatus[status] {
-		return // first wins; identical status duplicates collapse deterministically.
-	}
-	seenStatus[status] = true
 
 	var body *facts.TypeRef
 	if id, schema, ok := a.syntheticJSONResponse(h, call.Args[1], route.Handler, status); ok {
@@ -480,7 +480,7 @@ func (a *Analyzer) analyzeJSON(
 		file, line := positionOf(h.fset, call.Pos())
 		diags.DynamicResponse(route.Handler, "response body does not resolve to a named type", file, line)
 	}
-	cf.Responses = append(cf.Responses, facts.ResponseFact{Status: status, Body: body})
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{Status: status, Body: body}, false)
 }
 
 func (a *Analyzer) analyzeStatus(
@@ -489,6 +489,8 @@ func (a *Analyzer) analyzeStatus(
 	route routes.Route,
 	cf *CodeFacts,
 	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	provisional bool,
 	diags *diag.Accumulator,
 ) {
 	if len(call.Args) < 1 {
@@ -500,20 +502,21 @@ func (a *Analyzer) analyzeStatus(
 		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
-	a.addResponse(cf, seenStatus, facts.ResponseFact{Status: status})
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{Status: status}, provisional)
 }
 
 func (a *Analyzer) analyzeBinaryStatus(
 	cf *CodeFacts,
 	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
 	status uint16,
 	contentType string,
 ) {
-	a.addResponse(cf, seenStatus, facts.ResponseFact{
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:      status,
 		BodyKind:    "binary",
 		ContentType: responseContentType(contentType),
-	})
+	}, false)
 }
 
 func (a *Analyzer) analyzeData(
@@ -522,6 +525,7 @@ func (a *Analyzer) analyzeData(
 	route routes.Route,
 	cf *CodeFacts,
 	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
 	diags *diag.Accumulator,
 ) {
 	if len(call.Args) < 3 {
@@ -540,24 +544,39 @@ func (a *Analyzer) analyzeData(
 	}
 	contentType := ""
 	if value, ok := stringArg(call, 1); ok {
-		contentType = value
+		contentType = responseContentType(value)
+	} else {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic (GO-05)", file, line)
 	}
-	a.addResponse(cf, seenStatus, facts.ResponseFact{
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:      status,
 		BodyKind:    "binary",
-		ContentType: responseContentType(contentType),
-	})
+		ContentType: contentType,
+	}, false)
 }
 
 func (a *Analyzer) addResponse(
 	cf *CodeFacts,
 	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
 	response facts.ResponseFact,
+	provisional bool,
 ) {
 	if seenStatus[response.Status] {
+		if provisionalStatus[response.Status] && !provisional {
+			for i := range cf.Responses {
+				if cf.Responses[i].Status == response.Status {
+					cf.Responses[i] = response
+					break
+				}
+			}
+			provisionalStatus[response.Status] = false
+		}
 		return
 	}
 	seenStatus[response.Status] = true
+	provisionalStatus[response.Status] = provisional
 	cf.Responses = append(cf.Responses, response)
 }
 
@@ -569,6 +588,12 @@ func responseContentType(contentType string) string {
 }
 
 func isByteSlice(t gotypes.Type) bool {
+	if t == nil {
+		return false
+	}
+	if named, ok := gotypes.Unalias(t).(*gotypes.Named); ok {
+		t = named.Underlying()
+	}
 	slice, ok := gotypes.Unalias(t).(*gotypes.Slice)
 	if !ok {
 		return false

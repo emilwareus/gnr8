@@ -668,7 +668,11 @@ fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
         return Ok(());
     }
     let method_names: BTreeSet<String> = ops.iter().map(|op| camel(&op.handler)).collect();
-    let mut properties = BTreeSet::new();
+    let mut properties: BTreeSet<String> = ["apiKey", "baseUrl", "constructor", "fetchFn"]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut class_names = BTreeMap::new();
     for group in groups.keys() {
         let property = camel(group);
         if property.is_empty()
@@ -681,11 +685,20 @@ fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
                 ),
             });
         }
+        let class_name = api_class_name(group);
+        if let Some(existing) = class_names.insert(class_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit TypeScript facade class {class_name}"
+                    ),
+                });
+            }
+        }
         writeln!(
             out,
             "\n  get {property}(): {} {{\n    return new {}(this);\n  }}",
-            api_class_name(group),
-            api_class_name(group)
+            class_name, class_name
         )
         .map_err(sink)?;
     }
@@ -1771,6 +1784,61 @@ mod tests {
             let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
             assert!(
                 err.to_string().contains("do not match its path params"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_name_collision_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                { "method": "GET", "path": "/b", "handler": "listB",
+                  "operation_id": "listB", "group": "foo_bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be emitted as a TypeScript Client facade property"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_collision_with_client_member_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "base-url",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be emitted as a TypeScript Client facade property"),
                 "{err}"
             );
         }

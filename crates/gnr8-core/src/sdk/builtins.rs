@@ -127,7 +127,7 @@ fn go_gin_cache_key(input: &Path, package_patterns: &[String], cx: &Cx) -> Strin
     let mut files = Vec::new();
     collect_cache_input_files(input, &mut files);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-go-gin-source-cache-v1\n");
+    hasher.update(b"gnr8-go-gin-source-cache-v2\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
     for pattern in package_patterns {
