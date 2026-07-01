@@ -15,6 +15,8 @@
 //	c.JSON(http.StatusXxx, y)   -> responses[status] = TypeOf(y); status via go/constant
 //	c.Param("name")             -> path param (string, required)
 //	c.Query("name")             -> query param (string) + untyped-query WARN diagnostic
+//	c.DefaultQuery("n", "d")    -> optional query param (string) + default
+//	c.GetQuery("name")          -> optional query param (string)
 //
 // Status numbers come from `go/constant` on the resolved `*types.Const` (e.g.
 // http.StatusCreated -> 201), never a hardcoded name->number map.
@@ -40,6 +42,7 @@ import (
 // facts — there is no annotation/fallback path (CLAUDE.md rules 1 & 3).
 type CodeFacts struct {
 	RequestBody            *facts.TypeRef
+	RequestBodyRequired    bool
 	RequestBodyContentType string
 	Responses              []facts.ResponseFact
 	Params                 []facts.ParamFact
@@ -185,16 +188,19 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFacts {
 	h, ok := a.idx[route.Handler]
 	if !ok || h.decl == nil || h.decl.Body == nil {
-		return CodeFacts{Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
+		return CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	}
 
-	cf := CodeFacts{Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
+	cf := CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	seenParam := map[string]bool{}
 	seenStatus := map[uint16]bool{}
 	provisionalStatus := map[uint16]bool{}
 	formFields := map[string]facts.FieldFact{}
 	formHasFile := false
 	contentTypeHint := ""
+	optionalBindPositions := collectOptionalBindPositions(h)
+	hasBodyBind := false
+	allBodyBindsOptional := true
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -203,16 +209,25 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
+			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
 			return true
 		}
 		switch name {
 		case "ShouldBindJSON", "BindJSON":
 			if ref, _, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
+				hasBodyBind = true
+				if !optionalBindPositions[call.Pos()] {
+					allBodyBindsOptional = false
+				}
 			}
 		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
 			if ref, bound, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
+				hasBodyBind = true
+				if !optionalBindPositions[call.Pos()] {
+					allBodyBindsOptional = false
+				}
 				cf.RequestBodyContentType = bindContentType(name, h.info, call, bound)
 			}
 		case "JSON":
@@ -223,7 +238,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			a.analyzeStatus(h, call, route, &cf, seenStatus, provisionalStatus, false, diags)
 		case "Header":
 			if key, ok := stringArg(call, 0); ok && strings.EqualFold(key, "Content-Type") {
-				if value, ok := stringArg(call, 1); ok {
+				if value, ok := a.stringValueOf(h, call.Args[1]); ok {
 					contentTypeHint = value
 				}
 			}
@@ -231,17 +246,27 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			a.analyzeBinaryStatus(&cf, seenStatus, provisionalStatus, 200, contentTypeHint)
 		case "Data":
 			a.analyzeData(h, call, route, &cf, seenStatus, provisionalStatus, diags)
+		case "DataFromReader":
+			a.analyzeDataFromReader(h, call, route, &cf, seenStatus, provisionalStatus, diags)
+		case "SSEvent":
+			a.addSSEResponse(&cf, seenStatus, provisionalStatus)
+		case "Stream":
+			if streamCallContainsSSEvent(h.info, call) {
+				a.addSSEResponse(&cf, seenStatus, provisionalStatus)
+			}
 		case "Param":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["path/"+pname] {
 				seenParam["path/"+pname] = true
 				cf.Params = append(cf.Params, pathParam(pname, h.fset, call.Pos()))
 			}
-		case "Query":
+		case "Query", "DefaultQuery", "GetQuery":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["query/"+pname] {
 				seenParam["query/"+pname] = true
 				file, line := positionOf(h.fset, call.Pos())
-				cf.Params = append(cf.Params, queryParam(pname, h.fset, call.Pos()))
-				diags.UntypedQueryParam(pname, route.Method, untypedRouteLabel(route), file, line)
+				cf.Params = append(cf.Params, queryParamFromGinCall(h.info, name, pname, h.fset, call))
+				if name == "Query" {
+					diags.UntypedQueryParam(pname, route.Method, untypedRouteLabel(route), file, line)
+				}
 			}
 		case "FormFile":
 			if fname, ok := stringArg(call, 0); ok {
@@ -284,7 +309,534 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			Span: spanOf(h.fset, declPos(h.decl)),
 		})
 	}
+	if hasBodyBind {
+		cf.RequestBodyRequired = !allBodyBindsOptional
+	}
 	return cf
+}
+
+func collectOptionalBindPositions(h handlerDecl) map[token.Pos]bool {
+	out := map[token.Pos]bool{}
+	if h.decl == nil || h.decl.Body == nil {
+		return out
+	}
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok || !isOptionalBodyGuard(h.info, ifStmt.Cond) {
+			return true
+		}
+		ast.Inspect(ifStmt.Body, func(child ast.Node) bool {
+			call, ok := child.(*ast.CallExpr)
+			if !ok || !isGinBindCall(h.info, call) {
+				return true
+			}
+			out[call.Pos()] = true
+			return true
+		})
+		return true
+	})
+	return out
+}
+
+func isOptionalBodyGuard(info *gotypes.Info, expr ast.Expr) bool {
+	return isBodyPresentPredicate(info, expr)
+}
+
+func isBodyPresentPredicate(info *gotypes.Info, expr ast.Expr) bool {
+	switch node := expr.(type) {
+	case *ast.BinaryExpr:
+		switch node.Op {
+		case token.LOR:
+			return isBodyPresentPredicate(info, node.X) && isBodyPresentPredicate(info, node.Y)
+		case token.LAND:
+			return isBodyPresentPredicate(info, node.X) || isBodyPresentPredicate(info, node.Y)
+		case token.GTR:
+			return isContentLengthExpr(info, node.X) && isZeroLiteral(node.Y)
+		case token.LSS:
+			return isZeroLiteral(node.X) && isContentLengthExpr(info, node.Y)
+		case token.NEQ:
+			return (isContentLengthExpr(info, node.X) && isZeroLiteral(node.Y)) ||
+				(isZeroLiteral(node.X) && isContentLengthExpr(info, node.Y)) ||
+				(isContentLengthHeaderCall(info, node.X) && isEmptyStringLiteral(node.Y)) ||
+				(isEmptyStringLiteral(node.X) && isContentLengthHeaderCall(info, node.Y))
+		}
+	case *ast.ParenExpr:
+		return isBodyPresentPredicate(info, node.X)
+	}
+	return false
+}
+
+func isContentLengthExpr(info *gotypes.Info, expr ast.Expr) bool {
+	switch node := expr.(type) {
+	case *ast.SelectorExpr:
+		return isGinRequestContentLength(info, node)
+	case *ast.CallExpr:
+		if selectorName(node.Fun) == "len" && len(node.Args) == 1 {
+			return isContentLengthHeaderValueExpr(info, node.Args[0])
+		}
+	}
+	return false
+}
+
+func isGinRequestContentLength(info *gotypes.Info, selector *ast.SelectorExpr) bool {
+	if info == nil {
+		return false
+	}
+	if selector == nil || selector.Sel == nil || selector.Sel.Name != "ContentLength" {
+		return false
+	}
+	requestSelector, ok := selector.X.(*ast.SelectorExpr)
+	if !ok || requestSelector.Sel == nil || requestSelector.Sel.Name != "Request" {
+		return false
+	}
+	return isGinContextType(info.TypeOf(requestSelector.X)) &&
+		isNamedType(info.TypeOf(requestSelector), "net/http", "Request")
+}
+
+func mentionsContentLengthHeader(info *gotypes.Info, expr ast.Expr) bool {
+	if info == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !isContentLengthHeaderCall(info, call) {
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
+}
+
+func isContentLengthHeaderCall(info *gotypes.Info, expr ast.Expr) bool {
+	if info == nil {
+		return false
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	name, recvPkg, ok := routes.GinMethod(info, call)
+	if !ok || recvPkg != routes.GinPkgPath || name != "GetHeader" {
+		return false
+	}
+	value, ok := stringArg(call, 0)
+	return ok && strings.EqualFold(value, "Content-Length")
+}
+
+func isContentLengthHeaderValueExpr(info *gotypes.Info, expr ast.Expr) bool {
+	if isContentLengthHeaderCall(info, expr) {
+		return true
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	fn := calledFuncObject(info, call.Fun)
+	return fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == "strings" && fn.Name() == "TrimSpace" &&
+		isContentLengthHeaderValueExpr(info, call.Args[0])
+}
+
+func isGinContextType(t gotypes.Type) bool {
+	return isNamedType(t, routes.GinPkgPath, "Context")
+}
+
+func isNamedType(t gotypes.Type, pkgPath, name string) bool {
+	if t == nil {
+		return false
+	}
+	if ptr, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := gotypes.Unalias(t).(*gotypes.Named)
+	if !ok || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == pkgPath && named.Obj().Name() == name
+}
+
+func isZeroLiteral(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT && lit.Value == "0"
+}
+
+func isEmptyStringLiteral(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return false
+	}
+	value, err := strconv.Unquote(lit.Value)
+	return err == nil && value == ""
+}
+
+func isGinBindCall(info *gotypes.Info, call *ast.CallExpr) bool {
+	name, recvPkg, ok := routes.GinMethod(info, call)
+	if !ok || recvPkg != routes.GinPkgPath {
+		return false
+	}
+	switch name {
+	case "ShouldBindJSON", "BindJSON", "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Analyzer) analyzeQueryHelperCall(
+	h handlerDecl,
+	call *ast.CallExpr,
+	route routes.Route,
+	cf *CodeFacts,
+	seenParam map[string]bool,
+) {
+	query, ok := firstQueryCall(h.info, call)
+	if !ok || query == call {
+		return
+	}
+	pname, ok := stringArg(query, 0)
+	if !ok || seenParam["query/"+pname] {
+		return
+	}
+	if nestedQueryHelperOutranks(h.info, call, query) {
+		return
+	}
+	param, ok := queryParamFromHelper(h.info, call, query, pname, h.fset)
+	if !ok {
+		return
+	}
+	seenParam["query/"+pname] = true
+	cf.Params = append(cf.Params, param)
+	_ = route
+}
+
+func nestedQueryHelperOutranks(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) bool {
+	found := false
+	currentPriority := queryHelperPriority(info, helper, query)
+	ast.Inspect(helper, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok || call == helper || call == query {
+			return true
+		}
+		if nestedQuery, ok := firstQueryCall(info, call); ok && nestedQuery == query {
+			if name, recvPkg, ok := routes.GinMethod(info, call); ok && recvPkg == routes.GinPkgPath && isGinQueryMethod(name) {
+				return true
+			}
+			if queryHelperPriority(info, call, query) > currentPriority {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func queryHelperPriority(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) int {
+	if info == nil || helper == nil {
+		return 0
+	}
+	schema, ok := queryHelperSchema(info.TypeOf(helper), helper)
+	if !ok {
+		return 0
+	}
+	if !isPrimitiveStringType(schema) {
+		return 4
+	}
+	if queryDefaultValue(info, query) != nil || queryHelperDefault(info, helper, query) != nil || helperReturnsError(info, helper) {
+		return 3
+	}
+	name := strings.ToLower(selectorName(helper.Fun))
+	if name != "trimspace" && (strings.Contains(name, "optional") || strings.Contains(name, "required")) {
+		return 2
+	}
+	return 1
+}
+
+func isPrimitiveStringType(schema facts.Type) bool {
+	if schema.Type != facts.TypePrimitive {
+		return false
+	}
+	prim, ok := schema.Of.(*facts.Prim)
+	return ok && prim.Prim == facts.PrimString
+}
+
+func helperReturnsError(info *gotypes.Info, helper *ast.CallExpr) bool {
+	if info == nil || helper == nil {
+		return false
+	}
+	t := info.TypeOf(helper)
+	if tuple, ok := gotypes.Unalias(t).(*gotypes.Tuple); ok && tuple.Len() > 1 {
+		last := tuple.At(tuple.Len() - 1)
+		return last != nil && isErrorType(last.Type())
+	}
+	return false
+}
+
+func firstQueryCall(info *gotypes.Info, root ast.Expr) (*ast.CallExpr, bool) {
+	var found *ast.CallExpr
+	ast.Inspect(root, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(info, call)
+		if ok && recvPkg == routes.GinPkgPath && isGinQueryMethod(name) {
+			found = call
+			return false
+		}
+		return true
+	})
+	return found, found != nil
+}
+
+func isGinQueryMethod(name string) bool {
+	switch name {
+	case "Query", "DefaultQuery", "GetQuery":
+		return true
+	default:
+		return false
+	}
+}
+
+func queryParamFromHelper(
+	info *gotypes.Info,
+	helper *ast.CallExpr,
+	query *ast.CallExpr,
+	name string,
+	fset *token.FileSet,
+) (facts.ParamFact, bool) {
+	schema, ok := queryHelperSchema(info.TypeOf(helper), helper)
+	if !ok {
+		return facts.ParamFact{}, false
+	}
+	return facts.ParamFact{
+		Name:     name,
+		Location: "query",
+		Required: queryHelperRequired(info, helper, query),
+		Schema:   schema,
+		Default:  firstLiteral(queryDefaultValue(info, query), queryHelperDefault(info, helper, query)),
+		Span:     spanOf(fset, query.Pos()),
+	}, true
+}
+
+func queryDefaultValue(info *gotypes.Info, query *ast.CallExpr) *facts.LiteralValue {
+	if query == nil || selectorName(query.Fun) != "DefaultQuery" || len(query.Args) < 2 {
+		return nil
+	}
+	return literalValue(info, query.Args[1])
+}
+
+func queryHelperSchema(t gotypes.Type, helper *ast.CallExpr) (facts.Type, bool) {
+	if t == nil {
+		if selectorName(helper.Fun) == "TrimSpace" {
+			return facts.PrimitiveType(facts.StringPrim()), true
+		}
+		return facts.Type{}, false
+	}
+	if tuple, ok := gotypes.Unalias(t).(*gotypes.Tuple); ok && tuple.Len() > 0 {
+		t = tuple.At(0).Type()
+	}
+	if ptr, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = ptr.Elem()
+	}
+	if named, ok := gotypes.Unalias(t).(*gotypes.Named); ok {
+		if obj := named.Obj(); obj != nil && obj.Pkg() != nil {
+			if obj.Pkg().Path() == "time" && obj.Name() == "Time" {
+				return facts.WellKnownType(facts.WellKnownDateTime), true
+			}
+		}
+		t = named.Underlying()
+	}
+	if basic, ok := gotypes.Unalias(t).(*gotypes.Basic); ok {
+		switch basic.Kind() {
+		case gotypes.String:
+			return facts.PrimitiveType(facts.StringPrim()), true
+		case gotypes.Bool:
+			return facts.PrimitiveType(facts.BoolPrim()), true
+		case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64:
+			return facts.PrimitiveType(facts.IntPrim(64, true)), true
+		case gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
+			return facts.PrimitiveType(facts.IntPrim(64, false)), true
+		case gotypes.Float32:
+			return facts.PrimitiveType(facts.FloatPrim(32)), true
+		case gotypes.Float64:
+			return facts.PrimitiveType(facts.FloatPrim(64)), true
+		}
+	}
+	if selectorName(helper.Fun) == "TrimSpace" {
+		return facts.PrimitiveType(facts.StringPrim()), true
+	}
+	return facts.Type{}, false
+}
+
+func queryHelperRequired(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) bool {
+	name := selectorName(helper.Fun)
+	if strings.Contains(strings.ToLower(name), "optional") {
+		return false
+	}
+	if queryHelperDefault(info, helper, query) != nil {
+		return false
+	}
+	if queryDefaultValue(info, query) != nil {
+		return false
+	}
+	if name == "TrimSpace" || strings.Contains(strings.ToLower(name), "required") {
+		return true
+	}
+	t := info.TypeOf(helper)
+	if t == nil {
+		return false
+	}
+	if tuple, ok := gotypes.Unalias(t).(*gotypes.Tuple); ok && tuple.Len() > 1 {
+		last := tuple.At(tuple.Len() - 1)
+		return last != nil && isErrorType(last.Type())
+	}
+	return false
+}
+
+func queryHelperDefault(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) *facts.LiteralValue {
+	sig, ok := gotypes.Unalias(info.TypeOf(helper.Fun)).(*gotypes.Signature)
+	if !ok || sig.Params() == nil {
+		return nil
+	}
+	afterQuery := query == nil
+	for i, arg := range helper.Args {
+		if !afterQuery {
+			if arg == query || exprContainsCall(arg, query) {
+				afterQuery = true
+			}
+			continue
+		}
+		if i >= sig.Params().Len() || !isDefaultParamName(sig.Params().At(i).Name()) {
+			continue
+		}
+		if value := literalValue(info, arg); value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func exprContainsCall(expr ast.Expr, target *ast.CallExpr) bool {
+	if expr == nil || target == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if ok && call == target {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func isDefaultParamName(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "default") || strings.Contains(lower, "fallback")
+}
+
+func literalValue(info *gotypes.Info, expr ast.Expr) *facts.LiteralValue {
+	if value := constValueOf(info, expr); value != nil {
+		return literalValueFromConstant(value)
+	}
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		switch value.Kind {
+		case token.STRING:
+			unquoted, err := strconv.Unquote(value.Value)
+			if err != nil {
+				return nil
+			}
+			return &facts.LiteralValue{Type: "string", Value: unquoted}
+		case token.INT, token.FLOAT:
+			return &facts.LiteralValue{Type: "number", Value: value.Value}
+		}
+	case *ast.Ident:
+		if value.Name == "true" {
+			return &facts.LiteralValue{Type: "bool", Value: true}
+		}
+		if value.Name == "false" {
+			return &facts.LiteralValue{Type: "bool", Value: false}
+		}
+	}
+	return nil
+}
+
+func constValueOf(info *gotypes.Info, expr ast.Expr) constant.Value {
+	if info == nil || expr == nil {
+		return nil
+	}
+	if tv, ok := info.Types[expr]; ok && tv.Value != nil {
+		return tv.Value
+	}
+	if ident := leafIdent(expr); ident != nil {
+		if c, ok := info.ObjectOf(ident).(*gotypes.Const); ok {
+			return c.Val()
+		}
+	}
+	return nil
+}
+
+func literalValueFromConstant(value constant.Value) *facts.LiteralValue {
+	switch value.Kind() {
+	case constant.String:
+		return &facts.LiteralValue{Type: "string", Value: constant.StringVal(value)}
+	case constant.Bool:
+		return &facts.LiteralValue{Type: "bool", Value: constant.BoolVal(value)}
+	case constant.Int:
+		return &facts.LiteralValue{Type: "number", Value: value.ExactString()}
+	case constant.Float:
+		number := value.ExactString()
+		if strings.Contains(number, "/") {
+			if f, ok := constant.Float64Val(value); ok {
+				number = strconv.FormatFloat(f, 'g', -1, 64)
+			}
+		}
+		return &facts.LiteralValue{Type: "number", Value: number}
+	default:
+		return nil
+	}
+}
+
+func firstLiteral(values ...*facts.LiteralValue) *facts.LiteralValue {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func isErrorType(t gotypes.Type) bool {
+	named, ok := gotypes.Unalias(t).(*gotypes.Named)
+	if !ok || named.Obj() == nil {
+		return false
+	}
+	return named.Obj().Name() == "error" && named.Obj().Pkg() == nil
+}
+
+func selectorName(expr ast.Expr) string {
+	switch fun := expr.(type) {
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
+	case *ast.Ident:
+		return fun.Name
+	default:
+		return ""
+	}
 }
 
 // bindRequestType resolves ShouldBindJSON(&x) / ShouldBind(&x) -> a TypeRef to the bound named type.
@@ -519,6 +1071,40 @@ func (a *Analyzer) analyzeBinaryStatus(
 	}, false)
 }
 
+func (a *Analyzer) addSSEResponse(
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+) {
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+		Status:      200,
+		BodyKind:    "sse",
+		ContentType: "text/event-stream",
+	}, false)
+}
+
+func streamCallContainsSSEvent(info *gotypes.Info, stream *ast.CallExpr) bool {
+	found := false
+	for _, arg := range stream.Args {
+		ast.Inspect(arg, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			name, recvPkg, ok := routes.GinMethod(info, call)
+			if ok && recvPkg == routes.GinPkgPath && name == "SSEvent" {
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	return found
+}
+
 func (a *Analyzer) analyzeData(
 	h handlerDecl,
 	call *ast.CallExpr,
@@ -543,11 +1129,43 @@ func (a *Analyzer) analyzeData(
 		return
 	}
 	contentType := ""
-	if value, ok := stringArg(call, 1); ok {
+	if value, ok := a.stringValueOf(h, call.Args[1]); ok {
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
 		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic (GO-05)", file, line)
+	}
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+		Status:      status,
+		BodyKind:    "binary",
+		ContentType: contentType,
+	}, false)
+}
+
+func (a *Analyzer) analyzeDataFromReader(
+	h handlerDecl,
+	call *ast.CallExpr,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	diags *diag.Accumulator,
+) {
+	if len(call.Args) < 3 {
+		return
+	}
+	status, ok := statusOf(h.info, call.Args[0])
+	if !ok {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		return
+	}
+	contentType := "application/octet-stream"
+	if value, ok := a.stringValueOf(h, call.Args[2]); ok {
+		contentType = responseContentType(value)
+	} else {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.Warn("unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:      status,
@@ -585,6 +1203,73 @@ func responseContentType(contentType string) string {
 		return "application/octet-stream"
 	}
 	return contentType
+}
+
+func (a *Analyzer) stringValueOf(h handlerDecl, expr ast.Expr) (string, bool) {
+	return a.stringValueOfSeen(h, expr, map[string]bool{})
+}
+
+func (a *Analyzer) stringValueOfSeen(h handlerDecl, expr ast.Expr, seen map[string]bool) (string, bool) {
+	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		value, err := strconv.Unquote(lit.Value)
+		if err == nil {
+			return value, true
+		}
+		return strings.Trim(lit.Value, "`\""), true
+	}
+	if tv, ok := h.info.Types[expr]; ok && tv.Value != nil && tv.Value.Kind() == constant.String {
+		return constant.StringVal(tv.Value), true
+	}
+	if ident := leafIdent(expr); ident != nil {
+		if c, ok := h.info.ObjectOf(ident).(*gotypes.Const); ok && c.Val() != nil && c.Val().Kind() == constant.String {
+			return constant.StringVal(c.Val()), true
+		}
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 0 {
+		return "", false
+	}
+	fn := calledFuncObject(h.info, call.Fun)
+	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != h.pkgPath {
+		return "", false
+	}
+	name := fn.Name()
+	if name == "" || seen[name] {
+		return "", false
+	}
+	callee, ok := a.idx[name]
+	if !ok || callee.pkgPath != h.pkgPath || callee.decl == nil || callee.decl.Body == nil || callee.decl.Name.Pos() != fn.Pos() {
+		return "", false
+	}
+	seen[name] = true
+	if len(callee.decl.Body.List) != 1 {
+		return "", false
+	}
+	ret, ok := callee.decl.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return "", false
+	}
+	return a.stringValueOfSeen(callee, ret.Results[0], seen)
+}
+
+func calledFuncObject(info *gotypes.Info, fun ast.Expr) *gotypes.Func {
+	if info == nil {
+		return nil
+	}
+	switch f := fun.(type) {
+	case *ast.Ident:
+		fn, _ := info.ObjectOf(f).(*gotypes.Func)
+		return fn
+	case *ast.SelectorExpr:
+		if sel := info.Selections[f]; sel != nil {
+			fn, _ := sel.Obj().(*gotypes.Func)
+			return fn
+		}
+		fn, _ := info.ObjectOf(f.Sel).(*gotypes.Func)
+		return fn
+	default:
+		return nil
+	}
 }
 
 func isByteSlice(t gotypes.Type) bool {
@@ -864,6 +1549,14 @@ func queryParam(name string, fset *token.FileSet, pos token.Pos) facts.ParamFact
 		Schema:   facts.PrimitiveType(facts.StringPrim()),
 		Span:     spanOf(fset, pos),
 	}
+}
+
+func queryParamFromGinCall(info *gotypes.Info, method, name string, fset *token.FileSet, call *ast.CallExpr) facts.ParamFact {
+	param := queryParam(name, fset, call.Pos())
+	if method == "DefaultQuery" {
+		param.Default = queryDefaultValue(info, call)
+	}
+	return param
 }
 
 // untypedRouteLabel renders the operation label (method + group-relative path)

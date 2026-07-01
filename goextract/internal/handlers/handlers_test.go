@@ -261,6 +261,104 @@ func (s Server) uploadLoose(c *gin.Context) {
 	}
 }
 
+func TestBranchingContentTypeHelperIsDynamic(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/downloadhandlers
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import "io"
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) DataFromReader(int, int64, string, io.Reader, map[string]string) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package downloadhandlers
+
+import (
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+type Other struct{}
+
+var preferPDF bool
+
+func (s Server) Register() {
+	s.R.GET("/file", s.file)
+	s.R.GET("/method-file", s.methodFile)
+}
+
+func (s Server) file(c *gin.Context) {
+	c.DataFromReader(200, 12, dynamicContentType(), strings.NewReader("hello"), nil)
+}
+
+func (s Server) methodFile(c *gin.Context) {
+	var other Other
+	c.DataFromReader(200, 12, other.ContentType(), strings.NewReader("hello"), nil)
+}
+
+func ContentType() string {
+	return "application/pdf"
+}
+
+func (Other) ContentType() string {
+	return "text/plain"
+}
+
+func dynamicContentType() string {
+	if preferPDF {
+		return "application/pdf"
+	}
+	return "text/plain"
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load download handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/downloadhandlers", diags)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range routes.Recognize(res) {
+		got[r.Handler] = analyzer.Analyze(r, diags)
+	}
+	file := got["file"]
+	if len(file.Responses) != 1 || file.Responses[0].ContentType != "application/octet-stream" {
+		t.Fatalf("branching content type helper should fall back to octet-stream, got %+v", file.Responses)
+	}
+	methodFile := got["methodFile"]
+	if len(methodFile.Responses) != 1 || methodFile.Responses[0].ContentType != "application/octet-stream" {
+		t.Fatalf("method content type helper should not fold through a same-named top-level helper, got %+v", methodFile.Responses)
+	}
+	found := false
+	for _, item := range diags.Items() {
+		if strings.Contains(item.Message, "DataFromReader content type is dynamic") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("branching content type helper should emit dynamic-content diagnostic, got %+v", diags.Items())
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {

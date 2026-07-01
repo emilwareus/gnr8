@@ -141,7 +141,7 @@ components:
           items:
             type: string
         notes:
-          type: [string, null]
+          type: [string, 'null']
         priority:
           type: integer
         status:
@@ -173,7 +173,7 @@ components:
           items:
             type: string
         notes:
-          type: [string, null]
+          type: [string, 'null']
         priority:
           type: integer
         status:
@@ -195,12 +195,12 @@ components:
           items:
             type: string
         notes:
-          type: [string, null]
+          type: [string, 'null']
         priority:
-          type: [integer, null]
+          type: [integer, 'null']
         status:
           oneOf:
           - $ref: '#/components/schemas/Status'
           - type: null
         title:
-          type: [string, null]
+          type: [string, 'null']

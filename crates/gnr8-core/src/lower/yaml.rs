@@ -56,10 +56,16 @@ fn write_security(out: &mut String, security: &[SecurityRequirement]) {
         return;
     }
     let _ = writeln!(out, "security:");
-    for req in security {
+    write_security_requirement(out, security, 1);
+}
+
+fn write_security_requirement(out: &mut String, security: &[SecurityRequirement], depth: usize) {
+    let pad = INDENT.repeat(depth);
+    for (index, req) in security.iter().enumerate() {
+        let prefix = if index == 0 { "- " } else { "  " };
         let _ = writeln!(
             out,
-            "{INDENT}- {}: {}",
+            "{pad}{prefix}{}: {}",
             map_key(&req.scheme),
             flow_seq(&req.scopes)
         );
@@ -100,6 +106,10 @@ fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     let _ = writeln!(out, "{pad}operationId: {}", scalar(&op.operation_id));
     if !op.tags.is_empty() {
         let _ = writeln!(out, "{pad}tags: {}", flow_seq(&op.tags));
+    }
+    if !op.security.is_empty() {
+        let _ = writeln!(out, "{pad}security:");
+        write_security_requirement(out, &op.security, depth + 1);
     }
     if !op.parameters.is_empty() {
         let _ = writeln!(out, "{pad}parameters:");
@@ -179,6 +189,27 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                 out,
                 "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
             );
+        } else if resp.event_stream {
+            let content_type = resp.content_type.as_deref().unwrap_or("text/event-stream");
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                map_key(content_type)
+            );
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
+            if let Some(schema_ref) = &resp.schema_ref {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
+                    ref_pointer(schema_ref)
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
+                );
+            }
         } else if let Some(schema_ref) = &resp.schema_ref {
             let content_type = resp.content_type.as_deref().unwrap_or("application/json");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
@@ -365,7 +396,8 @@ fn flow_seq(items: &[String]) -> String {
 }
 
 fn flow_type_seq(items: &[String]) -> String {
-    format!("[{}]", items.join(", "))
+    let rendered: Vec<String> = items.iter().map(|item| scalar(item)).collect();
+    format!("[{}]", rendered.join(", "))
 }
 
 fn literal(value: &LiteralValue) -> String {
@@ -466,6 +498,7 @@ mod tests {
         let post = Operation {
             operation_id: "createGoal".to_string(),
             tags: vec!["goals".to_string()],
+            security: Vec::new(),
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
@@ -479,6 +512,7 @@ mod tests {
                     schema_ref: Some("CommandMessageWithUUID".to_string()),
                     content_type: None,
                     binary: false,
+                    event_stream: false,
                 },
             )],
         };

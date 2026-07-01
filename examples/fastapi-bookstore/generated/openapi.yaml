@@ -93,7 +93,7 @@ components:
       required: [bio, name]
       properties:
         bio:
-          type: [string, null]
+          type: [string, 'null']
         name:
           type: string
     Book:
@@ -127,9 +127,9 @@ components:
         in_stock:
           type: boolean
         published:
-          type: [integer, null]
+          type: [integer, 'null']
         sort:
-          type: [string, null]
+          type: [string, 'null']
           enum: [asc, desc]
     BookFormat:
       type: string
@@ -155,7 +155,7 @@ components:
           items:
             $ref: '#/components/schemas/Book'
         next_cursor:
-          type: [string, null]
+          type: [string, 'null']
         total:
           type: integer
     OutOfStock:

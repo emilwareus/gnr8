@@ -72,7 +72,7 @@ components:
           items:
             $ref: '#/components/schemas/Price'
         message:
-          type: [string, null]
+          type: [string, 'null']
         order_id:
           type: integer
     OrderInput:
@@ -82,7 +82,7 @@ components:
         book_id:
           type: integer
         coupon:
-          type: [string, null]
+          type: [string, 'null']
         discount:
           oneOf:
           - oneOf:
@@ -90,7 +90,7 @@ components:
             - type: number
           - type: null
         note:
-          type: [string, null]
+          type: [string, 'null']
         price:
           $ref: '#/components/schemas/Price'
         quantity:

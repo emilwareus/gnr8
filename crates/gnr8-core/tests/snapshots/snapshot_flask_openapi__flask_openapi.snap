@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_flask_openapi.rs
+assertion_line: 43
 expression: openapi
 ---
 openapi: 3.1.0
@@ -83,7 +84,7 @@ components:
           items:
             $ref: '#/components/schemas/Price'
         message:
-          type: [string, null]
+          type: [string, 'null']
         order_id:
           type: integer
     OrderInput:
@@ -93,7 +94,7 @@ components:
         book_id:
           type: integer
         coupon:
-          type: [string, null]
+          type: [string, 'null']
         discount:
           oneOf:
           - oneOf:
@@ -101,7 +102,7 @@ components:
             - type: number
           - type: null
         note:
-          type: [string, null]
+          type: [string, 'null']
         price:
           $ref: '#/components/schemas/Price'
         quantity:

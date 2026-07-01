@@ -48,6 +48,7 @@ type RouteFact struct {
 	Group                  string         `json:"group,omitempty"`
 	Params                 []ParamFact    `json:"params"`
 	RequestBody            *TypeRef       `json:"request_body"`
+	RequestBodyRequired    bool           `json:"request_body_required"`
 	RequestBodyContentType string         `json:"request_body_content_type,omitempty"`
 	Responses              []ResponseFact `json:"responses"`
 	Span                   SourceSpan     `json:"span"`
@@ -57,11 +58,12 @@ type RouteFact struct {
 // params are required; query params default to a string type and not required. There
 // is no enum or description — those were annotation-only and are gone.
 type ParamFact struct {
-	Name     string     `json:"name"`
-	Location string     `json:"location"`
-	Required bool       `json:"required"`
-	Schema   Type       `json:"schema"`
-	Span     SourceSpan `json:"span"`
+	Name     string        `json:"name"`
+	Location string        `json:"location"`
+	Required bool          `json:"required"`
+	Schema   Type          `json:"schema"`
+	Default  *LiteralValue `json:"default,omitempty"`
+	Span     SourceSpan    `json:"span"`
 }
 
 // ResponseFact describes one response keyed by HTTP status.

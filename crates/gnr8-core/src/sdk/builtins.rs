@@ -702,6 +702,9 @@ impl Transform for SetSchemaFieldType {
 #[derive(Debug, Clone, Default)]
 pub struct ApiOverrides {
     field_presence: Vec<FieldPresenceOverride>,
+    query_params: Vec<QueryParamOverride>,
+    request_bodies: Vec<RequestBodyOverride>,
+    responses: Vec<ResponseOverride>,
 }
 
 #[derive(Debug, Clone)]
@@ -709,6 +712,101 @@ struct FieldPresenceOverride {
     schema: String,
     field: String,
     required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct QueryParamOverride {
+    matcher: OperationMatcher,
+    param: QueryParam,
+}
+
+#[derive(Debug, Clone)]
+struct RequestBodyOverride {
+    matcher: OperationMatcher,
+    required: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ResponseOverride {
+    matcher: OperationMatcher,
+    status: u16,
+    body_kind: String,
+    content_type: Option<String>,
+    schema_ref: Option<String>,
+}
+
+/// Query parameter override builder.
+#[derive(Debug, Clone)]
+pub struct QueryParam {
+    name: String,
+    schema: Type,
+    required: bool,
+    default: Option<LiteralValue>,
+}
+
+impl QueryParam {
+    /// Create a string, optional query parameter override.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            schema: Type::Primitive(crate::graph::Prim::String),
+            required: false,
+            default: None,
+        }
+    }
+
+    /// Set the query parameter type to string.
+    #[must_use]
+    pub fn string(mut self) -> Self {
+        self.schema = Type::Primitive(crate::graph::Prim::String);
+        self
+    }
+
+    /// Set the query parameter type to integer.
+    #[must_use]
+    pub fn integer(mut self) -> Self {
+        self.schema = Type::Primitive(crate::graph::Prim::Int {
+            bits: 64,
+            signed: true,
+        });
+        self
+    }
+
+    /// Set the query parameter type to RFC-3339 date-time.
+    #[must_use]
+    pub fn date_time(mut self) -> Self {
+        self.schema = Type::WellKnown(crate::graph::WellKnown::DateTime);
+        self
+    }
+
+    /// Mark the query parameter required.
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Mark the query parameter optional.
+    #[must_use]
+    pub const fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+
+    /// Set a numeric default.
+    #[must_use]
+    pub fn default_number(mut self, value: impl Into<String>) -> Self {
+        self.default = Some(LiteralValue::Number(value.into()));
+        self
+    }
+
+    /// Set a string default.
+    #[must_use]
+    pub fn default_string(mut self, value: impl Into<String>) -> Self {
+        self.default = Some(LiteralValue::String(value.into()));
+        self
+    }
 }
 
 impl ApiOverrides {
@@ -739,6 +837,94 @@ impl ApiOverrides {
         });
         self
     }
+
+    /// Add or replace a query parameter on an operation matched by method and graph path.
+    #[must_use]
+    pub fn query_param(
+        mut self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        param: QueryParam,
+    ) -> Self {
+        self.query_params.push(QueryParamOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            param,
+        });
+        self
+    }
+
+    /// Target a request body on an operation matched by method and graph path.
+    #[must_use]
+    pub fn request_body(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
+        self.request_bodies.push(RequestBodyOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            required: None,
+        });
+        self
+    }
+
+    /// Mark the most recently configured request body optional.
+    #[must_use]
+    pub fn optional(mut self) -> Self {
+        if let Some(body) = self.request_bodies.last_mut() {
+            body.required = Some(false);
+        }
+        self
+    }
+
+    /// Mark one response as binary/file content.
+    #[must_use]
+    pub fn binary_response(
+        mut self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        status: u16,
+    ) -> Self {
+        self.responses.push(ResponseOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            status,
+            body_kind: "binary".to_string(),
+            content_type: Some("application/octet-stream".to_string()),
+            schema_ref: None,
+        });
+        self
+    }
+
+    /// Mark one response as server-sent events.
+    #[must_use]
+    pub fn sse_response(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
+        self.responses.push(ResponseOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            status: 200,
+            body_kind: "sse".to_string(),
+            content_type: Some("text/event-stream".to_string()),
+            schema_ref: None,
+        });
+        self
+    }
+
+    /// Attach an existing schema as the event envelope for the most recently configured SSE response.
+    #[must_use]
+    pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
+        if let Some(response) = self.responses.last_mut() {
+            if response.body_kind == "sse" {
+                response.schema_ref = Some(schema.into());
+            }
+        }
+        self
+    }
 }
 
 impl Transform for ApiOverrides {
@@ -750,6 +936,15 @@ impl Transform for ApiOverrides {
                 &override_.field,
                 override_.required,
             )?;
+        }
+        for override_ in &self.query_params {
+            apply_query_param_override(ir, &override_.matcher, &override_.param)?;
+        }
+        for override_ in &self.request_bodies {
+            apply_request_body_override(ir, &override_.matcher, override_.required)?;
+        }
+        for override_ in &self.responses {
+            apply_response_override(ir, override_)?;
         }
         Ok(())
     }
@@ -807,6 +1002,116 @@ fn apply_field_presence_override(
         })?;
     field.required = required;
     Ok(())
+}
+
+fn apply_query_param_override(
+    ir: &mut ApiGraph,
+    matcher: &OperationMatcher,
+    param: &QueryParam,
+) -> Result<(), CoreError> {
+    let op_index = find_operation_index(ir, matcher, "query parameter override")?;
+    let op = &mut ir.operations[op_index];
+    op.params
+        .retain(|existing| !(existing.location == "query" && existing.name == param.name));
+    op.params.push(crate::graph::Param {
+        name: param.name.clone(),
+        location: "query".to_string(),
+        required: param.required,
+        schema: param.schema.clone(),
+        default: param.default.clone(),
+        provenance: op.provenance.clone(),
+    });
+    op.params.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.location.cmp(&b.location))
+    });
+    Ok(())
+}
+
+fn apply_request_body_override(
+    ir: &mut ApiGraph,
+    matcher: &OperationMatcher,
+    required: Option<bool>,
+) -> Result<(), CoreError> {
+    let op_index = find_operation_index(ir, matcher, "request body override")?;
+    let op = &mut ir.operations[op_index];
+    if op.request_body.is_none() {
+        return Err(CoreError::Config {
+            message: format!(
+                "request body override matched operation '{}' with no request body",
+                op.id
+            ),
+        });
+    }
+    if let Some(required) = required {
+        op.request_body_required = required;
+    }
+    Ok(())
+}
+
+fn apply_response_override(
+    ir: &mut ApiGraph,
+    override_: &ResponseOverride,
+) -> Result<(), CoreError> {
+    let op_index = find_operation_index(ir, &override_.matcher, "response override")?;
+    let body = match &override_.schema_ref {
+        Some(schema) => Some(SchemaRef {
+            ref_id: resolve_schema_ref(ir, schema)?,
+        }),
+        None => None,
+    };
+    let op = &mut ir.operations[op_index];
+    op.responses
+        .retain(|response| response.status != override_.status);
+    op.responses.push(Response {
+        status: override_.status,
+        body,
+        body_kind: override_.body_kind.clone(),
+        content_type: override_.content_type.clone(),
+    });
+    op.responses.sort_by_key(|response| response.status);
+    Ok(())
+}
+
+fn resolve_schema_ref(ir: &ApiGraph, schema: &str) -> Result<String, CoreError> {
+    ir.schemas
+        .iter()
+        .find(|candidate| candidate.id == schema || candidate.name == schema)
+        .map(|candidate| candidate.id.clone())
+        .ok_or_else(|| CoreError::Config {
+            message: format!("response override event schema '{schema}' did not match any schema"),
+        })
+}
+
+fn find_operation_index(
+    ir: &ApiGraph,
+    matcher: &OperationMatcher,
+    label: &str,
+) -> Result<usize, CoreError> {
+    let matched_indices: Vec<usize> = ir
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, op)| {
+            let is_match = match matcher {
+                OperationMatcher::Id(id) => op.id == *id,
+                OperationMatcher::Route { method, path } => {
+                    op.method == *method && op.path == *path
+                }
+            };
+            is_match.then_some(index)
+        })
+        .collect();
+    match matched_indices.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(CoreError::Config {
+            message: format!("{label} did not match any operation: {matcher:?}"),
+        }),
+        many => Err(CoreError::Config {
+            message: format!("{label} matched {} operations: {matcher:?}", many.len()),
+        }),
+    }
 }
 
 /// Enum ordering policy for generated OpenAPI/SDK surfaces.
@@ -989,6 +1294,13 @@ fn ensure_same_enum_members(
 #[derive(Debug, Clone)]
 pub struct ApplySecurity {
     scheme: SecurityScheme,
+    rules: Vec<SecurityRule>,
+}
+
+#[derive(Debug, Clone)]
+enum SecurityRule {
+    PathPrefix(String),
+    Methods(Vec<String>),
 }
 
 impl ApplySecurity {
@@ -1002,15 +1314,95 @@ impl ApplySecurity {
                 kind: "apiKey".to_string(),
                 location: "header".to_string(),
                 name: header_name.into(),
+                global: true,
             },
+            rules: Vec::new(),
         }
+    }
+
+    /// Apply this scheme only to operations whose graph path, or base-path-joined path, starts with
+    /// `prefix`.
+    #[must_use]
+    pub fn when_path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.scheme.global = false;
+        self.rules.push(SecurityRule::PathPrefix(prefix.into()));
+        self
+    }
+
+    /// Apply this scheme only to operations whose HTTP method is in `methods`.
+    #[must_use]
+    pub fn when_methods<I, S>(mut self, methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.scheme.global = false;
+        let mut methods: Vec<String> = methods
+            .into_iter()
+            .map(Into::into)
+            .map(|method| method.to_ascii_uppercase())
+            .collect();
+        methods.sort();
+        methods.dedup();
+        self.rules.push(SecurityRule::Methods(methods));
+        self
     }
 }
 
 impl Transform for ApplySecurity {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.security.push(self.scheme.clone());
+        if self.rules.is_empty() {
+            return Ok(());
+        }
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        for op in &mut ir.operations {
+            if self
+                .rules
+                .iter()
+                .all(|rule| security_rule_matches(rule, op, &base_path))
+            {
+                matched += 1;
+                op.security.push(self.scheme.id.clone());
+                op.security.sort();
+                op.security.dedup();
+            }
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: format!(
+                    "security scheme '{}' did not match any operations",
+                    self.scheme.id
+                ),
+            });
+        }
         Ok(())
+    }
+}
+
+fn security_rule_matches(
+    rule: &SecurityRule,
+    op: &crate::graph::Operation,
+    base_path: &str,
+) -> bool {
+    match rule {
+        SecurityRule::PathPrefix(prefix) => {
+            op.path.starts_with(prefix)
+                || joined_operation_path(base_path, &op.path).starts_with(prefix)
+        }
+        SecurityRule::Methods(methods) => methods.iter().any(|method| method == &op.method),
+    }
+}
+
+fn joined_operation_path(base_path: &str, path: &str) -> String {
+    let base = base_path.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    match (base.is_empty() || base == "/", path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{path}"),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{path}"),
     }
 }
 
@@ -2580,12 +2972,12 @@ mod tests {
     use super::{
         sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk,
         GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, PostProcess, PySdk, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
-        Transform, TsSdk,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, PostProcess, PySdk, QueryParam, SetBasePath,
+        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source,
+        StaticFiles, Target, Transform, TsSdk,
     };
     use crate::analyze::facts::FieldMeta;
-    use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SourceSpan, Type};
+    use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SchemaRef, SourceSpan, Type};
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
@@ -2634,6 +3026,203 @@ mod tests {
     }
 
     #[test]
+    fn apply_security_can_scope_schemes_to_routes_and_methods() {
+        let mut ir = ApiGraph {
+            base_path: "/v1".to_string(),
+            operations: vec![
+                Operation {
+                    id: "activeSchool".to_string(),
+                    method: "GET".to_string(),
+                    path: "/schools/active/profile".to_string(),
+                    handler: "activeSchool".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "createItem".to_string(),
+                    method: "POST".to_string(),
+                    path: "/items".to_string(),
+                    handler: "createItem".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "activeWrite".to_string(),
+                    method: "PATCH".to_string(),
+                    path: "/schools/active/items".to_string(),
+                    handler: "activeWrite".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApplySecurity::api_key("ActiveSchoolAuth", "X-Plint-School-Id")
+            .when_path_prefix("/v1/schools/active/")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
+            .when_methods(["POST", "PUT", "PATCH", "DELETE"])
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.security.len(), 2);
+        assert!(ir.security.iter().all(|scheme| !scheme.global));
+        assert_eq!(ir.operations[0].security, vec!["ActiveSchoolAuth"]);
+        assert_eq!(ir.operations[1].security, vec!["CSRFAuth"]);
+        assert_eq!(
+            ir.operations[2].security,
+            vec!["ActiveSchoolAuth", "CSRFAuth"]
+        );
+
+        let mut out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let yaml = out.files()[0].text.as_str();
+        assert!(!yaml.starts_with("security:"), "{yaml}");
+        assert!(yaml.contains("ActiveSchoolAuth: []"), "{yaml}");
+        assert!(yaml.contains("CSRFAuth: []"), "{yaml}");
+        assert!(
+            yaml.contains("        - ActiveSchoolAuth: []\n          CSRFAuth: []"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn api_overrides_can_patch_query_body_binary_and_sse_facts() {
+        let mut ir = ApiGraph {
+            schemas: vec![
+                Schema {
+                    id: "app.MarkReadRequest".to_string(),
+                    name: "MarkReadRequest".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.SyncStreamEnvelope".to_string(),
+                    name: "SyncStreamEnvelope".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            operations: vec![
+                Operation {
+                    id: "markRead".to_string(),
+                    method: "PATCH".to_string(),
+                    path: "/conversations/{conversationId}/read".to_string(),
+                    handler: "markRead".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: Some(SchemaRef {
+                        ref_id: "app.MarkReadRequest".to_string(),
+                    }),
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "download".to_string(),
+                    method: "GET".to_string(),
+                    path: "/files/{fileId}/download".to_string(),
+                    handler: "download".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "stream".to_string(),
+                    method: "GET".to_string(),
+                    path: "/sync/stream".to_string(),
+                    handler: "stream".to_string(),
+                    group: None,
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .query_param(
+                "PATCH",
+                "/conversations/{conversationId}/read",
+                QueryParam::new("limit")
+                    .integer()
+                    .optional()
+                    .default_number("5"),
+            )
+            .request_body("PATCH", "/conversations/{conversationId}/read")
+            .optional()
+            .binary_response("GET", "/files/{fileId}/download", 200)
+            .sse_response("GET", "/sync/stream")
+            .event_schema("SyncStreamEnvelope")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert!(!ir.operations[0].request_body_required);
+        assert_eq!(ir.operations[0].params[0].name, "limit");
+        assert_eq!(ir.operations[1].responses[0].body_kind, "binary");
+        assert_eq!(ir.operations[2].responses[0].body_kind, "sse");
+
+        let mut out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let yaml = out.files()[0].text.as_str();
+        assert!(yaml.contains("required: false"), "{yaml}");
+        assert!(yaml.contains("default: 5"), "{yaml}");
+        assert!(yaml.contains("format: binary"), "{yaml}");
+        assert!(yaml.contains("text/event-stream"), "{yaml}");
+        assert!(
+            yaml.contains("'#/components/schemas/SyncStreamEnvelope'"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
     fn group_operations_overrides_matches_and_preserves_source_groups() {
         let mut ir = ApiGraph {
             operations: vec![
@@ -2645,8 +3234,11 @@ mod tests {
                     group: Some("auth".to_string()),
                     params: vec![],
                     request_body: None,
+                    request_body_required: true,
                     request_body_content_type: None,
                     responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
                     provenance: span(),
                 },
                 Operation {
@@ -2657,8 +3249,11 @@ mod tests {
                     group: Some("files".to_string()),
                     params: vec![],
                     request_body: None,
+                    request_body_required: true,
                     request_body_content_type: None,
                     responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
                     provenance: span(),
                 },
             ],
@@ -2705,6 +3300,7 @@ mod tests {
                 group: None,
                 params: vec![],
                 request_body: None,
+                request_body_required: true,
                 request_body_content_type: None,
                 responses: vec![
                     crate::graph::Response {
@@ -2720,6 +3316,8 @@ mod tests {
                         content_type: None,
                     },
                 ],
+                security: Vec::new(),
+                security_overrides_global: false,
                 provenance: span(),
             }],
             ..ApiGraph::default()
@@ -2766,8 +3364,11 @@ mod tests {
                 group: None,
                 params: vec![],
                 request_body: None,
+                request_body_required: true,
                 request_body_content_type: None,
                 responses: vec![],
+                security: Vec::new(),
+                security_overrides_global: false,
                 provenance: span(),
             }],
             ..ApiGraph::default()

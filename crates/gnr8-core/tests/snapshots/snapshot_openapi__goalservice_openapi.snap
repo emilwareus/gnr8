@@ -1,6 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_openapi.rs
-assertion_line: 39
+assertion_line: 40
 expression: openapi
 ---
 openapi: 3.1.0
@@ -146,7 +146,7 @@ components:
           - $ref: '#/components/schemas/TargetDirection'
           - type: null
         targetValue:
-          type: [number, null]
+          type: [number, 'null']
         workflowChainIds:
           type: array
           items:
@@ -186,7 +186,7 @@ components:
           - $ref: '#/components/schemas/TargetDirection'
           - type: null
         targetValue:
-          type: [number, null]
+          type: [number, 'null']
         uuid:
           type: string
           format: uuid
@@ -213,7 +213,7 @@ components:
           items:
             $ref: '#/components/schemas/GoalResponse'
         nextCursor:
-          type: [string, null]
+          type: [string, 'null']
           format: uuid
         pageSize:
           type: integer
@@ -240,7 +240,7 @@ components:
           - $ref: '#/components/schemas/TargetDirection'
           - type: null
         targetValue:
-          type: [number, null]
+          type: [number, 'null']
         workflowChainIds:
           type: array
           items:

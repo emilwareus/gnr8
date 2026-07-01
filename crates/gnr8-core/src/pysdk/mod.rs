@@ -16,7 +16,7 @@ mod emit;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_name, check_unique_schema_names, file_stem, model_file_name,
+    api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
     validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
@@ -109,7 +109,7 @@ pub(crate) fn generate_files_with_options(
     check_unique_schema_names(graph, "Python SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_header = api_key_header_name(graph)?;
+    let auth_headers = api_key_header_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
@@ -123,8 +123,12 @@ pub(crate) fn generate_files_with_options(
     });
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let mut client =
-        emit::emit_client_with_models(package, &model_module, model_style, auth_header.as_deref());
+    let mut client = emit::emit_client_with_models(
+        package,
+        &model_module,
+        model_style,
+        !auth_headers.is_empty(),
+    );
     client.push_str(&emit::emit_operations_with_style(
         graph,
         package,

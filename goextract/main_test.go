@@ -2,11 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
+	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/facts"
+	"github.com/gnr8/goextract/internal/handlers"
+	"github.com/gnr8/goextract/internal/load"
+	"github.com/gnr8/goextract/internal/routes"
 )
 
 func TestGinContractRegressionFacts(t *testing.T) {
@@ -74,6 +80,82 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	if stream.Responses[0].BodyKind != "binary" || stream.Responses[0].ContentType != "application/pdf" {
 		t.Fatalf("streamFile should be binary application/pdf, got %+v", stream.Responses)
 	}
+	reader := routeByHandler(t, doc, "readFile")
+	if reader.Responses[0].BodyKind != "binary" || reader.Responses[0].ContentType != "application/pdf" {
+		t.Fatalf("readFile should be binary application/pdf, got %+v", reader.Responses)
+	}
+	events := routeByHandler(t, doc, "itemEvents")
+	if events.Responses[0].BodyKind != "sse" || events.Responses[0].ContentType != "text/event-stream" {
+		t.Fatalf("itemEvents should be SSE text/event-stream, got %+v", events.Responses)
+	}
+	rawStream := routeByHandler(t, doc, "rawStream")
+	if len(rawStream.Responses) != 0 {
+		t.Fatalf("rawStream should not be classified as SSE, got %+v", rawStream.Responses)
+	}
+
+	search := routeByHandler(t, doc, "searchItems")
+	assertQueryParam(t, search, "q", true, `{"type":"primitive","of":{"prim":"string"}}`, "")
+	assertQueryParam(t, search, "limit", false, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":true}}`, "")
+	assertQueryParam(t, search, "trimmedLimit", false, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":true}}`, "")
+	assertQueryParam(t, search, "wrappedLimit", false, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":true}}`, "")
+	assertQueryParamDefault(t, search, "sort", false, `{"type":"primitive","of":{"prim":"string"}}`, "string", "asc")
+	assertQueryParamDefault(t, search, "cursor", false, `{"type":"primitive","of":{"prim":"string"}}`, "string", "first")
+	assertQueryParam(t, search, "token", false, `{"type":"primitive","of":{"prim":"string"}}`, "")
+
+	attendance := routeByHandler(t, doc, "attendance")
+	assertQueryParam(t, attendance, "startDate", true, `{"type":"well_known","of":"date_time"}`, "")
+	assertQueryParam(t, attendance, "days", false, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":true}}`, "5")
+
+	markRead := routeByHandler(t, doc, "markRead")
+	if markRead.RequestBody == nil || markRead.RequestBodyRequired {
+		t.Fatalf("markRead should have an optional request body, got body=%+v required=%v", markRead.RequestBody, markRead.RequestBodyRequired)
+	}
+	headerRead := routeByHandler(t, doc, "headerRead")
+	if headerRead.RequestBody == nil || headerRead.RequestBodyRequired {
+		t.Fatalf("headerRead should have an optional request body from direct Content-Length header guard, got body=%+v required=%v", headerRead.RequestBody, headerRead.RequestBodyRequired)
+	}
+	combinedHeaderRead := routeByHandler(t, doc, "combinedHeaderRead")
+	if combinedHeaderRead.RequestBody == nil || !combinedHeaderRead.RequestBodyRequired {
+		t.Fatalf("combinedHeaderRead should keep its request body required because another header can trigger binding, got body=%+v required=%v", combinedHeaderRead.RequestBody, combinedHeaderRead.RequestBodyRequired)
+	}
+	forceRead := routeByHandler(t, doc, "forceRead")
+	if forceRead.RequestBody == nil || !forceRead.RequestBodyRequired {
+		t.Fatalf("forceRead should keep its request body required because the OR guard can bind without a body, got body=%+v required=%v", forceRead.RequestBody, forceRead.RequestBodyRequired)
+	}
+	mixedRead := routeByHandler(t, doc, "mixedRead")
+	if mixedRead.RequestBody == nil || !mixedRead.RequestBodyRequired {
+		t.Fatalf("mixedRead should keep its request body required because not all binds are guarded, got body=%+v required=%v", mixedRead.RequestBody, mixedRead.RequestBodyRequired)
+	}
+	unrelatedLengthRead := routeByHandler(t, doc, "unrelatedLengthRead")
+	if unrelatedLengthRead.RequestBody == nil || !unrelatedLengthRead.RequestBodyRequired {
+		t.Fatalf("unrelatedLengthRead should keep its request body required because unrelated ContentLength is not a Gin request body guard, got body=%+v required=%v", unrelatedLengthRead.RequestBody, unrelatedLengthRead.RequestBodyRequired)
+	}
+}
+
+func TestBuildRoutesKeepsRequiredBodyDefaultForMissingHandler(t *testing.T) {
+	analyzer := handlers.NewAnalyzer(&load.Result{Fset: token.NewFileSet()}, "", diag.New())
+	routeFacts, _ := buildRoutes(
+		analyzer,
+		[]routes.Route{
+			{
+				Method:  "GET",
+				Path:    "/missing",
+				Handler: "missingHandler",
+				Span: facts.SourceSpan{
+					File:      "routes.go",
+					StartLine: 1,
+					EndLine:   1,
+				},
+			},
+		},
+		diag.New(),
+	)
+	if len(routeFacts) != 1 {
+		t.Fatalf("expected one route fact, got %d", len(routeFacts))
+	}
+	if !routeFacts[0].RequestBodyRequired {
+		t.Fatalf("missing handler should preserve request_body_required default true, got %+v", routeFacts[0])
+	}
 }
 
 func routeByHandler(t *testing.T, doc facts.GoFacts, handler string) facts.RouteFact {
@@ -127,4 +209,52 @@ func assertResponseBodyRef(t *testing.T, route facts.RouteFact, status uint16, r
 		return
 	}
 	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
+}
+
+func assertQueryParam(t *testing.T, route facts.RouteFact, name string, required bool, schemaJSON string, defaultNumber string) {
+	t.Helper()
+	if defaultNumber == "" {
+		assertQueryParamDefault(t, route, name, required, schemaJSON, "", nil)
+		return
+	}
+	assertQueryParamDefault(t, route, name, required, schemaJSON, "number", defaultNumber)
+}
+
+func assertQueryParamDefault(t *testing.T, route facts.RouteFact, name string, required bool, schemaJSON string, defaultType string, defaultValue any) {
+	t.Helper()
+	for _, param := range route.Params {
+		if param.Location != "query" || param.Name != name {
+			continue
+		}
+		gotSchema, err := json.Marshal(param.Schema)
+		if err != nil {
+			t.Fatalf("%s query %s schema marshal: %v", route.Handler, name, err)
+		}
+		if param.Required != required || !jsonEqual(t, gotSchema, []byte(schemaJSON)) {
+			t.Fatalf("%s query %s: want required=%v schema=%s, got required=%v schema=%s", route.Handler, name, required, schemaJSON, param.Required, gotSchema)
+		}
+		if defaultType == "" {
+			if param.Default != nil {
+				t.Fatalf("%s query %s should not have default, got %+v", route.Handler, name, param.Default)
+			}
+			return
+		}
+		if param.Default == nil || param.Default.Type != defaultType || param.Default.Value != defaultValue {
+			t.Fatalf("%s query %s default: want %s %v, got %+v", route.Handler, name, defaultType, defaultValue, param.Default)
+		}
+		return
+	}
+	t.Fatalf("%s missing query param %s, got %+v", route.Handler, name, route.Params)
+}
+
+func jsonEqual(t *testing.T, left, right []byte) bool {
+	t.Helper()
+	var l, r any
+	if err := json.Unmarshal(left, &l); err != nil {
+		t.Fatalf("unmarshal left json: %v", err)
+	}
+	if err := json.Unmarshal(right, &r); err != nil {
+		t.Fatalf("unmarshal right json: %v", err)
+	}
+	return reflect.DeepEqual(l, r)
 }

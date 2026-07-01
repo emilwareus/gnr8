@@ -27,8 +27,9 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, check_unique_schema_names, file_stem, is_json_object_key, join_path,
-    path_tokens, path_tokens_match, quoted_string_literal, split_words, success_responses_of,
+    check_unique_schema_names, file_stem, is_json_object_key, join_path, operation_api_key_headers,
+    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -782,7 +783,7 @@ class ApiError(Exception):
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", PyModelStyle::default(), None)
+    emit_client_with_models(package, "models", PyModelStyle::default(), false)
 }
 
 /// Emit `client.py` with a configurable model package import path.
@@ -790,7 +791,7 @@ pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     model_style: PyModelStyle,
-    auth_header: Option<&str>,
+    has_auth: bool,
 ) -> String {
     let (extra_import, body_encode, body_comment) = match model_style {
         PyModelStyle::Pydantic => (
@@ -804,12 +805,21 @@ pub(crate) fn emit_client_with_models(
             "        # Dataclass request models need conversion before json.dumps.\n",
         ),
     };
-    let auth_line = auth_header.map_or_else(String::new, |header| {
-        format!(
-            "        if self._api_key:\n            req.add_header({}, self._api_key)\n",
-            quoted_string_literal(header)
-        )
-    });
+    let auth_init = if has_auth {
+        "        api_keys: Optional[dict[str, str]] = None,\n"
+    } else {
+        ""
+    };
+    let auth_field = if has_auth {
+        "        self._api_keys = api_keys or {}\n"
+    } else {
+        ""
+    };
+    let auth_loop = if has_auth {
+        "        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                req.add_header(header, key)\n"
+    } else {
+        ""
+    };
     let out = format!(
         "\
 from __future__ import annotations
@@ -833,19 +843,19 @@ class Client:
         base_url: str,
         *,
         api_key: Optional[str] = None,
-        opener: Optional[urllib.request.OpenerDirector] = None,
+{auth_init}        opener: Optional[urllib.request.OpenerDirector] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-        self._opener = opener or urllib.request.build_opener()
+{auth_field}        self._opener = opener or urllib.request.build_opener()
 
-    def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
+    def _do(self, method: str, path: str, *, body: Optional[Any] = None, auth_headers: Optional[tuple[str, ...]] = None) -> tuple:
 {body_comment}{body_encode}
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
         if data is not None:
             req.add_header(\"Content-Type\", \"application/json\")
-{auth_line}        try:
+{auth_loop}        try:
             with self._opener.open(req) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as e:
@@ -1023,8 +1033,9 @@ fn emit_operation(
         });
     }
 
-    let body_model = body_model_of(op, graph)?;
+    let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let auth_headers = operation_api_key_headers(graph, op)?;
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1055,14 +1066,18 @@ fn emit_operation(
         optional_query_idents,
     } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
 
-    // Signature: self, path params (positional), body (typed), required query (positional), then
-    // optional query params (= None). All non-defaulted args precede defaulted ones (valid Python).
+    // Signature: self, path params (positional), required body when present, required query
+    // (positional), optional body when present, then optional query params (= None). This preserves
+    // the established required-body surface while keeping defaulted args after all required args.
     let mut args: Vec<String> = vec!["self".to_string()];
     args.extend(path_idents.iter().cloned());
-    if let Some(model) = &body_model {
-        args.push(format!("body: {model}"));
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: {}", body.model));
     }
     args.extend(required_query_idents.iter().cloned());
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body: Optional[{}] = None", body.model));
+    }
     for ident in &optional_query_idents {
         args.push(format!("{ident}=None"));
     }
@@ -1127,9 +1142,14 @@ fn emit_operation(
     } else {
         ""
     };
+    let auth_arg = if auth_headers.is_empty() {
+        String::new()
+    } else {
+        format!(", auth_headers={}", py_string_tuple(&auth_headers))
+    };
     writeln!(
         out,
-        "        _status, _raw = self._do(\"{}\", path{body_arg})",
+        "        _status, _raw = self._do(\"{}\", path{body_arg}{auth_arg})",
         op.method
     )
     .map_err(sink)?;
@@ -1187,6 +1207,21 @@ fn py_status_tuple(statuses: &[u16]) -> String {
             let joined = many
                 .iter()
                 .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({joined})")
+        }
+    }
+}
+
+fn py_string_tuple(values: &[String]) -> String {
+    match values {
+        [] => "()".to_string(),
+        [single] => format!("({},)", quoted_string_literal(single)),
+        many => {
+            let joined = many
+                .iter()
+                .map(|value| quoted_string_literal(value))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("({joined})")
@@ -1742,6 +1777,29 @@ mod tests {
                 out.contains("self._do(\"POST\", path, body=body)"),
                 "body op passes body to _do:\n{out}"
             );
+        }
+
+        #[test]
+        fn required_body_precedes_required_query_param() {
+            let mut g = ops_graph();
+            g.operations[0].params.push(crate::graph::Param {
+                name: "tenant".to_string(),
+                location: "query".to_string(),
+                required: true,
+                schema: crate::graph::Type::Primitive(crate::graph::Prim::String),
+                default: None,
+                provenance: crate::graph::SourceSpan {
+                    file: "main.py".to_string(),
+                    start_line: 4,
+                    end_line: 4,
+                },
+            });
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("def create_book(self, body: Book, tenant) -> CreatedMessage:"),
+                "required body must stay before required query params:\n{out}"
+            );
+            assert!(out.contains("_query[\"tenant\"] = tenant"), "{out}");
         }
 
         #[test]

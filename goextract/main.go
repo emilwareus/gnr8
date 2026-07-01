@@ -99,17 +99,19 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 			Path:   r.Path,
 			// operationId is derived deterministically from the handler symbol in
 			// code (e.g. "createGoal", "updateGoal") — there is no override source.
-			Handler:     r.Handler,
-			OperationID: r.Handler,
-			Group:       r.Group,
-			Params:      []facts.ParamFact{},
-			Responses:   []facts.ResponseFact{},
-			Span:        r.Span,
+			Handler:             r.Handler,
+			OperationID:         r.Handler,
+			Group:               r.Group,
+			Params:              []facts.ParamFact{},
+			Responses:           []facts.ResponseFact{},
+			RequestBodyRequired: true,
+			Span:                r.Span,
 		}
 
 		// Code-inferred request/response/param facts — the only source.
 		cf := analyzer.Analyze(r, diags)
 		rf.RequestBody = cf.RequestBody
+		rf.RequestBodyRequired = cf.RequestBodyRequired
 		rf.RequestBodyContentType = cf.RequestBodyContentType
 		rf.Responses = cf.Responses
 		rf.Params = mergeRoutePathParams(r.Path, r.Span, cf.Params)

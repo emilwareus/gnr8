@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::graph::{ApiGraph, Type};
-use crate::sdk::emit_common::api_key_header_name;
+use crate::sdk::emit_common::api_key_header_names;
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
@@ -38,8 +38,8 @@ pub struct SdkModel {
 /// Auth metadata used by generated clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdkAuth {
-    /// Header name used for API-key auth.
-    pub api_key_header: String,
+    /// Header names used for API-key auth.
+    pub api_key_headers: Vec<String>,
 }
 
 /// A generated service/group.
@@ -153,7 +153,8 @@ impl SdkModel {
     ) -> Result<Self, CoreError> {
         let package = package.into();
         let base_path = base_path.into();
-        let auth = api_key_header_name(graph)?.map(|api_key_header| SdkAuth { api_key_header });
+        let api_key_headers = api_key_header_names(graph)?;
+        let auth = (!api_key_headers.is_empty()).then_some(SdkAuth { api_key_headers });
         let resolved_aliases = aliases
             .resolve(graph)?
             .into_iter()
@@ -264,7 +265,8 @@ mod tests {
     use super::{SdkModel, SdkSchemaKind};
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{
-        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
+        Type,
     };
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
@@ -290,6 +292,7 @@ mod tests {
                 request_body: Some(SchemaRef {
                     ref_id: "app.Book".to_string(),
                 }),
+                request_body_required: true,
                 request_body_content_type: None,
                 responses: vec![Response {
                     status: 201,
@@ -299,6 +302,8 @@ mod tests {
                     body_kind: "json".to_string(),
                     content_type: None,
                 }],
+                security: Vec::new(),
+                security_overrides_global: false,
                 provenance: span(),
             }],
             schemas: vec![Schema {
@@ -357,5 +362,42 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("app.Missing"), "{err}");
+    }
+
+    #[test]
+    fn sdk_model_allows_multiple_api_key_headers() {
+        let mut graph = graph();
+        graph.security = vec![
+            SecurityScheme {
+                id: "CSRFAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-CSRF-Token".to_string(),
+                global: false,
+            },
+            SecurityScheme {
+                id: "SchoolAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-School-Id".to_string(),
+                global: false,
+            },
+        ];
+        graph.operations[0].security = vec!["CSRFAuth".to_string(), "SchoolAuth".to_string()];
+
+        let model = SdkModel::build(
+            &graph,
+            "books",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            model.auth.unwrap().api_key_headers,
+            vec!["X-CSRF-Token", "X-School-Id"]
+        );
     }
 }

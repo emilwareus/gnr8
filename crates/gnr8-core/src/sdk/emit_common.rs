@@ -3,12 +3,12 @@
 //! These are the pure, byte-identical pieces of `gosdk::emit`/`pysdk::emit`/`tssdk::emit`: identifier
 //! tokenization ([`split_words`]), path joining ([`join_path`]) and templating ([`path_tokens`] +
 //! [`path_tokens_match`]), and graph-walking model/response resolvers ([`success_responses_of`],
-//! [`body_model_of`]).
+//! [`request_body_model_of`]).
 //! They contain NO per-language formatting — the casers (`exported`/`snake`/`camel`/…) and the type
 //! mappers (`go_type`/`py_type`/`ts_type`) stay in each emitter, where they genuinely diverge. One
 //! definition per fact (CLAUDE.md rule 3).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Operation, Prim, Schema, Type};
@@ -89,23 +89,7 @@ pub(crate) fn file_in_dir(dir: Option<&str>, file_name: &str) -> String {
 /// No security means no auth header is emitted. A configured SDK currently supports exactly one
 /// `apiKey`/`header` scheme, matching the OpenAPI lowering contract.
 pub(crate) fn api_key_header_name(graph: &ApiGraph) -> Result<Option<String>, CoreError> {
-    if graph.security.is_empty() {
-        return Ok(None);
-    }
-    let mut headers = Vec::new();
-    for scheme in &graph.security {
-        if scheme.kind != "apiKey" || scheme.location != "header" {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "SDK targets support apiKey/header security only, got scheme '{}' as {}/{}",
-                    scheme.id, scheme.kind, scheme.location
-                ),
-            });
-        }
-        headers.push(scheme.name.clone());
-    }
-    headers.sort();
-    headers.dedup();
+    let headers = api_key_header_names(graph)?;
     match headers.as_slice() {
         [] => Ok(None),
         [single] => Ok(Some(single.clone())),
@@ -117,6 +101,94 @@ pub(crate) fn api_key_header_name(graph: &ApiGraph) -> Result<Option<String>, Co
             ),
         }),
     }
+}
+
+/// Resolve the one global API-key header supported by OpenAPI-generator compatibility profiles.
+///
+/// The compat surfaces mimic upstream generator APIs and cannot safely attach route-scoped auth without
+/// changing their request/config model. Reject scoped schemes instead of sending them on every route.
+pub(crate) fn global_api_key_header_name(
+    graph: &ApiGraph,
+    target: &str,
+) -> Result<Option<String>, CoreError> {
+    if graph.security.iter().any(|scheme| !scheme.global) {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "{target} does not support route-scoped apiKey security; use the default SDK profile \
+                 or remove scoped security for this compatibility target"
+            ),
+        });
+    }
+    api_key_header_name(graph)
+}
+
+/// Resolve every API-key header the built-in SDK clients may need to send.
+pub(crate) fn api_key_header_names(graph: &ApiGraph) -> Result<Vec<String>, CoreError> {
+    let schemes = api_key_security_schemes(graph)?;
+    let mut headers: Vec<String> = schemes.values().cloned().collect();
+    headers.sort();
+    headers.dedup();
+    Ok(headers)
+}
+
+/// Resolve the API-key headers required by one operation, including global schemes.
+pub(crate) fn operation_api_key_headers(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<String>, CoreError> {
+    let schemes = api_key_security_schemes(graph)?;
+    let mut scheme_ids: Vec<String> = if op.security_overrides_global {
+        op.security.clone()
+    } else {
+        graph
+            .security
+            .iter()
+            .filter(|scheme| scheme.global)
+            .map(|scheme| scheme.id.clone())
+            .chain(op.security.iter().cloned())
+            .collect()
+    };
+    scheme_ids.sort();
+    scheme_ids.dedup();
+
+    let mut headers = Vec::new();
+    for scheme_id in scheme_ids {
+        let Some(header) = schemes.get(&scheme_id) else {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' references unknown security scheme '{}'",
+                    op.id, scheme_id
+                ),
+            });
+        };
+        headers.push(header.clone());
+    }
+    headers.sort();
+    headers.dedup();
+    Ok(headers)
+}
+
+fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, String>, CoreError> {
+    let mut schemes = BTreeMap::new();
+    for scheme in &graph.security {
+        if scheme.kind != "apiKey" || scheme.location != "header" {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "SDK targets support apiKey/header security only, got scheme '{}' as {}/{}",
+                    scheme.id, scheme.kind, scheme.location
+                ),
+            });
+        }
+        if let Some(existing) = schemes.insert(scheme.id.clone(), scheme.name.clone()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "duplicate security scheme id '{}' uses headers '{}' and '{}'",
+                    scheme.id, existing, scheme.name
+                ),
+            });
+        }
+    }
+    Ok(schemes)
 }
 
 /// Reject duplicate graph schema names before a target turns them into top-level symbols.
@@ -326,6 +398,15 @@ pub(crate) struct SuccessResponses {
     pub(crate) binary_content_type: Option<String>,
 }
 
+/// The request-body shape an SDK operation can accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestBodyModel {
+    /// The referenced request model name.
+    pub(crate) model: String,
+    /// Whether callers must provide the body.
+    pub(crate) required: bool,
+}
+
 impl SuccessResponses {
     /// Whether at least one declared success has no body while another has a typed body.
     pub(crate) fn has_bodyless_alternative(&self) -> bool {
@@ -385,12 +466,21 @@ pub(crate) fn success_responses_of(
                         body_statuses.push(resp.status);
                     }
                 }
-                "binary" => {
+                "binary" | "sse" => {
                     if resp.body.is_some() {
+                        if resp.body_kind == "sse" {
+                            return Err(CoreError::SdkGen {
+                                message: format!(
+                                    "operation '{}' response {} is text/event-stream with an event \
+                                     schema; SDK targets do not yet support typed SSE event streams",
+                                    op.id, resp.status
+                                ),
+                            });
+                        }
                         return Err(CoreError::SdkGen {
                             message: format!(
-                                "operation '{}' response {} is binary but also has a schema body",
-                                op.id, resp.status
+                                "operation '{}' response {} is {} but also has a schema body",
+                                op.id, resp.status, resp.body_kind
                             ),
                         });
                     }
@@ -431,12 +521,15 @@ pub(crate) fn success_responses_of(
     })
 }
 
-/// Resolve an operation's request-body model name, if it has a typed body.
+/// Resolve an operation's request-body model and requiredness, if it has a typed body.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
-pub(crate) fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<String>, CoreError> {
+pub(crate) fn request_body_model_of(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<Option<RequestBodyModel>, CoreError> {
     let Some(body) = &op.request_body else {
         return Ok(None);
     };
@@ -450,13 +543,16 @@ pub(crate) fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<S
                 op.id, body.ref_id
             ),
         })?;
-    Ok(Some(model.name.clone()))
+    Ok(Some(RequestBodyModel {
+        model: model.name.clone(),
+        required: op.request_body_required,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{file_stem, success_responses_of};
-    use crate::graph::{ApiGraph, Operation, Response, SourceSpan};
+    use super::{file_stem, operation_api_key_headers, success_responses_of};
+    use crate::graph::{ApiGraph, Operation, Response, SecurityScheme, SourceSpan};
 
     #[test]
     fn file_stem_splits_acronym_before_capitalized_word() {
@@ -481,6 +577,7 @@ mod tests {
             group: None,
             params: vec![],
             request_body: None,
+            request_body_required: true,
             request_body_content_type: None,
             responses: vec![
                 Response {
@@ -496,6 +593,8 @@ mod tests {
                     content_type: Some("application/octet-stream".to_string()),
                 },
             ],
+            security: Vec::new(),
+            security_overrides_global: false,
             provenance: SourceSpan {
                 file: "http.go".to_string(),
                 start_line: 1,
@@ -506,6 +605,53 @@ mod tests {
         assert_eq!(success.binary_statuses, vec![200, 206]);
         assert!(success.has_binary_body());
         assert!(!success.has_bodyless_alternative());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_api_key_headers_honor_override_security() -> Result<(), crate::CoreError> {
+        let graph = ApiGraph {
+            security: vec![
+                SecurityScheme {
+                    id: "ApiKeyAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-API-Key".to_string(),
+                    global: true,
+                },
+                SecurityScheme {
+                    id: "CSRFAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-CSRF-Token".to_string(),
+                    global: false,
+                },
+            ],
+            ..ApiGraph::default()
+        };
+        let op = Operation {
+            id: "write".to_string(),
+            method: "POST".to_string(),
+            path: "/write".to_string(),
+            handler: "write".to_string(),
+            group: None,
+            params: vec![],
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![],
+            security: vec!["CSRFAuth".to_string()],
+            security_overrides_global: true,
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        assert_eq!(
+            operation_api_key_headers(&graph, &op)?,
+            vec!["X-CSRF-Token"]
+        );
         Ok(())
     }
 }

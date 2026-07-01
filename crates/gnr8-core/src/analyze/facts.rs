@@ -58,6 +58,10 @@ pub(crate) struct RouteFact {
     pub(crate) params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
     pub(crate) request_body: Option<TypeRef>,
+    /// Whether the request body is required when present. Older sidecars omit this; required is the
+    /// historical/default behavior.
+    #[serde(default = "default_true")]
+    pub(crate) request_body_required: bool,
     /// The request body media type when source analysis can infer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) request_body_content_type: Option<String>,
@@ -81,8 +85,15 @@ pub(crate) struct ParamFact {
     pub(crate) required: bool,
     /// The parameter's type.
     pub(crate) schema: Type,
+    /// Source-inferred default value, when a query helper exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default: Option<LiteralValue>,
     /// Source provenance for the parameter access.
     pub(crate) span: SourceSpan,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One response of a route keyed by HTTP status.

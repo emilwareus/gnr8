@@ -17,8 +17,8 @@ mod gofmt;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_name, check_unique_schema_names, file_stem, model_file_name,
-    operation_file_name, validate_sdk_base_path,
+    api_key_header_names, check_unique_schema_names, file_stem, global_api_key_header_name,
+    model_file_name, operation_file_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
@@ -97,7 +97,7 @@ pub(crate) fn generate_files_with_profile(
     check_unique_schema_names(graph, "Go SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_header = api_key_header_name(graph)?;
+    let auth_headers = api_key_header_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
     let emit_compat_surface =
         profile.is_go_openapi_generator_compat() || aliases.has_source_prefix_aliases();
@@ -108,10 +108,11 @@ pub(crate) fn generate_files_with_profile(
     // Fixed leading files (sorted: client.go before errors.go).
     files.push(raw_go_file(
         "client.go",
-        emit::emit_client(package, auth_header.as_deref()),
+        emit::emit_client(package, !auth_headers.is_empty()),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
     if emit_compat_surface {
+        let auth_header = global_api_key_header_name(graph, "Go compatibility profile")?;
         files.push(raw_go_file(
             "compat_helpers.go",
             emit::emit_compat_helpers(package),
@@ -130,13 +131,7 @@ pub(crate) fn generate_files_with_profile(
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
         for op in &ops {
-            let raw = emit::emit_operations_without_facades(
-                graph,
-                package,
-                base_path,
-                &[*op],
-                auth_header.as_deref(),
-            )?;
+            let raw = emit::emit_operations_without_facades(graph, package, base_path, &[*op])?;
             let name = operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
             files.push(raw_go_file(name, raw));
         }
@@ -156,7 +151,7 @@ pub(crate) fn generate_files_with_profile(
         // All operations go into a single generic `operations.go` resource surface. Tags were an
         // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
         // the file name is generic (not the package/fixture name) so it never overfits to one service.
-        let raw = emit::emit_operations(graph, package, base_path, &ops, auth_header.as_deref())?;
+        let raw = emit::emit_operations(graph, package, base_path, &ops)?;
         files.push(raw_go_file("operations.go", raw));
 
         // Trailing models.go.

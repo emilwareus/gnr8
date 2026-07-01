@@ -116,9 +116,15 @@ pub(crate) fn build_openapi_doc(
         .map(|schema| (schema.id.as_str(), schema.name.as_str()))
         .collect();
 
-    let paths = build_paths(graph, base_path, &ref_to_name)?;
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
     let security = build_security(security)?;
+    ensure_operation_security_refs(graph, &security)?;
+    let global_security = security
+        .requirements
+        .iter()
+        .map(|requirement| requirement.scheme.clone())
+        .collect::<Vec<_>>();
+    let paths = build_paths(graph, base_path, &ref_to_name, &global_security)?;
 
     Ok(OpenApiDoc {
         openapi: "3.1.0",
@@ -134,6 +140,26 @@ pub(crate) fn build_openapi_doc(
             schemas,
         },
     })
+}
+
+fn ensure_operation_security_refs(
+    graph: &ApiGraph,
+    security: &LoweredSecurity,
+) -> Result<(), crate::CoreError> {
+    let known: BTreeSet<&str> = security.schemes.iter().map(|(id, _)| id.as_str()).collect();
+    for op in &graph.operations {
+        for scheme in &op.security {
+            if !known.contains(scheme.as_str()) {
+                return Err(crate::CoreError::Lowering {
+                    message: format!(
+                        "operation '{}' references unknown security scheme '{}'",
+                        op.id, scheme
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The lowered security: the top-level `security` requirements and the `components.securitySchemes`,
@@ -181,10 +207,12 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
                 ),
             });
         }
-        requirements.push(SecurityRequirement {
-            scheme: scheme.id.clone(),
-            scopes: vec![],
-        });
+        if scheme.global {
+            requirements.push(SecurityRequirement {
+                scheme: scheme.id.clone(),
+                scopes: vec![],
+            });
+        }
         components.push((
             scheme.id.clone(),
             SecurityScheme {
@@ -206,13 +234,14 @@ fn build_paths(
     graph: &ApiGraph,
     base_path: &str,
     ref_to_name: &BTreeMap<&str, &str>,
+    global_security: &[String],
 ) -> Result<Vec<(String, PathItem)>, crate::CoreError> {
     // The graph sorts operations by (path, method); joining the base path preserves that order, so a
     // simple ordered accumulator keeps the output deterministic without re-sorting.
     let mut paths: Vec<(String, PathItem)> = Vec::new();
     for op in &graph.operations {
         let abs_path = join_base(base_path, &op.path)?;
-        let operation = lower_operation(op, ref_to_name)?;
+        let operation = lower_operation(op, ref_to_name, global_security)?;
         // Find the existing path-item index (the graph's (path, method) sort keeps same-path
         // operations adjacent, so this stays deterministic), else append a fresh one.
         let index = if let Some(index) = paths.iter().position(|(p, _)| *p == abs_path) {
@@ -267,23 +296,26 @@ fn place_operation(
 fn lower_operation(
     op: &GraphOp,
     ref_to_name: &BTreeMap<&str, &str>,
+    global_security: &[String],
 ) -> Result<Operation, crate::CoreError> {
     let parameters = op
         .params
         .iter()
         .map(|param| {
+            let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
+            schema.default_value.clone_from(&param.default);
             Ok(Parameter {
                 name: param.name.clone(),
                 location: param.location.clone(),
                 required: param.required,
-                schema: lower_schema_type(&param.schema, ref_to_name)?,
+                schema,
             })
         })
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
     let request_body = match &op.request_body {
         Some(body) => Some(RequestBody {
-            required: true,
+            required: op.request_body_required,
             content_type: op
                 .request_body_content_type
                 .clone()
@@ -293,76 +325,138 @@ fn lower_operation(
         None => None,
     };
 
-    let mut responses = op
-        .responses
-        .iter()
-        .map(|resp| {
-            let (schema_ref, content_type, binary) = match resp.body_kind.as_str() {
-                "json" => {
-                    let schema_ref = match &resp.body {
-                        Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
-                        None => None,
-                    };
-                    (schema_ref, resp.content_type.clone(), false)
-                }
-                "binary" => {
-                    if resp.body.is_some() {
-                        return Err(crate::CoreError::Lowering {
-                            message: format!(
-                                "operation '{}' response {} is binary but also has a schema body",
-                                op.id, resp.status
-                            ),
-                        });
-                    }
-                    (
-                        None,
-                        Some(
-                            resp.content_type
-                                .clone()
-                                .unwrap_or_else(|| "application/octet-stream".to_string()),
-                        ),
-                        true,
-                    )
-                }
-                other => {
-                    return Err(crate::CoreError::Lowering {
-                        message: format!(
-                            "operation '{}' response {} has unsupported body_kind {other:?}",
-                            op.id, resp.status
-                        ),
-                    });
-                }
-            };
-            Ok((
-                resp.status.to_string(),
-                ResponseObj {
-                    description: default_response_description(resp.status),
-                    schema_ref,
-                    content_type,
-                    binary,
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, crate::CoreError>>()?;
-    if responses.is_empty() {
-        responses.push((
-            "default".to_string(),
-            ResponseObj {
-                description: "Default response".to_string(),
-                schema_ref: None,
-                content_type: None,
-                binary: false,
-            },
-        ));
+    let responses = lower_responses(op, ref_to_name)?;
+    let mut operation_security = Vec::new();
+    if !op.security.is_empty() {
+        if !op.security_overrides_global {
+            operation_security.extend(global_security.iter().cloned());
+        }
+        operation_security.extend(op.security.iter().cloned());
     }
+    operation_security.sort();
+    operation_security.dedup();
 
     Ok(Operation {
         operation_id: op.id.clone(),
         tags: op.group.clone().into_iter().collect(),
+        security: operation_security
+            .into_iter()
+            .map(|scheme| SecurityRequirement {
+                scheme,
+                scopes: Vec::new(),
+            })
+            .collect(),
         parameters,
         request_body,
         responses,
     })
+}
+
+fn lower_responses(
+    op: &GraphOp,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<Vec<(String, ResponseObj)>, crate::CoreError> {
+    let mut responses = op
+        .responses
+        .iter()
+        .map(|resp| lower_response(op, resp, ref_to_name))
+        .collect::<Result<Vec<_>, crate::CoreError>>()?;
+    if responses.is_empty() {
+        responses.push(default_response());
+    }
+    Ok(responses)
+}
+
+fn lower_response(
+    op: &GraphOp,
+    resp: &crate::graph::Response,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<(String, ResponseObj), crate::CoreError> {
+    let (schema_ref, content_type, binary, event_stream) = match resp.body_kind.as_str() {
+        "json" => {
+            let schema_ref = match &resp.body {
+                Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
+                None => None,
+            };
+            (schema_ref, resp.content_type.clone(), false, false)
+        }
+        "binary" => {
+            ensure_response_has_no_schema(op, resp, "binary")?;
+            (
+                None,
+                Some(
+                    resp.content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                ),
+                true,
+                false,
+            )
+        }
+        "sse" => {
+            let schema_ref = match &resp.body {
+                Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
+                None => None,
+            };
+            (
+                schema_ref,
+                Some(
+                    resp.content_type
+                        .clone()
+                        .unwrap_or_else(|| "text/event-stream".to_string()),
+                ),
+                false,
+                true,
+            )
+        }
+        other => {
+            return Err(crate::CoreError::Lowering {
+                message: format!(
+                    "operation '{}' response {} has unsupported body_kind {other:?}",
+                    op.id, resp.status
+                ),
+            });
+        }
+    };
+    Ok((
+        resp.status.to_string(),
+        ResponseObj {
+            description: default_response_description(resp.status),
+            schema_ref,
+            content_type,
+            binary,
+            event_stream,
+        },
+    ))
+}
+
+fn ensure_response_has_no_schema(
+    op: &GraphOp,
+    resp: &crate::graph::Response,
+    body_kind: &str,
+) -> Result<(), crate::CoreError> {
+    if resp.body.is_some() {
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "operation '{}' response {} is {body_kind} but also has a schema body",
+                op.id, resp.status
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn default_response() -> (String, ResponseObj) {
+    (
+        "default".to_string(),
+        ResponseObj {
+            description: "Default response".to_string(),
+            schema_ref: None,
+            content_type: None,
+            binary: false,
+            event_stream: false,
+        },
+    )
 }
 
 /// Map each graph [`Schema`] to a component [`SchemaObject`], keyed by its bare local name.
@@ -706,6 +800,7 @@ mod tests {
             kind: "apiKey".to_string(),
             location: "header".to_string(),
             name: "X-API-Key".to_string(),
+            global: true,
         }]
     }
 
@@ -1024,7 +1119,7 @@ mod tests {
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
         let block = block.split("GoalResponse:").next().unwrap_or(block);
         assert!(
-            block.contains("type: [string, null]"),
+            block.contains("type: [string, 'null']"),
             "nullable field must render the 3.1 type array form:\n{block}"
         );
         assert!(
@@ -1172,7 +1267,7 @@ mod tests {
         use crate::graph::{Field, Type};
         // A NULLABLE enum: an enum lowers to `type: string` + `enum` (neither `$ref` nor `one_of`), so
         // the nullable wrap falls through to the `nullable: true, ..lowered` branch and renders the 3.1
-        // type-array form `type: [string, null]` alongside the `enum` keys (valid JSON-Schema-2020-12).
+        // type-array form `type: [string, 'null']` alongside the `enum` keys (valid JSON-Schema-2020-12).
         // This locks the contract CR-02's fixture snapshots must encode.
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
@@ -1189,7 +1284,8 @@ mod tests {
         let block = yaml.split("CreateGoalInput:").nth(1).expect("schema block");
         let block = block.split("GoalResponse:").next().unwrap_or(block);
         assert!(
-            block.contains("sort:\n          type: [string, null]\n          enum: [asc, desc]\n"),
+            block
+                .contains("sort:\n          type: [string, 'null']\n          enum: [asc, desc]\n"),
             "nullable enum must render the 3.1 type-array form with enum keys:\n{block}"
         );
     }
@@ -1351,6 +1447,39 @@ mod tests {
     }
 
     #[test]
+    fn operation_scoped_security_lowers_with_global_security() {
+        let mut graph = sample_graph();
+        graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "updateGoal")
+            .unwrap()
+            .security = vec!["CSRFAuth".to_string()];
+        let mut config = security_config();
+        config.push(SecurityScheme {
+            id: "CSRFAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "X-CSRF-Token".to_string(),
+            global: false,
+        });
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &config).unwrap();
+        let update_block = yaml
+            .split("operationId: updateGoal")
+            .nth(1)
+            .expect("updateGoal operation");
+        let update_block = update_block
+            .split("responses:")
+            .next()
+            .unwrap_or(update_block);
+        assert!(
+            update_block.contains("security:\n        - ApiKeyAuth: []\n          CSRFAuth: []"),
+            "operation-level security must include inherited global auth plus scoped auth:\n{update_block}"
+        );
+    }
+
+    #[test]
     fn no_security_config_emits_no_security() {
         // With an empty security config the document carries no security — proving security is
         // ENTIRELY config-driven, never derived from the graph (CLAUDE.md rule 4).
@@ -1369,6 +1498,7 @@ mod tests {
             kind: "oauth2".to_string(),
             location: "header".to_string(),
             name: "Authorization".to_string(),
+            global: true,
         }];
         let err = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap_err();
         let crate::CoreError::Lowering { message } = err else {

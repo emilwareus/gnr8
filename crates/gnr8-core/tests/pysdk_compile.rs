@@ -30,6 +30,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The `FastAPI` fixture, resolved relative to this crate's manifest dir (mirrors the other tests).
 const FIXTURE_DIR: &str = concat!(
@@ -42,6 +43,8 @@ const PACKAGE: &str = "bookstore";
 
 /// The four files the `pysdk` bundle always frames (D-06 push order).
 const SDK_FILES: [&str; 4] = ["__init__.py", "client.py", "errors.py", "models.py"];
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the `python3` toolchain is available so this test skips gracefully if it is absent.
 fn python_available() -> bool {
@@ -60,9 +63,10 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "gnr8-pysdk-compile-{label}-{}-{nanos}",
-        std::process::id()
+        "gnr8-pysdk-compile-{label}-{}-{seq}-{nanos}",
+        std::process::id(),
     ));
     std::fs::create_dir_all(&dir).expect("create unique temp dir");
     dir
