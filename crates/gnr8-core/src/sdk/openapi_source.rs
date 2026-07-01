@@ -489,22 +489,82 @@ impl Importer {
         };
         for (status, response) in response_map {
             let status_code = status.parse::<u16>().unwrap_or(200);
-            let schema = match self.version {
-                SpecVersion::Swagger2 => response.get("schema"),
+            let selected: Option<(String, &Value)> = match self.version {
+                SpecVersion::Swagger2 => response
+                    .get("schema")
+                    .map(|schema| (self.swagger_response_media_type(operation), schema)),
                 SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => response
                     .get("content")
                     .and_then(Value::as_object)
                     .and_then(choose_content)
-                    .and_then(|(_, media)| media.get("schema")),
+                    .and_then(|(media_type, media)| {
+                        media
+                            .get("schema")
+                            .map(|schema| (media_type.to_string(), schema))
+                    }),
             };
+            let Some((media_type, schema)) = selected else {
+                responses.push(Response {
+                    status: status_code,
+                    body: None,
+                    body_kind: "json".to_string(),
+                    content_type: None,
+                });
+                continue;
+            };
+            if self.response_schema_is_binary(schema) {
+                let content_type =
+                    if self.version == SpecVersion::Swagger2 && media_type == "application/json" {
+                        "application/octet-stream".to_string()
+                    } else {
+                        media_type
+                    };
+                responses.push(Response {
+                    status: status_code,
+                    body: None,
+                    body_kind: "binary".to_string(),
+                    content_type: Some(content_type),
+                });
+                continue;
+            }
             responses.push(Response {
                 status: status_code,
-                body: schema.map(|schema| {
-                    self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response"))
-                }),
+                body: Some(
+                    self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response")),
+                ),
+                body_kind: "json".to_string(),
+                content_type: (media_type != "application/json").then_some(media_type),
             });
         }
         responses
+    }
+
+    fn swagger_response_media_type(&self, operation: &Value) -> String {
+        operation
+            .get("produces")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .or_else(|| {
+                self.root
+                    .get("produces")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("application/json")
+            .to_string()
+    }
+
+    fn response_schema_is_binary(&mut self, schema: &Value) -> bool {
+        if is_binary_response_schema(schema) {
+            return true;
+        }
+        let Some(ref_value) = schema.get("$ref").and_then(Value::as_str) else {
+            return false;
+        };
+        self.resolve_ref_schema(ref_value)
+            .is_some_and(|(_, raw)| is_binary_response_schema(&raw))
     }
 
     fn schema_ref_for(&mut self, schema: &Value, suggested: &str) -> SchemaRef {
@@ -1009,6 +1069,13 @@ fn string_type(schema: &Value) -> Type {
     }
 }
 
+fn is_binary_response_schema(schema: &Value) -> bool {
+    matches!(
+        schema.get("format").and_then(Value::as_str),
+        Some("binary" | "byte")
+    ) || schema.get("type").and_then(Value::as_str) == Some("file")
+}
+
 fn integer_bits(schema: &Value) -> u16 {
     match schema.get("format").and_then(Value::as_str) {
         Some("int32") => 32,
@@ -1127,7 +1194,7 @@ fn is_http_method(method: &str) -> bool {
 }
 
 fn is_lowerable_method(method: &str) -> bool {
-    matches!(method, "get" | "put" | "post" | "delete")
+    matches!(method, "get" | "put" | "post" | "patch" | "delete")
 }
 
 fn normalize_path(path: &str) -> String {
@@ -1359,6 +1426,47 @@ components:
     }
 
     #[test]
+    fn imports_openapi31_patch_and_binary_response() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Files API, version: 1.0.0 }
+paths:
+  /files/{id}:
+    patch:
+      tags: [Files]
+      operationId: updateFile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: file
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        assert_eq!(graph.operations.len(), 1);
+        let op = &graph.operations[0];
+        assert_eq!(op.method, "PATCH");
+        assert_eq!(op.id, "updateFile");
+        assert_eq!(op.group.as_deref(), Some("Files"));
+        assert_eq!(op.responses.len(), 1);
+        let response = &op.responses[0];
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_none());
+        assert_eq!(response.body_kind, "binary");
+        assert_eq!(response.content_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
     fn imports_swagger20_form_data_file_upload() {
         let text = r"
 swagger: '2.0'
@@ -1406,6 +1514,34 @@ definitions:
         assert!(fields.iter().any(|field| {
             field.json_name == "file" && matches!(field.schema, Type::Primitive(Prim::Bytes))
         }));
+    }
+
+    #[test]
+    fn imports_swagger20_file_response_as_binary() {
+        let text = r"
+swagger: '2.0'
+info: { title: Files API, version: 1.0.0 }
+basePath: /api
+produces: [application/pdf]
+paths:
+  /download:
+    get:
+      operationId: downloadFile
+      responses:
+        '200':
+          description: file
+          schema: { type: file }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+        let response = &graph.operations[0].responses[0];
+        assert!(response.body.is_none());
+        assert_eq!(response.body_kind, "binary");
+        assert_eq!(response.content_type.as_deref(), Some("application/pdf"));
     }
 
     #[test]

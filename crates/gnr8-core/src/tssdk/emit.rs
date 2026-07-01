@@ -26,6 +26,7 @@
 //! object) returns [`crate::CoreError::SdkGen`]; there is no production `unwrap`/`expect`/`panic`
 //! (RUST-04).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
@@ -640,9 +641,97 @@ pub(crate) fn emit_operations(
         out.push('\n');
         emit_operation(&mut out, op, graph, base_path, auth_header)?;
     }
+    emit_group_getters(&mut out, ops)?;
     // Close the `class Client {` opened by emit_client.
     out.push_str("}\n");
+    emit_group_facades(&mut out, ops)?;
     Ok(out)
+}
+
+fn grouped_ops<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
+    let mut grouped: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in ops {
+        let Some(group) = &op.group else {
+            continue;
+        };
+        if group == "default" {
+            continue;
+        }
+        grouped.entry(group.clone()).or_default().push(*op);
+    }
+    grouped
+}
+
+fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreError> {
+    let groups = grouped_ops(ops);
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let method_names: BTreeSet<String> = ops.iter().map(|op| camel(&op.handler)).collect();
+    let mut properties: BTreeSet<String> = ["apiKey", "baseUrl", "constructor", "fetchFn"]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut class_names = BTreeMap::new();
+    for group in groups.keys() {
+        let property = camel(group);
+        if property.is_empty()
+            || method_names.contains(&property)
+            || !properties.insert(property.clone())
+        {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation group {group:?} cannot be emitted as a TypeScript Client facade property"
+                ),
+            });
+        }
+        let class_name = api_class_name(group);
+        if let Some(existing) = class_names.insert(class_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit TypeScript facade class {class_name}"
+                    ),
+                });
+            }
+        }
+        writeln!(
+            out,
+            "\n  get {property}(): {class_name} {{\n    return new {class_name}(this);\n  }}"
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_group_facades(out: &mut String, ops: &[&Operation]) -> Result<(), CoreError> {
+    for (group, group_ops) in grouped_ops(ops) {
+        writeln!(out, "\nexport class {} {{", api_class_name(&group)).map_err(sink)?;
+        writeln!(out, "  constructor(private readonly client: Client) {{}}").map_err(sink)?;
+        for op in group_ops {
+            let method = camel(&op.handler);
+            writeln!(
+                out,
+                "\n  {method}(...args: Parameters<Client[{}]>): ReturnType<Client[{}]> {{",
+                ts_string_literal(&method),
+                ts_string_literal(&method)
+            )
+            .map_err(sink)?;
+            writeln!(out, "    return this.client.{method}(...args);").map_err(sink)?;
+            writeln!(out, "  }}").map_err(sink)?;
+        }
+        writeln!(out, "}}").map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn api_class_name(group: &str) -> String {
+    let mut out = pascal_identifier(group);
+    if out.is_empty() {
+        out.push_str("Default");
+    }
+    out.push_str("Api");
+    out
 }
 
 /// The collision-checked TypeScript identifiers for one operation's arguments.
@@ -770,16 +859,24 @@ fn emit_operation(
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
-    let return_ty = return_model.as_ref().map_or_else(
-        || "void".to_string(),
-        |m| {
-            if success.has_bodyless_alternative() {
-                format!("models.{m} | undefined")
-            } else {
-                format!("models.{m}")
-            }
-        },
-    );
+    let return_ty = if success.has_binary_body() {
+        if success.has_bodyless_alternative() {
+            "Blob | undefined".to_string()
+        } else {
+            "Blob".to_string()
+        }
+    } else {
+        return_model.as_ref().map_or_else(
+            || "void".to_string(),
+            |m| {
+                if success.has_bodyless_alternative() {
+                    format!("models.{m} | undefined")
+                } else {
+                    format!("models.{m}")
+                }
+            },
+        )
+    };
 
     let ResolvedArgs {
         path_idents,
@@ -811,7 +908,7 @@ fn emit_operation(
         args.push(format!("{ident}?: {ty}"));
     }
 
-    let ret_promise = if return_model.is_some() {
+    let ret_promise = if return_model.is_some() || success.has_binary_body() {
         format!("Promise<{return_ty}>")
     } else {
         "Promise<void>".to_string()
@@ -836,8 +933,10 @@ fn emit_operation(
         out,
         &op.method,
         &success.body_statuses,
+        &success.binary_statuses,
         success.has_bodyless_alternative(),
         body_model.is_some(),
+        success.has_binary_body(),
         return_model.as_deref(),
         auth_header,
     )?;
@@ -916,12 +1015,15 @@ fn emit_op_query(
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
 /// body-bearing success statuses. The request carries a JSON body only for body-bearing ops.
+#[allow(clippy::too_many_arguments)]
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
     body_statuses: &[u16],
+    binary_statuses: &[u16],
     has_bodyless_success: bool,
     has_body: bool,
+    has_binary: bool,
     return_model: Option<&str>,
     auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
@@ -957,7 +1059,23 @@ fn emit_op_dispatch(
     )
     .map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
-    if let Some(model) = return_model {
+    if has_binary {
+        writeln!(
+            out,
+            "    if ({}) {{",
+            ts_status_match("res.status", binary_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(out, "      return await res.blob();").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+        if !has_bodyless_success {
+            writeln!(
+                out,
+                "    throw new ApiError(res.status, await res.json().catch(() => null));"
+            )
+            .map_err(sink)?;
+        }
+    } else if let Some(model) = return_model {
         writeln!(
             out,
             "    if ({}) {{",
@@ -1584,6 +1702,8 @@ mod tests {
             g.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
+                body_kind: "json".to_string(),
+                content_type: None,
             });
             g.operations[0]
                 .responses
@@ -1664,6 +1784,61 @@ mod tests {
             let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
             assert!(
                 err.to_string().contains("do not match its path params"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_name_collision_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                { "method": "GET", "path": "/b", "handler": "listB",
+                  "operation_id": "listB", "group": "foo_bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be emitted as a TypeScript Client facade property"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_collision_with_client_member_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "base-url",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot be emitted as a TypeScript Client facade property"),
                 "{err}"
             );
         }

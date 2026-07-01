@@ -127,7 +127,7 @@ fn go_gin_cache_key(input: &Path, package_patterns: &[String], cx: &Cx) -> Strin
     let mut files = Vec::new();
     collect_cache_input_files(input, &mut files);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-go-gin-source-cache-v1\n");
+    hasher.update(b"gnr8-go-gin-source-cache-v2\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
     for pattern in package_patterns {
@@ -602,6 +602,8 @@ impl Transform for SetOperationSuccessResponse {
         op.responses.push(Response {
             status: self.status,
             body: Some(SchemaRef { ref_id: schema_id }),
+            body_kind: "json".to_string(),
+            content_type: None,
         });
         op.responses.sort_by_key(|response| response.status);
         Ok(())
@@ -1114,7 +1116,6 @@ impl GroupOperations {
 impl Transform for GroupOperations {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         for op in &mut ir.operations {
-            op.group = None;
             for rule in &self.rules {
                 let matched = match rule {
                     GroupRule::PathPrefix { prefix, group } => {
@@ -2577,9 +2578,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk, Header,
-        NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
-        OpenApiSchemaPatch, PostProcess, PySdk, SetBasePath, SetEnumOrder,
+        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk,
+        GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, PostProcess, PySdk, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
         Transform, TsSdk,
     };
@@ -2633,6 +2634,48 @@ mod tests {
     }
 
     #[test]
+    fn group_operations_overrides_matches_and_preserves_source_groups() {
+        let mut ir = ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "login".to_string(),
+                    method: "POST".to_string(),
+                    path: "/auth/login".to_string(),
+                    handler: "login".to_string(),
+                    group: Some("auth".to_string()),
+                    params: vec![],
+                    request_body: None,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    provenance: span(),
+                },
+                Operation {
+                    id: "download".to_string(),
+                    method: "GET".to_string(),
+                    path: "/files/{fileId}".to_string(),
+                    handler: "download".to_string(),
+                    group: Some("files".to_string()),
+                    params: vec![],
+                    request_body: None,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        GroupOperations::new()
+            .by_operation("login", "session")
+            .by_path_prefix("/missing", "unused")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].group.as_deref(), Some("session"));
+        assert_eq!(ir.operations[1].group.as_deref(), Some("files"));
+    }
+
+    #[test]
     fn set_base_path_rejects_relative_or_url_like_paths() {
         let mut ir = ApiGraph::default();
         let err = SetBasePath::new("books").apply(&mut ir, &cx()).unwrap_err();
@@ -2667,10 +2710,14 @@ mod tests {
                     crate::graph::Response {
                         status: 200,
                         body: None,
+                        body_kind: "json".to_string(),
+                        content_type: None,
                     },
                     crate::graph::Response {
                         status: 404,
                         body: None,
+                        body_kind: "json".to_string(),
+                        content_type: None,
                     },
                 ],
                 provenance: span(),

@@ -59,6 +59,8 @@ pub(crate) struct PathItem {
     pub post: Option<Operation>,
     /// `PUT` operation, if any.
     pub put: Option<Operation>,
+    /// `PATCH` operation, if any.
+    pub patch: Option<Operation>,
     /// `DELETE` operation, if any.
     pub delete: Option<Operation>,
 }
@@ -116,6 +118,10 @@ pub(crate) struct ResponseObj {
     pub description: String,
     /// The JSON-pointer name of the referenced body schema, if the response has a typed body.
     pub schema_ref: Option<String>,
+    /// Response media type when content is emitted.
+    pub content_type: Option<String>,
+    /// Whether this response is binary/file content (`type: string`, `format: binary`).
+    pub binary: bool,
 }
 
 /// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.

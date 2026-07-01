@@ -479,16 +479,7 @@ fn emit_axios_operation_method(
         " = {}"
     };
     let success = success_responses_of(op, graph)?;
-    let data_ty = success.body_model.as_ref().map_or_else(
-        || "void".to_string(),
-        |model| {
-            if success.has_bodyless_alternative() {
-                format!("models.{model} | undefined")
-            } else {
-                format!("models.{model}")
-            }
-        },
-    );
+    let data_ty = ts_success_data_type(&success);
     let return_ty = axios_operation_return_type(&data_ty, response_policy);
 
     writeln!(
@@ -573,6 +564,9 @@ fn emit_axios_operation_method(
     writeln!(out, "        ...localVarHeaderParameter,").map_err(ts_mod_sink)?;
     writeln!(out, "      }},").map_err(ts_mod_sink)?;
     writeln!(out, "      validateStatus: () => true,").map_err(ts_mod_sink)?;
+    if success.has_binary_body() {
+        writeln!(out, "      responseType: \"blob\",").map_err(ts_mod_sink)?;
+    }
     writeln!(out, "    }};").map_err(ts_mod_sink)?;
     writeln!(
         out,
@@ -590,7 +584,32 @@ fn emit_axios_operation_method(
     )
     .map_err(ts_mod_sink)?;
     writeln!(out, "    }}").map_err(ts_mod_sink)?;
-    if let Some(model) = &success.body_model {
+    if success.has_binary_body() {
+        if response_policy == TsResponsePolicy::DataOnly && success.has_bodyless_alternative() {
+            writeln!(
+                out,
+                "    if (![{}].includes(response.status)) {{",
+                success
+                    .binary_statuses
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "      return undefined;").map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+        match response_policy {
+            TsResponsePolicy::DataOnly => {
+                writeln!(out, "    return response.data as Blob;").map_err(ts_mod_sink)?;
+            }
+            TsResponsePolicy::AxiosResponseWrapper => {
+                writeln!(out, "    return response as AxiosResponse<{data_ty}>;")
+                    .map_err(ts_mod_sink)?;
+            }
+        }
+    } else if let Some(model) = &success.body_model {
         if response_policy == TsResponsePolicy::DataOnly && success.has_bodyless_alternative() {
             writeln!(
                 out,
@@ -659,16 +678,7 @@ fn emit_axios_factory(
             " = {}"
         };
         let success = success_responses_of(op, graph)?;
-        let data_ty = success.body_model.as_ref().map_or_else(
-            || "void".to_string(),
-            |model| {
-                if success.has_bodyless_alternative() {
-                    format!("models.{model} | undefined")
-                } else {
-                    format!("models.{model}")
-                }
-            },
-        );
+        let data_ty = ts_success_data_type(&success);
         let return_ty = axios_operation_return_type(&data_ty, response_policy);
         writeln!(
             out,
@@ -692,6 +702,25 @@ fn axios_operation_return_type(data_ty: &str, response_policy: TsResponsePolicy)
         TsResponsePolicy::DataOnly => format!("Promise<{data_ty}>"),
         TsResponsePolicy::AxiosResponseWrapper => format!("Promise<AxiosResponse<{data_ty}>>"),
     }
+}
+
+fn ts_success_data_type(success: &crate::sdk::emit_common::SuccessResponses) -> String {
+    if success.has_binary_body() {
+        if success.has_bodyless_alternative() {
+            return "Blob | undefined".to_string();
+        }
+        return "Blob".to_string();
+    }
+    success.body_model.as_ref().map_or_else(
+        || "void".to_string(),
+        |model| {
+            if success.has_bodyless_alternative() {
+                format!("models.{model} | undefined")
+            } else {
+                format!("models.{model}")
+            }
+        },
+    )
 }
 
 fn emit_axios_path(

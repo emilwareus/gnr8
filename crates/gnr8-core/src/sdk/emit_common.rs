@@ -320,12 +320,22 @@ pub(crate) struct SuccessResponses {
     pub(crate) body_model: Option<String>,
     /// The statuses that carry [`Self::body_model`].
     pub(crate) body_statuses: Vec<u16>,
+    /// The statuses that carry binary/file content.
+    pub(crate) binary_statuses: Vec<u16>,
+    /// The media type for binary/file success content.
+    pub(crate) binary_content_type: Option<String>,
 }
 
 impl SuccessResponses {
     /// Whether at least one declared success has no body while another has a typed body.
     pub(crate) fn has_bodyless_alternative(&self) -> bool {
-        self.body_model.is_some() && self.body_statuses.len() < self.statuses.len()
+        (self.body_model.is_some() || !self.binary_statuses.is_empty())
+            && self.body_statuses.len() + self.binary_statuses.len() < self.statuses.len()
+    }
+
+    /// Whether at least one successful response carries binary/file content.
+    pub(crate) fn has_binary_body(&self) -> bool {
+        !self.binary_statuses.is_empty()
     }
 }
 
@@ -340,42 +350,84 @@ pub(crate) fn success_responses_of(
 ) -> Result<SuccessResponses, CoreError> {
     let mut statuses = Vec::new();
     let mut body_statuses = Vec::new();
+    let mut binary_statuses = Vec::new();
     let mut body_model: Option<String> = None;
+    let mut binary_content_type: Option<String> = None;
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
             statuses.push(resp.status);
-            if let Some(body) = &resp.body {
-                let model = graph
-                    .schemas
-                    .iter()
-                    .find(|s| s.id == body.ref_id)
-                    .ok_or_else(|| CoreError::SdkGen {
-                        message: format!(
-                            "operation '{}' success response references dangling $ref '{}'",
-                            op.id, body.ref_id
-                        ),
-                    })?;
-                match &body_model {
-                    Some(existing) if existing != &model.name => {
+            match resp.body_kind.as_str() {
+                "json" => {
+                    if let Some(body) = &resp.body {
+                        let model = graph
+                            .schemas
+                            .iter()
+                            .find(|s| s.id == body.ref_id)
+                            .ok_or_else(|| CoreError::SdkGen {
+                                message: format!(
+                                    "operation '{}' success response references dangling $ref '{}'",
+                                    op.id, body.ref_id
+                                ),
+                            })?;
+                        match &body_model {
+                            Some(existing) if existing != &model.name => {
+                                return Err(CoreError::SdkGen {
+                                    message: format!(
+                                        "operation '{}' has multiple success body models ('{}' and '{}'); \
+                                         SDK targets require one return model",
+                                        op.id, existing, model.name
+                                    ),
+                                });
+                            }
+                            Some(_) => {}
+                            None => body_model = Some(model.name.clone()),
+                        }
+                        body_statuses.push(resp.status);
+                    }
+                }
+                "binary" => {
+                    if resp.body.is_some() {
                         return Err(CoreError::SdkGen {
                             message: format!(
-                                "operation '{}' has multiple success body models ('{}' and '{}'); \
-                                 SDK targets require one return model",
-                                op.id, existing, model.name
+                                "operation '{}' response {} is binary but also has a schema body",
+                                op.id, resp.status
                             ),
                         });
                     }
-                    Some(_) => {}
-                    None => body_model = Some(model.name.clone()),
+                    binary_statuses.push(resp.status);
+                    let content_type = resp
+                        .content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    if binary_content_type.is_none() {
+                        binary_content_type = Some(content_type);
+                    }
                 }
-                body_statuses.push(resp.status);
+                other => {
+                    return Err(CoreError::SdkGen {
+                        message: format!(
+                            "operation '{}' response {} has unsupported body_kind {other:?}",
+                            op.id, resp.status
+                        ),
+                    });
+                }
             }
         }
+    }
+    if body_model.is_some() && !binary_statuses.is_empty() {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "operation '{}' mixes JSON and binary success responses; SDK targets require one success body kind",
+                op.id
+            ),
+        });
     }
     Ok(SuccessResponses {
         statuses,
         body_model,
         body_statuses,
+        binary_statuses,
+        binary_content_type,
     })
 }
 
@@ -403,7 +455,8 @@ pub(crate) fn body_model_of(op: &Operation, graph: &ApiGraph) -> Result<Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::file_stem;
+    use super::{file_stem, success_responses_of};
+    use crate::graph::{ApiGraph, Operation, Response, SourceSpan};
 
     #[test]
     fn file_stem_splits_acronym_before_capitalized_word() {
@@ -415,5 +468,44 @@ mod tests {
             file_stem("SupabaseCreateSignedURLOutput"),
             "supabase_create_signed_url_output"
         );
+    }
+
+    #[test]
+    fn binary_successes_allow_multiple_media_types() -> Result<(), crate::CoreError> {
+        let graph = ApiGraph::default();
+        let op = Operation {
+            id: "download".to_string(),
+            method: "GET".to_string(),
+            path: "/download".to_string(),
+            handler: "download".to_string(),
+            group: None,
+            params: vec![],
+            request_body: None,
+            request_body_content_type: None,
+            responses: vec![
+                Response {
+                    status: 200,
+                    body: None,
+                    body_kind: "binary".to_string(),
+                    content_type: Some("application/pdf".to_string()),
+                },
+                Response {
+                    status: 206,
+                    body: None,
+                    body_kind: "binary".to_string(),
+                    content_type: Some("application/octet-stream".to_string()),
+                },
+            ],
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        let success = success_responses_of(&op, &graph)?;
+        assert_eq!(success.binary_statuses, vec![200, 206]);
+        assert!(success.has_binary_body());
+        assert!(!success.has_bodyless_alternative());
+        Ok(())
     }
 }

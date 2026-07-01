@@ -93,6 +93,16 @@ pub(crate) struct ResponseFact {
     pub(crate) status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub(crate) body: Option<TypeRef>,
+    /// The response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes.
+    #[serde(default = "default_response_body_kind")]
+    pub(crate) body_kind: String,
+    /// Optional response media type, used primarily for binary/file responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_type: Option<String>,
+}
+
+fn default_response_body_kind() -> String {
+    "json".to_string()
 }
 
 /// One extracted named type. Its body is carried by the neutral [`Type`] enum:

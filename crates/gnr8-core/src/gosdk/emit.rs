@@ -20,7 +20,7 @@
 //! fails on them). Every un-representable fact (dangling `$ref`, unknown `kind`) returns
 //! [`crate::CoreError::SdkGen`]; there is no prod `unwrap`/`expect`/`panic` (RUST-04).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
@@ -2301,6 +2301,27 @@ pub(crate) fn emit_operations(
     ops: &[&Operation],
     auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
+    emit_operations_inner(graph, package, base_path, ops, auth_header, true)
+}
+
+pub(crate) fn emit_operations_without_facades(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+    auth_header: Option<&str>,
+) -> Result<String, CoreError> {
+    emit_operations_inner(graph, package, base_path, ops, auth_header, false)
+}
+
+fn emit_operations_inner(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+    auth_header: Option<&str>,
+    include_facades: bool,
+) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut first = true;
     for op in ops {
@@ -2317,6 +2338,16 @@ pub(crate) fn emit_operations(
     if ops.iter().any(|op| op.request_body.is_some()) {
         imports.push("bytes");
     }
+    let mut needs_io = false;
+    for op in ops {
+        if success_responses_of(op, graph)?.has_binary_body() {
+            needs_io = true;
+            break;
+        }
+    }
+    if needs_io {
+        imports.push("io");
+    }
     imports.extend(query_imports(ops, graph)?);
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
     if ops
@@ -2326,7 +2357,93 @@ pub(crate) fn emit_operations(
         imports.push("fmt");
         imports.push("net/url");
     }
+    if include_facades {
+        emit_group_facades(&mut body, graph, ops)?;
+    }
     Ok(file(package, &imports, &body))
+}
+
+pub(crate) fn emit_facades(
+    graph: &ApiGraph,
+    package: &str,
+    ops: &[&Operation],
+) -> Result<Option<String>, CoreError> {
+    let mut body = String::new();
+    emit_group_facades(&mut body, graph, ops)?;
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(file(package, &[], &body)))
+}
+
+fn emit_group_facades(
+    body: &mut String,
+    graph: &ApiGraph,
+    ops: &[&Operation],
+) -> Result<(), CoreError> {
+    let mut groups = BTreeMap::new();
+    let mut facade_methods = BTreeMap::new();
+    let mut facade_types = BTreeMap::new();
+    let method_names: BTreeSet<String> = ops.iter().map(|op| exported(&op.handler)).collect();
+    let schema_names: BTreeSet<&str> = graph
+        .schemas
+        .iter()
+        .map(|schema| schema.name.as_str())
+        .collect();
+    for op in ops {
+        let Some(group) = &op.group else {
+            continue;
+        };
+        if group == "default" {
+            continue;
+        }
+        let method_name = exported(group);
+        let type_name = format!("{method_name}API");
+        if schema_names.contains(type_name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation group {group:?} cannot be emitted as Go facade type {type_name} because a schema uses that name"
+                ),
+            });
+        }
+        if method_names.contains(&method_name) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation group {group:?} cannot be emitted as a Go Client facade method"
+                ),
+            });
+        }
+        if let Some(existing) = facade_methods.insert(method_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit Go Client facade method {method_name}"
+                    ),
+                });
+            }
+        }
+        if let Some(existing) = facade_types.insert(type_name.clone(), group.clone()) {
+            if existing != *group {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation groups {existing:?} and {group:?} both emit Go facade type {type_name}"
+                    ),
+                });
+            }
+        }
+        groups.insert(group.clone(), (method_name, type_name));
+    }
+    for (_group, (method_name, type_name)) in groups {
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "type {type_name} struct {{").map_err(sink)?;
+        writeln!(body, "*Client").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "func (c *Client) {method_name}() *{type_name} {{").map_err(sink)?;
+        writeln!(body, "return &{type_name}{{Client: c}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    Ok(())
 }
 
 /// Emit a single operation method, including its `<Method>Params` struct when the op has query params.
@@ -2356,11 +2473,15 @@ fn emit_operation(
     let body_model = body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     // The return type is the success model when one exists, else an empty struct.
-    let return_model = success
-        .body_model
-        .as_deref()
-        .unwrap_or("struct{}")
-        .to_string();
+    let return_model = if success.has_binary_body() {
+        "[]byte".to_string()
+    } else {
+        success
+            .body_model
+            .as_deref()
+            .unwrap_or("struct{}")
+            .to_string()
+    };
 
     // Build the signature argument list.
     let mut args = vec!["ctx context.Context".to_string()];
@@ -2391,7 +2512,8 @@ fn emit_operation(
 
     let has_body = body_model.is_some();
     let has_decode = success.body_model.is_some();
-    let dispatch_returns = has_decode && !success.has_bodyless_alternative();
+    let has_binary = success.has_binary_body();
+    let dispatch_returns = (has_decode || has_binary) && !success.has_bodyless_alternative();
     emit_request_dispatch(
         body,
         op,
@@ -2402,6 +2524,7 @@ fn emit_operation(
         has_body,
         &success,
         has_decode,
+        has_binary,
         auth_header,
     )?;
     if !dispatch_returns {
@@ -2415,7 +2538,7 @@ fn emit_operation(
 ///
 /// Split out of [`emit_operation`] so each half stays under the clippy `too_many_lines` ceiling; the
 /// caller has already written the doc comment, signature, and `var out` line.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_request_dispatch(
     body: &mut String,
     op: &Operation,
@@ -2426,6 +2549,7 @@ fn emit_request_dispatch(
     has_body: bool,
     success: &SuccessResponses,
     has_decode: bool,
+    has_binary: bool,
     auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     // Body marshalling.
@@ -2510,8 +2634,24 @@ fn emit_request_dispatch(
     emit_error_decode(body, op, graph)?;
     writeln!(body, "}}").map_err(sink)?;
 
-    // 2xx → decode the success model only for statuses that declare that body.
-    if has_decode {
+    // 2xx → read binary success bodies or decode JSON only for statuses that declare that body.
+    if has_binary {
+        writeln!(
+            body,
+            "if {} {{",
+            go_status_match("resp.StatusCode", &success.binary_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(body, "data, err := io.ReadAll(resp.Body)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        writeln!(body, "return out, err").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return data, nil").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        if !success.has_bodyless_alternative() {
+            writeln!(body, "return out, &APIError{{StatusCode: resp.StatusCode}}").map_err(sink)?;
+        }
+    } else if has_decode {
         writeln!(
             body,
             "if {} {{",
@@ -3444,6 +3584,67 @@ mod tests {
         }
 
         #[test]
+        fn grouped_facade_name_collision_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 } },
+                { "method": "GET", "path": "/b", "handler": "listB",
+                  "operation_id": "listB", "group": "foo_bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 } }
+              ],
+              "schemas": [],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("both emit Go Client facade method FooBar"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn grouped_facade_type_collision_with_schema_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listA",
+                  "operation_id": "listA", "group": "foo-bar",
+                  "params": [], "request_body": null,
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [
+                {
+                  "id": "app.FooBarAPI",
+                  "name": "FooBarAPI",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/models.go", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            assert!(
+                err.to_string().contains("because a schema uses that name"),
+                "{err}"
+            );
+        }
+
+        #[test]
         fn non_string_query_params_are_converted_to_string_with_strconv() {
             // WR-02: an `integer` query param (Go int64) and a `boolean` query param (Go bool) cannot
             // be passed to `q.Set` directly; they must be converted to string via strconv, and the
@@ -3523,6 +3724,8 @@ mod tests {
             graph.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
+                body_kind: "json".to_string(),
+                content_type: None,
             });
             graph.operations[0]
                 .responses

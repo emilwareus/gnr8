@@ -296,6 +296,8 @@ mod tests {
                     body: Some(SchemaRef {
                         ref_id: "app.Book".to_string(),
                     }),
+                    body_kind: "json".to_string(),
+                    content_type: None,
                 }],
                 provenance: span(),
             }],
