@@ -135,7 +135,7 @@ components:
         publisher:
           $ref: '#/components/schemas/Publisher'
         subtitle:
-          type: [string, null]
+          type: [string, 'null']
         tags:
           type: array
           items:
@@ -162,7 +162,7 @@ components:
         publisher:
           $ref: '#/components/schemas/Publisher'
         subtitle:
-          type: [string, null]
+          type: [string, 'null']
         tags:
           type: array
           items:
@@ -190,18 +190,18 @@ components:
       type: object
       properties:
         author:
-          type: [string, null]
+          type: [string, 'null']
         genre:
           oneOf:
           - $ref: '#/components/schemas/Genre'
           - type: null
         price:
-          type: [number, null]
+          type: [number, 'null']
         subtitle:
-          type: [string, null]
+          type: [string, 'null']
         tags:
           type: array
           items:
             type: string
         title:
-          type: [string, null]
+          type: [string, 'null']

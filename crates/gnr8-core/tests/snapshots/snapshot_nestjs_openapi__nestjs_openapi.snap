@@ -104,7 +104,7 @@ components:
       required: [bio, name]
       properties:
         bio:
-          type: [string, null]
+          type: [string, 'null']
         name:
           type: string
     BookDto:
@@ -118,7 +118,7 @@ components:
         id:
           type: number
         rating:
-          type: [number, null]
+          type: [number, 'null']
         tags:
           type: array
           items:
@@ -134,9 +134,9 @@ components:
         inStock:
           type: boolean
         published:
-          type: [number, null]
+          type: [number, 'null']
         sort:
-          type: [string, null]
+          type: [string, 'null']
           enum: [asc, desc]
     BookFormat:
       type: string
@@ -162,7 +162,7 @@ components:
           items:
             $ref: '#/components/schemas/BookDto'
         nextCursor:
-          type: [string, null]
+          type: [string, 'null']
         total:
           type: number
     OutOfStockDto:

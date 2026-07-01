@@ -26,7 +26,7 @@ class Client:
         self._api_key = api_key
         self._opener = opener or urllib.request.build_opener()
 
-    def _do(self, method: str, path: str, *, body: Optional[Any] = None) -> tuple:
+    def _do(self, method: str, path: str, *, body: Optional[Any] = None, auth_headers: Optional[tuple[str, ...]] = None) -> tuple:
         # Pydantic v2 request models need alias-aware JSON-mode dumping before json.dumps.
         if isinstance(body, BaseModel):
             body = body.model_dump(mode="json", by_alias=True, exclude_unset=True)

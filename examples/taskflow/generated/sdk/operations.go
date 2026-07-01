@@ -28,7 +28,9 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 		q.Set("status", *params.Status)
 	}
 	req.URL.RawQuery = q.Encode()
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -73,7 +75,9 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -106,7 +110,9 @@ func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, erro
 	if err != nil {
 		return out, err
 	}
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -145,7 +151,9 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 	if err != nil {
 		return out, err
 	}
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -184,7 +192,9 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)

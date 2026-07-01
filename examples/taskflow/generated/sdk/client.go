@@ -12,6 +12,7 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	apiKey     string
+	apiKeys    map[string]string
 }
 
 // Option mutates a Client during construction (functional-options pattern).
@@ -22,9 +23,19 @@ func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
 
-// WithAPIKey sets the API key sent in the "X-API-Key" header.
+// WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
+}
+
+// WithAPIKeyHeader sets the API key sent in one specific auth header.
+func WithAPIKeyHeader(header, key string) Option {
+	return func(c *Client) {
+		if c.apiKeys == nil {
+			c.apiKeys = map[string]string{}
+		}
+		c.apiKeys[header] = key
+	}
 }
 
 // NewClient builds a Client for the given base URL, applying any options. A
@@ -33,6 +44,7 @@ func NewClient(baseURL string, opts ...Option) *Client {
 	c := &Client{
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		apiKeys:    map[string]string{},
 	}
 	for _, opt := range opts {
 		opt(c)

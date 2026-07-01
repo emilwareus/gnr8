@@ -28,7 +28,9 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams) (BookLis
 		q.Set("genre", *params.Genre)
 	}
 	req.URL.RawQuery = q.Encode()
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -73,7 +75,9 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -106,7 +110,9 @@ func (c *Client) DeleteBook(ctx context.Context, id string) (ErrorResponse, erro
 	if err != nil {
 		return out, err
 	}
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -145,7 +151,9 @@ func (c *Client) GetBook(ctx context.Context, id string) (Book, error) {
 	if err != nil {
 		return out, err
 	}
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
@@ -184,7 +192,9 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
+	if key := c.apiKeys["X-API-Key"]; key != "" {
+		req.Header.Set("X-API-Key", key)
+	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
