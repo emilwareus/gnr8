@@ -162,6 +162,23 @@ pub struct Response {
     pub status: u16,
     /// The response body schema reference, if a typed body was inferred.
     pub body: Option<SchemaRef>,
+    /// Response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes.
+    #[serde(
+        default = "default_response_body_kind",
+        skip_serializing_if = "is_json_body_kind"
+    )]
+    pub body_kind: String,
+    /// Optional response media type, used for binary/file responses and future non-JSON responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+fn default_response_body_kind() -> String {
+    "json".to_string()
+}
+
+fn is_json_body_kind(kind: &str) -> bool {
+    kind == "json"
 }
 
 /// One named schema. Its shape is carried by the neutral [`Type`] vocabulary: a struct/class becomes
@@ -337,6 +354,8 @@ impl Response {
         Self {
             status: response.status,
             body: response.body.map(SchemaRef::from_fact),
+            body_kind: response.body_kind,
+            content_type: response.content_type,
         }
     }
 }
@@ -644,6 +663,33 @@ mod tests {
             .unwrap();
         let statuses: Vec<u16> = put.responses.iter().map(|r| r.status).collect();
         assert_eq!(statuses, vec![200, 400]);
+    }
+
+    #[test]
+    fn response_body_kind_and_content_type_default_through_facts() {
+        let graph = ApiGraph::from_facts(sample_facts(), "/root");
+        let put = graph
+            .operations
+            .iter()
+            .find(|op| op.method == "PUT")
+            .unwrap();
+        let ok = put
+            .responses
+            .iter()
+            .find(|response| response.status == 200)
+            .unwrap();
+        assert_eq!(ok.body_kind, "json");
+        assert_eq!(ok.content_type, None);
+
+        let json = serde_json::to_string(ok).unwrap();
+        assert!(
+            !json.contains("body_kind"),
+            "default json body kind should stay wire-compatible: {json}"
+        );
+        assert!(
+            !json.contains("content_type"),
+            "absent content type should stay omitted: {json}"
+        );
     }
 
     #[test]

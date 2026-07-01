@@ -193,6 +193,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	seenStatus := map[uint16]bool{}
 	formFields := map[string]facts.FieldFact{}
 	formHasFile := false
+	contentTypeHint := ""
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -215,6 +216,18 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			}
 		case "JSON":
 			a.analyzeJSON(h, call, route, &cf, seenStatus, diags)
+		case "Status", "AbortWithStatus":
+			a.analyzeStatus(h, call, route, &cf, seenStatus, diags)
+		case "Header":
+			if key, ok := stringArg(call, 0); ok && strings.EqualFold(key, "Content-Type") {
+				if value, ok := stringArg(call, 1); ok {
+					contentTypeHint = value
+				}
+			}
+		case "File", "FileAttachment":
+			a.analyzeBinaryStatus(&cf, seenStatus, 200, contentTypeHint)
+		case "Data":
+			a.analyzeData(h, call, route, &cf, seenStatus, diags)
 		case "Param":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["path/"+pname] {
 				seenParam["path/"+pname] = true
@@ -348,6 +361,15 @@ func syntheticFormSchemaIdentity(handler string) (id string, name string) {
 	return "__synthetic." + name, name
 }
 
+func syntheticResponseSchemaIdentity(handler string, status uint16) (id string, name string) {
+	base := exportedIdentifier(handler)
+	if base == "" {
+		base = "Response"
+	}
+	name = base + strconv.FormatUint(uint64(status), 10) + "Response"
+	return "__synthetic." + name, name
+}
+
 func exportedIdentifier(name string) string {
 	if name == "" {
 		return ""
@@ -449,13 +471,270 @@ func (a *Analyzer) analyzeJSON(
 	seenStatus[status] = true
 
 	var body *facts.TypeRef
-	if id, ok := a.namedTypeID(h.info.TypeOf(call.Args[1])); ok {
+	if id, schema, ok := a.syntheticJSONResponse(h, call.Args[1], route.Handler, status); ok {
+		body = &facts.TypeRef{RefID: id}
+		cf.Schemas = append(cf.Schemas, schema)
+	} else if id, ok := a.namedTypeID(h.info.TypeOf(call.Args[1])); ok {
 		body = &facts.TypeRef{RefID: id}
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
 		diags.DynamicResponse(route.Handler, "response body does not resolve to a named type", file, line)
 	}
 	cf.Responses = append(cf.Responses, facts.ResponseFact{Status: status, Body: body})
+}
+
+func (a *Analyzer) analyzeStatus(
+	h handlerDecl,
+	call *ast.CallExpr,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	diags *diag.Accumulator,
+) {
+	if len(call.Args) < 1 {
+		return
+	}
+	status, ok := statusOf(h.info, call.Args[0])
+	if !ok {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		return
+	}
+	a.addResponse(cf, seenStatus, facts.ResponseFact{Status: status})
+}
+
+func (a *Analyzer) analyzeBinaryStatus(
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	status uint16,
+	contentType string,
+) {
+	a.addResponse(cf, seenStatus, facts.ResponseFact{
+		Status:      status,
+		BodyKind:    "binary",
+		ContentType: responseContentType(contentType),
+	})
+}
+
+func (a *Analyzer) analyzeData(
+	h handlerDecl,
+	call *ast.CallExpr,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	diags *diag.Accumulator,
+) {
+	if len(call.Args) < 3 {
+		return
+	}
+	status, ok := statusOf(h.info, call.Args[0])
+	if !ok {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		return
+	}
+	if !isByteSlice(h.info.TypeOf(call.Args[2])) {
+		file, line := positionOf(h.fset, call.Pos())
+		diags.Warn("unsupported binary response pattern: Gin Data payload is not []byte (GO-05)", file, line)
+		return
+	}
+	contentType := ""
+	if value, ok := stringArg(call, 1); ok {
+		contentType = value
+	}
+	a.addResponse(cf, seenStatus, facts.ResponseFact{
+		Status:      status,
+		BodyKind:    "binary",
+		ContentType: responseContentType(contentType),
+	})
+}
+
+func (a *Analyzer) addResponse(
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	response facts.ResponseFact,
+) {
+	if seenStatus[response.Status] {
+		return
+	}
+	seenStatus[response.Status] = true
+	cf.Responses = append(cf.Responses, response)
+}
+
+func responseContentType(contentType string) string {
+	if contentType == "" {
+		return "application/octet-stream"
+	}
+	return contentType
+}
+
+func isByteSlice(t gotypes.Type) bool {
+	slice, ok := gotypes.Unalias(t).(*gotypes.Slice)
+	if !ok {
+		return false
+	}
+	basic, ok := gotypes.Unalias(slice.Elem()).(*gotypes.Basic)
+	return ok && basic.Kind() == gotypes.Uint8
+}
+
+func (a *Analyzer) syntheticJSONResponse(
+	h handlerDecl,
+	expr ast.Expr,
+	handler string,
+	status uint16,
+) (string, facts.SchemaFact, bool) {
+	if schema, ok := a.arrayResponseSchema(h.info.TypeOf(expr), handler, status, h.fset, expr.Pos()); ok {
+		return schema.ID, schema, true
+	}
+	if !isGinH(h.info.TypeOf(expr)) {
+		return "", facts.SchemaFact{}, false
+	}
+	schema := a.ginHResponseSchema(h, expr, handler, status)
+	return schema.ID, schema, true
+}
+
+func (a *Analyzer) arrayResponseSchema(
+	t gotypes.Type,
+	handler string,
+	status uint16,
+	fset *token.FileSet,
+	pos token.Pos,
+) (facts.SchemaFact, bool) {
+	var elem gotypes.Type
+	switch u := gotypes.Unalias(t).(type) {
+	case *gotypes.Slice:
+		elem = u.Elem()
+	case *gotypes.Array:
+		elem = u.Elem()
+	default:
+		return facts.SchemaFact{}, false
+	}
+	elemType, ok := a.responseType(elem)
+	if !ok {
+		return facts.SchemaFact{}, false
+	}
+	id, name := syntheticResponseSchemaIdentity(handler, status)
+	return facts.SchemaFact{
+		ID:   id,
+		Name: name,
+		Body: facts.ArrayType(elemType),
+		Span: spanOf(fset, pos),
+	}, true
+}
+
+func (a *Analyzer) ginHResponseSchema(
+	h handlerDecl,
+	expr ast.Expr,
+	handler string,
+	status uint16,
+) facts.SchemaFact {
+	id, name := syntheticResponseSchemaIdentity(handler, status)
+	body := facts.MapTypeOf(facts.PrimitiveType(facts.StringPrim()), facts.AnyType())
+	if lit, ok := expr.(*ast.CompositeLit); ok {
+		if fields, ok := ginHLiteralFields(lit); ok {
+			body = facts.ObjectType(fields)
+		}
+	}
+	return facts.SchemaFact{
+		ID:   id,
+		Name: name,
+		Body: body,
+		Span: spanOf(h.fset, expr.Pos()),
+	}
+}
+
+func ginHLiteralFields(lit *ast.CompositeLit) ([]facts.FieldFact, bool) {
+	fields := make([]facts.FieldFact, 0, len(lit.Elts))
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			return nil, false
+		}
+		key, ok := stringKey(kv.Key)
+		if !ok {
+			return nil, false
+		}
+		schema, ok := literalSchema(kv.Value)
+		if !ok {
+			return nil, false
+		}
+		fields = append(fields, facts.FieldFact{
+			JSONName: key,
+			Required: true,
+			Optional: false,
+			Nullable: false,
+			Schema:   schema,
+		})
+	}
+	return fields, true
+}
+
+func stringKey(expr ast.Expr) (string, bool) {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	value, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func literalSchema(expr ast.Expr) (facts.Type, bool) {
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		switch value.Kind {
+		case token.STRING:
+			return facts.PrimitiveType(facts.StringPrim()), true
+		case token.INT:
+			return facts.PrimitiveType(facts.IntPrim(64, true)), true
+		case token.FLOAT:
+			return facts.PrimitiveType(facts.FloatPrim(64)), true
+		}
+	case *ast.Ident:
+		if value.Name == "true" || value.Name == "false" {
+			return facts.PrimitiveType(facts.BoolPrim()), true
+		}
+	}
+	return facts.Type{}, false
+}
+
+func (a *Analyzer) responseType(t gotypes.Type) (facts.Type, bool) {
+	if t == nil {
+		return facts.Type{}, false
+	}
+	if p, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = p.Elem()
+	}
+	if id, ok := a.namedTypeID(t); ok {
+		return facts.NamedType(id), true
+	}
+	if basic, ok := gotypes.Unalias(t).(*gotypes.Basic); ok {
+		switch basic.Kind() {
+		case gotypes.String:
+			return facts.PrimitiveType(facts.StringPrim()), true
+		case gotypes.Bool:
+			return facts.PrimitiveType(facts.BoolPrim()), true
+		case gotypes.Int, gotypes.Int8, gotypes.Int16, gotypes.Int32, gotypes.Int64:
+			return facts.PrimitiveType(facts.IntPrim(64, true)), true
+		case gotypes.Uint, gotypes.Uint8, gotypes.Uint16, gotypes.Uint32, gotypes.Uint64:
+			return facts.PrimitiveType(facts.IntPrim(64, false)), true
+		case gotypes.Float32:
+			return facts.PrimitiveType(facts.FloatPrim(32)), true
+		case gotypes.Float64:
+			return facts.PrimitiveType(facts.FloatPrim(64)), true
+		}
+	}
+	return facts.Type{}, false
+}
+
+func isGinH(t gotypes.Type) bool {
+	named, ok := gotypes.Unalias(t).(*gotypes.Named)
+	if !ok || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == routes.GinPkgPath && named.Obj().Name() == "H"
 }
 
 // statusOf resolves an HTTP status argument to its numeric value via go/constant.

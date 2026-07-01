@@ -76,6 +76,7 @@ fn write_path_item(item: &PathItem) -> Value {
         ("get", &item.get),
         ("post", &item.post),
         ("put", &item.put),
+        ("patch", &item.patch),
         ("delete", &item.delete),
     ] {
         if let Some(op) = op {
@@ -161,12 +162,35 @@ fn write_response(response: &ResponseObj) -> Value {
         "description".to_string(),
         Value::String(response.description.clone()),
     );
-    if let Some(schema_ref) = &response.schema_ref {
+    if response.binary {
+        let mut schema = Map::new();
+        schema.insert("type".to_string(), Value::String("string".to_string()));
+        schema.insert("format".to_string(), Value::String("binary".to_string()));
+
+        let mut media = Map::new();
+        media.insert("schema".to_string(), Value::Object(schema));
+
+        let mut content = Map::new();
+        content.insert(
+            response
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            Value::Object(media),
+        );
+        out.insert("content".to_string(), Value::Object(content));
+    } else if let Some(schema_ref) = &response.schema_ref {
         let mut media = Map::new();
         media.insert("schema".to_string(), ref_schema(schema_ref));
 
         let mut content = Map::new();
-        content.insert("application/json".to_string(), Value::Object(media));
+        content.insert(
+            response
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/json".to_string()),
+            Value::Object(media),
+        );
         out.insert("content".to_string(), Value::Object(content));
     }
     Value::Object(out)
@@ -384,6 +408,8 @@ mod tests {
                             ResponseObj {
                                 description: "Goal created".to_string(),
                                 schema_ref: Some("CommandMessage".to_string()),
+                                content_type: None,
+                                binary: false,
                             },
                         )],
                     }),

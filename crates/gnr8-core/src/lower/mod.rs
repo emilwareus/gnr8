@@ -242,6 +242,7 @@ fn place_operation(
         "GET" => &mut item.get,
         "POST" => &mut item.post,
         "PUT" => &mut item.put,
+        "PATCH" => &mut item.patch,
         "DELETE" => &mut item.delete,
         other => {
             return Err(crate::CoreError::Lowering {
@@ -296,15 +297,49 @@ fn lower_operation(
         .responses
         .iter()
         .map(|resp| {
-            let schema_ref = match &resp.body {
-                Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
-                None => None,
+            let (schema_ref, content_type, binary) = match resp.body_kind.as_str() {
+                "json" => {
+                    let schema_ref = match &resp.body {
+                        Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
+                        None => None,
+                    };
+                    (schema_ref, resp.content_type.clone(), false)
+                }
+                "binary" => {
+                    if resp.body.is_some() {
+                        return Err(crate::CoreError::Lowering {
+                            message: format!(
+                                "operation '{}' response {} is binary but also has a schema body",
+                                op.id, resp.status
+                            ),
+                        });
+                    }
+                    (
+                        None,
+                        Some(
+                            resp.content_type
+                                .clone()
+                                .unwrap_or_else(|| "application/octet-stream".to_string()),
+                        ),
+                        true,
+                    )
+                }
+                other => {
+                    return Err(crate::CoreError::Lowering {
+                        message: format!(
+                            "operation '{}' response {} has unsupported body_kind {other:?}",
+                            op.id, resp.status
+                        ),
+                    });
+                }
             };
             Ok((
                 resp.status.to_string(),
                 ResponseObj {
                     description: default_response_description(resp.status),
                     schema_ref,
+                    content_type,
+                    binary,
                 },
             ))
         })
@@ -315,6 +350,8 @@ fn lower_operation(
             ResponseObj {
                 description: "Default response".to_string(),
                 schema_ref: None,
+                content_type: None,
+                binary: false,
             },
         ));
     }
@@ -838,6 +875,36 @@ mod tests {
     }
 
     #[test]
+    fn patch_lowers_to_yaml_and_json_path_item() {
+        let mut graph = sample_graph();
+        let update = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "updateGoal")
+            .unwrap();
+        update.method = "PATCH".to_string();
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let uuid_block = yaml
+            .split("'/goal/{uuid}':")
+            .nth(1)
+            .expect("uuid path present");
+        assert!(uuid_block.contains("patch:"), "{uuid_block}");
+        assert!(
+            uuid_block.contains("operationId: updateGoal"),
+            "{uuid_block}"
+        );
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            json["paths"]["/goal/{uuid}"]["patch"]["operationId"],
+            "updateGoal"
+        );
+    }
+
+    #[test]
     fn operation_ids_are_handler_symbols() {
         let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &security_config()).unwrap();
         // operationIds are the handler-symbol-derived ids — no annotation override (e.g. updateGoal,
@@ -1143,6 +1210,80 @@ mod tests {
             !yaml.contains("responses: {}"),
             "must not emit an empty responses object:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn bodyless_response_lowers_without_content() {
+        let mut graph = sample_graph();
+        let create = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "createGoal")
+            .unwrap();
+        create.responses[0].status = 204;
+        create.responses[0].body = None;
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let response_block = yaml
+            .split("'204':")
+            .nth(1)
+            .expect("204 response")
+            .split("'200':")
+            .next()
+            .unwrap();
+        assert!(
+            !response_block.contains("content:"),
+            "body-less responses must not emit content:\n{response_block}"
+        );
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert!(
+            json["paths"]["/goal/"]["post"]["responses"]["204"]
+                .get("content")
+                .is_none(),
+            "{json_text}"
+        );
+    }
+
+    #[test]
+    fn binary_response_lowers_to_openapi_binary_schema() {
+        let mut graph = sample_graph();
+        let create = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "createGoal")
+            .unwrap();
+        create.responses[0].body = None;
+        create.responses[0].body_kind = "binary".to_string();
+        create.responses[0].content_type = None;
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let response_block = yaml
+            .split("'201':")
+            .nth(1)
+            .expect("201 response")
+            .split("components:")
+            .next()
+            .unwrap();
+        assert!(
+            response_block.contains("application/octet-stream:"),
+            "{response_block}"
+        );
+        assert!(response_block.contains("type: string"), "{response_block}");
+        assert!(
+            response_block.contains("format: binary"),
+            "{response_block}"
+        );
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        let schema = &json["paths"]["/goal/"]["post"]["responses"]["201"]["content"]
+            ["application/octet-stream"]["schema"];
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["format"], "binary");
     }
 
     #[test]

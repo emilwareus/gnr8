@@ -83,6 +83,7 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
         ("get", &item.get),
         ("post", &item.post),
         ("put", &item.put),
+        ("patch", &item.patch),
         ("delete", &item.delete),
     ] {
         if let Some(op) = op {
@@ -158,9 +159,34 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
             "{pad}{INDENT}{INDENT}description: {}",
             scalar(&resp.description)
         );
-        if let Some(schema_ref) = &resp.schema_ref {
+        if resp.binary {
+            let content_type = resp
+                .content_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
-            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}application/json:");
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                map_key(content_type)
+            );
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
+            );
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
+            );
+        } else if let Some(schema_ref) = &resp.schema_ref {
+            let content_type = resp.content_type.as_deref().unwrap_or("application/json");
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                map_key(content_type)
+            );
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
             let _ = writeln!(
                 out,
@@ -451,6 +477,8 @@ mod tests {
                 ResponseObj {
                     description: "Goal created".to_string(),
                     schema_ref: Some("CommandMessageWithUUID".to_string()),
+                    content_type: None,
+                    binary: false,
                 },
             )],
         };

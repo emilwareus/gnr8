@@ -112,7 +112,7 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 		rf.RequestBody = cf.RequestBody
 		rf.RequestBodyContentType = cf.RequestBodyContentType
 		rf.Responses = cf.Responses
-		rf.Params = cf.Params
+		rf.Params = mergeRoutePathParams(r.Path, r.Span, cf.Params)
 		for _, schema := range cf.Schemas {
 			if seenSchema[schema.ID] {
 				continue
@@ -124,6 +124,48 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 		out = append(out, rf)
 	}
 	return out, schemas
+}
+
+func mergeRoutePathParams(path string, span facts.SourceSpan, params []facts.ParamFact) []facts.ParamFact {
+	seen := map[string]bool{}
+	out := make([]facts.ParamFact, 0, len(params))
+	for _, param := range params {
+		seen[param.Location+"/"+param.Name] = true
+		out = append(out, param)
+	}
+	for _, name := range pathTokens(path) {
+		key := "path/" + name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, facts.ParamFact{
+			Name:     name,
+			Location: "path",
+			Required: true,
+			Schema:   facts.PrimitiveType(facts.StringPrim()),
+			Span:     span,
+		})
+	}
+	return out
+}
+
+func pathTokens(path string) []string {
+	tokens := []string{}
+	rest := path
+	for {
+		open := strings.Index(rest, "{")
+		if open < 0 {
+			return tokens
+		}
+		after := rest[open+1:]
+		close := strings.Index(after, "}")
+		if close < 0 {
+			return tokens
+		}
+		tokens = append(tokens, after[:close])
+		rest = after[close+1:]
+	}
 }
 
 func moduleOf(res *load.Result) string {

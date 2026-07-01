@@ -2317,6 +2317,16 @@ pub(crate) fn emit_operations(
     if ops.iter().any(|op| op.request_body.is_some()) {
         imports.push("bytes");
     }
+    let mut needs_io = false;
+    for op in ops {
+        if success_responses_of(op, graph)?.has_binary_body() {
+            needs_io = true;
+            break;
+        }
+    }
+    if needs_io {
+        imports.push("io");
+    }
     imports.extend(query_imports(ops, graph)?);
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
     if ops
@@ -2326,7 +2336,44 @@ pub(crate) fn emit_operations(
         imports.push("fmt");
         imports.push("net/url");
     }
+    emit_group_facades(&mut body, ops)?;
     Ok(file(package, &imports, &body))
+}
+
+fn emit_group_facades(body: &mut String, ops: &[&Operation]) -> Result<(), CoreError> {
+    let mut groups = BTreeSet::new();
+    let method_names: BTreeSet<String> = ops.iter().map(|op| exported(&op.handler)).collect();
+    for op in ops {
+        let Some(group) = &op.group else {
+            continue;
+        };
+        if group == "default" {
+            continue;
+        }
+        let method_name = exported(group);
+        if method_names.contains(&method_name) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation group {group:?} cannot be emitted as a Go Client facade method"
+                ),
+            });
+        }
+        if !groups.insert((group.clone(), method_name)) {
+            continue;
+        }
+    }
+    for (group, method_name) in groups {
+        let type_name = format!("{}API", exported(&group));
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "type {type_name} struct {{").map_err(sink)?;
+        writeln!(body, "*Client").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "func (c *Client) {method_name}() *{type_name} {{").map_err(sink)?;
+        writeln!(body, "return &{type_name}{{Client: c}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    Ok(())
 }
 
 /// Emit a single operation method, including its `<Method>Params` struct when the op has query params.
@@ -2356,11 +2403,15 @@ fn emit_operation(
     let body_model = body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     // The return type is the success model when one exists, else an empty struct.
-    let return_model = success
-        .body_model
-        .as_deref()
-        .unwrap_or("struct{}")
-        .to_string();
+    let return_model = if success.has_binary_body() {
+        "[]byte".to_string()
+    } else {
+        success
+            .body_model
+            .as_deref()
+            .unwrap_or("struct{}")
+            .to_string()
+    };
 
     // Build the signature argument list.
     let mut args = vec!["ctx context.Context".to_string()];
@@ -2391,7 +2442,8 @@ fn emit_operation(
 
     let has_body = body_model.is_some();
     let has_decode = success.body_model.is_some();
-    let dispatch_returns = has_decode && !success.has_bodyless_alternative();
+    let has_binary = success.has_binary_body();
+    let dispatch_returns = (has_decode || has_binary) && !success.has_bodyless_alternative();
     emit_request_dispatch(
         body,
         op,
@@ -2402,6 +2454,7 @@ fn emit_operation(
         has_body,
         &success,
         has_decode,
+        has_binary,
         auth_header,
     )?;
     if !dispatch_returns {
@@ -2426,6 +2479,7 @@ fn emit_request_dispatch(
     has_body: bool,
     success: &SuccessResponses,
     has_decode: bool,
+    has_binary: bool,
     auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     // Body marshalling.
@@ -2510,8 +2564,24 @@ fn emit_request_dispatch(
     emit_error_decode(body, op, graph)?;
     writeln!(body, "}}").map_err(sink)?;
 
-    // 2xx → decode the success model only for statuses that declare that body.
-    if has_decode {
+    // 2xx → read binary success bodies or decode JSON only for statuses that declare that body.
+    if has_binary {
+        writeln!(
+            body,
+            "if {} {{",
+            go_status_match("resp.StatusCode", &success.binary_statuses)
+        )
+        .map_err(sink)?;
+        writeln!(body, "data, err := io.ReadAll(resp.Body)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        writeln!(body, "return out, err").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "return data, nil").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        if !success.has_bodyless_alternative() {
+            writeln!(body, "return out, &APIError{{StatusCode: resp.StatusCode}}").map_err(sink)?;
+        }
+    } else if has_decode {
         writeln!(
             body,
             "if {} {{",
@@ -3523,6 +3593,8 @@ mod tests {
             graph.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
+                body_kind: "json".to_string(),
+                content_type: None,
             });
             graph.operations[0]
                 .responses

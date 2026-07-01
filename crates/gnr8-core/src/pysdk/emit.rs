@@ -1025,6 +1025,14 @@ fn emit_operation(
 
     let body_model = body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    if success.has_binary_body() {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "operation '{}' has a binary success response, which the Python SDK target does not yet support",
+                op.id
+            ),
+        });
+    }
     let return_model = success.body_model.clone();
     let return_hint = return_model.as_ref().map_or_else(
         || "Any".to_string(),
@@ -1729,6 +1737,8 @@ mod tests {
             g.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
+                body_kind: "json".to_string(),
+                content_type: None,
             });
             g.operations[0]
                 .responses

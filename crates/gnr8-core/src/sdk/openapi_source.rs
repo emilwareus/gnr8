@@ -502,6 +502,8 @@ impl Importer {
                 body: schema.map(|schema| {
                     self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response"))
                 }),
+                body_kind: "json".to_string(),
+                content_type: None,
             });
         }
         responses
