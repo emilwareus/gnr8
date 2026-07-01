@@ -12,7 +12,9 @@ pub struct SdkProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SdkProfileKind {
     Minimal,
-    OpenApiGeneratorCompat,
+    TypeScriptFetchCompat,
+    TypeScriptAxiosCompat,
+    GoOpenApiGeneratorCompat,
 }
 
 impl SdkProfile {
@@ -27,8 +29,30 @@ impl SdkProfile {
     /// Emit an OpenAPI-generator-compatible SDK surface where supported.
     #[must_use]
     pub fn openapi_generator_compat() -> Self {
+        Self::typescript_axios_compat()
+    }
+
+    /// Emit a TypeScript `fetch` SDK surface with OpenAPI Generator-compatible model policies.
+    #[must_use]
+    pub fn typescript_fetch_compat() -> Self {
         Self {
-            kind: SdkProfileKind::OpenApiGeneratorCompat,
+            kind: SdkProfileKind::TypeScriptFetchCompat,
+        }
+    }
+
+    /// Emit a TypeScript `axios` SDK surface compatible with OpenAPI Generator's TypeScript output.
+    #[must_use]
+    pub fn typescript_axios_compat() -> Self {
+        Self {
+            kind: SdkProfileKind::TypeScriptAxiosCompat,
+        }
+    }
+
+    /// Emit a Go SDK surface compatible with OpenAPI Generator's Go client shape.
+    #[must_use]
+    pub fn go_openapi_generator_compat() -> Self {
+        Self {
+            kind: SdkProfileKind::GoOpenApiGeneratorCompat,
         }
     }
 
@@ -38,10 +62,22 @@ impl SdkProfile {
         matches!(self.kind, SdkProfileKind::Minimal)
     }
 
-    /// Whether this profile requests OpenAPI-generator compatibility.
+    /// Whether this profile requests TypeScript fetch compatibility.
     #[must_use]
-    pub(crate) const fn is_openapi_generator_compat(&self) -> bool {
-        matches!(self.kind, SdkProfileKind::OpenApiGeneratorCompat)
+    pub(crate) const fn is_typescript_fetch_compat(&self) -> bool {
+        matches!(self.kind, SdkProfileKind::TypeScriptFetchCompat)
+    }
+
+    /// Whether this profile requests TypeScript axios compatibility.
+    #[must_use]
+    pub(crate) const fn is_typescript_axios_compat(&self) -> bool {
+        matches!(self.kind, SdkProfileKind::TypeScriptAxiosCompat)
+    }
+
+    /// Whether this profile requests OpenAPI Generator-compatible Go output.
+    #[must_use]
+    pub(crate) const fn is_go_openapi_generator_compat(&self) -> bool {
+        matches!(self.kind, SdkProfileKind::GoOpenApiGeneratorCompat)
     }
 
     /// Stable machine-readable profile name.
@@ -49,7 +85,9 @@ impl SdkProfile {
     pub fn name(&self) -> &'static str {
         match self.kind {
             SdkProfileKind::Minimal => "minimal",
-            SdkProfileKind::OpenApiGeneratorCompat => "openapi_generator_compat",
+            SdkProfileKind::TypeScriptFetchCompat => "typescript_fetch_compat",
+            SdkProfileKind::TypeScriptAxiosCompat => "typescript_axios_compat",
+            SdkProfileKind::GoOpenApiGeneratorCompat => "go_openapi_generator_compat",
         }
     }
 }

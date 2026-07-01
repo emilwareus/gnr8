@@ -18,6 +18,8 @@ serde = { workspace = true }
 # the runner emits / the host parses, and is the source error type for CoreError::FactsParse. Pinned
 # via [workspace.dependencies] (1.0).
 serde_json = { workspace = true }
+# noyalib parses JSON/YAML OpenAPI source artifacts behind the OpenApi Source seam only.
+noyalib = { workspace = true }
 # blake3 hashes generated outputs for the ownership manifest + no-op detection (manifest/
 # lifecycle, 04-02). Pinned via [workspace.dependencies] (1.8); a stable, collision-resistant
 # content fingerprint (NOT std DefaultHasher, which is not stable across toolchains — RESEARCH

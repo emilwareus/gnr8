@@ -1,0 +1,89 @@
+swagger: '2.0'
+info:
+  title: Brownfield Books API
+  version: 1.0.0
+basePath: /v1
+consumes:
+  - application/json
+produces:
+  - application/json
+paths:
+  /books/{id}:
+    get:
+      tags: [Books]
+      operationId: getBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          type: string
+          format: uuid
+        - name: include
+          in: query
+          type: string
+          enum: [author, reviews]
+      responses:
+        '200':
+          description: OK
+          schema:
+            $ref: '#/definitions/legacy.Book'
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: uploadBookCover
+      consumes:
+        - multipart/form-data
+      parameters:
+        - name: file
+          in: formData
+          required: true
+          type: file
+        - name: note
+          in: formData
+          type: string
+      responses:
+        '200':
+          description: Uploaded
+          schema:
+            $ref: '#/definitions/UploadResult'
+definitions:
+  BookBase:
+    type: object
+    required: [title, status]
+    properties:
+      title:
+        type: string
+      status:
+        type: string
+        enum: [draft, published]
+  legacy.Book:
+    allOf:
+      - $ref: '#/definitions/BookBase'
+      - type: object
+        required: [id, metadata]
+        properties:
+          id:
+            type: string
+            format: uuid
+          note:
+            type: string
+            x-nullable: true
+          metadata:
+            type: object
+            additionalProperties:
+              type: string
+          tags:
+            type: array
+            items:
+              type: string
+  LegacyBook:
+    type: object
+    properties:
+      collision:
+        type: string
+  UploadResult:
+    type: object
+    required: [id]
+    properties:
+      id:
+        type: string

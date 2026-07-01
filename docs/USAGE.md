@@ -5,14 +5,15 @@ code; this matches the current build. Product invariants: [`../CLAUDE.md`](../CL
 fact, no third-party deps, no fallback/dual paths, config supplies what typed source can't).
 
 ## What it is / isn't
-- Reads source services into a router-agnostic API graph, emits **OpenAPI 3.1**, and generates
-  client SDKs. Supported source frontends today: **Go + Gin**, **Python FastAPI**,
-  **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**. Code-first: your code is the
-  single source of truth for the API.
+- Reads source services or existing OpenAPI artifacts into a router-agnostic API graph, emits
+  **OpenAPI 3.1**, and generates client SDKs. Supported source frontends today: **Go + Gin**,
+  **Python FastAPI**, **Python Flask typed-envelope**, **TypeScript NestJS class DTOs**, and
+  **Swagger 2.0 / OpenAPI 3.0 / OpenAPI 3.1 JSON or YAML artifacts**.
 - **Envelope (hard limits today):** each `Source` takes exactly one input directory. Go support is Gin
-  only and supports exactly one route group per service. Flask intentionally extracts typed DTO/return
-  envelopes only. NestJS extracts DTO classes, not erased interfaces or swagger/zod/class-validator
-  metadata. Unsupported facts become diagnostics, not guesses.
+  only, with static nested route groups folded into operation paths. Dynamic Gin route paths and group
+  prefixes are diagnostics, not guesses. Flask intentionally extracts typed DTO/return envelopes only. NestJS
+  extracts DTO classes, not erased interfaces or swagger/zod/class-validator metadata. Unsupported facts
+  become diagnostics, not guesses.
 - **Config is CODE, not a file.** Facts not in typed source (base/mount path, OpenAPI title, security
   schemes) — and the whole parse/generate lifecycle — are expressed as Rust in a project-local `.gnr8/`
   crate that drives the engine. There is **no TOML/YAML/JSON config** (see "Config: the `.gnr8/` crate").
@@ -64,6 +65,8 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
+| `gnr8 compat typescript` | `--old <dir> --new <dir> [--contract <path>]` | old/new TypeScript SDK dirs | — | **0 compatible; 1 breaking** |
+| `gnr8 compat go` | `--old <dir> --new <dir> [--contract <path>]` | old/new Go SDK dirs | — | **0 compatible; 1 breaking** |
 
 `doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
 reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
@@ -102,8 +105,8 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 
 | Trait | Signature | Role | Built-ins |
 |---|---|---|---|
-| `Source` | `load(&self, &Cx) -> Result<ApiGraph, CoreError>` | source code → IR | `GoGin`, `FastApi`, `Flask`, `NestJs` |
-| `Transform` | `apply(&self, &mut ApiGraph, &Cx) -> Result<(), CoreError>` | IR → IR (where TOML knobs now live, as code) | `SetBasePath`, `SetTitle`, `ApplySecurity`, `RenameOperation`, `RenameType` |
+| `Source` | `load(&self, &Cx) -> Result<ApiGraph, CoreError>` | source code/artifact → IR | `GoGin`, `FastApi`, `Flask`, `NestJs`, `OpenApi` |
+| `Transform` | `apply(&self, &mut ApiGraph, &Cx) -> Result<(), CoreError>` | IR → IR (where TOML knobs now live, as code) | `SetBasePath`, `SetTitle`, `ApplySecurity`, `RenameOperation`, `RenameType`, `GroupOperations`, `ApiOverrides`, `SetEnumOrder` |
 | `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
 | `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
@@ -118,6 +121,7 @@ Built-in builder methods (each replaces a former TOML key):
 | Was (TOML) | Now (code) |
 |---|---|
 | `inputs = ["."]` | `GoGin::new().inputs(["."])` (one dir; >1 is a typed error) |
+| existing OpenAPI artifact | `OpenApi::new().input("openapi.yaml")` |
 | `base_path = "/books"` | `.transform(SetBasePath::new("/books"))` |
 | `title = "Bookstore API"` | `.transform(SetTitle::new("Bookstore API"))` |
 | `[[security.schemes]]` (apiKey/header) | `.transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))` |
@@ -147,6 +151,53 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
+Brownfield OpenAPI Generator replacement:
+```rust
+use gnr8::sdk::prelude::*;
+
+fn main() -> std::process::ExitCode {
+    gnr8::runner::run(
+        Pipeline::new()
+            .source(OpenApi::new().input("openapi.yaml"))
+            .target(OpenApi31::new().to("generated/openapi.yaml"))
+            .target(
+                TsSdk::new()
+                    .module("@acme/books")
+                    .to("generated/typescript")
+                    .profile(SdkProfile::typescript_fetch_compat()),
+            )
+            .target(
+                GoSdk::new()
+                    .module("example.com/acme/books")
+                    .to("generated/go")
+                    .profile(SdkProfile::go_openapi_generator_compat()),
+            ),
+    )
+}
+```
+
+Compatibility layout controls stay on the SDK targets, separate from the clean defaults:
+
+```rust
+TsSdk::new()
+    .module("@acme/books")
+    .to("generated/typescript")
+    .profile(SdkProfile::typescript_fetch_compat())
+    .layout(
+        SdkFileLayout::split()
+            .operation_file_template("apis/{service_kebab}/{operation_kebab}.ts")
+            .model_file_template("models/{schema_kebab}.ts"),
+    )
+    .package_metadata(true)
+    .docs(true);
+
+GoSdk::new()
+    .module("example.com/acme/books")
+    .to("generated/go")
+    .profile(SdkProfile::go_openapi_generator_compat())
+    .source_only(); // suppress docs and package metadata when an outer package owns them
+```
+
 ### Writing your own stage (the escape hatch is code)
 Anything the built-ins don't cover, you implement as a trait and add to the pipeline — no forking a
 generator, no config DSL. The IR (`gnr8::graph`) is read/write so a `Transform` edits it freely;
@@ -158,11 +209,12 @@ use gnr8::graph::ApiGraph;
 use gnr8::sdk::prelude::*;
 use gnr8::CoreError;
 
-// A custom Transform: edit the IR before generation (e.g. drop internal routes).
-struct DropDebugRoutes;
-impl Transform for DropDebugRoutes {
+// A custom Transform: edit the IR before generation (e.g. drop internal routes
+// that existed in an old generator input but should not ship in public SDKs).
+struct DropInternalRoutes;
+impl Transform for DropInternalRoutes {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
-        ir.operations.retain(|op| !op.path.contains("_debug"));
+        ir.operations.retain(|op| !op.path.starts_with("/internal/"));
         Ok(())
     }
 }
@@ -178,8 +230,14 @@ impl Target for ApiMarkdown {
     }
     fn output_anchors(&self) -> Vec<String> { vec![self.path.clone()] } // loop-safety: don't re-ingest
 }
-// …then: .transform(DropDebugRoutes).target(ApiMarkdown { path: "generated/API.md".into() })
+// …then: .transform(DropInternalRoutes).target(ApiMarkdown { path: "generated/API.md".into() })
 ```
+
+Production migration patches should stay at the graph/profile layer. Common examples:
+`GroupOperations::new().by_path_prefix("/billing", "Billing")` to preserve API service grouping,
+`RenameOperation::new("legacyOp", "LegacyApi_legacyOp")` for SDK public method names, and
+`StaticFiles::new().from("sdk-static").to("generated/typescript").include(["README.md", "docs/**"])`
+for hand-authored compatibility docs that must stay lifecycle-owned.
 A `Source` shells out / parses to produce an `ApiGraph`; a `PostProcess` rewrites the in-memory
 `Artifacts` (license header, import rewrite). The full runnable Go example: `examples/taskflow/`. The
 cross-language example lifecycles (real committed output) live at `examples/fastapi-bookstore/` (Python →
@@ -203,7 +261,7 @@ contract (the committed graph/OpenAPI snapshots are the spec).
 
 | Frontend | Lang | Status | Recognized | Limits / diagnostics |
 |---|---|---|---|---|
-| Gin | Go | full | route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | ONE route group only; `float64`→`float32` narrowing (diag); `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
+| Gin | Go | full | static nested route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | dynamic route paths skipped and dynamic group prefixes omitted with diagnostics; `float64`→`float32` narrowing (diag); `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
 | FastAPI | Python | full | `@app`/`@router` verbs, `APIRouter`/literal prefixes, path params (template∩args), typed query params (defaults→required/optional), Pydantic/`@dataclass` bodies, `response_model=`, `status_code=`, `Literal`/`Enum`, `Union` aliases | static `ast` only (never imports/executes the target); unresolvable/foreign type → diagnostic + omit (no guess). |
 | Flask | Python | typed-envelope (honest second-class) | `@app.route`/`methods=`, `Blueprint(url_prefix=)`, `<int:id>` converter path params, OPT-IN typed DTOs/returns; method-derived status (typed `POST`→201, else 200) | untyped `request.json` / unannotated `request.args` / missing return annotation → **diagnostic, NEVER inferred**. State plainly: untyped surfaces are NOT recovered (typed-envelope only). |
 | NestJS | TypeScript | class-DTO scope | `@nestjs/common` verb + `@Param`/`@Query`/`@Body` decorators, `@Controller` prefix (provenance, never folded), DTO **classes**, enums + string-literal-union, method-derived status (`@HttpCode` override) | DTO **classes** only (bare `interface`s are erased — not extracted); never reads `@nestjs/swagger` / `zod` / `class-validator` (rule 1); unresolvable → diagnostic + omit. |
@@ -238,7 +296,7 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 
 | Fact | Source pattern | Notes |
 |---|---|---|
-| route | `group := r.Group(...)` then `group.GET/POST/PUT/DELETE(path, handler)` | ONE group only. `path` is group-relative; final path = `base_path` + path. |
+| route | `group := r.Group(...)` then `group.GET/POST/PUT/DELETE(path, handler)` | Static nested groups compose into the route path. `path` is group-relative; final path = `base_path` + grouped path. |
 | path param | `:name` segment + `c.Param("name")` | → OpenAPI `{name}`. |
 | query param | `c.Query("name")` | name only; type=`string`, `required:false` (no type/enum/required inferable from `c.Query`). |
 | request body | `c.ShouldBindJSON(&x)` where `x: T` | T → request schema. |
@@ -276,8 +334,9 @@ Single package `<go_module last segment>`, files: `client.go`, `models.go`, `ope
 
 ## Diagnostics
 Each carries severity + message + `file:line` provenance. Classes: `float64->float32` narrowing,
-free-form map (`map[string]any`), untyped query param, dynamic/unresolvable response, duplicate handler
-name. Diagnostics are non-fatal to generation (output still produced) EXCEPT a dangling `$ref` (a route
+free-form map (`map[string]any`), untyped query param, dynamic/unresolvable response, unsupported Gin
+route pattern, duplicate handler name. Diagnostics are non-fatal to generation (output still produced)
+EXCEPT a dangling `$ref` (a route
 references a type with no schema) which IS fatal — see Errors. `gnr8 doctor` aggregates them; `gnr8
 inspect graph <dir>` lists them.
 
@@ -292,8 +351,8 @@ inspect graph <dir>` lists them.
 - gnr8 EXCLUDES the configured output paths from analysis (never ingests its own generated SDK).
 
 ## Known quirks / limits (do not treat as bugs unless fixing them)
-- **One route group only.** Multiple groups (distinct base paths) → `duplicate <METHOD> operation on a
-  single path` (lowering). This is the headline gap.
+- Static Gin group prefixes are folded only when they are literal strings. Dynamic route paths are
+  skipped with diagnostics; dynamic group prefixes are omitted with diagnostics.
 - `float64` → SDK `float32` (precision narrowing).
 - Optional pointer fields → value type + `,omitempty` in the Go SDK (pointer-ness lost there), while
   the graph still carries nullability for OpenAPI and TypeScript targets.
@@ -305,7 +364,8 @@ inspect graph <dir>` lists them.
 | Message (substring) | Cause | Fix |
 |---|---|---|
 | `dangling $ref '<pkg>.<Type>'` | a route references a type not extracted (out of the `Source`'s input scope, or only partially loaded) | widen `GoGin::new().inputs([..])` to a dir that includes the type's package; ensure the module type-checks |
-| `duplicate <METHOD> operation on a single path` | >1 route group, paths collapse | unsupported today — scope to a single group, or wait for multi-group support |
+| `unsupported Gin route pattern` | dynamic path/group prefix or unnamed route handler | make the route path/group literal, use a named handler, or add an explicit custom source/transform patch |
+| `duplicate <METHOD> operation on a single path` | two routes normalize to the same method/path | rename/scope one route, or add `SetBasePath`/group prefixes so public paths are distinct |
 | `unsupported security scheme` | `kind`/`location` not `apiKey`/`header` | use `ApplySecurity::api_key(..)` (apiKey/header is the supported scheme) |
 | `duplicate security scheme id` | two `ApplySecurity` transforms share an `id` | dedupe |
 | `no .gnr8/ workspace … run `gnr8 init`` | no `.gnr8/Cargo.toml` in cwd | run `gnr8 init` (and `cd` to the project root) |
@@ -316,6 +376,10 @@ inspect graph <dir>` lists them.
 ```
 # generate + verify in CI
 gnr8 generate && gnr8 check            # check exits 1 if generate left drift
+
+# brownfield SDK migration gates
+gnr8 compat typescript --old old-typescript-sdk --new generated/typescript
+gnr8 compat go --old old-go-sdk --new generated/go
 
 # inspect what it sees (no generation, takes a dir)
 gnr8 inspect routes ./internal         # human table; add --json for machine

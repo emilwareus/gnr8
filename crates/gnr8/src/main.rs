@@ -16,6 +16,8 @@ mod watch;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -227,6 +229,10 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "language-specific compat rendering stays together for CLI readability"
+)]
 fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     match action {
         CompatAction::Typescript { old, new, contract } => {
@@ -293,6 +299,12 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         change.operation, change.old, change.new
                     );
                 }
+                for change in &diff.operation_signature_changes {
+                    println!(
+                        "  operation signature changed: {} ({} -> {})",
+                        change.operation, change.old, change.new
+                    );
+                }
                 for mismatch in &diff.export_kind_mismatches {
                     println!(
                         "  export kind mismatch: {} ({:?} -> {:?})",
@@ -301,6 +313,66 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                 }
             } else {
                 output.progress("compat typescript: compatible");
+            }
+            if breaking {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        CompatAction::Go { old, new, contract } => {
+            if let Some(contract) = contract {
+                let path = std::path::Path::new(contract);
+                if !path.exists() {
+                    anyhow::bail!("compat contract does not exist: {contract}");
+                }
+            }
+            let diff = gnr8::sdk::compat::diff_go_dirs(old, new)?;
+            let breaking = diff.is_breaking();
+            if output.json {
+                #[derive(serde::Serialize)]
+                struct CompatReport<'a> {
+                    language: &'static str,
+                    old: &'a str,
+                    new: &'a str,
+                    contract: Option<&'a str>,
+                    breaking: bool,
+                    diff: gnr8::sdk::compat::GoSurfaceDiff,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CompatReport {
+                        language: "go",
+                        old,
+                        new,
+                        contract: contract.as_deref(),
+                        breaking,
+                        diff,
+                    })?
+                );
+            } else if breaking {
+                output.progress("compat go: breaking changes detected");
+                print_compat_list("missing exported types", &diff.missing_exported_types);
+                print_compat_list(
+                    "missing exported functions",
+                    &diff.missing_exported_functions,
+                );
+                print_compat_list("missing exported methods", &diff.missing_exported_methods);
+                print_compat_list("missing docs", &diff.missing_docs);
+                print_compat_list("package metadata changes", &diff.package_metadata_changes);
+                for change in &diff.exported_function_signature_changes {
+                    println!(
+                        "  exported function signature changed: {} ({} -> {})",
+                        change.symbol, change.old, change.new
+                    );
+                }
+                for change in &diff.exported_method_signature_changes {
+                    println!(
+                        "  exported method signature changed: {} ({} -> {})",
+                        change.symbol, change.old, change.new
+                    );
+                }
+            } else {
+                output.progress("compat go: compatible");
             }
             if breaking {
                 std::process::exit(1);
@@ -390,6 +462,24 @@ struct LifecycleReport {
     artifact_files: usize,
     /// Whether `--accept-generated-baseline` was used.
     baseline_adopted: bool,
+    /// Migration cleanup classification for reviewing stale/generated-looking files.
+    cleanup: CleanupReport,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CleanupReport {
+    /// Files currently owned by this generation run.
+    owned_files: Vec<String>,
+    /// Stale generated files deleted during this generation.
+    stale_generated_files: Vec<String>,
+    /// Generated-looking files that are not owned by this run.
+    generated_looking_unowned_files: Vec<String>,
+    /// Hand-edited generated files protected from overwrite.
+    protected_hand_edited_files: Vec<String>,
+    /// Package/config files likely left from `OpenAPI` Generator-era output.
+    legacy_package_files: Vec<String>,
+    /// Package dependencies likely no longer needed after replacing `OpenAPI` Generator output.
+    obsolete_package_dependencies: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -471,6 +561,7 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
     }
 
     if output.json {
+        let cleanup = migration_cleanup_report(&root, &outcome);
         let counts = LifecycleCounts {
             written: outcome.written.len(),
             unchanged: outcome.unchanged.len(),
@@ -494,6 +585,7 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
             source_files,
             artifact_files,
             baseline_adopted: accept_generated_baseline,
+            cleanup,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -515,6 +607,189 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
         output.verbose_paths("skipped", &outcome.skipped);
     }
     Ok(())
+}
+
+fn migration_cleanup_report(
+    root: &Path,
+    outcome: &gnr8::lifecycle::GenerateOutcome,
+) -> CleanupReport {
+    let mut owned_files = Vec::new();
+    owned_files.extend(outcome.written.iter().cloned());
+    owned_files.extend(outcome.unchanged.iter().cloned());
+    owned_files.extend(outcome.skipped.iter().cloned());
+    owned_files.sort();
+    owned_files.dedup();
+
+    let owned: BTreeSet<String> = owned_files.iter().cloned().collect();
+    let legacy_package_files = legacy_openapi_generator_files(root);
+    let generated_looking_unowned_files = legacy_package_files
+        .iter()
+        .filter(|path| !owned.contains(*path))
+        .cloned()
+        .collect();
+
+    CleanupReport {
+        owned_files,
+        stale_generated_files: outcome.deleted.clone(),
+        generated_looking_unowned_files,
+        protected_hand_edited_files: outcome.skipped.clone(),
+        obsolete_package_dependencies: legacy_openapi_generator_dependencies(root),
+        legacy_package_files,
+    }
+}
+
+fn legacy_openapi_generator_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_legacy_openapi_generator_files(root, root, 0, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_legacy_openapi_generator_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if should_skip_cleanup_scan_dir(&path) {
+                continue;
+            }
+            collect_legacy_openapi_generator_files(root, &path, depth + 1, out);
+            continue;
+        }
+        let Some(rel) = path.strip_prefix(root).ok().map(path_to_slash_string) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if legacy_openapi_generator_filename(name)
+            || legacy_openapi_generator_package_file(name, &path)
+        {
+            out.push(rel);
+        }
+    }
+}
+
+fn should_skip_cleanup_scan_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | ".gnr8" | "node_modules" | "target" | "vendor")
+    )
+}
+
+fn legacy_openapi_generator_filename(name: &str) -> bool {
+    matches!(
+        name,
+        ".openapi-generator-ignore" | "git_push.sh" | "openapitools.json"
+    ) || name == ".openapi-generator"
+}
+
+fn legacy_openapi_generator_package_file(name: &str, path: &Path) -> bool {
+    if !matches!(
+        name,
+        "package.json" | "go.mod" | "pom.xml" | "build.gradle" | "build.gradle.kts"
+    ) {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.contains("openapi-generator")
+        || text.contains("@openapitools")
+        || text.contains("github.com/antihax/optional")
+}
+
+fn legacy_openapi_generator_dependencies(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_legacy_openapi_generator_dependencies(root, root, 0, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_legacy_openapi_generator_dependencies(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if should_skip_cleanup_scan_dir(&path) {
+                continue;
+            }
+            collect_legacy_openapi_generator_dependencies(root, &path, depth + 1, out);
+            continue;
+        }
+        let Some(rel) = path.strip_prefix(root).ok().map(path_to_slash_string) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match name {
+            "package.json" => {
+                for dep in [
+                    "@openapitools/openapi-generator-cli",
+                    "openapi-generator",
+                    "typescript-axios",
+                    "typescript-fetch",
+                ] {
+                    if text.contains(dep) {
+                        out.push(format!("{rel}: {dep}"));
+                    }
+                }
+            }
+            "go.mod" => {
+                for dep in ["github.com/antihax/optional"] {
+                    if text.contains(dep) {
+                        out.push(format!("{rel}: {dep}"));
+                    }
+                }
+            }
+            "pom.xml" | "build.gradle" | "build.gradle.kts" => {
+                for dep in ["org.openapitools", "openapi-generator"] {
+                    if text.contains(dep) {
+                        out.push(format!("{rel}: {dep}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Run `gnr8 check`: run the user's `.gnr8/` pipeline, then DRY-RUN the same `plan_writes` decision (no

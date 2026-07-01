@@ -99,6 +99,18 @@ pub(crate) enum CompatAction {
         #[arg(long)]
         contract: Option<String>,
     },
+    /// Compare two generated Go SDK directories.
+    Go {
+        /// Old/baseline SDK directory.
+        #[arg(long)]
+        old: String,
+        /// New/candidate SDK directory.
+        #[arg(long)]
+        new: String,
+        /// Optional compatibility contract TOML path.
+        #[arg(long)]
+        contract: Option<String>,
+    },
 }
 
 /// Source frontend presets for `gnr8 init`.
@@ -255,6 +267,14 @@ mod tests {
             .command,
             Commands::Compat {
                 action: CompatAction::Typescript { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "compat", "go", "--old", "old-sdk", "--new", "new-sdk"])
+                .unwrap()
+                .command,
+            Commands::Compat {
+                action: CompatAction::Go { .. }
             }
         ));
         assert!(matches!(

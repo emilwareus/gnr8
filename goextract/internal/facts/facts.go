@@ -36,18 +36,21 @@ type GoFacts struct {
 //     `/{uuid}`). The dynamic mount prefix is a lowering concern on the host side.
 //   - RequestBody / Responses / Params come from the recognized handler-body calls.
 //
-// Security, summary, tags, router-path overrides, and param enum/required-from-
+// Security, summary, router-path overrides, and param enum/required-from-
 // annotation are DELIBERATELY ABSENT: those were doc-comment-annotation facts.
-// Security now lives in the user's gnr8 config (CLAUDE.md rule 4); the rest are gone.
+// Security now lives in the user's gnr8 config (CLAUDE.md rule 4). Group is a
+// source-derived route-group/tag name from static Gin groups, not an annotation.
 type RouteFact struct {
-	Method      string         `json:"method"`
-	Path        string         `json:"path"`
-	Handler     string         `json:"handler"`
-	OperationID string         `json:"operation_id"`
-	Params      []ParamFact    `json:"params"`
-	RequestBody *TypeRef       `json:"request_body"`
-	Responses   []ResponseFact `json:"responses"`
-	Span        SourceSpan     `json:"span"`
+	Method                 string         `json:"method"`
+	Path                   string         `json:"path"`
+	Handler                string         `json:"handler"`
+	OperationID            string         `json:"operation_id"`
+	Group                  string         `json:"group,omitempty"`
+	Params                 []ParamFact    `json:"params"`
+	RequestBody            *TypeRef       `json:"request_body"`
+	RequestBodyContentType string         `json:"request_body_content_type,omitempty"`
+	Responses              []ResponseFact `json:"responses"`
+	Span                   SourceSpan     `json:"span"`
 }
 
 // ParamFact describes a path or query parameter, derived purely from code. Path
@@ -94,6 +97,7 @@ type FieldFact struct {
 type FieldMeta struct {
 	Constraints *Constraints  `json:"constraints,omitempty"`
 	Default     *LiteralValue `json:"default,omitempty"`
+	Format      *string       `json:"format,omitempty"`
 	Extensions  []Extension   `json:"extensions,omitempty"`
 }
 

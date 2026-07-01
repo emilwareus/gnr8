@@ -264,6 +264,96 @@ type FileRef struct {
 	}
 }
 
+func TestFormDTOAndMultipartFileMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/uploadfixture\n\ngo 1.22\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package uploadfixture
+
+import "mime/multipart"
+
+type UploadForm struct {
+	File        *multipart.FileHeader `+"`form:\"file\" binding:\"required\" description:\"CSV upload\"`"+`
+	Title       string                `+"`form:\"title\" validate:\"required,min=3\" schema:\"example=June report,format=slug\"`"+`
+	Visibility  string                `+"`form:\"visibility\" enums:\"private,public\" default:\"private\"`"+`
+	Attachments []*multipart.FileHeader `+"`form:\"attachments,omitempty\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load upload fixture: %v", err)
+	}
+	diags := diag.New()
+	schemas := types.Extract(res, diags)
+	s, ok := schemaByName(schemas, "UploadForm")
+	if !ok {
+		t.Fatal("UploadForm form-tag DTO not found")
+	}
+
+	file, ok := fieldByJSON(s, "file")
+	if !ok {
+		t.Fatal("field 'file' not found")
+	}
+	if !file.Required || !file.Nullable || primName(file.Schema) != facts.PrimBytes {
+		t.Fatalf("file should be required nullable bytes, got required=%v nullable=%v schema=%+v", file.Required, file.Nullable, file.Schema)
+	}
+	if file.Description == nil || *file.Description != "CSV upload" {
+		t.Fatalf("description tag not preserved: %#v", file.Description)
+	}
+
+	title, ok := fieldByJSON(s, "title")
+	if !ok {
+		t.Fatal("field 'title' not found")
+	}
+	if !title.Required || title.Meta == nil || title.Meta.Constraints == nil || title.Meta.Constraints.MinLength == nil || *title.Meta.Constraints.MinLength != 3 {
+		t.Fatalf("validate min/required metadata not preserved: %+v", title)
+	}
+	if title.Example == nil || *title.Example != "June report" {
+		t.Fatalf("schema example not preserved: %#v", title.Example)
+	}
+	if title.Meta.Format == nil || *title.Meta.Format != "slug" {
+		t.Fatalf("schema format not preserved: %#v", title.Meta)
+	}
+
+	visibility, ok := fieldByJSON(s, "visibility")
+	if !ok {
+		t.Fatal("field 'visibility' not found")
+	}
+	if visibility.Meta == nil || visibility.Meta.Constraints == nil || len(visibility.Meta.Constraints.EnumValues) != 2 {
+		t.Fatalf("enums tag not preserved: %+v", visibility)
+	}
+	if visibility.Meta.Default == nil || visibility.Meta.Default.Type != "string" || visibility.Meta.Default.Value != "private" {
+		t.Fatalf("default tag not preserved: %#v", visibility.Meta.Default)
+	}
+
+	attachments, ok := fieldByJSON(s, "attachments")
+	if !ok {
+		t.Fatal("field 'attachments' not found")
+	}
+	if !attachments.Optional || attachments.Nullable {
+		t.Fatalf("omitempty file slice should be optional but not nullable, got optional=%v nullable=%v", attachments.Optional, attachments.Nullable)
+	}
+	if attachments.Schema.Type != facts.TypeArray {
+		t.Fatalf("attachments should be an array, got %+v", attachments.Schema)
+	}
+	elem, ok := attachments.Schema.Of.(*facts.Type)
+	if !ok || elem == nil || primName(*elem) != facts.PrimBytes {
+		t.Fatalf("attachments element should be bytes, got %+v", attachments.Schema.Of)
+	}
+}
+
 func TestEmbeddedFlattening(t *testing.T) {
 	schemas, _ := extractFixture(t)
 	s, ok := schemaByName(schemas, "CommandMessageWithUUID")

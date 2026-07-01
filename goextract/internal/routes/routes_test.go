@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/load"
 	"github.com/gnr8/goextract/internal/routes"
 )
@@ -114,5 +115,96 @@ func TestAliasedGinImportStillResolves(t *testing.T) {
 	}
 	if read.Handler != "read" || !read.Secured {
 		t.Errorf("aliased GET /{id}: want handler=read secured=true, got handler=%q secured=%v", read.Handler, read.Secured)
+	}
+}
+
+func TestStaticGinGroupPrefixesAreComposedForModularServices(t *testing.T) {
+	dir, err := filepath.Abs(filepath.Join("testdata", "modulargin"))
+	if err != nil {
+		t.Fatalf("resolve modulargin dir: %v", err)
+	}
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load modulargin: %v", err)
+	}
+	rs := routes.Recognize(res)
+	got := index(rs)
+
+	want := []routes.Route{
+		{Method: "GET", Path: "/api/health", Handler: "health", Group: "api", Secured: true},
+		{Method: "GET", Path: "/api/books", Handler: "listBooks", Group: "books", Secured: false},
+		{Method: "GET", Path: "/api/books/{id}", Handler: "getBook", Group: "books", Secured: false},
+		{Method: "GET", Path: "/api/admin/stats", Handler: "adminStats", Group: "admin", Secured: false},
+		{Method: "GET", Path: "/api/ready", Handler: "ready", Group: "api", Secured: false},
+	}
+	if len(rs) != len(want) {
+		t.Fatalf("expected %d modular routes, got %d: %+v", len(want), len(rs), rs)
+	}
+	for _, w := range want {
+		r, ok := got[routeKey{w.Method, w.Path}]
+		if !ok {
+			t.Fatalf("missing modular route %s %s; got %+v", w.Method, w.Path, rs)
+		}
+		if r.Handler != w.Handler {
+			t.Errorf("%s %s: handler want %q got %q", w.Method, w.Path, w.Handler, r.Handler)
+		}
+		if r.Group != w.Group {
+			t.Errorf("%s %s: group want %q got %q", w.Method, w.Path, w.Group, r.Group)
+		}
+		if r.Secured != w.Secured {
+			t.Errorf("%s %s: secured want %v got %v", w.Method, w.Path, w.Secured, r.Secured)
+		}
+	}
+}
+
+func TestDynamicGinGroupPrefixProducesDiagnostic(t *testing.T) {
+	dir, err := filepath.Abs(filepath.Join("testdata", "dynamicgin"))
+	if err != nil {
+		t.Fatalf("resolve dynamicgin dir: %v", err)
+	}
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load dynamicgin: %v", err)
+	}
+	diags := diag.New()
+	rs := routes.RecognizeWithDiagnostics(res, diags)
+	if len(rs) != 1 {
+		t.Fatalf("expected route to remain discoverable without guessed prefix, got %d: %+v", len(rs), rs)
+	}
+	if rs[0].Path != "/ping" {
+		t.Fatalf("dynamic prefix must not be guessed into the route path, got %q", rs[0].Path)
+	}
+	items := diags.Items()
+	if len(items) != 1 {
+		t.Fatalf("expected one dynamic-prefix diagnostic, got %+v", items)
+	}
+	if got := items[0].Message; got != "unsupported Gin route pattern: dynamic Gin group prefix; prefix skipped rather than guessed (GO-04)" {
+		t.Fatalf("unexpected diagnostic: %q", got)
+	}
+}
+
+func TestRouterGroupParameterProducesDiagnostic(t *testing.T) {
+	dir, err := filepath.Abs(filepath.Join("testdata", "paramgin"))
+	if err != nil {
+		t.Fatalf("resolve paramgin dir: %v", err)
+	}
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load paramgin: %v", err)
+	}
+	diags := diag.New()
+	rs := routes.RecognizeWithDiagnostics(res, diags)
+	if len(rs) != 1 {
+		t.Fatalf("expected one helper route, got %d: %+v", len(rs), rs)
+	}
+	if rs[0].Path != "/{id}" {
+		t.Fatalf("router-group parameter prefix must not be guessed, got %q", rs[0].Path)
+	}
+	items := diags.Items()
+	if len(items) != 1 {
+		t.Fatalf("expected one router-group-parameter diagnostic, got %+v", items)
+	}
+	if got := items[0].Message; got != "unsupported Gin route pattern: route registered on router group parameter; prefix cannot be inferred across helper calls, so the route is emitted relative (GO-04)" {
+		t.Fatalf("unexpected diagnostic: %q", got)
 	}
 }

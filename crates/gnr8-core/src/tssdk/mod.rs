@@ -214,18 +214,18 @@ pub(crate) fn generate_files_with_profile_options(
     profile: &SdkProfile,
     options: TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
-    if !profile.is_openapi_generator_compat() && options.response.is_axios_response_wrapper() {
+    if !profile.is_typescript_axios_compat() && options.response.is_axios_response_wrapper() {
         return Err(crate::CoreError::Config {
-            message: "TsResponsePolicy::AxiosResponseWrapper requires SdkProfile::openapi_generator_compat()"
+            message: "TsResponsePolicy::AxiosResponseWrapper requires SdkProfile::typescript_axios_compat()"
                 .to_string(),
         });
     }
-    if profile.is_minimal() {
+    if profile.is_minimal() || profile.is_typescript_fetch_compat() {
         return generate_files_with_layout_options(
             graph, package, base_path, layout, aliases, options,
         );
     }
-    if profile.is_openapi_generator_compat() {
+    if profile.is_typescript_axios_compat() {
         return generate_openapi_generator_compat_files(
             graph, package, base_path, aliases, options,
         );

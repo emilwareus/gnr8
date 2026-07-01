@@ -3,8 +3,9 @@
 //
 // Scope discipline (02-01): only named types DECLARED IN THE TARGET MODULE are
 // considered, and a struct is treated as a DTO schema only when it (or an
-// embedded struct) carries at least one `json:` tag. This excludes server/wiring
-// structs such as HttpServer (no json tags) while capturing every dto.* type.
+// embedded struct) carries at least one payload tag (`json:` or `form:`). This
+// excludes server/wiring structs such as HttpServer while capturing JSON DTOs and
+// multipart/form DTOs.
 // Routes/handlers are 02-02; this package does not look at them.
 package types
 
@@ -23,9 +24,10 @@ import (
 
 // well-known package paths for type mapping (RESEARCH Pattern 6).
 const (
-	uuidPkgPath = "github.com/google/uuid"
-	timePkgPath = "time"
-	jsonPkgPath = "encoding/json"
+	uuidPkgPath      = "github.com/google/uuid"
+	timePkgPath      = "time"
+	jsonPkgPath      = "encoding/json"
+	multipartPkgPath = "mime/multipart"
 )
 
 // Extract returns one SchemaFact per DTO struct and per string-enum named type
@@ -69,7 +71,7 @@ func schemaFor(
 ) (facts.SchemaFact, bool) {
 	switch under := named.Underlying().(type) {
 	case *gotypes.Struct:
-		if under.NumFields() > 0 && !structHasJSONTag(under) {
+		if under.NumFields() > 0 && !structHasPayloadTag(under) {
 			return facts.SchemaFact{}, false
 		}
 		span := spanOf(fset, named.Obj().Pos())
@@ -146,7 +148,7 @@ func extractFields(
 			continue
 		}
 
-		jsonName, omitempty, skip := parseJSONTag(tag, f.Name())
+		jsonName, omitempty, skip := parsePayloadTag(tag, f.Name())
 		if skip {
 			continue
 		}
@@ -169,6 +171,14 @@ func extractFields(
 		optional := isPointer(f.Type()) || omitempty
 		nullable := isPointer(f.Type())
 		meta := fieldMetaFromTags(structName, f.Name(), tag, st.Tag(i), schema, file, line, diags)
+		description := optString(tag.Get("description"))
+		if description == nil {
+			description = optString(schemaTagValue(tag.Get("schema"), "description"))
+		}
+		example := optString(tag.Get("example"))
+		if example == nil {
+			example = optString(schemaTagValue(tag.Get("schema"), "example"))
+		}
 
 		fields = append(fields, facts.FieldFact{
 			JSONName:    jsonName,
@@ -176,8 +186,8 @@ func extractFields(
 			Optional:    optional,
 			Nullable:    nullable,
 			Schema:      schema,
-			Description: optString(tag.Get("description")),
-			Example:     optString(tag.Get("example")),
+			Description: description,
+			Example:     example,
 			Meta:        meta,
 		})
 	}
@@ -213,12 +223,28 @@ func fieldMetaFromTags(
 ) *facts.FieldMeta {
 	meta := &facts.FieldMeta{}
 
-	if constraints := constraintsFromBinding(structName, fieldName, tag.Get("binding"), schema, file, line, diags); !constraintsEmpty(constraints) {
+	constraints := constraintsFromBinding(structName, fieldName, tag.Get("binding"), schema, file, line, diags)
+	mergeConstraints(constraints, constraintsFromValidate(structName, fieldName, tag.Get("validate"), schema, file, line, diags))
+	applyDirectConstraints(constraints, tag, schema, structName, fieldName, file, line, diags)
+	if !constraintsEmpty(constraints) {
 		meta.Constraints = constraints
 	}
 
 	if rawDefault, ok := tag.Lookup("default"); ok {
 		meta.Default = literalForSchema(rawDefault, schema, structName, fieldName, file, line, diags)
+	}
+	if meta.Default == nil {
+		if rawDefault := schemaTagValue(tag.Get("schema"), "default"); rawDefault != "" {
+			meta.Default = literalForSchema(rawDefault, schema, structName, fieldName, file, line, diags)
+		}
+	}
+	if format, ok := tag.Lookup("format"); ok && format != "" {
+		meta.Format = stringPtr(format)
+	}
+	if meta.Format == nil {
+		if format := schemaTagValue(tag.Get("schema"), "format"); format != "" {
+			meta.Format = stringPtr(format)
+		}
 	}
 
 	extensions := make([]facts.Extension, 0)
@@ -233,6 +259,9 @@ func fieldMetaFromTags(
 			Name:  "x-gnr8-render",
 			Value: stringLiteral(render),
 		})
+	}
+	if rawExtensions, ok := tag.Lookup("extensions"); ok {
+		extensions = append(extensions, parseExtensions(rawExtensions)...)
 	}
 
 	rawTags := parseStructTag(rawTag)
@@ -253,7 +282,7 @@ func fieldMetaFromTags(
 		meta.Extensions = extensions
 	}
 
-	if meta.Constraints == nil && meta.Default == nil && len(meta.Extensions) == 0 {
+	if meta.Constraints == nil && meta.Default == nil && meta.Format == nil && len(meta.Extensions) == 0 {
 		return nil
 	}
 	return meta
@@ -268,11 +297,36 @@ func constraintsFromBinding(
 	line uint32,
 	diags *diag.Accumulator,
 ) *facts.Constraints {
+	return constraintsFromTag("binding", structName, fieldName, binding, schema, file, line, diags)
+}
+
+func constraintsFromValidate(
+	structName string,
+	fieldName string,
+	validate string,
+	schema facts.Type,
+	file string,
+	line uint32,
+	diags *diag.Accumulator,
+) *facts.Constraints {
+	return constraintsFromTag("validate", structName, fieldName, validate, schema, file, line, diags)
+}
+
+func constraintsFromTag(
+	tagKind string,
+	structName string,
+	fieldName string,
+	value string,
+	schema facts.Type,
+	file string,
+	line uint32,
+	diags *diag.Accumulator,
+) *facts.Constraints {
 	constraints := &facts.Constraints{}
-	if binding == "" {
+	if value == "" {
 		return constraints
 	}
-	for _, token := range strings.Split(binding, ",") {
+	for _, token := range strings.Split(value, ",") {
 		token = strings.TrimSpace(token)
 		if token == "" || token == "required" || token == "omitempty" || token == "dive" {
 			continue
@@ -283,49 +337,49 @@ func constraintsFromBinding(
 		switch name {
 		case "min":
 			if !hasValue || !applyMinMaxConstraint(constraints, "min", value, schema) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 			}
 		case "max":
 			if !hasValue || !applyMinMaxConstraint(constraints, "max", value, schema) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 			}
 		case "gte":
 			if !hasValue || !validNumber(value) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			constraints.Minimum = stringPtr(value)
 		case "lte":
 			if !hasValue || !validNumber(value) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			constraints.Maximum = stringPtr(value)
 		case "gt":
 			if !hasValue || !validNumber(value) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			constraints.ExclusiveMinimum = stringPtr(value)
 		case "lt":
 			if !hasValue || !validNumber(value) {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			constraints.ExclusiveMaximum = stringPtr(value)
 		case "oneof":
 			if !hasValue {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			values := strings.Fields(value)
 			if len(values) == 0 {
-				unsupportedBinding(diags, structName, fieldName, token, file, line)
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
 			constraints.EnumValues = values
 		default:
-			unsupportedBinding(diags, structName, fieldName, token, file, line)
+			unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 		}
 	}
 	return constraints
@@ -358,6 +412,76 @@ func applyMinMaxConstraint(c *facts.Constraints, name string, value string, sche
 	return false
 }
 
+func mergeConstraints(dst, src *facts.Constraints) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.MinLength != nil {
+		dst.MinLength = src.MinLength
+	}
+	if src.MaxLength != nil {
+		dst.MaxLength = src.MaxLength
+	}
+	if src.Minimum != nil {
+		dst.Minimum = src.Minimum
+	}
+	if src.Maximum != nil {
+		dst.Maximum = src.Maximum
+	}
+	if src.ExclusiveMinimum != nil {
+		dst.ExclusiveMinimum = src.ExclusiveMinimum
+	}
+	if src.ExclusiveMaximum != nil {
+		dst.ExclusiveMaximum = src.ExclusiveMaximum
+	}
+	if src.Pattern != nil {
+		dst.Pattern = src.Pattern
+	}
+	if len(src.EnumValues) > 0 {
+		dst.EnumValues = src.EnumValues
+	}
+}
+
+func applyDirectConstraints(c *facts.Constraints, tag reflect.StructTag, schema facts.Type, structName, fieldName, file string, line uint32, diags *diag.Accumulator) {
+	if c == nil {
+		return
+	}
+	if minLength := firstTagValue(tag, "minLength", "minlength"); minLength != "" {
+		if parsed, err := strconv.ParseUint(minLength, 10, 64); err == nil {
+			c.MinLength = &parsed
+		} else {
+			invalidSchemaTag(diags, structName, fieldName, "minLength", minLength, file, line)
+		}
+	}
+	if maxLength := firstTagValue(tag, "maxLength", "maxlength"); maxLength != "" {
+		if parsed, err := strconv.ParseUint(maxLength, 10, 64); err == nil {
+			c.MaxLength = &parsed
+		} else {
+			invalidSchemaTag(diags, structName, fieldName, "maxLength", maxLength, file, line)
+		}
+	}
+	if minimum := firstTagValue(tag, "minimum"); minimum != "" {
+		if validNumber(minimum) || !schemaIsNumeric(schema) {
+			c.Minimum = stringPtr(minimum)
+		} else {
+			invalidSchemaTag(diags, structName, fieldName, "minimum", minimum, file, line)
+		}
+	}
+	if maximum := firstTagValue(tag, "maximum"); maximum != "" {
+		if validNumber(maximum) || !schemaIsNumeric(schema) {
+			c.Maximum = stringPtr(maximum)
+		} else {
+			invalidSchemaTag(diags, structName, fieldName, "maximum", maximum, file, line)
+		}
+	}
+	if pattern := firstTagValue(tag, "pattern"); pattern != "" {
+		c.Pattern = stringPtr(pattern)
+	}
+	if enumValues := firstTagValue(tag, "enums", "enum"); enumValues != "" {
+		c.EnumValues = splitEnumValues(enumValues)
+	}
+}
+
 func constraintsEmpty(c *facts.Constraints) bool {
 	return c == nil ||
 		(c.MinLength == nil &&
@@ -370,9 +494,9 @@ func constraintsEmpty(c *facts.Constraints) bool {
 			len(c.EnumValues) == 0)
 }
 
-func unsupportedBinding(diags *diag.Accumulator, structName, fieldName, token, file string, line uint32) {
+func unsupportedConstraintTag(diags *diag.Accumulator, tagKind, structName, fieldName, token, file string, line uint32) {
 	diags.Warn(
-		"unsupported binding tag on "+structName+"."+fieldName+": "+strconv.Quote(token)+
+		"unsupported "+tagKind+" tag on "+structName+"."+fieldName+": "+strconv.Quote(token)+
 			" ignored by gnr8 metadata extraction (GO-06)",
 		file,
 		line,
@@ -497,6 +621,79 @@ func stringPtr(value string) *string {
 	return &value
 }
 
+func firstTagValue(tag reflect.StructTag, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := tag.Lookup(key); ok && value != "" {
+			return value
+		}
+		if value := schemaTagValue(tag.Get("schema"), key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func schemaTagValue(raw string, key string) string {
+	if raw == "" {
+		return ""
+	}
+	for _, token := range strings.Split(raw, ",") {
+		name, value, ok := strings.Cut(strings.TrimSpace(token), "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(name), key) {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func splitEnumValues(value string) []string {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '|' || r == ' '
+	})
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func parseExtensions(value string) []facts.Extension {
+	parts := strings.Split(value, ",")
+	extensions := make([]facts.Extension, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, hasValue := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		if !strings.HasPrefix(name, "x-") {
+			name = "x-" + name
+		}
+		if hasValue {
+			extensions = append(extensions, facts.Extension{Name: name, Value: inferLiteral(strings.TrimSpace(value))})
+		} else {
+			extensions = append(extensions, facts.Extension{Name: name, Value: boolLiteral(true)})
+		}
+	}
+	return extensions
+}
+
+func invalidSchemaTag(diags *diag.Accumulator, structName, fieldName, key, value, file string, line uint32) {
+	diags.Warn(
+		"invalid schema tag on "+structName+"."+fieldName+": "+key+"="+strconv.Quote(value)+
+			" ignored by gnr8 metadata extraction (GO-06)",
+		file,
+		line,
+	)
+}
+
 func parseStructTag(raw string) map[string]string {
 	out := map[string]string{}
 	for raw != "" {
@@ -594,6 +791,8 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 		return facts.AnyType()
 	case pkgPath == jsonPkgPath && obj.Name() == "Number":
 		return facts.PrimitiveType(facts.FloatPrim(64))
+	case pkgPath == multipartPkgPath && obj.Name() == "FileHeader":
+		return facts.PrimitiveType(facts.BytesPrim())
 	}
 	// A named string (with or without a const set) refs its own schema; the enum
 	// values are resolved by the enum SchemaFact (see Extract). A non-string named
@@ -686,15 +885,18 @@ func schemaID(named *gotypes.Named, modulePath string) string {
 	return rel + "." + obj.Name()
 }
 
-func structHasJSONTag(st *gotypes.Struct) bool {
+func structHasPayloadTag(st *gotypes.Struct) bool {
 	for i := 0; i < st.NumFields(); i++ {
 		tag := reflect.StructTag(st.Tag(i))
 		if _, ok := tag.Lookup("json"); ok {
 			return true
 		}
+		if _, ok := tag.Lookup("form"); ok {
+			return true
+		}
 		if st.Field(i).Embedded() {
 			if embedded, ok := embeddedStruct(st.Field(i).Type()); ok {
-				if structHasJSONTag(embedded) {
+				if structHasPayloadTag(embedded) {
 					return true
 				}
 			}
@@ -750,28 +952,34 @@ func isPointer(t gotypes.Type) bool {
 	return ok
 }
 
-// parseJSONTag returns the effective json field name, whether omitempty is set,
-// and whether the field is JSON-skipped (`json:"-"`). Falls back to the Go field
-// name when no json tag is present.
-func parseJSONTag(tag reflect.StructTag, goName string) (name string, omitempty, skip bool) {
-	raw, ok := tag.Lookup("json")
-	if !ok || raw == "" {
-		return goName, false, false
+// parsePayloadTag returns the effective payload field name, whether omitempty is
+// set, and whether the field is skipped. JSON tags win when present; form tags
+// let multipart/form DTOs participate in the same neutral schema extraction.
+func parsePayloadTag(tag reflect.StructTag, goName string) (name string, omitempty, skip bool) {
+	if raw, ok := tag.Lookup("json"); ok && raw != "" {
+		return parseWireTag(raw, goName)
 	}
+	if raw, ok := tag.Lookup("form"); ok && raw != "" {
+		return parseWireTag(raw, goName)
+	}
+	return goName, false, false
+}
+
+func parseWireTag(raw string, goName string) (name string, omitempty, skip bool) {
 	parts := strings.Split(raw, ",")
-	jsonName := parts[0]
-	if jsonName == "-" && len(parts) == 1 {
+	wireName := parts[0]
+	if wireName == "-" && len(parts) == 1 {
 		return "", false, true
 	}
-	if jsonName == "" {
-		jsonName = goName
+	if wireName == "" {
+		wireName = goName
 	}
 	for _, opt := range parts[1:] {
 		if opt == "omitempty" {
 			omitempty = true
 		}
 	}
-	return jsonName, omitempty, false
+	return wireName, omitempty, false
 }
 
 func spanOf(fset *token.FileSet, pos token.Pos) facts.SourceSpan {

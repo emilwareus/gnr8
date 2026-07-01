@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: Brownfield Books API
+  version: 1.0.0
+servers:
+  - url: /v1
+paths:
+  /books/{id}:
+    get:
+      tags: [Books]
+      operationId: getBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: include
+          in: query
+          schema:
+            type: string
+            enum: [author, reviews]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/legacy.Book'
+        '404':
+          description: Missing
+          content:
+            application/json:
+              schema:
+                $ref: './common.yaml#/components/schemas/Shared.Error'
+  /books:
+    post:
+      tags: [Books]
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/legacy.Book'
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: uploadBookCover
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                note:
+                  type: [string, 'null']
+      responses:
+        '200':
+          description: Uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResult'
+components:
+  schemas:
+    BookBase:
+      type: object
+      required: [title, status]
+      properties:
+        title:
+          type: string
+        status:
+          type: string
+          enum: [draft, published]
+    legacy.Book:
+      allOf:
+        - $ref: '#/components/schemas/BookBase'
+        - type: object
+          required: [id, metadata]
+          properties:
+            id:
+              type: string
+              format: uuid
+            note:
+              type: [string, 'null']
+            metadata:
+              type: object
+              additionalProperties:
+                type: string
+            tags:
+              type: array
+              items:
+                type: string
+    LegacyBook:
+      type: object
+      properties:
+        collision:
+          type: string
+    CreateBookRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        authorId:
+          type: string
+          format: uuid
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+    UploadResult:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string

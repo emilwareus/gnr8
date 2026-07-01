@@ -226,7 +226,7 @@ impl SdkModel {
             },
             compatibility: SdkCompatibility {
                 profile: profile.name().to_string(),
-                openapi_generator_compat: profile.is_openapi_generator_compat(),
+                openapi_generator_compat: !profile.is_minimal(),
             },
         })
     }
@@ -290,6 +290,7 @@ mod tests {
                 request_body: Some(SchemaRef {
                     ref_id: "app.Book".to_string(),
                 }),
+                request_body_content_type: None,
                 responses: vec![Response {
                     status: 201,
                     body: Some(SchemaRef {

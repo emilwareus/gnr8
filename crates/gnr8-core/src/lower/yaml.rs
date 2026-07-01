@@ -92,13 +92,14 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
     }
 }
 
-/// Emit one operation's keys in fixed order: `operationId`, `parameters`, `requestBody`, `responses`.
-///
-/// There is no `summary`/`tags` — those were annotation facts and have been removed (CLAUDE.md rules
-/// 1 & 3).
+/// Emit one operation's keys in fixed order: `operationId`, `tags`, `parameters`, `requestBody`,
+/// `responses`.
 fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     let pad = INDENT.repeat(depth);
     let _ = writeln!(out, "{pad}operationId: {}", scalar(&op.operation_id));
+    if !op.tags.is_empty() {
+        let _ = writeln!(out, "{pad}tags: {}", flow_seq(&op.tags));
+    }
     if !op.parameters.is_empty() {
         let _ = writeln!(out, "{pad}parameters:");
         for param in &op.parameters {
@@ -122,13 +123,13 @@ fn write_parameter(out: &mut String, param: &Parameter, depth: usize) {
     write_schema(out, &param.schema, depth + 2);
 }
 
-/// Emit a `requestBody` with `application/json` content referencing a component schema.
+/// Emit a `requestBody` with source-inferred content type referencing a component schema.
 fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
     let pad = INDENT.repeat(depth);
     let _ = writeln!(out, "{pad}requestBody:");
     let _ = writeln!(out, "{pad}{INDENT}required: {}", body.required);
     let _ = writeln!(out, "{pad}{INDENT}content:");
-    let _ = writeln!(out, "{pad}{INDENT}{INDENT}application/json:");
+    let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(&body.content_type));
     let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
     let _ = writeln!(
         out,
@@ -272,6 +273,9 @@ fn write_schema(out: &mut String, schema: &SchemaObject, depth: usize) {
     }
     if let Some(default_value) = &schema.default_value {
         let _ = writeln!(out, "{pad}default: {}", literal(default_value));
+    }
+    if let Some(example) = &schema.example {
+        let _ = writeln!(out, "{pad}example: {}", literal(example));
     }
     for extension in &schema.extensions {
         let _ = writeln!(
@@ -435,9 +439,11 @@ mod tests {
     fn sample_doc() -> OpenApiDoc {
         let post = Operation {
             operation_id: "createGoal".to_string(),
+            tags: vec!["goals".to_string()],
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
+                content_type: "application/json".to_string(),
                 schema_ref: "CreateGoalInput".to_string(),
             }),
             responses: vec![(

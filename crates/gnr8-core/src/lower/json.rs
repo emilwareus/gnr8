@@ -91,6 +91,17 @@ fn write_operation(op: &Operation) -> Value {
         "operationId".to_string(),
         Value::String(op.operation_id.clone()),
     );
+    if !op.tags.is_empty() {
+        out.insert(
+            "tags".to_string(),
+            Value::Array(
+                op.tags
+                    .iter()
+                    .map(|tag| Value::String(tag.clone()))
+                    .collect(),
+            ),
+        );
+    }
     if !op.parameters.is_empty() {
         out.insert(
             "parameters".to_string(),
@@ -118,7 +129,7 @@ fn write_request_body(body: &RequestBody) -> Value {
     media.insert("schema".to_string(), ref_schema(&body.schema_ref));
 
     let mut content = Map::new();
-    content.insert("application/json".to_string(), Value::Object(media));
+    content.insert(body.content_type.clone(), Value::Object(media));
 
     let mut out = Map::new();
     out.insert("required".to_string(), Value::Bool(body.required));
@@ -263,6 +274,9 @@ fn write_schema(schema: &SchemaObject) -> Value {
     if let Some(default_value) = &schema.default_value {
         out.insert("default".to_string(), literal(default_value));
     }
+    if let Some(example) = &schema.example {
+        out.insert("example".to_string(), literal(example));
+    }
     for extension in &schema.extensions {
         out.insert(extension.name.clone(), literal(&extension.value));
     }
@@ -358,9 +372,11 @@ mod tests {
                 PathItem {
                     post: Some(Operation {
                         operation_id: "createGoal".to_string(),
+                        tags: vec!["goals".to_string()],
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,
+                            content_type: "application/json".to_string(),
                             schema_ref: "CreateGoalInput".to_string(),
                         }),
                         responses: vec![(

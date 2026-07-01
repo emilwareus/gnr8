@@ -9,6 +9,9 @@
 // recognizer via routes.GinMethod):
 //
 //	c.ShouldBindJSON(&x)        -> request body type = TypeOf(x)
+//	c.ShouldBind(&x)            -> form/multipart body when the bound DTO uses form tags
+//	c.FormFile("name")          -> multipart file field on a synthesized request body
+//	c.PostForm("name")          -> form string field on a synthesized request body
 //	c.JSON(http.StatusXxx, y)   -> responses[status] = TypeOf(y); status via go/constant
 //	c.Param("name")             -> path param (string, required)
 //	c.Query("name")             -> query param (string) + untyped-query WARN diagnostic
@@ -22,6 +25,7 @@ import (
 	"go/constant"
 	"go/token"
 	gotypes "go/types"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -35,9 +39,11 @@ import (
 // responses keyed by status, and the params. This is the ONLY source of these
 // facts — there is no annotation/fallback path (CLAUDE.md rules 1 & 3).
 type CodeFacts struct {
-	RequestBody *facts.TypeRef
-	Responses   []facts.ResponseFact
-	Params      []facts.ParamFact
+	RequestBody            *facts.TypeRef
+	RequestBodyContentType string
+	Responses              []facts.ResponseFact
+	Params                 []facts.ParamFact
+	Schemas                []facts.SchemaFact
 }
 
 // handlerDecl bundles a handler FuncDecl with its owning package's type info and
@@ -185,6 +191,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	cf := CodeFacts{Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	seenParam := map[string]bool{}
 	seenStatus := map[uint16]bool{}
+	formFields := map[string]facts.FieldFact{}
+	formHasFile := false
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -197,8 +205,13 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		switch name {
 		case "ShouldBindJSON", "BindJSON":
-			if ref, ok := a.bindRequestType(h.info, call); ok {
+			if ref, _, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
+			}
+		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
+			if ref, bound, ok := a.bindRequestType(h.info, call); ok {
+				cf.RequestBody = ref
+				cf.RequestBodyContentType = bindContentType(name, h.info, call, bound)
 			}
 		case "JSON":
 			a.analyzeJSON(h, call, route, &cf, seenStatus, diags)
@@ -214,29 +227,200 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				cf.Params = append(cf.Params, queryParam(pname, h.fset, call.Pos()))
 				diags.UntypedQueryParam(pname, route.Method, untypedRouteLabel(route), file, line)
 			}
+		case "FormFile":
+			if fname, ok := stringArg(call, 0); ok {
+				formFields[fname] = formField(fname, facts.PrimitiveType(facts.BytesPrim()), true)
+				formHasFile = true
+			} else {
+				file, line := positionOf(h.fset, call.Pos())
+				diags.Warn("unsupported multipart source pattern: FormFile field name is dynamic (GO-05)", file, line)
+			}
+		case "PostForm", "DefaultPostForm":
+			if fname, ok := stringArg(call, 0); ok {
+				if _, seen := formFields[fname]; !seen {
+					formFields[fname] = formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
+				}
+			} else {
+				file, line := positionOf(h.fset, call.Pos())
+				diags.Warn("unsupported form source pattern: form field name is dynamic (GO-05)", file, line)
+			}
+		case "MultipartForm":
+			file, line := positionOf(h.fset, call.Pos())
+			diags.Warn("unsupported multipart source pattern: MultipartForm map access cannot be fully extracted; use typed ShouldBind or direct FormFile/PostForm calls (GO-05)", file, line)
 		}
 		return true
 	})
+	if cf.RequestBody == nil && len(formFields) > 0 {
+		schemaID, schemaName := syntheticFormSchemaIdentity(route.Handler)
+		fields := make([]facts.FieldFact, 0, len(formFields))
+		for _, field := range formFields {
+			fields = append(fields, field)
+		}
+		cf.RequestBody = &facts.TypeRef{RefID: schemaID}
+		cf.RequestBodyContentType = "application/x-www-form-urlencoded"
+		if formHasFile {
+			cf.RequestBodyContentType = "multipart/form-data"
+		}
+		cf.Schemas = append(cf.Schemas, facts.SchemaFact{
+			ID:   schemaID,
+			Name: schemaName,
+			Body: facts.ObjectType(fields),
+			Span: spanOf(h.fset, declPos(h.decl)),
+		})
+	}
 	return cf
 }
 
-// bindRequestType resolves ShouldBindJSON(&x) -> a TypeRef to the bound named type.
+// bindRequestType resolves ShouldBindJSON(&x) / ShouldBind(&x) -> a TypeRef to the bound named type.
 // arg[0] must be &ident (an *ast.UnaryExpr with Op AND). When the type cannot be
 // resolved to a named type, returns ok=false and the route simply has no request
 // body — there is no secondary source (CLAUDE.md rule 3).
-func (a *Analyzer) bindRequestType(info *gotypes.Info, call *ast.CallExpr) (*facts.TypeRef, bool) {
+func (a *Analyzer) bindRequestType(info *gotypes.Info, call *ast.CallExpr) (*facts.TypeRef, gotypes.Type, bool) {
 	if len(call.Args) < 1 {
-		return nil, false
+		return nil, nil, false
 	}
 	unary, ok := call.Args[0].(*ast.UnaryExpr)
 	if !ok || unary.Op != token.AND {
-		return nil, false
+		return nil, nil, false
 	}
-	id, ok := a.namedTypeID(info.TypeOf(unary.X))
+	bound := info.TypeOf(unary.X)
+	id, ok := a.namedTypeID(bound)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	return &facts.TypeRef{RefID: id}, true
+	return &facts.TypeRef{RefID: id}, bound, true
+}
+
+func bindContentType(method string, info *gotypes.Info, call *ast.CallExpr, bound gotypes.Type) string {
+	switch explicitBindingName(info, call) {
+	case "FormMultipart":
+		return "multipart/form-data"
+	case "Form", "FormPost":
+		return "application/x-www-form-urlencoded"
+	case "JSON":
+		return ""
+	}
+	if typeContainsMultipartFile(bound) {
+		return "multipart/form-data"
+	}
+	if typeHasFormTag(bound) {
+		return "application/x-www-form-urlencoded"
+	}
+	if method == "Bind" || method == "ShouldBind" {
+		return ""
+	}
+	return ""
+}
+
+func explicitBindingName(info *gotypes.Info, call *ast.CallExpr) string {
+	if len(call.Args) < 2 {
+		return ""
+	}
+	switch arg := call.Args[1].(type) {
+	case *ast.SelectorExpr:
+		return arg.Sel.Name
+	case *ast.Ident:
+		if obj := info.ObjectOf(arg); obj != nil {
+			return obj.Name()
+		}
+		return arg.Name
+	default:
+		return ""
+	}
+}
+
+func formField(name string, schema facts.Type, required bool) facts.FieldFact {
+	return facts.FieldFact{
+		JSONName: name,
+		Required: required,
+		Optional: !required,
+		Nullable: false,
+		Schema:   schema,
+	}
+}
+
+func syntheticFormSchemaIdentity(handler string) (id string, name string) {
+	base := exportedIdentifier(handler)
+	if base == "" {
+		base = "Request"
+	}
+	name = base + "FormRequest"
+	return "__synthetic." + name, name
+}
+
+func exportedIdentifier(name string) string {
+	if name == "" {
+		return ""
+	}
+	return strings.ToUpper(name[:1]) + name[1:]
+}
+
+func typeContainsMultipartFile(t gotypes.Type) bool {
+	return typeContainsMultipartFileSeen(t, map[string]bool{})
+}
+
+func typeContainsMultipartFileSeen(t gotypes.Type, seen map[string]bool) bool {
+	if t == nil {
+		return false
+	}
+	key := t.String()
+	if seen[key] {
+		return false
+	}
+	seen[key] = true
+	switch u := gotypes.Unalias(t).(type) {
+	case *gotypes.Pointer:
+		return typeContainsMultipartFileSeen(u.Elem(), seen)
+	case *gotypes.Slice:
+		return typeContainsMultipartFileSeen(u.Elem(), seen)
+	case *gotypes.Array:
+		return typeContainsMultipartFileSeen(u.Elem(), seen)
+	case *gotypes.Named:
+		obj := u.Obj()
+		if obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == "mime/multipart" && obj.Name() == "FileHeader" {
+			return true
+		}
+		return typeContainsMultipartFileSeen(u.Underlying(), seen)
+	case *gotypes.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			if typeContainsMultipartFileSeen(u.Field(i).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func typeHasFormTag(t gotypes.Type) bool {
+	return typeHasFormTagSeen(t, map[string]bool{})
+}
+
+func typeHasFormTagSeen(t gotypes.Type, seen map[string]bool) bool {
+	if t == nil {
+		return false
+	}
+	key := t.String()
+	if seen[key] {
+		return false
+	}
+	seen[key] = true
+	switch u := gotypes.Unalias(t).(type) {
+	case *gotypes.Pointer:
+		return typeHasFormTagSeen(u.Elem(), seen)
+	case *gotypes.Named:
+		return typeHasFormTagSeen(u.Underlying(), seen)
+	case *gotypes.Struct:
+		for i := 0; i < u.NumFields(); i++ {
+			tag := reflect.StructTag(u.Tag(i))
+			if raw, ok := tag.Lookup("form"); ok && raw != "" && raw != "-" {
+				return true
+			}
+			if u.Field(i).Embedded() && typeHasFormTagSeen(u.Field(i).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // analyzeJSON resolves c.JSON(http.StatusXxx, y): status from go/constant, body

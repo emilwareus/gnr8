@@ -1,0 +1,92 @@
+openapi: 3.0.3
+info:
+  title: Brownfield Books API
+  version: 1.0.0
+servers:
+  - url: /v1
+paths:
+  /books/{id}:
+    get:
+      tags: [Books]
+      operationId: getBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/legacy.Book'
+  /uploads:
+    post:
+      tags: [Uploads]
+      operationId: uploadBookCover
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                note:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResult'
+components:
+  schemas:
+    BookBase:
+      type: object
+      required: [title, status]
+      properties:
+        title:
+          type: string
+        status:
+          type: string
+          enum: [draft, published]
+    legacy.Book:
+      allOf:
+        - $ref: '#/components/schemas/BookBase'
+        - type: object
+          required: [id, metadata]
+          properties:
+            id:
+              type: string
+              format: uuid
+            note:
+              type: string
+              nullable: true
+            metadata:
+              type: object
+              additionalProperties:
+                type: string
+            tags:
+              type: array
+              items:
+                type: string
+    LegacyBook:
+      type: object
+      properties:
+        collision:
+          type: string
+    UploadResult:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string

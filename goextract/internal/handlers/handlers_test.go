@@ -2,6 +2,7 @@ package handlers_test
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -152,11 +153,126 @@ func TestListGoalsQueryParamsAndDiagnostics(t *testing.T) {
 	}
 }
 
+func TestMultipartFormBodiesFromTypedBindAndDirectCalls(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/uploadhandlers
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBind(any) error { return nil }
+func (c *Context) FormFile(string) (any, error) { return nil, nil }
+func (c *Context) PostForm(string) string { return "" }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package uploadhandlers
+
+import (
+	"mime/multipart"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+
+type UploadForm struct {
+	File *multipart.FileHeader `+"`form:\"file\" binding:\"required\"`"+`
+	Name string `+"`form:\"name\" validate:\"required\"`"+`
+}
+
+type UploadResult struct {
+	ID string `+"`json:\"id\"`"+`
+}
+
+func (s Server) Register() {
+	s.R.POST("/upload", s.uploadTyped)
+	s.R.POST("/loose", s.uploadLoose)
+}
+
+func (s Server) uploadTyped(c *gin.Context) {
+	var in UploadForm
+	_ = c.ShouldBind(&in)
+	c.JSON(201, UploadResult{})
+}
+
+func (s Server) uploadLoose(c *gin.Context) {
+	_, _ = c.FormFile("file")
+	_ = c.PostForm("name")
+	c.JSON(200, UploadResult{})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load upload handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/uploadhandlers", diags)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range routes.Recognize(res) {
+		got[r.Handler] = analyzer.Analyze(r, diags)
+	}
+
+	typed := got["uploadTyped"]
+	if typed.RequestBody == nil || !strings.HasSuffix(typed.RequestBody.RefID, "UploadForm") {
+		t.Fatalf("typed upload body should reference UploadForm, got %+v", typed.RequestBody)
+	}
+	if typed.RequestBodyContentType != "multipart/form-data" {
+		t.Fatalf("typed upload content type: want multipart/form-data got %q", typed.RequestBodyContentType)
+	}
+
+	loose := got["uploadLoose"]
+	if loose.RequestBody == nil || loose.RequestBody.RefID != "__synthetic.UploadLooseFormRequest" {
+		t.Fatalf("loose upload should synthesize request schema, got %+v", loose.RequestBody)
+	}
+	if loose.RequestBodyContentType != "multipart/form-data" {
+		t.Fatalf("loose upload content type: want multipart/form-data got %q", loose.RequestBodyContentType)
+	}
+	if len(loose.Schemas) != 1 || loose.Schemas[0].Name != "UploadLooseFormRequest" {
+		t.Fatalf("loose upload synthetic schemas: %+v", loose.Schemas)
+	}
+	fields, ok := loose.Schemas[0].Body.Of.([]facts.FieldFact)
+	if !ok {
+		t.Fatalf("synthetic schema body should be object fields, got %+v", loose.Schemas[0].Body)
+	}
+	seen := map[string]facts.FieldFact{}
+	for _, field := range fields {
+		seen[field.JSONName] = field
+	}
+	if primName(seen["file"].Schema) != facts.PrimBytes || !seen["file"].Required {
+		t.Fatalf("synthetic file field should be required bytes, got %+v", seen["file"])
+	}
+	if primName(seen["name"].Schema) != facts.PrimString || seen["name"].Required {
+		t.Fatalf("synthetic name field should be optional string, got %+v", seen["name"])
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {
 	msg, file string
 	line      uint32
+}
+
+func mustWrite(t *testing.T, path string, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
 }
 
 func statuses(rs []facts.ResponseFact) []uint16 {
@@ -180,6 +296,16 @@ func paramByName(ps []facts.ParamFact, name string) (facts.ParamFact, bool) {
 		}
 	}
 	return facts.ParamFact{}, false
+}
+
+func primName(ty facts.Type) string {
+	if ty.Type != facts.TypePrimitive {
+		return ""
+	}
+	if p, ok := ty.Of.(*facts.Prim); ok {
+		return p.Prim
+	}
+	return ""
 }
 
 func equalUint16(a, b []uint16) bool {

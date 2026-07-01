@@ -35,6 +35,8 @@ pub struct TypeScriptSurface {
     pub interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
     /// Operation/factory return types keyed by `Class.method` or `Factory.method`.
     pub operation_return_types: BTreeMap<String, String>,
+    /// Operation/factory method signatures keyed by `Class.method` or `Factory.method`.
+    pub operation_signatures: BTreeMap<String, String>,
     /// Package entry point fields.
     pub package_entry_points: BTreeMap<String, String>,
 }
@@ -70,6 +72,8 @@ pub struct TypeScriptSurfaceDiff {
     pub interface_type_changes: Vec<TsInterfacePropertyChange>,
     /// Operation/factory return type annotations changed or were removed.
     pub operation_return_type_changes: Vec<TsOperationReturnTypeChange>,
+    /// Operation/factory method signatures changed or were removed.
+    pub operation_signature_changes: Vec<TsOperationSignatureChange>,
     /// Package entry points changed or removed.
     pub package_entry_point_changes: Vec<String>,
 }
@@ -92,8 +96,68 @@ impl TypeScriptSurfaceDiff {
             || !self.interface_nullable_changes.is_empty()
             || !self.interface_type_changes.is_empty()
             || !self.operation_return_type_changes.is_empty()
+            || !self.operation_signature_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
     }
+}
+
+/// Extracted Go public surface.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct GoSurface {
+    /// Exported type names.
+    pub exported_types: Vec<String>,
+    /// Exported function signatures keyed by function name.
+    pub exported_functions: BTreeMap<String, String>,
+    /// Exported method signatures keyed by `Receiver.Method`.
+    pub exported_methods: BTreeMap<String, String>,
+    /// Documentation files present in the SDK package.
+    pub docs: Vec<String>,
+    /// `go.mod` metadata and other package-level compatibility fields.
+    pub package_metadata: BTreeMap<String, String>,
+}
+
+/// Go surface diff report.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct GoSurfaceDiff {
+    /// Exported types present in old but missing in new.
+    pub missing_exported_types: Vec<String>,
+    /// Exported functions present in old but missing in new.
+    pub missing_exported_functions: Vec<String>,
+    /// Exported methods present in old but missing in new.
+    pub missing_exported_methods: Vec<String>,
+    /// Exported function signatures changed.
+    pub exported_function_signature_changes: Vec<GoSignatureChange>,
+    /// Exported method signatures changed.
+    pub exported_method_signature_changes: Vec<GoSignatureChange>,
+    /// Documentation files present in old but missing in new.
+    pub missing_docs: Vec<String>,
+    /// Package metadata changed or was removed.
+    pub package_metadata_changes: Vec<String>,
+}
+
+impl GoSurfaceDiff {
+    /// Whether this report contains any breaking change.
+    #[must_use]
+    pub fn is_breaking(&self) -> bool {
+        !self.missing_exported_types.is_empty()
+            || !self.missing_exported_functions.is_empty()
+            || !self.missing_exported_methods.is_empty()
+            || !self.exported_function_signature_changes.is_empty()
+            || !self.exported_method_signature_changes.is_empty()
+            || !self.missing_docs.is_empty()
+            || !self.package_metadata_changes.is_empty()
+    }
+}
+
+/// Changed Go function/method signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GoSignatureChange {
+    /// Function or `Receiver.Method` symbol.
+    pub symbol: String,
+    /// Old normalized signature.
+    pub old: String,
+    /// New normalized signature.
+    pub new: String,
 }
 
 /// A type/value namespace mismatch.
@@ -151,6 +215,17 @@ pub struct TsOperationReturnTypeChange {
     pub new: String,
 }
 
+/// A changed TypeScript operation or factory method signature.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsOperationSignatureChange {
+    /// Operation key, e.g. `DefaultApi.listBooks`.
+    pub operation: String,
+    /// Old normalized method signature.
+    pub old: String,
+    /// New normalized method signature.
+    pub new: String,
+}
+
 /// Diff two TypeScript SDK directories.
 ///
 /// # Errors
@@ -163,6 +238,74 @@ pub fn diff_typescript_dirs(
     let old = extract_typescript_surface(old_dir)?;
     let new = extract_typescript_surface(new_dir)?;
     Ok(diff_typescript_surfaces(&old, &new))
+}
+
+/// Diff two Go SDK directories.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Workspace`] if either directory cannot be read.
+pub fn diff_go_dirs(
+    old_dir: impl AsRef<Path>,
+    new_dir: impl AsRef<Path>,
+) -> Result<GoSurfaceDiff, CoreError> {
+    let old = extract_go_surface(old_dir)?;
+    let new = extract_go_surface(new_dir)?;
+    Ok(diff_go_surfaces(&old, &new))
+}
+
+/// Extract a Go SDK public surface from a directory.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Workspace`] if the directory cannot be read.
+pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError> {
+    let dir = dir.as_ref();
+    let mut files = Vec::new();
+    collect_go_files(dir, dir, &mut files)?;
+    files.sort();
+
+    let mut exported_types = BTreeSet::new();
+    let mut exported_functions = BTreeMap::new();
+    let mut exported_methods = BTreeMap::new();
+    for rel in &files {
+        let text = read_to_string(dir.join(rel))?;
+        let parsed = parse_go_file(&text);
+        exported_types.extend(parsed.types);
+        exported_functions.extend(parsed.functions);
+        exported_methods.extend(parsed.methods);
+    }
+
+    Ok(GoSurface {
+        exported_types: exported_types.into_iter().collect(),
+        exported_functions,
+        exported_methods,
+        docs: go_doc_files(dir)?,
+        package_metadata: go_package_metadata(dir)?,
+    })
+}
+
+/// Diff two already-extracted Go surfaces.
+#[must_use]
+pub fn diff_go_surfaces(old: &GoSurface, new: &GoSurface) -> GoSurfaceDiff {
+    GoSurfaceDiff {
+        missing_exported_types: missing_values(&old.exported_types, &new.exported_types),
+        missing_exported_functions: missing_string_keys(
+            &old.exported_functions,
+            &new.exported_functions,
+        ),
+        missing_exported_methods: missing_string_keys(&old.exported_methods, &new.exported_methods),
+        exported_function_signature_changes: go_signature_changes(
+            &old.exported_functions,
+            &new.exported_functions,
+        ),
+        exported_method_signature_changes: go_signature_changes(
+            &old.exported_methods,
+            &new.exported_methods,
+        ),
+        missing_docs: missing_values(&old.docs, &new.docs),
+        package_metadata_changes: package_changes(&old.package_metadata, &new.package_metadata),
+    }
 }
 
 /// Extract a TypeScript SDK surface from a directory.
@@ -184,6 +327,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
     let mut request_aliases = BTreeSet::new();
     let mut interface_properties = BTreeMap::new();
     let mut operation_return_types = BTreeMap::new();
+    let mut operation_signatures = BTreeMap::new();
 
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
@@ -191,6 +335,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         merge_exports(&mut all_exports, &parsed.exports);
         merge_interface_properties(&mut interface_properties, parsed.interface_properties);
         merge_operation_return_types(&mut operation_return_types, parsed.operation_return_types);
+        operation_signatures.extend(parsed.operation_signatures);
         if is_model_file(rel) {
             merge_exports(&mut model_exports, &parsed.exports);
         }
@@ -210,6 +355,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         request_aliases: request_aliases.into_iter().collect(),
         interface_properties,
         operation_return_types,
+        operation_signatures,
         package_entry_points: package_entry_points(dir)?,
     })
 }
@@ -243,6 +389,10 @@ pub fn diff_typescript_surfaces(
             &old.operation_return_types,
             &new.operation_return_types,
         ),
+        operation_signature_changes: operation_signature_changes(
+            &old.operation_signatures,
+            &new.operation_signatures,
+        ),
         package_entry_point_changes: package_changes(
             &old.package_entry_points,
             &new.package_entry_points,
@@ -259,6 +409,7 @@ struct ParsedTsFile {
     request_aliases: Vec<String>,
     interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
     operation_return_types: BTreeMap<String, String>,
+    operation_signatures: BTreeMap<String, String>,
 }
 
 #[expect(
@@ -318,14 +469,14 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         if let Some((class_name, depth)) = &mut current_api_class {
             if !starts_api_class {
                 if let Some((method, return_ty)) = parse_async_method_signature(line) {
-                    parsed
-                        .operation_methods
-                        .push(format!("{class_name}.{method}"));
+                    let key = format!("{class_name}.{method}");
+                    parsed.operation_methods.push(key.clone());
                     if let Some(return_ty) = return_ty {
-                        parsed
-                            .operation_return_types
-                            .insert(format!("{class_name}.{method}"), return_ty);
+                        parsed.operation_return_types.insert(key.clone(), return_ty);
                     }
+                    parsed
+                        .operation_signatures
+                        .insert(key, normalize_ts_signature(line));
                 }
                 *depth += brace_delta(line);
             }
@@ -341,9 +492,11 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         if let Some((factory_name, depth)) = &mut current_api_factory {
             if !starts_api_factory {
                 if let Some((method, Some(return_ty))) = parse_method_signature(line) {
+                    let key = format!("{factory_name}.{method}");
+                    parsed.operation_return_types.insert(key.clone(), return_ty);
                     parsed
-                        .operation_return_types
-                        .insert(format!("{factory_name}.{method}"), return_ty);
+                        .operation_signatures
+                        .insert(key, normalize_ts_signature(line));
                 }
                 *depth += brace_delta(line);
             }
@@ -475,6 +628,17 @@ fn property_name_and_optional(left: &str) -> Option<(String, bool)> {
 
 fn normalize_ts_type(ty: &str) -> String {
     ty.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_ts_signature(signature: &str) -> String {
+    let signature = signature
+        .split_once('{')
+        .map_or(signature, |(signature, _)| signature)
+        .trim()
+        .trim_end_matches(';')
+        .trim_end_matches(',')
+        .trim();
+    signature.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn ts_type_contains_null(ty: &str) -> bool {
@@ -721,9 +885,191 @@ fn package_entry_points(dir: &Path) -> Result<BTreeMap<String, String>, CoreErro
     Ok(out)
 }
 
+#[derive(Default)]
+struct ParsedGoFile {
+    types: Vec<String>,
+    functions: BTreeMap<String, String>,
+    methods: BTreeMap<String, String>,
+}
+
+fn parse_go_file(text: &str) -> ParsedGoFile {
+    let mut parsed = ParsedGoFile::default();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some(name) = go_type_decl(line) {
+            if is_go_exported(name) {
+                parsed.types.push(name.to_string());
+            }
+        }
+        if let Some((name, signature)) = go_func_decl(line) {
+            if is_go_exported(&name) {
+                parsed.functions.insert(name, signature);
+            }
+        }
+        if let Some((receiver, method, signature)) = go_method_decl(line) {
+            if is_go_exported(&receiver) && is_go_exported(&method) {
+                parsed
+                    .methods
+                    .insert(format!("{receiver}.{method}"), signature);
+            }
+        }
+    }
+    parsed.types.sort();
+    parsed.types.dedup();
+    parsed
+}
+
+fn go_type_decl(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("type ")?;
+    ident_prefix(rest)
+}
+
+fn go_func_decl(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("func ")?;
+    if rest.starts_with('(') {
+        return None;
+    }
+    let name = ident_prefix(rest)?;
+    let signature = normalize_go_signature(line);
+    Some((name.to_string(), signature))
+}
+
+fn go_method_decl(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("func ")?;
+    let rest = rest.strip_prefix('(')?;
+    let receiver_end = rest.find(')')?;
+    let receiver = rest[..receiver_end].trim();
+    let receiver_type = go_receiver_type(receiver)?;
+    let after_receiver = rest[receiver_end + 1..].trim_start();
+    let method = ident_prefix(after_receiver)?;
+    let signature = normalize_go_signature(line);
+    Some((receiver_type, method.to_string(), signature))
+}
+
+fn go_receiver_type(receiver: &str) -> Option<String> {
+    let raw = receiver.split_whitespace().last()?;
+    let raw = raw.trim_start_matches('*');
+    let raw = raw.trim_start_matches("[]");
+    let name = raw.rsplit('.').next().unwrap_or(raw);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn normalize_go_signature(line: &str) -> String {
+    let signature = line
+        .split_once('{')
+        .map_or(line, |(signature, _)| signature)
+        .trim();
+    signature.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_go_exported(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+}
+
+fn collect_go_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CoreError> {
+    let entries = std::fs::read_dir(dir).map_err(|err| CoreError::Workspace {
+        message: format!("failed to read Go SDK dir {}: {err}", dir.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| CoreError::Workspace {
+            message: format!("failed to read Go SDK dir entry {}: {err}", dir.display()),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("vendor") {
+                continue;
+            }
+            collect_go_files(root, &path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("go")
+            && path.file_name().and_then(|name| name.to_str()) != Some("go.mod")
+        {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|err| CoreError::Workspace {
+                    message: format!("failed to relativize Go file {}: {err}", path.display()),
+                })?
+                .to_path_buf();
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+fn go_package_metadata(dir: &Path) -> Result<BTreeMap<String, String>, CoreError> {
+    let path = dir.join("go.mod");
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = read_to_string(path)?;
+    let mut out = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(module) = line.strip_prefix("module ") {
+            out.insert("module".to_string(), module.trim().to_string());
+        } else if let Some(version) = line.strip_prefix("go ") {
+            out.insert("go".to_string(), version.trim().to_string());
+        } else if let Some(requirement) = line.strip_prefix("require ") {
+            let requirement = requirement.trim();
+            if !requirement.starts_with('(') && !requirement.is_empty() {
+                out.insert(format!("require:{requirement}"), requirement.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn go_doc_files(dir: &Path) -> Result<Vec<String>, CoreError> {
+    let mut out = Vec::new();
+    collect_doc_files(dir, dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn collect_doc_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), CoreError> {
+    let entries = std::fs::read_dir(dir).map_err(|err| CoreError::Workspace {
+        message: format!("failed to read Go SDK dir {}: {err}", dir.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| CoreError::Workspace {
+            message: format!("failed to read Go SDK dir entry {}: {err}", dir.display()),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("vendor") {
+                continue;
+            }
+            collect_doc_files(root, &path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|err| CoreError::Workspace {
+                    message: format!("failed to relativize Go doc file {}: {err}", path.display()),
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
 fn missing_keys(
     old: &BTreeMap<String, TsExportKind>,
     new: &BTreeMap<String, TsExportKind>,
+) -> Vec<String> {
+    old.keys()
+        .filter(|key| !new.contains_key(*key))
+        .cloned()
+        .collect()
+}
+
+fn missing_string_keys(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
 ) -> Vec<String> {
     old.keys()
         .filter(|key| !new.contains_key(*key))
@@ -761,6 +1107,22 @@ fn package_changes(old: &BTreeMap<String, String>, new: &BTreeMap<String, String
             Some(new_value) if new_value == old_value => None,
             Some(new_value) => Some(format!("{key}: {old_value} -> {new_value}")),
             None => Some(format!("{key}: removed {old_value}")),
+        })
+        .collect()
+}
+
+fn go_signature_changes(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Vec<GoSignatureChange> {
+    old.iter()
+        .filter_map(|(symbol, old_signature)| {
+            let new_signature = new.get(symbol)?;
+            (old_signature != new_signature).then(|| GoSignatureChange {
+                symbol: symbol.clone(),
+                old: old_signature.clone(),
+                new: new_signature.clone(),
+            })
         })
         .collect()
 }
@@ -877,11 +1239,34 @@ fn operation_return_type_changes(
         .collect()
 }
 
+fn operation_signature_changes(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Vec<TsOperationSignatureChange> {
+    old.iter()
+        .filter_map(|(operation, old_signature)| match new.get(operation) {
+            Some(new_signature) if old_signature != new_signature => {
+                Some(TsOperationSignatureChange {
+                    operation: operation.clone(),
+                    old: old_signature.clone(),
+                    new: new_signature.clone(),
+                })
+            }
+            None => Some(TsOperationSignatureChange {
+                operation: operation.clone(),
+                old: old_signature.clone(),
+                new: "<missing>".to_string(),
+            }),
+            Some(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{diff_typescript_dirs, extract_typescript_surface, TsExportKind};
+    use super::{diff_go_dirs, diff_typescript_dirs, extract_typescript_surface, TsExportKind};
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -931,8 +1316,16 @@ mod tests {
             "Promise<AxiosResponse<Book>>"
         );
         assert_eq!(
+            surface.operation_signatures["DefaultApi.createBook"],
+            "async createBook(): Promise<AxiosResponse<Book>>"
+        );
+        assert_eq!(
             surface.operation_return_types["DefaultApiFactory.createBook"],
             "Promise<AxiosResponse<Book>>"
+        );
+        assert_eq!(
+            surface.operation_signatures["DefaultApiFactory.createBook"],
+            "createBook(): Promise<AxiosResponse<Book>>"
         );
         assert_eq!(surface.request_aliases, vec!["CreateBookRequest"]);
 
@@ -1011,8 +1404,53 @@ mod tests {
             "Promise<AxiosResponse<Book>>"
         );
         assert_eq!(diff.operation_return_type_changes[0].new, "Promise<Book>");
+        assert_eq!(
+            diff.operation_signature_changes[0].old,
+            "async createBook(): Promise<AxiosResponse<Book>>"
+        );
+        assert_eq!(
+            diff.operation_signature_changes[0].new,
+            "async createBook(): Promise<Book>"
+        );
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_diff_catches_missing_symbols_and_signature_changes() {
+        let old = temp_dir("go-old");
+        let new = temp_dir("go-new");
+        std::fs::write(old.join("go.mod"), "module example.com/old\n\ngo 1.23\n").unwrap();
+        std::fs::write(new.join("go.mod"), "module example.com/new\n\ngo 1.23\n").unwrap();
+        std::fs::write(old.join("README.md"), "# Old SDK\n").unwrap();
+        std::fs::write(
+            old.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\ntype APIClient struct{}\ntype BooksAPIService service\nfunc NewConfiguration() *Configuration { return nil }\nfunc (r ApiGetBookRequest) Execute() (*Book, error) { return nil, nil }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\ntype APIClient struct{}\nfunc NewConfiguration(baseURL string) *Configuration { return nil }\nfunc (r ApiGetBookRequest) Execute(ctx context.Context) (*Book, error) { return nil, nil }\n",
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert!(diff.is_breaking());
+        assert_eq!(diff.missing_exported_types, vec!["BooksAPIService"]);
+        assert_eq!(diff.missing_exported_methods, Vec::<String>::new());
+        assert_eq!(
+            diff.exported_function_signature_changes[0].symbol,
+            "NewConfiguration"
+        );
+        assert_eq!(
+            diff.exported_method_signature_changes[0].symbol,
+            "ApiGetBookRequest.Execute"
+        );
+        assert_eq!(diff.missing_docs, vec!["README.md"]);
+        assert_eq!(
+            diff.package_metadata_changes,
+            vec!["module: example.com/old -> example.com/new"]
+        );
     }
 }

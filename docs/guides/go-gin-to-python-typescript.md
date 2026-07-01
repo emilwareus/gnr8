@@ -38,6 +38,9 @@ fn main() -> std::process::ExitCode {
 
 - Keep `GoGin::new().inputs(["."])` pointed at the Go module root unless the service code lives in a
   clear subdirectory.
+- Static nested Gin groups such as `api := r.Group("/api")` and `books := api.Group("/books")` are
+  folded into operation paths. Dynamic route paths are skipped with diagnostics; dynamic group prefixes
+  are omitted with diagnostics.
 - Use `SetBasePath` for router mount prefixes such as `/api` or `/v1`.
 - Use `ApplySecurity::api_key(...)` when handlers expect a shared auth header.
 - Use `RenameOperation` only for public SDK compatibility or awkward generated names.
