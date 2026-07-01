@@ -17,9 +17,9 @@ func main() {
 	_ = r.Run(":8080")
 }
 
-// registerRoutes mounts the ONE supported route group at /tasks. gnr8 records the
-// routes group-relative; the /tasks prefix comes from the .gnr8/ lifecycle
-// (SetBasePath). Note the /_debug route: it is a real internal endpoint that the
+// registerRoutes mounts a static route group at /tasks. gnr8 extracts that group
+// prefix from source; SetBasePath is reserved for an external mount prefix.
+// Note the /_debug route: it is a real internal endpoint that the
 // .gnr8/ lifecycle's custom DropDebugRoutes transform removes before generation,
 // so it never reaches the OpenAPI document or the SDK.
 func registerRoutes(r *gin.Engine) {

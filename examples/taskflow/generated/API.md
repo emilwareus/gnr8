@@ -1,13 +1,13 @@
 # Taskflow API
 
-Base path: `/tasks`
+Base path: `/`
 
 ## Operations
 
 | Method | Path | Operation |
 |--------|------|-----------|
-| GET | `/tasks/` | listTasks |
-| POST | `/tasks/` | createTask |
+| GET | `/tasks` | listTasks |
+| POST | `/tasks` | createTask |
 | DELETE | `/tasks/{id}` | deleteTask |
 | GET | `/tasks/{id}` | getTask |
 | PUT | `/tasks/{id}` | updateTask |

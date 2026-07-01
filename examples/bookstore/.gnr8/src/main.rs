@@ -13,7 +13,7 @@
 //! This reproduces the committed `examples/bookstore/generated/` output (same routes/schemas/security/
 //! title/base path) — every TOML knob from the old `.gnr8/config.toml` is now a call below:
 //!   inputs            → GoGin::new().inputs(["."])
-//!   base_path         → SetBasePath::new("/books")
+//!   base_path         → SetBasePath::new("/")
 //!   title             → SetTitle::new("Bookstore API")
 //!   [[security]]      → ApplySecurity::api_key("ApiKeyAuth", "X-API-Key")
 //!   output.openapi    → OpenApi31::new().to("generated/openapi.yaml")
@@ -26,7 +26,7 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
-            .transform(SetBasePath::new("/books"))
+            .transform(SetBasePath::new("/"))
             .transform(SetTitle::new("Bookstore API"))
             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
             .target(OpenApi31::new().to("generated/openapi.yaml"))
