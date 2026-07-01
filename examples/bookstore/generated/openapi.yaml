@@ -5,9 +5,10 @@ info:
 security:
   - ApiKeyAuth: []
 paths:
-  '/books/':
+  '/books':
     get:
       operationId: listBooks
+      tags: [books]
       parameters:
       - name: genre
         in: query
@@ -23,6 +24,7 @@ paths:
                 $ref: '#/components/schemas/BookList'
     post:
       operationId: createBook
+      tags: [books]
       requestBody:
         required: true
         content:
@@ -45,6 +47,7 @@ paths:
   '/books/{id}':
     get:
       operationId: getBook
+      tags: [books]
       parameters:
       - name: id
         in: path
@@ -66,6 +69,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     put:
       operationId: updateBook
+      tags: [books]
       parameters:
       - name: id
         in: path
@@ -93,6 +97,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     delete:
       operationId: deleteBook
+      tags: [books]
       parameters:
       - name: id
         in: path

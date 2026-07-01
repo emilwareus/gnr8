@@ -126,7 +126,8 @@ var canonicalFieldNames = []string{
 	// GoFacts
 	"module", "routes", "schemas", "diagnostics",
 	// RouteFact
-	"method", "path", "handler", "operation_id", "params", "request_body", "responses", "span",
+	"method", "path", "handler", "operation_id", "group", "params", "request_body",
+	"request_body_content_type", "responses", "span",
 	// ParamFact (name/location/required/schema/span)
 	"name", "location", "required", "schema",
 	// ResponseFact
@@ -136,7 +137,7 @@ var canonicalFieldNames = []string{
 	// FieldFact
 	"json_name", "optional", "nullable", "description", "example", "meta",
 	// FieldMeta / Constraints / Extension / LiteralValue
-	"constraints", "default", "extensions", "min_length", "max_length", "minimum", "maximum",
+	"constraints", "default", "format", "extensions", "min_length", "max_length", "minimum", "maximum",
 	"exclusive_minimum", "exclusive_maximum", "pattern", "enum_values",
 	// Type (adjacent tag/content)
 	"type", "of",
@@ -158,6 +159,7 @@ var canonicalFieldNames = []string{
 // route. Used by the drift guard to harvest the complete emitted key set.
 func fullyPopulatedDoc() facts.GoFacts {
 	desc, ex := "a description", "an example"
+	format := "uuid"
 	minLen, maxLen := uint64(1), uint64(120)
 	minimum, maximum := "0", "100"
 	exclusiveMinimum, exclusiveMaximum := "-1", "101"
@@ -179,6 +181,7 @@ func fullyPopulatedDoc() facts.GoFacts {
 					EnumValues:       []string{"low", "high"},
 				},
 				Default: &facts.LiteralValue{Type: "number", Value: "3.14"},
+				Format:  &format,
 				Extensions: []facts.Extension{
 					{Name: "x-gnr8-render", Value: facts.LiteralValue{Type: "string", Value: "slider"}},
 				},
@@ -216,6 +219,7 @@ func fullyPopulatedDoc() facts.GoFacts {
 		Routes: []facts.RouteFact{
 			{
 				Method: "PUT", Path: "/{uuid}", Handler: "updateGoal", OperationID: "updateGoal",
+				Group: "goals",
 				Params: []facts.ParamFact{
 					{
 						Name: "uuid", Location: "path", Required: true,
@@ -223,7 +227,8 @@ func fullyPopulatedDoc() facts.GoFacts {
 						Span:   facts.SourceSpan{File: "handlers.go", StartLine: 94, EndLine: 94},
 					},
 				},
-				RequestBody: &facts.TypeRef{RefID: "internal/dto.UpdateGoalInput"},
+				RequestBody:            &facts.TypeRef{RefID: "internal/dto.UpdateGoalInput"},
+				RequestBodyContentType: "application/json",
 				Responses: []facts.ResponseFact{
 					{Status: 200, Body: &facts.TypeRef{RefID: "internal/dto.CommandMessage"}},
 				},

@@ -30,6 +30,7 @@ mod json;
 pub(crate) mod model;
 mod yaml;
 
+use crate::analyze::facts::LiteralValue;
 use crate::graph::{
     ApiGraph, Field, Operation as GraphOp, Prim, Schema, SecurityScheme as GraphSecurityScheme,
     Type, WellKnown,
@@ -282,6 +283,10 @@ fn lower_operation(
     let request_body = match &op.request_body {
         Some(body) => Some(RequestBody {
             required: true,
+            content_type: op
+                .request_body_content_type
+                .clone()
+                .unwrap_or_else(|| "application/json".to_string()),
             schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
         }),
         None => None,
@@ -316,6 +321,7 @@ fn lower_operation(
 
     Ok(Operation {
         operation_id: op.id.clone(),
+        tags: op.group.clone().into_iter().collect(),
         parameters,
         request_body,
         responses,
@@ -388,6 +394,9 @@ fn lower_object(
                 if let Some(desc) = &field.description {
                     prop.description = Some(desc.clone());
                 }
+                if let Some(example) = &field.example {
+                    prop.example = Some(LiteralValue::String(example.clone()));
+                }
                 apply_field_meta(field, &mut prop);
             }
             Ok((field.json_name.clone(), prop))
@@ -413,6 +422,9 @@ fn apply_field_meta(field: &Field, prop: &mut SchemaObject) {
     prop.exclusive_maximum
         .clone_from(&constraints.exclusive_maximum);
     prop.pattern.clone_from(&constraints.pattern);
+    if let Some(format) = &field.meta.format {
+        prop.format = Some(format.clone());
+    }
     if !constraints.enum_values.is_empty() {
         let mut enum_values = constraints.enum_values.clone();
         enum_values.sort();
@@ -469,7 +481,10 @@ fn lower_schema_type(
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<SchemaObject, crate::CoreError> {
     match ty {
-        Type::Primitive(prim) => Ok(SchemaObject::primitive(openapi_primitive(prim), None)),
+        Type::Primitive(prim) => Ok(SchemaObject::primitive(
+            openapi_primitive(prim),
+            openapi_primitive_format(prim).map(ToString::to_string),
+        )),
         // A well-known scalar lowers to its canonical `string` + `format` (uuid, date-time, ...). The
         // format string is the neutral wire token, never a language type name (IR-03).
         Type::WellKnown(well_known) => Ok(SchemaObject::primitive(
@@ -538,6 +553,13 @@ fn openapi_primitive(prim: &Prim) -> &'static str {
         Prim::Bool => "boolean",
         Prim::Int { .. } => "integer",
         Prim::Float { .. } => "number",
+    }
+}
+
+fn openapi_primitive_format(prim: &Prim) -> Option<&'static str> {
+    match prim {
+        Prim::Bytes => Some("binary"),
+        Prim::String | Prim::Bool | Prim::Int { .. } | Prim::Float { .. } => None,
     }
 }
 
@@ -1234,7 +1256,7 @@ mod tests {
             nullable: false,
             schema: Type::Primitive(crate::graph::Prim::String),
             description: Some("Goal name".to_string()),
-            example: None,
+            example: Some("alpha example".to_string()),
             meta: FieldMeta {
                 constraints: Constraints {
                     min_length: Some(3),
@@ -1243,6 +1265,7 @@ mod tests {
                     ..Constraints::default()
                 },
                 default: Some(LiteralValue::String("alpha".to_string())),
+                format: Some("slug".to_string()),
                 extensions: vec![Extension {
                     name: "x-gnr8-render".to_string(),
                     value: LiteralValue::String("textarea".to_string()),
@@ -1255,8 +1278,10 @@ mod tests {
         let block = block.split("GoalResponse:").next().unwrap_or(block);
         assert!(block.contains("minLength: 3"), "{block}");
         assert!(block.contains("maxLength: 80"), "{block}");
+        assert!(block.contains("format: slug"), "{block}");
         assert!(block.contains("enum: [alpha, beta]"), "{block}");
         assert!(block.contains("default: alpha"), "{block}");
+        assert!(block.contains("example: alpha example"), "{block}");
         assert!(block.contains("x-gnr8-render: textarea"), "{block}");
 
         let json_text =
@@ -1266,7 +1291,9 @@ mod tests {
         assert_eq!(prop["minLength"], 3);
         assert_eq!(prop["maxLength"], 80);
         assert_eq!(prop["enum"][0], "alpha");
+        assert_eq!(prop["format"], "slug");
         assert_eq!(prop["default"], "alpha");
+        assert_eq!(prop["example"], "alpha example");
         assert_eq!(prop["x-gnr8-render"], "textarea");
         assert!(
             !json_text.contains("min_length"),
@@ -1289,6 +1316,7 @@ mod tests {
             meta: FieldMeta {
                 constraints: Constraints::default(),
                 default: Some(LiteralValue::String("gte".to_string())),
+                format: None,
                 extensions: vec![Extension {
                     name: "x-gnr8-render".to_string(),
                     value: LiteralValue::String("select".to_string()),
@@ -1336,6 +1364,7 @@ mod tests {
                 meta: FieldMeta {
                     constraints: Constraints::default(),
                     default: Some(LiteralValue::Number("30".to_string())),
+                    format: None,
                     extensions: vec![],
                 },
             },
@@ -1353,6 +1382,7 @@ mod tests {
                         ..Constraints::default()
                     },
                     default: Some(LiteralValue::String("true".to_string())),
+                    format: None,
                     extensions: vec![Extension {
                         name: "x-gnr8-placeholder".to_string(),
                         value: LiteralValue::String("123".to_string()),

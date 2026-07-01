@@ -150,9 +150,19 @@ impl TsSdkOptions {
         }
     }
 
+    pub(crate) const fn fetch_compat() -> Self {
+        Self {
+            model_properties: TsModelPropertyPolicy::OpenApiRequired,
+            nullable: TsNullablePolicy::ExplicitNull,
+            response: TsResponsePolicy::DataOnly,
+        }
+    }
+
     pub(crate) fn for_profile(profile: &SdkProfile) -> Self {
-        if profile.is_openapi_generator_compat() {
+        if profile.is_typescript_axios_compat() {
             Self::openapi_generator_compat()
+        } else if profile.is_typescript_fetch_compat() {
+            Self::fetch_compat()
         } else {
             Self::strict()
         }

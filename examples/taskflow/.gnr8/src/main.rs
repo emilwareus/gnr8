@@ -107,9 +107,9 @@ impl Target for ApiMarkdown {
     }
 }
 
-/// Join the API base path with a group-relative operation path, collapsing the seam slash — the same
-/// rule the OpenAPI lowering uses, so the Markdown paths match the spec (`/tasks` + `/` → `/tasks/`,
-/// `/tasks` + `/{id}` → `/tasks/{id}`).
+/// Join the API base path with a source-derived operation path, collapsing the seam slash — the same
+/// rule the OpenAPI lowering uses, so the Markdown paths match the spec (`/` + `/tasks` → `/tasks`,
+/// `/` + `/tasks/{id}` → `/tasks/{id}`).
 fn join_base(base: &str, relative: &str) -> String {
     let base = base.trim_end_matches('/');
     if relative == "/" {
@@ -129,7 +129,7 @@ fn main() -> std::process::ExitCode {
             // Source: read the Go + Gin service in this module (built-in).
             .source(GoGin::new().inputs(["."]))
             // Transforms: metadata the typed Go source can't express (built-ins) + our own edit.
-            .transform(SetBasePath::new("/tasks"))
+            .transform(SetBasePath::new("/"))
             .transform(SetTitle::new("Taskflow API"))
             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
             .transform(DropDebugRoutes) // <-- user-defined: drop the internal /tasks/_debug route

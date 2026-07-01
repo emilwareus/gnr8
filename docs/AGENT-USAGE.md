@@ -16,6 +16,7 @@ Supported source frontends:
 | FastAPI | `--source fastapi` | `FastApi::new().inputs(["."])` | `python3` |
 | Flask typed-envelope | `--source flask` | `Flask::new().inputs(["."])` | `python3` |
 | NestJS class DTOs | `--source nestjs` | `NestJs::new().inputs(["src"])` | `node` + project `typescript` |
+| OpenAPI/Swagger artifact | n/a | `OpenApi::new().input("openapi.yaml")` | none |
 
 Supported targets:
 
@@ -81,9 +82,10 @@ Common changes:
 
 ## Source-Specific Notes
 
-Go + Gin recognizes Gin route groups, route methods, path/query params, `ShouldBindJSON`, `c.JSON`
-responses, structs, nested structs, and string enums. Current limit: one input directory and
-Gin-oriented patterns.
+Go + Gin recognizes static nested Gin route groups, route methods, path/query params,
+`ShouldBindJSON`, `c.JSON` responses, structs, nested structs, and string enums. Current limit: one
+input directory and Gin-oriented patterns; dynamic route paths are skipped with diagnostics, and dynamic
+group prefixes are omitted with diagnostics rather than guessed.
 
 FastAPI is static: it reads Python AST and never imports/runs the app. It recognizes typed params,
 Pydantic/dataclass models, `response_model`, `status_code`, `Literal`, `Enum`, and unions.
@@ -94,6 +96,53 @@ missing return annotations become diagnostics instead of guesses.
 NestJS reads TypeScript through the target project's own `typescript` package. It recognizes controller
 methods, params/query/body decorators, DTO classes, enums, and unions. It does not read swagger, zod, or
 class-validator metadata.
+
+OpenAPI/Swagger source reads JSON or YAML Swagger 2.0, OpenAPI 3.0, and OpenAPI 3.1 artifacts into
+the same API graph used by code-first sources. Use it for brownfield generator replacement, then target
+`OpenApi31`, `TsSdk`, `GoSdk`, or other SDK targets from that one graph.
+
+```rust
+Pipeline::new()
+    .source(OpenApi::new().input("openapi.yaml"))
+    .target(
+        TsSdk::new()
+            .module("@acme/books")
+            .to("generated/typescript")
+            .profile(SdkProfile::typescript_fetch_compat()),
+    )
+    .target(
+        GoSdk::new()
+            .module("example.com/acme/books")
+            .to("generated/go")
+            .profile(SdkProfile::go_openapi_generator_compat()),
+    )
+```
+
+Compatibility checks compare old and new generated SDK surfaces:
+
+```bash
+gnr8 compat typescript --old old-typescript-sdk --new generated/typescript
+gnr8 compat go --old old-go-sdk --new generated/go
+```
+
+For OpenAPI Generator migrations, use compatibility profiles first and clean profiles later:
+
+```rust
+TsSdk::new()
+    .module("@acme/books")
+    .to("generated/typescript")
+    .profile(SdkProfile::typescript_fetch_compat())
+    .layout(SdkFileLayout::split().model_file_template("models/{schema_kebab}.ts"));
+
+GoSdk::new()
+    .module("example.com/acme/books")
+    .to("generated/go")
+    .profile(SdkProfile::go_openapi_generator_compat());
+```
+
+`gnr8 generate --json` includes a `cleanup` section for migration review: files gnr8 owns, stale
+generated files removed, generated-looking unowned files, protected hand edits, legacy package files,
+and old generator dependencies to remove.
 
 ## Generated SDKs
 
@@ -125,3 +174,20 @@ gnr8 check
 ```
 
 `check` exits non-zero when outputs are stale or protected by user edits.
+
+GitHub Actions example:
+
+```yaml
+name: gnr8
+on: [pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.23' }
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: gnr8 generate
+      - run: gnr8 check
+```

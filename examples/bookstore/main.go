@@ -16,8 +16,8 @@ func main() {
 	_ = r.Run(":8080")
 }
 
-// registerRoutes mounts the ONE supported route group at /books. gnr8 records the
-// routes group-relative; the /books prefix is set in .gnr8/src/main.rs (SetBasePath).
+// registerRoutes mounts a static route group at /books. gnr8 extracts that group
+// prefix from source; SetBasePath is reserved for an external mount prefix.
 func registerRoutes(r *gin.Engine) {
 	books := r.Group("/books")
 	{

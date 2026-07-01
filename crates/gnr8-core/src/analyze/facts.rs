@@ -51,10 +51,16 @@ pub(crate) struct RouteFact {
     pub(crate) handler: String,
     /// Operation id, derived deterministically from the handler symbol in code.
     pub(crate) operation_id: String,
+    /// Source-derived route group/tag name, if the source router exposes one statically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group: Option<String>,
     /// Path and query parameters.
     pub(crate) params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
     pub(crate) request_body: Option<TypeRef>,
+    /// The request body media type when source analysis can infer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) request_body_content_type: Option<String>,
     /// Responses keyed by HTTP status.
     pub(crate) responses: Vec<ResponseFact>,
     /// Source provenance for the route registration.
@@ -149,6 +155,9 @@ pub struct FieldMeta {
     /// A source-declared default value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<LiteralValue>,
+    /// Source-declared `OpenAPI` format override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
     /// Source-declared vendor extensions (`x-*` tags and normalized UI hints).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<Extension>,
@@ -158,7 +167,10 @@ impl FieldMeta {
     /// Whether this metadata object carries no effective data.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.constraints.is_empty() && self.default.is_none() && self.extensions.is_empty()
+        self.constraints.is_empty()
+            && self.default.is_none()
+            && self.format.is_none()
+            && self.extensions.is_empty()
     }
 }
 

@@ -69,8 +69,9 @@ func run(targetDir string, patterns []string, w *os.File) error {
 	// ordering. Building it also indexes the handlers, surfacing any duplicate-
 	// bare-name collisions as diagnostics (WR-02).
 	analyzer := handlers.NewAnalyzer(res, module, diags)
-	recognized := routes.Recognize(res)
-	routeFacts := buildRoutes(analyzer, recognized, diags)
+	recognized := routes.RecognizeWithDiagnostics(res, diags)
+	routeFacts, syntheticSchemas := buildRoutes(analyzer, recognized, diags)
+	schemas = append(schemas, syntheticSchemas...)
 
 	doc := facts.GoFacts{
 		Module:      module,
@@ -88,8 +89,10 @@ func run(targetDir string, patterns []string, w *os.File) error {
 // method/path/handler come from the route recognizer, the operationId is the
 // handler symbol, and the request body / responses / params come from analyzing
 // the handler body. There is no annotation source and no fallback anywhere.
-func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *diag.Accumulator) []facts.RouteFact {
+func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *diag.Accumulator) ([]facts.RouteFact, []facts.SchemaFact) {
 	out := make([]facts.RouteFact, 0, len(recognized))
+	schemas := []facts.SchemaFact{}
+	seenSchema := map[string]bool{}
 	for _, r := range recognized {
 		rf := facts.RouteFact{
 			Method: r.Method,
@@ -98,6 +101,7 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 			// code (e.g. "createGoal", "updateGoal") — there is no override source.
 			Handler:     r.Handler,
 			OperationID: r.Handler,
+			Group:       r.Group,
 			Params:      []facts.ParamFact{},
 			Responses:   []facts.ResponseFact{},
 			Span:        r.Span,
@@ -106,12 +110,20 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 		// Code-inferred request/response/param facts — the only source.
 		cf := analyzer.Analyze(r, diags)
 		rf.RequestBody = cf.RequestBody
+		rf.RequestBodyContentType = cf.RequestBodyContentType
 		rf.Responses = cf.Responses
 		rf.Params = cf.Params
+		for _, schema := range cf.Schemas {
+			if seenSchema[schema.ID] {
+				continue
+			}
+			seenSchema[schema.ID] = true
+			schemas = append(schemas, schema)
+		}
 
 		out = append(out, rf)
 	}
-	return out
+	return out, schemas
 }
 
 func moduleOf(res *load.Result) string {

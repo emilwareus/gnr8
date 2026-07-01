@@ -17,6 +17,7 @@ use super::{
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{ApiGraph, Response, SchemaRef, SecurityScheme, Type};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
+use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
@@ -163,6 +164,51 @@ fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {
         .join("sources")
         .join("go-gin")
         .join(format!("{key}.json"))
+}
+
+/// An OpenAPI/Swagger artifact source.
+///
+/// Accepts JSON or YAML Swagger 2.0, OpenAPI 3.0, and OpenAPI 3.1 documents, then normalizes paths,
+/// operations, parameters, request/response schemas, and named components into the shared
+/// [`ApiGraph`]. Output generation remains owned by normal targets such as [`OpenApi31`],
+/// [`TsSdk`], and [`GoSdk`].
+#[derive(Debug, Default, Clone)]
+pub struct OpenApi {
+    input: String,
+}
+
+impl OpenApi {
+    /// An OpenAPI source with no input yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the project-relative OpenAPI/Swagger JSON or YAML input file.
+    #[must_use]
+    pub fn input(mut self, input: impl Into<String>) -> Self {
+        self.input = input.into();
+        self
+    }
+}
+
+impl Source for OpenApi {
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+        if self.input.is_empty() {
+            return Err(CoreError::Config {
+                message: "OpenApi source has no input — call .input(\"openapi.yaml\")".to_string(),
+            });
+        }
+        crate::sdk::openapi_source::load_openapi(&cx.project_root, &self.input)
+    }
+
+    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
+        if self.input.is_empty() {
+            None
+        } else {
+            Some(vec![cx.project_root.join(&self.input)])
+        }
+    }
 }
 
 /// The FastAPI (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
@@ -1601,6 +1647,8 @@ pub struct GoSdk {
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
+    docs: bool,
+    package_metadata: bool,
 }
 
 impl GoSdk {
@@ -1613,6 +1661,8 @@ impl GoSdk {
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
+            docs: true,
+            package_metadata: true,
         }
     }
 
@@ -1658,6 +1708,32 @@ impl GoSdk {
         self
     }
 
+    /// Enable or disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn docs(mut self, enabled: bool) -> Self {
+        self.docs = enabled;
+        self
+    }
+
+    /// Disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn without_docs(self) -> Self {
+        self.docs(false)
+    }
+
+    /// Enable or disable package metadata files such as `go.mod`.
+    #[must_use]
+    pub const fn package_metadata(mut self, enabled: bool) -> Self {
+        self.package_metadata = enabled;
+        self
+    }
+
+    /// Emit source files only, without docs or package metadata.
+    #[must_use]
+    pub const fn source_only(self) -> Self {
+        self.docs(false).package_metadata(false)
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1696,19 +1772,24 @@ impl Target for GoSdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::gosdk::generate_files_with_layout(
+        let files = crate::gosdk::generate_files_with_profile(
             ir,
             &package,
             &ir.base_path,
             &self.layout,
             &self.aliases,
+            &self.profile,
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Go", &package, ir);
-        out.write(
-            format!("{}/go.mod", self.dir.trim_end_matches('/')),
-            format!("module {}\n\ngo 1.23\n", self.module),
-        );
+        if self.docs {
+            write_sdk_docs(out, &self.dir, "Go", &package, ir);
+        }
+        if self.package_metadata {
+            out.write(
+                format!("{}/go.mod", self.dir.trim_end_matches('/')),
+                format!("module {}\n\ngo 1.23\n", self.module),
+            );
+        }
         Ok(())
     }
 
@@ -1742,6 +1823,7 @@ pub struct PySdk {
     model_style: PyModelStyle,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
+    docs: bool,
 }
 
 impl PySdk {
@@ -1755,6 +1837,7 @@ impl PySdk {
             model_style: PyModelStyle::default(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
+            docs: true,
         }
     }
 
@@ -1815,6 +1898,25 @@ impl PySdk {
         self
     }
 
+    /// Enable or disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn docs(mut self, enabled: bool) -> Self {
+        self.docs = enabled;
+        self
+    }
+
+    /// Disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn without_docs(self) -> Self {
+        self.docs(false)
+    }
+
+    /// Emit source files only, without generated docs.
+    #[must_use]
+    pub const fn source_only(self) -> Self {
+        self.docs(false)
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -1864,7 +1966,9 @@ impl Target for PySdk {
             &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Python", &package, ir);
+        if self.docs {
+            write_sdk_docs(out, &self.dir, "Python", &package, ir);
+        }
         Ok(())
     }
 
@@ -1897,6 +2001,8 @@ pub struct TsSdk {
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
+    docs: bool,
+    package_metadata: Option<bool>,
     model_property_policy: Option<TsModelPropertyPolicy>,
     nullable_policy: Option<TsNullablePolicy>,
     response_policy: Option<TsResponsePolicy>,
@@ -1912,6 +2018,8 @@ impl TsSdk {
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
+            docs: true,
+            package_metadata: None,
             model_property_policy: None,
             nullable_policy: None,
             response_policy: None,
@@ -1959,6 +2067,32 @@ impl TsSdk {
     pub fn profile(mut self, profile: SdkProfile) -> Self {
         self.profile = profile;
         self
+    }
+
+    /// Enable or disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn docs(mut self, enabled: bool) -> Self {
+        self.docs = enabled;
+        self
+    }
+
+    /// Disable generated SDK README/reference docs.
+    #[must_use]
+    pub const fn without_docs(self) -> Self {
+        self.docs(false)
+    }
+
+    /// Enable or disable package metadata files such as `package.json`.
+    #[must_use]
+    pub const fn package_metadata(mut self, enabled: bool) -> Self {
+        self.package_metadata = Some(enabled);
+        self
+    }
+
+    /// Emit source files only, without docs or package metadata.
+    #[must_use]
+    pub const fn source_only(self) -> Self {
+        self.docs(false).package_metadata(false)
     }
 
     /// Set a TypeScript compatibility profile.
@@ -2012,6 +2146,12 @@ impl TsSdk {
         }
         options
     }
+
+    fn effective_package_metadata(&self) -> bool {
+        self.package_metadata.unwrap_or_else(|| {
+            self.profile.is_typescript_fetch_compat() || self.profile.is_typescript_axios_compat()
+        })
+    }
 }
 
 impl Default for TsSdk {
@@ -2046,7 +2186,7 @@ impl Target for TsSdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::tssdk::generate_files_with_profile_options(
+        let mut files = crate::tssdk::generate_files_with_profile_options(
             ir,
             &package,
             &ir.base_path,
@@ -2055,8 +2195,21 @@ impl Target for TsSdk {
             &self.profile,
             self.effective_options(),
         )?;
+        if self.effective_package_metadata() {
+            if !files.iter().any(|file| file.name == "package.json") {
+                files.push(super::bundle::SdkFile {
+                    name: "package.json".to_string(),
+                    contents: ts_package_json(&package, self.profile.is_typescript_axios_compat()),
+                });
+                files.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        } else {
+            files.retain(|file| file.name != "package.json");
+        }
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "TypeScript", &package, ir);
+        if self.docs {
+            write_sdk_docs(out, &self.dir, "TypeScript", &package, ir);
+        }
         Ok(())
     }
 
@@ -2179,6 +2332,33 @@ fn write_sdk_docs(out: &mut Artifacts, dir: &str, language: &str, package: &str,
         format!("{dir}/reference.md"),
         sdk_reference(language, package, ir),
     );
+}
+
+fn ts_package_json(package: &str, axios: bool) -> String {
+    let dependencies = if axios {
+        "\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  },"
+    } else {
+        ""
+    };
+    format!(
+        "{{
+  \"name\": {},
+  \"version\": \"0.1.0\",
+  \"type\": \"module\",{}
+  \"main\": \"./index.js\",
+  \"module\": \"./index.js\",
+  \"types\": \"./index.d.ts\",
+  \"exports\": {{
+    \".\": {{
+      \"types\": \"./index.d.ts\",
+      \"import\": \"./index.js\"
+    }}
+  }}
+}}
+",
+        quoted_string_literal(package),
+        dependencies
+    )
 }
 
 fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
@@ -2482,6 +2662,7 @@ mod tests {
                 group: None,
                 params: vec![],
                 request_body: None,
+                request_body_content_type: None,
                 responses: vec![
                     crate::graph::Response {
                         status: 200,
@@ -2538,6 +2719,7 @@ mod tests {
                 group: None,
                 params: vec![],
                 request_body: None,
+                request_body_content_type: None,
                 responses: vec![],
                 provenance: span(),
             }],
@@ -3030,6 +3212,29 @@ mod tests {
     }
 
     #[test]
+    fn gosdk_source_only_omits_docs_and_package_metadata() {
+        let ir = ApiGraph::default();
+        let target = GoSdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-go")
+            .source_only();
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+
+        for path in [
+            "generated/sdk-go/go.mod",
+            "generated/sdk-go/README.md",
+            "generated/sdk-go/reference.md",
+        ] {
+            assert!(
+                !out.files().iter().any(|file| file.path == path),
+                "source_only should not emit {path}"
+            );
+        }
+    }
+
+    #[test]
     fn pysdk_target_writes_under_the_output_dir_and_is_deterministic() {
         let ir = ApiGraph::default();
         let target = PySdk::new()
@@ -3074,6 +3279,28 @@ mod tests {
             .map(|a| (a.path.as_str(), a.text.as_str()))
             .collect();
         assert_eq!(first, second, "two PySdk runs must be byte-identical");
+    }
+
+    #[test]
+    fn pysdk_source_only_omits_docs() {
+        let ir = ApiGraph::default();
+        let target = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .to("generated/sdk-py")
+            .source_only();
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+
+        for path in [
+            "generated/sdk-py/README.md",
+            "generated/sdk-py/reference.md",
+        ] {
+            assert!(
+                !out.files().iter().any(|file| file.path == path),
+                "source_only should not emit {path}"
+            );
+        }
     }
 
     #[test]
@@ -3145,6 +3372,59 @@ mod tests {
             .map(|a| (a.path.as_str(), a.text.as_str()))
             .collect();
         assert_eq!(first, second, "two TsSdk runs must be byte-identical");
+    }
+
+    #[test]
+    fn tssdk_fetch_compat_emits_package_metadata_and_source_only_can_disable_it() {
+        let ir = ApiGraph::default();
+
+        let mut compat_out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .profile(SdkProfile::typescript_fetch_compat())
+            .generate(&ir, &mut compat_out, &cx())
+            .unwrap();
+        let package_json = compat_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/package.json")
+            .expect("typescript-fetch compat should emit package metadata by default");
+        assert!(package_json.text.contains("\"types\": \"./index.d.ts\""));
+
+        let mut axios_out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .profile(SdkProfile::typescript_axios_compat())
+            .generate(&ir, &mut axios_out, &cx())
+            .unwrap();
+        let axios_package_json = axios_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/package.json")
+            .expect("typescript-axios compat should emit package metadata by default");
+        assert!(axios_package_json.text.contains("\"axios\""));
+
+        let mut source_only_out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .profile(SdkProfile::typescript_fetch_compat())
+            .source_only()
+            .generate(&ir, &mut source_only_out, &cx())
+            .unwrap();
+
+        for path in [
+            "generated/sdk-ts/package.json",
+            "generated/sdk-ts/README.md",
+            "generated/sdk-ts/reference.md",
+        ] {
+            assert!(
+                !source_only_out.files().iter().any(|file| file.path == path),
+                "source_only should not emit {path}"
+            );
+        }
     }
 
     #[test]

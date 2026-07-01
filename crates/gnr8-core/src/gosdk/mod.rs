@@ -21,6 +21,7 @@ use crate::sdk::emit_common::{
     operation_file_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
@@ -74,14 +75,34 @@ pub(crate) fn generate_files_with_layout(
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    generate_files_with_profile(
+        graph,
+        package,
+        base_path,
+        layout,
+        aliases,
+        &SdkProfile::minimal(),
+    )
+}
+
+pub(crate) fn generate_files_with_profile(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+    profile: &SdkProfile,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_header = api_key_header_name(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
+    let emit_compat_surface =
+        profile.is_go_openapi_generator_compat() || aliases.has_source_prefix_aliases();
     let compat_options = emit::GoEmitOptions {
-        compat_model_helpers: aliases.has_source_prefix_aliases(),
+        compat_model_helpers: emit_compat_surface,
     };
 
     // Fixed leading files (sorted: client.go before errors.go).
@@ -90,7 +111,7 @@ pub(crate) fn generate_files_with_layout(
         emit::emit_client(package, auth_header.as_deref()),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
-    if aliases.has_source_prefix_aliases() {
+    if emit_compat_surface {
         files.push(raw_go_file(
             "compat_helpers.go",
             emit::emit_compat_helpers(package),
@@ -157,9 +178,12 @@ mod tests {
     // toolchain (generate runs gofmt) and skip gracefully if it is absent.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, generate_files_with_layout, generate_with_layout};
+    use super::{
+        generate, generate_files_with_layout, generate_files_with_profile, generate_with_layout,
+    };
     use crate::graph::ApiGraph;
     use crate::sdk::layout::SdkFileLayout;
+    use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
 
     /// A facts document (code-first shape — no annotation facts) covering three operations plus the
@@ -423,5 +447,28 @@ mod tests {
         ] {
             assert!(compat.contains(snippet), "missing {snippet}:\n{compat}");
         }
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_emits_compat_client_surface_without_aliases() {
+        if !gofmt_available() {
+            eprintln!("skipping Go profile compat client test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        for op in &mut graph.operations {
+            op.group = Some("Goals".to_string());
+        }
+        let files = generate_files_with_profile(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        assert!(files.iter().any(|file| file.name == "compat_helpers.go"));
+        assert!(files.iter().any(|file| file.name == "compat_client.go"));
     }
 }

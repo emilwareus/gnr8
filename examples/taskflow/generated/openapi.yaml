@@ -5,9 +5,10 @@ info:
 security:
   - ApiKeyAuth: []
 paths:
-  '/tasks/':
+  '/tasks':
     get:
       operationId: listTasks
+      tags: [tasks]
       parameters:
       - name: status
         in: query
@@ -23,6 +24,7 @@ paths:
                 $ref: '#/components/schemas/TaskList'
     post:
       operationId: createTask
+      tags: [tasks]
       requestBody:
         required: true
         content:
@@ -45,6 +47,7 @@ paths:
   '/tasks/{id}':
     get:
       operationId: getTask
+      tags: [tasks]
       parameters:
       - name: id
         in: path
@@ -66,6 +69,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     put:
       operationId: updateTask
+      tags: [tasks]
       parameters:
       - name: id
         in: path
@@ -93,6 +97,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     delete:
       operationId: deleteTask
+      tags: [tasks]
       parameters:
       - name: id
         in: path

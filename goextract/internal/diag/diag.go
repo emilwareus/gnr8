@@ -80,6 +80,19 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 	})
 }
 
+// UnsupportedRoutePattern records a Gin route registration shape that cannot be
+// lowered faithfully. The route is skipped rather than guessed so migration
+// review can fix the source pattern or add an explicit custom Source/Transform.
+func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityWarn,
+		Message: "unsupported Gin route pattern: " + reason +
+			"; route skipped rather than guessed (GO-04)",
+		File: file,
+		Line: line,
+	})
+}
+
 // UnsupportedType records that a struct field's declared type has no faithful
 // neutral primitive (e.g. complex64/128, uintptr, an untyped constant kind), so
 // the extractor lowers it to free-form `any` rather than guessing a concrete

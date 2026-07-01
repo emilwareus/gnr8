@@ -34,6 +34,7 @@ pub(crate) mod emit_common;
 pub mod layout;
 pub mod model;
 pub mod model_style;
+pub(crate) mod openapi_source;
 pub mod profile;
 pub mod surface;
 pub mod typescript;
@@ -852,7 +853,7 @@ pub struct RunOutcome {
 pub mod prelude {
     pub use super::builtins::{
         ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, GoGin, GoSdk, GroupOperations,
-        Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
         OpenApiSchemaPatch, PySdk, RenameOperation, RenameType, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };

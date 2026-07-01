@@ -15,10 +15,10 @@ type ListBooksParams struct {
 	Genre *string
 }
 
-// ListBooks -> GET /books/
+// ListBooks -> GET /books
 func (c *Client) ListBooks(ctx context.Context, params ListBooksParams) (BookList, error) {
 	var out BookList
-	reqURL := c.baseURL + "/books/"
+	reqURL := c.baseURL + "/books"
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
@@ -59,7 +59,7 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams) (BookLis
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// CreateBook -> POST /books/
+// CreateBook -> POST /books
 func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, error) {
 	var out Book
 	payload, err := json.Marshal(in)
@@ -67,7 +67,7 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, er
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + "/books/"
+	reqURL := c.baseURL + "/books"
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
 		return out, err

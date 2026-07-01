@@ -106,8 +106,9 @@ pub struct SecurityScheme {
 ///
 /// Language-neutral — there is deliberately no framework handle here; only the recognized HTTP facts.
 /// Every field is derived PURELY from source code (CLAUDE.md rules 1 & 3); there is no annotation
-/// carry-through (no summary, tags, router-path override, or security here — security comes from the
-/// user's gnr8 config at lowering time, rule 4).
+/// carry-through (no summary, router-path override, or security here — security comes from the
+/// user's gnr8 config at lowering time, rule 4). `group` is optional static router grouping
+/// metadata derived from source and used as an `OpenAPI` tag / SDK grouping hint.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
@@ -121,17 +122,16 @@ pub struct Operation {
     pub path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub handler: String,
-    /// Optional SDK grouping metadata set by transforms, never extracted from source.
-    ///
-    /// Emitters may use this for file placement or future grouped client surfaces. It is deliberately
-    /// generation metadata, not a framework fact, so it stays configurable without reshaping the
-    /// source extractors.
+    /// Optional static route-group/tag metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// Path and query parameters, sorted by name.
     pub params: Vec<Param>,
     /// The request body schema reference, if a typed body was inferred.
     pub request_body: Option<SchemaRef>,
+    /// The request body media type when source analysis can infer it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body_content_type: Option<String>,
     /// Responses, sorted by status.
     pub responses: Vec<Response>,
     /// Source provenance for the route registration (D-07).
@@ -310,9 +310,10 @@ impl Operation {
             method: route.method,
             path: route.path,
             handler: route.handler,
-            group: None,
+            group: route.group,
             params,
             request_body: route.request_body.map(SchemaRef::from_fact),
+            request_body_content_type: route.request_body_content_type,
             responses,
             provenance: relativize_span(&route.span, root),
         }

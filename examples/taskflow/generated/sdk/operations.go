@@ -15,10 +15,10 @@ type ListTasksParams struct {
 	Status *string
 }
 
-// ListTasks -> GET /tasks/
+// ListTasks -> GET /tasks
 func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskList, error) {
 	var out TaskList
-	reqURL := c.baseURL + "/tasks/"
+	reqURL := c.baseURL + "/tasks"
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
@@ -59,7 +59,7 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// CreateTask -> POST /tasks/
+// CreateTask -> POST /tasks
 func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, error) {
 	var out Task
 	payload, err := json.Marshal(in)
@@ -67,7 +67,7 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + "/tasks/"
+	reqURL := c.baseURL + "/tasks"
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
 		return out, err

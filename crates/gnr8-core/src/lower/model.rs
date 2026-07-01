@@ -65,8 +65,8 @@ pub(crate) struct PathItem {
 
 /// One HTTP operation (an `operationId` + its params/body/responses).
 ///
-/// There is no `summary`/`tags` here: those were doc-comment-annotation facts and have been removed
-/// (CLAUDE.md rules 1 & 3). The `operationId` is the handler-symbol-derived id from the graph.
+/// There is no `summary` here: those were doc-comment-annotation facts and have been removed
+/// (CLAUDE.md rules 1 & 3). `tags` are static source route-group names, not annotations.
 // `operation_id` mirrors the spec's `operationId` key; the field name intentionally echoes the
 // struct, so the field-name lint is silenced here rather than renamed away from the spec term.
 #[allow(clippy::struct_field_names)]
@@ -74,6 +74,8 @@ pub(crate) struct PathItem {
 pub(crate) struct Operation {
     /// Stable, unique operation id (the graph operation id).
     pub operation_id: String,
+    /// Static source route-group tags.
+    pub tags: Vec<String>,
     /// Path + query parameters, in graph (name-sorted) order.
     pub parameters: Vec<Parameter>,
     /// The JSON request body, if the operation takes one.
@@ -101,6 +103,8 @@ pub(crate) struct Parameter {
 pub(crate) struct RequestBody {
     /// Whether the body is required — always `true` for the inferred typed bodies.
     pub required: bool,
+    /// The request media type (`application/json`, `multipart/form-data`, ...).
+    pub content_type: String,
     /// The JSON-pointer name of the referenced schema (bare component name).
     pub schema_ref: String,
 }
@@ -172,6 +176,8 @@ pub(crate) struct SchemaObject {
     pub pattern: Option<String>,
     /// Source-declared default value.
     pub default_value: Option<LiteralValue>,
+    /// Source-declared example value.
+    pub example: Option<LiteralValue>,
     /// Vendor extension values.
     pub extensions: Vec<Extension>,
     /// Required field names for object schemas, in sorted order; empty otherwise.
