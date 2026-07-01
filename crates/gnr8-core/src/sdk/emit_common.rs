@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_successes_allow_multiple_media_types() {
+    fn binary_successes_allow_multiple_media_types() -> Result<(), crate::CoreError> {
         let graph = ApiGraph::default();
         let op = Operation {
             id: "download".to_string(),
@@ -502,9 +502,10 @@ mod tests {
                 end_line: 1,
             },
         };
-        let success = success_responses_of(&op, &graph).unwrap();
+        let success = success_responses_of(&op, &graph)?;
         assert_eq!(success.binary_statuses, vec![200, 206]);
         assert!(success.has_binary_body());
         assert!(!success.has_bodyless_alternative());
+        Ok(())
     }
 }

@@ -208,3 +208,11 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 	}
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
+
+type BooksAPI struct {
+	*Client
+}
+
+func (c *Client) Books() *BooksAPI {
+	return &BooksAPI{Client: c}
+}

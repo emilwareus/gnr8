@@ -2538,7 +2538,7 @@ fn emit_operation(
 ///
 /// Split out of [`emit_operation`] so each half stays under the clippy `too_many_lines` ceiling; the
 /// caller has already written the doc comment, signature, and `var out` line.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_request_dispatch(
     body: &mut String,
     op: &Operation,

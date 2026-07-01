@@ -208,3 +208,11 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 	}
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
+
+type TasksAPI struct {
+	*Client
+}
+
+func (c *Client) Tasks() *TasksAPI {
+	return &TasksAPI{Client: c}
+}

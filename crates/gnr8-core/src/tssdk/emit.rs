@@ -697,8 +697,7 @@ fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
         }
         writeln!(
             out,
-            "\n  get {property}(): {} {{\n    return new {}(this);\n  }}",
-            class_name, class_name
+            "\n  get {property}(): {class_name} {{\n    return new {class_name}(this);\n  }}"
         )
         .map_err(sink)?;
     }
@@ -1016,6 +1015,7 @@ fn emit_op_query(
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
 /// body-bearing success statuses. The request carries a JSON body only for body-bearing ops.
+#[allow(clippy::too_many_arguments)]
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
