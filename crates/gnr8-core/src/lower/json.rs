@@ -42,24 +42,19 @@ fn write_info(info: &Info) -> Value {
 }
 
 fn write_security(security: &[SecurityRequirement]) -> Value {
-    Value::Array(
-        security
-            .iter()
-            .map(|req| {
-                let mut entry = Map::new();
-                entry.insert(
-                    req.scheme.clone(),
-                    Value::Array(
-                        req.scopes
-                            .iter()
-                            .map(|scope| Value::String(scope.clone()))
-                            .collect(),
-                    ),
-                );
-                Value::Object(entry)
-            })
-            .collect(),
-    )
+    let mut entry = Map::new();
+    for req in security {
+        entry.insert(
+            req.scheme.clone(),
+            Value::Array(
+                req.scopes
+                    .iter()
+                    .map(|scope| Value::String(scope.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Array(vec![Value::Object(entry)])
 }
 
 fn write_paths(paths: &[(String, PathItem)]) -> Value {
@@ -102,6 +97,9 @@ fn write_operation(op: &Operation) -> Value {
                     .collect(),
             ),
         );
+    }
+    if !op.security.is_empty() {
+        out.insert("security".to_string(), write_security(&op.security));
     }
     if !op.parameters.is_empty() {
         out.insert(
@@ -176,6 +174,27 @@ fn write_response(response: &ResponseObj) -> Value {
                 .content_type
                 .clone()
                 .unwrap_or_else(|| "application/octet-stream".to_string()),
+            Value::Object(media),
+        );
+        out.insert("content".to_string(), Value::Object(content));
+    } else if response.event_stream {
+        let mut media = Map::new();
+        let schema = response.schema_ref.as_ref().map_or_else(
+            || {
+                let mut schema = Map::new();
+                schema.insert("type".to_string(), Value::String("string".to_string()));
+                Value::Object(schema)
+            },
+            |schema_ref| ref_schema(schema_ref),
+        );
+        media.insert("schema".to_string(), schema);
+
+        let mut content = Map::new();
+        content.insert(
+            response
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "text/event-stream".to_string()),
             Value::Object(media),
         );
         out.insert("content".to_string(), Value::Object(content));
@@ -397,6 +416,7 @@ mod tests {
                     post: Some(Operation {
                         operation_id: "createGoal".to_string(),
                         tags: vec!["goals".to_string()],
+                        security: Vec::new(),
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,
@@ -410,6 +430,7 @@ mod tests {
                                 schema_ref: Some("CommandMessage".to_string()),
                                 content_type: None,
                                 binary: false,
+                                event_stream: false,
                             },
                         )],
                     }),
@@ -494,5 +515,20 @@ mod tests {
                 "internal key {internal:?} leaked into JSON:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn security_entries_emit_one_requirement_object() {
+        let mut doc = sample_doc();
+        doc.security.push(SecurityRequirement {
+            scheme: "CSRFAuth".to_string(),
+            scopes: vec![],
+        });
+
+        let json = write(&doc);
+        let security = json["security"].as_array().unwrap();
+        assert_eq!(security.len(), 1, "{json}");
+        assert!(security[0]["ApiKeyAuth"].is_array(), "{json}");
+        assert!(security[0]["CSRFAuth"].is_array(), "{json}");
     }
 }

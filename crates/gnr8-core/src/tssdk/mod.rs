@@ -22,9 +22,10 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_name, body_model_of, check_unique_schema_names, file_in_dir, file_stem,
-    join_path, model_file_name, path_tokens, path_tokens_match, quoted_string_literal, split_words,
-    success_responses_of, validate_sdk_base_path,
+    api_key_header_names, check_unique_schema_names, file_in_dir, file_stem,
+    global_api_key_header_name, join_path, model_file_name, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
@@ -104,22 +105,19 @@ fn generate_files_with_layout_options(
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_header = api_key_header_name(graph)?;
+    let auth_headers = api_key_header_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     let model_dir = layout.model_dir_ref().unwrap_or("models");
-    let mut client =
-        emit::emit_client_with_models(package, model_dir.trim_matches('/'), auth_header.as_deref());
-    client.push_str(&emit::emit_operations(
-        graph,
+    let mut client = emit::emit_client_with_models(
         package,
-        base_path,
-        &ops,
-        auth_header.as_deref(),
-    )?);
+        model_dir.trim_matches('/'),
+        !auth_headers.is_empty(),
+    );
+    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -243,7 +241,7 @@ fn generate_openapi_generator_compat_files(
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
-    let auth_header = api_key_header_name(graph)?;
+    let auth_header = global_api_key_header_name(graph, "TypeScript axios compatibility profile")?;
     let resolved_aliases = aliases.resolve(graph)?;
     let mut files = vec![
         SdkFile {
@@ -515,8 +513,8 @@ fn emit_axios_operation_method(
         )
         .map_err(ts_mod_sink)?;
     }
-    let body_model = body_model_of(op, graph)?;
-    if body_model.is_some() {
+    let body_model = request_body_model_of(op, graph)?;
+    if let Some(body_model) = &body_model {
         writeln!(
             out,
             "    const localVarRequestOptions: AxiosRequestConfig = {{"
@@ -532,7 +530,15 @@ fn emit_axios_operation_method(
         .map_err(ts_mod_sink)?;
         writeln!(out, "      url: this.basePath + localVarPath,").map_err(ts_mod_sink)?;
         writeln!(out, "      params: localVarQueryParameter,").map_err(ts_mod_sink)?;
-        writeln!(out, "      data: requestParameters.body,").map_err(ts_mod_sink)?;
+        if body_model.required {
+            writeln!(out, "      data: requestParameters.body,").map_err(ts_mod_sink)?;
+        } else {
+            writeln!(
+                out,
+                "      ...(requestParameters.body === undefined ? {{}} : {{ data: requestParameters.body }}),"
+            )
+            .map_err(ts_mod_sink)?;
+        }
     } else {
         writeln!(
             out,
@@ -794,7 +800,7 @@ struct RequestField {
 
 fn request_fields(graph: &ApiGraph, op: &Operation) -> Result<Vec<RequestField>, crate::CoreError> {
     let mut fields = Vec::new();
-    let body_model = body_model_of(op, graph)?;
+    let body_model = request_body_model_of(op, graph)?;
     let mut used_names: Vec<String> = if body_model.is_some() {
         vec!["body".to_string()]
     } else {
@@ -830,8 +836,8 @@ fn request_fields(graph: &ApiGraph, op: &Operation) -> Result<Vec<RequestField>,
     if let Some(model) = body_model {
         fields.push(RequestField {
             name: "body".to_string(),
-            ty: format!("models.{model}"),
-            required: true,
+            ty: format!("models.{}", model.model),
+            required: model.required,
         });
     }
     Ok(fields)
@@ -1170,6 +1176,7 @@ mod tests {
             location: "query".to_string(),
             required: false,
             schema: Type::Primitive(Prim::String),
+            default: None,
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,

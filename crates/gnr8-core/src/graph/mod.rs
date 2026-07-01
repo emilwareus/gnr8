@@ -16,7 +16,8 @@
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
 use crate::analyze::facts::{
-    DiagnosticFact, FieldFact, GoFacts, ParamFact, ResponseFact, RouteFact, SchemaFact, TypeRef,
+    DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact, ResponseFact, RouteFact,
+    SchemaFact, TypeRef,
 };
 
 // Re-export the neutral type vocabulary so the IR and the facts DTO share ONE definition (the IR
@@ -100,6 +101,9 @@ pub struct SecurityScheme {
     pub location: String,
     /// The credential name (for an `apiKey`/`header` scheme, the header name, e.g. `"X-API-Key"`).
     pub name: String,
+    /// Whether the scheme applies at the document top level.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub global: bool,
 }
 
 /// One HTTP operation: a method + path template plus its inferred params/body/responses (D-07).
@@ -129,11 +133,20 @@ pub struct Operation {
     pub params: Vec<Param>,
     /// The request body schema reference, if a typed body was inferred.
     pub request_body: Option<SchemaRef>,
+    /// Whether the request body is required when present.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub request_body_required: bool,
     /// The request body media type when source analysis can infer it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body_content_type: Option<String>,
     /// Responses, sorted by status.
     pub responses: Vec<Response>,
+    /// Operation-level security scheme ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<String>,
+    /// Whether operation-level security replaces inherited global security instead of adding to it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub security_overrides_global: bool,
     /// Source provenance for the route registration (D-07).
     pub provenance: SourceSpan,
 }
@@ -151,6 +164,9 @@ pub struct Param {
     pub required: bool,
     /// The parameter's type.
     pub schema: Type,
+    /// Source-inferred default value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<LiteralValue>,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
@@ -179,6 +195,26 @@ fn default_response_body_kind() -> String {
 
 fn is_json_body_kind(kind: &str) -> bool {
     kind == "json"
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a reference to the field value"
+)]
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a reference to the field value"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One named schema. Its shape is carried by the neutral [`Type`] vocabulary: a struct/class becomes
@@ -228,7 +264,7 @@ pub struct Diagnostic {
 ///
 /// Graph-owned (not the crate-private `facts::SourceSpan`) so the public graph surface is
 /// self-contained and the analyzed-module prefix has been stripped from `file` for portability.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     /// The source file path, relative to the analyzed module.
     pub file: String,
@@ -330,8 +366,11 @@ impl Operation {
             group: route.group,
             params,
             request_body: route.request_body.map(SchemaRef::from_fact),
+            request_body_required: route.request_body_required,
             request_body_content_type: route.request_body_content_type,
             responses,
+            security: Vec::new(),
+            security_overrides_global: false,
             provenance: relativize_span(&route.span, root),
         }
     }
@@ -344,6 +383,7 @@ impl Param {
             location: param.location,
             required: param.required,
             schema: normalize_type(param.schema),
+            default: param.default,
             provenance: relativize_span(&param.span, root),
         }
     }

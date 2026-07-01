@@ -94,16 +94,70 @@ fn write_go_mod(dir: &Path) {
 }
 
 /// Materialize the generated SDK + a hermetic go.mod into a fresh temp dir, returning the dir.
-fn materialize_sdk() -> PathBuf {
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
-    let bundle = gnr8::gosdk::generate(&graph, "goalservice", "/goal")
+fn materialize_sdk_from_graph(
+    label: &str,
+    graph: &gnr8::graph::ApiGraph,
+    base_path: &str,
+) -> PathBuf {
+    let bundle = gnr8::gosdk::generate(graph, "goalservice", base_path)
         .expect("sdk::generate must succeed (requires gofmt)");
-    let dir = unique_temp_dir("ok");
+    let dir = unique_temp_dir(label);
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");
     write_go_mod(&dir);
     dir
+}
+
+/// Materialize the generated SDK + a hermetic go.mod into a fresh temp dir, returning the dir.
+fn materialize_sdk() -> PathBuf {
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+        .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
+    materialize_sdk_from_graph("ok", &graph, "/goal")
+}
+
+fn optional_body_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "markRead",
+              "method": "PATCH",
+              "path": "/read",
+              "handler": "markRead",
+              "params": [],
+              "request_body": { "ref_id": "dto.MarkReadRequest" },
+              "request_body_required": false,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.MarkReadRequest",
+              "name": "MarkReadRequest",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "lastId",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("optional body graph json")
 }
 
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
@@ -239,6 +293,59 @@ func TestDeleteGoalNotFoundAPIError(t *testing.T) {{
         test.is_ok(),
         "go test ./... (httptest smoke) must pass: {test:?}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_optional_body_nil_sends_no_body() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile optional body smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = optional_body_graph();
+    let dir = materialize_sdk_from_graph("optional-body", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestOptionalBodyNilDoesNotSendJSON(t *testing.T) {{
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		if r.Method != http.MethodPatch {{
+			t.Errorf("method = %s, want PATCH", r.Method)
+		}}
+		if r.URL.Path != "/api/read" {{
+			t.Errorf("path = %s, want /api/read", r.URL.Path)
+		}}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != 0 {{
+			t.Errorf("body = %q, want empty", string(body))
+		}}
+		if got := r.Header.Get("Content-Type"); got != "" {{
+			t.Errorf("Content-Type = %q, want empty", got)
+		}}
+		w.WriteHeader(http.StatusNoContent)
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	if _, err := c.MarkRead(context.Background(), nil); err != nil {{
+		t.Fatalf("MarkRead nil body returned error: %v", err)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("optional_body_test.go"), smoke).expect("write optional smoke");
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(test.is_ok(), "go test ./... must succeed: {test:?}");
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }

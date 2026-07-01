@@ -685,6 +685,7 @@ fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
         kind: "apiKey".to_string(),
         location: "header".to_string(),
         name: "X-API-Key".to_string(),
+        global: true,
     }]
 }
 

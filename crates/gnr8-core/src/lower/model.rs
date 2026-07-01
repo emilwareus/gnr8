@@ -78,6 +78,8 @@ pub(crate) struct Operation {
     pub operation_id: String,
     /// Static source route-group tags.
     pub tags: Vec<String>,
+    /// Operation-level security requirements.
+    pub security: Vec<SecurityRequirement>,
     /// Path + query parameters, in graph (name-sorted) order.
     pub parameters: Vec<Parameter>,
     /// The JSON request body, if the operation takes one.
@@ -103,7 +105,7 @@ pub(crate) struct Parameter {
 /// A JSON request body referencing a component schema.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct RequestBody {
-    /// Whether the body is required — always `true` for the inferred typed bodies.
+    /// Whether the body is required.
     pub required: bool,
     /// The request media type (`application/json`, `multipart/form-data`, ...).
     pub content_type: String,
@@ -122,6 +124,8 @@ pub(crate) struct ResponseObj {
     pub content_type: Option<String>,
     /// Whether this response is binary/file content (`type: string`, `format: binary`).
     pub binary: bool,
+    /// Whether this response is a server-sent event stream (`text/event-stream`).
+    pub event_stream: bool,
 }
 
 /// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.

@@ -13,7 +13,7 @@ use crate::analyze::facts::{
     Constraints, FieldFact, FieldMeta, LiteralValue, Prim, Type, WellKnown,
 };
 use crate::graph::{
-    ApiGraph, Diagnostic, Operation, Param, Response, Schema, SchemaRef, SourceSpan,
+    ApiGraph, Diagnostic, Operation, Param, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
 };
 use crate::CoreError;
 
@@ -71,7 +71,7 @@ fn import_openapi_document(
     let root = parse_json_or_yaml(text, &root_file)?;
     let version = detect_version(&root, &root_file)?;
     let mut importer = Importer::new(project_root.to_path_buf(), root_file, root, version);
-    Ok(importer.import())
+    importer.import()
 }
 
 fn read_text(path: &Path) -> Result<String, CoreError> {
@@ -134,8 +134,11 @@ impl Importer {
         }
     }
 
-    fn import(&mut self) -> ApiGraph {
+    fn import(&mut self) -> Result<ApiGraph, CoreError> {
+        self.validate_representable_security()?;
+        self.validate_representable_responses()?;
         self.collect_root_schemas();
+        let security = self.import_security_schemes();
         let mut operations = self.import_operations();
         let mut schemas = self.import_schemas();
 
@@ -144,7 +147,7 @@ impl Importer {
         self.diagnostics
             .sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
-        ApiGraph {
+        Ok(ApiGraph {
             module: self
                 .root
                 .get("info")
@@ -162,8 +165,209 @@ impl Importer {
                 .and_then(Value::as_str)
                 .unwrap_or("API")
                 .to_string(),
-            security: Vec::new(),
+            security,
+        })
+    }
+
+    fn validate_representable_security(&self) -> Result<(), CoreError> {
+        let root_security = self.root.get("security").and_then(Value::as_array);
+        let raw_schemes = self.raw_security_schemes();
+        if root_security.is_some_and(|requirements| requirements.len() > 1) {
+            return Err(CoreError::Config {
+                message: "OpenAPI source uses alternative top-level security requirements; gnr8 currently supports one AND requirement object, not OR alternatives".to_string(),
+            });
         }
+        if let Some(requirement) = root_security
+            .and_then(|requirements| requirements.first())
+            .and_then(Value::as_object)
+        {
+            for id in requirement.keys() {
+                Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
+            }
+        }
+        let has_inherited_security =
+            !security_requirement_scheme_ids(self.root.get("security")).is_empty();
+        let Some(paths) = self.root.get("paths").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for (path, item) in paths {
+            let Some(path_item) = item.as_object() else {
+                continue;
+            };
+            for (method, operation) in path_item {
+                if !is_http_method(method) || !is_lowerable_method(method) {
+                    continue;
+                }
+                let Some(operation_object) = operation.as_object() else {
+                    continue;
+                };
+                let Some(security) = operation_object.get("security") else {
+                    continue;
+                };
+                let Some(requirements) = security.as_array() else {
+                    continue;
+                };
+                let op_label = operation_object
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || format!("{} {}", method.to_ascii_uppercase(), path),
+                        str::to_string,
+                    );
+                if requirements.is_empty() && has_inherited_security {
+                    return Err(CoreError::Config {
+                        message: format!(
+                            "operation '{op_label}' disables inherited security with security: []; gnr8 graph cannot represent per-operation security removal"
+                        ),
+                    });
+                }
+                if requirements.len() > 1 {
+                    return Err(CoreError::Config {
+                        message: format!(
+                            "operation '{op_label}' uses alternative security requirements; gnr8 currently supports one AND requirement object, not OR alternatives"
+                        ),
+                    });
+                }
+                if has_inherited_security
+                    && requirements
+                        .first()
+                        .and_then(Value::as_object)
+                        .is_some_and(serde_json::Map::is_empty)
+                {
+                    return Err(CoreError::Config {
+                        message: format!(
+                            "operation '{op_label}' disables inherited security with an empty security requirement; gnr8 graph cannot represent per-operation security removal"
+                        ),
+                    });
+                }
+                if let Some(requirement) = requirements.first().and_then(Value::as_object) {
+                    for id in requirement.keys() {
+                        Self::validate_security_scheme_ref(
+                            &raw_schemes,
+                            id,
+                            &format!("operation '{op_label}' security"),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn raw_security_schemes(&self) -> BTreeMap<String, Value> {
+        match self.version {
+            SpecVersion::Swagger2 => self
+                .root
+                .get("securityDefinitions")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
+                .root
+                .get("components")
+                .and_then(|components| components.get("securitySchemes"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
+        }
+        .into_iter()
+        .collect()
+    }
+
+    fn validate_security_scheme_ref(
+        schemes: &BTreeMap<String, Value>,
+        id: &str,
+        context: &str,
+    ) -> Result<(), CoreError> {
+        let Some(scheme) = schemes.get(id) else {
+            return Err(CoreError::Config {
+                message: format!(
+                    "{context} references missing security scheme '{id}' in OpenAPI source"
+                ),
+            });
+        };
+        let kind = scheme.get("type").and_then(Value::as_str).unwrap_or("");
+        let location = scheme.get("in").and_then(Value::as_str).unwrap_or("");
+        let has_name = scheme.get("name").and_then(Value::as_str).is_some();
+        if kind != "apiKey" || location != "header" || !has_name {
+            return Err(CoreError::Config {
+                message: format!(
+                    "{context} references unsupported security scheme '{id}'; gnr8 imports only apiKey/header schemes with a name"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_representable_responses(&self) -> Result<(), CoreError> {
+        let Some(paths) = self.root.get("paths").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        for (path, item) in paths {
+            let Some(path_item) = item.as_object() else {
+                continue;
+            };
+            for (method, operation) in path_item {
+                if !is_http_method(method) || !is_lowerable_method(method) {
+                    continue;
+                }
+                let Some(operation_object) = operation.as_object() else {
+                    continue;
+                };
+                let op_label = operation_object
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || format!("{} {}", method.to_ascii_uppercase(), path),
+                        str::to_string,
+                    );
+                let Some(responses) = operation_object.get("responses").and_then(Value::as_object)
+                else {
+                    continue;
+                };
+                for status in responses.keys() {
+                    if status.parse::<u16>().is_err() {
+                        return Err(CoreError::Config {
+                            message: format!(
+                                "operation '{op_label}' uses non-numeric response key '{status}'; gnr8 graph cannot represent default responses from OpenAPI sources"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn import_security_schemes(&mut self) -> Vec<SecurityScheme> {
+        let raw_schemes = self.raw_security_schemes();
+        let global_ids = security_requirement_scheme_ids(self.root.get("security"));
+        let mut schemes = Vec::new();
+        for (id, scheme) in raw_schemes {
+            let kind = scheme.get("type").and_then(Value::as_str).unwrap_or("");
+            let location = scheme.get("in").and_then(Value::as_str).unwrap_or("");
+            let Some(name) = scheme.get("name").and_then(Value::as_str) else {
+                self.warn(format!(
+                    "security scheme '{id}' has no header name and was not imported"
+                ));
+                continue;
+            };
+            if kind != "apiKey" || location != "header" {
+                self.warn(format!(
+                    "security scheme '{id}' uses unsupported {kind}/{location}; only apiKey/header is imported"
+                ));
+                continue;
+            }
+            schemes.push(SecurityScheme {
+                id: id.clone(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: name.to_string(),
+                global: global_ids.contains(&id),
+            });
+        }
+        schemes.sort_by(|a, b| a.id.cmp(&b.id));
+        schemes
     }
 
     fn collect_root_schemas(&mut self) {
@@ -272,6 +476,7 @@ impl Importer {
                 let mut params = Vec::new();
                 let mut form_fields = Vec::new();
                 let mut request_body = None;
+                let mut request_body_required = false;
                 let mut request_body_content_type = None;
 
                 let mut all_parameters = path_parameters.clone();
@@ -301,10 +506,15 @@ impl Importer {
                                 request_body = Some(
                                     self.schema_ref_for(schema, &format!("{operation_id}Request")),
                                 );
+                                request_body_required = parameter_object
+                                    .get("required")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
                             }
                         }
                         Some("formData") if self.version == SpecVersion::Swagger2 => {
                             if let Some(field) = self.field_from_parameter(&parameter) {
+                                request_body_required |= field.required;
                                 form_fields.push(field);
                             }
                         }
@@ -344,6 +554,11 @@ impl Importer {
                         SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
                             .request_body_schema_ref(operation, &operation_id)
                             .map(|(schema_ref, media_type)| {
+                                request_body_required = operation
+                                    .get("requestBody")
+                                    .and_then(|body| body.get("required"))
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
                                 if media_type != "application/json" {
                                     request_body_content_type = Some(media_type);
                                 }
@@ -359,6 +574,8 @@ impl Importer {
                 });
                 let mut responses = self.import_responses(operation, &operation_id);
                 responses.sort_by_key(|response| response.status);
+                let security = self.operation_security(operation_object, &operation_id);
+                let security_overrides_global = operation_object.contains_key("security");
 
                 operations.push(Operation {
                     id: operation_id.clone(),
@@ -368,13 +585,63 @@ impl Importer {
                     group,
                     params,
                     request_body,
+                    request_body_required,
                     request_body_content_type,
                     responses,
+                    security,
+                    security_overrides_global,
                     provenance: self.span(),
                 });
             }
         }
         operations
+    }
+
+    fn operation_security(
+        &mut self,
+        operation_object: &serde_json::Map<String, Value>,
+        operation_id: &str,
+    ) -> Vec<String> {
+        let Some(security) = operation_object.get("security") else {
+            return Vec::new();
+        };
+        let Some(requirements) = security.as_array() else {
+            self.warn(format!(
+                "security on operation '{operation_id}' is not an array and was not imported"
+            ));
+            return Vec::new();
+        };
+        if requirements.is_empty() {
+            if self
+                .root
+                .get("security")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+            {
+                self.warn(format!(
+                    "operation '{operation_id}' disables inherited security; gnr8 graph cannot represent per-operation security removal"
+                ));
+            }
+            return Vec::new();
+        }
+        if requirements.len() > 1 {
+            self.warn(format!(
+                "operation '{operation_id}' has alternative security requirements; importing merged scheme ids"
+            ));
+        }
+        let mut ids = Vec::new();
+        for requirement in requirements {
+            let Some(object) = requirement.as_object() else {
+                self.warn(format!(
+                    "security requirement on operation '{operation_id}' is not an object"
+                ));
+                continue;
+            };
+            ids.extend(object.keys().cloned());
+        }
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     fn operation_id(&mut self, method: &str, path: &str, operation: &Value) -> String {
@@ -406,12 +673,14 @@ impl Importer {
             .and_then(Value::as_bool)
             .unwrap_or(location == "path");
         let schema = parameter.get("schema").unwrap_or(parameter);
+        let default = schema.get("default").and_then(literal_value);
         let imported = self.type_from_schema(schema);
         Some(Param {
             name,
             location,
             required,
             schema: imported.ty,
+            default,
             provenance: self.span(),
         })
     }
@@ -488,7 +757,32 @@ impl Importer {
             return responses;
         };
         for (status, response) in response_map {
-            let status_code = status.parse::<u16>().unwrap_or(200);
+            let Ok(status_code) = status.parse::<u16>() else {
+                continue;
+            };
+            if matches!(
+                self.version,
+                SpecVersion::OpenApi30 | SpecVersion::OpenApi31
+            ) {
+                if let Some(media) = response
+                    .get("content")
+                    .and_then(Value::as_object)
+                    .and_then(|content| content.get("text/event-stream"))
+                {
+                    responses.push(Response {
+                        status: status_code,
+                        body: media.get("schema").map(|schema| {
+                            self.schema_ref_for(
+                                schema,
+                                &format!("{operation_id}{status_code}Event"),
+                            )
+                        }),
+                        body_kind: "sse".to_string(),
+                        content_type: Some("text/event-stream".to_string()),
+                    });
+                    continue;
+                }
+            }
             let selected: Option<(String, &Value)> = match self.version {
                 SpecVersion::Swagger2 => response
                     .get("schema")
@@ -1148,6 +1442,19 @@ fn literal_value(value: &Value) -> Option<LiteralValue> {
     }
 }
 
+fn security_requirement_scheme_ids(security: Option<&Value>) -> BTreeSet<String> {
+    security
+        .and_then(Value::as_array)
+        .map(|requirements| {
+            requirements
+                .iter()
+                .filter_map(Value::as_object)
+                .flat_map(|requirement| requirement.keys().cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn choose_content(content: &serde_json::Map<String, Value>) -> Option<(&str, &Value)> {
     for preferred in [
         "application/json",
@@ -1320,6 +1627,7 @@ mod tests {
     use super::load_openapi;
     use super::{detect_version, import_openapi_document, parse_json_or_yaml, SpecVersion};
     use crate::analyze::facts::{Prim, Type};
+    use crate::lower::to_openapi;
     use crate::sdk::builtins::{OpenApi, OpenApi31Json, TsSdk};
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::{Cx, Pipeline};
@@ -1503,6 +1811,7 @@ definitions:
         )
         .unwrap();
         assert_eq!(graph.base_path, "/api");
+        assert!(graph.operations[0].request_body_required);
         let request = graph
             .schemas
             .iter()
@@ -1514,6 +1823,256 @@ definitions:
         assert!(fields.iter().any(|field| {
             field.json_name == "file" && matches!(field.schema, Type::Primitive(Prim::Bytes))
         }));
+    }
+
+    #[test]
+    fn imports_openapi31_security_schemes_and_operation_security() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Secure API, version: 1.0.0 }
+security:
+  - ApiKeyAuth: []
+paths:
+  /write:
+    post:
+      operationId: writeEndpoint
+      security:
+        - CSRFAuth: []
+      responses: { '204': { description: ok } }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    CSRFAuth:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        assert_eq!(graph.security.len(), 2);
+        assert!(graph
+            .security
+            .iter()
+            .any(|scheme| scheme.id == "ApiKeyAuth" && scheme.global));
+        let write = graph
+            .operations
+            .iter()
+            .find(|operation| operation.id == "writeEndpoint")
+            .unwrap();
+        assert_eq!(write.security, vec!["CSRFAuth"]);
+        assert!(write.security_overrides_global);
+
+        let yaml = to_openapi(&graph, "Secure API", "/", &graph.security).unwrap();
+        let write_block = yaml
+            .split("operationId: writeEndpoint")
+            .nth(1)
+            .expect("writeEndpoint operation");
+        let write_block = write_block
+            .split("responses:")
+            .next()
+            .unwrap_or(write_block);
+        assert!(
+            write_block.contains("security:\n        - CSRFAuth: []"),
+            "imported operation security must keep OpenAPI override semantics:\n{write_block}"
+        );
+        assert!(
+            !write_block.contains("ApiKeyAuth: []"),
+            "imported operation security must not inherit top-level security:\n{write_block}"
+        );
+    }
+
+    #[test]
+    fn rejects_openapi_security_shapes_that_graph_cannot_represent() {
+        let top_level_or = r"
+openapi: 3.1.0
+info: { title: Secure API, version: 1.0.0 }
+security:
+  - ApiKeyAuth: []
+  - PartnerAuth: []
+paths: {}
+";
+        let err = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            top_level_or,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("alternative top-level security"));
+
+        let security_removal = r"
+openapi: 3.1.0
+info: { title: Secure API, version: 1.0.0 }
+security:
+  - ApiKeyAuth: []
+paths:
+  /public:
+    get:
+      operationId: publicEndpoint
+      security: []
+      responses: { '204': { description: ok } }
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+";
+        let err = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            security_removal,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disables inherited security"));
+
+        let missing_scheme = r"
+openapi: 3.1.0
+info: { title: Secure API, version: 1.0.0 }
+security:
+  - MissingAuth: []
+paths: {}
+";
+        let err = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            missing_scheme,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing security scheme"));
+
+        let unsupported_scheme = r"
+openapi: 3.1.0
+info: { title: Secure API, version: 1.0.0 }
+security:
+  - OAuth: []
+paths: {}
+components:
+  securitySchemes:
+    OAuth:
+      type: oauth2
+      flows: {}
+";
+        let err = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            unsupported_scheme,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unsupported security scheme"));
+
+        let anonymous_global_security = r"
+openapi: 3.1.0
+info: { title: Public API, version: 1.0.0 }
+security:
+  - {}
+paths:
+  /public:
+    get:
+      operationId: publicEndpoint
+      security: []
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            anonymous_global_security,
+        )
+        .unwrap();
+        assert_eq!(graph.operations[0].id, "publicEndpoint");
+    }
+
+    #[test]
+    fn rejects_openapi_default_response_key() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Default Response API, version: 1.0.0 }
+paths:
+  /items:
+    get:
+      operationId: listItems
+      responses:
+        default:
+          description: fallback
+";
+        let err = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-numeric response key"));
+
+        let unsupported_method = r"
+openapi: 3.1.0
+info: { title: Default Response API, version: 1.0.0 }
+paths:
+  /items:
+    options:
+      operationId: itemOptions
+      responses:
+        default:
+          description: fallback
+    get:
+      operationId: listItems
+      responses:
+        '204':
+          description: ok
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            unsupported_method,
+        )
+        .unwrap();
+        assert_eq!(graph.operations.len(), 1);
+        assert_eq!(graph.operations[0].id, "listItems");
+    }
+
+    #[test]
+    fn imports_openapi31_sse_response() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Events API, version: 1.0.0 }
+paths:
+  /events:
+    get:
+      operationId: streamEvents
+      responses:
+        '200':
+          description: events
+          content:
+            application/json:
+              schema: { type: object }
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/EventEnvelope' }
+components:
+  schemas:
+    EventEnvelope:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        let response = &graph.operations[0].responses[0];
+        assert_eq!(response.body_kind, "sse");
+        assert_eq!(response.content_type.as_deref(), Some("text/event-stream"));
+        assert_eq!(
+            response.body.as_ref().map(|body| body.ref_id.as_str()),
+            Some("EventEnvelope")
+        );
     }
 
     #[test]

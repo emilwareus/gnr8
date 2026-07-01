@@ -66,6 +66,7 @@ fn add_runtime_metadata(ir: &mut gnr8::graph::ApiGraph) {
         kind: "apiKey".to_string(),
         location: "header".to_string(),
         name: "authorization".to_string(),
+        global: true,
     });
     GroupOperations::new()
         .by_operation("createGoal", "goals")

@@ -31,8 +31,9 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    body_model_of, check_unique_schema_names, file_stem, is_json_object_key, join_path,
-    path_tokens, path_tokens_match, quoted_string_literal, split_words, success_responses_of,
+    check_unique_schema_names, file_stem, is_json_object_key, join_path, operation_api_key_headers,
+    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -567,27 +568,27 @@ export class ApiError extends Error {
 /// `--lib es2022,dom`).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", None)
+    emit_client_with_models(package, "models", false)
 }
 
 /// Emit `client.ts` with a configurable model-barrel import path.
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
-    auth_header: Option<&str>,
+    has_auth: bool,
 ) -> String {
-    let api_key_option = if auth_header.is_some() {
-        "  apiKey?: string;\n"
+    let api_key_option = if has_auth {
+        "  apiKey?: string;\n  apiKeys?: Record<string, string>;\n"
     } else {
         ""
     };
-    let api_key_field = if auth_header.is_some() {
-        "  private readonly apiKey?: string;\n"
+    let api_key_field = if has_auth {
+        "  private readonly apiKey?: string;\n  private readonly apiKeys: Record<string, string>;\n"
     } else {
         ""
     };
-    let api_key_assign = if auth_header.is_some() {
-        "    this.apiKey = opts.apiKey;\n"
+    let api_key_assign = if has_auth {
+        "    this.apiKey = opts.apiKey;\n    this.apiKeys = opts.apiKeys ?? {};\n"
     } else {
         ""
     };
@@ -634,12 +635,11 @@ pub(crate) fn emit_operations(
     _package: &str,
     base_path: &str,
     ops: &[&Operation],
-    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
     let mut out = String::new();
     for op in ops {
         out.push('\n');
-        emit_operation(&mut out, op, graph, base_path, auth_header)?;
+        emit_operation(&mut out, op, graph, base_path)?;
     }
     emit_group_getters(&mut out, ops)?;
     // Close the `class Client {` opened by emit_client.
@@ -831,7 +831,6 @@ fn emit_operation(
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
-    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     let method_name = camel(&op.handler);
     let abs = join_path(base_path, &op.path);
@@ -854,8 +853,9 @@ fn emit_operation(
         });
     }
 
-    let body_model = body_model_of(op, graph)?;
+    let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let auth_headers = operation_api_key_headers(graph, op)?;
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
@@ -886,8 +886,9 @@ fn emit_operation(
         optional_query_idents,
     } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
 
-    // Signature: path params (positional), body (typed), required query (positional), then optional
-    // query params (`?: T`). All non-optional args precede optional ones (TS requirement).
+    // Signature: path params (positional), required body when present, required query
+    // (positional), optional body when present, then optional query params (`?: T`). This preserves
+    // the established required-body surface while keeping optional args after all required args.
     let mut args: Vec<String> = Vec::new();
     // A param type emitted into client.ts must reach a named model/enum through the `models` namespace
     // import (the symbols live in models.ts, not in scope here) — pass the `"models."` prefix so a named
@@ -896,12 +897,15 @@ fn emit_operation(
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
     }
-    if let Some(model) = &body_model {
-        args.push(format!("body: models.{model}"));
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: models.{}", body.model));
     }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body?: models.{}", body.model));
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
@@ -932,13 +936,9 @@ fn emit_operation(
     emit_op_dispatch(
         out,
         &op.method,
-        &success.body_statuses,
-        &success.binary_statuses,
-        success.has_bodyless_alternative(),
-        body_model.is_some(),
-        success.has_binary_body(),
-        return_model.as_deref(),
-        auth_header,
+        &success,
+        TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
+        &auth_headers,
     )?;
     writeln!(out, "  }}").map_err(sink)?;
     Ok(())
@@ -1015,31 +1015,67 @@ fn emit_op_query(
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
 /// body-bearing success statuses. The request carries a JSON body only for body-bearing ops.
+#[derive(Clone, Copy)]
+enum TsRequestBody {
+    None,
+    Optional,
+    Required,
+}
+
+impl TsRequestBody {
+    fn from_required(required: Option<bool>) -> Self {
+        match required {
+            Some(true) => Self::Required,
+            Some(false) => Self::Optional,
+            None => Self::None,
+        }
+    }
+
+    fn is_present(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
-    body_statuses: &[u16],
-    binary_statuses: &[u16],
-    has_bodyless_success: bool,
-    has_body: bool,
-    has_binary: bool,
-    return_model: Option<&str>,
-    auth_header: Option<&str>,
+    success: &SuccessResponses,
+    request_body: TsRequestBody,
+    auth_headers: &[String],
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
-    if let Some(header) = auth_header {
-        writeln!(out, "    if (this.apiKey) {{").map_err(sink)?;
+    for (idx, header) in auth_headers.iter().enumerate() {
+        let local = format!("apiKey{idx}");
         writeln!(
             out,
-            "      headers[{}] = this.apiKey;",
+            "    const {local} = this.apiKeys[{}] ?? this.apiKey;",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      headers[{}] = {local};",
             quoted_string_literal(header)
         )
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    if has_body {
+    if request_body.is_required() {
         writeln!(out, "    headers[\"Content-Type\"] = \"application/json\";").map_err(sink)?;
+    } else if request_body.is_present() {
+        writeln!(out, "    if (body !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      headers[\"Content-Type\"] = \"application/json\";"
+        )
+        .map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
     }
     writeln!(
         out,
@@ -1048,8 +1084,14 @@ fn emit_op_dispatch(
     .map_err(sink)?;
     writeln!(out, "      method: \"{method}\",").map_err(sink)?;
     writeln!(out, "      headers,").map_err(sink)?;
-    if has_body {
+    if request_body.is_required() {
         writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
+    } else if request_body.is_present() {
+        writeln!(
+            out,
+            "      body: body === undefined ? undefined : JSON.stringify(body),"
+        )
+        .map_err(sink)?;
     }
     writeln!(out, "    }});").map_err(sink)?;
     writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
@@ -1059,32 +1101,32 @@ fn emit_op_dispatch(
     )
     .map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
-    if has_binary {
+    if success.has_binary_body() {
         writeln!(
             out,
             "    if ({}) {{",
-            ts_status_match("res.status", binary_statuses)
+            ts_status_match("res.status", &success.binary_statuses)
         )
         .map_err(sink)?;
         writeln!(out, "      return await res.blob();").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
-        if !has_bodyless_success {
+        if !success.has_bodyless_alternative() {
             writeln!(
                 out,
                 "    throw new ApiError(res.status, await res.json().catch(() => null));"
             )
             .map_err(sink)?;
         }
-    } else if let Some(model) = return_model {
+    } else if let Some(model) = success.body_model.as_deref() {
         writeln!(
             out,
             "    if ({}) {{",
-            ts_status_match("res.status", body_statuses)
+            ts_status_match("res.status", &success.body_statuses)
         )
         .map_err(sink)?;
         writeln!(out, "      return (await res.json()) as models.{model};").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
-        if !has_bodyless_success {
+        if !success.has_bodyless_alternative() {
             writeln!(
                 out,
                 "    throw new ApiError(res.status, await res.json().catch(() => null));"
@@ -1667,8 +1709,7 @@ mod tests {
         #[test]
         fn body_op_has_camel_method_typed_body_and_typed_return() {
             let g = ops_graph();
-            let out =
-                emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook"), None).unwrap();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
                 out.contains(
                     "async createBook(body: models.Book): Promise<models.CreatedMessage> {"
@@ -1696,6 +1737,34 @@ mod tests {
         }
 
         #[test]
+        fn required_body_precedes_required_query_param() {
+            let mut g = ops_graph();
+            g.operations[0].params.push(crate::graph::Param {
+                name: "tenant".to_string(),
+                location: "query".to_string(),
+                required: true,
+                schema: crate::graph::Type::Primitive(crate::graph::Prim::String),
+                default: None,
+                provenance: crate::graph::SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 4,
+                    end_line: 4,
+                },
+            });
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains(
+                    "async createBook(body: models.Book, tenant: string): Promise<models.CreatedMessage> {"
+                ),
+                "required body must stay before required query params:\n{out}"
+            );
+            assert!(
+                out.contains("searchParams.set(\"tenant\", String(tenant));"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn typed_success_with_bodyless_alternate_returns_undefined_union_and_decodes_only_body_status(
         ) {
             let mut g = ops_graph();
@@ -1708,8 +1777,7 @@ mod tests {
             g.operations[0]
                 .responses
                 .sort_by_key(|response| response.status);
-            let out =
-                emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook"), None).unwrap();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
                 out.contains(
                     "async createBook(body: models.Book): Promise<models.CreatedMessage | undefined> {"
@@ -1725,7 +1793,7 @@ mod tests {
         #[test]
         fn templated_path_escapes_each_param_with_encode_uri_component() {
             let g = ops_graph();
-            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook"), None).unwrap();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
             assert!(
                 out.contains("let path = `/books/${encodeURIComponent(String(bookId))}`;"),
                 "path param must be percent-escaped (V5) via a backslash-free template literal:\n{out}"
@@ -1739,8 +1807,7 @@ mod tests {
         #[test]
         fn query_op_encodes_present_params_and_has_no_body() {
             let g = ops_graph();
-            let out =
-                emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks"), None).unwrap();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("async listBooks(cursor?: string): Promise<void> {"),
                 "{out}"
@@ -1755,6 +1822,72 @@ mod tests {
             assert!(
                 !out.contains("JSON.stringify(body)"),
                 "query op has no body:\n{out}"
+            );
+        }
+
+        #[test]
+        fn auth_headers_use_collision_free_temp_names() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "DashAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-API-Key".to_string(),
+                    global: false,
+                },
+                crate::graph::SecurityScheme {
+                    id: "UnderscoreAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X_API_Key".to_string(),
+                    global: false,
+                },
+            ];
+            g.operations[0].security = vec!["DashAuth".to_string(), "UnderscoreAuth".to_string()];
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("const apiKey0 = this.apiKeys[\"X-API-Key\"] ?? this.apiKey;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("const apiKey1 = this.apiKeys[\"X_API_Key\"] ?? this.apiKey;"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("const apiKey_x_api_key"),
+                "auth locals must not be derived from colliding header stems:\n{out}"
+            );
+        }
+
+        #[test]
+        fn auth_headers_honor_imported_operation_security_override() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "ApiKeyAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-API-Key".to_string(),
+                    global: true,
+                },
+                crate::graph::SecurityScheme {
+                    id: "CSRFAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-CSRF-Token".to_string(),
+                    global: false,
+                },
+            ];
+            g.operations[0].security = vec!["CSRFAuth".to_string()];
+            g.operations[0].security_overrides_global = true;
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(out.contains("this.apiKeys[\"X-CSRF-Token\"]"), "{out}");
+            assert!(
+                !out.contains("this.apiKeys[\"X-API-Key\"]"),
+                "imported operation security override must not inherit global auth:\n{out}"
             );
         }
 
@@ -1781,7 +1914,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
             assert!(
                 err.to_string().contains("do not match its path params"),
                 "{err}"
@@ -1810,7 +1943,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("cannot be emitted as a TypeScript Client facade property"),
@@ -1835,7 +1968,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "bookstore", "/", &ops, None).unwrap_err();
+            let err = emit_operations(&g, "bookstore", "/", &ops).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("cannot be emitted as a TypeScript Client facade property"),
@@ -1867,7 +2000,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let out = emit_operations(&g, "pkg", "/", &ops, None).unwrap();
+            let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
             // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
             assert!(
                 out.contains("async search(q: string, page?: string): Promise<void> {"),
@@ -1901,7 +2034,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "pkg", "/", &ops, None).unwrap_err();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
             assert!(
                 err.to_string().contains("empty TypeScript identifier"),
                 "{err}"
@@ -1933,7 +2066,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
-            let err = emit_operations(&g, "pkg", "/", &ops, None).unwrap_err();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
             assert!(err.to_string().contains("collides"), "{err}");
         }
     }

@@ -25,8 +25,9 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    body_model_of, check_unique_schema_names, join_path, path_tokens, path_tokens_match,
-    quoted_string_literal, split_words, success_responses_of, SuccessResponses,
+    check_unique_schema_names, join_path, operation_api_key_headers, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
@@ -953,18 +954,22 @@ fn compat_constructor_requires_field(_owner_name: &str, field: &Field) -> bool {
 /// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
 /// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
 /// hard-coded fixture name.
-pub(crate) fn emit_client(package: &str, auth_header: Option<&str>) -> String {
-    let api_key_field = if auth_header.is_some() {
-        "apiKey string\n"
+pub(crate) fn emit_client(package: &str, has_auth: bool) -> String {
+    let api_key_field = if has_auth {
+        "apiKey string\napiKeys map[string]string\n"
     } else {
         ""
     };
-    let api_key_option = auth_header.map_or_else(String::new, |header| {
-        format!(
-            "\n// WithAPIKey sets the API key sent in the {} header.\nfunc WithAPIKey(key string) Option {{\nreturn func(c *Client) {{ c.apiKey = key }}\n}}\n",
-            quoted_string_literal(header)
-        )
-    });
+    let api_key_option = if has_auth {
+        "\n// WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.\nfunc WithAPIKey(key string) Option {\nreturn func(c *Client) { c.apiKey = key }\n}\n\n// WithAPIKeyHeader sets the API key sent in one specific auth header.\nfunc WithAPIKeyHeader(header, key string) Option {\nreturn func(c *Client) {\nif c.apiKeys == nil {\nc.apiKeys = map[string]string{}\n}\nc.apiKeys[header] = key\n}\n}\n".to_string()
+    } else {
+        String::new()
+    };
+    let api_key_init = if has_auth {
+        "apiKeys: map[string]string{},\n"
+    } else {
+        ""
+    };
     let body = format!(
         "\
 // Client is the {package} SDK entrypoint. Tag-grouped operation methods hang
@@ -989,6 +994,7 @@ func NewClient(baseURL string, opts ...Option) *Client {{
 c := &Client{{
 baseURL: baseURL,
 httpClient: &http.Client{{Timeout: 30 * time.Second}},
+{api_key_init}
 }}
 for _, opt := range opts {{
 opt(c)
@@ -1334,7 +1340,7 @@ fn emit_compat_request(
     });
     let query_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location == "query").collect();
-    let body_model = body_model_of(op, graph)?;
+    let body_model = request_body_model_of(op, graph)?;
     let return_model = compat_success_return_model(op, graph)?;
 
     writeln!(body).map_err(sink)?;
@@ -1377,7 +1383,9 @@ fn emit_compat_request(
             emit_compat_extra_query_setter(body, &request_name, &setter, query_name)?;
         }
     }
-    for (setter, query_name) in compat_body_field_query_setters(body_model.as_deref(), graph) {
+    for (setter, query_name) in
+        compat_body_field_query_setters(body_model.as_ref().map(|body| body.model.as_str()), graph)
+    {
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
@@ -1385,7 +1393,10 @@ fn emit_compat_request(
             emit_compat_extra_query_setter(body, &request_name, &setter, &query_name)?;
         }
     }
-    for setter in compat_body_setters(body_model.as_deref(), &service) {
+    for setter in compat_body_setters(
+        body_model.as_ref().map(|body| body.model.as_str()),
+        &service,
+    ) {
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
@@ -1415,7 +1426,7 @@ fn emit_compat_request(
         op,
         base_path,
         auth_header,
-        body_model.is_some(),
+        body_model.as_ref().map(|body| body.required),
         &return_model,
         &path_params,
         &query_params,
@@ -1571,7 +1582,7 @@ fn emit_compat_execute_body(
     op: &Operation,
     base_path: &str,
     auth_header: Option<&str>,
-    has_declared_body: bool,
+    declared_body_required: Option<bool>,
     return_model: &str,
     path_params: &[&crate::graph::Param],
     query_params: &[&crate::graph::Param],
@@ -1600,7 +1611,7 @@ fn emit_compat_execute_body(
     write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "reqContentType = contentType").map_err(sink)?;
-    if has_declared_body {
+    if matches!(declared_body_required, Some(true)) {
         writeln!(body, "}} else {{").map_err(sink)?;
         writeln!(body, "bodyValue := r.body").map_err(sink)?;
         writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
@@ -2299,9 +2310,8 @@ pub(crate) fn emit_operations(
     package: &str,
     base_path: &str,
     ops: &[&Operation],
-    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
-    emit_operations_inner(graph, package, base_path, ops, auth_header, true)
+    emit_operations_inner(graph, package, base_path, ops, true)
 }
 
 pub(crate) fn emit_operations_without_facades(
@@ -2309,9 +2319,8 @@ pub(crate) fn emit_operations_without_facades(
     package: &str,
     base_path: &str,
     ops: &[&Operation],
-    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
-    emit_operations_inner(graph, package, base_path, ops, auth_header, false)
+    emit_operations_inner(graph, package, base_path, ops, false)
 }
 
 fn emit_operations_inner(
@@ -2319,7 +2328,6 @@ fn emit_operations_inner(
     package: &str,
     base_path: &str,
     ops: &[&Operation],
-    auth_header: Option<&str>,
     include_facades: bool,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
@@ -2329,7 +2337,7 @@ fn emit_operations_inner(
             writeln!(body).map_err(sink)?;
         }
         first = false;
-        emit_operation(&mut body, op, graph, base_path, auth_header)?;
+        emit_operation(&mut body, op, graph, base_path)?;
     }
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
@@ -2338,7 +2346,9 @@ fn emit_operations_inner(
     if ops.iter().any(|op| op.request_body.is_some()) {
         imports.push("bytes");
     }
-    let mut needs_io = false;
+    let mut needs_io = ops
+        .iter()
+        .any(|op| op.request_body.is_some() && !op.request_body_required);
     for op in ops {
         if success_responses_of(op, graph)?.has_binary_body() {
             needs_io = true;
@@ -2452,7 +2462,6 @@ fn emit_operation(
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
-    auth_header: Option<&str>,
 ) -> Result<(), CoreError> {
     let method_name = exported(&op.handler);
     let path_params: Vec<&str> = op
@@ -2470,8 +2479,9 @@ fn emit_operation(
         writeln!(body).map_err(sink)?;
     }
 
-    let body_model = body_model_of(op, graph)?;
+    let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let auth_headers = operation_api_key_headers(graph, op)?;
     // The return type is the success model when one exists, else an empty struct.
     let return_model = if success.has_binary_body() {
         "[]byte".to_string()
@@ -2491,8 +2501,12 @@ fn emit_operation(
     if !query_params.is_empty() {
         args.push(format!("params {method_name}Params"));
     }
-    if let Some(model) = &body_model {
-        args.push(format!("in {model}"));
+    if let Some(body_model) = &body_model {
+        if body_model.required {
+            args.push(format!("in {}", body_model.model));
+        } else {
+            args.push(format!("in *{}", body_model.model));
+        }
     }
 
     writeln!(
@@ -2510,7 +2524,6 @@ fn emit_operation(
     .map_err(sink)?;
     writeln!(body, "var out {return_model}").map_err(sink)?;
 
-    let has_body = body_model.is_some();
     let has_decode = success.body_model.is_some();
     let has_binary = success.has_binary_body();
     let dispatch_returns = (has_decode || has_binary) && !success.has_bodyless_alternative();
@@ -2521,11 +2534,8 @@ fn emit_operation(
         base_path,
         &path_params,
         &query_params,
-        has_body,
         &success,
-        has_decode,
-        has_binary,
-        auth_header,
+        &auth_headers,
     )?;
     if !dispatch_returns {
         writeln!(body, "return out, nil").map_err(sink)?;
@@ -2546,19 +2556,31 @@ fn emit_request_dispatch(
     base_path: &str,
     path_params: &[&str],
     query_params: &[&crate::graph::Param],
-    has_body: bool,
     success: &SuccessResponses,
-    has_decode: bool,
-    has_binary: bool,
-    auth_header: Option<&str>,
+    auth_headers: &[String],
 ) -> Result<(), CoreError> {
+    let body_model = request_body_model_of(op, graph)?;
+    let has_body = body_model.is_some();
+    let has_required_body = body_model.as_ref().is_some_and(|body| body.required);
+    let has_decode = success.body_model.is_some();
+    let has_binary = success.has_binary_body();
+
     // Body marshalling.
-    if has_body {
+    if has_required_body {
         writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
         writeln!(body, "if err != nil {{").map_err(sink)?;
         writeln!(body, "return out, err").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
         writeln!(body, "reqBody := bytes.NewReader(payload)").map_err(sink)?;
+    } else if has_body {
+        writeln!(body, "var reqBody io.Reader").map_err(sink)?;
+        writeln!(body, "if in != nil {{").map_err(sink)?;
+        writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        writeln!(body, "return out, err").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
     }
 
     // URL construction: baseURL + absolute path with path params interpolated.
@@ -2575,12 +2597,20 @@ fn emit_request_dispatch(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    if has_body {
+    if has_required_body {
         writeln!(
             body,
             "req.Header.Set(\"Content-Type\", \"application/json\")"
         )
         .map_err(sink)?;
+    } else if has_body {
+        writeln!(body, "if in != nil {{").map_err(sink)?;
+        writeln!(
+            body,
+            "req.Header.Set(\"Content-Type\", \"application/json\")"
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
     }
 
     // Query parameter encoding.
@@ -2606,9 +2636,21 @@ fn emit_request_dispatch(
         writeln!(body, "req.URL.RawQuery = q.Encode()").map_err(sink)?;
     }
 
-    // Auth header.
-    if let Some(header) = auth_header {
-        writeln!(body, "if c.apiKey != \"\" {{").map_err(sink)?;
+    // Auth headers.
+    for header in auth_headers {
+        writeln!(
+            body,
+            "if key := c.apiKeys[{}]; key != \"\" {{",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "req.Header.Set({}, key)",
+            quoted_string_literal(header)
+        )
+        .map_err(sink)?;
+        writeln!(body, "}} else if c.apiKey != \"\" {{").map_err(sink)?;
         writeln!(
             body,
             "req.Header.Set({}, c.apiKey)",
@@ -3261,6 +3303,37 @@ mod tests {
         ApiGraph::from_facts(facts, "/root")
     }
 
+    /// A minimal graph with ONE PATCH operation whose JSON body is optional.
+    fn optional_body_graph() -> ApiGraph {
+        let facts = br#"{
+          "module": "github.com/acme/svc",
+          "routes": [
+            {
+              "method": "PATCH", "path": "/read", "handler": "markRead",
+              "operation_id": "markRead", "params": [],
+              "request_body": { "ref_id": "dto.MarkReadRequest" },
+              "request_body_required": false,
+              "responses": [ { "status": 204, "body": null } ],
+              "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.MarkReadRequest", "name": "MarkReadRequest",
+              "body": { "type": "object", "of": [
+                { "json_name": "lastId", "required": true, "optional": false, "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null, "example": null }
+              ] },
+              "span": { "file": "/root/m.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "diagnostics": []
+        }"#;
+        let facts = serde_json::from_slice(facts).unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
     /// A minimal graph with ONE GET operation that declares ONLY a `200` response (no error body),
     /// so the SDK has no graph error model and must fall back to an anonymous struct (CR-01).
     fn no_error_response_graph() -> ApiGraph {
@@ -3455,7 +3528,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "createGoal")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
@@ -3472,7 +3545,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(out.contains("type ListGoalsParams struct"), "{out}");
             assert!(
                 out.contains("Aggregation string"),
@@ -3494,7 +3567,7 @@ mod tests {
         fn ops_file_imports_the_request_plumbing_set() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             for imp in ["bytes", "context", "encoding/json", "net/http"] {
                 assert!(
                     out.contains(&format!("\"{imp}\"")),
@@ -3504,13 +3577,36 @@ mod tests {
         }
 
         #[test]
+        fn optional_body_uses_nil_safe_io_reader() {
+            let graph = super::optional_body_graph();
+            let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            assert!(
+                out.contains("func (c *Client) MarkRead(ctx context.Context, in *MarkReadRequest) (struct{}, error)"),
+                "optional bodies must take a pointer input:\n{out}"
+            );
+            assert!(
+                out.contains("\"io\""),
+                "optional body request construction needs io.Reader:\n{out}"
+            );
+            assert!(
+                out.contains("var reqBody io.Reader"),
+                "omitted optional body must leave a true nil reader interface:\n{out}"
+            );
+            assert!(
+                !out.contains("var reqBody *bytes.Reader"),
+                "typed nil *bytes.Reader can panic when boxed into io.Reader:\n{out}"
+            );
+        }
+
+        #[test]
         fn error_decode_uses_the_graphs_error_model_name_not_a_hardcoded_httperror() {
             // CR-01 generality: a graph whose error response model is named `ApiError` (NOT
             // `HttpError`) must emit `var apiErr ApiError`, referencing the type the graph actually
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
@@ -3537,7 +3633,7 @@ mod tests {
             // struct exposing exactly the fields APIError consumes, so it always compiles.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("var apiErr struct {"),
                 "absent error model must decode into an anonymous struct:\n{out}"
@@ -3556,7 +3652,7 @@ mod tests {
             // import `net/url`. The local URL var is `reqURL` to avoid shadowing the `url` package.
             let graph = super::path_param_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
                     "reqURL := c.baseURL + fmt.Sprintf(\"/goal/%s\", url.PathEscape(uuid))"
@@ -3575,7 +3671,7 @@ mod tests {
             // param set) must be a typed SdkGen error, not a silent `%!s(MISSING)` at runtime.
             let graph = super::mismatched_path_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("do not match its path params"),
@@ -3605,7 +3701,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("both emit Go Client facade method FooBar"),
@@ -3637,7 +3733,7 @@ mod tests {
             let facts = serde_json::from_slice(facts).unwrap();
             let graph = crate::graph::ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let err = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap_err();
+            let err = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap_err();
             assert!(
                 err.to_string().contains("because a schema uses that name"),
                 "{err}"
@@ -3651,7 +3747,7 @@ mod tests {
             // file must import `strconv`. The all-string fixture stays unaffected (no strconv import).
             let graph = super::typed_query_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"page\", strconv.FormatInt(params.Page, 10))"),
                 "required int64 query param must be strconv.FormatInt:\n{out}"
@@ -3676,7 +3772,7 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == "listGoals")
                 .collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("q.Set(\"aggregation\", params.Aggregation)"),
                 "string query param must pass through unconverted:\n{out}"
@@ -3692,7 +3788,7 @@ mod tests {
             // WR-01: body-less 2xx responses must not be rejected just because they are not 200.
             let graph = super::body_less_success_graph(201);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode < 200 || resp.StatusCode >= 300 {"),
                 "body-less success must reject only non-2xx responses:\n{out}"
@@ -3711,7 +3807,7 @@ mod tests {
         fn body_less_204_accepts_the_2xx_range() {
             let graph = super::body_less_success_graph(204);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode < 200 || resp.StatusCode >= 300 {"),
                 "body-less 204 must reject only non-2xx responses:\n{out}"
@@ -3731,7 +3827,7 @@ mod tests {
                 .responses
                 .sort_by_key(|response| response.status);
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains("if resp.StatusCode == 200 {"),
                 "only the body-bearing success status should decode:\n{out}"
@@ -3744,7 +3840,7 @@ mod tests {
             // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
-            let out = emit_operations(&graph, "goalservice", "/goal", &ops, None).unwrap();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             // The synthetic error model in error_model_graph declares message + slug only.
             assert!(
                 out.contains("Message: apiErrorStringValue(apiErr.Message),"),
@@ -3766,7 +3862,7 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client("goalservice", None);
+            let out = emit_client("goalservice", false);
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -3776,7 +3872,7 @@ mod tests {
                 "{out}"
             );
             assert!(!out.contains("func WithAPIKey(key string) Option"), "{out}");
-            let secured = emit_client("goalservice", Some("authorization"));
+            let secured = emit_client("goalservice", true);
             assert!(
                 secured.contains("func WithAPIKey(key string) Option"),
                 "{secured}"

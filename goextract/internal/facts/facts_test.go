@@ -127,9 +127,9 @@ var canonicalFieldNames = []string{
 	"module", "routes", "schemas", "diagnostics",
 	// RouteFact
 	"method", "path", "handler", "operation_id", "group", "params", "request_body",
-	"request_body_content_type", "responses", "span",
+	"request_body_required", "request_body_content_type", "responses", "span",
 	// ParamFact (name/location/required/schema/span)
-	"name", "location", "required", "schema",
+	"name", "location", "required", "schema", "default",
 	// ResponseFact
 	"status", "body", "body_kind", "content_type",
 	// SchemaFact (id/name/body/span)
@@ -223,11 +223,13 @@ func fullyPopulatedDoc() facts.GoFacts {
 				Params: []facts.ParamFact{
 					{
 						Name: "uuid", Location: "path", Required: true,
-						Schema: facts.WellKnownType(facts.WellKnownUUID),
-						Span:   facts.SourceSpan{File: "handlers.go", StartLine: 94, EndLine: 94},
+						Schema:  facts.WellKnownType(facts.WellKnownUUID),
+						Default: &facts.LiteralValue{Type: "string", Value: "00000000-0000-0000-0000-000000000000"},
+						Span:    facts.SourceSpan{File: "handlers.go", StartLine: 94, EndLine: 94},
 					},
 				},
 				RequestBody:            &facts.TypeRef{RefID: "internal/dto.UpdateGoalInput"},
+				RequestBodyRequired:    true,
 				RequestBodyContentType: "application/json",
 				Responses: []facts.ResponseFact{
 					{
