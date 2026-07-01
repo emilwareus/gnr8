@@ -2148,8 +2148,9 @@ impl TsSdk {
     }
 
     fn effective_package_metadata(&self) -> bool {
-        self.package_metadata
-            .unwrap_or_else(|| self.profile.is_typescript_fetch_compat())
+        self.package_metadata.unwrap_or_else(|| {
+            self.profile.is_typescript_fetch_compat() || self.profile.is_typescript_axios_compat()
+        })
     }
 }
 
@@ -3390,6 +3391,20 @@ mod tests {
             .find(|file| file.path == "generated/sdk-ts/package.json")
             .expect("typescript-fetch compat should emit package metadata by default");
         assert!(package_json.text.contains("\"types\": \"./index.d.ts\""));
+
+        let mut axios_out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .profile(SdkProfile::typescript_axios_compat())
+            .generate(&ir, &mut axios_out, &cx())
+            .unwrap();
+        let axios_package_json = axios_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/package.json")
+            .expect("typescript-axios compat should emit package metadata by default");
+        assert!(axios_package_json.text.contains("\"axios\""));
 
         let mut source_only_out = Artifacts::new();
         TsSdk::new()
