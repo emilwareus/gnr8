@@ -359,6 +359,68 @@ func dynamicContentType() string {
 	}
 }
 
+func TestDataApplicationJSONBytesAreRawBinaryResponses(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/rawjson
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Data(int, string, []byte) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package rawjson
+
+import "github.com/gin-gonic/gin"
+
+type Server struct{ R *gin.Engine }
+
+func (s Server) Register() {
+	s.R.GET("/export", s.export)
+}
+
+func (s Server) export(c *gin.Context) {
+	payload := []byte(`+"`"+`{"status":"ready"}`+"`"+`)
+	c.Data(200, "application/json", payload)
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load raw json handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/rawjson", diags)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range routes.Recognize(res) {
+		got[r.Handler] = analyzer.Analyze(r, diags)
+	}
+
+	response := got["export"].Responses[0]
+	if response.BodyKind != "binary" {
+		t.Fatalf("c.Data application/json bytes must be marked binary, got %+v", response)
+	}
+	if response.ContentType != "application/json" {
+		t.Fatalf("raw JSON response content type: got %+v", response)
+	}
+	if !equalStrings(response.ContentTypes, []string{"application/json"}) {
+		t.Fatalf("raw JSON response content_types: got %+v", response)
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {

@@ -13,7 +13,7 @@ code-derived path (rule 1): the snapshot's operation paths stay group-relative (
 A RouteFact has EXACTLY the keys the host ``RouteFact`` DTO (``deny_unknown_fields``)
 requires: ``method, path, handler, operation_id, params, request_body, responses, span``.
 A ParamFact has EXACTLY ``name, location, required, schema, span``. A ResponseFact has
-EXACTLY ``status, body``.
+``status, body`` plus optional body/media metadata.
 """
 
 import ast
@@ -332,6 +332,7 @@ def recognize_fastapi(modules, table, diags):
             response = {
                 "status": status,
                 "body": {"ref_id": body_ref} if body_ref is not None else None,
+                "content_types": ["application/json"],
             }
             routes.append(
                 {
@@ -659,6 +660,7 @@ def recognize_flask(modules, table, diags):
                     response = {
                         "status": 201 if method == "POST" else 200,
                         "body": {"ref_id": body_ref},
+                        "content_types": ["application/json"],
                     }
                     responses = [response]
                 else:

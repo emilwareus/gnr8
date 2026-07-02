@@ -30,6 +30,12 @@ struct ImportedType {
     nullable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportedResponseKind {
+    Json,
+    Binary,
+}
+
 impl ImportedType {
     fn new(ty: Type) -> Self {
         Self {
@@ -779,6 +785,7 @@ impl Importer {
                         }),
                         body_kind: "sse".to_string(),
                         content_type: Some("text/event-stream".to_string()),
+                        content_types: vec!["text/event-stream".to_string()],
                     });
                     continue;
                 }
@@ -801,8 +808,9 @@ impl Importer {
                 responses.push(Response {
                     status: status_code,
                     body: None,
-                    body_kind: "json".to_string(),
+                    body_kind: "empty".to_string(),
                     content_type: None,
+                    content_types: Vec::new(),
                 });
                 continue;
             };
@@ -813,24 +821,63 @@ impl Importer {
                     } else {
                         media_type
                     };
+                let content_types = self.response_content_types_for_kind(
+                    response,
+                    &content_type,
+                    ImportedResponseKind::Binary,
+                );
                 responses.push(Response {
                     status: status_code,
                     body: None,
                     body_kind: "binary".to_string(),
-                    content_type: Some(content_type),
+                    content_type: Some(content_type.clone()),
+                    content_types,
                 });
                 continue;
             }
+            let content_types = self.response_content_types_for_kind(
+                response,
+                &media_type,
+                ImportedResponseKind::Json,
+            );
             responses.push(Response {
                 status: status_code,
                 body: Some(
                     self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response")),
                 ),
                 body_kind: "json".to_string(),
-                content_type: (media_type != "application/json").then_some(media_type),
+                content_type: (media_type != "application/json").then_some(media_type.clone()),
+                content_types,
             });
         }
         responses
+    }
+
+    fn response_content_types_for_kind(
+        &mut self,
+        response: &Value,
+        selected_media_type: &str,
+        kind: ImportedResponseKind,
+    ) -> Vec<String> {
+        let mut content_types = vec![selected_media_type.to_string()];
+        let Some(content) = response.get("content").and_then(Value::as_object) else {
+            return content_types;
+        };
+        for (media_type, media) in content {
+            if media_type == selected_media_type {
+                continue;
+            }
+            let Some(schema) = media.get("schema") else {
+                continue;
+            };
+            let is_binary = self.response_schema_is_binary(schema);
+            if (kind == ImportedResponseKind::Binary && is_binary)
+                || (kind == ImportedResponseKind::Json && !is_binary)
+            {
+                content_types.push(media_type.clone());
+            }
+        }
+        content_types
     }
 
     fn swagger_response_media_type(&self, operation: &Value) -> String {
@@ -1772,6 +1819,98 @@ paths:
         assert!(response.body.is_none());
         assert_eq!(response.body_kind, "binary");
         assert_eq!(response.content_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn imports_openapi31_binary_response_preserves_same_kind_content_types() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Files API, version: 1.0.0 }
+paths:
+  /exports/{id}:
+    get:
+      operationId: downloadExport
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: raw export
+          content:
+            application/json:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let response = &graph.operations[0].responses[0];
+        assert_eq!(response.body_kind, "binary");
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            response.content_types,
+            vec![
+                "application/json".to_string(),
+                "application/pdf".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn imports_openapi31_json_response_preserves_same_kind_content_types() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Files API, version: 1.0.0 }
+paths:
+  /reports/{id}:
+    get:
+      operationId: getReport
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: report metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+            application/vnd.acme.report+json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+            application/pdf:
+              schema: { type: string, format: binary }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let response = &graph.operations[0].responses[0];
+        assert_eq!(response.body_kind, "json");
+        assert_eq!(response.content_type, None);
+        assert_eq!(
+            response.content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
     }
 
     #[test]

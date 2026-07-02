@@ -25,6 +25,8 @@ operations:
       - status: 200
         body:
           ref_id: app.dto.OrderConfirmation
+        content_types:
+          - application/json
     provenance:
       file: app/routes.py
       start_line: 31
@@ -40,6 +42,8 @@ operations:
       - status: 201
         body:
           ref_id: app.dto.OrderConfirmation
+        content_types:
+          - application/json
     provenance:
       file: app/routes.py
       start_line: 48
@@ -78,6 +82,8 @@ operations:
       - status: 200
         body:
           ref_id: app.dto.OrderConfirmation
+        content_types:
+          - application/json
     provenance:
       file: app/routes.py
       start_line: 59

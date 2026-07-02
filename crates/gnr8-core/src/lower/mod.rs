@@ -378,17 +378,22 @@ fn lower_response(
                 Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
                 None => None,
             };
-            (schema_ref, resp.content_type.clone(), false, false)
+            (
+                schema_ref,
+                Some(response_content_type(resp, "application/json")),
+                false,
+                false,
+            )
+        }
+        "empty" => {
+            ensure_response_has_no_schema(op, resp, "empty")?;
+            (None, None, false, false)
         }
         "binary" => {
             ensure_response_has_no_schema(op, resp, "binary")?;
             (
                 None,
-                Some(
-                    resp.content_type
-                        .clone()
-                        .unwrap_or_else(|| "application/octet-stream".to_string()),
-                ),
+                Some(response_content_type(resp, "application/octet-stream")),
                 true,
                 false,
             )
@@ -400,11 +405,7 @@ fn lower_response(
             };
             (
                 schema_ref,
-                Some(
-                    resp.content_type
-                        .clone()
-                        .unwrap_or_else(|| "text/event-stream".to_string()),
-                ),
+                Some(response_content_type(resp, "text/event-stream")),
                 false,
                 true,
             )
@@ -428,6 +429,13 @@ fn lower_response(
             event_stream,
         },
     ))
+}
+
+fn response_content_type(resp: &crate::graph::Response, fallback: &str) -> String {
+    resp.content_type
+        .clone()
+        .or_else(|| resp.content_types.first().cloned())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn ensure_response_has_no_schema(
@@ -1318,6 +1326,7 @@ mod tests {
             .unwrap();
         create.responses[0].status = 204;
         create.responses[0].body = None;
+        create.responses[0].body_kind = "empty".to_string();
 
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let response_block = yaml
@@ -1354,6 +1363,7 @@ mod tests {
         create.responses[0].body = None;
         create.responses[0].body_kind = "binary".to_string();
         create.responses[0].content_type = None;
+        create.responses[0].content_types = vec!["application/pdf".to_string()];
 
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let response_block = yaml
@@ -1364,7 +1374,7 @@ mod tests {
             .next()
             .unwrap();
         assert!(
-            response_block.contains("application/octet-stream:"),
+            response_block.contains("application/pdf:"),
             "{response_block}"
         );
         assert!(response_block.contains("type: string"), "{response_block}");
@@ -1377,7 +1387,7 @@ mod tests {
             to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
         let schema = &json["paths"]["/goal/"]["post"]["responses"]["201"]["content"]
-            ["application/octet-stream"]["schema"];
+            ["application/pdf"]["schema"];
         assert_eq!(schema["type"], "string");
         assert_eq!(schema["format"], "binary");
     }

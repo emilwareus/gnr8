@@ -68,10 +68,11 @@ type ParamFact struct {
 
 // ResponseFact describes one response keyed by HTTP status.
 type ResponseFact struct {
-	Status      uint16   `json:"status"`
-	Body        *TypeRef `json:"body"`
-	BodyKind    string   `json:"body_kind,omitempty"`
-	ContentType string   `json:"content_type,omitempty"`
+	Status       uint16   `json:"status"`
+	Body         *TypeRef `json:"body"`
+	BodyKind     string   `json:"body_kind,omitempty"`
+	ContentType  string   `json:"content_type,omitempty"`
+	ContentTypes []string `json:"content_types,omitempty"`
 }
 
 // SchemaFact is one extracted named type. Its body is carried by the neutral Type

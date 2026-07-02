@@ -131,7 +131,7 @@ var canonicalFieldNames = []string{
 	// ParamFact (name/location/required/schema/span)
 	"name", "location", "required", "schema", "default",
 	// ResponseFact
-	"status", "body", "body_kind", "content_type",
+	"status", "body", "body_kind", "content_type", "content_types",
 	// SchemaFact (id/name/body/span)
 	"id",
 	// FieldFact
@@ -234,7 +234,7 @@ func fullyPopulatedDoc() facts.GoFacts {
 				Responses: []facts.ResponseFact{
 					{
 						Status: 200, Body: &facts.TypeRef{RefID: "internal/dto.CommandMessage"},
-						BodyKind: "json", ContentType: "application/json",
+						BodyKind: "json", ContentType: "application/json", ContentTypes: []string{"application/json"},
 					},
 				},
 				Span: facts.SourceSpan{File: "http.go", StartLine: 57, EndLine: 57},

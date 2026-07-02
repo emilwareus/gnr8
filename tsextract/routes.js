@@ -20,7 +20,7 @@
 // A RouteFact has EXACTLY the keys the host `RouteFact` DTO (deny_unknown_fields)
 // requires: method, path, handler, operation_id, params, request_body, responses,
 // span. A ParamFact has EXACTLY name, location, required, schema, span. A
-// ResponseFact has EXACTLY status, body — body = {ref_id:<id>} or null.
+// ResponseFact has status/body plus optional body/media metadata — body = {ref_id:<id>} or null.
 
 const ts = require("./ts");
 
@@ -411,6 +411,7 @@ function recognizeNestController(loaded, diags, registry) {
           {
             status: status,
             body: bodyRef === null ? null : { ref_id: bodyRef },
+            content_types: ["application/json"],
           },
         ];
 

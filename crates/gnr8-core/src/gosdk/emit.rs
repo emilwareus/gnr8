@@ -3564,6 +3564,36 @@ mod tests {
         }
 
         #[test]
+        fn binary_success_reads_bytes_without_success_json_decode() {
+            let mut graph = sample_graph();
+            let op = graph
+                .operations
+                .iter_mut()
+                .find(|op| op.handler == "listGoals")
+                .unwrap();
+            op.responses[0].body = None;
+            op.responses[0].body_kind = "binary".to_string();
+            op.responses[0].content_type = None;
+            op.responses[0].content_types = vec!["application/pdf".to_string()];
+
+            let ops: Vec<&crate::graph::Operation> = graph
+                .operations
+                .iter()
+                .filter(|op| op.handler == "listGoals")
+                .collect();
+            let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
+            assert!(
+                out.contains("func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) ([]byte, error)"),
+                "binary success should return raw bytes:\n{out}"
+            );
+            assert!(out.contains("data, err := io.ReadAll(resp.Body)"), "{out}");
+            assert!(
+                !out.contains("json.NewDecoder(resp.Body).Decode(&out)"),
+                "binary success must not decode JSON into out:\n{out}"
+            );
+        }
+
+        #[test]
         fn ops_file_imports_the_request_plumbing_set() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
@@ -3820,8 +3850,9 @@ mod tests {
             graph.operations[0].responses.push(crate::graph::Response {
                 status: 204,
                 body: None,
-                body_kind: "json".to_string(),
+                body_kind: "empty".to_string(),
                 content_type: None,
+                content_types: Vec::new(),
             });
             graph.operations[0]
                 .responses

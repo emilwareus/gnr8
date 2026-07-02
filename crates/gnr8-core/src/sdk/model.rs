@@ -301,6 +301,7 @@ mod tests {
                     }),
                     body_kind: "json".to_string(),
                     content_type: None,
+                    content_types: vec!["application/json".to_string()],
                 }],
                 security: Vec::new(),
                 security_overrides_global: false,

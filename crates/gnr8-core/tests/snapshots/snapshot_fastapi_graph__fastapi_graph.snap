@@ -47,6 +47,8 @@ operations:
       - status: 200
         body:
           ref_id: app.models.ListBooksResponse
+        content_types:
+          - application/json
     provenance:
       file: app/main.py
       start_line: 38
@@ -62,6 +64,8 @@ operations:
       - status: 201
         body:
           ref_id: app.models.CreatedMessage
+        content_types:
+          - application/json
     provenance:
       file: app/main.py
       start_line: 57
@@ -99,6 +103,8 @@ operations:
       - status: 200
         body:
           ref_id: app.models.BookOrError
+        content_types:
+          - application/json
     provenance:
       file: app/main.py
       start_line: 65
@@ -127,6 +133,8 @@ operations:
       - status: 200
         body:
           ref_id: app.models.CreatedMessage
+        content_types:
+          - application/json
     provenance:
       file: app/main.py
       start_line: 75
