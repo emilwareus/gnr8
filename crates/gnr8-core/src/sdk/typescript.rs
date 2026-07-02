@@ -126,35 +126,72 @@ impl TsResponsePolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the fetch compatibility profile emits the root `index.ts` barrel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TsBarrelExports {
+    /// Re-export every API, runtime, and model symbol.
+    #[default]
+    Star,
+    /// Export runtime and models broadly, but only API classes from `./apis` to avoid request/model
+    /// name collisions seen in OpenAPI Generator migrations.
+    OpenApiGeneratorCompat,
+}
+
+impl TsBarrelExports {
+    /// Re-export every generated symbol.
+    #[must_use]
+    pub const fn star() -> Self {
+        Self::Star
+    }
+
+    /// Emit the OpenAPI Generator-compatible root barrel.
+    #[must_use]
+    pub const fn openapi_generator_compat() -> Self {
+        Self::OpenApiGeneratorCompat
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TsSdkOptions {
     pub(crate) model_properties: TsModelPropertyPolicy,
     pub(crate) nullable: TsNullablePolicy,
     pub(crate) response: TsResponsePolicy,
+    pub(crate) request_body_param_name: String,
+    pub(crate) init_override_function: bool,
+    pub(crate) barrel_exports: TsBarrelExports,
 }
 
 impl TsSdkOptions {
-    pub(crate) const fn strict() -> Self {
+    pub(crate) fn strict() -> Self {
         Self {
             model_properties: TsModelPropertyPolicy::Strict,
             nullable: TsNullablePolicy::ExplicitNull,
             response: TsResponsePolicy::DataOnly,
+            request_body_param_name: "body".to_string(),
+            init_override_function: false,
+            barrel_exports: TsBarrelExports::Star,
         }
     }
 
-    pub(crate) const fn openapi_generator_compat() -> Self {
+    pub(crate) fn openapi_generator_compat() -> Self {
         Self {
             model_properties: TsModelPropertyPolicy::OpenApiRequired,
             nullable: TsNullablePolicy::ExplicitNull,
             response: TsResponsePolicy::AxiosResponseWrapper,
+            request_body_param_name: "body".to_string(),
+            init_override_function: false,
+            barrel_exports: TsBarrelExports::Star,
         }
     }
 
-    pub(crate) const fn fetch_compat() -> Self {
+    pub(crate) fn fetch_compat() -> Self {
         Self {
             model_properties: TsModelPropertyPolicy::OpenApiRequired,
             nullable: TsNullablePolicy::ExplicitNull,
             response: TsResponsePolicy::DataOnly,
+            request_body_param_name: "body".to_string(),
+            init_override_function: true,
+            barrel_exports: TsBarrelExports::Star,
         }
     }
 

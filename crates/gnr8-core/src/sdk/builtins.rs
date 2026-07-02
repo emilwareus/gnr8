@@ -18,13 +18,17 @@ use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::emit_common::quoted_string_literal;
+use crate::sdk::go::{
+    GoRequestBuilderScope, GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy,
+};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::sdk::typescript::{
-    TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
+    TsBarrelExports, TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
+    TsSdkOptions,
 };
 use crate::CoreError;
 use std::fmt::Write as _;
@@ -2418,6 +2422,10 @@ pub struct GoSdk {
     profile: SdkProfile,
     docs: bool,
     package_metadata: bool,
+    error_model: Option<String>,
+    required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
+    query_time_format: Option<QueryTimeFormat>,
+    request_builder_scope: Option<GoRequestBuilderScope>,
 }
 
 impl GoSdk {
@@ -2432,6 +2440,10 @@ impl GoSdk {
             profile: SdkProfile::default(),
             docs: true,
             package_metadata: true,
+            error_model: None,
+            required_pointer_constructor_policy: None,
+            query_time_format: None,
+            request_builder_scope: None,
         }
     }
 
@@ -2477,6 +2489,38 @@ impl GoSdk {
         self
     }
 
+    /// Decode non-2xx response bodies into the named error model when `GenericOpenAPIError::Model`
+    /// is called and no explicit model was attached.
+    #[must_use]
+    pub fn error_model(mut self, model: impl Into<String>) -> Self {
+        self.error_model = Some(model.into());
+        self
+    }
+
+    /// Set how required pointer fields are represented in OpenAPI Generator-compatible constructors.
+    #[must_use]
+    pub const fn required_pointer_constructor_policy(
+        mut self,
+        policy: RequiredPointerConstructorPolicy,
+    ) -> Self {
+        self.required_pointer_constructor_policy = Some(policy);
+        self
+    }
+
+    /// Set how `time.Time` query values are serialized in compatibility helpers.
+    #[must_use]
+    pub const fn query_time_format(mut self, format: QueryTimeFormat) -> Self {
+        self.query_time_format = Some(format);
+        self
+    }
+
+    /// Set whether request builders emit operation-local or legacy graph-wide setters.
+    #[must_use]
+    pub const fn request_builder_scope(mut self, scope: GoRequestBuilderScope) -> Self {
+        self.request_builder_scope = Some(scope);
+        self
+    }
+
     /// Enable or disable generated SDK README/reference docs.
     #[must_use]
     pub const fn docs(mut self, enabled: bool) -> Self {
@@ -2508,6 +2552,23 @@ impl GoSdk {
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
         let aliases = self.aliases.clone().type_alias(schema, alias);
         self.aliases(aliases)
+    }
+
+    fn effective_options(&self) -> GoSdkOptions {
+        let mut options = GoSdkOptions::for_profile(&self.profile);
+        if let Some(model) = &self.error_model {
+            options.error_model = Some(model.clone());
+        }
+        if let Some(policy) = self.required_pointer_constructor_policy {
+            options.required_pointer_constructor_policy = policy;
+        }
+        if let Some(format) = self.query_time_format {
+            options.query_time_format = format;
+        }
+        if let Some(scope) = self.request_builder_scope {
+            options.request_builder_scope = scope;
+        }
+        options
     }
 }
 
@@ -2541,13 +2602,14 @@ impl Target for GoSdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::gosdk::generate_files_with_profile(
+        let files = crate::gosdk::generate_files_with_profile_options(
             ir,
             &package,
             &ir.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
+            self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         if self.docs {
@@ -2775,6 +2837,9 @@ pub struct TsSdk {
     model_property_policy: Option<TsModelPropertyPolicy>,
     nullable_policy: Option<TsNullablePolicy>,
     response_policy: Option<TsResponsePolicy>,
+    request_body_param_name: Option<String>,
+    init_override_function: Option<bool>,
+    barrel_exports: Option<TsBarrelExports>,
 }
 
 impl TsSdk {
@@ -2792,6 +2857,9 @@ impl TsSdk {
             model_property_policy: None,
             nullable_policy: None,
             response_policy: None,
+            request_body_param_name: None,
+            init_override_function: None,
+            barrel_exports: None,
         }
     }
 
@@ -2895,6 +2963,27 @@ impl TsSdk {
         self
     }
 
+    /// Set the request object property name used for JSON request bodies.
+    #[must_use]
+    pub fn request_body_param_name(mut self, name: impl Into<String>) -> Self {
+        self.request_body_param_name = Some(name.into());
+        self
+    }
+
+    /// Enable or disable OpenAPI Generator-compatible `InitOverrideFunction` support.
+    #[must_use]
+    pub const fn init_override_function(mut self, enabled: bool) -> Self {
+        self.init_override_function = Some(enabled);
+        self
+    }
+
+    /// Set how the TypeScript fetch profile emits the root barrel.
+    #[must_use]
+    pub const fn barrel_exports(mut self, exports: TsBarrelExports) -> Self {
+        self.barrel_exports = Some(exports);
+        self
+    }
+
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
     #[must_use]
     pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
@@ -2912,6 +3001,15 @@ impl TsSdk {
         }
         if let Some(policy) = self.response_policy {
             options.response = policy;
+        }
+        if let Some(name) = &self.request_body_param_name {
+            options.request_body_param_name.clone_from(name);
+        }
+        if let Some(enabled) = self.init_override_function {
+            options.init_override_function = enabled;
+        }
+        if let Some(exports) = self.barrel_exports {
+            options.barrel_exports = exports;
         }
         options
     }
@@ -2955,6 +3053,7 @@ impl Target for TsSdk {
             &self.aliases,
             &self.profile,
         )?;
+        let options = self.effective_options();
         let mut files = crate::tssdk::generate_files_with_profile_options(
             ir,
             &package,
@@ -2962,7 +3061,7 @@ impl Target for TsSdk {
             &self.layout,
             &self.aliases,
             &self.profile,
-            self.effective_options(),
+            &options,
         )?;
         if self.effective_package_metadata() {
             if !files.iter().any(|file| file.name == "package.json") {
