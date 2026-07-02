@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_graph.rs
+assertion_line: 26
 expression: graph
 ---
 module: github.com/gnr8/gnr8-fixtures/goalservice
@@ -8,6 +9,8 @@ operations:
     method: POST
     path: /
     handler: createGoal
+    middleware:
+      - AuthMiddleware
     params: []
     request_body:
       ref_id: internal/common/dto.CreateGoalInput
@@ -30,6 +33,8 @@ operations:
     method: GET
     path: /list
     handler: listGoals
+    middleware:
+      - AuthMiddleware
     params:
       - name: aggregation
         location: query
@@ -79,6 +84,8 @@ operations:
     method: DELETE
     path: "/{uuid}"
     handler: deleteGoal
+    middleware:
+      - AuthMiddleware
     params:
       - name: uuid
         location: path
@@ -111,6 +118,8 @@ operations:
     method: PUT
     path: "/{uuid}"
     handler: updateGoal
+    middleware:
+      - AuthMiddleware
     params:
       - name: uuid
         location: path

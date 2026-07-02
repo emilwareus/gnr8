@@ -46,6 +46,7 @@ type RouteFact struct {
 	Handler                string         `json:"handler"`
 	OperationID            string         `json:"operation_id"`
 	Group                  string         `json:"group,omitempty"`
+	Middleware             []string       `json:"middleware,omitempty"`
 	Params                 []ParamFact    `json:"params"`
 	RequestBody            *TypeRef       `json:"request_body"`
 	RequestBodyRequired    bool           `json:"request_body_required"`
@@ -373,6 +374,7 @@ func sortFieldMeta(meta *FieldMeta) {
 // are byte-identical (GRAPH-02): params by (name, location), responses by status, and
 // each param's type body recursively.
 func sortRoute(r *RouteFact) {
+	sort.Strings(r.Middleware)
 	sort.Slice(r.Params, func(a, b int) bool {
 		if r.Params[a].Name != r.Params[b].Name {
 			return r.Params[a].Name < r.Params[b].Name

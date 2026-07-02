@@ -49,17 +49,18 @@ var httpMethods = map[string]bool{
 }
 
 // Route is one recognized HTTP route plus the handler symbol and enclosing group,
-// so the handler analyzer can match a handler FuncDecl by symbol. Secured records
-// whether the enclosing group carried a Use(middleware) call — pure code
-// recognition, NOT a security fact: security for the generated API comes from the
-// user's gnr8 config, never from the source (CLAUDE.md rule 4).
+// so the handler analyzer can match a handler FuncDecl by symbol. Middleware/Secured
+// record source middleware placement for later explicit config matching — pure code
+// recognition, NOT an inferred security requirement: generated API security still
+// comes from the user's gnr8 config (CLAUDE.md rule 4).
 type Route struct {
-	Method  string           // "POST"
-	Path    string           // group-relative, normalized: "/", "/list", "/{uuid}"
-	Handler string           // selector name of the handler arg, e.g. "createGoal"
-	Group   string           // deepest static route group segment, e.g. "books"
-	Secured bool             // the enclosing group had a Use(middleware) call
-	Span    facts.SourceSpan // provenance of the METHOD registration call
+	Method     string           // "POST"
+	Path       string           // group-relative, normalized: "/", "/list", "/{uuid}"
+	Handler    string           // selector name of the handler arg, e.g. "createGoal"
+	Group      string           // deepest static route group segment, e.g. "books"
+	Middleware []string         // source middleware symbols applied before the handler
+	Secured    bool             // route/group carried middleware
+	Span       facts.SourceSpan // provenance of the METHOD registration call
 }
 
 // Recognize walks every target package's syntax and returns the recognized routes
@@ -86,20 +87,23 @@ func RecognizeWithDiagnostics(res *load.Result, diags *diag.Accumulator) []Route
 	return out
 }
 
-// groupInfo tracks, per receiver object (the `api` group variable), whether the
-// group has been secured by a Use(...) call. Routes registered on a secured group
-// inherit secured=true.
+// groupInfo tracks, per receiver object (the `api` group variable), the static
+// prefix and middleware accumulated from Group(...middleware) and Use(...). Routes
+// registered on that group inherit both.
 type groupInfo struct {
-	secured bool
-	prefix  string
+	secured    bool
+	prefix     string
+	middleware []string
 }
 
 type rawGroup struct {
-	parent       gotypes.Object
-	parentPrefix string
-	prefix       string
-	static       bool
-	span         facts.SourceSpan
+	parent           gotypes.Object
+	parentPrefix     string
+	parentMiddleware []string
+	prefix           string
+	middleware       []string
+	static           bool
+	span             facts.SourceSpan
 }
 
 // recognizeFile collects routes from a single file. It performs two passes over the
@@ -123,7 +127,9 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 			return true
 		}
 		if obj := receiverObject(info, call); obj != nil {
-			groupOf(groups, obj).secured = true
+			group := groupOf(groups, obj)
+			group.secured = true
+			group.middleware = appendUniqueStrings(group.middleware, middlewareSymbols(info, call.Args)...)
 		}
 		return true
 	})
@@ -134,6 +140,10 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		}
 		g := groupOf(groups, obj)
 		g.prefix = resolveGroupPrefix(obj, rawGroups, map[gotypes.Object]bool{})
+		g.middleware = resolveGroupMiddleware(obj, rawGroups, groups, map[gotypes.Object]bool{})
+		if len(g.middleware) > 0 {
+			g.secured = true
+		}
 	}
 
 	// Pass 2: emit one Route per recognized METHOD(path, handler) call.
@@ -167,11 +177,15 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 			return true
 		}
 
-		secured := false
 		prefix := receiverPrefix(info, groups, call)
+		middleware := receiverMiddleware(info, groups, call)
+		if len(call.Args) > 2 {
+			middleware = appendUniqueStrings(middleware, middlewareSymbols(info, call.Args[1:len(call.Args)-1])...)
+		}
+		secured := len(middleware) > 0
 		if obj := receiverObject(info, call); obj != nil {
 			if g, seen := groups[obj]; seen {
-				secured = g.secured
+				secured = secured || g.secured
 			} else if prefix == "" && receiverIsGinRouterGroup(info, call) && diags != nil {
 				span := spanOf(fset, call.Pos(), call.End())
 				diags.Warn("unsupported Gin route pattern: route registered on router group parameter; prefix cannot be inferred across helper calls, so the route is emitted relative (GO-04)", span.File, span.StartLine)
@@ -179,12 +193,13 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		}
 
 		out = append(out, Route{
-			Method:  name,
-			Path:    joinPaths(prefix, normalizePath(pathLit)),
-			Handler: handler,
-			Group:   groupNameFromPrefix(prefix),
-			Secured: secured,
-			Span:    spanOf(fset, call.Pos(), call.End()),
+			Method:     name,
+			Path:       joinPaths(prefix, normalizePath(pathLit)),
+			Handler:    handler,
+			Group:      groupNameFromPrefix(prefix),
+			Middleware: middleware,
+			Secured:    secured,
+			Span:       spanOf(fset, call.Pos(), call.End()),
 		})
 		return true
 	})
@@ -244,9 +259,12 @@ func groupFromExpr(info *gotypes.Info, expr ast.Expr, fset *token.FileSet) (rawG
 		prefix, static = stringLiteral(call.Args[0])
 	}
 	parentPrefix := ""
+	var parentMiddleware []string
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if parentGroup, ok := groupFromExpr(info, sel.X, fset); ok {
 			parentPrefix = resolvedRawGroupPrefix(parentGroup, nil)
+			parentMiddleware = appendUniqueStrings(parentMiddleware, parentGroup.parentMiddleware...)
+			parentMiddleware = appendUniqueStrings(parentMiddleware, parentGroup.middleware...)
 		}
 	}
 	var span facts.SourceSpan
@@ -254,11 +272,13 @@ func groupFromExpr(info *gotypes.Info, expr ast.Expr, fset *token.FileSet) (rawG
 		span = spanOf(fset, call.Pos(), call.End())
 	}
 	return rawGroup{
-		parent:       receiverObject(info, call),
-		parentPrefix: parentPrefix,
-		prefix:       normalizePath(prefix),
-		static:       static,
-		span:         span,
+		parent:           receiverObject(info, call),
+		parentPrefix:     parentPrefix,
+		parentMiddleware: parentMiddleware,
+		prefix:           normalizePath(prefix),
+		middleware:       middlewareSymbols(info, call.Args[1:]),
+		static:           static,
+		span:             span,
 	}, true
 }
 
@@ -274,6 +294,34 @@ func resolveGroupPrefix(obj gotypes.Object, rawGroups map[gotypes.Object]rawGrou
 	parent := resolveGroupPrefix(group.parent, rawGroups, visiting)
 	delete(visiting, obj)
 	return joinPaths(parent, resolvedRawGroupPrefix(group, nil))
+}
+
+func resolveGroupMiddleware(
+	obj gotypes.Object,
+	rawGroups map[gotypes.Object]rawGroup,
+	groups map[gotypes.Object]*groupInfo,
+	visiting map[gotypes.Object]bool,
+) []string {
+	if obj == nil || visiting[obj] {
+		return nil
+	}
+	raw, ok := rawGroups[obj]
+	if !ok {
+		if g, seen := groups[obj]; seen {
+			return appendUniqueStrings(nil, g.middleware...)
+		}
+		return nil
+	}
+	visiting[obj] = true
+	var out []string
+	out = appendUniqueStrings(out, resolveGroupMiddleware(raw.parent, rawGroups, groups, visiting)...)
+	out = appendUniqueStrings(out, raw.parentMiddleware...)
+	out = appendUniqueStrings(out, raw.middleware...)
+	if g, seen := groups[obj]; seen {
+		out = appendUniqueStrings(out, g.middleware...)
+	}
+	delete(visiting, obj)
+	return out
 }
 
 func receiverPrefix(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, call *ast.CallExpr) string {
@@ -311,6 +359,44 @@ func prefixFromExpr(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, ex
 		return joinPaths(parent, resolvedRawGroupPrefix(group, nil))
 	}
 	return ""
+}
+
+func receiverMiddleware(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, call *ast.CallExpr) []string {
+	if obj := receiverObject(info, call); obj != nil {
+		if g, ok := groups[obj]; ok {
+			return appendUniqueStrings(nil, g.middleware...)
+		}
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+	return middlewareFromExpr(info, groups, sel.X)
+}
+
+func middlewareFromExpr(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, expr ast.Expr) []string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if obj := info.ObjectOf(e); obj != nil {
+			if g, ok := groups[obj]; ok {
+				return appendUniqueStrings(nil, g.middleware...)
+			}
+		}
+	case *ast.CallExpr:
+		group, ok := groupFromExpr(info, e, nil)
+		if !ok {
+			return nil
+		}
+		var out []string
+		if group.parent != nil {
+			if g, ok := groups[group.parent]; ok {
+				out = appendUniqueStrings(out, g.middleware...)
+			}
+		}
+		out = appendUniqueStrings(out, group.parentMiddleware...)
+		return appendUniqueStrings(out, group.middleware...)
+	}
+	return nil
 }
 
 func resolvedRawGroupPrefix(group rawGroup, parentPrefix *string) string {
@@ -421,6 +507,66 @@ func handlerSymbol(arg ast.Expr) string {
 		return e.Name
 	}
 	return ""
+}
+
+func middlewareSymbols(info *gotypes.Info, args []ast.Expr) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		if symbol := middlewareSymbol(info, arg); symbol != "" {
+			out = appendUniqueStrings(out, symbol)
+		}
+	}
+	return out
+}
+
+func middlewareSymbol(info *gotypes.Info, arg ast.Expr) string {
+	switch e := arg.(type) {
+	case *ast.CallExpr:
+		return middlewareSymbol(info, e.Fun)
+	case *ast.SelectorExpr:
+		if fn := selectedFunc(info, e); fn != nil {
+			return fn.Name()
+		}
+		return e.Sel.Name
+	case *ast.Ident:
+		if obj := info.ObjectOf(e); obj != nil {
+			return obj.Name()
+		}
+		return e.Name
+	default:
+		return ""
+	}
+}
+
+func selectedFunc(info *gotypes.Info, sel *ast.SelectorExpr) *gotypes.Func {
+	if info == nil || sel == nil {
+		return nil
+	}
+	if selection := info.Selections[sel]; selection != nil {
+		fn, _ := selection.Obj().(*gotypes.Func)
+		return fn
+	}
+	fn, _ := info.ObjectOf(sel.Sel).(*gotypes.Func)
+	return fn
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range dst {
+			if existing == value {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			dst = append(dst, value)
+		}
+	}
+	return dst
 }
 
 // stringLiteral extracts the value of a basic string-literal expression.

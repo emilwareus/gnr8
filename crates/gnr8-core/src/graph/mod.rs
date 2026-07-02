@@ -129,6 +129,9 @@ pub struct Operation {
     /// Optional static route-group/tag metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Source middleware symbols applied before the handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub middleware: Vec<String>,
     /// Path and query parameters, sorted by name.
     pub params: Vec<Param>,
     /// The request body schema reference, if a typed body was inferred.
@@ -362,12 +365,17 @@ impl Operation {
             .collect();
         responses.sort_by_key(|r| r.status);
 
+        let mut middleware = route.middleware;
+        middleware.sort();
+        middleware.dedup();
+
         Self {
             id,
             method: route.method,
             path: route.path,
             handler: route.handler,
             group: route.group,
+            middleware,
             params,
             request_body: route.request_body.map(SchemaRef::from_fact),
             request_body_required: route.request_body_required,

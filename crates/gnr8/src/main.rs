@@ -24,9 +24,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let output = Output::new(cli.json, cli.verbose);
 
-    // `inspect` analyzes a target dir directly (a dev/debug tool over `analyze::build_graph`); it is
-    // dispatched first and renders straight to stdout. The remaining commands either scaffold (`init`)
-    // or delegate to the user's `.gnr8/` child crate and own writing/policy.
+    // `inspect` renders straight to stdout. In initialized projects it delegates to the user's `.gnr8/`
+    // child pipeline, while uninitialized/direct use still analyzes the requested source path.
+    // The remaining commands either scaffold (`init`) or delegate to the user's `.gnr8/` child crate and
+    // own writing/policy.
     match &cli.command {
         Commands::Inspect { action } => run_inspect(action, output),
         Commands::Init { source, sdk } => run_init(*source, *sdk, output),
@@ -1465,30 +1466,43 @@ fn run_watch(debounce_ms: u64, output: Output) -> Result<()> {
     watch::run(&root, debounce, output.json, output.verbose)
 }
 
-/// Build the API graph for an `inspect` subcommand's target dir, render it (table or `--json`), and
-/// print it. A dev/debug tool over `analyze::build_graph` (it analyzes a directory directly, NOT through
-/// the child pipeline, since the renderers take an `ApiGraph` and the IR carries no transforms yet). The
-/// `build_graph` `CoreError` and any render error both flow through the anyhow boundary (clean message +
-/// exit 1, never a panic).
+/// Build the API graph for an `inspect` subcommand, render it (table or `--json`), and print it.
+///
+/// In a project with `.gnr8/`, inspect uses the same child `__inspect` pipeline as generation so source
+/// package filters, transforms, and resource/toolchain resolution match `generate`/`check`. Without a
+/// local `.gnr8/` workspace it falls back to direct source inspection of the provided path.
 fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     let total_start = Instant::now();
     let rendered = match action {
         InspectAction::Routes { path } => {
-            let graph = gnr8::analyze::build_graph(path)?;
+            let graph = inspect_graph(path, output)?;
             render::render_routes(&graph, output.json)?
         }
         InspectAction::Schemas { path } => {
-            let graph = gnr8::analyze::build_graph(path)?;
+            let graph = inspect_graph(path, output)?;
             render::render_schemas(&graph, output.json)?
         }
         InspectAction::Graph { path } => {
-            let graph = gnr8::analyze::build_graph(path)?;
+            let graph = inspect_graph(path, output)?;
             render::render_graph(&graph, output.json)?
         }
     };
     print!("{rendered}");
     output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
     Ok(())
+}
+
+fn inspect_graph(path: &str, output: Output) -> Result<gnr8::graph::ApiGraph> {
+    let root = project_root()?;
+    if gnr8::workspace::manifest_path(&root).is_file() {
+        output.verbose(format!(
+            "inspect: using .gnr8 pipeline at {}",
+            root.display()
+        ));
+        return Ok(child::inspect_child(&root)?);
+    }
+    output.verbose(format!("inspect: analyzing source path directly: {path}"));
+    Ok(gnr8::analyze::build_graph(path)?)
 }
 
 fn lifecycle_summary(outcome: &gnr8::lifecycle::GenerateOutcome) -> String {

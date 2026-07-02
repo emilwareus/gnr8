@@ -6,7 +6,7 @@
 //! JSON-on-stdout + an exit code — no FFI, no plugin ABI (mirrors the polint model). This module owns
 //! the HOST side: it requires the `.gnr8/` workspace, spawns the child with `current_dir = project
 //! root` (so the child's relative inputs resolve against the project), and on success parses the
-//! child's stdout as a versioned [`ArtifactBundle`].
+//! child's stdout as either a versioned [`ArtifactBundle`] or an inspect [`gnr8::graph::ApiGraph`].
 //!
 //! ## Error categorization (never a panic — RUST-04 / D-09)
 //!
@@ -62,6 +62,33 @@ pub(crate) fn run_child(
     project_root: &Path,
     subcommand: &str,
 ) -> Result<ArtifactBundle, CoreError> {
+    let (stdout, stderr) = run_child_stdout(project_root, subcommand)?;
+    let bundle = parse_bundle(stdout.trim(), &stderr)?;
+
+    // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8`, so a
+    // version skew (e.g. a pinned published `gnr8` vs a newer host) must fail with an actionable
+    // message rather than a confusing parse error or silently-wrong output.
+    if bundle.version != gnr8::runner::BUNDLE_VERSION {
+        return Err(CoreError::ChildRun {
+            message: format!(
+                "the .gnr8 generation crate emitted artifact-bundle schema version {}, but this gnr8 \
+                 supports version {}. Realign the gnr8 crate your .gnr8/ crate depends on with this \
+                 gnr8 binary (update .gnr8/Cargo.toml), then re-run.",
+                bundle.version,
+                gnr8::runner::BUNDLE_VERSION
+            ),
+        });
+    }
+    Ok(bundle)
+}
+
+/// Run the user's `.gnr8/` generation crate in inspect mode and parse the transformed graph.
+pub(crate) fn inspect_child(project_root: &Path) -> Result<gnr8::graph::ApiGraph, CoreError> {
+    let (stdout, stderr) = run_child_stdout(project_root, "__inspect")?;
+    parse_graph(stdout.trim(), &stderr)
+}
+
+fn run_child_stdout(project_root: &Path, subcommand: &str) -> Result<(String, Vec<u8>), CoreError> {
     let manifest = gnr8::workspace::manifest_path(project_root);
     if !manifest.is_file() {
         return Err(CoreError::ChildRun {
@@ -98,24 +125,10 @@ pub(crate) fn run_child(
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let bundle = parse_bundle(stdout.trim(), &output.stderr)?;
-
-    // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8`, so a
-    // version skew (e.g. a pinned published `gnr8` vs a newer host) must fail with an actionable
-    // message rather than a confusing parse error or silently-wrong output.
-    if bundle.version != gnr8::runner::BUNDLE_VERSION {
-        return Err(CoreError::ChildRun {
-            message: format!(
-                "the .gnr8 generation crate emitted artifact-bundle schema version {}, but this gnr8 \
-                 supports version {}. Realign the gnr8 crate your .gnr8/ crate depends on with this \
-                 gnr8 binary (update .gnr8/Cargo.toml), then re-run.",
-                bundle.version,
-                gnr8::runner::BUNDLE_VERSION
-            ),
-        });
-    }
-    Ok(bundle)
+    Ok((
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        output.stderr,
+    ))
 }
 
 /// Parse the child's stdout as an [`ArtifactBundle`], folding the child's stderr into the error message
@@ -126,6 +139,24 @@ fn parse_bundle(stdout: &str, stderr: &[u8]) -> Result<ArtifactBundle, CoreError
         CoreError::ChildRun {
             message: format!(
                 "the .gnr8 generation crate did not emit a parseable artifact bundle on stdout \
+                 ({err}). Got {} byte(s) of stdout.{}",
+                stdout.len(),
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Child stderr:\n{}", stderr.trim_end())
+                }
+            ),
+        }
+    })
+}
+
+fn parse_graph(stdout: &str, stderr: &[u8]) -> Result<gnr8::graph::ApiGraph, CoreError> {
+    serde_json::from_str::<gnr8::graph::ApiGraph>(stdout).map_err(|err| {
+        let stderr = String::from_utf8_lossy(stderr);
+        CoreError::ChildRun {
+            message: format!(
+                "the .gnr8 generation crate did not emit a parseable API graph on stdout \
                  ({err}). Got {} byte(s) of stdout.{}",
                 stdout.len(),
                 if stderr.trim().is_empty() {

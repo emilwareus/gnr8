@@ -589,6 +589,7 @@ impl Importer {
                     path: normalize_path(&path),
                     handler: operation_id,
                     group,
+                    middleware: Vec::new(),
                     params,
                     request_body,
                     request_body_required,

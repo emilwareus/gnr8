@@ -110,8 +110,9 @@ type Index map[string]handlerDecl
 // no longer clobber each other's prefix (WR-03), and the setup ordering is
 // enforced by construction rather than by call discipline.
 type Analyzer struct {
-	idx          Index
-	modulePrefix string
+	idx           Index
+	declsByObject map[string]handlerDecl
+	modulePrefix  string
 }
 
 // NewAnalyzer builds an Analyzer from the loaded packages and the target module
@@ -120,8 +121,9 @@ type Analyzer struct {
 // warnings (WR-02).
 func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Analyzer {
 	return &Analyzer{
-		idx:          BuildIndex(res, diags),
-		modulePrefix: module,
+		idx:           BuildIndex(res, diags),
+		declsByObject: buildDeclObjectIndex(res),
+		modulePrefix:  module,
 	}
 }
 
@@ -180,6 +182,54 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 	return idx
 }
 
+func buildDeclObjectIndex(res *load.Result) map[string]handlerDecl {
+	out := make(map[string]handlerDecl)
+	if res == nil {
+		return out
+	}
+	for _, pkg := range res.Packages {
+		if pkg.TypesInfo == nil {
+			continue
+		}
+		for _, file := range pkg.Syntax {
+			for _, d := range file.Decls {
+				fn, ok := d.(*ast.FuncDecl)
+				if !ok || fn.Name == nil {
+					continue
+				}
+				decl := handlerDecl{decl: fn, info: pkg.TypesInfo, fset: res.Fset, pkgPath: pkg.PkgPath}
+				out[funcDeclObjectKey(pkg.PkgPath, fn.Name.Pos())] = decl
+			}
+		}
+	}
+	return out
+}
+
+func funcDeclObjectKey(pkgPath string, pos token.Pos) string {
+	if pkgPath == "" || !pos.IsValid() {
+		return ""
+	}
+	return pkgPath + "@" + strconv.FormatInt(int64(pos), 10)
+}
+
+func funcObjectKey(fn *gotypes.Func) string {
+	if fn == nil || fn.Pkg() == nil {
+		return ""
+	}
+	return funcDeclObjectKey(fn.Pkg().Path(), fn.Pos())
+}
+
+func (a *Analyzer) samePackageCallee(h handlerDecl, fn *gotypes.Func) (handlerDecl, bool) {
+	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != h.pkgPath {
+		return handlerDecl{}, false
+	}
+	callee, ok := a.declsByObject[funcObjectKey(fn)]
+	if !ok || callee.pkgPath != h.pkgPath || callee.decl == nil || callee.decl.Body == nil {
+		return handlerDecl{}, false
+	}
+	return callee, true
+}
+
 // Analyze infers the request/response/param facts for one route's handler. The
 // route carries the method + normalized path so untyped-query diagnostics can name
 // the operation. Unknown handlers (no matching decl) yield empty facts, not a
@@ -201,6 +251,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	optionalBindPositions := collectOptionalBindPositions(h)
 	hasBodyBind := false
 	allBodyBindsOptional := true
+	delegatedSeen := map[string]bool{}
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -209,6 +260,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
+			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedSeen, contentTypeHint)
+			a.analyzePathHelperCall(h, call, &cf, seenParam)
 			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
 			return true
 		}
@@ -510,6 +563,165 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	_ = route
 }
 
+func (a *Analyzer) analyzePathHelperCall(
+	h handlerDecl,
+	call *ast.CallExpr,
+	cf *CodeFacts,
+	seenParam map[string]bool,
+) {
+	pname, schema, ok := a.pathParamFromHelper(h, call)
+	if !ok || seenParam["path/"+pname] {
+		return
+	}
+	seenParam["path/"+pname] = true
+	cf.Params = append(cf.Params, facts.ParamFact{
+		Name:     pname,
+		Location: "path",
+		Required: true,
+		Schema:   schema,
+		Span:     spanOf(h.fset, call.Pos()),
+	})
+}
+
+func (a *Analyzer) pathParamFromHelper(
+	h handlerDecl,
+	call *ast.CallExpr,
+) (string, facts.Type, bool) {
+	fn := calledFuncObject(h.info, call.Fun)
+	callee, ok := a.samePackageCallee(h, fn)
+	if !ok {
+		return "", facts.Type{}, false
+	}
+	sig, ok := gotypes.Unalias(h.info.TypeOf(call.Fun)).(*gotypes.Signature)
+	if !ok || sig.Params() == nil {
+		return "", facts.Type{}, false
+	}
+	schema, ok := queryHelperSchema(h.info.TypeOf(call), call)
+	if !ok {
+		return "", facts.Type{}, false
+	}
+	for i := 0; i < len(call.Args) && i < sig.Params().Len(); i++ {
+		name, ok := stringArg(call, i)
+		if !ok {
+			continue
+		}
+		if helperReadsGinParamWithVar(callee, sig.Params().At(i)) {
+			return name, schema, true
+		}
+	}
+	return "", facts.Type{}, false
+}
+
+func helperReadsGinParamWithVar(h handlerDecl, keyVar *gotypes.Var) bool {
+	if h.decl == nil || h.decl.Body == nil || keyVar == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(h.info, call)
+		if !ok || recvPkg != routes.GinPkgPath || name != "Param" || len(call.Args) == 0 {
+			return true
+		}
+		id, ok := call.Args[0].(*ast.Ident)
+		if ok && h.info.ObjectOf(id) == keyVar {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func (a *Analyzer) analyzeDelegatedResponses(
+	h handlerDecl,
+	call *ast.CallExpr,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	diags *diag.Accumulator,
+	seenHelpers map[string]bool,
+	inheritedContentTypeHint string,
+) {
+	callee, ok := a.delegatedGinContextHelper(h, call)
+	if !ok {
+		return
+	}
+	key := callee.identityKey()
+	if seenHelpers[key] {
+		return
+	}
+	seenHelpers[key] = true
+
+	contentTypeHint := inheritedContentTypeHint
+	ast.Inspect(callee.decl.Body, func(n ast.Node) bool {
+		nested, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(callee.info, nested)
+		if !ok || recvPkg != routes.GinPkgPath {
+			a.analyzeDelegatedResponses(callee, nested, route, cf, seenStatus, provisionalStatus, diags, seenHelpers, contentTypeHint)
+			return true
+		}
+		switch name {
+		case "JSON":
+			a.analyzeJSON(callee, nested, route, cf, seenStatus, provisionalStatus, diags)
+		case "Status":
+			a.analyzeStatus(callee, nested, route, cf, seenStatus, provisionalStatus, true, diags)
+		case "AbortWithStatus":
+			a.analyzeStatus(callee, nested, route, cf, seenStatus, provisionalStatus, false, diags)
+		case "Header":
+			if key, ok := stringArg(nested, 0); ok && strings.EqualFold(key, "Content-Type") {
+				if value, ok := a.stringValueOf(callee, nested.Args[1]); ok {
+					contentTypeHint = value
+				}
+			}
+		case "File", "FileAttachment":
+			a.analyzeBinaryStatus(cf, seenStatus, provisionalStatus, 200, contentTypeHint)
+		case "Data":
+			a.analyzeData(callee, nested, route, cf, seenStatus, provisionalStatus, diags)
+		case "DataFromReader":
+			a.analyzeDataFromReader(callee, nested, route, cf, seenStatus, provisionalStatus, diags)
+		case "SSEvent":
+			a.addSSEResponse(cf, seenStatus, provisionalStatus)
+		case "Stream":
+			if streamCallContainsSSEvent(callee.info, nested) {
+				a.addSSEResponse(cf, seenStatus, provisionalStatus)
+			}
+		}
+		return true
+	})
+}
+
+func (a *Analyzer) delegatedGinContextHelper(h handlerDecl, call *ast.CallExpr) (handlerDecl, bool) {
+	if !callPassesGinContext(h.info, call) {
+		return handlerDecl{}, false
+	}
+	fn := calledFuncObject(h.info, call.Fun)
+	callee, ok := a.samePackageCallee(h, fn)
+	if !ok {
+		return handlerDecl{}, false
+	}
+	return callee, true
+}
+
+func callPassesGinContext(info *gotypes.Info, call *ast.CallExpr) bool {
+	for _, arg := range call.Args {
+		if isGinContextType(info.TypeOf(arg)) {
+			return true
+		}
+	}
+	return false
+}
+
 func nestedQueryHelperOutranks(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) bool {
 	found := false
 	currentPriority := queryHelperPriority(info, helper, query)
@@ -648,6 +860,9 @@ func queryHelperSchema(t gotypes.Type, helper *ast.CallExpr) (facts.Type, bool) 
 	}
 	if named, ok := gotypes.Unalias(t).(*gotypes.Named); ok {
 		if obj := named.Obj(); obj != nil && obj.Pkg() != nil {
+			if obj.Pkg().Path() == "github.com/google/uuid" && obj.Name() == "UUID" {
+				return facts.WellKnownType(facts.WellKnownUUID), true
+			}
 			if obj.Pkg().Path() == "time" && obj.Name() == "Time" {
 				return facts.WellKnownType(facts.WellKnownDateTime), true
 			}
@@ -1134,12 +1349,12 @@ func (a *Analyzer) analyzeData(
 		diags.Warn("unsupported binary response pattern: Gin Data payload is not []byte (GO-05)", file, line)
 		return
 	}
-	contentType := ""
+	contentType := "application/octet-stream"
 	if value, ok := a.stringValueOf(h, call.Args[1]); ok {
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic (GO-05)", file, line)
+		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,
@@ -1244,19 +1459,19 @@ func (a *Analyzer) stringValueOfSeen(h handlerDecl, expr ast.Expr, seen map[stri
 	if !ok || len(call.Args) != 0 {
 		return "", false
 	}
+	if _, ok := call.Fun.(*ast.Ident); !ok {
+		return "", false
+	}
 	fn := calledFuncObject(h.info, call.Fun)
-	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != h.pkgPath {
+	callee, ok := a.samePackageCallee(h, fn)
+	if !ok {
 		return "", false
 	}
-	name := fn.Name()
-	if name == "" || seen[name] {
+	key := funcObjectKey(fn)
+	if key == "" || seen[key] {
 		return "", false
 	}
-	callee, ok := a.idx[name]
-	if !ok || callee.pkgPath != h.pkgPath || callee.decl == nil || callee.decl.Body == nil || callee.decl.Name.Pos() != fn.Pos() {
-		return "", false
-	}
-	seen[name] = true
+	seen[key] = true
 	if len(callee.decl.Body.List) != 1 {
 		return "", false
 	}
