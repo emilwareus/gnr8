@@ -116,9 +116,8 @@ fn run_goextract_with(
         cmd.args(["run", "."]);
         cmd
     };
-    cmd.arg(target_dir)
-        .args(patterns)
-        .current_dir(goextract_dir());
+    let dir = checked_sidecar_dir("goextract", goextract_dir())?;
+    cmd.arg(target_dir).args(patterns).current_dir(dir);
     let output = cmd
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
@@ -137,7 +136,8 @@ fn run_goextract_with(
 }
 
 fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
-    let source_hash = goextract_source_hash();
+    let root = checked_sidecar_dir("goextract", goextract_dir())?;
+    let source_hash = goextract_source_hash(&root);
     let dir = std::env::temp_dir()
         .join("gnr8-goextract")
         .join(source_hash);
@@ -160,7 +160,7 @@ fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
         .args(["build", "-o"])
         .arg(&binary)
         .arg(".")
-        .current_dir(goextract_dir())
+        .current_dir(&root)
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
     if !output.status.success() {
@@ -172,14 +172,26 @@ fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
     Ok(binary)
 }
 
-fn goextract_source_hash() -> String {
-    let root = goextract_dir();
+fn checked_sidecar_dir(label: &str, path: PathBuf) -> Result<PathBuf, CoreError> {
+    if path.is_dir() {
+        return Ok(path);
+    }
+    Err(CoreError::Io {
+        message: format!(
+            "{label} resource directory is missing or unreadable at {} — reinstall gnr8 or set {} to the release resource root",
+            path.display(),
+            crate::resource::GNR8_RESOURCE_DIR_ENV
+        ),
+    })
+}
+
+fn goextract_source_hash(root: &std::path::Path) -> String {
     let mut files = Vec::new();
-    collect_goextract_source_files(&root, &mut files);
+    collect_goextract_source_files(root, &mut files);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-goextract-binary-cache-v1\n");
     for path in files {
-        let rel = path.strip_prefix(&root).unwrap_or(&path);
+        let rel = path.strip_prefix(root).unwrap_or(&path);
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
         if let Ok(bytes) = std::fs::read(path) {

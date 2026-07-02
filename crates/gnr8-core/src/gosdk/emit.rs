@@ -25,8 +25,8 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, join_path, operation_api_key_headers, path_tokens,
-    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_schemes,
+    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -1080,10 +1080,9 @@ pub(crate) fn emit_compat_client_surface(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
-    auth_header: Option<&str>,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
-    emit_compat_client_prelude(&mut body, auth_header);
+    emit_compat_client_prelude(&mut body);
 
     let services = compat_services(graph);
     let query_setters = compat_query_setters(graph);
@@ -1093,7 +1092,7 @@ pub(crate) fn emit_compat_client_surface(
     writeln!(body).map_err(sink)?;
     emit_compat_api_client(&mut body, &services)?;
     for op in &graph.operations {
-        emit_compat_request(&mut body, op, graph, base_path, auth_header, &query_setters)?;
+        emit_compat_request(&mut body, op, graph, base_path, &query_setters)?;
     }
 
     Ok(file(
@@ -1115,9 +1114,303 @@ pub(crate) fn emit_compat_client_surface(
     ))
 }
 
+pub(crate) fn compat_operations_by_service(graph: &ApiGraph) -> BTreeMap<String, Vec<&Operation>> {
+    let mut grouped: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in &graph.operations {
+        grouped.entry(compat_service_name(op)).or_default().push(op);
+    }
+    grouped
+}
+
+pub(crate) fn emit_compat_errors(package: &str) -> String {
+    let body = "\
+type GenericOpenAPIError struct {
+body []byte
+model any
+error string
+}
+
+func (e GenericOpenAPIError) Error() string {
+return e.error
+}
+
+func (e GenericOpenAPIError) Body() []byte {
+return e.body
+}
+
+func (e GenericOpenAPIError) Model() any {
+return e.model
+}
+";
+    file(package, &[], body)
+}
+
+pub(crate) fn emit_compat_configuration(package: &str) -> String {
+    let body = "\
+type APIKey struct {
+Key string
+Prefix string
+}
+
+type contextKey string
+
+const ContextAPIKeys contextKey = \"apiKeys\"
+
+func WithAPIKey(ctx context.Context, name string, key APIKey) context.Context {
+if ctx == nil {
+ctx = context.Background()
+}
+values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
+next := map[string]APIKey{}
+for k, v := range values {
+next[k] = v
+}
+next[name] = key
+return context.WithValue(ctx, ContextAPIKeys, next)
+}
+
+type ServerVariable struct {
+Description string
+DefaultValue string
+EnumValues []string
+}
+
+type ServerConfiguration struct {
+URL string
+Description string
+Variables map[string]ServerVariable
+}
+
+type ServerConfigurations []ServerConfiguration
+
+type Configuration struct {
+DefaultHeader map[string]string
+UserAgent string
+Servers ServerConfigurations
+HTTPClient *http.Client
+}
+
+func NewConfiguration() *Configuration {
+return &Configuration{
+DefaultHeader: map[string]string{},
+UserAgent: \"gnr8-compat/go\",
+Servers: ServerConfigurations{{URL: \"\"}},
+HTTPClient: http.DefaultClient,
+}
+}
+
+func (c *Configuration) AddDefaultHeader(key string, value string) {
+if c.DefaultHeader == nil {
+c.DefaultHeader = map[string]string{}
+}
+c.DefaultHeader[key] = value
+}
+
+func (c *Configuration) serverURL() string {
+if c != nil && len(c.Servers) > 0 {
+return c.Servers[0].URL
+}
+return \"\"
+}
+
+func (c *Configuration) ServerURLWithContext(_ context.Context, _ string) (string, error) {
+return c.serverURL(), nil
+}
+";
+    file(package, &["context", "net/http"], body)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the OpenAPI Generator compatibility helpers are emitted as one generated support file"
+)]
+pub(crate) fn emit_compat_utils(package: &str) -> String {
+    let body = "\
+type compatNamedReader interface {
+io.Reader
+Name() string
+}
+
+func IsNil(value any) bool {
+if value == nil {
+return true
+}
+reflected := reflect.ValueOf(value)
+switch reflected.Kind() {
+case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+return reflected.IsNil()
+default:
+return false
+}
+}
+
+func compatMultipartFileBody(file any, fields map[string]any) (*bytes.Reader, string, error) {
+var buf bytes.Buffer
+writer := multipart.NewWriter(&buf)
+for key, value := range fields {
+if err := writer.WriteField(key, compatQueryValue(value)); err != nil {
+return nil, \"\", err
+}
+}
+if file != nil {
+reader, ok := file.(compatNamedReader)
+if !ok {
+return nil, \"\", fmt.Errorf(\"file must implement io.Reader and Name() string\")
+}
+part, err := writer.CreateFormFile(\"file\", filepath.Base(reader.Name()))
+if err != nil {
+return nil, \"\", err
+}
+if _, err := io.Copy(part, reader); err != nil {
+return nil, \"\", err
+}
+if closer, ok := file.(io.Closer); ok {
+_ = closer.Close()
+}
+}
+if err := writer.Close(); err != nil {
+return nil, \"\", err
+}
+return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
+}
+
+func reportError(format string, args ...any) error {
+return fmt.Errorf(format, args...)
+}
+
+func compatEncodeJSONBody(v any) (*bytes.Reader, error) {
+var buf bytes.Buffer
+if err := json.NewEncoder(&buf).Encode(v); err != nil {
+return nil, err
+}
+return bytes.NewReader(buf.Bytes()), nil
+}
+
+func compatDefaultAuthHeader() string {
+return \"Authorization\"
+}
+
+func compatQueryValue(value any) string {
+v := reflect.ValueOf(value)
+if !v.IsValid() {
+return \"\"
+}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+if v.IsNil() {
+return \"\"
+}
+return compatQueryValue(v.Elem().Interface())
+}
+if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+return fmt.Sprint(value)
+}
+parts := make([]string, 0, v.Len())
+for i := 0; i < v.Len(); i++ {
+parts = append(parts, fmt.Sprint(v.Index(i).Interface()))
+}
+return strings.Join(parts, \",\")
+}
+
+func compatSetQueryValue(q url.Values, key string, value any) {
+q.Set(key, compatQueryValue(value))
+}
+
+func parameterAddToHeaderOrQuery(headerOrQueryParams any, key string, value any, _ string) {
+switch params := headerOrQueryParams.(type) {
+case url.Values:
+params.Set(key, compatQueryValue(value))
+case http.Header:
+params.Set(key, compatQueryValue(value))
+}
+}
+
+func compatApplyAPIKey(req *http.Request, ctx context.Context, scheme string, header string) {
+if req.Header.Get(header) != \"\" || ctx == nil {
+return
+}
+values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
+apiKey, ok := values[scheme]
+if !ok {
+apiKey, ok = values[header]
+}
+if !ok || apiKey.Key == \"\" {
+return
+}
+value := apiKey.Key
+if apiKey.Prefix != \"\" {
+value = apiKey.Prefix + \" \" + value
+}
+req.Header.Set(header, value)
+}
+";
+    file(
+        package,
+        &[
+            "bytes",
+            "context",
+            "encoding/json",
+            "fmt",
+            "io",
+            "mime/multipart",
+            "net/http",
+            "net/url",
+            "path/filepath",
+            "reflect",
+            "strings",
+        ],
+        body,
+    )
+}
+
+pub(crate) fn emit_compat_api_client_file(
+    graph: &ApiGraph,
+    package: &str,
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    let services = compat_services(graph);
+    for service in &services {
+        writeln!(body, "type {service}APIService service").map_err(sink)?;
+    }
+    writeln!(body).map_err(sink)?;
+    emit_compat_api_client(&mut body, &services)?;
+    Ok(file(package, &["net/http"], &body))
+}
+
+pub(crate) fn emit_compat_api_file(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    _service: &str,
+    ops: &[&Operation],
+) -> Result<String, CoreError> {
+    let mut body = String::new();
+    let query_setters = compat_query_setters(graph);
+    let mut imports = vec!["bytes", "context", "io", "net/http", "net/url"];
+    if ops
+        .iter()
+        .any(|op| !path_tokens(&join_path(base_path, &op.path)).is_empty())
+    {
+        imports.push("fmt");
+    }
+    let mut needs_json = false;
+    for op in ops {
+        let return_model = compat_success_return_model(op, graph)?;
+        if return_model != "struct{}" && !success_responses_of(op, graph)?.has_binary_body() {
+            needs_json = true;
+        }
+        emit_compat_request(&mut body, op, graph, base_path, &query_setters)?;
+    }
+    if needs_json {
+        imports.push("encoding/json");
+    }
+    imports.sort_unstable();
+    imports.dedup();
+    Ok(file(package, &imports, &body))
+}
+
 #[allow(clippy::too_many_lines)]
-fn emit_compat_client_prelude(body: &mut String, auth_header: Option<&str>) {
-    let default_auth_header = auth_header.unwrap_or("Authorization");
+fn emit_compat_client_prelude(body: &mut String) {
+    let default_auth_header = "Authorization";
     let _ = writeln!(
         body,
         "\
@@ -1177,6 +1470,23 @@ return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
 type APIKey struct {{
 Key string
 Prefix string
+}}
+
+type contextKey string
+
+const ContextAPIKeys contextKey = \"apiKeys\"
+
+func WithAPIKey(ctx context.Context, name string, key APIKey) context.Context {{
+if ctx == nil {{
+ctx = context.Background()
+}}
+values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
+next := map[string]APIKey{{}}
+for k, v := range values {{
+next[k] = v
+}}
+next[name] = key
+return context.WithValue(ctx, ContextAPIKeys, next)
 }}
 
 type ServerVariable struct {{
@@ -1267,6 +1577,34 @@ return strings.Join(parts, \",\")
 func compatSetQueryValue(q url.Values, key string, value any) {{
 q.Set(key, compatQueryValue(value))
 }}
+
+func parameterAddToHeaderOrQuery(headerOrQueryParams any, key string, value any, _ string) {{
+switch params := headerOrQueryParams.(type) {{
+case url.Values:
+params.Set(key, compatQueryValue(value))
+case http.Header:
+params.Set(key, compatQueryValue(value))
+}}
+}}
+
+func compatApplyAPIKey(req *http.Request, ctx context.Context, scheme string, header string) {{
+if req.Header.Get(header) != \"\" || ctx == nil {{
+return
+}}
+values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
+apiKey, ok := values[scheme]
+if !ok {{
+apiKey, ok = values[header]
+}}
+if !ok || apiKey.Key == \"\" {{
+return
+}}
+value := apiKey.Key
+if apiKey.Prefix != \"\" {{
+value = apiKey.Prefix + \" \" + value
+}}
+req.Header.Set(header, value)
+}}
 ",
         quoted_string_literal(default_auth_header)
     );
@@ -1323,7 +1661,6 @@ fn emit_compat_request(
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
-    auth_header: Option<&str>,
     global_query_setters: &[(String, String)],
 ) -> Result<(), CoreError> {
     let method_name = compat_operation_name(op);
@@ -1424,8 +1761,8 @@ fn emit_compat_request(
     emit_compat_execute_body(
         body,
         op,
+        graph,
         base_path,
-        auth_header,
         body_model.as_ref().map(|body| body.required),
         &return_model,
         &path_params,
@@ -1580,8 +1917,8 @@ fn emit_compat_file_and_auth_setters(
 fn emit_compat_execute_body(
     body: &mut String,
     op: &Operation,
+    graph: &ApiGraph,
     base_path: &str,
-    auth_header: Option<&str>,
     declared_body_required: Option<bool>,
     return_model: &str,
     path_params: &[&crate::graph::Param],
@@ -1590,6 +1927,7 @@ fn emit_compat_execute_body(
     let returns_value = return_model != "struct{}";
     let returns_slice = return_model.starts_with("[]");
     let returns_map = return_model.starts_with("map[");
+    let success = success_responses_of(op, graph)?;
     if returns_value {
         writeln!(
             body,
@@ -1651,7 +1989,12 @@ fn emit_compat_execute_body(
     writeln!(body, "if reqContentType != \"\" {{").map_err(sink)?;
     writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "req.Header.Set(\"Accept\", \"application/json\")").map_err(sink)?;
+    writeln!(
+        body,
+        "req.Header.Set(\"Accept\", {})",
+        quoted_string_literal(&compat_accept_header(&success))
+    )
+    .map_err(sink)?;
     writeln!(
         body,
         "for key, value := range r.ApiService.client.cfg.DefaultHeader {{"
@@ -1662,22 +2005,15 @@ fn emit_compat_execute_body(
     writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
     writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    if let Some(header) = auth_header {
+    for scheme in operation_api_key_schemes(graph, op)? {
         writeln!(
             body,
-            "if req.Header.Get({}) == \"\" && req.Header.Get(\"Authorization\") != \"\" {{",
-            quoted_string_literal(header)
+            "compatApplyAPIKey(req, r.ctx, {}, {})",
+            quoted_string_literal(&scheme.id),
+            quoted_string_literal(&scheme.header)
         )
         .map_err(sink)?;
-        writeln!(
-            body,
-            "req.Header.Set({}, req.Header.Get(\"Authorization\"))",
-            quoted_string_literal(header)
-        )
-        .map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
     }
-    writeln!(body, "_ = compatDefaultAuthHeader()").map_err(sink)?;
     writeln!(body, "resp, err := r.ApiService.client.httpClient.Do(req)").map_err(sink)?;
     writeln!(body, "if err != nil || resp == nil {{").map_err(sink)?;
     write_compat_return(body, returns_value, "localVarReturnValue", "resp", "err")?;
@@ -1708,6 +2044,27 @@ fn emit_compat_execute_body(
     )?;
     writeln!(body, "}}").map_err(sink)?;
     if returns_value {
+        if success.has_binary_body() {
+            writeln!(
+                body,
+                "if {} {{",
+                go_status_match("resp.StatusCode", &success.binary_statuses)
+            )
+            .map_err(sink)?;
+            writeln!(body, "localVarReturnValue = localVarBody").map_err(sink)?;
+            write_compat_return(body, true, "localVarReturnValue", "resp", "nil")?;
+            writeln!(body, "}}").map_err(sink)?;
+            if !success.has_bodyless_alternative() {
+                write_compat_return(
+                    body,
+                    true,
+                    "localVarReturnValue",
+                    "resp",
+                    "&GenericOpenAPIError{body: localVarBody, error: resp.Status}",
+                )?;
+            }
+            return Ok(());
+        }
         if !returns_slice && !returns_map {
             writeln!(body, "localVarReturnValue = new({return_model})").map_err(sink)?;
         }
@@ -1734,6 +2091,17 @@ fn emit_compat_execute_body(
     }
     write_compat_return(body, returns_value, "localVarReturnValue", "resp", "nil")?;
     Ok(())
+}
+
+fn compat_accept_header(success: &SuccessResponses) -> String {
+    if success.has_binary_body() {
+        success
+            .binary_content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string())
+    } else {
+        "application/json".to_string()
+    }
 }
 
 fn emit_compat_request_url(
@@ -1944,29 +2312,7 @@ fn compat_service_name(op: &Operation) -> String {
 }
 
 fn compat_operation_name(op: &Operation) -> String {
-    if op
-        .handler
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-    {
-        return op.handler.clone();
-    }
-    let mut out = String::new();
-    for part in op.path.split('/') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let cleaned = part.trim_start_matches('{').trim_end_matches('}');
-        out.push_str(&compat_exported(cleaned));
-    }
-    out.push_str(&compat_exported(&op.method.to_ascii_lowercase()));
-    if out.is_empty() {
-        compat_exported(&op.handler)
-    } else {
-        out
-    }
+    compat_exported(&op.handler)
 }
 
 fn compat_body_setters(model: Option<&str>, service: &str) -> Vec<String> {
@@ -2086,6 +2432,9 @@ fn compat_return_type(return_model: &str) -> String {
 }
 
 fn compat_success_return_model(op: &Operation, graph: &ApiGraph) -> Result<String, CoreError> {
+    if success_responses_of(op, graph)?.has_binary_body() {
+        return Ok("[]byte".to_string());
+    }
     for resp in &op.responses {
         if !(200..300).contains(&resp.status) {
             continue;

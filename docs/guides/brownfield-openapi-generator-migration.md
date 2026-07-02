@@ -62,7 +62,7 @@ gnr8 compat go --old old-go-sdk --new generated/go
    TypeScript checks exports, API classes/factories, request aliases, method signatures, operation return wrappers, model optionality/nullability/type drift, and package entry points. Go checks exported types, exported functions, exported methods, normalized signatures, docs presence, and `go.mod` metadata.
 
 3. Fix at the profile/config layer.
-   Prefer `SdkProfile::typescript_fetch_compat()`, `SdkProfile::typescript_axios_compat()`, `SdkProfile::go_openapi_generator_compat()`, `RenameType`, `RenameOperation`, and explicit output layout/profile controls over postprocessing generated files.
+   Prefer `SdkProfile::typescript_fetch_compat()`, `SdkProfile::typescript_axios_compat()`, `SdkProfile::go_openapi_generator_compat()`, `SdkOperationAliases`, `OperationSelector`, `ApiOverrides`, and explicit output layout/profile controls over postprocessing generated files.
 
 4. Accept only explainable drift.
    The clean migration gate is: SDKs generate from the OpenAPI source without postprocessing; strict/minimal SDK outputs stay unchanged; remaining compatibility differences are either eliminated by profiles or reported by `gnr8 compat`.
@@ -105,10 +105,37 @@ Use `.source_only()` when a parent package or monorepo already owns docs/package
 Prefer graph transforms over postprocessing generated files:
 
 ```rust
+let active_school = OperationSelector::any([
+    OperationSelector::path_prefix("/v1/schools/active/"),
+    OperationSelector::path_prefix("/v1/import-jobs/"),
+]);
+let mutating = OperationSelector::methods(["POST", "PUT", "PATCH", "DELETE"]);
+
 Pipeline::new()
     .source(OpenApi::new().input("openapi.yaml"))
-    .transform(GroupOperations::new().by_path_prefix("/billing", "Billing"))
-    .transform(RenameOperation::new("getBillingInvoice", "BillingApi_getInvoice"))
+    .transform(
+        ApplySecurity::api_key("ActiveSchoolAuth", "X-Plint-School-Id")
+            .when(active_school.clone()),
+    )
+    .transform(
+        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
+            .when(OperationSelector::all([active_school, mutating])),
+    )
+    .transform(
+        ApiOverrides::new()
+            .query_param(
+                "GET",
+                "/v1/schools/active/schedule/week",
+                QueryParam::new("startDate").date().required(),
+            )
+            .binary_response("GET", "/v1/schools/active/files/{fileId}/download", 200),
+    )
+    .transform(
+        SdkOperationAliases::new()
+            .operation("GET", "/v1/schools/active/files/{fileId}/download")
+            .tag("files")
+            .name("downloadSchoolFile"),
+    )
     .target(
         TsSdk::new()
             .module("@acme/books")

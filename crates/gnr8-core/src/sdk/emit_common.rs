@@ -84,44 +84,6 @@ pub(crate) fn file_in_dir(dir: Option<&str>, file_name: &str) -> String {
     }
 }
 
-/// Resolve the one API-key header the built-in SDK clients can send.
-///
-/// No security means no auth header is emitted. A configured SDK currently supports exactly one
-/// `apiKey`/`header` scheme, matching the OpenAPI lowering contract.
-pub(crate) fn api_key_header_name(graph: &ApiGraph) -> Result<Option<String>, CoreError> {
-    let headers = api_key_header_names(graph)?;
-    match headers.as_slice() {
-        [] => Ok(None),
-        [single] => Ok(Some(single.clone())),
-        many => Err(CoreError::SdkGen {
-            message: format!(
-                "SDK targets support one apiKey/header scheme, got {} header names: {}",
-                many.len(),
-                many.join(", ")
-            ),
-        }),
-    }
-}
-
-/// Resolve the one global API-key header supported by OpenAPI-generator compatibility profiles.
-///
-/// The compat surfaces mimic upstream generator APIs and cannot safely attach route-scoped auth without
-/// changing their request/config model. Reject scoped schemes instead of sending them on every route.
-pub(crate) fn global_api_key_header_name(
-    graph: &ApiGraph,
-    target: &str,
-) -> Result<Option<String>, CoreError> {
-    if graph.security.iter().any(|scheme| !scheme.global) {
-        return Err(CoreError::SdkGen {
-            message: format!(
-                "{target} does not support route-scoped apiKey security; use the default SDK profile \
-                 or remove scoped security for this compatibility target"
-            ),
-        });
-    }
-    api_key_header_name(graph)
-}
-
 /// Resolve every API-key header the built-in SDK clients may need to send.
 pub(crate) fn api_key_header_names(graph: &ApiGraph) -> Result<Vec<String>, CoreError> {
     let schemes = api_key_security_schemes(graph)?;
@@ -136,6 +98,29 @@ pub(crate) fn operation_api_key_headers(
     graph: &ApiGraph,
     op: &Operation,
 ) -> Result<Vec<String>, CoreError> {
+    let mut headers: Vec<String> = operation_api_key_schemes(graph, op)?
+        .into_iter()
+        .map(|scheme| scheme.header)
+        .collect();
+    headers.sort();
+    headers.dedup();
+    Ok(headers)
+}
+
+/// One operation-scoped API-key scheme after global inheritance and id/header validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperationApiKeyScheme {
+    /// The OpenAPI security scheme id.
+    pub(crate) id: String,
+    /// The apiKey header name.
+    pub(crate) header: String,
+}
+
+/// Resolve the API-key schemes required by one operation, including global schemes.
+pub(crate) fn operation_api_key_schemes(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<OperationApiKeyScheme>, CoreError> {
     let schemes = api_key_security_schemes(graph)?;
     let mut scheme_ids: Vec<String> = if op.security_overrides_global {
         op.security.clone()
@@ -151,7 +136,7 @@ pub(crate) fn operation_api_key_headers(
     scheme_ids.sort();
     scheme_ids.dedup();
 
-    let mut headers = Vec::new();
+    let mut out = Vec::new();
     for scheme_id in scheme_ids {
         let Some(header) = schemes.get(&scheme_id) else {
             return Err(CoreError::SdkGen {
@@ -161,11 +146,14 @@ pub(crate) fn operation_api_key_headers(
                 ),
             });
         };
-        headers.push(header.clone());
+        out.push(OperationApiKeyScheme {
+            id: scheme_id,
+            header: header.clone(),
+        });
     }
-    headers.sort();
-    headers.dedup();
-    Ok(headers)
+    out.sort_by(|a, b| a.header.cmp(&b.header).then_with(|| a.id.cmp(&b.id)));
+    out.dedup();
+    Ok(out)
 }
 
 fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, String>, CoreError> {

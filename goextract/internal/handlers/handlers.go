@@ -113,23 +113,51 @@ type Analyzer struct {
 	idx           Index
 	declsByObject map[string]handlerDecl
 	modulePrefix  string
+	collisions    []handlerCollision
+}
+
+type handlerCollision struct {
+	name    string
+	message string
+	file    string
+	line    uint32
 }
 
 // NewAnalyzer builds an Analyzer from the loaded packages and the target module
 // path. The module prefix qualifies handler-inferred schema refs into the 02-01
-// module-relative format. diags receives any duplicate-handler-name collision
-// warnings (WR-02).
+// module-relative format. Duplicate-name collisions are retained so callers can
+// report only the ones that recognized routes actually reference (WR-02).
 func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Analyzer {
+	idx, collisions := buildIndex(res)
 	return &Analyzer{
-		idx:           BuildIndex(res, diags),
+		idx:           idx,
 		declsByObject: buildDeclObjectIndex(res),
 		modulePrefix:  module,
+		collisions:    collisions,
 	}
 }
 
 // Index exposes the underlying handler index (for callers that look up docs or
 // build their own per-route flow).
 func (a *Analyzer) Index() Index { return a.idx }
+
+// ReportRouteHandlerCollisions emits duplicate-name diagnostics only for names
+// that recognized routes actually reference. Helper/helper collisions that never
+// affect route extraction are not actionable and stay silent.
+func (a *Analyzer) ReportRouteHandlerCollisions(recognized []routes.Route, diags *diag.Accumulator) {
+	if diags == nil || len(a.collisions) == 0 {
+		return
+	}
+	routeHandlers := map[string]bool{}
+	for _, route := range recognized {
+		routeHandlers[route.Handler] = true
+	}
+	for _, collision := range a.collisions {
+		if routeHandlers[collision.name] {
+			diags.Warn(collision.message, collision.file, collision.line)
+		}
+	}
+}
 
 // BuildIndex collects every function/method declaration in the target packages,
 // keyed by its name, so routes can look up their handler by symbol.
@@ -142,7 +170,18 @@ func (a *Analyzer) Index() Index { return a.idx }
 // fully-qualified identity (package path, then receiver + file:line position), and
 // the collision is surfaced as a diagnostic so it is never silent (WR-02).
 func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
+	idx, collisions := buildIndex(res)
+	if diags != nil {
+		for _, collision := range collisions {
+			diags.Warn(collision.message, collision.file, collision.line)
+		}
+	}
+	return idx
+}
+
+func buildIndex(res *load.Result) (Index, []handlerCollision) {
 	idx := make(Index)
+	var collisions []handlerCollision
 	for _, pkg := range res.Packages {
 		if pkg.TypesInfo == nil {
 			continue
@@ -166,20 +205,20 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 					winner, loser = cand, existing
 				}
 				idx[fn.Name.Name] = winner
-				if diags != nil {
-					file, line := positionOf(loser.fset, declPos(loser.decl))
-					diags.Warn(
-						"duplicate handler name '"+fn.Name.Name+"': also declared at "+
-							loser.identityKey()+"; route lookups by bare name are ambiguous, "+
-							"keeping "+winner.identityKey()+" deterministically — qualify the "+
-							"handler or disambiguate the route (WR-02)",
-						file, line,
-					)
-				}
+				file, line := positionOf(loser.fset, declPos(loser.decl))
+				collisions = append(collisions, handlerCollision{
+					name: fn.Name.Name,
+					message: "duplicate handler name '" + fn.Name.Name + "': also declared at " +
+						loser.identityKey() + "; route lookups by bare name are ambiguous, " +
+						"keeping " + winner.identityKey() + " deterministically — qualify the " +
+						"handler or disambiguate the route (WR-02)",
+					file: file,
+					line: line,
+				})
 			}
 		}
 	}
-	return idx
+	return idx, collisions
 }
 
 func buildDeclObjectIndex(res *load.Result) map[string]handlerDecl {

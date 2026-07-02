@@ -811,6 +811,13 @@ impl QueryParam {
         self
     }
 
+    /// Set the query parameter type to an RFC-3339 full-date (`OpenAPI` `format: date`).
+    #[must_use]
+    pub fn date(mut self) -> Self {
+        self.schema = Type::WellKnown(crate::graph::WellKnown::Date);
+        self
+    }
+
     /// Mark the query parameter required.
     #[must_use]
     pub const fn required(mut self) -> Self {
@@ -1082,6 +1089,8 @@ fn apply_query_param_override(
     param: &QueryParam,
 ) -> Result<(), CoreError> {
     let op_index = find_operation_index(ir, matcher, "query parameter override")?;
+    let op_method = ir.operations[op_index].method.clone();
+    let op_path = ir.operations[op_index].path.clone();
     let op = &mut ir.operations[op_index];
     op.params
         .retain(|existing| !(existing.location == "query" && existing.name == param.name));
@@ -1098,6 +1107,7 @@ fn apply_query_param_override(
             .cmp(&b.name)
             .then_with(|| a.location.cmp(&b.location))
     });
+    remove_untyped_query_diagnostics(ir, &op_method, &op_path, &param.name);
     Ok(())
 }
 
@@ -1128,6 +1138,7 @@ fn apply_response_override(
 ) -> Result<(), CoreError> {
     let op_index = find_operation_index(ir, &override_.matcher, "response override")?;
     let body = response_override_body(ir, override_.schema_ref.as_deref())?;
+    let op_span = ir.operations[op_index].provenance.clone();
     let op = &mut ir.operations[op_index];
     op.responses
         .retain(|response| response.status != override_.status);
@@ -1142,6 +1153,14 @@ fn apply_response_override(
         ),
     });
     op.responses.sort_by_key(|response| response.status);
+    if override_.body_kind == "binary"
+        && override_
+            .content_types
+            .iter()
+            .any(|content_type| content_type == "application/octet-stream")
+    {
+        remove_binary_octet_stream_default_diagnostics(ir, &op_span);
+    }
     Ok(())
 }
 
@@ -1264,6 +1283,30 @@ fn find_operation_index(
             message: format!("{label} matched {} operations: {matcher:?}", many.len()),
         }),
     }
+}
+
+fn remove_untyped_query_diagnostics(ir: &mut ApiGraph, method: &str, path: &str, param_name: &str) {
+    let prefix = format!("untyped query param '{param_name}' on {method} {path}:");
+    ir.diagnostics
+        .retain(|diagnostic| !diagnostic.message.starts_with(&prefix));
+}
+
+fn remove_binary_octet_stream_default_diagnostics(
+    ir: &mut ApiGraph,
+    op_span: &crate::graph::SourceSpan,
+) {
+    ir.diagnostics.retain(|diagnostic| {
+        let is_same_operation = diagnostic.file == op_span.file
+            && diagnostic.line >= op_span.start_line
+            && diagnostic.line <= op_span.end_line;
+        let is_resolved_binary_default = diagnostic
+            .message
+            .contains("unsupported binary response pattern")
+            && diagnostic
+                .message
+                .contains("defaulting to application/octet-stream");
+        !(is_same_operation && is_resolved_binary_default)
+    });
 }
 
 /// Enum ordering policy for generated OpenAPI/SDK surfaces.
@@ -1446,14 +1489,72 @@ fn ensure_same_enum_members(
 #[derive(Debug, Clone)]
 pub struct ApplySecurity {
     scheme: SecurityScheme,
-    rules: Vec<SecurityRule>,
+    selectors: Vec<OperationSelector>,
 }
 
+/// Reusable operation selector for transforms that need to match routes by path, method, middleware,
+/// or boolean composition.
 #[derive(Debug, Clone)]
-enum SecurityRule {
+pub enum OperationSelector {
+    /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
     PathPrefix(String),
+    /// Match operations whose HTTP method is one of these uppercase method names.
     Methods(Vec<String>),
+    /// Match operations carrying this source middleware symbol.
     Middleware(String),
+    /// Match if any nested selector matches.
+    Any(Vec<OperationSelector>),
+    /// Match only if all nested selectors match.
+    All(Vec<OperationSelector>),
+}
+
+impl OperationSelector {
+    /// Match operations whose graph path, or base-path-joined path, starts with `prefix`.
+    #[must_use]
+    pub fn path_prefix(prefix: impl Into<String>) -> Self {
+        Self::PathPrefix(prefix.into())
+    }
+
+    /// Match operations whose HTTP method is in `methods`.
+    #[must_use]
+    pub fn methods<I, S>(methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut methods: Vec<String> = methods
+            .into_iter()
+            .map(Into::into)
+            .map(|method| method.to_ascii_uppercase())
+            .collect();
+        methods.sort();
+        methods.dedup();
+        Self::Methods(methods)
+    }
+
+    /// Match operations carrying a source middleware symbol.
+    #[must_use]
+    pub fn middleware(symbol: impl Into<String>) -> Self {
+        Self::Middleware(symbol.into())
+    }
+
+    /// Match if any nested selector matches.
+    #[must_use]
+    pub fn any<I>(selectors: I) -> Self
+    where
+        I: IntoIterator<Item = OperationSelector>,
+    {
+        Self::Any(selectors.into_iter().collect())
+    }
+
+    /// Match only if all nested selectors match.
+    #[must_use]
+    pub fn all<I>(selectors: I) -> Self
+    where
+        I: IntoIterator<Item = OperationSelector>,
+    {
+        Self::All(selectors.into_iter().collect())
+    }
 }
 
 impl ApplySecurity {
@@ -1469,60 +1570,55 @@ impl ApplySecurity {
                 name: header_name.into(),
                 global: true,
             },
-            rules: Vec::new(),
+            selectors: Vec::new(),
         }
+    }
+
+    /// Apply this scheme only to operations matched by `selector`.
+    #[must_use]
+    pub fn when(mut self, selector: OperationSelector) -> Self {
+        self.scheme.global = false;
+        self.selectors.push(selector);
+        self
     }
 
     /// Apply this scheme only to operations whose graph path, or base-path-joined path, starts with
     /// `prefix`.
     #[must_use]
-    pub fn when_path_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.scheme.global = false;
-        self.rules.push(SecurityRule::PathPrefix(prefix.into()));
-        self
+    pub fn when_path_prefix(self, prefix: impl Into<String>) -> Self {
+        self.when(OperationSelector::path_prefix(prefix))
     }
 
     /// Apply this scheme only to operations whose HTTP method is in `methods`.
     #[must_use]
-    pub fn when_methods<I, S>(mut self, methods: I) -> Self
+    pub fn when_methods<I, S>(self, methods: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.scheme.global = false;
-        let mut methods: Vec<String> = methods
-            .into_iter()
-            .map(Into::into)
-            .map(|method| method.to_ascii_uppercase())
-            .collect();
-        methods.sort();
-        methods.dedup();
-        self.rules.push(SecurityRule::Methods(methods));
-        self
+        self.when(OperationSelector::methods(methods))
     }
 
     /// Apply this scheme only to operations that carry a source middleware symbol.
     #[must_use]
-    pub fn when_middleware(mut self, symbol: impl Into<String>) -> Self {
-        self.scheme.global = false;
-        self.rules.push(SecurityRule::Middleware(symbol.into()));
-        self
+    pub fn when_middleware(self, symbol: impl Into<String>) -> Self {
+        self.when(OperationSelector::middleware(symbol))
     }
 }
 
 impl Transform for ApplySecurity {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.security.push(self.scheme.clone());
-        if self.rules.is_empty() {
+        if self.selectors.is_empty() {
             return Ok(());
         }
         let base_path = ir.base_path.clone();
         let mut matched = 0_usize;
         for op in &mut ir.operations {
             if self
-                .rules
+                .selectors
                 .iter()
-                .all(|rule| security_rule_matches(rule, op, &base_path))
+                .all(|selector| operation_selector_matches(selector, op, &base_path))
             {
                 matched += 1;
                 op.security.push(self.scheme.id.clone());
@@ -1542,21 +1638,27 @@ impl Transform for ApplySecurity {
     }
 }
 
-fn security_rule_matches(
-    rule: &SecurityRule,
+fn operation_selector_matches(
+    selector: &OperationSelector,
     op: &crate::graph::Operation,
     base_path: &str,
 ) -> bool {
-    match rule {
-        SecurityRule::PathPrefix(prefix) => {
+    match selector {
+        OperationSelector::PathPrefix(prefix) => {
             op.path.starts_with(prefix)
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
         }
-        SecurityRule::Methods(methods) => methods.iter().any(|method| method == &op.method),
-        SecurityRule::Middleware(symbol) => op
+        OperationSelector::Methods(methods) => methods.iter().any(|method| method == &op.method),
+        OperationSelector::Middleware(symbol) => op
             .middleware
             .iter()
             .any(|middleware| middleware_symbol_matches(middleware, symbol)),
+        OperationSelector::Any(selectors) => selectors
+            .iter()
+            .any(|selector| operation_selector_matches(selector, op, base_path)),
+        OperationSelector::All(selectors) => selectors
+            .iter()
+            .all(|selector| operation_selector_matches(selector, op, base_path)),
     }
 }
 
@@ -1706,6 +1808,108 @@ impl Transform for GroupOperations {
         }
         Ok(())
     }
+}
+
+/// Route-scoped SDK operation aliases for preserving an existing public SDK surface.
+///
+/// These aliases are user-supplied code-as-config metadata. They do not parse another generator's
+/// output; they match the neutral graph route and set the operation group/tag and generated operation
+/// name that SDK targets already consume.
+#[derive(Debug, Clone, Default)]
+pub struct SdkOperationAliases {
+    aliases: Vec<SdkOperationAlias>,
+}
+
+#[derive(Debug, Clone)]
+struct SdkOperationAlias {
+    matcher: OperationMatcher,
+    tag: Option<String>,
+    name: Option<String>,
+}
+
+impl SdkOperationAliases {
+    /// Create an empty operation alias set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start configuring an operation alias matched by method and graph path.
+    #[must_use]
+    pub fn operation(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
+        self.aliases.push(SdkOperationAlias {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            tag: None,
+            name: None,
+        });
+        self
+    }
+
+    /// Set the SDK group/tag for the most recently configured operation alias.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        if let Some(alias) = self.aliases.last_mut() {
+            alias.tag = Some(tag.into());
+        }
+        self
+    }
+
+    /// Set the SDK operation name for the most recently configured operation alias.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        if let Some(alias) = self.aliases.last_mut() {
+            alias.name = Some(name.into());
+        }
+        self
+    }
+}
+
+impl Transform for SdkOperationAliases {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        for alias in &self.aliases {
+            if alias.tag.is_none() && alias.name.is_none() {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "SDK operation alias has no tag or name: {:?}",
+                        alias.matcher
+                    ),
+                });
+            }
+            let op_index = find_operation_index(ir, &alias.matcher, "SDK operation alias")?;
+            let op = &mut ir.operations[op_index];
+            if let Some(tag) = &alias.tag {
+                op.group = Some(tag.clone());
+            }
+            if let Some(name) = &alias.name {
+                op.id.clone_from(name);
+                op.handler.clone_from(name);
+            }
+        }
+        ensure_unique_operation_ids(ir)?;
+        Ok(())
+    }
+}
+
+fn ensure_unique_operation_ids(ir: &ApiGraph) -> Result<(), CoreError> {
+    for (index, op) in ir.operations.iter().enumerate() {
+        if ir
+            .operations
+            .iter()
+            .skip(index + 1)
+            .any(|other| other.id == op.id)
+        {
+            return Err(CoreError::Config {
+                message: format!(
+                    "SDK operation alias produced duplicate operation id {:?}",
+                    op.id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -3144,13 +3348,13 @@ mod tests {
     use super::{
         sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk,
         GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, PostProcess, PySdk, QueryParam, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source,
-        StaticFiles, Target, Transform, TsSdk,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
+        QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{
-        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+        ApiGraph, Diagnostic, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
     };
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::typescript::TsCompatibility;
@@ -3386,6 +3590,108 @@ mod tests {
     }
 
     #[test]
+    fn apply_security_accepts_reusable_composed_operation_selectors() {
+        let active_school = OperationSelector::any([
+            OperationSelector::path_prefix("/v1/schools/active/"),
+            OperationSelector::path_prefix("/v1/import-jobs/"),
+        ]);
+        let mutating = OperationSelector::methods(["POST", "PUT", "PATCH", "DELETE"]);
+
+        let mut ir = ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "readActive".to_string(),
+                    method: "GET".to_string(),
+                    path: "/v1/schools/active/files".to_string(),
+                    handler: "readActive".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "createActive".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/schools/active/files".to_string(),
+                    handler: "createActive".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "deleteGovernance".to_string(),
+                    method: "DELETE".to_string(),
+                    path: "/v1/governance/legal-holds/book/1".to_string(),
+                    handler: "deleteGovernance".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "readGovernance".to_string(),
+                    method: "GET".to_string(),
+                    path: "/v1/governance/legal-holds/book/1".to_string(),
+                    handler: "readGovernance".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApplySecurity::api_key("ActiveSchoolAuth", "X-Plint-School-Id")
+            .when(active_school.clone())
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
+            .when(OperationSelector::all([
+                OperationSelector::any([
+                    active_school,
+                    OperationSelector::path_prefix("/v1/governance/"),
+                ]),
+                mutating,
+            ]))
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].security, vec!["ActiveSchoolAuth"]);
+        assert_eq!(
+            ir.operations[1].security,
+            vec!["ActiveSchoolAuth", "CSRFAuth"]
+        );
+        assert_eq!(ir.operations[2].security, vec!["CSRFAuth"]);
+        assert!(ir.operations[3].security.is_empty());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn api_overrides_can_patch_query_body_binary_and_sse_facts() {
         let mut ir = ApiGraph {
@@ -3496,6 +3802,164 @@ mod tests {
             yaml.contains("'#/components/schemas/SyncStreamEnvelope'"),
             "{yaml}"
         );
+    }
+
+    #[test]
+    fn query_param_date_lowers_to_openapi_date_and_cleans_untyped_diagnostic() {
+        let mut ir = ApiGraph {
+            operations: vec![Operation {
+                id: "listSchedule".to_string(),
+                method: "GET".to_string(),
+                path: "/schedule/week".to_string(),
+                handler: "listSchedule".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params: vec![],
+                request_body: None,
+                request_body_required: true,
+                request_body_content_type: None,
+                responses: vec![],
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: span(),
+            }],
+            diagnostics: vec![Diagnostic {
+                severity: "WARN".to_string(),
+                message:
+                    "untyped query param 'startDate' on GET /schedule/week: defaulting to string"
+                        .to_string(),
+                file: "handlers.go".to_string(),
+                line: 12,
+            }],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .query_param(
+                "GET",
+                "/schedule/week",
+                QueryParam::new("startDate").date().required(),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert!(ir.diagnostics.is_empty());
+        let mut out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let yaml = out.files()[0].text.as_str();
+        assert!(yaml.contains("name: startDate"), "{yaml}");
+        assert!(yaml.contains("format: date"), "{yaml}");
+        assert!(!yaml.contains("format: date-time"), "{yaml}");
+    }
+
+    #[test]
+    fn binary_response_override_cleans_resolved_octet_stream_diagnostic_only_for_that_operation() {
+        let mut ir = ApiGraph {
+            operations: vec![Operation {
+                id: "downloadFile".to_string(),
+                method: "GET".to_string(),
+                path: "/files/{fileId}/download".to_string(),
+                handler: "downloadFile".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params: vec![],
+                request_body: None,
+                request_body_required: true,
+                request_body_content_type: None,
+                responses: vec![],
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: SourceSpan {
+                    file: "handlers.go".to_string(),
+                    start_line: 10,
+                    end_line: 20,
+                },
+            }],
+            diagnostics: vec![
+                Diagnostic {
+                    severity: "WARN".to_string(),
+                    message: "unsupported binary response pattern on GET /files/{fileId}/download: defaulting to application/octet-stream".to_string(),
+                    file: "handlers.go".to_string(),
+                    line: 12,
+                },
+                Diagnostic {
+                    severity: "WARN".to_string(),
+                    message: "unsupported binary response pattern on GET /other: defaulting to application/octet-stream".to_string(),
+                    file: "handlers.go".to_string(),
+                    line: 30,
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .binary_response("GET", "/files/{fileId}/download", 200)
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.diagnostics.len(), 1);
+        assert!(ir.diagnostics[0].message.contains("/other"));
+    }
+
+    #[test]
+    fn sdk_operation_aliases_patch_group_and_sdk_operation_name() {
+        let mut ir = ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "download".to_string(),
+                    method: "GET".to_string(),
+                    path: "/v1/files/{fileId}/download".to_string(),
+                    handler: "download".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "search".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/coursework/search".to_string(),
+                    handler: "search".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        SdkOperationAliases::new()
+            .operation("GET", "/v1/files/{fileId}/download")
+            .tag("files")
+            .name("downloadSchoolFile")
+            .operation("POST", "/v1/coursework/search")
+            .tag("coursework")
+            .name("searchCoursework")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].group.as_deref(), Some("files"));
+        assert_eq!(ir.operations[0].id, "downloadSchoolFile");
+        assert_eq!(ir.operations[0].handler, "downloadSchoolFile");
+        assert_eq!(ir.operations[1].group.as_deref(), Some("coursework"));
+        assert_eq!(ir.operations[1].id, "searchCoursework");
+        assert_eq!(ir.operations[1].handler, "searchCoursework");
     }
 
     #[test]

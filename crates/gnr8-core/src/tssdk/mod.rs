@@ -22,8 +22,8 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_in_dir, file_stem,
-    global_api_key_header_name, join_path, model_file_name, path_tokens, path_tokens_match,
+    api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
+    model_file_name, operation_api_key_schemes, path_tokens, path_tokens_match,
     quoted_string_literal, request_body_model_of, split_words, success_responses_of,
     validate_sdk_base_path,
 };
@@ -218,10 +218,13 @@ pub(crate) fn generate_files_with_profile_options(
                 .to_string(),
         });
     }
-    if profile.is_minimal() || profile.is_typescript_fetch_compat() {
+    if profile.is_minimal() {
         return generate_files_with_layout_options(
             graph, package, base_path, layout, aliases, options,
         );
+    }
+    if profile.is_typescript_fetch_compat() {
+        return generate_typescript_fetch_compat_files(graph, package, base_path, aliases, options);
     }
     if profile.is_typescript_axios_compat() {
         return generate_openapi_generator_compat_files(
@@ -241,12 +244,11 @@ fn generate_openapi_generator_compat_files(
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
-    let auth_header = global_api_key_header_name(graph, "TypeScript axios compatibility profile")?;
     let resolved_aliases = aliases.resolve(graph)?;
     let mut files = vec![
         SdkFile {
             name: "api.ts".to_string(),
-            contents: emit_axios_api(graph, base_path, auth_header.as_deref(), options.response)?,
+            contents: emit_axios_api(graph, base_path, options.response)?,
         },
         SdkFile {
             name: "base.ts".to_string(),
@@ -283,6 +285,590 @@ fn generate_openapi_generator_compat_files(
     Ok(files)
 }
 
+fn generate_typescript_fetch_compat_files(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    aliases: &SdkTypeAliases,
+    options: TsSdkOptions,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    validate_sdk_base_path(base_path)?;
+    check_unique_schema_names(graph, "TypeScript SDK")?;
+
+    let resolved_aliases = aliases.resolve(graph)?;
+    let mut files = vec![
+        SdkFile {
+            name: "apis/index.ts".to_string(),
+            contents: emit_fetch_api(graph, base_path)?,
+        },
+        SdkFile {
+            name: "index.ts".to_string(),
+            contents: emit_fetch_index(),
+        },
+        SdkFile {
+            name: "models/index.ts".to_string(),
+            contents: emit::emit_models_openapi_generator_compat(
+                graph,
+                package,
+                &resolved_aliases,
+                options.model_properties,
+                options.nullable,
+            )?,
+        },
+        SdkFile {
+            name: "runtime.ts".to_string(),
+            contents: emit_fetch_runtime(),
+        },
+        SdkFile {
+            name: "package.json".to_string(),
+            contents: emit_fetch_package_json(package),
+        },
+    ];
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
+fn emit_fetch_index() -> String {
+    "\
+export * from \"./runtime\";
+export * from \"./apis\";
+export * from \"./models\";
+"
+    .to_string()
+}
+
+fn emit_fetch_package_json(package: &str) -> String {
+    format!(
+        "{{
+  \"name\": {},
+  \"version\": \"0.1.0\",
+  \"type\": \"module\",
+  \"main\": \"./index.js\",
+  \"types\": \"./index.d.ts\"
+}}
+",
+        quoted_string_literal(package)
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the typescript-fetch compatibility runtime is emitted as one generated runtime.ts file"
+)]
+fn emit_fetch_runtime() -> String {
+    "\
+export type HTTPHeaders = Record<string, string>;
+export type HTTPQuery = Record<string, unknown>;
+export type HTTPMethod = \"GET\" | \"POST\" | \"PUT\" | \"PATCH\" | \"DELETE\" | \"HEAD\" | \"OPTIONS\";
+export type ApiKey = string | ((name: string) => string | Promise<string>);
+
+export interface ConfigurationParameters {
+  basePath?: string;
+  fetchApi?: typeof fetch;
+  middleware?: Middleware[];
+  headers?: HTTPHeaders;
+  credentials?: RequestCredentials;
+  apiKey?: ApiKey;
+  apiKeys?: Record<string, ApiKey>;
+}
+
+export class Configuration {
+  public readonly basePath: string;
+  public readonly fetchApi: typeof fetch;
+  public readonly middleware: Middleware[];
+  public readonly headers: HTTPHeaders;
+  public readonly credentials?: RequestCredentials;
+  private readonly apiKey?: ApiKey;
+  private readonly apiKeys: Record<string, ApiKey>;
+
+  constructor(parameters: ConfigurationParameters = {}) {
+    this.basePath = (parameters.basePath ?? \"\").replace(/\\/+$/, \"\");
+    this.fetchApi = parameters.fetchApi ?? fetch;
+    this.middleware = parameters.middleware ?? [];
+    this.headers = parameters.headers ?? {};
+    this.credentials = parameters.credentials;
+    this.apiKey = parameters.apiKey;
+    this.apiKeys = parameters.apiKeys ?? {};
+  }
+
+  async getApiKey(...names: string[]): Promise<string | undefined> {
+    for (const name of names) {
+      const value = this.apiKeys[name];
+      if (value !== undefined) {
+        return resolveApiKey(value, name);
+      }
+    }
+    if (this.apiKey !== undefined) {
+      return resolveApiKey(this.apiKey, names[0] ?? \"apiKey\");
+    }
+    return undefined;
+  }
+
+  withMiddleware(...middleware: Middleware[]): Configuration {
+    return new Configuration({
+      basePath: this.basePath,
+      fetchApi: this.fetchApi,
+      middleware: this.middleware.concat(middleware),
+      headers: this.headers,
+      credentials: this.credentials,
+      apiKey: this.apiKey,
+      apiKeys: { ...this.apiKeys },
+    });
+  }
+}
+
+async function resolveApiKey(apiKey: ApiKey, name: string): Promise<string> {
+  if (typeof apiKey === \"function\") {
+    return await apiKey(name);
+  }
+  return apiKey;
+}
+
+export interface RequestOpts {
+  path: string;
+  method: HTTPMethod;
+  headers?: HTTPHeaders;
+  query?: HTTPQuery;
+  body?: unknown;
+}
+
+export interface RequestContext {
+  url: string;
+  init: RequestInit;
+}
+
+export interface ResponseContext {
+  response: Response;
+}
+
+export interface ErrorContext {
+  error: unknown;
+  url: string;
+  init: RequestInit;
+}
+
+export interface Middleware {
+  pre?(context: RequestContext): Promise<RequestContext | void> | RequestContext | void;
+  post?(context: ResponseContext): Promise<Response | void> | Response | void;
+  onError?(context: ErrorContext): Promise<Response | void> | Response | void;
+}
+
+export interface ApiResponse<T> {
+  raw: Response;
+  value(): Promise<T>;
+}
+
+export class JSONApiResponse<T> implements ApiResponse<T> {
+  constructor(
+    public readonly raw: Response,
+    private readonly transformer: (json: unknown) => T | Promise<T> = (json) => json as T,
+  ) {}
+
+  async value(): Promise<T> {
+    return await this.transformer(await this.raw.json());
+  }
+}
+
+export class VoidApiResponse implements ApiResponse<void> {
+  constructor(public readonly raw: Response) {}
+
+  async value(): Promise<void> {
+    return undefined;
+  }
+}
+
+export class BlobApiResponse implements ApiResponse<Blob> {
+  constructor(public readonly raw: Response) {}
+
+  async value(): Promise<Blob> {
+    return await this.raw.blob();
+  }
+}
+
+export class ResponseError extends Error {
+  constructor(public readonly response: Response, message?: string) {
+    super(message ?? `Response returned status code ${response.status}`);
+    this.name = \"ResponseError\";
+  }
+}
+
+export class FetchError extends Error {
+  constructor(public readonly cause: unknown, message?: string) {
+    super(message ?? \"The request failed and no response was returned\");
+    this.name = \"FetchError\";
+  }
+}
+
+export class BaseAPI {
+  protected readonly configuration: Configuration;
+
+  constructor(configuration: Configuration = new Configuration()) {
+    this.configuration = configuration;
+  }
+
+  withMiddleware(...middleware: Middleware[]): this {
+    const next = Object.create(this);
+    next.configuration = this.configuration.withMiddleware(...middleware);
+    return next;
+  }
+
+  protected async request(context: RequestOpts, initOverrides: RequestInit = {}): Promise<Response> {
+    const query = querystring(context.query ?? {});
+    const url = `${this.configuration.basePath}${context.path}${query ? `?${query}` : \"\"}`;
+    const headers: HTTPHeaders = {
+      ...this.configuration.headers,
+      ...(context.headers ?? {}),
+      ...((initOverrides.headers as HTTPHeaders | undefined) ?? {}),
+    };
+    const init: RequestInit = {
+      ...initOverrides,
+      method: context.method,
+      headers,
+      credentials: initOverrides.credentials ?? this.configuration.credentials,
+    };
+    if (context.body !== undefined) {
+      if (isBodyInit(context.body)) {
+        init.body = context.body;
+      } else {
+        if (headers[\"Content-Type\"] === undefined) {
+          headers[\"Content-Type\"] = \"application/json\";
+        }
+        init.body = JSON.stringify(context.body);
+      }
+    }
+
+    let requestContext: RequestContext = { url, init };
+    for (const middleware of this.configuration.middleware) {
+      if (middleware.pre) {
+        requestContext = (await middleware.pre(requestContext)) ?? requestContext;
+      }
+    }
+
+    let response: Response | undefined;
+    try {
+      response = await this.configuration.fetchApi(requestContext.url, requestContext.init);
+    } catch (error) {
+      for (const middleware of this.configuration.middleware) {
+        if (middleware.onError) {
+          response = (await middleware.onError({ error, url: requestContext.url, init: requestContext.init })) ?? response;
+        }
+      }
+      if (response === undefined) {
+        throw new FetchError(error);
+      }
+    }
+
+    for (const middleware of this.configuration.middleware) {
+      if (middleware.post) {
+        response = (await middleware.post({ response })) ?? response;
+      }
+    }
+    return response;
+  }
+}
+
+function querystring(params: HTTPQuery): string {
+  const searchParams = new URLSearchParams();
+  for (const key of Object.keys(params)) {
+    const value = params[key];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        searchParams.append(key, String(item));
+      }
+    } else {
+      searchParams.set(key, String(value));
+    }
+  }
+  return searchParams.toString();
+}
+
+function isBodyInit(value: unknown): value is BodyInit {
+  return typeof value === \"string\"
+    || value instanceof Blob
+    || value instanceof FormData
+    || value instanceof URLSearchParams
+    || value instanceof ArrayBuffer;
+}
+"
+    .to_string()
+}
+
+fn emit_fetch_api(graph: &ApiGraph, base_path: &str) -> Result<String, crate::CoreError> {
+    let mut out = String::new();
+    out.push_str(
+        "\
+import * as runtime from \"../runtime\";
+import * as models from \"../models\";
+
+",
+    );
+    for (service, ops) in grouped_operations(graph) {
+        let class_name = api_class_name(&service);
+        for op in &ops {
+            emit_fetch_request_alias(&mut out, graph, op)?;
+        }
+        writeln!(out, "export class {class_name} extends runtime.BaseAPI {{")
+            .map_err(ts_mod_sink)?;
+        for op in &ops {
+            emit_fetch_operation_methods(&mut out, graph, base_path, op)?;
+        }
+        writeln!(out, "}}\n").map_err(ts_mod_sink)?;
+    }
+    Ok(out)
+}
+
+fn emit_fetch_request_alias(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    emit_axios_request_alias(out, graph, op)
+}
+
+#[allow(clippy::too_many_lines)]
+fn emit_fetch_operation_methods(
+    out: &mut String,
+    graph: &ApiGraph,
+    base_path: &str,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    let method_name = emit::camel(&op.handler);
+    let raw_method_name = format!("{method_name}Raw");
+    let request_name = request_alias_name(op);
+    let request_fields = request_fields(graph, op)?;
+    let request_default = if request_fields.iter().any(|field| field.required) {
+        ""
+    } else {
+        " = {}"
+    };
+    let success = success_responses_of(op, graph)?;
+    let data_ty = ts_success_data_type(&success);
+
+    writeln!(
+        out,
+        "  async {raw_method_name}(requestParameters: {request_name}{request_default}, initOverrides: RequestInit = {{}}): Promise<runtime.ApiResponse<{data_ty}>> {{"
+    )
+    .map_err(ts_mod_sink)?;
+    emit_fetch_path(out, base_path, op)?;
+    emit_fetch_query(out, op)?;
+    writeln!(
+        out,
+        "    const headerParameters: runtime.HTTPHeaders = {{}};"
+    )
+    .map_err(ts_mod_sink)?;
+    for (auth_index, (header, names)) in operation_auth_header_names(graph, op)?
+        .into_iter()
+        .enumerate()
+    {
+        let auth_var = format!("apiKey{auth_index}");
+        writeln!(
+            out,
+            "    const {} = await this.configuration.getApiKey({});",
+            auth_var,
+            names
+                .iter()
+                .map(|name| quoted_string_literal(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    if ({auth_var} !== undefined) {{").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      headerParameters[{}] = {};",
+            quoted_string_literal(&header),
+            auth_var
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    }
+    let body_model = request_body_model_of(op, graph)?;
+    writeln!(out, "    const response = await this.request({{").map_err(ts_mod_sink)?;
+    writeln!(out, "      path: localVarPath,").map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "      method: {},",
+        quoted_string_literal(&op.method.to_uppercase())
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "      headers: headerParameters,").map_err(ts_mod_sink)?;
+    writeln!(out, "      query: queryParameters,").map_err(ts_mod_sink)?;
+    if let Some(body) = &body_model {
+        if body.required {
+            writeln!(out, "      body: requestParameters.body,").map_err(ts_mod_sink)?;
+        } else {
+            writeln!(
+                out,
+                "      ...(requestParameters.body === undefined ? {{}} : {{ body: requestParameters.body }}),"
+            )
+            .map_err(ts_mod_sink)?;
+        }
+    }
+    writeln!(out, "    }}, initOverrides);").map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "    if (response.status < 200 || response.status >= 300) {{"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "      throw new runtime.ResponseError(response);").map_err(ts_mod_sink)?;
+    writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    emit_fetch_api_response(out, &success)?;
+    writeln!(out, "  }}").map_err(ts_mod_sink)?;
+
+    writeln!(
+        out,
+        "\n  async {method_name}(requestParameters: {request_name}{request_default}, initOverrides: RequestInit = {{}}): Promise<{data_ty}> {{"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(
+        out,
+        "    const response = await this.{raw_method_name}(requestParameters, initOverrides);"
+    )
+    .map_err(ts_mod_sink)?;
+    writeln!(out, "    return await response.value();").map_err(ts_mod_sink)?;
+    writeln!(out, "  }}").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_fetch_api_response(
+    out: &mut String,
+    success: &crate::sdk::emit_common::SuccessResponses,
+) -> Result<(), crate::CoreError> {
+    if success.has_binary_body() {
+        if success.has_bodyless_alternative() {
+            writeln!(
+                out,
+                "    if (![{}].includes(response.status)) {{",
+                success
+                    .binary_statuses
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(
+                out,
+                "      return new runtime.VoidApiResponse(response) as runtime.ApiResponse<{data_ty}>;",
+                data_ty = ts_success_data_type(success)
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+        writeln!(out, "    return new runtime.BlobApiResponse(response);").map_err(ts_mod_sink)?;
+        return Ok(());
+    }
+    if let Some(model) = &success.body_model {
+        if success.has_bodyless_alternative() {
+            writeln!(
+                out,
+                "    if (![{}].includes(response.status)) {{",
+                success
+                    .body_statuses
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(
+                out,
+                "      return new runtime.VoidApiResponse(response) as runtime.ApiResponse<{data_ty}>;",
+                data_ty = ts_success_data_type(success)
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+        writeln!(
+            out,
+            "    return new runtime.JSONApiResponse(response, (json) => json as models.{model});"
+        )
+        .map_err(ts_mod_sink)?;
+        return Ok(());
+    }
+    writeln!(out, "    return new runtime.VoidApiResponse(response);").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_fetch_path(
+    out: &mut String,
+    base_path: &str,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    let mut template = join_path(base_path, &op.path);
+    let tokens = path_tokens(&template);
+    let mut param_set: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|param| param.location == "path")
+        .map(|param| param.name.as_str())
+        .collect();
+    param_set.sort_unstable();
+    if !path_tokens_match(&tokens, &param_set) {
+        return Err(crate::CoreError::SdkGen {
+            message: format!(
+                "operation '{}' path '{}' templated tokens {:?} do not match its path params {:?}",
+                op.id, template, tokens, param_set
+            ),
+        });
+    }
+    for param in op.params.iter().filter(|param| param.location == "path") {
+        let ident = emit::camel(&param.name);
+        template = template.replace(
+            &format!("{{{}}}", param.name),
+            &format!("${{encodeURIComponent(String(requestParameters.{ident}))}}"),
+        );
+    }
+    writeln!(out, "    const localVarPath = `{template}`;").map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_fetch_query(out: &mut String, op: &Operation) -> Result<(), crate::CoreError> {
+    writeln!(out, "    const queryParameters: runtime.HTTPQuery = {{}};").map_err(ts_mod_sink)?;
+    for param in op.params.iter().filter(|param| param.location == "query") {
+        let ident = emit::camel(&param.name);
+        if param.required {
+            writeln!(
+                out,
+                "    queryParameters[{}] = requestParameters.{ident};",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(ts_mod_sink)?;
+        } else {
+            writeln!(out, "    if (requestParameters.{ident} !== undefined) {{")
+                .map_err(ts_mod_sink)?;
+            writeln!(
+                out,
+                "      queryParameters[{}] = requestParameters.{ident};",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(ts_mod_sink)?;
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn operation_auth_header_names(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for scheme in operation_api_key_schemes(graph, op)? {
+        let names = grouped.entry(scheme.header.clone()).or_default();
+        names.push(scheme.id);
+        names.push(scheme.header);
+    }
+    for names in grouped.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    Ok(grouped.into_iter().collect())
+}
+
 fn emit_axios_configuration() -> String {
     "\
 import type { AxiosRequestConfig } from \"axios\";
@@ -292,21 +878,33 @@ export type ApiKey = string | (() => string | Promise<string>);
 export interface ConfigurationParameters {
   basePath?: string;
   apiKey?: ApiKey;
+  apiKeys?: Record<string, ApiKey>;
   baseOptions?: AxiosRequestConfig;
 }
 
 export class Configuration {
   public readonly basePath: string;
   public readonly apiKey?: ApiKey;
+  public readonly apiKeys: Record<string, ApiKey>;
   public readonly baseOptions?: AxiosRequestConfig;
 
   constructor(parameters: ConfigurationParameters = {}) {
     this.basePath = (parameters.basePath ?? \"\").replace(/\\/+$/, \"\");
     this.apiKey = parameters.apiKey;
+    this.apiKeys = parameters.apiKeys ?? {};
     this.baseOptions = parameters.baseOptions;
   }
 
-  async getApiKey(): Promise<string | undefined> {
+  async getApiKey(...names: string[]): Promise<string | undefined> {
+    for (const name of names) {
+      const value = this.apiKeys[name];
+      if (typeof value === \"function\") {
+        return await value();
+      }
+      if (value !== undefined) {
+        return value;
+      }
+    }
     if (typeof this.apiKey === \"function\") {
       return await this.apiKey();
     }
@@ -374,7 +972,6 @@ fn emit_axios_package_json(package: &str) -> String {
 fn emit_axios_api(
     graph: &ApiGraph,
     base_path: &str,
-    auth_header: Option<&str>,
     response_policy: TsResponsePolicy,
 ) -> Result<String, crate::CoreError> {
     let mut out = String::new();
@@ -403,14 +1000,7 @@ import * as models from \"./models\";
         }
         writeln!(out, "export class {class_name} extends BaseAPI {{").map_err(ts_mod_sink)?;
         for op in &ops {
-            emit_axios_operation_method(
-                &mut out,
-                graph,
-                base_path,
-                op,
-                auth_header,
-                response_policy,
-            )?;
+            emit_axios_operation_method(&mut out, graph, base_path, op, response_policy)?;
         }
         writeln!(out, "}}\n").map_err(ts_mod_sink)?;
         emit_axios_factory(&mut out, graph, &class_name, &ops, response_policy)?;
@@ -465,7 +1055,6 @@ fn emit_axios_operation_method(
     graph: &ApiGraph,
     base_path: &str,
     op: &Operation,
-    auth_header: Option<&str>,
     response_policy: TsResponsePolicy,
 ) -> Result<(), crate::CoreError> {
     let method_name = emit::camel(&op.handler);
@@ -487,31 +1076,36 @@ fn emit_axios_operation_method(
     .map_err(ts_mod_sink)?;
     emit_axios_path(out, base_path, op)?;
     emit_axios_query(out, op)?;
-    if let Some(header) = auth_header {
+    writeln!(
+        out,
+        "    const localVarHeaderParameter: Record<string, string> = {{}};"
+    )
+    .map_err(ts_mod_sink)?;
+    for (auth_index, (header, names)) in operation_auth_header_names(graph, op)?
+        .into_iter()
+        .enumerate()
+    {
+        let auth_var = format!("apiKey{auth_index}");
         writeln!(
             out,
-            "    const localVarHeaderParameter: Record<string, string> = {{}};"
+            "    const {} = await this.configuration.getApiKey({});",
+            auth_var,
+            names
+                .iter()
+                .map(|name| quoted_string_literal(name))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
         .map_err(ts_mod_sink)?;
+        writeln!(out, "    if ({auth_var} !== undefined) {{").map_err(ts_mod_sink)?;
         writeln!(
             out,
-            "    const apiKey = await this.configuration.getApiKey();"
-        )
-        .map_err(ts_mod_sink)?;
-        writeln!(out, "    if (apiKey !== undefined) {{").map_err(ts_mod_sink)?;
-        writeln!(
-            out,
-            "      localVarHeaderParameter[{}] = apiKey;",
-            quoted_string_literal(header)
+            "      localVarHeaderParameter[{}] = {};",
+            quoted_string_literal(&header),
+            auth_var
         )
         .map_err(ts_mod_sink)?;
         writeln!(out, "    }}").map_err(ts_mod_sink)?;
-    } else {
-        writeln!(
-            out,
-            "    const localVarHeaderParameter: Record<string, string> = {{}};"
-        )
-        .map_err(ts_mod_sink)?;
     }
     let body_model = request_body_model_of(op, graph)?;
     if let Some(body_model) = &body_model {
@@ -895,7 +1489,7 @@ mod tests {
         generate, generate_files_with_profile, generate_files_with_profile_options,
         generate_with_layout, split_bundle,
     };
-    use crate::graph::{ApiGraph, Param, Prim, SourceSpan, Type};
+    use crate::graph::{ApiGraph, Param, Prim, Response, SecurityScheme, SourceSpan, Type};
     use crate::sdk::bundle::write_to_dir;
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
@@ -1082,6 +1676,224 @@ mod tests {
             .contents
             .as_str();
         assert!(package.contains("\"axios\": \"^1.0.0\""), "{package}");
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test constructs a complete binary route and verifies the generated compatibility surface"
+    )]
+    fn typescript_fetch_compat_profile_emits_runtime_raw_methods_binary_and_scoped_headers() {
+        let mut graph = sample_graph();
+        graph.security = vec![
+            SecurityScheme {
+                id: "ActiveSchoolAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-Plint-School-Id".to_string(),
+                global: false,
+            },
+            SecurityScheme {
+                id: "CSRFAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-CSRF-Token".to_string(),
+                global: false,
+            },
+        ];
+        graph.operations[0].id = "getCourseworkSubmissionAttachment".to_string();
+        graph.operations[0].handler = "getCourseworkSubmissionAttachment".to_string();
+        graph.operations[0].group = Some("coursework".to_string());
+        graph.operations[0].method = "GET".to_string();
+        graph.operations[0].path =
+            "/coursework/assignments/{assignmentId}/submissions/{studentPersonId}/attachment"
+                .to_string();
+        graph.operations[0].params = vec![
+            Param {
+                name: "assignmentId".to_string(),
+                location: "path".to_string(),
+                required: true,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                provenance: SourceSpan {
+                    file: "/root/main.ts".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+            Param {
+                name: "studentPersonId".to_string(),
+                location: "path".to_string(),
+                required: true,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                provenance: SourceSpan {
+                    file: "/root/main.ts".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+        ];
+        graph.operations[0].request_body = None;
+        graph.operations[0].responses = vec![Response {
+            status: 200,
+            body: None,
+            body_kind: "binary".to_string(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_types: vec!["application/octet-stream".to_string()],
+        }];
+        graph.operations[0].security = vec!["ActiveSchoolAuth".to_string(), "CSRFAuth".to_string()];
+        graph.operations[1].security.clear();
+
+        let files = generate_files_with_profile(
+            &graph,
+            "@example/school-sdk",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::typescript_fetch_compat(),
+        )
+        .unwrap();
+        let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "apis/index.ts",
+                "index.ts",
+                "models/index.ts",
+                "package.json",
+                "runtime.ts",
+            ]
+        );
+
+        let runtime = files
+            .iter()
+            .find(|file| file.name == "runtime.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "export class Configuration",
+            "export interface Middleware",
+            "export class BaseAPI",
+            "export interface ApiResponse<T>",
+            "export class JSONApiResponse<T>",
+            "export class VoidApiResponse",
+            "export class BlobApiResponse",
+            "export class ResponseError extends Error",
+            "export class FetchError extends Error",
+            "apiKeys: { ...this.apiKeys }",
+            "next.configuration = this.configuration.withMiddleware(...middleware);",
+        ] {
+            assert!(runtime.contains(snippet), "missing {snippet}:\n{runtime}");
+        }
+
+        let api = files
+            .iter()
+            .find(|file| file.name == "apis/index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "export class CourseworkApi extends runtime.BaseAPI",
+            "export interface GetCourseworkSubmissionAttachmentRequest",
+            "async getCourseworkSubmissionAttachmentRaw(requestParameters: GetCourseworkSubmissionAttachmentRequest",
+            "Promise<runtime.ApiResponse<Blob>>",
+            "async getCourseworkSubmissionAttachment(requestParameters: GetCourseworkSubmissionAttachmentRequest",
+            "Promise<Blob>",
+            "return new runtime.BlobApiResponse(response);",
+            "const apiKey0 = await this.configuration.getApiKey(\"CSRFAuth\", \"X-CSRF-Token\");",
+            "const apiKey1 = await this.configuration.getApiKey(\"ActiveSchoolAuth\", \"X-Plint-School-Id\");",
+            "this.configuration.getApiKey(\"CSRFAuth\", \"X-CSRF-Token\")",
+            "this.configuration.getApiKey(\"ActiveSchoolAuth\", \"X-Plint-School-Id\")",
+            "headerParameters[\"X-CSRF-Token\"]",
+            "headerParameters[\"X-Plint-School-Id\"]",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+
+        let list_books_start = api
+            .find("async listBooksRaw")
+            .expect("sample graph should still emit listBooksRaw");
+        let list_books_end = api[list_books_start..]
+            .find("  async listBooks(")
+            .map_or(api.len(), |offset| list_books_start + offset);
+        let list_books_raw = &api[list_books_start..list_books_end];
+        assert!(!list_books_raw.contains("X-CSRF-Token"), "{list_books_raw}");
+        assert!(
+            !list_books_raw.contains("X-Plint-School-Id"),
+            "{list_books_raw}"
+        );
+    }
+
+    #[test]
+    fn compatibility_auth_header_variables_are_collision_free() {
+        let mut graph = sample_graph();
+        graph.security = vec![
+            SecurityScheme {
+                id: "PrimaryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-API-Key".to_string(),
+                global: false,
+            },
+            SecurityScheme {
+                id: "SecondaryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X_APIKey".to_string(),
+                global: false,
+            },
+        ];
+        graph.operations[0].security = vec!["PrimaryAuth".to_string(), "SecondaryAuth".to_string()];
+
+        let fetch_files = generate_files_with_profile(
+            &graph,
+            "@example/bookstore-sdk",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::typescript_fetch_compat(),
+        )
+        .unwrap();
+        let fetch_api = fetch_files
+            .iter()
+            .find(|file| file.name == "apis/index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            fetch_api.contains("const apiKey0 = await this.configuration.getApiKey"),
+            "{fetch_api}"
+        );
+        assert!(
+            fetch_api.contains("const apiKey1 = await this.configuration.getApiKey"),
+            "{fetch_api}"
+        );
+
+        let axios_files = generate_files_with_profile(
+            &graph,
+            "@example/bookstore-sdk",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::openapi_generator_compat(),
+        )
+        .unwrap();
+        let axios_api = axios_files
+            .iter()
+            .find(|file| file.name == "api.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            axios_api.contains("const apiKey0 = await this.configuration.getApiKey"),
+            "{axios_api}"
+        );
+        assert!(
+            axios_api.contains("const apiKey1 = await this.configuration.getApiKey"),
+            "{axios_api}"
+        );
     }
 
     #[test]
