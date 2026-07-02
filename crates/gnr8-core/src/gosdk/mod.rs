@@ -20,6 +20,7 @@ use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
     operation_file_name, validate_sdk_base_path,
 };
+use crate::sdk::go::GoSdkOptions;
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
@@ -93,11 +94,33 @@ pub(crate) fn generate_files_with_profile(
     aliases: &SdkTypeAliases,
     profile: &SdkProfile,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    generate_files_with_profile_options(
+        graph,
+        package,
+        base_path,
+        layout,
+        aliases,
+        profile,
+        GoSdkOptions::for_profile(profile),
+    )
+}
+
+pub(crate) fn generate_files_with_profile_options(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    aliases: &SdkTypeAliases,
+    profile: &SdkProfile,
+    options: GoSdkOptions,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
 
     if profile.is_go_openapi_generator_compat() {
-        return generate_go_openapi_generator_compat_files(graph, package, base_path, aliases);
+        return generate_go_openapi_generator_compat_files(
+            graph, package, base_path, aliases, options,
+        );
     }
 
     let mut files: Vec<SdkFile> = Vec::new();
@@ -107,6 +130,7 @@ pub(crate) fn generate_files_with_profile(
         profile.is_go_openapi_generator_compat() || aliases.has_source_prefix_aliases();
     let compat_options = emit::GoEmitOptions {
         compat_model_helpers: emit_compat_surface,
+        sdk: options.clone(),
     };
 
     // Fixed leading files (sorted: client.go before errors.go).
@@ -128,7 +152,7 @@ pub(crate) fn generate_files_with_profile(
     if !resolved_aliases.is_empty() {
         files.push(raw_go_file(
             "aliases.go",
-            emit::emit_type_aliases(graph, package, &resolved_aliases, compat_options)?,
+            emit::emit_type_aliases(graph, package, &resolved_aliases, &compat_options)?,
         ));
     }
     let ops: Vec<&Operation> = graph.operations.iter().collect();
@@ -142,7 +166,8 @@ pub(crate) fn generate_files_with_profile(
             files.push(raw_go_file("facades.go", raw));
         }
         for schema in &graph.schemas {
-            let raw = emit::emit_model_schema_with_options(graph, package, schema, compat_options)?;
+            let raw =
+                emit::emit_model_schema_with_options(graph, package, schema, &compat_options)?;
             let name = model_file_name(
                 layout,
                 schema,
@@ -160,7 +185,7 @@ pub(crate) fn generate_files_with_profile(
         // Trailing models.go.
         files.push(raw_go_file(
             "models.go",
-            emit::emit_models_with_options(graph, package, compat_options)?,
+            emit::emit_models_with_options(graph, package, &compat_options)?,
         ));
     }
 
@@ -174,10 +199,15 @@ fn generate_go_openapi_generator_compat_files(
     package: &str,
     base_path: &str,
     aliases: &SdkTypeAliases,
+    options: GoSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    if let Some(error_model) = &options.error_model {
+        validate_go_error_model_name(error_model)?;
+    }
     let resolved_aliases = aliases.resolve(graph)?;
     let compat_options = emit::GoEmitOptions {
         compat_model_helpers: true,
+        sdk: options,
     };
     let mut files = vec![
         raw_go_file(
@@ -185,25 +215,31 @@ fn generate_go_openapi_generator_compat_files(
             emit::emit_compat_api_client_file(graph, package)?,
         ),
         raw_go_file("configuration.go", emit::emit_compat_configuration(package)),
-        raw_go_file("errors.go", emit::emit_compat_errors(package)),
-        raw_go_file("utils.go", emit::emit_compat_utils(package)),
+        raw_go_file(
+            "errors.go",
+            emit::emit_compat_errors(package, &compat_options),
+        ),
+        raw_go_file(
+            "utils.go",
+            emit::emit_compat_utils(package, &compat_options),
+        ),
     ];
     for (service, ops) in emit::compat_operations_by_service(graph) {
         files.push(raw_go_file(
             format!("api_{}.go", file_stem(&service)),
-            emit::emit_compat_api_file(graph, package, base_path, &service, &ops)?,
+            emit::emit_compat_api_file(graph, package, base_path, &service, &ops, &compat_options)?,
         ));
     }
     if !resolved_aliases.is_empty() {
         files.push(raw_go_file(
             "aliases.go",
-            emit::emit_type_aliases(graph, package, &resolved_aliases, compat_options)?,
+            emit::emit_type_aliases(graph, package, &resolved_aliases, &compat_options)?,
         ));
     }
     for schema in &graph.schemas {
         files.push(raw_go_file(
             format!("model_{}.go", file_stem(&schema.name)),
-            emit::emit_model_schema_with_options(graph, package, schema, compat_options)?,
+            emit::emit_model_schema_with_options(graph, package, schema, &compat_options)?,
         ));
     }
     let mut files = gofmt::gofmt_files(files)?;
@@ -219,6 +255,55 @@ fn raw_go_file(name: impl Into<String>, raw: impl Into<String>) -> SdkFile {
     }
 }
 
+fn validate_go_error_model_name(name: &str) -> Result<(), crate::CoreError> {
+    if is_go_identifier(name) && !is_go_keyword(name) {
+        return Ok(());
+    }
+    Err(crate::CoreError::Config {
+        message: format!("GoSdk error_model must be a valid Go type identifier, got '{name}'"),
+    })
+}
+
+fn is_go_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_go_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "break"
+            | "default"
+            | "func"
+            | "interface"
+            | "select"
+            | "case"
+            | "defer"
+            | "go"
+            | "map"
+            | "struct"
+            | "chan"
+            | "else"
+            | "goto"
+            | "package"
+            | "switch"
+            | "const"
+            | "fallthrough"
+            | "if"
+            | "range"
+            | "type"
+            | "continue"
+            | "for"
+            | "import"
+            | "return"
+            | "var"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow so
@@ -227,9 +312,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        generate, generate_files_with_layout, generate_files_with_profile, generate_with_layout,
+        generate, generate_files_with_layout, generate_files_with_profile,
+        generate_files_with_profile_options, generate_with_layout,
     };
-    use crate::graph::{ApiGraph, Param, Prim, Response, SecurityScheme, SourceSpan, Type};
+    use crate::analyze::facts::FieldMeta;
+    use crate::graph::{
+        ApiGraph, Field, Param, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
+        Type, WellKnown,
+    };
+    use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
@@ -513,7 +604,7 @@ mod tests {
             "func NewAPIClient(cfg *Configuration) *APIClient",
             "GoalsAPI   *GoalsAPIService",
             "func (a *GoalsAPIService) ListGoals(ctx context.Context) ApiListGoalsRequest",
-            "func (r ApiListGoalsRequest) Aggregation(aggregation any) ApiListGoalsRequest",
+            "func (r ApiListGoalsRequest) Aggregation(aggregation string) ApiListGoalsRequest",
             "func (r ApiCreateGoalRequest) GoalInput(goalInput any) ApiCreateGoalRequest",
             "func (r ApiListGoalsRequest) Execute() (*ListGoalsOutput, *http.Response, error)",
         ] {
@@ -655,7 +746,7 @@ mod tests {
             .contents
             .as_str();
         for snippet in [
-            "func (a *CourseworkAPIService) GetCourseworkSubmissionAttachment(ctx context.Context, assignmentID any, studentPersonID any) ApiGetCourseworkSubmissionAttachmentRequest",
+            "func (a *CourseworkAPIService) GetCourseworkSubmissionAttachment(ctx context.Context, assignmentID string, studentPersonID string) ApiGetCourseworkSubmissionAttachmentRequest",
             "func (r ApiGetCourseworkSubmissionAttachmentRequest) Execute() ([]byte, *http.Response, error)",
             "compatApplyAPIKey(req, r.ctx, \"ActiveSchoolAuth\", \"X-Plint-School-Id\")",
             "compatApplyAPIKey(req, r.ctx, \"CSRFAuth\", \"X-CSRF-Token\")",
@@ -694,5 +785,341 @@ mod tests {
             errors.contains("type GenericOpenAPIError struct"),
             "{errors}"
         );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_scopes_request_builder_setters_to_operation() {
+        if !gofmt_available() {
+            eprintln!("skipping operation-scoped compat test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "healthzGet".to_string();
+        graph.operations[0].id = "healthzGet".to_string();
+        graph.operations[0].group = Some("health".to_string());
+        graph.operations[0].method = "GET".to_string();
+        graph.operations[0].path = "/healthz".to_string();
+        graph.operations[0].params.clear();
+        graph.operations[0].request_body = None;
+
+        let files = generate_files_with_profile(
+            &graph,
+            "plintsdk",
+            "/",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_health.go")
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(api.contains("type ApiHealthzGetRequest struct"), "{api}");
+        for forbidden in [
+            "body any",
+            "file any",
+            "extraQuery map[string]any",
+            "func (r ApiHealthzGetRequest) Body(",
+            "func (r ApiHealthzGetRequest) Aggregation(",
+            "func (r ApiHealthzGetRequest) File(",
+        ] {
+            assert!(!api.contains(forbidden), "forbidden {forbidden}:\n{api}");
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test constructs a representative multipart operation graph inline"
+    )]
+    fn go_openapi_generator_profile_uses_named_multipart_file_field() {
+        if !gofmt_available() {
+            eprintln!("skipping multipart compat test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "executeImportJob".to_string();
+        graph.operations[0].id = "executeImportJob".to_string();
+        graph.operations[0].group = Some("school".to_string());
+        graph.operations[0].method = "POST".to_string();
+        graph.operations[0].path = "/import-jobs/{jobId}/execute".to_string();
+        graph.operations[0].params = vec![Param {
+            name: "jobId".to_string(),
+            location: "path".to_string(),
+            required: true,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }];
+        graph.operations[0].request_body = Some(SchemaRef {
+            ref_id: "__synthetic.ExecuteImportJobFormRequest".to_string(),
+        });
+        graph.operations[0].request_body_content_type = Some("multipart/form-data".to_string());
+        graph.schemas.push(Schema {
+            id: "__synthetic.ExecuteImportJobFormRequest".to_string(),
+            name: "ExecuteImportJobFormRequest".to_string(),
+            body: Type::Object(vec![
+                Field {
+                    json_name: "bundle".to_string(),
+                    required: true,
+                    optional: false,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::Bytes),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "sourceKey".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "sourceSystem".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "runAt".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: true,
+                    schema: Type::WellKnown(WellKnown::DateTime),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+            ]),
+            enum_source_order: Vec::new(),
+            provenance: SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let files = generate_files_with_profile(
+            &graph,
+            "plintsdk",
+            "/v1",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_school.go")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "func (r ApiExecuteImportJobRequest) Bundle(bundle any) ApiExecuteImportJobRequest",
+            "func (r ApiExecuteImportJobRequest) SourceKey(sourceKey string) ApiExecuteImportJobRequest",
+            "func (r ApiExecuteImportJobRequest) SourceSystem(sourceSystem string) ApiExecuteImportJobRequest",
+            "func (r ApiExecuteImportJobRequest) RunAt(runAt *time.Time) ApiExecuteImportJobRequest",
+            "compatMultipartFileBody(\"bundle\", r.file, r.extraQuery)",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+        assert!(api.contains("\"time\""), "{api}");
+        let utils = files
+            .iter()
+            .find(|file| file.name == "utils.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            utils.contains("writer.CreateFormFile(fileField, filepath.Base(reader.Name()))"),
+            "{utils}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_preserves_literal_file_multipart_field_name() {
+        if !gofmt_available() {
+            eprintln!("skipping literal file multipart compat test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "uploadDocument".to_string();
+        graph.operations[0].id = "uploadDocument".to_string();
+        graph.operations[0].group = Some("documents".to_string());
+        graph.operations[0].method = "POST".to_string();
+        graph.operations[0].path = "/documents/{documentId}/upload".to_string();
+        graph.operations[0].params = vec![Param {
+            name: "documentId".to_string(),
+            location: "path".to_string(),
+            required: true,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }];
+        graph.operations[0].request_body = Some(SchemaRef {
+            ref_id: "__synthetic.UploadDocumentFormRequest".to_string(),
+        });
+        graph.operations[0].request_body_content_type = Some("multipart/form-data".to_string());
+        graph.schemas.push(Schema {
+            id: "__synthetic.UploadDocumentFormRequest".to_string(),
+            name: "UploadDocumentFormRequest".to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "file".to_string(),
+                required: true,
+                optional: false,
+                nullable: false,
+                schema: Type::Primitive(Prim::Bytes),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let files = generate_files_with_profile(
+            &graph,
+            "plintsdk",
+            "/v1",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_documents.go")
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains(
+                "func (r ApiUploadDocumentRequest) File(file any) ApiUploadDocumentRequest"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("compatMultipartFileBody(\"file\", r.file, r.extraQuery)"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_honors_compatibility_options() {
+        if !gofmt_available() {
+            eprintln!("skipping Go compatibility options test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        let Type::Object(fields) = &mut graph.schemas[1].body else {
+            panic!("CreateGoalInput must be an object");
+        };
+        fields[1].required = true;
+        fields[1].optional = false;
+
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.error_model = Some("CommandMessage".to_string());
+        options.query_time_format = QueryTimeFormat::DateOnlyAtMidnightElseRfc3339;
+        options.required_pointer_constructor_policy = RequiredPointerConstructorPolicy::ValueParam;
+
+        let files = generate_files_with_profile_options(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+
+        let errors = files
+            .iter()
+            .find(|file| file.name == "errors.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(errors.contains("var model CommandMessage"), "{errors}");
+        assert!(
+            errors.contains("json.Unmarshal(e.body, &model)"),
+            "{errors}"
+        );
+
+        let utils = files
+            .iter()
+            .find(|file| file.name == "utils.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            utils.contains("parts = append(parts, compatQueryValue(v.Index(i).Interface()))"),
+            "{utils}"
+        );
+        assert!(utils.contains("return t.Format(\"2006-01-02\")"), "{utils}");
+        assert!(utils.contains("return t.Format(time.RFC3339)"), "{utils}");
+
+        let model = files
+            .iter()
+            .find(|file| file.name == "model_create_goal_input.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            model.contains(
+                "func NewCreateGoalInput(name string, targetDirection TargetDirection) *CreateGoalInput"
+            ),
+            "{model}"
+        );
+        assert!(
+            model.contains("this.TargetDirection = &targetDirection"),
+            "{model}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_invalid_error_model_name() {
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.error_model = Some("Error Response".to_string());
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("error_model"), "{err}");
     }
 }

@@ -31,6 +31,7 @@ pub mod builtins;
 pub mod bundle;
 pub mod compat;
 pub(crate) mod emit_common;
+pub mod go;
 pub mod layout;
 pub mod model;
 pub mod model_style;
@@ -858,13 +859,14 @@ pub mod prelude {
         SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
         SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
+    pub use super::go::{GoRequestBuilderScope, QueryTimeFormat, RequiredPointerConstructorPolicy};
     pub use super::layout::SdkFileLayout;
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::profile::SdkProfile;
     pub use super::surface::SdkTypeAliases;
     pub use super::typescript::{
-        TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
+        TsBarrelExports, TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
     };
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,

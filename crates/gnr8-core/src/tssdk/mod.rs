@@ -19,7 +19,7 @@ mod emit;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Operation};
+use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
@@ -30,7 +30,7 @@ use crate::sdk::emit_common::{
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
-use crate::sdk::typescript::{TsResponsePolicy, TsSdkOptions};
+use crate::sdk::typescript::{TsBarrelExports, TsResponsePolicy, TsSdkOptions};
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
 /// TSSDK-01).
@@ -83,14 +83,8 @@ pub(crate) fn generate_files_with_layout(
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
-    generate_files_with_layout_options(
-        graph,
-        package,
-        base_path,
-        layout,
-        aliases,
-        TsSdkOptions::strict(),
-    )
+    let options = TsSdkOptions::strict();
+    generate_files_with_layout_options(graph, package, base_path, layout, aliases, &options)
 }
 
 fn generate_files_with_layout_options(
@@ -99,7 +93,7 @@ fn generate_files_with_layout_options(
     base_path: &str,
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
-    options: TsSdkOptions,
+    options: &TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -192,14 +186,9 @@ pub(crate) fn generate_files_with_profile(
     aliases: &SdkTypeAliases,
     profile: &SdkProfile,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let options = TsSdkOptions::for_profile(profile);
     generate_files_with_profile_options(
-        graph,
-        package,
-        base_path,
-        layout,
-        aliases,
-        profile,
-        TsSdkOptions::for_profile(profile),
+        graph, package, base_path, layout, aliases, profile, &options,
     )
 }
 
@@ -210,7 +199,7 @@ pub(crate) fn generate_files_with_profile_options(
     layout: &SdkFileLayout,
     aliases: &SdkTypeAliases,
     profile: &SdkProfile,
-    options: TsSdkOptions,
+    options: &TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     if !profile.is_typescript_axios_compat() && options.response.is_axios_response_wrapper() {
         return Err(crate::CoreError::Config {
@@ -239,7 +228,7 @@ fn generate_openapi_generator_compat_files(
     package: &str,
     base_path: &str,
     aliases: &SdkTypeAliases,
-    options: TsSdkOptions,
+    options: &TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -290,7 +279,7 @@ fn generate_typescript_fetch_compat_files(
     package: &str,
     base_path: &str,
     aliases: &SdkTypeAliases,
-    options: TsSdkOptions,
+    options: &TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -299,11 +288,11 @@ fn generate_typescript_fetch_compat_files(
     let mut files = vec![
         SdkFile {
             name: "apis/index.ts".to_string(),
-            contents: emit_fetch_api(graph, base_path)?,
+            contents: emit_fetch_api(graph, base_path, options)?,
         },
         SdkFile {
             name: "index.ts".to_string(),
-            contents: emit_fetch_index(),
+            contents: emit_fetch_index(graph, options.barrel_exports),
         },
         SdkFile {
             name: "models/index.ts".to_string(),
@@ -317,7 +306,7 @@ fn generate_typescript_fetch_compat_files(
         },
         SdkFile {
             name: "runtime.ts".to_string(),
-            contents: emit_fetch_runtime(),
+            contents: emit_fetch_runtime(options.init_override_function),
         },
         SdkFile {
             name: "package.json".to_string(),
@@ -328,13 +317,33 @@ fn generate_typescript_fetch_compat_files(
     Ok(files)
 }
 
-fn emit_fetch_index() -> String {
-    "\
+fn emit_fetch_index(graph: &ApiGraph, exports: TsBarrelExports) -> String {
+    match exports {
+        TsBarrelExports::Star => "\
 export * from \"./runtime\";
 export * from \"./apis\";
 export * from \"./models\";
 "
-    .to_string()
+        .to_string(),
+        TsBarrelExports::OpenApiGeneratorCompat => {
+            let mut out = String::from("export * from \"./runtime\";\n");
+            let classes: Vec<String> = grouped_operations(graph)
+                .into_keys()
+                .map(|service| api_class_name(&service))
+                .collect();
+            if !classes.is_empty() {
+                out.push_str("export {\n");
+                for class in classes {
+                    out.push_str("  ");
+                    out.push_str(&class);
+                    out.push_str(",\n");
+                }
+                out.push_str("} from \"./apis\";\n");
+            }
+            out.push_str("export * from \"./models\";\n");
+            out
+        }
+    }
 }
 
 fn emit_fetch_package_json(package: &str) -> String {
@@ -355,10 +364,14 @@ fn emit_fetch_package_json(package: &str) -> String {
     clippy::too_many_lines,
     reason = "the typescript-fetch compatibility runtime is emitted as one generated runtime.ts file"
 )]
-fn emit_fetch_runtime() -> String {
-    "\
+fn emit_fetch_runtime(init_override_function: bool) -> String {
+    let mut runtime = "\
 export type HTTPHeaders = Record<string, string>;
 export type HTTPQuery = Record<string, unknown>;
+export interface HTTPRequestInit extends RequestInit {
+  headers?: HTTPHeaders;
+}
+export type FetchAPI = typeof fetch;
 export type HTTPMethod = \"GET\" | \"POST\" | \"PUT\" | \"PATCH\" | \"DELETE\" | \"HEAD\" | \"OPTIONS\";
 export type ApiKey = string | ((name: string) => string | Promise<string>);
 
@@ -593,10 +606,34 @@ function isBodyInit(value: unknown): value is BodyInit {
     || value instanceof ArrayBuffer;
 }
 "
-    .to_string()
+    .to_string();
+    if init_override_function {
+        runtime = runtime
+            .replace(
+                "export interface Middleware {\n",
+                "export interface InitOverrideFunction {\n  (requestContext: { init: RequestInit; context: RequestOpts }): Promise<RequestInit> | RequestInit;\n}\n\nexport interface Middleware {\n",
+            )
+            .replace(
+                "  protected async request(context: RequestOpts, initOverrides: RequestInit = {}): Promise<Response> {",
+                "  protected async request(context: RequestOpts, initOverrides: RequestInit | InitOverrideFunction = {}): Promise<Response> {",
+            )
+            .replace(
+                "    const headers: HTTPHeaders = {\n      ...this.configuration.headers,\n      ...(context.headers ?? {}),\n      ...((initOverrides.headers as HTTPHeaders | undefined) ?? {}),\n    };\n    const init: RequestInit = {\n      ...initOverrides,\n      method: context.method,\n      headers,\n      credentials: initOverrides.credentials ?? this.configuration.credentials,\n    };",
+                "    const initOverrideObject = typeof initOverrides === \"function\" ? {} : initOverrides;\n    const headers: HTTPHeaders = {\n      ...this.configuration.headers,\n      ...(context.headers ?? {}),\n      ...((initOverrideObject.headers as HTTPHeaders | undefined) ?? {}),\n    };\n    const init: RequestInit = {\n      ...initOverrideObject,\n      method: context.method,\n      headers,\n      credentials: initOverrideObject.credentials ?? this.configuration.credentials,\n    };",
+            )
+            .replace(
+                "    let requestContext: RequestContext = { url, init };",
+                "    const initOverrideFn = typeof initOverrides === \"function\" ? initOverrides : undefined;\n    const finalInit = initOverrideFn ? await initOverrideFn({ init, context }) : init;\n    let requestContext: RequestContext = { url, init: finalInit };",
+            );
+    }
+    runtime
 }
 
-fn emit_fetch_api(graph: &ApiGraph, base_path: &str) -> Result<String, crate::CoreError> {
+fn emit_fetch_api(
+    graph: &ApiGraph,
+    base_path: &str,
+    options: &TsSdkOptions,
+) -> Result<String, crate::CoreError> {
     let mut out = String::new();
     out.push_str(
         "\
@@ -605,15 +642,32 @@ import * as models from \"../models\";
 
 ",
     );
+    if graph.operations.iter().any(is_multipart_operation) {
+        out.push_str(
+            "\
+function multipartBody(fields: Record<string, Blob | string | number | boolean | null | undefined>): FormData {
+  const formData = new FormData();
+  for (const name in fields) {
+    const value = fields[name];
+    if (value !== undefined && value !== null) {
+      formData.append(name, value instanceof Blob ? value : String(value));
+    }
+  }
+  return formData;
+}
+
+",
+        );
+    }
     for (service, ops) in grouped_operations(graph) {
         let class_name = api_class_name(&service);
         for op in &ops {
-            emit_fetch_request_alias(&mut out, graph, op)?;
+            emit_fetch_request_alias(&mut out, graph, op, options)?;
         }
         writeln!(out, "export class {class_name} extends runtime.BaseAPI {{")
             .map_err(ts_mod_sink)?;
         for op in &ops {
-            emit_fetch_operation_methods(&mut out, graph, base_path, op)?;
+            emit_fetch_operation_methods(&mut out, graph, base_path, op, options)?;
         }
         writeln!(out, "}}\n").map_err(ts_mod_sink)?;
     }
@@ -624,8 +678,9 @@ fn emit_fetch_request_alias(
     out: &mut String,
     graph: &ApiGraph,
     op: &Operation,
+    options: &TsSdkOptions,
 ) -> Result<(), crate::CoreError> {
-    emit_axios_request_alias(out, graph, op)
+    emit_request_alias(out, graph, op, &options.request_body_param_name)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -634,11 +689,12 @@ fn emit_fetch_operation_methods(
     graph: &ApiGraph,
     base_path: &str,
     op: &Operation,
+    options: &TsSdkOptions,
 ) -> Result<(), crate::CoreError> {
     let method_name = emit::camel(&op.handler);
     let raw_method_name = format!("{method_name}Raw");
     let request_name = request_alias_name(op);
-    let request_fields = request_fields(graph, op)?;
+    let request_fields = request_fields(graph, op, &options.request_body_param_name)?;
     let request_default = if request_fields.iter().any(|field| field.required) {
         ""
     } else {
@@ -649,7 +705,8 @@ fn emit_fetch_operation_methods(
 
     writeln!(
         out,
-        "  async {raw_method_name}(requestParameters: {request_name}{request_default}, initOverrides: RequestInit = {{}}): Promise<runtime.ApiResponse<{data_ty}>> {{"
+        "  async {raw_method_name}(requestParameters: {request_name}{request_default}, initOverrides: {} = {{}}): Promise<runtime.ApiResponse<{data_ty}>> {{",
+        fetch_init_override_type(options)
     )
     .map_err(ts_mod_sink)?;
     emit_fetch_path(out, base_path, op)?;
@@ -686,6 +743,7 @@ fn emit_fetch_operation_methods(
         writeln!(out, "    }}").map_err(ts_mod_sink)?;
     }
     let body_model = request_body_model_of(op, graph)?;
+    let multipart_fields = multipart_request_fields(graph, op)?;
     writeln!(out, "    const response = await this.request({{").map_err(ts_mod_sink)?;
     writeln!(out, "      path: localVarPath,").map_err(ts_mod_sink)?;
     writeln!(
@@ -696,13 +754,32 @@ fn emit_fetch_operation_methods(
     .map_err(ts_mod_sink)?;
     writeln!(out, "      headers: headerParameters,").map_err(ts_mod_sink)?;
     writeln!(out, "      query: queryParameters,").map_err(ts_mod_sink)?;
-    if let Some(body) = &body_model {
+    if let Some(fields) = &multipart_fields {
+        let parts = fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "{}: requestParameters.{}",
+                    quoted_string_literal(&field.wire_name),
+                    field.name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "      body: multipartBody({{ {parts} }}),").map_err(ts_mod_sink)?;
+    } else if let Some(body) = &body_model {
         if body.required {
-            writeln!(out, "      body: requestParameters.body,").map_err(ts_mod_sink)?;
+            writeln!(
+                out,
+                "      body: requestParameters.{},",
+                options.request_body_param_name
+            )
+            .map_err(ts_mod_sink)?;
         } else {
             writeln!(
                 out,
-                "      ...(requestParameters.body === undefined ? {{}} : {{ body: requestParameters.body }}),"
+                "      ...(requestParameters.{name} === undefined ? {{}} : {{ body: requestParameters.{name} }}),",
+                name = options.request_body_param_name
             )
             .map_err(ts_mod_sink)?;
         }
@@ -720,7 +797,8 @@ fn emit_fetch_operation_methods(
 
     writeln!(
         out,
-        "\n  async {method_name}(requestParameters: {request_name}{request_default}, initOverrides: RequestInit = {{}}): Promise<{data_ty}> {{"
+        "\n  async {method_name}(requestParameters: {request_name}{request_default}, initOverrides: {} = {{}}): Promise<{data_ty}> {{",
+        fetch_init_override_type(options)
     )
     .map_err(ts_mod_sink)?;
     writeln!(
@@ -1034,8 +1112,17 @@ fn emit_axios_request_alias(
     graph: &ApiGraph,
     op: &Operation,
 ) -> Result<(), crate::CoreError> {
+    emit_request_alias(out, graph, op, "body")
+}
+
+fn emit_request_alias(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+    request_body_param_name: &str,
+) -> Result<(), crate::CoreError> {
     let request_name = request_alias_name(op);
-    let fields = request_fields(graph, op)?;
+    let fields = request_fields(graph, op, request_body_param_name)?;
     if fields.is_empty() {
         writeln!(out, "export interface {request_name} {{}}\n").map_err(ts_mod_sink)?;
         return Ok(());
@@ -1059,7 +1146,7 @@ fn emit_axios_operation_method(
 ) -> Result<(), crate::CoreError> {
     let method_name = emit::camel(&op.handler);
     let request_name = request_alias_name(op);
-    let request_fields = request_fields(graph, op)?;
+    let request_fields = request_fields(graph, op, "body")?;
     let request_default = if request_fields.iter().any(|field| field.required) {
         ""
     } else {
@@ -1271,7 +1358,7 @@ fn emit_axios_factory(
     for op in ops {
         let method = emit::camel(&op.handler);
         let request_name = request_alias_name(op);
-        let request_fields = request_fields(graph, op)?;
+        let request_fields = request_fields(graph, op, "body")?;
         let request_default = if request_fields.iter().any(|field| field.required) {
             ""
         } else {
@@ -1321,6 +1408,67 @@ fn ts_success_data_type(success: &crate::sdk::emit_common::SuccessResponses) -> 
             }
         },
     )
+}
+
+fn is_multipart_operation(op: &Operation) -> bool {
+    op.request_body_content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.eq_ignore_ascii_case("multipart/form-data"))
+}
+
+fn multipart_request_fields(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Option<Vec<RequestField>>, crate::CoreError> {
+    if !is_multipart_operation(op) {
+        return Ok(None);
+    }
+    let Some(body) = &op.request_body else {
+        return Ok(None);
+    };
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.id == body.ref_id)
+        .ok_or_else(|| crate::CoreError::SdkGen {
+            message: format!(
+                "operation '{}' multipart request body references dangling $ref '{}'",
+                op.id, body.ref_id
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        let name = emit::camel(&field.json_name);
+        out.push(RequestField {
+            name,
+            wire_name: field.json_name.clone(),
+            ty: multipart_field_type(field, graph)?,
+            required: op.request_body_required && field.required,
+        });
+    }
+    Ok(Some(out))
+}
+
+fn multipart_field_type(field: &Field, graph: &ApiGraph) -> Result<String, crate::CoreError> {
+    if matches!(&field.schema, Type::Primitive(Prim::Bytes)) {
+        return Ok(if field.nullable {
+            "Blob | null".to_string()
+        } else {
+            "Blob".to_string()
+        });
+    }
+    emit::ts_type(&field.schema, field.nullable, graph, "models.")
+}
+
+fn fetch_init_override_type(options: &TsSdkOptions) -> &'static str {
+    if options.init_override_function {
+        "RequestInit | runtime.InitOverrideFunction"
+    } else {
+        "RequestInit"
+    }
 }
 
 fn emit_axios_path(
@@ -1390,24 +1538,31 @@ struct RequestField {
     name: String,
     ty: String,
     required: bool,
+    wire_name: String,
 }
 
-fn request_fields(graph: &ApiGraph, op: &Operation) -> Result<Vec<RequestField>, crate::CoreError> {
+fn request_fields(
+    graph: &ApiGraph,
+    op: &Operation,
+    request_body_param_name: &str,
+) -> Result<Vec<RequestField>, crate::CoreError> {
     let mut fields = Vec::new();
     let body_model = request_body_model_of(op, graph)?;
-    let mut used_names: Vec<String> = if body_model.is_some() {
-        vec!["body".to_string()]
+    let multipart_fields = multipart_request_fields(graph, op)?;
+    let mut used_names: Vec<String> = if body_model.is_some() && multipart_fields.is_none() {
+        validate_request_body_param_name(request_body_param_name)?;
+        vec![request_body_param_name.to_string()]
     } else {
         Vec::new()
     };
     for param in &op.params {
         let name = emit::camel(&param.name);
-        if name.is_empty() {
+        if !is_ts_request_identifier(&name) {
             return Err(crate::CoreError::SdkGen {
                 message: format!(
-                    "operation '{}' has a parameter named '{}' that yields an empty TypeScript \
-                     request field name",
-                    op.id, param.name
+                    "operation '{}' has a parameter named '{}' that yields an invalid TypeScript \
+                     request field identifier '{}'",
+                    op.id, param.name, name
                 ),
             });
         }
@@ -1422,19 +1577,64 @@ fn request_fields(graph: &ApiGraph, op: &Operation) -> Result<Vec<RequestField>,
         }
         used_names.push(name.clone());
         fields.push(RequestField {
+            wire_name: param.name.clone(),
             name,
             ty: emit::ts_type(&param.schema, false, graph, "models.")?,
             required: param.required || param.location == "path",
         });
     }
-    if let Some(model) = body_model {
+    if let Some(multipart_fields) = multipart_fields {
+        for field in multipart_fields {
+            if !is_ts_request_identifier(&field.name) {
+                return Err(crate::CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' has multipart field '{}' whose TypeScript request field \
+                         identifier '{}' is invalid",
+                        op.id, field.wire_name, field.name
+                    ),
+                });
+            }
+            if used_names.contains(&field.name) {
+                return Err(crate::CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' has multipart field '{}' whose TypeScript request field name '{}' \
+                         collides with another request field",
+                        op.id, field.wire_name, field.name
+                    ),
+                });
+            }
+            used_names.push(field.name.clone());
+            fields.push(field);
+        }
+    } else if let Some(model) = body_model {
         fields.push(RequestField {
-            name: "body".to_string(),
+            name: request_body_param_name.to_string(),
+            wire_name: request_body_param_name.to_string(),
             ty: format!("models.{}", model.model),
             required: model.required,
         });
     }
     Ok(fields)
+}
+
+fn validate_request_body_param_name(name: &str) -> Result<(), crate::CoreError> {
+    if is_ts_request_identifier(name) {
+        return Ok(());
+    }
+    Err(crate::CoreError::Config {
+        message: format!(
+            "TsSdk request_body_param_name must be a valid TypeScript request field identifier, got '{name}'"
+        ),
+    })
+}
+
+fn is_ts_request_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 fn request_alias_name(op: &Operation) -> String {
@@ -1489,12 +1689,17 @@ mod tests {
         generate, generate_files_with_profile, generate_files_with_profile_options,
         generate_with_layout, split_bundle,
     };
-    use crate::graph::{ApiGraph, Param, Prim, Response, SecurityScheme, SourceSpan, Type};
+    use crate::analyze::facts::FieldMeta;
+    use crate::graph::{
+        ApiGraph, Field, Param, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan, Type,
+    };
     use crate::sdk::bundle::write_to_dir;
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
-    use crate::sdk::typescript::{TsNullablePolicy, TsResponsePolicy, TsSdkOptions};
+    use crate::sdk::typescript::{
+        TsBarrelExports, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
+    };
 
     /// A facts document covering one body POST and one query GET plus the request/response models +
     /// a named enum — enough to assert the four-file bundle shape and determinism without a toolchain.
@@ -1827,6 +2032,258 @@ mod tests {
     }
 
     #[test]
+    fn typescript_fetch_compat_options_emit_request_body_init_override_and_named_barrel() {
+        let profile = SdkProfile::typescript_fetch_compat();
+        let mut options = TsSdkOptions::for_profile(&profile);
+        options.request_body_param_name = "request".to_string();
+        options.init_override_function = true;
+        options.barrel_exports = TsBarrelExports::OpenApiGeneratorCompat;
+
+        let files = generate_files_with_profile_options(
+            &sample_graph(),
+            "@example/bookstore-sdk",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &profile,
+            &options,
+        )
+        .unwrap();
+
+        let runtime = files
+            .iter()
+            .find(|file| file.name == "runtime.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            runtime.contains("export interface InitOverrideFunction"),
+            "{runtime}"
+        );
+        assert!(
+            runtime.contains("initOverrides: RequestInit | InitOverrideFunction = {}"),
+            "{runtime}"
+        );
+
+        let api = files
+            .iter()
+            .find(|file| file.name == "apis/index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(api.contains("  request: models.Book;"), "{api}");
+        assert!(!api.contains("  body: models.Book;"), "{api}");
+        assert!(api.contains("body: requestParameters.request,"), "{api}");
+        assert!(
+            api.contains("initOverrides: RequestInit | runtime.InitOverrideFunction = {}"),
+            "{api}"
+        );
+
+        let index = files
+            .iter()
+            .find(|file| file.name == "index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            index.contains("  DefaultApi,\n} from \"./apis\";"),
+            "{index}"
+        );
+        assert!(!index.contains("export * from \"./apis\";"), "{index}");
+    }
+
+    #[test]
+    fn typescript_fetch_compat_flattens_multipart_form_fields() {
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "executeImportJob".to_string();
+        graph.operations[0].id = "executeImportJob".to_string();
+        graph.operations[0].group = Some("school".to_string());
+        graph.operations[0].method = "POST".to_string();
+        graph.operations[0].path = "/import-jobs/{jobId}/execute".to_string();
+        graph.operations[0].params = vec![Param {
+            name: "jobId".to_string(),
+            location: "path".to_string(),
+            required: true,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: SourceSpan {
+                file: "/root/main.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }];
+        graph.operations[0].request_body = Some(SchemaRef {
+            ref_id: "__synthetic.ExecuteImportJobFormRequest".to_string(),
+        });
+        graph.operations[0].request_body_content_type = Some("multipart/form-data".to_string());
+        graph.schemas.push(Schema {
+            id: "__synthetic.ExecuteImportJobFormRequest".to_string(),
+            name: "ExecuteImportJobFormRequest".to_string(),
+            body: Type::Object(vec![
+                Field {
+                    json_name: "bundle".to_string(),
+                    required: true,
+                    optional: false,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::Bytes),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "sourceKey".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "sourceSystem".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+                Field {
+                    json_name: "note".to_string(),
+                    required: false,
+                    optional: true,
+                    nullable: true,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                },
+            ]),
+            enum_source_order: Vec::new(),
+            provenance: SourceSpan {
+                file: "/root/main.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let files = generate_files_with_profile(
+            &graph,
+            "@example/school-sdk",
+            "/v1",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::typescript_fetch_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "apis/index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "function multipartBody(fields: Record<string, Blob | string | number | boolean | null | undefined>): FormData",
+            "if (value !== undefined && value !== null)",
+            "export interface ExecuteImportJobRequest {\n  jobId: string;\n  bundle: Blob;\n  sourceKey?: string;\n  sourceSystem?: string;\n  note?: string | null;\n}",
+            "body: multipartBody({ \"bundle\": requestParameters.bundle, \"sourceKey\": requestParameters.sourceKey, \"sourceSystem\": requestParameters.sourceSystem, \"note\": requestParameters.note }),",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+    }
+
+    #[test]
+    fn typescript_fetch_compat_preserves_literal_file_multipart_field_name() {
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "uploadDocument".to_string();
+        graph.operations[0].id = "uploadDocument".to_string();
+        graph.operations[0].group = Some("documents".to_string());
+        graph.operations[0].method = "POST".to_string();
+        graph.operations[0].path = "/documents/{documentId}/upload".to_string();
+        graph.operations[0].params = vec![Param {
+            name: "documentId".to_string(),
+            location: "path".to_string(),
+            required: true,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: SourceSpan {
+                file: "/root/main.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }];
+        graph.operations[0].request_body = Some(SchemaRef {
+            ref_id: "__synthetic.UploadDocumentFormRequest".to_string(),
+        });
+        graph.operations[0].request_body_content_type = Some("multipart/form-data".to_string());
+        graph.schemas.push(Schema {
+            id: "__synthetic.UploadDocumentFormRequest".to_string(),
+            name: "UploadDocumentFormRequest".to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "file".to_string(),
+                required: true,
+                optional: false,
+                nullable: false,
+                schema: Type::Primitive(Prim::Bytes),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: SourceSpan {
+                file: "/root/main.ts".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let files = generate_files_with_profile(
+            &graph,
+            "@example/documents-sdk",
+            "/v1",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::typescript_fetch_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "apis/index.ts")
+            .unwrap()
+            .contents
+            .as_str();
+
+        for snippet in [
+            "export interface UploadDocumentRequest {\n  documentId: string;\n  file: Blob;\n}",
+            "body: multipartBody({ \"file\": requestParameters.file }),",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+    }
+
+    #[test]
+    fn typescript_fetch_compat_rejects_invalid_request_body_param_name() {
+        let profile = SdkProfile::typescript_fetch_compat();
+        let mut options = TsSdkOptions::for_profile(&profile);
+        options.request_body_param_name = "request-body".to_string();
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "@example/bookstore-sdk",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &profile,
+            &options,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("request_body_param_name"), "{err}");
+    }
+
+    #[test]
     fn compatibility_auth_header_variables_are_collision_free() {
         let mut graph = sample_graph();
         graph.security = vec![
@@ -1918,7 +2375,7 @@ mod tests {
             &SdkFileLayout::compact(),
             &SdkTypeAliases::default(),
             &SdkProfile::openapi_generator_compat(),
-            options,
+            &options,
         )
         .unwrap();
         let models = files

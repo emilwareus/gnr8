@@ -29,12 +29,14 @@ use crate::sdk::emit_common::{
     path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of, SuccessResponses,
 };
+use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct GoEmitOptions {
     pub(crate) compat_model_helpers: bool,
+    pub(crate) sdk: GoSdkOptions,
 }
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -310,13 +312,13 @@ fn type_needs_time(schema: &Type, graph: &ApiGraph) -> bool {
 /// Returns [`CoreError::SdkGen`] if any field's schema cannot be mapped to a Go type.
 #[cfg(test)]
 pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
-    emit_models_with_options(graph, package, GoEmitOptions::default())
+    emit_models_with_options(graph, package, &GoEmitOptions::default())
 }
 
 pub(crate) fn emit_models_with_options(
     graph: &ApiGraph,
     package: &str,
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "Go SDK")?;
 
@@ -388,7 +390,7 @@ pub(crate) fn emit_model_schema_with_options(
     graph: &ApiGraph,
     package: &str,
     schema: &Schema,
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
@@ -445,7 +447,7 @@ fn emit_struct(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
     let fields = go_field_emissions(name, fields, options)?;
     writeln!(body, "type {name} struct {{").map_err(sink)?;
@@ -454,7 +456,7 @@ fn emit_struct(
     }
     writeln!(body, "}}").map_err(sink)?;
     if options.compat_model_helpers {
-        emit_compat_model_helpers(body, name, &fields, graph)?;
+        emit_compat_model_helpers(body, name, &fields, graph, options)?;
     }
     Ok(())
 }
@@ -468,7 +470,7 @@ struct GoFieldEmission<'a> {
 fn go_field_emissions<'a>(
     _owner_name: &str,
     fields: &'a [Field],
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<Vec<GoFieldEmission<'a>>, CoreError> {
     let mut used_go = BTreeSet::new();
     let mut used_args = BTreeSet::new();
@@ -523,7 +525,7 @@ fn emit_struct_field(
     field: &Field,
     go_name: &str,
     graph: &ApiGraph,
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
     let go_ty = go_field_type(field, graph, options, Some(owner_name))?;
     let tag = json_tag(
@@ -538,7 +540,7 @@ fn emit_struct_field(
     Ok(())
 }
 
-fn go_field_name(name: &str, options: GoEmitOptions) -> String {
+fn go_field_name(name: &str, options: &GoEmitOptions) -> String {
     if options.compat_model_helpers {
         compat_exported(name)
     } else {
@@ -549,7 +551,7 @@ fn go_field_name(name: &str, options: GoEmitOptions) -> String {
 fn go_field_type(
     field: &Field,
     graph: &ApiGraph,
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
     _owner_name: Option<&str>,
 ) -> Result<String, CoreError> {
     if options.compat_model_helpers {
@@ -621,11 +623,40 @@ fn compat_type_is_nilable(go_type: &str) -> bool {
     go_type == "any" || go_type.starts_with("[]") || go_type.starts_with("map[")
 }
 
+fn compat_constructor_arg_type(
+    field: &Field,
+    graph: &ApiGraph,
+    options: &GoEmitOptions,
+    owner_name: Option<&str>,
+) -> Result<String, CoreError> {
+    let ty = go_field_type(field, graph, options, owner_name)?;
+    if compat_constructor_arg_takes_value(field, graph, options, owner_name)? {
+        Ok(ty.trim_start_matches('*').to_string())
+    } else {
+        Ok(ty)
+    }
+}
+
+fn compat_constructor_arg_takes_value(
+    field: &Field,
+    graph: &ApiGraph,
+    options: &GoEmitOptions,
+    owner_name: Option<&str>,
+) -> Result<bool, CoreError> {
+    if options.sdk.required_pointer_constructor_policy
+        != RequiredPointerConstructorPolicy::ValueParam
+    {
+        return Ok(false);
+    }
+    Ok(go_field_type(field, graph, options, owner_name)?.starts_with('*'))
+}
+
 fn emit_compat_model_helpers(
     body: &mut String,
     name: &str,
     fields: &[GoFieldEmission<'_>],
     graph: &ApiGraph,
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
     writeln!(body).map_err(sink)?;
     writeln!(body, "func New{name}WithDefaults() *{name} {{").map_err(sink)?;
@@ -643,14 +674,7 @@ fn emit_compat_model_helpers(
             Ok(format!(
                 "{} {}",
                 field.arg_name,
-                go_field_type(
-                    field.field,
-                    graph,
-                    GoEmitOptions {
-                        compat_model_helpers: true,
-                    },
-                    Some(name),
-                )?
+                compat_constructor_arg_type(field.field, graph, options, Some(name))?
             ))
         })
         .collect();
@@ -658,13 +682,17 @@ fn emit_compat_model_helpers(
     writeln!(body, "func New{name}({}) *{name} {{", args?.join(", ")).map_err(sink)?;
     writeln!(body, "this := {name}{{}}").map_err(sink)?;
     for field in &required {
-        writeln!(body, "this.{} = {}", field.go_name, field.arg_name).map_err(sink)?;
+        if compat_constructor_arg_takes_value(field.field, graph, options, Some(name))? {
+            writeln!(body, "this.{} = &{}", field.go_name, field.arg_name).map_err(sink)?;
+        } else {
+            writeln!(body, "this.{} = {}", field.go_name, field.arg_name).map_err(sink)?;
+        }
     }
     writeln!(body, "return &this").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
 
     for field in fields {
-        emit_compat_field_helpers(body, name, field.field, &field.go_name, graph)?;
+        emit_compat_field_helpers(body, name, field.field, &field.go_name, graph, options)?;
     }
     writeln!(body).map_err(sink)?;
     writeln!(body, "func (o {name}) MarshalJSON() ([]byte, error) {{").map_err(sink)?;
@@ -720,15 +748,9 @@ fn emit_compat_field_helpers(
     field: &Field,
     field_name: &str,
     graph: &ApiGraph,
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
-    let ty = go_field_type(
-        field,
-        graph,
-        GoEmitOptions {
-            compat_model_helpers: true,
-        },
-        Some(name),
-    )?;
+    let ty = go_field_type(field, graph, options, Some(name))?;
     let value_ty = ty.strip_prefix('*').unwrap_or(&ty);
     writeln!(body).map_err(sink)?;
     writeln!(body, "func (o *{name}) Get{field_name}() {value_ty} {{").map_err(sink)?;
@@ -1011,7 +1033,7 @@ pub(crate) fn emit_type_aliases(
     graph: &ApiGraph,
     package: &str,
     aliases: &[ResolvedTypeAlias],
-    options: GoEmitOptions,
+    options: &GoEmitOptions,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     for alias in aliases {
@@ -1035,6 +1057,7 @@ pub(crate) fn emit_type_aliases(
                 &alias.canonical,
                 fields,
                 graph,
+                options,
             )?;
         }
     }
@@ -1122,8 +1145,31 @@ pub(crate) fn compat_operations_by_service(graph: &ApiGraph) -> BTreeMap<String,
     grouped
 }
 
-pub(crate) fn emit_compat_errors(package: &str) -> String {
-    let body = "\
+pub(crate) fn emit_compat_errors(package: &str, options: &GoEmitOptions) -> String {
+    let model_body = if let Some(error_model) = &options.sdk.error_model {
+        format!(
+            "\
+func (e GenericOpenAPIError) Model() any {{
+if e.model != nil {{
+return e.model
+}}
+var model {error_model}
+if err := json.Unmarshal(e.body, &model); err == nil {{
+return model
+}}
+return nil
+}}
+"
+        )
+    } else {
+        "\
+func (e GenericOpenAPIError) Model() any {
+return e.model
+}
+"
+        .to_string()
+    };
+    let mut body = "\
 type GenericOpenAPIError struct {
 body []byte
 model any
@@ -1138,11 +1184,15 @@ func (e GenericOpenAPIError) Body() []byte {
 return e.body
 }
 
-func (e GenericOpenAPIError) Model() any {
-return e.model
-}
-";
-    file(package, &[], body)
+"
+    .to_string();
+    body.push_str(&model_body);
+    let imports = if options.sdk.error_model.is_some() {
+        vec!["encoding/json"]
+    } else {
+        Vec::new()
+    };
+    file(package, &imports, &body)
 }
 
 pub(crate) fn emit_compat_configuration(package: &str) -> String {
@@ -1224,8 +1274,8 @@ return c.serverURL(), nil
     clippy::too_many_lines,
     reason = "the OpenAPI Generator compatibility helpers are emitted as one generated support file"
 )]
-pub(crate) fn emit_compat_utils(package: &str) -> String {
-    let body = "\
+pub(crate) fn emit_compat_utils(package: &str, options: &GoEmitOptions) -> String {
+    let mut body = "\
 type compatNamedReader interface {
 io.Reader
 Name() string
@@ -1244,7 +1294,7 @@ return false
 }
 }
 
-func compatMultipartFileBody(file any, fields map[string]any) (*bytes.Reader, string, error) {
+func compatMultipartFileBody(fileField string, file any, fields map[string]any) (*bytes.Reader, string, error) {
 var buf bytes.Buffer
 writer := multipart.NewWriter(&buf)
 for key, value := range fields {
@@ -1257,7 +1307,10 @@ reader, ok := file.(compatNamedReader)
 if !ok {
 return nil, \"\", fmt.Errorf(\"file must implement io.Reader and Name() string\")
 }
-part, err := writer.CreateFormFile(\"file\", filepath.Base(reader.Name()))
+if fileField == \"\" {
+fileField = \"file\"
+}
+part, err := writer.CreateFormFile(fileField, filepath.Base(reader.Name()))
 if err != nil {
 return nil, \"\", err
 }
@@ -1302,13 +1355,17 @@ return \"\"
 return compatQueryValue(v.Elem().Interface())
 }
 if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-return fmt.Sprint(value)
+return compatScalarQueryValue(value)
 }
 parts := make([]string, 0, v.Len())
 for i := 0; i < v.Len(); i++ {
-parts = append(parts, fmt.Sprint(v.Index(i).Interface()))
+parts = append(parts, compatQueryValue(v.Index(i).Interface()))
 }
 return strings.Join(parts, \",\")
+}
+
+func compatScalarQueryValue(value any) string {
+return fmt.Sprint(value)
 }
 
 func compatSetQueryValue(q url.Values, key string, value any) {
@@ -1342,24 +1399,33 @@ value = apiKey.Prefix + \" \" + value
 }
 req.Header.Set(header, value)
 }
-";
-    file(
-        package,
-        &[
-            "bytes",
-            "context",
-            "encoding/json",
-            "fmt",
-            "io",
-            "mime/multipart",
-            "net/http",
-            "net/url",
-            "path/filepath",
-            "reflect",
-            "strings",
-        ],
-        body,
-    )
+"
+    .to_string();
+    if options.sdk.query_time_format == QueryTimeFormat::DateOnlyAtMidnightElseRfc3339 {
+        body = body.replace(
+            "func compatScalarQueryValue(value any) string {\nreturn fmt.Sprint(value)\n}",
+            "func compatScalarQueryValue(value any) string {\nif t, ok := value.(time.Time); ok {\nif t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {\nreturn t.Format(\"2006-01-02\")\n}\nreturn t.Format(time.RFC3339)\n}\nreturn fmt.Sprint(value)\n}",
+        );
+    }
+    let mut imports = vec![
+        "bytes",
+        "context",
+        "encoding/json",
+        "fmt",
+        "io",
+        "mime/multipart",
+        "net/http",
+        "net/url",
+        "path/filepath",
+        "reflect",
+        "strings",
+    ];
+    if options.sdk.query_time_format.needs_time_import() {
+        imports.push("time");
+    }
+    imports.sort_unstable();
+    imports.dedup();
+    file(package, &imports, &body)
 }
 
 pub(crate) fn emit_compat_api_client_file(
@@ -1382,9 +1448,14 @@ pub(crate) fn emit_compat_api_file(
     base_path: &str,
     _service: &str,
     ops: &[&Operation],
+    options: &GoEmitOptions,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
-    let query_setters = compat_query_setters(graph);
+    let query_setters = if options.sdk.request_builder_scope.is_global() {
+        compat_query_setters(graph)
+    } else {
+        Vec::new()
+    };
     let mut imports = vec!["bytes", "context", "io", "net/http", "net/url"];
     if ops
         .iter()
@@ -1402,6 +1473,9 @@ pub(crate) fn emit_compat_api_file(
     }
     if needs_json {
         imports.push("encoding/json");
+    }
+    if ops.iter().any(|op| compat_operation_needs_time(op, graph)) {
+        imports.push("time");
     }
     imports.sort_unstable();
     imports.dedup();
@@ -1655,6 +1729,94 @@ fn emit_compat_api_client(body: &mut String, services: &[String]) -> Result<(), 
     Ok(())
 }
 
+struct CompatMultipartField {
+    wire_name: String,
+    setter: String,
+    arg_name: String,
+    arg_type: String,
+    is_file: bool,
+}
+
+fn compat_multipart_fields(
+    model: Option<&str>,
+    graph: &ApiGraph,
+) -> Result<Vec<CompatMultipartField>, CoreError> {
+    let Some(model) = model else {
+        return Ok(Vec::new());
+    };
+    let Some(schema) = graph.schemas.iter().find(|schema| schema.name == model) else {
+        return Ok(Vec::new());
+    };
+    let Type::Object(fields) = &schema.body else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        let setter = compat_exported(&field.json_name);
+        let is_file = is_multipart_file_field(field);
+        let arg_type = if is_file {
+            "any".to_string()
+        } else {
+            go_type(&field.schema, field.nullable, graph)?
+        };
+        out.push(CompatMultipartField {
+            wire_name: field.json_name.clone(),
+            arg_name: compat_arg_name(&setter),
+            setter,
+            arg_type,
+            is_file,
+        });
+    }
+    Ok(out)
+}
+
+fn is_multipart_file_field(field: &Field) -> bool {
+    matches!(&field.schema, Type::Primitive(Prim::Bytes))
+}
+
+fn compat_param_type(param: &crate::graph::Param, graph: &ApiGraph) -> Result<String, CoreError> {
+    go_type(&param.schema, false, graph)
+}
+
+fn compat_operation_needs_time(op: &Operation, graph: &ApiGraph) -> bool {
+    if op
+        .params
+        .iter()
+        .any(|param| type_needs_time(&param.schema, graph))
+    {
+        return true;
+    }
+    if !op
+        .request_body_content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.eq_ignore_ascii_case("multipart/form-data"))
+    {
+        return false;
+    }
+    request_body_model_of(op, graph)
+        .ok()
+        .flatten()
+        .and_then(|body| {
+            graph
+                .schemas
+                .iter()
+                .find(|schema| schema.name == body.model)
+        })
+        .is_some_and(|schema| match &schema.body {
+            Type::Object(fields) => fields.iter().any(|field| {
+                !is_multipart_file_field(field) && type_needs_time(&field.schema, graph)
+            }),
+            Type::Primitive(_)
+            | Type::WellKnown(_)
+            | Type::Array(_)
+            | Type::Map { .. }
+            | Type::Named(_)
+            | Type::Enum(_)
+            | Type::Union(_)
+            | Type::Any {} => false,
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_compat_request(
     body: &mut String,
@@ -1678,6 +1840,32 @@ fn emit_compat_request(
     let query_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location == "query").collect();
     let body_model = request_body_model_of(op, graph)?;
+    let multipart_fields =
+        compat_multipart_fields(body_model.as_ref().map(|body| body.model.as_str()), graph)?;
+    let has_multipart_body = op
+        .request_body_content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.eq_ignore_ascii_case("multipart/form-data"))
+        && !multipart_fields.is_empty();
+    let file_field = multipart_fields.iter().find(|field| field.is_file);
+    let has_json_body = body_model.is_some() && !has_multipart_body;
+    let body_field_query_setters = if has_multipart_body {
+        Vec::new()
+    } else {
+        compat_body_field_query_setters(body_model.as_ref().map(|body| body.model.as_str()), graph)
+    };
+    let body_setters = if has_json_body {
+        compat_body_setters(
+            body_model.as_ref().map(|body| body.model.as_str()),
+            &service,
+        )
+    } else {
+        Vec::new()
+    };
+    let has_extra_query = !global_query_setters.is_empty()
+        || !body_field_query_setters.is_empty()
+        || has_multipart_body;
+    let has_extra_header = !operation_api_key_schemes(graph, op)?.is_empty();
     let return_model = compat_success_return_model(op, graph)?;
 
     writeln!(body).map_err(sink)?;
@@ -1685,15 +1873,35 @@ fn emit_compat_request(
     writeln!(body, "ctx context.Context").map_err(sink)?;
     writeln!(body, "ApiService *{service}APIService").map_err(sink)?;
     for param in &path_params {
-        writeln!(body, "{} any", lower_camel(&param.name)).map_err(sink)?;
+        writeln!(
+            body,
+            "{} {}",
+            lower_camel(&param.name),
+            compat_param_type(param, graph)?
+        )
+        .map_err(sink)?;
     }
     for param in &query_params {
-        writeln!(body, "{} *any", lower_camel(&param.name)).map_err(sink)?;
+        writeln!(
+            body,
+            "{} *{}",
+            lower_camel(&param.name),
+            compat_param_type(param, graph)?
+        )
+        .map_err(sink)?;
     }
-    writeln!(body, "body any").map_err(sink)?;
-    writeln!(body, "file any").map_err(sink)?;
-    writeln!(body, "extraQuery map[string]any").map_err(sink)?;
-    writeln!(body, "extraHeader map[string]string").map_err(sink)?;
+    if has_json_body {
+        writeln!(body, "body any").map_err(sink)?;
+    }
+    if file_field.is_some() {
+        writeln!(body, "file any").map_err(sink)?;
+    }
+    if has_extra_query {
+        writeln!(body, "extraQuery map[string]any").map_err(sink)?;
+    }
+    if has_extra_header {
+        writeln!(body, "extraHeader map[string]string").map_err(sink)?;
+    }
     writeln!(body, "}}").map_err(sink)?;
 
     let mut emitted_methods = BTreeSet::new();
@@ -1707,8 +1915,8 @@ fn emit_compat_request(
                 body,
                 &request_name,
                 &setter,
-                &param.name,
                 &lower_camel(&param.name),
+                &compat_param_type(param, graph)?,
             )?;
         }
     }
@@ -1717,23 +1925,44 @@ fn emit_compat_request(
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            emit_compat_extra_query_setter(body, &request_name, &setter, query_name)?;
+            emit_compat_extra_query_setter(body, &request_name, &setter, query_name, "any")?;
         }
     }
-    for (setter, query_name) in
-        compat_body_field_query_setters(body_model.as_ref().map(|body| body.model.as_str()), graph)
-    {
-        for setter in compat_method_names(&setter) {
+    for (setter, query_name) in &body_field_query_setters {
+        for setter in compat_method_names(setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            emit_compat_extra_query_setter(body, &request_name, &setter, &query_name)?;
+            emit_compat_extra_query_setter(body, &request_name, &setter, query_name, "any")?;
         }
     }
-    for setter in compat_body_setters(
-        body_model.as_ref().map(|body| body.model.as_str()),
-        &service,
-    ) {
+    for field in &multipart_fields {
+        for setter in compat_method_names(&field.setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            if field.is_file {
+                emit_compat_file_setter(body, &request_name, &setter, &field.arg_name)?;
+            } else {
+                emit_compat_extra_query_setter(
+                    body,
+                    &request_name,
+                    &setter,
+                    &field.wire_name,
+                    &field.arg_type,
+                )?;
+            }
+        }
+    }
+    if file_field.is_some() {
+        for setter in compat_method_names("File") {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_file_setter(body, &request_name, &setter, &compat_arg_name(&setter))?;
+        }
+    }
+    for setter in body_setters {
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
@@ -1741,7 +1970,9 @@ fn emit_compat_request(
             emit_compat_body_setter(body, &request_name, &setter)?;
         }
     }
-    emit_compat_file_and_auth_setters(body, &request_name)?;
+    if has_extra_header {
+        emit_compat_auth_setter(body, &request_name)?;
+    }
 
     writeln!(body).map_err(sink)?;
     if return_model == "struct{}" {
@@ -1764,6 +1995,10 @@ fn emit_compat_request(
         graph,
         base_path,
         body_model.as_ref().map(|body| body.required),
+        has_multipart_body,
+        file_field.map(|field| field.wire_name.as_str()),
+        has_extra_header,
+        has_extra_query && !has_multipart_body,
         &return_model,
         &path_params,
         &query_params,
@@ -1772,7 +2007,13 @@ fn emit_compat_request(
 
     let args: Result<Vec<_>, _> = path_params
         .iter()
-        .map(|param| Ok(format!("{} any", lower_camel(&param.name))))
+        .map(|param| {
+            Ok(format!(
+                "{} {}",
+                lower_camel(&param.name),
+                compat_param_type(param, graph)?
+            ))
+        })
         .collect();
     let args = args?;
     writeln!(body).map_err(sink)?;
@@ -1803,12 +2044,13 @@ fn emit_compat_extra_query_setter(
     request_name: &str,
     setter: &str,
     query_name: &str,
+    arg_type: &str,
 ) -> Result<(), CoreError> {
     let arg = compat_arg_name(setter);
     writeln!(body).map_err(sink)?;
     writeln!(
         body,
-        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+        "func (r {request_name}) {setter}({arg} {arg_type}) {request_name} {{"
     )
     .map_err(sink)?;
     writeln!(body, "if r.extraQuery == nil {{").map_err(sink)?;
@@ -1829,26 +2071,17 @@ fn emit_compat_query_setter(
     body: &mut String,
     request_name: &str,
     setter: &str,
-    query_name: &str,
     field: &str,
+    arg_type: &str,
 ) -> Result<(), CoreError> {
     let arg = compat_arg_name(setter);
     writeln!(body).map_err(sink)?;
     writeln!(
         body,
-        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+        "func (r {request_name}) {setter}({arg} {arg_type}) {request_name} {{"
     )
     .map_err(sink)?;
     writeln!(body, "r.{field} = &{arg}").map_err(sink)?;
-    writeln!(body, "if r.extraQuery == nil {{").map_err(sink)?;
-    writeln!(body, "r.extraQuery = map[string]any{{}}").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(
-        body,
-        "r.extraQuery[{}] = {arg}",
-        quoted_string_literal(query_name)
-    )
-    .map_err(sink)?;
     writeln!(body, "return r").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -1884,20 +2117,25 @@ fn compat_arg_name(name: &str) -> String {
     }
 }
 
-fn emit_compat_file_and_auth_setters(
+fn emit_compat_file_setter(
     body: &mut String,
     request_name: &str,
+    setter: &str,
+    arg: &str,
 ) -> Result<(), CoreError> {
     writeln!(body).map_err(sink)?;
     writeln!(
         body,
-        "func (r {request_name}) File(file any) {request_name} {{"
+        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
     )
     .map_err(sink)?;
-    writeln!(body, "r.file = file").map_err(sink)?;
+    writeln!(body, "r.file = {arg}").map_err(sink)?;
     writeln!(body, "return r").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
 
+fn emit_compat_auth_setter(body: &mut String, request_name: &str) -> Result<(), CoreError> {
     writeln!(body).map_err(sink)?;
     writeln!(
         body,
@@ -1920,6 +2158,10 @@ fn emit_compat_execute_body(
     graph: &ApiGraph,
     base_path: &str,
     declared_body_required: Option<bool>,
+    has_multipart_body: bool,
+    multipart_file_field: Option<&str>,
+    has_extra_header: bool,
+    include_extra_query: bool,
     return_model: &str,
     path_params: &[&crate::graph::Param],
     query_params: &[&crate::graph::Param],
@@ -1939,18 +2181,24 @@ fn emit_compat_execute_body(
     writeln!(body, "var reqBody *bytes.Reader").map_err(sink)?;
     writeln!(body, "var reqContentType string").map_err(sink)?;
     writeln!(body, "var err error").map_err(sink)?;
-    writeln!(body, "if r.file != nil {{").map_err(sink)?;
-    writeln!(
-        body,
-        "var contentType string\nreqBody, contentType, err = compatMultipartFileBody(r.file, r.extraQuery)"
-    )
-    .map_err(sink)?;
-    writeln!(body, "if err != nil {{").map_err(sink)?;
-    write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "reqContentType = contentType").map_err(sink)?;
-    if matches!(declared_body_required, Some(true)) {
-        writeln!(body, "}} else {{").map_err(sink)?;
+    if has_multipart_body {
+        let file_field = multipart_file_field.unwrap_or("file");
+        let file_arg = if multipart_file_field.is_some() {
+            "r.file"
+        } else {
+            "nil"
+        };
+        writeln!(
+            body,
+            "var contentType string\nreqBody, contentType, err = compatMultipartFileBody({}, {file_arg}, r.extraQuery)",
+            quoted_string_literal(file_field)
+        )
+        .map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqContentType = contentType").map_err(sink)?;
+    } else if matches!(declared_body_required, Some(true)) {
         writeln!(body, "bodyValue := r.body").map_err(sink)?;
         writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
         writeln!(body, "bodyValue = map[string]any{{}}").map_err(sink)?;
@@ -1961,9 +2209,8 @@ fn emit_compat_execute_body(
         writeln!(body, "}}").map_err(sink)?;
         writeln!(body, "reqBody = encodedBody").map_err(sink)?;
         writeln!(body, "reqContentType = \"application/json\"").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
-    } else {
-        writeln!(body, "}} else if r.body != nil {{").map_err(sink)?;
+    } else if declared_body_required.is_some() {
+        writeln!(body, "if r.body != nil {{").map_err(sink)?;
         writeln!(body, "encodedBody, err := compatEncodeJSONBody(r.body)").map_err(sink)?;
         writeln!(body, "if err != nil {{").map_err(sink)?;
         write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
@@ -1973,10 +2220,12 @@ fn emit_compat_execute_body(
         writeln!(body, "}} else {{").map_err(sink)?;
         writeln!(body, "reqBody = bytes.NewReader(nil)").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
+    } else {
+        writeln!(body, "reqBody = bytes.NewReader(nil)").map_err(sink)?;
     }
 
     emit_compat_request_url(body, op, base_path, path_params, returns_value)?;
-    emit_compat_query(body, query_params)?;
+    emit_compat_query(body, query_params, include_extra_query)?;
     writeln!(
         body,
         "req, err := http.NewRequestWithContext(r.ctx, {}, parsedURL.String(), reqBody)",
@@ -2002,9 +2251,11 @@ fn emit_compat_execute_body(
     .map_err(sink)?;
     writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
-    writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
+    if has_extra_header {
+        writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
+        writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
     for scheme in operation_api_key_schemes(graph, op)? {
         writeln!(
             body,
@@ -2160,6 +2411,7 @@ fn emit_compat_request_url(
 fn emit_compat_query(
     body: &mut String,
     query_params: &[&crate::graph::Param],
+    include_extra_query: bool,
 ) -> Result<(), CoreError> {
     if !query_params.is_empty() {
         writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
@@ -2176,13 +2428,15 @@ fn emit_compat_query(
         }
         writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
     }
-    writeln!(body, "if len(r.extraQuery) > 0 && r.file == nil {{").map_err(sink)?;
-    writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
-    writeln!(body, "for key, value := range r.extraQuery {{").map_err(sink)?;
-    writeln!(body, "compatSetQueryValue(q, key, value)").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
+    if include_extra_query {
+        writeln!(body, "if len(r.extraQuery) > 0 {{").map_err(sink)?;
+        writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+        writeln!(body, "for key, value := range r.extraQuery {{").map_err(sink)?;
+        writeln!(body, "compatSetQueryValue(q, key, value)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
     Ok(())
 }
 
@@ -2368,7 +2622,7 @@ fn filter_compat_body_setters(setters: BTreeSet<String>) -> Vec<String> {
 }
 
 fn compat_request_reserved_method(name: &str) -> bool {
-    matches!(name, "Authorization" | "Execute" | "File")
+    matches!(name, "Authorization" | "Execute")
 }
 
 fn compat_trimmed_body_setters(name: &str) -> Vec<String> {
@@ -2491,6 +2745,7 @@ fn emit_compat_alias_constructors(
     canonical: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
     writeln!(body).map_err(sink)?;
     writeln!(body, "func New{alias}WithDefaults() *{alias} {{").map_err(sink)?;
@@ -2507,14 +2762,7 @@ fn emit_compat_alias_constructors(
             Ok(format!(
                 "{} {}",
                 lower_camel(&field.json_name),
-                go_field_type(
-                    field,
-                    graph,
-                    GoEmitOptions {
-                        compat_model_helpers: true,
-                    },
-                    Some(canonical),
-                )?
+                compat_constructor_arg_type(field, graph, options, Some(canonical))?
             ))
         })
         .collect();
@@ -2532,7 +2780,11 @@ fn emit_compat_alias_constructors(
         writeln!(
             body,
             "return (*{alias})(New{canonical}({}))",
-            names.join(", ")
+            names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
         .map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
@@ -3299,6 +3551,8 @@ fn lower_camel(name: &str) -> String {
     }
     if out.is_empty() {
         out.push_str("value");
+    } else if !out.starts_with(|ch: char| ch == '_' || ch.is_ascii_alphabetic()) {
+        out.insert_str(0, "value");
     }
     if is_go_keyword(&out) {
         out.push_str("Value");
@@ -3739,6 +3993,7 @@ mod tests {
             assert_eq!(lower_camel("page_size"), "pageSize");
             assert_eq!(lower_camel("goalId"), "goalID");
             assert_eq!(lower_camel("id"), "id");
+            assert_eq!(lower_camel("3d-model"), "value3dModel");
         }
     }
 
@@ -3791,8 +4046,9 @@ mod tests {
             let emitted = go_field_emissions(
                 "TokenIdentifyResponse",
                 &fields,
-                GoEmitOptions {
+                &GoEmitOptions {
                     compat_model_helpers: true,
+                    sdk: crate::sdk::go::GoSdkOptions::default(),
                 },
             )
             .unwrap();
