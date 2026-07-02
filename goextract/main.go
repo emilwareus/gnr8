@@ -102,6 +102,7 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 			Handler:             r.Handler,
 			OperationID:         r.Handler,
 			Group:               r.Group,
+			Middleware:          r.Middleware,
 			Params:              []facts.ParamFact{},
 			Responses:           []facts.ResponseFact{},
 			RequestBodyRequired: true,

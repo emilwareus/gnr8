@@ -1,7 +1,9 @@
 package routes_test
 
 import (
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -132,8 +134,8 @@ func TestStaticGinGroupPrefixesAreComposedForModularServices(t *testing.T) {
 
 	want := []routes.Route{
 		{Method: "GET", Path: "/api/health", Handler: "health", Group: "api", Secured: true},
-		{Method: "GET", Path: "/api/books", Handler: "listBooks", Group: "books", Secured: false},
-		{Method: "GET", Path: "/api/books/{id}", Handler: "getBook", Group: "books", Secured: false},
+		{Method: "GET", Path: "/api/books", Handler: "listBooks", Group: "books", Secured: true},
+		{Method: "GET", Path: "/api/books/{id}", Handler: "getBook", Group: "books", Secured: true},
 		{Method: "GET", Path: "/api/admin/stats", Handler: "adminStats", Group: "admin", Secured: false},
 		{Method: "GET", Path: "/api/ready", Handler: "ready", Group: "api", Secured: false},
 	}
@@ -154,6 +156,96 @@ func TestStaticGinGroupPrefixesAreComposedForModularServices(t *testing.T) {
 		if r.Secured != w.Secured {
 			t.Errorf("%s %s: secured want %v got %v", w.Method, w.Path, w.Secured, r.Secured)
 		}
+	}
+	assertRouteMiddleware(t, got[routeKey{"GET", "/api/books"}], []string{"Guard"})
+	assertRouteMiddleware(t, got[routeKey{"GET", "/api/books/{id}"}], []string{"Guard"})
+}
+
+func TestMiddlewareSymbolsAreCapturedFromGroupsUseAndRoutes(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteRouteTestFile(t, filepath.Join(dir, "go.mod"), `module example.com/middlewaregin
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWriteRouteTestFile(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWriteRouteTestFile(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Context struct{}
+type Engine struct{}
+type RouterGroup struct{}
+
+func (e *Engine) Group(string, ...HandlerFunc) *RouterGroup { return nil }
+func (e *Engine) GET(string, ...HandlerFunc) {}
+func (g *RouterGroup) Use(...HandlerFunc) {}
+func (g *RouterGroup) Group(string, ...HandlerFunc) *RouterGroup { return nil }
+func (g *RouterGroup) GET(string, ...HandlerFunc) {}
+func (g *RouterGroup) POST(string, ...HandlerFunc) {}
+`)
+	mustWriteRouteTestFile(t, filepath.Join(dir, "app.go"), `package middlewaregin
+
+import "github.com/gin-gonic/gin"
+
+type Auth struct{}
+type Handler struct{}
+type Server struct {
+	R *gin.Engine
+	H Handler
+	A Auth
+}
+
+func (Auth) RequireActiveSchool() gin.HandlerFunc { return nil }
+func (Auth) RequireActor() gin.HandlerFunc { return nil }
+func (Auth) RequireCSRF() gin.HandlerFunc { return nil }
+
+func (s Server) Register() {
+	active := s.R.Group("/v1/schools/active", s.A.RequireActiveSchool())
+	active.Use(s.A.RequireActor())
+	active.GET("/files/:fileId/open", s.H.open)
+	active.POST("/files", s.A.RequireCSRF(), s.H.create)
+	s.R.GET("/v1/admin/export/:exportId", s.A.RequireActor(), s.H.export)
+	s.R.Group("/inline", s.A.RequireActiveSchool()).Group("/files", s.A.RequireActor()).GET("/:fileId/open", s.H.open)
+}
+
+func (Handler) open(*gin.Context) {}
+func (Handler) create(*gin.Context) {}
+func (Handler) export(*gin.Context) {}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load middlewaregin: %v", err)
+	}
+	rs := routes.Recognize(res)
+	got := index(rs)
+
+	assertRouteMiddleware(t, got[routeKey{"GET", "/v1/schools/active/files/{fileId}/open"}], []string{"RequireActiveSchool", "RequireActor"})
+	assertRouteMiddleware(t, got[routeKey{"POST", "/v1/schools/active/files"}], []string{"RequireActiveSchool", "RequireActor", "RequireCSRF"})
+	assertRouteMiddleware(t, got[routeKey{"GET", "/v1/admin/export/{exportId}"}], []string{"RequireActor"})
+	assertRouteMiddleware(t, got[routeKey{"GET", "/inline/files/{fileId}/open"}], []string{"RequireActiveSchool", "RequireActor"})
+}
+
+func mustWriteRouteTestFile(t *testing.T, path string, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertRouteMiddleware(t *testing.T, route routes.Route, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(route.Middleware, want) {
+		t.Fatalf("%s %s middleware: want %v got %v", route.Method, route.Path, want, route.Middleware)
+	}
+	if !route.Secured {
+		t.Fatalf("%s %s should be marked secured when middleware is present", route.Method, route.Path)
 	}
 }
 

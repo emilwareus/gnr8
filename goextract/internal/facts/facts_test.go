@@ -126,7 +126,7 @@ var canonicalFieldNames = []string{
 	// GoFacts
 	"module", "routes", "schemas", "diagnostics",
 	// RouteFact
-	"method", "path", "handler", "operation_id", "group", "params", "request_body",
+	"method", "path", "handler", "operation_id", "group", "middleware", "params", "request_body",
 	"request_body_required", "request_body_content_type", "responses", "span",
 	// ParamFact (name/location/required/schema/span)
 	"name", "location", "required", "schema", "default",
@@ -219,7 +219,8 @@ func fullyPopulatedDoc() facts.GoFacts {
 		Routes: []facts.RouteFact{
 			{
 				Method: "PUT", Path: "/{uuid}", Handler: "updateGoal", OperationID: "updateGoal",
-				Group: "goals",
+				Group:      "goals",
+				Middleware: []string{"RequireActor"},
 				Params: []facts.ParamFact{
 					{
 						Name: "uuid", Location: "path", Required: true,

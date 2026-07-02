@@ -15,7 +15,7 @@ use super::{
     collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
-use crate::graph::{ApiGraph, Response, SchemaRef, SecurityScheme, Type};
+use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::layout::SdkFileLayout;
@@ -725,6 +725,7 @@ pub struct ApiOverrides {
     query_params: Vec<QueryParamOverride>,
     request_bodies: Vec<RequestBodyOverride>,
     responses: Vec<ResponseOverride>,
+    default_responses: Vec<DefaultResponseOverride>,
 }
 
 #[derive(Debug, Clone)]
@@ -752,6 +753,16 @@ struct ResponseOverride {
     status: u16,
     body_kind: String,
     content_type: Option<String>,
+    content_types: Vec<String>,
+    schema_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DefaultResponseOverride {
+    status: u16,
+    body_kind: String,
+    content_type: Option<String>,
+    content_types: Vec<String>,
     schema_ref: Option<String>,
 }
 
@@ -914,7 +925,44 @@ impl ApiOverrides {
             status,
             body_kind: "binary".to_string(),
             content_type: Some("application/octet-stream".to_string()),
+            content_types: vec!["application/octet-stream".to_string()],
             schema_ref: None,
+        });
+        self
+    }
+
+    /// Set or replace one JSON response body on an operation matched by method and graph path.
+    #[must_use]
+    pub fn json_response(
+        mut self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        status: u16,
+        schema: impl Into<String>,
+    ) -> Self {
+        self.responses.push(ResponseOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            status,
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+            schema_ref: Some(schema.into()),
+        });
+        self
+    }
+
+    /// Attach a JSON error response model to every operation that does not already declare `status`.
+    #[must_use]
+    pub fn default_error_response(mut self, status: u16, schema: impl Into<String>) -> Self {
+        self.default_responses.push(DefaultResponseOverride {
+            status,
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+            schema_ref: Some(schema.into()),
         });
         self
     }
@@ -930,6 +978,7 @@ impl ApiOverrides {
             status: 200,
             body_kind: "sse".to_string(),
             content_type: Some("text/event-stream".to_string()),
+            content_types: vec!["text/event-stream".to_string()],
             schema_ref: None,
         });
         self
@@ -965,6 +1014,9 @@ impl Transform for ApiOverrides {
         }
         for override_ in &self.responses {
             apply_response_override(ir, override_)?;
+        }
+        for override_ in &self.default_responses {
+            apply_default_response_override(ir, override_)?;
         }
         Ok(())
     }
@@ -1075,12 +1127,7 @@ fn apply_response_override(
     override_: &ResponseOverride,
 ) -> Result<(), CoreError> {
     let op_index = find_operation_index(ir, &override_.matcher, "response override")?;
-    let body = match &override_.schema_ref {
-        Some(schema) => Some(SchemaRef {
-            ref_id: resolve_schema_ref(ir, schema)?,
-        }),
-        None => None,
-    };
+    let body = response_override_body(ir, override_.schema_ref.as_deref())?;
     let op = &mut ir.operations[op_index];
     op.responses
         .retain(|response| response.status != override_.status);
@@ -1089,24 +1136,104 @@ fn apply_response_override(
         body,
         body_kind: override_.body_kind.clone(),
         content_type: override_.content_type.clone(),
-        content_types: override_
-            .content_type
-            .clone()
-            .into_iter()
-            .collect::<Vec<_>>(),
+        content_types: response_override_content_types(
+            override_.content_type.as_deref(),
+            &override_.content_types,
+        ),
     });
     op.responses.sort_by_key(|response| response.status);
     Ok(())
 }
 
-fn resolve_schema_ref(ir: &ApiGraph, schema: &str) -> Result<String, CoreError> {
-    ir.schemas
-        .iter()
-        .find(|candidate| candidate.id == schema || candidate.name == schema)
-        .map(|candidate| candidate.id.clone())
-        .ok_or_else(|| CoreError::Config {
-            message: format!("response override event schema '{schema}' did not match any schema"),
+fn apply_default_response_override(
+    ir: &mut ApiGraph,
+    override_: &DefaultResponseOverride,
+) -> Result<(), CoreError> {
+    if (200..300).contains(&override_.status) {
+        return Err(CoreError::Config {
+            message: format!(
+                "default error response status {} is a 2xx status",
+                override_.status
+            ),
+        });
+    }
+    let body_ref = override_
+        .schema_ref
+        .as_deref()
+        .map(|schema| resolve_schema_ref(ir, schema))
+        .transpose()?;
+    let content_types = response_override_content_types(
+        override_.content_type.as_deref(),
+        &override_.content_types,
+    );
+    for op in &mut ir.operations {
+        if op
+            .responses
+            .iter()
+            .any(|response| response.status == override_.status)
+        {
+            continue;
+        }
+        op.responses.push(Response {
+            status: override_.status,
+            body: body_ref.as_ref().map(|ref_id| SchemaRef {
+                ref_id: ref_id.clone(),
+            }),
+            body_kind: override_.body_kind.clone(),
+            content_type: override_.content_type.clone(),
+            content_types: content_types.clone(),
+        });
+        op.responses.sort_by_key(|response| response.status);
+    }
+    Ok(())
+}
+
+fn response_override_body(
+    ir: &ApiGraph,
+    schema_ref: Option<&str>,
+) -> Result<Option<SchemaRef>, CoreError> {
+    schema_ref
+        .map(|schema| {
+            Ok(SchemaRef {
+                ref_id: resolve_schema_ref(ir, schema)?,
+            })
         })
+        .transpose()
+}
+
+fn response_override_content_types(
+    content_type: Option<&str>,
+    content_types: &[String],
+) -> Vec<String> {
+    if content_types.is_empty() {
+        content_type.map(str::to_string).into_iter().collect()
+    } else {
+        content_types.to_vec()
+    }
+}
+
+fn resolve_schema_ref(ir: &ApiGraph, schema: &str) -> Result<String, CoreError> {
+    if let Some(candidate) = ir.schemas.iter().find(|candidate| candidate.id == schema) {
+        return Ok(candidate.id.clone());
+    }
+
+    let matches: Vec<&Schema> = ir
+        .schemas
+        .iter()
+        .filter(|candidate| candidate.name == schema)
+        .collect();
+    match matches.as_slice() {
+        [single] => Ok(single.id.clone()),
+        [] => Err(CoreError::Config {
+            message: format!("response override schema '{schema}' did not match any schema"),
+        }),
+        many => Err(CoreError::Config {
+            message: format!(
+                "response override schema '{schema}' matches {} schemas; use the full schema id",
+                many.len()
+            ),
+        }),
+    }
 }
 
 fn find_operation_index(
@@ -1326,6 +1453,7 @@ pub struct ApplySecurity {
 enum SecurityRule {
     PathPrefix(String),
     Methods(Vec<String>),
+    Middleware(String),
 }
 
 impl ApplySecurity {
@@ -1370,6 +1498,14 @@ impl ApplySecurity {
         methods.sort();
         methods.dedup();
         self.rules.push(SecurityRule::Methods(methods));
+        self
+    }
+
+    /// Apply this scheme only to operations that carry a source middleware symbol.
+    #[must_use]
+    pub fn when_middleware(mut self, symbol: impl Into<String>) -> Self {
+        self.scheme.global = false;
+        self.rules.push(SecurityRule::Middleware(symbol.into()));
         self
     }
 }
@@ -1417,7 +1553,18 @@ fn security_rule_matches(
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
         }
         SecurityRule::Methods(methods) => methods.iter().any(|method| method == &op.method),
+        SecurityRule::Middleware(symbol) => op
+            .middleware
+            .iter()
+            .any(|middleware| middleware_symbol_matches(middleware, symbol)),
     }
+}
+
+fn middleware_symbol_matches(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || actual
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix == expected)
 }
 
 fn joined_operation_path(base_path: &str, path: &str) -> String {
@@ -3002,7 +3149,9 @@ mod tests {
         StaticFiles, Target, Transform, TsSdk,
     };
     use crate::analyze::facts::FieldMeta;
-    use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, SchemaRef, SourceSpan, Type};
+    use crate::graph::{
+        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+    };
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
@@ -3080,6 +3229,7 @@ mod tests {
                     path: "/schools/active/profile".to_string(),
                     handler: "activeSchool".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3095,6 +3245,7 @@ mod tests {
                     path: "/items".to_string(),
                     handler: "createItem".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3110,6 +3261,7 @@ mod tests {
                     path: "/schools/active/items".to_string(),
                     handler: "activeWrite".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3157,6 +3309,83 @@ mod tests {
     }
 
     #[test]
+    fn apply_security_can_scope_schemes_to_source_middleware() {
+        let mut ir = ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "openActiveFile".to_string(),
+                    method: "GET".to_string(),
+                    path: "/v1/schools/active/files/{fileId}/open".to_string(),
+                    handler: "openActiveFile".to_string(),
+                    group: Some("files".to_string()),
+                    middleware: vec!["RequireActiveSchool".to_string()],
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "createActiveFile".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/schools/active/files".to_string(),
+                    handler: "createActiveFile".to_string(),
+                    group: Some("files".to_string()),
+                    middleware: vec!["RequireActiveSchool".to_string(), "RequireCSRF".to_string()],
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "exportAdmin".to_string(),
+                    method: "GET".to_string(),
+                    path: "/v1/admin/export/{exportId}".to_string(),
+                    handler: "exportAdmin".to_string(),
+                    group: Some("admin".to_string()),
+                    middleware: vec!["Auth.RequireActor".to_string()],
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApplySecurity::api_key("ActiveSchoolAuth", "X-School-Id")
+            .when_middleware("RequireActiveSchool")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
+            .when_middleware("RequireCSRF")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApplySecurity::api_key("ActorAuth", "Authorization")
+            .when_middleware("RequireActor")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(ir.operations[0].security, vec!["ActiveSchoolAuth"]);
+        assert_eq!(
+            ir.operations[1].security,
+            vec!["ActiveSchoolAuth", "CSRFAuth"]
+        );
+        assert_eq!(ir.operations[2].security, vec!["ActorAuth"]);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn api_overrides_can_patch_query_body_binary_and_sse_facts() {
         let mut ir = ApiGraph {
@@ -3183,6 +3412,7 @@ mod tests {
                     path: "/conversations/{conversationId}/read".to_string(),
                     handler: "markRead".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: Some(SchemaRef {
                         ref_id: "app.MarkReadRequest".to_string(),
@@ -3200,6 +3430,7 @@ mod tests {
                     path: "/files/{fileId}/download".to_string(),
                     handler: "download".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3215,6 +3446,7 @@ mod tests {
                     path: "/sync/stream".to_string(),
                     handler: "stream".to_string(),
                     group: None,
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3267,6 +3499,222 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn api_overrides_can_patch_json_and_default_error_responses() {
+        let mut ir = ApiGraph {
+            schemas: vec![
+                Schema {
+                    id: "app.Book".to_string(),
+                    name: "Book".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.ErrorResponse".to_string(),
+                    name: "ErrorResponse".to_string(),
+                    body: Type::Object(vec![Field {
+                        json_name: "message".to_string(),
+                        required: true,
+                        optional: false,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    }]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            operations: vec![
+                Operation {
+                    id: "getBook".to_string(),
+                    method: "GET".to_string(),
+                    path: "/books/current".to_string(),
+                    handler: "getBook".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![Response {
+                        status: 200,
+                        body: Some(SchemaRef {
+                            ref_id: "app.Book".to_string(),
+                        }),
+                        body_kind: "json".to_string(),
+                        content_type: None,
+                        content_types: vec!["application/json".to_string()],
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "createBook".to_string(),
+                    method: "POST".to_string(),
+                    path: "/books".to_string(),
+                    handler: "createBook".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![Response {
+                        status: 400,
+                        body: None,
+                        body_kind: "empty".to_string(),
+                        content_type: None,
+                        content_types: Vec::new(),
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .json_response("GET", "/books/current", 404, "ErrorResponse")
+            .default_error_response(400, "ErrorResponse")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let get_book = &ir.operations[0];
+        assert!(
+            get_book
+                .responses
+                .iter()
+                .any(|response| response.status == 400
+                    && response
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| body.ref_id == "app.ErrorResponse")
+                    && response.content_types.len() == 1
+                    && response.content_types[0] == "application/json"),
+            "{get_book:?}"
+        );
+        assert!(
+            get_book
+                .responses
+                .iter()
+                .any(|response| response.status == 404
+                    && response
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| body.ref_id == "app.ErrorResponse")
+                    && response.content_types.len() == 1
+                    && response.content_types[0] == "application/json"),
+            "{get_book:?}"
+        );
+        assert!(
+            ir.operations[1]
+                .responses
+                .iter()
+                .any(|response| response.status == 400 && response.body.is_none()),
+            "default response override must not replace explicit operation responses"
+        );
+
+        let mut out = Artifacts::new();
+        GoSdk::new()
+            .module("example.com/bookclient")
+            .to("sdk")
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let operations = out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "sdk/operations.go")
+            .unwrap()
+            .text
+            .as_str();
+        assert!(
+            operations.contains("var apiErr ErrorResponse"),
+            "Go SDK should decode non-2xx graph responses into ErrorResponse:\n{operations}"
+        );
+    }
+
+    #[test]
+    fn api_overrides_rejects_2xx_default_error_response() {
+        let mut ir = ApiGraph::default();
+        let err = ApiOverrides::new()
+            .default_error_response(200, "ErrorResponse")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("default error response status 200 is a 2xx status"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn api_overrides_rejects_ambiguous_response_schema_name() {
+        let mut ir = ApiGraph {
+            schemas: vec![
+                Schema {
+                    id: "public.ErrorResponse".to_string(),
+                    name: "ErrorResponse".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "admin.ErrorResponse".to_string(),
+                    name: "ErrorResponse".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            operations: vec![Operation {
+                id: "getBook".to_string(),
+                method: "GET".to_string(),
+                path: "/books/current".to_string(),
+                handler: "getBook".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params: vec![],
+                request_body: None,
+                request_body_required: true,
+                request_body_content_type: None,
+                responses: Vec::new(),
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let err = ApiOverrides::new()
+            .json_response("GET", "/books/current", 400, "ErrorResponse")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("response override schema 'ErrorResponse' matches 2 schemas"),
+            "{err}"
+        );
+
+        ApiOverrides::new()
+            .json_response("GET", "/books/current", 400, "admin.ErrorResponse")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(
+            ir.operations[0].responses.iter().any(|response| response
+                .body
+                .as_ref()
+                .is_some_and(|body| body.ref_id == "admin.ErrorResponse")),
+            "{ir:?}"
+        );
+    }
+
+    #[test]
     fn group_operations_overrides_matches_and_preserves_source_groups() {
         let mut ir = ApiGraph {
             operations: vec![
@@ -3276,6 +3724,7 @@ mod tests {
                     path: "/auth/login".to_string(),
                     handler: "login".to_string(),
                     group: Some("auth".to_string()),
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3291,6 +3740,7 @@ mod tests {
                     path: "/files/{fileId}".to_string(),
                     handler: "download".to_string(),
                     group: Some("files".to_string()),
+                    middleware: Vec::new(),
                     params: vec![],
                     request_body: None,
                     request_body_required: true,
@@ -3342,6 +3792,7 @@ mod tests {
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
                 group: None,
+                middleware: Vec::new(),
                 params: vec![],
                 request_body: None,
                 request_body_required: true,
@@ -3408,6 +3859,7 @@ mod tests {
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
                 group: None,
+                middleware: Vec::new(),
                 params: vec![],
                 request_body: None,
                 request_body_required: true,

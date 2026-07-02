@@ -54,6 +54,9 @@ pub(crate) struct RouteFact {
     /// Source-derived route group/tag name, if the source router exposes one statically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group: Option<String>,
+    /// Source middleware symbols applied before the handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) middleware: Vec<String>,
     /// Path and query parameters.
     pub(crate) params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
@@ -693,6 +696,7 @@ mod tests {
               "path": "/{uuid}",
               "handler": "updateGoal",
               "operation_id": "updateGoal",
+              "middleware": ["RequireActor"],
               "params": [
                 {
                   "name": "uuid",
@@ -725,6 +729,7 @@ mod tests {
             assert_eq!(r.path, "/{uuid}");
             assert_eq!(r.operation_id, "updateGoal");
             assert_eq!(r.handler, "updateGoal");
+            assert_eq!(r.middleware, vec!["RequireActor"]);
 
             let body = r.request_body.as_ref().unwrap();
             assert!(body.ref_id.ends_with("dto.UpdateGoalInput"));

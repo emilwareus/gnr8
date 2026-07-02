@@ -359,6 +359,205 @@ func dynamicContentType() string {
 	}
 }
 
+func TestDelegatedBinaryResponseHelpersAreAnalyzed(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/delegatedbinary
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import "io"
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Header(string, string) {}
+func (c *Context) Data(int, string, []byte) {}
+func (c *Context) DataFromReader(int, int64, string, io.Reader, map[string]string) {}
+func (c *Context) File(string) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package delegatedbinary
+
+import (
+	"io"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+type Other struct{}
+type attachment struct {
+	Reader io.Reader
+	SizeBytes int64
+	ContentType string
+}
+
+func (s Server) Register() {
+	s.R.GET("/download", s.download)
+	s.R.GET("/content", s.content)
+	s.R.GET("/file", s.file)
+}
+
+func (s Server) download(c *gin.Context) {
+	s.serveAttachment(c, false)
+}
+
+func (s Server) serveAttachment(c *gin.Context, inline bool) {
+	attachment := loadAttachment(c)
+	c.Header("Content-Disposition", "attachment")
+	c.DataFromReader(200, attachment.SizeBytes, attachment.ContentType, attachment.Reader, nil)
+}
+
+func (Other) serveAttachment(c *gin.Context, inline bool) {}
+
+func loadAttachment(c *gin.Context) attachment {
+	return attachment{Reader: strings.NewReader("hello"), SizeBytes: 5}
+}
+
+func (s Server) content(c *gin.Context) {
+	writeAttachmentContent(c, dynamicContentType(c), "file.txt", []byte("hello"))
+}
+
+func (s Server) file(c *gin.Context) {
+	c.Header("Content-Type", "application/pdf")
+	s.serveFile(c)
+}
+
+func (s Server) serveFile(c *gin.Context) {
+	c.File("/tmp/report.pdf")
+}
+
+func writeAttachmentContent(c *gin.Context, contentType, filename string, body []byte) {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Data(200, contentType, body)
+}
+
+func dynamicContentType(c *gin.Context) string {
+	return ""
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load delegated binary handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/delegatedbinary", diags)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range routes.Recognize(res) {
+		got[r.Handler] = analyzer.Analyze(r, diags)
+	}
+
+	assertBinaryOctetStreamResponse(t, got["download"].Responses)
+	assertBinaryOctetStreamResponse(t, got["content"].Responses)
+	assertBinaryResponse(t, got["file"].Responses, "application/pdf")
+}
+
+func TestPathParamHelperReturnTypeSetsSchema(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/pathhelpers
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v0.0.0
+	github.com/google/uuid v0.0.0
+)
+
+replace github.com/gin-gonic/gin => ./ginstub
+replace github.com/google/uuid => ./uuidstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "uuidstub"), 0o755); err != nil {
+		t.Fatalf("mkdir uuidstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Param(string) string { return "" }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "uuidstub", "go.mod"), "module github.com/google/uuid\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "uuidstub", "uuid.go"), `package uuid
+
+type UUID [16]byte
+
+func Parse(string) (UUID, error) { return UUID{}, nil }
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package pathhelpers
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type Server struct{ R *gin.Engine }
+type File struct {
+	ID string `+"`json:\"id\"`"+`
+}
+
+func (s Server) Register() {
+	s.R.GET("/files/:fileId", s.getFile)
+}
+
+func (s Server) getFile(c *gin.Context) {
+	fileID, err := parsePathUUID(c, "fileId")
+	_, _ = fileID, err
+	c.JSON(200, File{})
+}
+
+func parsePathUUID(c *gin.Context, key string) (uuid.UUID, error) {
+	return uuid.Parse(c.Param(key))
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load path helper handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/pathhelpers", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		if r.Handler == "getFile" {
+			cf = analyzer.Analyze(r, diags)
+		}
+	}
+
+	param, ok := paramByName(cf.Params, "fileId")
+	if !ok {
+		t.Fatalf("missing helper-derived fileId param: %+v", cf.Params)
+	}
+	if param.Location != "path" || !param.Required {
+		t.Fatalf("fileId param should be required path param, got %+v", param)
+	}
+	if param.Schema.Type != facts.TypeWellKnown || param.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("fileId helper return type should infer uuid schema, got %+v", param.Schema)
+	}
+}
+
 func TestDataApplicationJSONBytesAreRawBinaryResponses(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/rawjson
@@ -432,6 +631,28 @@ func mustWrite(t *testing.T, path string, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertBinaryOctetStreamResponse(t *testing.T, responses []facts.ResponseFact) {
+	t.Helper()
+	assertBinaryResponse(t, responses, "application/octet-stream")
+}
+
+func assertBinaryResponse(t *testing.T, responses []facts.ResponseFact, contentType string) {
+	t.Helper()
+	if len(responses) != 1 {
+		t.Fatalf("want exactly one response, got %+v", responses)
+	}
+	response := responses[0]
+	if response.Status != 200 || response.BodyKind != "binary" || response.Body != nil {
+		t.Fatalf("want 200 binary response with no body schema, got %+v", response)
+	}
+	if response.ContentType != contentType {
+		t.Fatalf("want %s content type, got %+v", contentType, response)
+	}
+	if !equalStrings(response.ContentTypes, []string{contentType}) {
+		t.Fatalf("want %s content_types, got %+v", contentType, response)
 	}
 }
 

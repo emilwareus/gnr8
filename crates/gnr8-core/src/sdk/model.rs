@@ -288,6 +288,7 @@ mod tests {
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
                 group: Some("Books".to_string()),
+                middleware: Vec::new(),
                 params: vec![],
                 request_body: Some(SchemaRef {
                     ref_id: "app.Book".to_string(),
