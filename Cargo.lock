@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "gnr8"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "blake3",
  "insta",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "gnr8-cli"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "clap",
