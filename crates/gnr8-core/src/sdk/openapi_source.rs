@@ -2315,7 +2315,9 @@ paths:
             .collect::<Vec<_>>();
         assert!(paths.contains(&"generated/openapi.json"));
         assert!(paths.contains(&"generated/ts/index.ts"));
-        assert!(paths.contains(&"generated/ts/models.ts"));
+        assert!(paths.contains(&"generated/ts/runtime.ts"));
+        assert!(paths.contains(&"generated/ts/apis/index.ts"));
+        assert!(paths.contains(&"generated/ts/models/index.ts"));
 
         let _ = std::fs::remove_dir_all(root);
     }

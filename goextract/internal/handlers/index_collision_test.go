@@ -14,6 +14,7 @@ import (
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/handlers"
 	"github.com/gnr8/goextract/internal/load"
+	"github.com/gnr8/goextract/internal/routes"
 )
 
 // parsePkg parses a single source string into a *packages.Package with the given
@@ -103,6 +104,23 @@ func TestBuildIndexDuplicateSurvivorIsDeterministic(t *testing.T) {
 	}
 	if !strings.Contains(loser0, "example.com/m/b") {
 		t.Errorf("deterministic loser should be pkg b (sorts after a), got %q", loser0)
+	}
+}
+
+func TestAnalyzerReportsOnlyRouteReferencedDuplicateNames(t *testing.T) {
+	analyzer := handlers.NewAnalyzer(collidingResult(t, 0), "example.com/m", nil)
+
+	unreferenced := diag.New()
+	analyzer.ReportRouteHandlerCollisions([]routes.Route{{Handler: "Other"}}, unreferenced)
+	if dupes := dupMessages(unreferenced.Items()); len(dupes) != 0 {
+		t.Fatalf("helper-only duplicate should stay silent, got %d diagnostics: %v", len(dupes), dupes)
+	}
+
+	referenced := diag.New()
+	analyzer.ReportRouteHandlerCollisions([]routes.Route{{Handler: "Handle"}}, referenced)
+	dupes := dupMessages(referenced.Items())
+	if len(dupes) != 1 {
+		t.Fatalf("route-referenced duplicate should warn once, got %d diagnostics: %v", len(dupes), dupes)
 	}
 }
 

@@ -66,10 +66,11 @@ func run(targetDir string, patterns []string, w *os.File) error {
 	//
 	// The Analyzer carries the module prefix as per-invocation context (WR-03), so
 	// the analysis is reentrant rather than depending on process-global setup
-	// ordering. Building it also indexes the handlers, surfacing any duplicate-
-	// bare-name collisions as diagnostics (WR-02).
+	// ordering. The analyzer keeps duplicate bare-name collisions so they can be
+	// reported after route recognition only when they affect a route (WR-02).
 	analyzer := handlers.NewAnalyzer(res, module, diags)
 	recognized := routes.RecognizeWithDiagnostics(res, diags)
+	analyzer.ReportRouteHandlerCollisions(recognized, diags)
 	routeFacts, syntheticSchemas := buildRoutes(analyzer, recognized, diags)
 	schemas = append(schemas, syntheticSchemas...)
 

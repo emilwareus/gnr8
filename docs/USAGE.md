@@ -198,6 +198,73 @@ GoSdk::new()
     .source_only(); // suppress docs and package metadata when an outer package owns them
 ```
 
+Route-scoped auth, legacy SDK names, and source-fact overrides stay in `.gnr8/src/main.rs` as regular
+Rust:
+
+```rust
+let active_school = OperationSelector::any([
+    OperationSelector::path_prefix("/v1/schools/active/"),
+    OperationSelector::path_prefix("/v1/import-jobs/"),
+]);
+let mutating = OperationSelector::methods(["POST", "PUT", "PATCH", "DELETE"]);
+
+Pipeline::new()
+    .source(GoGin::new().inputs(["backend"]))
+    .transform(
+        ApplySecurity::api_key("ActiveSchoolAuth", "X-Plint-School-Id")
+            .when(active_school.clone()),
+    )
+    .transform(
+        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
+            .when(OperationSelector::all([
+                OperationSelector::any([
+                    active_school,
+                    OperationSelector::path_prefix("/v1/governance/"),
+                ]),
+                mutating,
+            ])),
+    )
+    .transform(
+        ApiOverrides::new()
+            .query_param(
+                "GET",
+                "/v1/schools/active/schedule/week",
+                QueryParam::new("startDate").date().required(),
+            )
+            .binary_response("GET", "/v1/schools/active/files/{fileId}/download", 200),
+    )
+    .transform(
+        SdkOperationAliases::new()
+            .operation("GET", "/v1/schools/active/files/{fileId}/download")
+            .tag("files")
+            .name("downloadSchoolFile")
+            .operation("POST", "/v1/schools/active/coursework/search")
+            .tag("coursework")
+            .name("searchCoursework"),
+    )
+    .target(
+        TsSdk::new()
+            .module("@acme/books")
+            .to("generated/typescript")
+            .profile(SdkProfile::typescript_fetch_compat()),
+    )
+    .target(
+        GoSdk::new()
+            .module("example.com/acme/books")
+            .to("generated/go")
+            .profile(SdkProfile::go_openapi_generator_compat()),
+    );
+```
+
+The TypeScript fetch profile emits `runtime.ts`, `apis/index.ts`, `models/index.ts`, grouped API
+classes, raw methods such as `getCourseworkSubmissionAttachmentRaw(...)`, and value methods such as
+`getCourseworkSubmissionAttachment(...)`. Binary responses return `BlobApiResponse`; JSON responses
+return `JSONApiResponse`; empty responses return `VoidApiResponse`.
+
+The Go OpenAPI Generator profile emits `client.go`, `configuration.go`, `errors.go`, `utils.go`, and
+grouped `api_*.go` files with request builders and `Execute()` methods. Operation-scoped API-key
+headers are only sent by operations whose selectors matched.
+
 ### Writing your own stage (the escape hatch is code)
 Anything the built-ins don't cover, you implement as a trait and add to the pipeline — no forking a
 generator, no config DSL. The IR (`gnr8::graph`) is read/write so a `Transform` edits it freely;

@@ -64,6 +64,10 @@ const AXIOS_SDK_FILES: [&str; 6] = [
     "models.ts",
 ];
 
+/// Files emitted by the `typescript-fetch` OpenAPI-generator compatibility profile.
+const FETCH_COMPAT_SDK_FILES: [&str; 4] =
+    ["apis/index.ts", "index.ts", "models/index.ts", "runtime.ts"];
+
 /// Whether the `node` + vendored `tsc` toolchain is available so this test skips gracefully if it is
 /// absent. Checks BOTH `node` (drives tsextract AND tsc) and the vendored compiler file existing.
 fn toolchain_available() -> bool {
@@ -172,6 +176,29 @@ fn materialize_axios_sdk() -> PathBuf {
         std::fs::write(path, &artifact.text).expect("write generated artifact");
     }
     write_axios_type_stub(&root.join("sdk"));
+    root.join("sdk")
+}
+
+fn materialize_fetch_compat_sdk() -> PathBuf {
+    use gnr8::sdk::prelude::*;
+
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+        .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
+    let root = unique_temp_dir("fetch-root");
+    let mut artifacts = Artifacts::new();
+    TsSdk::new()
+        .module("example.com/bookstore/sdk")
+        .to("sdk")
+        .profile(SdkProfile::typescript_fetch_compat())
+        .generate(&graph, &mut artifacts, &Cx::new(root.clone()))
+        .expect("typescript-fetch profile SDK generation must succeed");
+    for artifact in artifacts.files() {
+        let path = root.join(&artifact.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create artifact parent");
+        }
+        std::fs::write(path, &artifact.text).expect("write generated artifact");
+    }
     root.join("sdk")
 }
 
@@ -304,6 +331,61 @@ void smoke;
     assert!(
         result.is_ok(),
         "axios profile must type-check against the test-local axios stub: {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
+}
+
+#[test]
+fn typescript_fetch_compat_profile_typechecks_with_raw_response_consumer() {
+    if !toolchain_available() {
+        eprintln!("skipping tssdk fetch compat compile: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_fetch_compat_sdk();
+
+    for name in FETCH_COMPAT_SDK_FILES {
+        assert!(
+            dir.join(name).exists(),
+            "expected {name} in {}",
+            dir.display()
+        );
+    }
+    let runtime = std::fs::read_to_string(dir.join("runtime.ts")).expect("read runtime.ts");
+    for snippet in [
+        "export class BaseAPI",
+        "export class Configuration",
+        "export class JSONApiResponse<T>",
+        "export class VoidApiResponse",
+        "export class BlobApiResponse",
+    ] {
+        assert!(runtime.contains(snippet), "missing {snippet}:\n{runtime}");
+    }
+
+    std::fs::write(
+        dir.join("consumer.ts"),
+        r#"
+import { Configuration, DefaultApi } from "./index";
+
+async function smoke(): Promise<void> {
+  const api = new DefaultApi(new Configuration({ basePath: "https://example.test" }));
+  const raw = await api.listBooksRaw({ genre: "fiction" });
+  raw.raw.status.toFixed();
+  const value = await raw.value();
+  value.books;
+}
+
+void smoke;
+"#,
+    )
+    .expect("write fetch consumer smoke test");
+
+    let mut ts_files = FETCH_COMPAT_SDK_FILES.to_vec();
+    ts_files.push("consumer.ts");
+    let result = run_tsc(&ts_files, &dir);
+    assert!(
+        result.is_ok(),
+        "typescript-fetch profile must type-check with the raw response consumer: {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));

@@ -17,8 +17,8 @@ mod gofmt;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_stem, global_api_key_header_name,
-    model_file_name, operation_file_name, validate_sdk_base_path,
+    api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
+    operation_file_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
@@ -96,6 +96,10 @@ pub(crate) fn generate_files_with_profile(
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
 
+    if profile.is_go_openapi_generator_compat() {
+        return generate_go_openapi_generator_compat_files(graph, package, base_path, aliases);
+    }
+
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_headers = api_key_header_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
@@ -112,14 +116,13 @@ pub(crate) fn generate_files_with_profile(
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
     if emit_compat_surface {
-        let auth_header = global_api_key_header_name(graph, "Go compatibility profile")?;
         files.push(raw_go_file(
             "compat_helpers.go",
             emit::emit_compat_helpers(package),
         ));
         files.push(raw_go_file(
             "compat_client.go",
-            emit::emit_compat_client_surface(graph, package, base_path, auth_header.as_deref())?,
+            emit::emit_compat_client_surface(graph, package, base_path)?,
         ));
     }
     if !resolved_aliases.is_empty() {
@@ -166,6 +169,48 @@ pub(crate) fn generate_files_with_profile(
     Ok(files)
 }
 
+fn generate_go_openapi_generator_compat_files(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    aliases: &SdkTypeAliases,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let resolved_aliases = aliases.resolve(graph)?;
+    let compat_options = emit::GoEmitOptions {
+        compat_model_helpers: true,
+    };
+    let mut files = vec![
+        raw_go_file(
+            "client.go",
+            emit::emit_compat_api_client_file(graph, package)?,
+        ),
+        raw_go_file("configuration.go", emit::emit_compat_configuration(package)),
+        raw_go_file("errors.go", emit::emit_compat_errors(package)),
+        raw_go_file("utils.go", emit::emit_compat_utils(package)),
+    ];
+    for (service, ops) in emit::compat_operations_by_service(graph) {
+        files.push(raw_go_file(
+            format!("api_{}.go", file_stem(&service)),
+            emit::emit_compat_api_file(graph, package, base_path, &service, &ops)?,
+        ));
+    }
+    if !resolved_aliases.is_empty() {
+        files.push(raw_go_file(
+            "aliases.go",
+            emit::emit_type_aliases(graph, package, &resolved_aliases, compat_options)?,
+        ));
+    }
+    for schema in &graph.schemas {
+        files.push(raw_go_file(
+            format!("model_{}.go", file_stem(&schema.name)),
+            emit::emit_model_schema_with_options(graph, package, schema, compat_options)?,
+        ));
+    }
+    let mut files = gofmt::gofmt_files(files)?;
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
 /// Wrap a raw emitted file as a named [`SdkFile`] before batched formatting.
 fn raw_go_file(name: impl Into<String>, raw: impl Into<String>) -> SdkFile {
     SdkFile {
@@ -184,7 +229,7 @@ mod tests {
     use super::{
         generate, generate_files_with_layout, generate_files_with_profile, generate_with_layout,
     };
-    use crate::graph::ApiGraph;
+    use crate::graph::{ApiGraph, Param, Prim, Response, SecurityScheme, SourceSpan, Type};
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
@@ -467,10 +512,10 @@ mod tests {
             "func NewConfiguration() *Configuration",
             "func NewAPIClient(cfg *Configuration) *APIClient",
             "GoalsAPI   *GoalsAPIService",
-            "func (a *GoalsAPIService) ListGet(ctx context.Context) ApiListGetRequest",
-            "func (r ApiListGetRequest) Aggregation(aggregation any) ApiListGetRequest",
-            "func (r ApiPostRequest) GoalInput(goalInput any) ApiPostRequest",
-            "func (r ApiListGetRequest) Execute() (*ListGoalsOutput, *http.Response, error)",
+            "func (a *GoalsAPIService) ListGoals(ctx context.Context) ApiListGoalsRequest",
+            "func (r ApiListGoalsRequest) Aggregation(aggregation any) ApiListGoalsRequest",
+            "func (r ApiCreateGoalRequest) GoalInput(goalInput any) ApiCreateGoalRequest",
+            "func (r ApiListGoalsRequest) Execute() (*ListGoalsOutput, *http.Response, error)",
         ] {
             assert!(compat.contains(snippet), "missing {snippet}:\n{compat}");
         }
@@ -495,7 +540,159 @@ mod tests {
             &SdkProfile::go_openapi_generator_compat(),
         )
         .unwrap();
-        assert!(files.iter().any(|file| file.name == "compat_helpers.go"));
-        assert!(files.iter().any(|file| file.name == "compat_client.go"));
+        for name in [
+            "api_goals.go",
+            "client.go",
+            "configuration.go",
+            "errors.go",
+            "utils.go",
+        ] {
+            assert!(
+                files.iter().any(|file| file.name == name),
+                "missing {name}: {files:#?}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test constructs a complete binary route and verifies the generated compatibility surface"
+    )]
+    fn go_openapi_generator_profile_emits_grouped_requests_binary_and_scoped_headers() {
+        if !gofmt_available() {
+            eprintln!("skipping Go profile scoped compat test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.security = vec![
+            SecurityScheme {
+                id: "ActiveSchoolAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-Plint-School-Id".to_string(),
+                global: false,
+            },
+            SecurityScheme {
+                id: "CSRFAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-CSRF-Token".to_string(),
+                global: false,
+            },
+        ];
+        graph.operations[0].id = "getCourseworkSubmissionAttachment".to_string();
+        graph.operations[0].handler = "getCourseworkSubmissionAttachment".to_string();
+        graph.operations[0].group = Some("Coursework".to_string());
+        graph.operations[0].method = "GET".to_string();
+        graph.operations[0].path =
+            "/coursework/assignments/{assignmentId}/submissions/{studentPersonId}/attachment"
+                .to_string();
+        graph.operations[0].params = vec![
+            Param {
+                name: "assignmentId".to_string(),
+                location: "path".to_string(),
+                required: true,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                provenance: SourceSpan {
+                    file: "/root/http.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+            Param {
+                name: "studentPersonId".to_string(),
+                location: "path".to_string(),
+                required: true,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                provenance: SourceSpan {
+                    file: "/root/http.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            },
+        ];
+        graph.operations[0].request_body = None;
+        graph.operations[0].responses = vec![Response {
+            status: 200,
+            body: None,
+            body_kind: "binary".to_string(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_types: vec!["application/octet-stream".to_string()],
+        }];
+        graph.operations[0].security = vec!["ActiveSchoolAuth".to_string(), "CSRFAuth".to_string()];
+        graph.operations[1].security.clear();
+
+        let files = generate_files_with_profile(
+            &graph,
+            "plintsdk",
+            "/v1",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+
+        for name in [
+            "api_coursework.go",
+            "client.go",
+            "configuration.go",
+            "errors.go",
+            "utils.go",
+        ] {
+            assert!(
+                files.iter().any(|file| file.name == name),
+                "missing {name}: {files:#?}"
+            );
+        }
+
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_coursework.go")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "func (a *CourseworkAPIService) GetCourseworkSubmissionAttachment(ctx context.Context, assignmentID any, studentPersonID any) ApiGetCourseworkSubmissionAttachmentRequest",
+            "func (r ApiGetCourseworkSubmissionAttachmentRequest) Execute() ([]byte, *http.Response, error)",
+            "compatApplyAPIKey(req, r.ctx, \"ActiveSchoolAuth\", \"X-Plint-School-Id\")",
+            "compatApplyAPIKey(req, r.ctx, \"CSRFAuth\", \"X-CSRF-Token\")",
+            "req.Header.Set(\"Accept\", \"application/octet-stream\")",
+            "localVarReturnValue = localVarBody",
+            "&GenericOpenAPIError{body: localVarBody, error: resp.Status}",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+        for forbidden in [
+            "req.Header.Get(\"Authorization\") != \"\"",
+            "req.Header.Set(\"X-CSRF-Token\", req.Header.Get(\"Authorization\"))",
+            "req.Header.Set(\"X-Plint-School-Id\", req.Header.Get(\"Authorization\"))",
+        ] {
+            assert!(!api.contains(forbidden), "forbidden {forbidden}:\n{api}");
+        }
+
+        let utils = files
+            .iter()
+            .find(|file| file.name == "utils.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            utils.contains("func parameterAddToHeaderOrQuery("),
+            "{utils}"
+        );
+
+        let errors = files
+            .iter()
+            .find(|file| file.name == "errors.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            errors.contains("type GenericOpenAPIError struct"),
+            "{errors}"
+        );
     }
 }
