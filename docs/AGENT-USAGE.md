@@ -78,6 +78,8 @@ Common changes:
 - Change `SetTitle` for OpenAPI `info.title`.
 - Add `ApplySecurity::api_key(...)` for header API-key auth.
 - Add `RenameOperation` or `RenameType` for compatibility.
+- Add `ApiOverrides::new().json_request_body(...)`, `.form_request_body(...)`, or
+  `.multipart_request_body(...)` when the source graph is missing a legacy request body shape.
 - Change target output paths to keep generated files under `generated/` or `sdk/`.
 
 ## Source-Specific Notes
@@ -121,8 +123,54 @@ Pipeline::new()
 Compatibility checks compare old and new generated SDK surfaces:
 
 ```bash
-gnr8 compat typescript --old old-typescript-sdk --new generated/typescript
-gnr8 compat go --old old-go-sdk --new generated/go
+gnr8 compat typescript --old old-typescript-sdk --new generated/typescript --contract sdk-compat.toml
+gnr8 compat go --old old-go-sdk --new generated/go --contract sdk-compat.toml --suggest
+```
+
+Without `--contract`, any surface diff is breaking. With `--contract`, only missing required symbols
+and unapproved diff items fail the command; stale allowances are reported in `--json` and do not fail.
+`--suggest` adds high-confidence migration snippets to human output and to the JSON `suggestions`
+array.
+
+Contract keys are optional arrays, except `allow.docs_layout_migration`, which defaults to `false`:
+
+```toml
+[allow]
+docs_layout_migration = false
+missing_docs = []
+
+[go]
+require_exported_types = []
+require_exported_functions = []
+require_exported_methods = []
+allow_missing_exported_types = []
+allow_missing_exported_functions = []
+allow_missing_exported_methods = []
+allow_exported_function_signature_changes = []
+allow_exported_method_signature_changes = []
+allow_missing_docs = []
+allow_package_metadata_changes = []
+
+[typescript]
+require_root_exports = []
+require_model_exports = []
+require_api_classes = []
+require_api_factories = []
+require_operation_methods = []
+require_request_aliases = []
+allow_missing_root_exports = []
+allow_missing_model_exports = []
+allow_missing_api_classes = []
+allow_missing_api_factories = []
+allow_missing_operation_methods = []
+allow_missing_request_aliases = []
+allow_missing_interface_properties = []  # "Interface.property"
+allow_interface_property_changes = []    # "Interface.property"
+allow_operation_return_type_changes = []
+allow_operation_signature_changes = []
+allow_export_kind_mismatches = []
+allow_package_entry_point_changes = []
+allow_missing_docs = []
 ```
 
 For OpenAPI Generator migrations, use compatibility profiles first and clean profiles later:
@@ -137,7 +185,47 @@ TsSdk::new()
 GoSdk::new()
     .module("example.com/acme/books")
     .to("generated/go")
-    .profile(SdkProfile::go_openapi_generator_compat());
+    .profile(SdkProfile::go_openapi_generator_compat())
+    .request_builder_aliases(
+        GoRequestBuilderAliases::new()
+            .operation("POST", "/books")
+            .body("Book")
+            .operation("GET", "/books")
+            .query("PageSize", "pageSize"),
+    )
+    .query_setter_argument_policy(
+        GoQuerySetterArgumentPolicy::typed().any_for_queries(["sort", "filter"]),
+    )
+    .execute_compatibility(GoExecuteCompatibility::preserve_legacy().route("GET", "/books"));
+```
+
+Request-body creation helpers create or replace `op.request_body`, set the content type, and default to
+required. Chain `.optional()` immediately after a typed body helper when the legacy body is optional.
+Plain `.request_body(method, path).optional()` remains requiredness-only for an existing body.
+
+```rust
+ApiOverrides::new()
+    .json_request_body("POST", "/books", "CreateBookRequest")
+    .optional()
+    .form_request_body("POST", "/oauth/token", "OAuthTokenRequest")
+    .multipart_request_body("POST", "/files/upload", "UploadFileRequest");
+```
+
+OpenAPI target patch helpers are available when generator replacement needs small schema-level polish:
+
+```rust
+OpenApi31::new()
+    .to("generated/openapi.yaml")
+    .schema_aliases(OpenApiSchemaAliases::new().clone_alias("Book", "LegacyBook"))
+    .schema_patch(
+        OpenApiSchemaPatch::new("Book").field(
+            OpenApiFieldPatch::new("status")
+                .description("Lifecycle status")
+                .enum_values_in_order(["beta", "alpha"])
+                .example_string("beta")
+                .extension_bool("x-visible", true),
+        ),
+    );
 ```
 
 `gnr8 generate --json` includes a `cleanup` section for migration review: files gnr8 owns, stale

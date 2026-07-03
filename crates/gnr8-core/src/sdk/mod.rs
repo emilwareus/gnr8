@@ -894,7 +894,8 @@ pub mod prelude {
     pub use super::docs::SdkDocs;
     pub use super::go::{
         GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
-        GoRequestBuilderScope, QueryTimeFormat, RequiredPointerConstructorPolicy,
+        GoRequestBuilderOperationAliases, GoRequestBuilderScope, QueryTimeFormat,
+        RequiredPointerConstructorPolicy,
     };
     pub use super::layout::SdkFileLayout;
     pub use super::model::SdkModel;

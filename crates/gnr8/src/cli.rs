@@ -98,6 +98,9 @@ pub(crate) enum CompatAction {
         /// Optional compatibility contract TOML path.
         #[arg(long)]
         contract: Option<String>,
+        /// Print high-confidence config suggestions for detected drift.
+        #[arg(long)]
+        suggest: bool,
     },
     /// Compare two generated Go SDK directories.
     Go {
@@ -110,6 +113,9 @@ pub(crate) enum CompatAction {
         /// Optional compatibility contract TOML path.
         #[arg(long)]
         contract: Option<String>,
+        /// Print high-confidence config suggestions for detected drift.
+        #[arg(long)]
+        suggest: bool,
     },
 }
 

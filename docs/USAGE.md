@@ -65,8 +65,8 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
-| `gnr8 compat typescript` | `--old <dir> --new <dir> [--contract <path>]` | old/new TypeScript SDK dirs | — | **0 compatible; 1 breaking** |
-| `gnr8 compat go` | `--old <dir> --new <dir> [--contract <path>]` | old/new Go SDK dirs | — | **0 compatible; 1 breaking** |
+| `gnr8 compat typescript` | `--old <dir> --new <dir> [--contract <path>] [--suggest]` | old/new TypeScript SDK dirs | — | **0 compatible; 1 breaking** |
+| `gnr8 compat go` | `--old <dir> --new <dir> [--contract <path>] [--suggest]` | old/new Go SDK dirs | — | **0 compatible; 1 breaking** |
 
 `doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
 reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
@@ -80,6 +80,82 @@ Notes:
   outputs and the `.gnr8/target`/`.gnr8/cache` dirs (no regen loop).
 - No command panics on bad input/missing toolchain — typed error → clean stderr + non-zero. A `.gnr8/`
   that is missing, won't compile, or whose `cargo` is absent surfaces as an actionable error.
+
+### Compatibility contracts and suggestions
+`gnr8 compat` compares old/new SDK directories. Without `--contract`, any detected public-surface drift
+is breaking. With `--contract`, exit 1 is reserved for missing required symbols or unapproved diff
+items; stale allowances are reported in `--json` under `contract_evaluation.stale_allowances` but do
+not fail the check. `--suggest` adds high-confidence migration snippets to human output and to the JSON
+`suggestions` array.
+
+```bash
+gnr8 compat go \
+  --old old-go-sdk \
+  --new generated/go \
+  --contract sdk-compat.toml \
+  --suggest
+
+gnr8 --json compat typescript \
+  --old old-typescript-sdk \
+  --new generated/typescript \
+  --contract sdk-compat.toml \
+  --suggest
+```
+
+Contract files are TOML. Every key is optional and defaults to `false` or an empty list.
+
+```toml
+[allow]
+docs_layout_migration = false
+missing_docs = []
+
+[go]
+require_exported_types = []
+require_exported_functions = []
+require_exported_methods = []
+allow_missing_exported_types = []
+allow_missing_exported_functions = []
+allow_missing_exported_methods = []
+allow_exported_function_signature_changes = []
+allow_exported_method_signature_changes = []
+allow_missing_docs = []
+allow_package_metadata_changes = []
+
+[typescript]
+require_root_exports = []
+require_model_exports = []
+require_api_classes = []
+require_api_factories = []
+require_operation_methods = []
+require_request_aliases = []
+allow_missing_root_exports = []
+allow_missing_model_exports = []
+allow_missing_api_classes = []
+allow_missing_api_factories = []
+allow_missing_operation_methods = []
+allow_missing_request_aliases = []
+allow_missing_interface_properties = []      # "Interface.property"
+allow_interface_property_changes = []        # "Interface.property"
+allow_operation_return_type_changes = []     # "Class.method" or "Factory.method"
+allow_operation_signature_changes = []       # "Class.method" or "Factory.method"
+allow_export_kind_mismatches = []
+allow_package_entry_point_changes = []
+allow_missing_docs = []
+```
+
+Example gate:
+
+```toml
+[go]
+require_exported_types = ["Book", "ApiListBooksRequest"]
+allow_exported_method_signature_changes = ["ApiListBooksRequest.Execute"]
+
+[typescript]
+require_root_exports = ["Book", "DefaultApi"]
+allow_interface_property_changes = ["Book.title"]
+allow_operation_return_type_changes = ["DefaultApi.listBooks"]
+allow_operation_signature_changes = ["DefaultApi.listBooks"]
+```
 
 ## Config: the `.gnr8/` crate (code, not TOML)
 **There is no config file.** Configuration is a small Rust **binary crate** at `.gnr8/` that depends on
@@ -198,6 +274,31 @@ GoSdk::new()
     .source_only(); // suppress docs and package metadata when an outer package owns them
 ```
 
+Go OpenAPI Generator compatibility controls can be selected by old request-builder type name, operation
+id, or graph route. Route/operation selectors are resolved during generation and fail with a config
+error if they match nothing or match ambiguously.
+
+```rust
+GoSdk::new()
+    .module("example.com/acme/books")
+    .to("generated/go")
+    .profile(SdkProfile::go_openapi_generator_compat())
+    .request_builder_aliases(
+        GoRequestBuilderAliases::new()
+            .operation("POST", "/books")
+            .body("Book")
+            .operation("GET", "/books")
+            .query("PageSize", "pageSize"),
+    )
+    .query_setter_argument_policy(
+        GoQuerySetterArgumentPolicy::typed()
+            .any_for_query("pageSize")
+            .any_for_queries(["sort", "filter"])
+            .any_for_route_query("GET", "/books", "includeArchived"),
+    )
+    .execute_compatibility(GoExecuteCompatibility::preserve_legacy().route("GET", "/books"));
+```
+
 Route-scoped auth, legacy SDK names, and source-fact overrides stay in `.gnr8/src/main.rs` as regular
 Rust:
 
@@ -231,6 +332,8 @@ Pipeline::new()
                 "/v1/schools/active/schedule/week",
                 QueryParam::new("startDate").date().required(),
             )
+            .json_request_body("POST", "/v1/schools/active/coursework/search", "SearchCourseworkRequest")
+            .optional()
             .binary_response("GET", "/v1/schools/active/files/{fileId}/download", 200),
     )
     .transform(
@@ -356,7 +459,47 @@ ApiOverrides::new()
     .force_required("Event", "id")
 ```
 
+Request-body overrides can also create or replace an operation body when the source graph lacks the
+legacy shape. Typed helpers default to required; `.optional()` applies to the most recently configured
+body. Plain `.request_body(method, path).optional()` keeps its existing meaning: requiredness-only, and
+it errors if no body already exists.
+
+```rust
+ApiOverrides::new()
+    .json_request_body("POST", "/books", "CreateBookRequest")
+    .optional()
+    .form_request_body("POST", "/oauth/token", "OAuthTokenRequest")
+    .multipart_request_body("POST", "/files/upload", "UploadFileRequest");
+```
+
 These overrides mutate the graph before OpenAPI or SDK targets render, so all generated surfaces agree.
+
+OpenAPI targets support narrow document patches for migration-only polish. `alias` emits a `$ref`
+component alias; `clone_alias` duplicates the canonical schema body for generators that require a
+distinct schema. `enum_values(...)` sorts values deterministically; `enum_values_in_order(...)`
+preserves caller order.
+
+```rust
+OpenApi31::new()
+    .to("generated/openapi.yaml")
+    .schema_aliases(
+        OpenApiSchemaAliases::new()
+            .alias("CreateBookRequest", "BookCreateRequest")
+            .clone_alias("Book", "LegacyBook"),
+    )
+    .schema_patch(
+        OpenApiSchemaPatch::new("Book").field(
+            OpenApiFieldPatch::new("status")
+                .description("Lifecycle status shown in the legacy SDK")
+                .enum_values_in_order(["beta", "alpha"])
+                .example_string("beta")
+                .extension_string("x-gnr8-render", "input")
+                .extension_number("x-rank", 2)
+                .extension_bool("x-visible", true)
+                .extension_null("x-empty"),
+        ),
+    );
+```
 
 ## Recognized Go/Gin patterns (code-first)
 Resolution is via `go/types` (alias/import-robust), not string matching.
@@ -445,8 +588,8 @@ inspect graph <dir>` lists them.
 gnr8 generate && gnr8 check            # check exits 1 if generate left drift
 
 # brownfield SDK migration gates
-gnr8 compat typescript --old old-typescript-sdk --new generated/typescript
-gnr8 compat go --old old-go-sdk --new generated/go
+gnr8 compat typescript --old old-typescript-sdk --new generated/typescript --contract sdk-compat.toml
+gnr8 compat go --old old-go-sdk --new generated/go --contract sdk-compat.toml --suggest
 
 # inspect what it sees (no generation, takes a dir)
 gnr8 inspect routes ./internal         # human table; add --json for machine

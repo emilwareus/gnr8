@@ -13,7 +13,7 @@ mod doctor;
 mod render;
 mod watch;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use std::collections::BTreeSet;
@@ -236,12 +236,38 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
 )]
 fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     match action {
-        CompatAction::Typescript { old, new, contract } => {
-            let contract_config = load_compat_contract(contract.as_deref())?;
-            let diff = gnr8::sdk::compat::diff_typescript_dirs(old, new)?;
-            let unallowed_missing_docs =
-                unallowed_missing_docs(&diff.missing_docs, &contract_config);
-            let breaking = diff.has_code_breaks() || !unallowed_missing_docs.is_empty();
+        CompatAction::Typescript {
+            old,
+            new,
+            contract,
+            suggest,
+        } => {
+            let contract_path = contract.as_deref();
+            let contract = load_compat_contract(contract_path)?;
+            let old_surface = gnr8::sdk::compat::extract_typescript_surface(old)?;
+            let new_surface = gnr8::sdk::compat::extract_typescript_surface(new)?;
+            let diff = gnr8::sdk::compat::diff_typescript_surfaces(&old_surface, &new_surface);
+            let evaluation = contract.as_ref().map(|contract| {
+                gnr8::sdk::compat::evaluate_typescript_contract(
+                    &contract.typescript,
+                    &diff,
+                    &new_surface,
+                )
+                .with_global_docs_allowance(&contract.allow)
+            });
+            let effective_diff = evaluation
+                .as_ref()
+                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
+            let suggestions = if *suggest {
+                gnr8::sdk::compat::suggest_typescript_compat(effective_diff)
+            } else {
+                Vec::new()
+            };
+            let breaking = evaluation
+                .as_ref()
+                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
+            let allowed_missing_docs =
+                allowed_missing_docs(&diff.missing_docs, &effective_diff.missing_docs);
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -251,8 +277,11 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     contract: Option<&'a str>,
                     breaking: bool,
                     docs_breaking: bool,
-                    allowed_missing_docs: Vec<String>,
-                    diff: gnr8::sdk::compat::TypeScriptSurfaceDiff,
+                    allowed_missing_docs: &'a [String],
+                    diff: &'a gnr8::sdk::compat::TypeScriptSurfaceDiff,
+                    contract_evaluation:
+                        Option<&'a gnr8::sdk::compat::TypeScriptContractEvaluation>,
+                    suggestions: &'a [String],
                 }
                 println!(
                     "{}",
@@ -260,77 +289,63 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         language: "typescript",
                         old,
                         new,
-                        contract: contract.as_deref(),
+                        contract: contract_path,
                         breaking,
-                        docs_breaking: diff.has_doc_breaks(),
-                        allowed_missing_docs: allowed_missing_docs(
-                            &diff.missing_docs,
-                            &unallowed_missing_docs
-                        ),
-                        diff,
+                        docs_breaking: effective_diff.has_doc_breaks(),
+                        allowed_missing_docs: &allowed_missing_docs,
+                        diff: &diff,
+                        contract_evaluation: evaluation.as_ref(),
+                        suggestions: &suggestions,
                     })?
                 );
             } else if breaking {
                 output.progress("compat typescript: breaking changes detected");
-                print_compat_list("missing root exports", &diff.missing_root_exports);
-                print_compat_list("missing model exports", &diff.missing_model_exports);
-                print_compat_list("missing API classes", &diff.missing_api_classes);
-                print_compat_list("missing API factories", &diff.missing_api_factories);
-                print_compat_list("missing operation methods", &diff.missing_operation_methods);
-                print_compat_list("missing request aliases", &diff.missing_request_aliases);
-                print_compat_list("package entry changes", &diff.package_entry_point_changes);
-                print_compat_list("missing docs", &unallowed_missing_docs);
-                for missing in &diff.missing_interface_properties {
-                    println!(
-                        "  missing interface property: {}.{}",
-                        missing.interface, missing.property
+                if let Some(evaluation) = &evaluation {
+                    print_compat_list(
+                        "missing required contract symbols",
+                        &evaluation.missing_required,
                     );
                 }
-                for change in &diff.interface_property_changes {
-                    println!(
-                        "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
-                        change.interface,
-                        change.property,
-                        change.old.optional,
-                        change.new.optional,
-                        change.old.nullable,
-                        change.new.nullable,
-                        change.old.ty,
-                        change.new.ty
-                    );
-                }
-                for change in &diff.operation_return_type_changes {
-                    println!(
-                        "  operation return changed: {} ({} -> {})",
-                        change.operation, change.old, change.new
-                    );
-                }
-                for change in &diff.operation_signature_changes {
-                    println!(
-                        "  operation signature changed: {} ({} -> {})",
-                        change.operation, change.old, change.new
-                    );
-                }
-                for mismatch in &diff.export_kind_mismatches {
-                    println!(
-                        "  export kind mismatch: {} ({:?} -> {:?})",
-                        mismatch.symbol, mismatch.old, mismatch.new
-                    );
-                }
+                print_typescript_compat_diff(effective_diff);
             } else {
                 output.progress("compat typescript: compatible");
+            }
+            if !output.json {
+                print_compat_suggestions(&suggestions);
             }
             if breaking {
                 std::process::exit(1);
             }
             Ok(())
         }
-        CompatAction::Go { old, new, contract } => {
-            let contract_config = load_compat_contract(contract.as_deref())?;
-            let diff = gnr8::sdk::compat::diff_go_dirs(old, new)?;
-            let unallowed_missing_docs =
-                unallowed_missing_docs(&diff.missing_docs, &contract_config);
-            let breaking = diff.has_code_breaks() || !unallowed_missing_docs.is_empty();
+        CompatAction::Go {
+            old,
+            new,
+            contract,
+            suggest,
+        } => {
+            let contract_path = contract.as_deref();
+            let contract = load_compat_contract(contract_path)?;
+            let old_surface = gnr8::sdk::compat::extract_go_surface(old)?;
+            let new_surface = gnr8::sdk::compat::extract_go_surface(new)?;
+            let diff = gnr8::sdk::compat::diff_go_surfaces(&old_surface, &new_surface);
+            let evaluation = contract.as_ref().map(|contract| {
+                gnr8::sdk::compat::evaluate_go_contract(&contract.go, &diff, &new_surface)
+                    .with_global_docs_allowance(&contract.allow)
+            });
+            let effective_diff = evaluation
+                .as_ref()
+                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
+            let suggestions = if *suggest {
+                gnr8::sdk::compat::suggest_go_compat(effective_diff)
+            } else {
+                Vec::new()
+            };
+            let breaking = evaluation
+                .as_ref()
+                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
+            let allowed_missing_docs =
+                allowed_missing_docs(&diff.missing_docs, &effective_diff.missing_docs);
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -340,8 +355,10 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     contract: Option<&'a str>,
                     breaking: bool,
                     docs_breaking: bool,
-                    allowed_missing_docs: Vec<String>,
-                    diff: gnr8::sdk::compat::GoSurfaceDiff,
+                    allowed_missing_docs: &'a [String],
+                    diff: &'a gnr8::sdk::compat::GoSurfaceDiff,
+                    contract_evaluation: Option<&'a gnr8::sdk::compat::GoContractEvaluation>,
+                    suggestions: &'a [String],
                 }
                 println!(
                     "{}",
@@ -349,40 +366,29 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         language: "go",
                         old,
                         new,
-                        contract: contract.as_deref(),
+                        contract: contract_path,
                         breaking,
-                        docs_breaking: diff.has_doc_breaks(),
-                        allowed_missing_docs: allowed_missing_docs(
-                            &diff.missing_docs,
-                            &unallowed_missing_docs
-                        ),
-                        diff,
+                        docs_breaking: effective_diff.has_doc_breaks(),
+                        allowed_missing_docs: &allowed_missing_docs,
+                        diff: &diff,
+                        contract_evaluation: evaluation.as_ref(),
+                        suggestions: &suggestions,
                     })?
                 );
             } else if breaking {
                 output.progress("compat go: breaking changes detected");
-                print_compat_list("missing exported types", &diff.missing_exported_types);
-                print_compat_list(
-                    "missing exported functions",
-                    &diff.missing_exported_functions,
-                );
-                print_compat_list("missing exported methods", &diff.missing_exported_methods);
-                print_compat_list("missing docs", &unallowed_missing_docs);
-                print_compat_list("package metadata changes", &diff.package_metadata_changes);
-                for change in &diff.exported_function_signature_changes {
-                    println!(
-                        "  exported function signature changed: {} ({} -> {})",
-                        change.symbol, change.old, change.new
+                if let Some(evaluation) = &evaluation {
+                    print_compat_list(
+                        "missing required contract symbols",
+                        &evaluation.missing_required,
                     );
                 }
-                for change in &diff.exported_method_signature_changes {
-                    println!(
-                        "  exported method signature changed: {} ({} -> {})",
-                        change.symbol, change.old, change.new
-                    );
-                }
+                print_go_compat_diff(effective_diff);
             } else {
                 output.progress("compat go: compatible");
+            }
+            if !output.json {
+                print_compat_suggestions(&suggestions);
             }
             if breaking {
                 std::process::exit(1);
@@ -392,46 +398,100 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-struct CompatContract {
-    #[serde(default)]
-    allow: CompatAllow,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct CompatAllow {
-    #[serde(default)]
-    docs_layout_migration: bool,
-    #[serde(default)]
-    missing_docs: Vec<String>,
-}
-
-fn load_compat_contract(path: Option<&str>) -> Result<CompatContract> {
+fn load_compat_contract(
+    path: Option<&str>,
+) -> Result<Option<gnr8::sdk::compat::CompatibilityContract>> {
     let Some(path) = path else {
-        return Ok(CompatContract::default());
+        return Ok(None);
     };
-    let path = std::path::Path::new(path);
-    if !path.exists() {
-        anyhow::bail!("compat contract does not exist: {}", path.display());
+    let contract_path = Path::new(path);
+    if !contract_path.exists() {
+        anyhow::bail!("compat contract does not exist: {path}");
     }
-    let text = std::fs::read_to_string(path)?;
-    let contract = toml::from_str(&text)?;
-    Ok(contract)
+    let text = std::fs::read_to_string(contract_path)
+        .with_context(|| format!("failed to read compat contract: {path}"))?;
+    let contract = toml::from_str(&text)
+        .with_context(|| format!("failed to parse compat contract TOML: {path}"))?;
+    Ok(Some(contract))
 }
 
-fn unallowed_missing_docs(missing_docs: &[String], contract: &CompatContract) -> Vec<String> {
-    if contract.allow.docs_layout_migration {
+trait GoContractEvaluationExt {
+    fn with_global_docs_allowance(
+        self,
+        allow: &gnr8::sdk::compat::CompatibilityAllow,
+    ) -> gnr8::sdk::compat::GoContractEvaluation;
+}
+
+impl GoContractEvaluationExt for gnr8::sdk::compat::GoContractEvaluation {
+    fn with_global_docs_allowance(
+        mut self,
+        allow: &gnr8::sdk::compat::CompatibilityAllow,
+    ) -> gnr8::sdk::compat::GoContractEvaluation {
+        apply_global_docs_stale_allowances(
+            "allow.missing_docs",
+            allow,
+            &self.unapproved_diff.missing_docs,
+            &mut self.stale_allowances,
+        );
+        self.unapproved_diff.missing_docs =
+            unallowed_missing_docs(&self.unapproved_diff.missing_docs, allow);
+        self.breaking = !self.missing_required.is_empty() || self.unapproved_diff.is_breaking();
+        self
+    }
+}
+
+trait TypeScriptContractEvaluationExt {
+    fn with_global_docs_allowance(
+        self,
+        allow: &gnr8::sdk::compat::CompatibilityAllow,
+    ) -> gnr8::sdk::compat::TypeScriptContractEvaluation;
+}
+
+impl TypeScriptContractEvaluationExt for gnr8::sdk::compat::TypeScriptContractEvaluation {
+    fn with_global_docs_allowance(
+        mut self,
+        allow: &gnr8::sdk::compat::CompatibilityAllow,
+    ) -> gnr8::sdk::compat::TypeScriptContractEvaluation {
+        apply_global_docs_stale_allowances(
+            "allow.missing_docs",
+            allow,
+            &self.unapproved_diff.missing_docs,
+            &mut self.stale_allowances,
+        );
+        self.unapproved_diff.missing_docs =
+            unallowed_missing_docs(&self.unapproved_diff.missing_docs, allow);
+        self.breaking = !self.missing_required.is_empty() || self.unapproved_diff.is_breaking();
+        self
+    }
+}
+
+fn apply_global_docs_stale_allowances(
+    label: &str,
+    allow: &gnr8::sdk::compat::CompatibilityAllow,
+    current: &[String],
+    stale: &mut Vec<String>,
+) {
+    if allow.docs_layout_migration {
+        return;
+    }
+    let current: BTreeSet<&str> = current.iter().map(String::as_str).collect();
+    for doc in &allow.missing_docs {
+        if !current.contains(doc.as_str()) {
+            stale.push(format!("{label}: {doc}"));
+        }
+    }
+}
+
+fn unallowed_missing_docs(
+    missing_docs: &[String],
+    allow: &gnr8::sdk::compat::CompatibilityAllow,
+) -> Vec<String> {
+    if allow.docs_layout_migration {
         return Vec::new();
     }
     missing_docs
         .iter()
-        .filter(|doc| {
-            !contract
-                .allow
-                .missing_docs
-                .iter()
-                .any(|allowed| allowed == *doc)
-        })
+        .filter(|doc| !allow.missing_docs.iter().any(|allowed| allowed == *doc))
         .cloned()
         .collect()
 }
@@ -442,6 +502,81 @@ fn allowed_missing_docs(missing_docs: &[String], unallowed: &[String]) -> Vec<St
         .filter(|doc| !unallowed.iter().any(|unallowed| unallowed == *doc))
         .cloned()
         .collect()
+}
+
+fn print_typescript_compat_diff(diff: &gnr8::sdk::compat::TypeScriptSurfaceDiff) {
+    print_compat_list("missing root exports", &diff.missing_root_exports);
+    print_compat_list("missing model exports", &diff.missing_model_exports);
+    print_compat_list("missing API classes", &diff.missing_api_classes);
+    print_compat_list("missing API factories", &diff.missing_api_factories);
+    print_compat_list("missing operation methods", &diff.missing_operation_methods);
+    print_compat_list("missing request aliases", &diff.missing_request_aliases);
+    print_compat_list("package entry changes", &diff.package_entry_point_changes);
+    print_compat_list("missing docs", &diff.missing_docs);
+    for missing in &diff.missing_interface_properties {
+        println!(
+            "  missing interface property: {}.{}",
+            missing.interface, missing.property
+        );
+    }
+    for change in &diff.interface_property_changes {
+        println!(
+            "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
+            change.interface,
+            change.property,
+            change.old.optional,
+            change.new.optional,
+            change.old.nullable,
+            change.new.nullable,
+            change.old.ty,
+            change.new.ty
+        );
+    }
+    for change in &diff.operation_return_type_changes {
+        println!(
+            "  operation return changed: {} ({} -> {})",
+            change.operation, change.old, change.new
+        );
+    }
+    for change in &diff.operation_signature_changes {
+        println!(
+            "  operation signature changed: {} ({} -> {})",
+            change.operation, change.old, change.new
+        );
+    }
+    for mismatch in &diff.export_kind_mismatches {
+        println!(
+            "  export kind mismatch: {} ({:?} -> {:?})",
+            mismatch.symbol, mismatch.old, mismatch.new
+        );
+    }
+}
+
+fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
+    print_compat_list("missing exported types", &diff.missing_exported_types);
+    print_compat_list(
+        "missing exported functions",
+        &diff.missing_exported_functions,
+    );
+    print_compat_list("missing exported methods", &diff.missing_exported_methods);
+    print_compat_list("missing docs", &diff.missing_docs);
+    print_compat_list("package metadata changes", &diff.package_metadata_changes);
+    for change in &diff.exported_function_signature_changes {
+        println!(
+            "  exported function signature changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
+    for change in &diff.exported_method_signature_changes {
+        println!(
+            "  exported method signature changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
+}
+
+fn print_compat_suggestions(suggestions: &[String]) {
+    print_compat_list("suggestions", suggestions);
 }
 
 fn print_compat_list(label: &str, values: &[String]) {
@@ -1628,10 +1763,8 @@ fn fmt_duration(duration: Duration) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{
-        allowed_missing_docs, reconcile_doctor_source_probe, unallowed_missing_docs, CompatAllow,
-        CompatContract,
-    };
+    use super::{allowed_missing_docs, reconcile_doctor_source_probe, unallowed_missing_docs};
+    use gnr8::sdk::compat::CompatibilityAllow;
     use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1675,27 +1808,23 @@ mod tests {
 
     #[test]
     fn compat_contract_can_allow_all_docs_layout_migration() {
-        let contract = CompatContract {
-            allow: CompatAllow {
-                docs_layout_migration: true,
-                missing_docs: Vec::new(),
-            },
+        let allow = CompatibilityAllow {
+            docs_layout_migration: true,
+            missing_docs: Vec::new(),
         };
         let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
 
-        assert!(unallowed_missing_docs(&missing, &contract).is_empty());
+        assert!(unallowed_missing_docs(&missing, &allow).is_empty());
     }
 
     #[test]
     fn compat_contract_can_allow_selected_missing_docs_only() {
-        let contract = CompatContract {
-            allow: CompatAllow {
-                docs_layout_migration: false,
-                missing_docs: vec!["docs/Book.md".to_string()],
-            },
+        let allow = CompatibilityAllow {
+            docs_layout_migration: false,
+            missing_docs: vec!["docs/Book.md".to_string()],
         };
         let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
-        let unallowed = unallowed_missing_docs(&missing, &contract);
+        let unallowed = unallowed_missing_docs(&missing, &allow);
 
         assert_eq!(unallowed, vec!["docs/BooksApi.md".to_string()]);
         assert_eq!(

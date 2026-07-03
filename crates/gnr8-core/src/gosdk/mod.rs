@@ -23,6 +23,7 @@ use crate::sdk::emit_common::{
     operation_file_name, validate_sdk_base_path,
 };
 use crate::sdk::go::GoSdkOptions;
+use crate::sdk::go::{GoQuerySetterArgumentPolicy, GoRequestBuilderAliases};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
@@ -203,6 +204,7 @@ fn generate_go_openapi_generator_compat_files(
     aliases: &SdkTypeAliases,
     options: GoSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let options = resolve_go_compat_options(graph, options)?;
     if let Some(error_model) = &options.error_model {
         validate_go_error_model_name(error_model)?;
     }
@@ -248,6 +250,208 @@ fn generate_go_openapi_generator_compat_files(
     let mut files = gofmt::gofmt_files(files)?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
+}
+
+fn resolve_go_compat_options(
+    graph: &ApiGraph,
+    mut options: GoSdkOptions,
+) -> Result<GoSdkOptions, crate::CoreError> {
+    options.request_builder_aliases =
+        resolve_request_builder_aliases(graph, &options.request_builder_aliases)?;
+    options.query_setter_argument_policy =
+        resolve_query_setter_argument_policy(graph, &options.query_setter_argument_policy)?;
+    options.execute_compatibility =
+        resolve_execute_compatibility(graph, &options.execute_compatibility)?;
+    Ok(options)
+}
+
+fn resolve_request_builder_aliases(
+    graph: &ApiGraph,
+    aliases: &GoRequestBuilderAliases,
+) -> Result<GoRequestBuilderAliases, crate::CoreError> {
+    let mut resolved = GoRequestBuilderAliases::new();
+    for (selector, setters) in &aliases.body {
+        let request = resolve_request_selector(graph, selector)?;
+        for setter in setters {
+            resolved = resolved.body(request.clone(), setter.clone());
+        }
+    }
+    for (selector, query_aliases) in &aliases.query {
+        let request = resolve_request_selector(graph, selector)?;
+        for alias in query_aliases {
+            resolved = resolved.query(
+                request.clone(),
+                alias.setter.clone(),
+                alias.query_name.clone(),
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_query_setter_argument_policy(
+    graph: &ApiGraph,
+    policy: &GoQuerySetterArgumentPolicy,
+) -> Result<GoQuerySetterArgumentPolicy, crate::CoreError> {
+    let GoQuerySetterArgumentPolicy::SelectiveAny(any_for) = policy else {
+        return Ok(policy.clone());
+    };
+    let mut resolved = GoQuerySetterArgumentPolicy::typed();
+    for (selector, setters) in any_for {
+        if selector == "operation:*" {
+            for setter in setters {
+                let Some(query_name) = setter.strip_prefix("query:") else {
+                    return Err(crate::CoreError::Config {
+                        message: format!(
+                            "GoSdk query_setter_argument_policy global selector requires query:name, got '{setter}'"
+                        ),
+                    });
+                };
+                resolved = widen_query_name_on_matching_operations(graph, resolved, query_name)?;
+            }
+            continue;
+        }
+
+        let request = resolve_request_selector(graph, selector)?;
+        for setter in setters {
+            if let Some(query_name) = setter.strip_prefix("query:") {
+                resolved = widen_query_name_on_request(graph, resolved, &request, query_name)?;
+            } else {
+                resolved = resolved.any_for(request.clone(), setter.clone());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_execute_compatibility(
+    graph: &ApiGraph,
+    compatibility: &crate::sdk::go::GoExecuteCompatibility,
+) -> Result<crate::sdk::go::GoExecuteCompatibility, crate::CoreError> {
+    let mut resolved = crate::sdk::go::GoExecuteCompatibility::preserve_legacy();
+    for request in compatibility.request_names() {
+        resolved = resolved.request(request.clone());
+    }
+    for operation in compatibility.operation_names() {
+        if operation.starts_with("route:") {
+            let op = resolve_operation_selector(graph, operation)?;
+            resolved = resolved.operation(op.id.clone());
+        } else {
+            resolved = resolved.operation(operation.clone());
+        }
+    }
+    Ok(resolved)
+}
+
+fn widen_query_name_on_matching_operations(
+    graph: &ApiGraph,
+    mut policy: GoQuerySetterArgumentPolicy,
+    query_name: &str,
+) -> Result<GoQuerySetterArgumentPolicy, crate::CoreError> {
+    let mut matched = false;
+    for op in &graph.operations {
+        if op
+            .params
+            .iter()
+            .any(|param| param.location == "query" && param.name == query_name)
+        {
+            matched = true;
+            let request = emit::compat_request_name(op);
+            policy = widen_query_name_on_request(graph, policy, &request, query_name)?;
+        }
+    }
+    if matched {
+        Ok(policy)
+    } else {
+        Err(crate::CoreError::Config {
+            message: format!(
+                "GoSdk query_setter_argument_policy query selector did not match any query parameter '{query_name}'"
+            ),
+        })
+    }
+}
+
+fn widen_query_name_on_request(
+    graph: &ApiGraph,
+    mut policy: GoQuerySetterArgumentPolicy,
+    request: &str,
+    query_name: &str,
+) -> Result<GoQuerySetterArgumentPolicy, crate::CoreError> {
+    let op = graph
+        .operations
+        .iter()
+        .find(|op| emit::compat_request_name(op) == request)
+        .ok_or_else(|| crate::CoreError::Config {
+            message: format!("GoSdk query selector references unknown request builder '{request}'"),
+        })?;
+    let param = op
+        .params
+        .iter()
+        .find(|param| param.location == "query" && param.name == query_name)
+        .ok_or_else(|| crate::CoreError::Config {
+            message: format!(
+                "GoSdk query selector references unknown query parameter '{query_name}' on '{request}'"
+            ),
+        })?;
+    for setter in emit::compat_method_names(&emit::compat_exported(&param.name)) {
+        policy = policy.any_for(request.to_string(), setter);
+    }
+    Ok(policy)
+}
+
+fn resolve_request_selector(graph: &ApiGraph, selector: &str) -> Result<String, crate::CoreError> {
+    if selector.starts_with("operation:") || selector.starts_with("route:") {
+        return resolve_operation_selector(graph, selector).map(emit::compat_request_name);
+    }
+    Ok(selector.to_string())
+}
+
+fn resolve_operation_selector<'a>(
+    graph: &'a ApiGraph,
+    selector: &str,
+) -> Result<&'a Operation, crate::CoreError> {
+    if let Some(operation_id) = selector.strip_prefix("operation:") {
+        let matches: Vec<&Operation> = graph
+            .operations
+            .iter()
+            .filter(|op| op.id == operation_id)
+            .collect();
+        return single_operation_match(selector, &matches);
+    }
+    if let Some(route) = selector.strip_prefix("route:") {
+        let Some((method, path)) = route.split_once(' ') else {
+            return Err(crate::CoreError::Config {
+                message: format!("invalid GoSdk operation selector '{selector}'"),
+            });
+        };
+        let matches: Vec<&Operation> = graph
+            .operations
+            .iter()
+            .filter(|op| op.method == method && op.path == path)
+            .collect();
+        return single_operation_match(selector, &matches);
+    }
+    Err(crate::CoreError::Config {
+        message: format!("invalid GoSdk operation selector '{selector}'"),
+    })
+}
+
+fn single_operation_match<'a>(
+    selector: &str,
+    matches: &[&'a Operation],
+) -> Result<&'a Operation, crate::CoreError> {
+    match matches {
+        [single] => Ok(*single),
+        [] => Err(crate::CoreError::Config {
+            message: format!("GoSdk operation selector did not match any operation: {selector}"),
+        }),
+        many => Err(crate::CoreError::Config {
+            message: format!(
+                "GoSdk operation selector matched {} operations: {selector}",
+                many.len()
+            ),
+        }),
+    }
 }
 
 fn validate_go_compat_options(
@@ -488,8 +692,8 @@ mod tests {
     };
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{
-        ApiGraph, Field, Param, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
-        Type, WellKnown,
+        ApiGraph, Field, Operation, Param, Prim, Response, Schema, SchemaRef, SecurityScheme,
+        SourceSpan, Type, WellKnown,
     };
     use crate::sdk::go::{
         GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases, GoSdkOptions,
@@ -1322,6 +1526,165 @@ mod tests {
         ] {
             assert!(api.contains(snippet), "missing {snippet}:\n{api}");
         }
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_resolves_operation_selectors_for_request_builder_aliases() {
+        if !gofmt_available() {
+            eprintln!(
+                "skipping operation selector request builder aliases test: gofmt unavailable"
+            );
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "createThingPost".to_string();
+        graph.operations[0].id = "createThingPost".to_string();
+        graph.operations[0].group = Some("thing".to_string());
+        graph.operations[1].handler = "updateThingPost".to_string();
+        graph.operations[1].id = "updateThingPost".to_string();
+        graph.operations[1].group = Some("thing".to_string());
+
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases = GoRequestBuilderAliases::new()
+            .operation("POST", "/")
+            .body("Thing")
+            .operation_id("updateThingPost")
+            .query("BranchId", "branchId");
+
+        let files = generate_files_with_profile_options(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_thing.go")
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains(
+                "func (r ApiCreateThingPostRequest) Thing(thing any) ApiCreateThingPostRequest"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("func (r ApiUpdateThingPostRequest) BranchId(branchId any) ApiUpdateThingPostRequest"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_resolves_query_and_execute_selectors() {
+        if !gofmt_available() {
+            eprintln!("skipping query and execute selector test: gofmt unavailable");
+            return;
+        }
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.query_setter_argument_policy =
+            GoQuerySetterArgumentPolicy::typed().any_for_query("aggregation");
+        options.execute_compatibility =
+            GoExecuteCompatibility::preserve_legacy().route("GET", "/list");
+
+        let files = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiListGoalsRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains(
+                "func (r ApiListGoalsRequest) Aggregation(aggregation any) ApiListGoalsRequest"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("func (r ApiListGoalsRequest) Execute() (*http.Response, error)"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_unknown_operation_selector() {
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases = GoRequestBuilderAliases::new()
+            .operation("POST", "/missing")
+            .body("Thing");
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("operation selector"), "{err}");
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_ambiguous_operation_selector() {
+        let mut graph = sample_graph();
+        graph.operations.push(Operation {
+            id: "createGoalDuplicate".to_string(),
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            handler: "createGoalDuplicate".to_string(),
+            group: None,
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: Vec::new(),
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 99,
+                end_line: 99,
+            },
+        });
+
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases = GoRequestBuilderAliases::new()
+            .operation("POST", "/")
+            .body("Thing");
+
+        let err = generate_files_with_profile_options(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("matched 2 operations"), "{err}");
     }
 
     #[test]

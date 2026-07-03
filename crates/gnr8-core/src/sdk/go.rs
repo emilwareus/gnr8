@@ -132,6 +132,55 @@ impl GoQuerySetterArgumentPolicy {
         }
     }
 
+    /// Widen query setters matching a query parameter name to `any` on every request builder.
+    #[must_use]
+    pub fn any_for_query(self, query_name: impl Into<String>) -> Self {
+        self.any_for_operation_query("*", query_name)
+    }
+
+    /// Widen query setters matching any of the query parameter names to `any`.
+    #[must_use]
+    pub fn any_for_queries<I, S>(mut self, query_names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for query_name in query_names {
+            self = self.any_for_query(query_name);
+        }
+        self
+    }
+
+    /// Widen a query setter matching a query parameter name on one operation id.
+    #[must_use]
+    pub fn any_for_operation_query(
+        mut self,
+        operation: impl Into<String>,
+        query_name: impl Into<String>,
+    ) -> Self {
+        let request = format!("operation:{}", operation.into());
+        let setter = format!("query:{}", query_name.into());
+        self = self.any_for(request, setter);
+        self
+    }
+
+    /// Widen a query setter matching a query parameter name on one method/path route.
+    #[must_use]
+    pub fn any_for_route_query(
+        self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        query_name: impl Into<String>,
+    ) -> Self {
+        let request = format!(
+            "route:{} {}",
+            method.into().to_ascii_uppercase(),
+            path.into()
+        );
+        let setter = format!("query:{}", query_name.into());
+        self.any_for(request, setter)
+    }
+
     pub(crate) fn is_any_for(&self, request: &str, setter: &str) -> bool {
         match self {
             Self::Any => true,
@@ -206,6 +255,32 @@ impl GoRequestBuilderAliases {
         self
     }
 
+    /// Add aliases to the request builder for one method/path route.
+    #[must_use]
+    pub fn operation(
+        self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+    ) -> GoRequestBuilderOperationAliases {
+        GoRequestBuilderOperationAliases {
+            aliases: self,
+            selector: format!(
+                "route:{} {}",
+                method.into().to_ascii_uppercase(),
+                path.into()
+            ),
+        }
+    }
+
+    /// Add aliases to the request builder for one operation id.
+    #[must_use]
+    pub fn operation_id(self, operation: impl Into<String>) -> GoRequestBuilderOperationAliases {
+        GoRequestBuilderOperationAliases {
+            aliases: self,
+            selector: format!("operation:{}", operation.into()),
+        }
+    }
+
     pub(crate) fn body_aliases_for(&self, request: &str) -> Vec<String> {
         self.body
             .get(request)
@@ -222,6 +297,32 @@ impl GoRequestBuilderAliases {
 
     pub(crate) fn request_names(&self) -> BTreeSet<String> {
         self.body.keys().chain(self.query.keys()).cloned().collect()
+    }
+}
+
+/// Builder returned by [`GoRequestBuilderAliases::operation`] and
+/// [`GoRequestBuilderAliases::operation_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoRequestBuilderOperationAliases {
+    aliases: GoRequestBuilderAliases,
+    selector: String,
+}
+
+impl GoRequestBuilderOperationAliases {
+    /// Add an alias body setter for the selected operation request builder.
+    #[must_use]
+    pub fn body(self, setter: impl Into<String>) -> GoRequestBuilderAliases {
+        self.aliases.body(self.selector, setter)
+    }
+
+    /// Add an alias query setter for the selected operation request builder.
+    #[must_use]
+    pub fn query(
+        self,
+        setter: impl Into<String>,
+        query_name: impl Into<String>,
+    ) -> GoRequestBuilderAliases {
+        self.aliases.query(self.selector, setter, query_name)
     }
 }
 
@@ -250,6 +351,17 @@ impl GoExecuteCompatibility {
     #[must_use]
     pub fn operation(mut self, operation: impl Into<String>) -> Self {
         self.preserve_legacy_operations.insert(operation.into());
+        self
+    }
+
+    /// Preserve the legacy `Execute` signature for an operation matched by method/path.
+    #[must_use]
+    pub fn route(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
+        self.preserve_legacy_operations.insert(format!(
+            "route:{} {}",
+            method.into().to_ascii_uppercase(),
+            path.into()
+        ));
         self
     }
 

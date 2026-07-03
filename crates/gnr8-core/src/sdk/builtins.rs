@@ -797,6 +797,8 @@ struct QueryParamOverride {
 struct RequestBodyOverride {
     matcher: OperationMatcher,
     required: Option<bool>,
+    schema_ref: Option<String>,
+    content_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -955,6 +957,60 @@ impl ApiOverrides {
                 path: path.into(),
             },
             required: None,
+            schema_ref: None,
+            content_type: None,
+        });
+        self
+    }
+
+    /// Set or replace one JSON request body on an operation matched by method and graph path.
+    #[must_use]
+    pub fn json_request_body(
+        self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Self {
+        self.typed_request_body(method, path, schema, "application/json")
+    }
+
+    /// Set or replace one `application/x-www-form-urlencoded` request body.
+    #[must_use]
+    pub fn form_request_body(
+        self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Self {
+        self.typed_request_body(method, path, schema, "application/x-www-form-urlencoded")
+    }
+
+    /// Set or replace one `multipart/form-data` request body.
+    #[must_use]
+    pub fn multipart_request_body(
+        self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        schema: impl Into<String>,
+    ) -> Self {
+        self.typed_request_body(method, path, schema, "multipart/form-data")
+    }
+
+    fn typed_request_body(
+        mut self,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        schema: impl Into<String>,
+        content_type: impl Into<String>,
+    ) -> Self {
+        self.request_bodies.push(RequestBodyOverride {
+            matcher: OperationMatcher::Route {
+                method: method.into().to_ascii_uppercase(),
+                path: path.into(),
+            },
+            required: Some(true),
+            schema_ref: Some(schema.into()),
+            content_type: Some(content_type.into()),
         });
         self
     }
@@ -1069,7 +1125,13 @@ impl Transform for ApiOverrides {
             apply_query_param_override(ir, &override_.matcher, &override_.param)?;
         }
         for override_ in &self.request_bodies {
-            apply_request_body_override(ir, &override_.matcher, override_.required)?;
+            apply_request_body_override(
+                ir,
+                &override_.matcher,
+                override_.required,
+                override_.schema_ref.as_deref(),
+                override_.content_type.as_deref(),
+            )?;
         }
         for override_ in &self.responses {
             apply_response_override(ir, override_)?;
@@ -1167,8 +1229,18 @@ fn apply_request_body_override(
     ir: &mut ApiGraph,
     matcher: &OperationMatcher,
     required: Option<bool>,
+    schema_ref: Option<&str>,
+    content_type: Option<&str>,
 ) -> Result<(), CoreError> {
     let op_index = find_operation_index(ir, matcher, "request body override")?;
+    if let Some(schema_ref) = schema_ref {
+        let resolved = resolve_schema_ref(ir, schema_ref, "request body override schema")?;
+        let op = &mut ir.operations[op_index];
+        op.request_body = Some(SchemaRef { ref_id: resolved });
+        op.request_body_required = required.unwrap_or(true);
+        op.request_body_content_type = content_type.map(str::to_string);
+        return Ok(());
+    }
     let op = &mut ir.operations[op_index];
     if op.request_body.is_none() {
         return Err(CoreError::Config {
@@ -1231,7 +1303,7 @@ fn apply_default_response_override(
     let body_ref = override_
         .schema_ref
         .as_deref()
-        .map(|schema| resolve_schema_ref(ir, schema))
+        .map(|schema| resolve_schema_ref(ir, schema, "default response override schema"))
         .transpose()?;
     let content_types = response_override_content_types(
         override_.content_type.as_deref(),
@@ -1266,7 +1338,7 @@ fn response_override_body(
     schema_ref
         .map(|schema| {
             Ok(SchemaRef {
-                ref_id: resolve_schema_ref(ir, schema)?,
+                ref_id: resolve_schema_ref(ir, schema, "response override schema")?,
             })
         })
         .transpose()
@@ -1283,7 +1355,7 @@ fn response_override_content_types(
     }
 }
 
-fn resolve_schema_ref(ir: &ApiGraph, schema: &str) -> Result<String, CoreError> {
+fn resolve_schema_ref(ir: &ApiGraph, schema: &str, label: &str) -> Result<String, CoreError> {
     if let Some(candidate) = ir.schemas.iter().find(|candidate| candidate.id == schema) {
         return Ok(candidate.id.clone());
     }
@@ -1296,11 +1368,11 @@ fn resolve_schema_ref(ir: &ApiGraph, schema: &str) -> Result<String, CoreError> 
     match matches.as_slice() {
         [single] => Ok(single.id.clone()),
         [] => Err(CoreError::Config {
-            message: format!("response override schema '{schema}' did not match any schema"),
+            message: format!("{label} '{schema}' did not match any schema"),
         }),
         many => Err(CoreError::Config {
             message: format!(
-                "response override schema '{schema}' matches {} schemas; use the full schema id",
+                "{label} '{schema}' matches {} schemas; use the full schema id",
                 many.len()
             ),
         }),
@@ -1968,11 +2040,12 @@ fn ensure_unique_operation_ids(ir: &ApiGraph) -> Result<(), CoreError> {
 // Targets
 // ---------------------------------------------------------------------------------------------------
 
-/// Typed OpenAPI component aliases. Aliases are added as component schemas whose body is a `$ref` to
-/// the canonical component.
+/// Typed OpenAPI component aliases. `$ref` aliases point at a canonical component, while clone aliases
+/// duplicate the canonical component body after schema patches have been applied.
 #[derive(Debug, Clone, Default)]
 pub struct OpenApiSchemaAliases {
     aliases: Vec<(String, String)>,
+    clone_aliases: Vec<(String, String)>,
 }
 
 impl OpenApiSchemaAliases {
@@ -1986,6 +2059,13 @@ impl OpenApiSchemaAliases {
     #[must_use]
     pub fn alias(mut self, canonical: impl Into<String>, alias: impl Into<String>) -> Self {
         self.aliases.push((canonical.into(), alias.into()));
+        self
+    }
+
+    /// Add one component alias by cloning the canonical schema body into a distinct component.
+    #[must_use]
+    pub fn clone_alias(mut self, canonical: impl Into<String>, alias: impl Into<String>) -> Self {
+        self.clone_aliases.push((canonical.into(), alias.into()));
         self
     }
 }
@@ -2020,7 +2100,9 @@ impl OpenApiSchemaPatch {
 pub struct OpenApiFieldPatch {
     field: String,
     constraints: Constraints,
+    description: Option<String>,
     default: Option<LiteralValue>,
+    example: Option<LiteralValue>,
     extensions: Vec<Extension>,
 }
 
@@ -2031,7 +2113,9 @@ impl OpenApiFieldPatch {
         Self {
             field: field.into(),
             constraints: Constraints::default(),
+            description: None,
             default: None,
+            example: None,
             extensions: Vec::new(),
         }
     }
@@ -2076,6 +2160,24 @@ impl OpenApiFieldPatch {
         self
     }
 
+    /// Set a field-level enum while preserving caller-provided order.
+    #[must_use]
+    pub fn enum_values_in_order<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.constraints.enum_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set a field description.
+    #[must_use]
+    pub fn description(mut self, value: impl Into<String>) -> Self {
+        self.description = Some(value.into());
+        self
+    }
+
     /// Set a string default.
     #[must_use]
     pub fn default_string(mut self, value: impl Into<String>) -> Self {
@@ -2097,12 +2199,74 @@ impl OpenApiFieldPatch {
         self
     }
 
+    /// Set a string example.
+    #[must_use]
+    pub fn example_string(mut self, value: impl Into<String>) -> Self {
+        self.example = Some(LiteralValue::String(value.into()));
+        self
+    }
+
+    /// Set a numeric example.
+    #[must_use]
+    pub fn example_number(mut self, value: impl std::fmt::Display) -> Self {
+        self.example = Some(LiteralValue::Number(value.to_string()));
+        self
+    }
+
+    /// Set a boolean example.
+    #[must_use]
+    pub fn example_bool(mut self, value: bool) -> Self {
+        self.example = Some(LiteralValue::Bool(value));
+        self
+    }
+
+    /// Set an explicit null example.
+    #[must_use]
+    pub fn example_null(mut self) -> Self {
+        self.example = Some(LiteralValue::Null);
+        self
+    }
+
     /// Add or replace a string vendor extension.
     #[must_use]
     pub fn extension_string(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extensions.push(Extension {
             name: name.into(),
             value: LiteralValue::String(value.into()),
+        });
+        self
+    }
+
+    /// Add or replace a numeric vendor extension.
+    #[must_use]
+    pub fn extension_number(
+        mut self,
+        name: impl Into<String>,
+        value: impl std::fmt::Display,
+    ) -> Self {
+        self.extensions.push(Extension {
+            name: name.into(),
+            value: LiteralValue::Number(value.to_string()),
+        });
+        self
+    }
+
+    /// Add or replace a boolean vendor extension.
+    #[must_use]
+    pub fn extension_bool(mut self, name: impl Into<String>, value: bool) -> Self {
+        self.extensions.push(Extension {
+            name: name.into(),
+            value: LiteralValue::Bool(value),
+        });
+        self
+    }
+
+    /// Add or replace an explicit null vendor extension.
+    #[must_use]
+    pub fn extension_null(mut self, name: impl Into<String>) -> Self {
+        self.extensions.push(Extension {
+            name: name.into(),
+            value: LiteralValue::Null,
         });
         self
     }
@@ -2133,25 +2297,68 @@ fn apply_openapi_customizations(
             .schemas
             .push((alias.clone(), SchemaObject::reference(canonical.clone())));
     }
-    doc.components.schemas.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for patch in patches {
-        let Some((_, schema)) = doc
+    let clone_alias_names: BTreeSet<&str> = aliases
+        .clone_aliases
+        .iter()
+        .map(|(_, alias)| alias.as_str())
+        .collect();
+    for patch in patches
+        .iter()
+        .filter(|patch| !clone_alias_names.contains(patch.schema.as_str()))
+    {
+        apply_openapi_schema_patch(doc, patch)?;
+    }
+    for (canonical, alias) in &aliases.clone_aliases {
+        let Some((_, canonical_schema)) = doc
             .components
             .schemas
-            .iter_mut()
-            .find(|(name, _)| name == &patch.schema)
+            .iter()
+            .find(|(name, _)| name == canonical)
         else {
             return Err(CoreError::Config {
                 message: format!(
-                    "OpenAPI schema patch references unknown schema {:?}",
-                    patch.schema
+                    "OpenAPI schema clone alias references unknown schema {canonical:?}"
                 ),
             });
         };
-        for field_patch in &patch.field_patches {
-            apply_openapi_field_patch(&patch.schema, schema, field_patch)?;
+        if doc.components.schemas.iter().any(|(name, _)| name == alias) {
+            return Err(CoreError::Config {
+                message: format!("OpenAPI schema alias {alias:?} collides with an existing schema"),
+            });
         }
+        doc.components
+            .schemas
+            .push((alias.clone(), canonical_schema.clone()));
+    }
+    for patch in patches
+        .iter()
+        .filter(|patch| clone_alias_names.contains(patch.schema.as_str()))
+    {
+        apply_openapi_schema_patch(doc, patch)?;
+    }
+    doc.components.schemas.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(())
+}
+
+fn apply_openapi_schema_patch(
+    doc: &mut OpenApiDoc,
+    patch: &OpenApiSchemaPatch,
+) -> Result<(), CoreError> {
+    let Some((_, schema)) = doc
+        .components
+        .schemas
+        .iter_mut()
+        .find(|(name, _)| name == &patch.schema)
+    else {
+        return Err(CoreError::Config {
+            message: format!(
+                "OpenAPI schema patch references unknown schema {:?}",
+                patch.schema
+            ),
+        });
+    };
+    for field_patch in &patch.field_patches {
+        apply_openapi_field_patch(&patch.schema, schema, field_patch)?;
     }
     Ok(())
 }
@@ -2174,19 +2381,39 @@ fn apply_openapi_field_patch(
         });
     };
 
-    prop.min_length = patch.constraints.min_length;
-    prop.max_length = patch.constraints.max_length;
-    prop.minimum.clone_from(&patch.constraints.minimum);
-    prop.maximum.clone_from(&patch.constraints.maximum);
-    prop.exclusive_minimum
-        .clone_from(&patch.constraints.exclusive_minimum);
-    prop.exclusive_maximum
-        .clone_from(&patch.constraints.exclusive_maximum);
-    prop.pattern.clone_from(&patch.constraints.pattern);
+    if let Some(value) = patch.constraints.min_length {
+        prop.min_length = Some(value);
+    }
+    if let Some(value) = patch.constraints.max_length {
+        prop.max_length = Some(value);
+    }
+    if let Some(value) = &patch.constraints.minimum {
+        prop.minimum = Some(value.clone());
+    }
+    if let Some(value) = &patch.constraints.maximum {
+        prop.maximum = Some(value.clone());
+    }
+    if let Some(value) = &patch.constraints.exclusive_minimum {
+        prop.exclusive_minimum = Some(value.clone());
+    }
+    if let Some(value) = &patch.constraints.exclusive_maximum {
+        prop.exclusive_maximum = Some(value.clone());
+    }
+    if let Some(value) = &patch.constraints.pattern {
+        prop.pattern = Some(value.clone());
+    }
+    if let Some(value) = &patch.description {
+        prop.description = Some(value.clone());
+    }
     if !patch.constraints.enum_values.is_empty() {
         prop.enum_values.clone_from(&patch.constraints.enum_values);
     }
-    prop.default_value.clone_from(&patch.default);
+    if let Some(value) = &patch.default {
+        prop.default_value = Some(value.clone());
+    }
+    if let Some(value) = &patch.example {
+        prop.example = Some(value.clone());
+    }
     for extension in &patch.extensions {
         if let Some(existing) = prop
             .extensions
@@ -2236,6 +2463,9 @@ impl OpenApi31 {
     #[must_use]
     pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
         self.schema_aliases.aliases.extend(aliases.aliases);
+        self.schema_aliases
+            .clone_aliases
+            .extend(aliases.clone_aliases);
         self
     }
 
@@ -2310,6 +2540,9 @@ impl OpenApi31Json {
     #[must_use]
     pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
         self.schema_aliases.aliases.extend(aliases.aliases);
+        self.schema_aliases
+            .clone_aliases
+            .extend(aliases.clone_aliases);
         self
     }
 
@@ -3665,7 +3898,7 @@ mod tests {
         QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
         SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
-    use crate::analyze::facts::FieldMeta;
+    use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
         ApiGraph, Diagnostic, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
     };
@@ -4115,6 +4348,176 @@ mod tests {
         assert!(
             yaml.contains("'#/components/schemas/SyncStreamEnvelope'"),
             "{yaml}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single request-body override scenario verifies create, replace, and optional semantics"
+    )]
+    fn api_overrides_can_create_and_replace_typed_request_bodies() {
+        let mut ir = ApiGraph {
+            schemas: vec![
+                Schema {
+                    id: "app.ImportBooksRequest".to_string(),
+                    name: "ImportBooksRequest".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.OAuthTokenRequest".to_string(),
+                    name: "OAuthTokenRequest".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.UploadRequest".to_string(),
+                    name: "UploadRequest".to_string(),
+                    body: Type::Object(vec![]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            operations: vec![
+                Operation {
+                    id: "importBooks".to_string(),
+                    method: "POST".to_string(),
+                    path: "/books/import".to_string(),
+                    handler: "importBooks".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "token".to_string(),
+                    method: "POST".to_string(),
+                    path: "/oauth/token".to_string(),
+                    handler: "token".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "upload".to_string(),
+                    method: "POST".to_string(),
+                    path: "/files/upload".to_string(),
+                    handler: "upload".to_string(),
+                    group: None,
+                    middleware: Vec::new(),
+                    params: vec![],
+                    request_body: Some(SchemaRef {
+                        ref_id: "app.ImportBooksRequest".to_string(),
+                    }),
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .json_request_body("POST", "/books/import", "ImportBooksRequest")
+            .optional()
+            .form_request_body("POST", "/oauth/token", "OAuthTokenRequest")
+            .multipart_request_body("POST", "/files/upload", "UploadRequest")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert_eq!(
+            ir.operations[0].request_body.as_ref().unwrap().ref_id,
+            "app.ImportBooksRequest"
+        );
+        assert!(!ir.operations[0].request_body_required);
+        assert_eq!(
+            ir.operations[0].request_body_content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            ir.operations[1].request_body.as_ref().unwrap().ref_id,
+            "app.OAuthTokenRequest"
+        );
+        assert_eq!(
+            ir.operations[1].request_body_content_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(
+            ir.operations[2].request_body.as_ref().unwrap().ref_id,
+            "app.UploadRequest"
+        );
+        assert_eq!(
+            ir.operations[2].request_body_content_type.as_deref(),
+            Some("multipart/form-data")
+        );
+    }
+
+    #[test]
+    fn api_overrides_typed_request_body_unknown_schema_is_a_config_error() {
+        let mut ir = ApiGraph {
+            operations: vec![Operation {
+                id: "importBooks".to_string(),
+                method: "POST".to_string(),
+                path: "/books/import".to_string(),
+                handler: "importBooks".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params: vec![],
+                request_body: None,
+                request_body_required: true,
+                request_body_content_type: None,
+                responses: vec![],
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let err = ApiOverrides::new()
+            .json_request_body("POST", "/books/import", "MissingRequest")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("request body override schema 'MissingRequest' did not match any schema"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn api_overrides_typed_request_body_missing_route_is_a_config_error() {
+        let mut ir = ApiGraph::default();
+
+        let err = ApiOverrides::new()
+            .json_request_body("POST", "/books/import", "ImportBooksRequest")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("request body override did not match any operation"),
+            "{err}"
         );
     }
 
@@ -4886,40 +5289,75 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single OpenAPI serialization scenario verifies aliases, patches, preservation, and both encoders"
+    )]
     fn openapi_helpers_patch_typed_doc_before_yaml_and_json_serialization() {
         let ir = ApiGraph {
             schemas: vec![Schema {
                 id: "app.CreateBookInput".to_string(),
                 name: "CreateBookInput".to_string(),
-                body: Type::Object(vec![Field {
-                    json_name: "title".to_string(),
-                    required: true,
-                    optional: false,
-                    nullable: false,
-                    schema: Type::Primitive(Prim::String),
-                    description: None,
-                    example: None,
-                    meta: FieldMeta::default(),
-                }]),
+                body: Type::Object(vec![
+                    Field {
+                        json_name: "title".to_string(),
+                        required: true,
+                        optional: false,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    },
+                    Field {
+                        json_name: "source".to_string(),
+                        required: false,
+                        optional: true,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: Some("Source description".to_string()),
+                        example: Some("source-example".to_string()),
+                        meta: FieldMeta {
+                            constraints: Constraints {
+                                min_length: Some(2),
+                                ..Constraints::default()
+                            },
+                            ..FieldMeta::default()
+                        },
+                    },
+                ]),
                 enum_source_order: Vec::new(),
                 provenance: span(),
             }],
             ..ApiGraph::default()
         };
 
-        let aliases = OpenApiSchemaAliases::new().alias("CreateBookInput", "CreateBookRequest");
-        let patch = OpenApiSchemaPatch::new("CreateBookInput").field(
-            OpenApiFieldPatch::new("title")
-                .min_length(3)
-                .default_string("Untitled")
-                .extension_string("x-gnr8-render", "input"),
-        );
+        let aliases = OpenApiSchemaAliases::new()
+            .alias("CreateBookInput", "CreateBookRequest")
+            .clone_alias("CreateBookInput", "LegacyCreateBookInput");
+        let patch = OpenApiSchemaPatch::new("CreateBookInput")
+            .field(
+                OpenApiFieldPatch::new("title")
+                    .description("Display title")
+                    .min_length(3)
+                    .enum_values_in_order(["beta", "alpha"])
+                    .default_string("Untitled")
+                    .example_string("Example Book")
+                    .extension_string("x-gnr8-render", "input")
+                    .extension_number("x-rank", 2)
+                    .extension_bool("x-visible", true)
+                    .extension_null("x-empty"),
+            )
+            .field(OpenApiFieldPatch::new("source").extension_bool("x-source", true));
+        let clone_patch = OpenApiSchemaPatch::new("LegacyCreateBookInput")
+            .field(OpenApiFieldPatch::new("source").description("Legacy source description"));
 
         let mut yaml_out = Artifacts::new();
         OpenApi31::new()
             .to("openapi.yaml")
             .schema_aliases(aliases.clone())
             .schema_patch(patch.clone())
+            .schema_patch(clone_patch.clone())
             .generate(&ir, &mut yaml_out, &cx())
             .unwrap();
         let yaml = yaml_out
@@ -4930,19 +5368,28 @@ mod tests {
             .text
             .as_str();
         assert!(yaml.contains("CreateBookRequest:"), "{yaml}");
+        assert!(yaml.contains("LegacyCreateBookInput:"), "{yaml}");
         assert!(
             yaml.contains("$ref: '#/components/schemas/CreateBookInput'"),
             "{yaml}"
         );
+        assert!(yaml.contains("description: Display title"), "{yaml}");
+        assert!(yaml.contains("enum: [beta, alpha]"), "{yaml}");
         assert!(yaml.contains("minLength: 3"), "{yaml}");
         assert!(yaml.contains("default: Untitled"), "{yaml}");
+        assert!(yaml.contains("example: Example Book"), "{yaml}");
         assert!(yaml.contains("x-gnr8-render: input"), "{yaml}");
+        assert!(yaml.contains("x-rank: 2"), "{yaml}");
+        assert!(yaml.contains("description: Source description"), "{yaml}");
+        assert!(yaml.contains("example: source-example"), "{yaml}");
+        assert!(yaml.contains("x-source: true"), "{yaml}");
 
         let mut json_out = Artifacts::new();
         OpenApi31Json::new()
             .to("openapi.json")
             .schema_aliases(aliases)
             .schema_patch(patch)
+            .schema_patch(clone_patch)
             .generate(&ir, &mut json_out, &cx())
             .unwrap();
         let json = json_out
@@ -4957,10 +5404,111 @@ mod tests {
             value["components"]["schemas"]["CreateBookRequest"]["$ref"],
             "#/components/schemas/CreateBookInput"
         );
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookInput"]["properties"]["title"]["x-rank"],
+            2
+        );
+        assert_eq!(
+            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]["type"],
+            "string"
+        );
+        assert_eq!(
+            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]
+                ["description"],
+            "Display title"
+        );
+        assert_eq!(
+            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]
+                ["minLength"],
+            3
+        );
+        assert_eq!(
+            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["source"]
+                ["description"],
+            "Legacy source description"
+        );
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookInput"]["properties"]["source"]
+                ["description"],
+            "Source description"
+        );
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookInput"]["properties"]["source"]["example"],
+            "source-example"
+        );
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookInput"]["properties"]["source"]["minLength"],
+            2
+        );
+        assert_eq!(
+            value["components"]["schemas"]["CreateBookInput"]["properties"]["source"]["x-source"],
+            true
+        );
         let title = &value["components"]["schemas"]["CreateBookInput"]["properties"]["title"];
+        assert_eq!(title["description"], "Display title");
+        assert_eq!(title["enum"], serde_json::json!(["beta", "alpha"]));
         assert_eq!(title["minLength"], 3);
         assert_eq!(title["default"], "Untitled");
+        assert_eq!(title["example"], "Example Book");
         assert_eq!(title["x-gnr8-render"], "input");
+        assert_eq!(title["x-rank"], 2);
+        assert_eq!(title["x-visible"], true);
+        assert_eq!(title["x-empty"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn openapi_field_patch_examples_support_primitive_literals() {
+        let field = |json_name: &str, schema: Type| Field {
+            json_name: json_name.to_string(),
+            required: false,
+            optional: true,
+            nullable: false,
+            schema,
+            description: None,
+            example: None,
+            meta: FieldMeta::default(),
+        };
+        let ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.PrimitiveExamples".to_string(),
+                name: "PrimitiveExamples".to_string(),
+                body: Type::Object(vec![
+                    field("count", Type::Primitive(Prim::String)),
+                    field("enabled", Type::Primitive(Prim::String)),
+                    field("empty", Type::Primitive(Prim::String)),
+                ]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let mut out = Artifacts::new();
+        OpenApi31Json::new()
+            .to("openapi.json")
+            .schema_patch(
+                OpenApiSchemaPatch::new("PrimitiveExamples")
+                    .field(OpenApiFieldPatch::new("count").example_number(7))
+                    .field(OpenApiFieldPatch::new("enabled").example_bool(false))
+                    .field(OpenApiFieldPatch::new("empty").example_null()),
+            )
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+
+        let json = out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "openapi.json")
+            .unwrap()
+            .text
+            .as_str();
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let properties = &value["components"]["schemas"]["PrimitiveExamples"]["properties"];
+        assert_eq!(properties["count"]["example"], 7);
+        assert_eq!(properties["enabled"]["example"], false);
+        assert!(properties["empty"]
+            .get("example")
+            .is_some_and(serde_json::Value::is_null));
     }
 
     #[test]
