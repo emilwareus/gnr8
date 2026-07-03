@@ -2464,6 +2464,7 @@ impl StaticFiles {
 #[derive(Debug, Clone)]
 pub struct GoSdk {
     module: String,
+    go_version: String,
     dir: String,
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
@@ -2485,6 +2486,7 @@ impl GoSdk {
     pub fn new() -> Self {
         Self {
             module: String::new(),
+            go_version: "1.23".to_string(),
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
@@ -2506,6 +2508,21 @@ impl GoSdk {
     #[must_use]
     pub fn module(mut self, module: impl Into<String>) -> Self {
         self.module = module.into();
+        self
+    }
+
+    /// Set the Go module path for the generated SDK.
+    ///
+    /// Alias for [`GoSdk::module`] for call sites that prefer `module_path(...)`.
+    #[must_use]
+    pub fn module_path(self, module: impl Into<String>) -> Self {
+        self.module(module)
+    }
+
+    /// Set the Go language version for the generated `go.mod`.
+    #[must_use]
+    pub fn go_version(mut self, version: impl Into<String>) -> Self {
+        self.go_version = version.into();
         self
     }
 
@@ -2584,10 +2601,7 @@ impl GoSdk {
 
     /// Set how OpenAPI Generator-compatible query setter arguments are typed.
     #[must_use]
-    pub const fn query_setter_argument_policy(
-        mut self,
-        policy: GoQuerySetterArgumentPolicy,
-    ) -> Self {
+    pub fn query_setter_argument_policy(mut self, policy: GoQuerySetterArgumentPolicy) -> Self {
         self.query_setter_argument_policy = Some(policy);
         self
     }
@@ -2649,8 +2663,8 @@ impl GoSdk {
         if let Some(aliases) = &self.request_builder_aliases {
             options.request_builder_aliases = aliases.clone();
         }
-        if let Some(policy) = self.query_setter_argument_policy {
-            options.query_setter_argument_policy = policy;
+        if let Some(policy) = &self.query_setter_argument_policy {
+            options.query_setter_argument_policy = policy.clone();
         }
         if let Some(compatibility) = &self.execute_compatibility {
             options.execute_compatibility = compatibility.clone();
@@ -2676,6 +2690,12 @@ impl Target for GoSdk {
         if self.dir.is_empty() {
             return Err(CoreError::Config {
                 message: "GoSdk target has no output dir — call .to(\"sdk\")".to_string(),
+            });
+        }
+        if self.go_version.trim().is_empty() || self.go_version.chars().any(char::is_whitespace) {
+            return Err(CoreError::Config {
+                message: "GoSdk go_version must be a non-empty Go version without whitespace"
+                    .to_string(),
             });
         }
         // Derive the package from the module path (the single source of truth) and generate via the
@@ -2705,7 +2725,7 @@ impl Target for GoSdk {
         if self.package_metadata {
             out.write(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
-                format!("module {}\n\ngo 1.23\n", self.module),
+                format!("module {}\n\ngo {}\n", self.module, self.go_version),
             );
         }
         Ok(())
@@ -5221,7 +5241,8 @@ mod tests {
     fn gosdk_target_emits_go_mod_under_output_dir() {
         let ir = ApiGraph::default();
         let target = GoSdk::new()
-            .module("example.com/bookstore/sdk")
+            .module_path("example.com/bookstore/sdk")
+            .go_version("1.26.4")
             .to("generated/sdk-go");
 
         let mut out = Artifacts::new();
@@ -5232,7 +5253,10 @@ mod tests {
             .iter()
             .find(|file| file.path == "generated/sdk-go/go.mod")
             .expect("GoSdk must emit go.mod so pruned SDK dirs remain buildable");
-        assert_eq!(go_mod.text, "module example.com/bookstore/sdk\n\ngo 1.23\n");
+        assert_eq!(
+            go_mod.text,
+            "module example.com/bookstore/sdk\n\ngo 1.26.4\n"
+        );
     }
 
     #[test]

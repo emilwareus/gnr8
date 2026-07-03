@@ -298,6 +298,7 @@ fn validate_go_compat_options(
         }
     }
     validate_go_request_builder_alias_conflicts(options)?;
+    validate_go_query_setter_argument_policy(graph, options, &request_names)?;
     for request in options.execute_compatibility.request_names() {
         if !request_names.contains(request) {
             return Err(crate::CoreError::Config {
@@ -317,6 +318,48 @@ fn validate_go_compat_options(
         }
     }
     Ok(())
+}
+
+fn validate_go_query_setter_argument_policy(
+    graph: &ApiGraph,
+    options: &GoSdkOptions,
+    request_names: &BTreeSet<String>,
+) -> Result<(), crate::CoreError> {
+    for request in options.query_setter_argument_policy.request_names() {
+        if !request_names.contains(&request) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk query_setter_argument_policy references unknown request builder '{request}'"
+                ),
+            });
+        }
+        let valid_setters = go_query_setter_methods_for_request(graph, &request);
+        for setter in options.query_setter_argument_policy.setters_for(&request) {
+            if !valid_setters.contains(&setter) {
+                return Err(crate::CoreError::Config {
+                    message: format!(
+                        "GoSdk query_setter_argument_policy references unknown query setter '{setter}' on '{request}'"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn go_query_setter_methods_for_request(graph: &ApiGraph, request: &str) -> BTreeSet<String> {
+    graph
+        .operations
+        .iter()
+        .find(|op| emit::compat_request_name(op) == request)
+        .map(|op| {
+            op.params
+                .iter()
+                .filter(|param| param.location == "query")
+                .flat_map(|param| emit::compat_method_names(&emit::compat_exported(&param.name)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_go_request_builder_alias_conflicts(
@@ -1282,6 +1325,123 @@ mod tests {
     }
 
     #[test]
+    fn go_openapi_generator_profile_body_alias_wins_over_generated_body_field_setter() {
+        if !gofmt_available() {
+            eprintln!("skipping body alias precedence test: gofmt unavailable");
+            return;
+        }
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases =
+            GoRequestBuilderAliases::new().body("ApiCreateGoalRequest", "Name");
+
+        let files = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiCreateGoalRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains("func (r ApiCreateGoalRequest) Name(name any) ApiCreateGoalRequest"),
+            "{api}"
+        );
+        assert!(api.contains("r.body = name"), "{api}");
+        assert!(!api.contains("r.extraQuery[\"name\"] = name"), "{api}");
+        assert!(
+            !api.contains("r.body = compatSetBodyField(r.body, \"name\", name)"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_body_field_setters_update_json_body_not_query() {
+        if !gofmt_available() {
+            eprintln!("skipping body field setter test: gofmt unavailable");
+            return;
+        }
+        let files = generate_files_with_profile(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiCreateGoalRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains("func (r ApiCreateGoalRequest) Name(name any) ApiCreateGoalRequest"),
+            "{api}"
+        );
+        assert!(
+            api.contains("r.body = compatSetBodyField(r.body, \"name\", name)"),
+            "{api}"
+        );
+        assert!(!api.contains("r.extraQuery[\"name\"] = name"), "{api}");
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_encodes_form_urlencoded_body_fields() {
+        if !gofmt_available() {
+            eprintln!("skipping form-url-encoded compat test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].request_body_content_type =
+            Some("application/x-www-form-urlencoded".to_string());
+
+        let files = generate_files_with_profile(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::go_openapi_generator_compat(),
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiCreateGoalRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "func (r ApiCreateGoalRequest) Name(name any) ApiCreateGoalRequest",
+            "r.body = compatSetBodyField(r.body, \"name\", name)",
+            "encodedBody, err := compatEncodeFormBody(bodyValue)",
+            "reqContentType = \"application/x-www-form-urlencoded\"",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+
+        let utils = files
+            .iter()
+            .find(|file| file.name == "utils.go")
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(utils.contains("func compatEncodeFormBody("), "{utils}");
+        assert!(utils.contains("func compatSetBodyField("), "{utils}");
+    }
+
+    #[test]
     fn go_openapi_generator_profile_can_emit_any_query_setters() {
         if !gofmt_available() {
             eprintln!("skipping any query setters test: gofmt unavailable");
@@ -1316,6 +1476,93 @@ mod tests {
         assert!(
             api.contains("r.extraQuery[\"aggregation\"] = aggregation"),
             "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_can_widen_selected_query_setters_to_any() {
+        if !gofmt_available() {
+            eprintln!("skipping selected any query setters test: gofmt unavailable");
+            return;
+        }
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.query_setter_argument_policy =
+            GoQuerySetterArgumentPolicy::typed().any_for("ApiListGoalsRequest", "Aggregation");
+        let mut graph = sample_graph();
+        graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "listGoals")
+            .unwrap()
+            .params
+            .push(Param {
+                name: "cursor".to_string(),
+                location: "query".to_string(),
+                required: false,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                provenance: SourceSpan {
+                    file: "/root/h.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            });
+
+        let files = generate_files_with_profile_options(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiListGoalsRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+
+        assert!(
+            api.contains(
+                "func (r ApiListGoalsRequest) Aggregation(aggregation any) ApiListGoalsRequest"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("r.extraQuery[\"aggregation\"] = aggregation"),
+            "{api}"
+        );
+        assert!(
+            api.contains("func (r ApiListGoalsRequest) Cursor(cursor string) ApiListGoalsRequest"),
+            "{api}"
+        );
+        assert!(!api.contains("r.extraQuery[\"cursor\"] = cursor"), "{api}");
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_unknown_selected_any_query_setter() {
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.query_setter_argument_policy =
+            GoQuerySetterArgumentPolicy::typed().any_for("ApiListGoalsRequest", "Missing");
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown query setter 'Missing'"),
+            "unexpected error: {err}"
         );
     }
 

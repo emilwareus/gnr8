@@ -85,13 +85,15 @@ impl GoRequestBuilderScope {
 }
 
 /// How OpenAPI Generator-compatible query setter arguments are typed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GoQuerySetterArgumentPolicy {
     /// Use the query parameter's generated Go type.
     #[default]
     Typed,
     /// Accept `any` and serialize through compatibility query helpers.
     Any,
+    /// Accept `any` only for selected request-builder setters.
+    SelectiveAny(BTreeMap<String, BTreeSet<String>>),
 }
 
 impl GoQuerySetterArgumentPolicy {
@@ -107,8 +109,51 @@ impl GoQuerySetterArgumentPolicy {
         Self::Any
     }
 
-    pub(crate) const fn is_any(self) -> bool {
-        matches!(self, Self::Any)
+    /// Widen one generated query setter on one request builder to `any`.
+    #[must_use]
+    pub fn any_for(mut self, request: impl Into<String>, setter: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Any => self,
+            Self::Typed => {
+                let mut any_for = BTreeMap::new();
+                any_for
+                    .entry(request.into())
+                    .or_insert_with(BTreeSet::new)
+                    .insert(setter.into());
+                Self::SelectiveAny(any_for)
+            }
+            Self::SelectiveAny(any_for) => {
+                any_for
+                    .entry(request.into())
+                    .or_insert_with(BTreeSet::new)
+                    .insert(setter.into());
+                self
+            }
+        }
+    }
+
+    pub(crate) fn is_any_for(&self, request: &str, setter: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Typed => false,
+            Self::SelectiveAny(any_for) => any_for
+                .get(request)
+                .is_some_and(|setters| setters.contains(setter)),
+        }
+    }
+
+    pub(crate) fn request_names(&self) -> BTreeSet<String> {
+        match self {
+            Self::SelectiveAny(any_for) => any_for.keys().cloned().collect(),
+            Self::Typed | Self::Any => BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn setters_for(&self, request: &str) -> BTreeSet<String> {
+        match self {
+            Self::SelectiveAny(any_for) => any_for.get(request).cloned().unwrap_or_default(),
+            Self::Typed | Self::Any => BTreeSet::new(),
+        }
     }
 }
 
