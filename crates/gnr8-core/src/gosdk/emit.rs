@@ -39,6 +39,14 @@ pub(crate) struct GoEmitOptions {
     pub(crate) sdk: GoSdkOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatRequestBodyEncoding {
+    None,
+    Json,
+    Multipart,
+    FormUrlEncoded,
+}
+
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
 ///
 /// `write!`/`writeln!` into a `String` is infallible in practice, but the `fmt::Write` trait is
@@ -84,7 +92,7 @@ pub(crate) fn exported(name: &str) -> String {
     out
 }
 
-fn compat_exported(name: &str) -> String {
+pub(crate) fn compat_exported(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for word in split_words(name) {
         let lower = word.to_ascii_lowercase();
@@ -1343,6 +1351,122 @@ return nil, err
 return bytes.NewReader(buf.Bytes()), nil
 }
 
+func compatSetBodyField(body any, key string, value any) any {
+switch typed := body.(type) {
+case nil:
+next := map[string]any{}
+next[key] = value
+return next
+case map[string]any:
+typed[key] = value
+return typed
+case map[string]string:
+typed[key] = compatQueryValue(value)
+return typed
+case url.Values:
+compatSetQueryValue(typed, key, value)
+return typed
+default:
+next := map[string]any{}
+next[key] = value
+return next
+}
+}
+
+func compatEncodeFormBody(v any) (*bytes.Reader, error) {
+values := url.Values{}
+if err := compatAddFormValues(values, v); err != nil {
+return nil, err
+}
+return bytes.NewReader([]byte(values.Encode())), nil
+}
+
+func compatAddFormValues(values url.Values, value any) error {
+if value == nil {
+return nil
+}
+switch typed := value.(type) {
+case url.Values:
+for key, items := range typed {
+for _, item := range items {
+values.Add(key, item)
+}
+}
+return nil
+case map[string]any:
+for key, item := range typed {
+compatSetQueryValue(values, key, item)
+}
+return nil
+case map[string]string:
+for key, item := range typed {
+values.Set(key, item)
+}
+return nil
+}
+
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {
+if reflected.IsNil() {
+return nil
+}
+reflected = reflected.Elem()
+}
+switch reflected.Kind() {
+case reflect.Map:
+if reflected.Type().Key().Kind() != reflect.String {
+return fmt.Errorf(\"form body map keys must be strings\")
+}
+iter := reflected.MapRange()
+for iter.Next() {
+compatSetQueryValue(values, iter.Key().String(), iter.Value().Interface())
+}
+case reflect.Struct:
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {
+field := typ.Field(i)
+if field.PkgPath != \"\" {
+continue
+}
+name, omitempty := compatFormFieldName(field)
+if name == \"\" || name == \"-\" {
+continue
+}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {
+continue
+}
+compatSetQueryValue(values, name, fieldValue.Interface())
+}
+default:
+return fmt.Errorf(\"form body must be a map, url.Values, or struct\")
+}
+return nil
+}
+
+func compatFormFieldName(field reflect.StructField) (string, bool) {
+tag := field.Tag.Get(\"form\")
+if tag == \"\" {
+tag = field.Tag.Get(\"json\")
+}
+if tag == \"-\" {
+return \"-\", false
+}
+omitempty := false
+if tag != \"\" {
+parts := strings.Split(tag, \",\")
+for _, option := range parts[1:] {
+if option == \"omitempty\" {
+omitempty = true
+}
+}
+if parts[0] != \"\" {
+return parts[0], omitempty
+}
+}
+return field.Name, omitempty
+}
+
 func compatDefaultAuthHeader() string {
 return \"Authorization\"
 }
@@ -1627,6 +1751,122 @@ return nil, err
 return bytes.NewReader(buf.Bytes()), nil
 }}
 
+func compatSetBodyField(body any, key string, value any) any {{
+switch typed := body.(type) {{
+case nil:
+next := map[string]any{{}}
+next[key] = value
+return next
+case map[string]any:
+typed[key] = value
+return typed
+case map[string]string:
+typed[key] = compatQueryValue(value)
+return typed
+case url.Values:
+compatSetQueryValue(typed, key, value)
+return typed
+default:
+next := map[string]any{{}}
+next[key] = value
+return next
+}}
+}}
+
+func compatEncodeFormBody(v any) (*bytes.Reader, error) {{
+values := url.Values{{}}
+if err := compatAddFormValues(values, v); err != nil {{
+return nil, err
+}}
+return bytes.NewReader([]byte(values.Encode())), nil
+}}
+
+func compatAddFormValues(values url.Values, value any) error {{
+if value == nil {{
+return nil
+}}
+switch typed := value.(type) {{
+case url.Values:
+for key, items := range typed {{
+for _, item := range items {{
+values.Add(key, item)
+}}
+}}
+return nil
+case map[string]any:
+for key, item := range typed {{
+compatSetQueryValue(values, key, item)
+}}
+return nil
+case map[string]string:
+for key, item := range typed {{
+values.Set(key, item)
+}}
+return nil
+}}
+
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {{
+if reflected.IsNil() {{
+return nil
+}}
+reflected = reflected.Elem()
+}}
+switch reflected.Kind() {{
+case reflect.Map:
+if reflected.Type().Key().Kind() != reflect.String {{
+return fmt.Errorf(\"form body map keys must be strings\")
+}}
+iter := reflected.MapRange()
+for iter.Next() {{
+compatSetQueryValue(values, iter.Key().String(), iter.Value().Interface())
+}}
+case reflect.Struct:
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {{
+field := typ.Field(i)
+if field.PkgPath != \"\" {{
+continue
+}}
+name, omitempty := compatFormFieldName(field)
+if name == \"\" || name == \"-\" {{
+continue
+}}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {{
+continue
+}}
+compatSetQueryValue(values, name, fieldValue.Interface())
+}}
+default:
+return fmt.Errorf(\"form body must be a map, url.Values, or struct\")
+}}
+return nil
+}}
+
+func compatFormFieldName(field reflect.StructField) (string, bool) {{
+tag := field.Tag.Get(\"form\")
+if tag == \"\" {{
+tag = field.Tag.Get(\"json\")
+}}
+if tag == \"-\" {{
+return \"-\", false
+}}
+omitempty := false
+if tag != \"\" {{
+parts := strings.Split(tag, \",\")
+for _, option := range parts[1:] {{
+if option == \"omitempty\" {{
+omitempty = true
+}}
+}}
+if parts[0] != \"\" {{
+return parts[0], omitempty
+}}
+}}
+return field.Name, omitempty
+}}
+
 func compatDefaultAuthHeader() string {{
 return {}
 }}
@@ -1852,14 +2092,32 @@ fn emit_compat_request(
         .as_deref()
         .is_some_and(|content_type| content_type.eq_ignore_ascii_case("multipart/form-data"))
         && !multipart_fields.is_empty();
+    let has_form_body = op
+        .request_body_content_type
+        .as_deref()
+        .is_some_and(|content_type| {
+            content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+        && body_model.is_some()
+        && !has_multipart_body;
     let file_field = multipart_fields.iter().find(|field| field.is_file);
-    let has_json_body = body_model.is_some() && !has_multipart_body;
-    let body_field_query_setters = if has_multipart_body {
-        Vec::new()
+    let has_json_body = body_model.is_some() && !has_multipart_body && !has_form_body;
+    let body_encoding = if has_multipart_body {
+        CompatRequestBodyEncoding::Multipart
+    } else if has_form_body {
+        CompatRequestBodyEncoding::FormUrlEncoded
+    } else if has_json_body {
+        CompatRequestBodyEncoding::Json
     } else {
-        compat_body_field_query_setters(body_model.as_ref().map(|body| body.model.as_str()), graph)
+        CompatRequestBodyEncoding::None
     };
-    let body_setters = if has_json_body {
+    let has_body_value = has_json_body || has_form_body;
+    let body_field_setters = if has_body_value {
+        compat_body_field_setters(body_model.as_ref().map(|body| body.model.as_str()), graph)
+    } else {
+        Vec::new()
+    };
+    let body_setters = if has_body_value {
         compat_body_setters(
             body_model.as_ref().map(|body| body.model.as_str()),
             &service,
@@ -1867,10 +2125,19 @@ fn emit_compat_request(
     } else {
         Vec::new()
     };
+    let has_selective_any_query_param = query_params.iter().any(|param| {
+        compat_method_names(&compat_exported(&param.name))
+            .iter()
+            .any(|setter| {
+                options
+                    .sdk
+                    .query_setter_argument_policy
+                    .is_any_for(&request_name, setter)
+            })
+    });
     let has_extra_query = !global_query_setters.is_empty()
-        || !body_field_query_setters.is_empty()
         || has_multipart_body
-        || options.sdk.query_setter_argument_policy.is_any() && !query_params.is_empty()
+        || has_selective_any_query_param
         || !options
             .sdk
             .request_builder_aliases
@@ -1901,7 +2168,7 @@ fn emit_compat_request(
         )
         .map_err(sink)?;
     }
-    if has_json_body {
+    if has_body_value {
         writeln!(body, "body any").map_err(sink)?;
     }
     if file_field.is_some() {
@@ -1916,13 +2183,29 @@ fn emit_compat_request(
     writeln!(body, "}}").map_err(sink)?;
 
     let mut emitted_methods = BTreeSet::new();
+    for setter in options
+        .sdk
+        .request_builder_aliases
+        .body_aliases_for(&request_name)
+    {
+        for setter in compat_method_names(&setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_body_setter(body, &request_name, &setter)?;
+        }
+    }
     for param in &query_params {
         let setter = compat_exported(&param.name);
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            if options.sdk.query_setter_argument_policy.is_any() {
+            if options
+                .sdk
+                .query_setter_argument_policy
+                .is_any_for(&request_name, &setter)
+            {
                 emit_compat_extra_query_setter(body, &request_name, &setter, &param.name, "any")?;
             } else {
                 emit_compat_query_setter(
@@ -1955,12 +2238,12 @@ fn emit_compat_request(
             emit_compat_extra_query_setter(body, &request_name, &setter, query_name, "any")?;
         }
     }
-    for (setter, query_name) in &body_field_query_setters {
+    for (setter, field_name) in &body_field_setters {
         for setter in compat_method_names(setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            emit_compat_extra_query_setter(body, &request_name, &setter, query_name, "any")?;
+            emit_compat_body_field_setter(body, &request_name, &setter, field_name)?;
         }
     }
     for field in &multipart_fields {
@@ -1989,13 +2272,7 @@ fn emit_compat_request(
             emit_compat_file_setter(body, &request_name, &setter, &compat_arg_name(&setter))?;
         }
     }
-    for setter in options
-        .sdk
-        .request_builder_aliases
-        .body_aliases_for(&request_name)
-        .into_iter()
-        .chain(body_setters)
-    {
+    for setter in body_setters {
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
@@ -2048,10 +2325,10 @@ fn emit_compat_request(
         graph,
         base_path,
         body_model.as_ref().map(|body| body.required),
-        has_multipart_body,
+        body_encoding,
         file_field.map(|field| field.wire_name.as_str()),
         has_extra_header,
-        has_extra_query && !has_multipart_body,
+        has_extra_query && body_encoding != CompatRequestBodyEncoding::Multipart,
         &return_model,
         &path_params,
         &query_params,
@@ -2158,6 +2435,30 @@ fn emit_compat_body_setter(
     Ok(())
 }
 
+fn emit_compat_body_field_setter(
+    body: &mut String,
+    request_name: &str,
+    setter: &str,
+    field_name: &str,
+) -> Result<(), CoreError> {
+    let arg = compat_arg_name(setter);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "func (r {request_name}) {setter}({arg} any) {request_name} {{"
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "r.body = compatSetBodyField(r.body, {}, {arg})",
+        quoted_string_literal(field_name)
+    )
+    .map_err(sink)?;
+    writeln!(body, "return r").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
 fn compat_arg_name(name: &str) -> String {
     let mut candidate = lower_camel(name);
     if name.ends_with("Id") && candidate.ends_with("ID") {
@@ -2215,7 +2516,7 @@ fn emit_compat_execute_body(
     graph: &ApiGraph,
     base_path: &str,
     declared_body_required: Option<bool>,
-    has_multipart_body: bool,
+    body_encoding: CompatRequestBodyEncoding,
     multipart_file_field: Option<&str>,
     has_extra_header: bool,
     include_extra_query: bool,
@@ -2238,7 +2539,7 @@ fn emit_compat_execute_body(
     writeln!(body, "var reqBody *bytes.Reader").map_err(sink)?;
     writeln!(body, "var reqContentType string").map_err(sink)?;
     writeln!(body, "var err error").map_err(sink)?;
-    if has_multipart_body {
+    if body_encoding == CompatRequestBodyEncoding::Multipart {
         let file_field = multipart_file_field.unwrap_or("file");
         let file_arg = if multipart_file_field.is_some() {
             "r.file"
@@ -2255,6 +2556,40 @@ fn emit_compat_execute_body(
         write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
         writeln!(body, "}}").map_err(sink)?;
         writeln!(body, "reqContentType = contentType").map_err(sink)?;
+    } else if body_encoding == CompatRequestBodyEncoding::FormUrlEncoded
+        && matches!(declared_body_required, Some(true))
+    {
+        writeln!(body, "bodyValue := r.body").map_err(sink)?;
+        writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
+        writeln!(body, "bodyValue = map[string]any{{}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "encodedBody, err := compatEncodeFormBody(bodyValue)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(
+            body,
+            "reqContentType = \"application/x-www-form-urlencoded\""
+        )
+        .map_err(sink)?;
+    } else if body_encoding == CompatRequestBodyEncoding::FormUrlEncoded
+        && declared_body_required.is_some()
+    {
+        writeln!(body, "if r.body != nil {{").map_err(sink)?;
+        writeln!(body, "encodedBody, err := compatEncodeFormBody(r.body)").map_err(sink)?;
+        writeln!(body, "if err != nil {{").map_err(sink)?;
+        write_compat_return(body, returns_value, "localVarReturnValue", "nil", "err")?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "reqBody = encodedBody").map_err(sink)?;
+        writeln!(
+            body,
+            "reqContentType = \"application/x-www-form-urlencoded\""
+        )
+        .map_err(sink)?;
+        writeln!(body, "}} else {{").map_err(sink)?;
+        writeln!(body, "reqBody = bytes.NewReader(nil)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
     } else if matches!(declared_body_required, Some(true)) {
         writeln!(body, "bodyValue := r.body").map_err(sink)?;
         writeln!(body, "if bodyValue == nil {{").map_err(sink)?;
@@ -2589,7 +2924,7 @@ fn compat_query_schema(schema: &Schema) -> bool {
         || name.contains("upload")
 }
 
-fn compat_body_field_query_setters(model: Option<&str>, graph: &ApiGraph) -> Vec<(String, String)> {
+fn compat_body_field_setters(model: Option<&str>, graph: &ApiGraph) -> Vec<(String, String)> {
     let Some(model) = model else {
         return Vec::new();
     };

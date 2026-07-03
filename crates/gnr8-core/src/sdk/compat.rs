@@ -1040,6 +1040,168 @@ fn normalize_go_signature(line: &str) -> String {
         .split_once('{')
         .map_or(line, |(signature, _)| signature)
         .trim();
+    normalize_go_func_signature(signature)
+        .unwrap_or_else(|| collapse_go_signature_whitespace(signature))
+}
+
+fn normalize_go_func_signature(signature: &str) -> Option<String> {
+    let rest = signature.strip_prefix("func ")?;
+    if rest.starts_with('(') {
+        let (receiver, after_receiver) = take_go_parenthesized(rest)?;
+        let receiver = normalize_go_param_list(receiver);
+        let after_receiver = after_receiver.trim_start();
+        let method = ident_prefix(after_receiver)?;
+        let after_method = after_receiver[method.len()..].trim_start();
+        let (params, after_params) = take_go_parenthesized(after_method)?;
+        let params = normalize_go_param_list(params);
+        let results = normalize_go_results(after_params.trim());
+        return Some(format!("func ({receiver}) {method}({params}){results}"));
+    }
+
+    let name = ident_prefix(rest)?;
+    let after_name = rest[name.len()..].trim_start();
+    let (params, after_params) = take_go_parenthesized(after_name)?;
+    let params = normalize_go_param_list(params);
+    let results = normalize_go_results(after_params.trim());
+    Some(format!("func {name}({params}){results}"))
+}
+
+fn normalize_go_results(results: &str) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+    if let Some((list, rest)) = take_go_parenthesized(results) {
+        let normalized = normalize_go_param_list(list);
+        let suffix = collapse_go_signature_whitespace(rest);
+        if !normalized.contains(',') && suffix.is_empty() {
+            return format!(" {normalized}");
+        }
+        if suffix.is_empty() {
+            format!(" ({normalized})")
+        } else {
+            format!(" ({normalized}) {suffix}")
+        }
+    } else {
+        format!(" {}", collapse_go_signature_whitespace(results))
+    }
+}
+
+fn take_go_parenthesized(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    if !value.starts_with('(') {
+        return None;
+    }
+    let end = matching_go_delimiter(value, 0, '(', ')')?;
+    Some((&value[1..end], &value[end + 1..]))
+}
+
+fn matching_go_delimiter(value: &str, open_at: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in value
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_at)
+    {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_go_param_list(list: &str) -> String {
+    split_go_top_level_commas(list)
+        .into_iter()
+        .flat_map(normalize_go_param_decl)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn normalize_go_param_decl(decl: &str) -> Vec<String> {
+    let decl = collapse_go_signature_whitespace(decl);
+    if decl.is_empty() {
+        return Vec::new();
+    }
+    let Some((names, ty)) = split_go_decl_at_top_level_name_space(&decl) else {
+        return vec![decl];
+    };
+    if !is_go_identifier_list(names) {
+        return vec![decl];
+    }
+    let count = names
+        .split(',')
+        .filter(|name| !name.trim().is_empty())
+        .count();
+    std::iter::repeat_n(ty.to_string(), count).collect()
+}
+
+fn split_go_decl_at_top_level_name_space(value: &str) -> Option<(&str, &str)> {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut current_space_start: Option<usize> = None;
+
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+        let at_top = paren == 0 && bracket == 0 && brace == 0;
+        if at_top && ch.is_whitespace() {
+            current_space_start.get_or_insert(index);
+        } else if let Some(start) = current_space_start.take() {
+            let names = value[..start].trim();
+            let ty = value[index..].trim();
+            if !names.is_empty() && !ty.is_empty() && is_go_identifier_list(names) {
+                return Some((names, ty));
+            }
+        }
+    }
+    None
+}
+
+fn split_go_top_level_commas(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            ',' if paren == 0 && bracket == 0 && brace == 0 => {
+                out.push(value[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(value[start..].trim());
+    out
+}
+
+fn is_go_identifier_list(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .all(|part| !part.is_empty() && ident_prefix(part) == Some(part))
+}
+
+fn collapse_go_signature_whitespace(signature: &str) -> String {
     signature.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -1579,5 +1741,39 @@ mod tests {
             diff.package_metadata_changes,
             vec!["module: example.com/old -> example.com/new"]
         );
+    }
+
+    #[test]
+    fn go_diff_ignores_parameter_and_result_names() {
+        let old = temp_dir("go-old-param-names");
+        let new = temp_dir("go-new-param-names");
+        std::fs::write(old.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        std::fs::write(new.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        std::fs::write(
+            old.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\nfunc NewConfiguration(baseURL string, priceID any) (*Configuration, error) { return nil, nil }\nfunc (r ApiGetBookRequest) PriceId(priceID any) ApiGetBookRequest { return r }\nfunc (r ApiGetBookRequest) Execute() (value *Book, resp *http.Response, err error) { return nil, nil, nil }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\nfunc NewConfiguration(rawURL string, priceId any) (*Configuration, error) { return nil, nil }\nfunc (request ApiGetBookRequest) PriceId(priceId any) ApiGetBookRequest { return request }\nfunc (request ApiGetBookRequest) Execute() (*Book, *http.Response, error) { return nil, nil, nil }\n",
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert!(
+            diff.exported_function_signature_changes.is_empty(),
+            "parameter names should be ignored for functions: {:?}",
+            diff.exported_function_signature_changes
+        );
+        assert!(
+            diff.exported_method_signature_changes.is_empty(),
+            "parameter/result names should be ignored for methods: {:?}",
+            diff.exported_method_signature_changes
+        );
+        assert!(!diff.is_breaking(), "unexpected Go surface diff: {diff:?}");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
     }
 }
