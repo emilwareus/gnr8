@@ -79,9 +79,9 @@ impl Manifest {
     #[must_use]
     pub fn recorded_hash(&self, path: &str) -> Option<&str> {
         self.files
-            .iter()
-            .find(|entry| entry.path == path)
-            .map(|entry| entry.hash.as_str())
+            .binary_search_by(|entry| entry.path.as_str().cmp(path))
+            .ok()
+            .map(|idx| self.files[idx].hash.as_str())
     }
 
     /// Insert or update the record for `path` (hash + provenance), keeping `files` sorted by path.
@@ -89,24 +89,52 @@ impl Manifest {
     /// An existing entry for `path` is updated in place; a new entry is inserted and the vector is
     /// re-sorted so the manifest stays a deterministic, byte-stable diff.
     pub fn record(&mut self, path: &str, hash: &str, source: &str) {
-        if let Some(entry) = self.files.iter_mut().find(|entry| entry.path == path) {
-            entry.hash = hash.to_string();
-            entry.source = source.to_string();
-        } else {
-            self.files.push(ManifestEntry {
-                path: path.to_string(),
-                hash: hash.to_string(),
-                source: source.to_string(),
-            });
-            self.files.sort_by(|a, b| a.path.cmp(&b.path));
+        match self
+            .files
+            .binary_search_by(|entry| entry.path.as_str().cmp(path))
+        {
+            Ok(idx) => {
+                let entry = &mut self.files[idx];
+                entry.hash = hash.to_string();
+                entry.source = source.to_string();
+            }
+            Err(idx) => self.files.insert(
+                idx,
+                ManifestEntry {
+                    path: path.to_string(),
+                    hash: hash.to_string(),
+                    source: source.to_string(),
+                },
+            ),
         }
     }
 
     /// Drop every entry whose path is not in `current_paths` (D-04: deleting a file from config
     /// drops its manifest entry, so a stale recorded hash never protects a no-longer-generated file).
     pub fn prune_to(&mut self, current_paths: &[String]) {
+        let keep: std::collections::HashSet<&str> =
+            current_paths.iter().map(String::as_str).collect();
         self.files
-            .retain(|entry| current_paths.iter().any(|p| p == &entry.path));
+            .retain(|entry| keep.contains(entry.path.as_str()));
+    }
+
+    fn normalized_files(mut files: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            files: Self::normalized_files(self.files),
+        }
+    }
+
+    fn empty_current() -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            files: Vec::new(),
+        }
     }
 
     /// Persist the manifest to `<gnr8_dir>/cache/manifest.json`, creating `cache/` if needed.
@@ -129,11 +157,9 @@ impl Manifest {
         })?;
 
         // Serialize a normalized view: current version + path-sorted entries (deterministic diff).
-        let mut files = self.files.clone();
-        files.sort_by(|a, b| a.path.cmp(&b.path));
         let normalized = Manifest {
             version: MANIFEST_VERSION,
-            files,
+            files: Self::normalized_files(self.files.clone()),
         };
         let json = serde_json::to_string_pretty(&normalized).map_err(|err| {
             crate::CoreError::Manifest {
@@ -164,18 +190,12 @@ pub fn load(gnr8_dir: &Path) -> Result<Manifest, crate::CoreError> {
     match std::fs::read(&path) {
         Ok(bytes) => {
             // Corrupt/unparseable cache ⇒ regenerate-from-scratch (empty default), never an error.
-            let manifest =
-                serde_json::from_slice::<Manifest>(&bytes).unwrap_or_else(|_| Manifest {
-                    version: MANIFEST_VERSION,
-                    files: Vec::new(),
-                });
-            Ok(manifest)
+            let manifest = serde_json::from_slice::<Manifest>(&bytes)
+                .unwrap_or_else(|_| Manifest::empty_current());
+            Ok(manifest.normalized())
         }
         // Absent ⇒ graceful empty default (first run).
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Manifest {
-            version: MANIFEST_VERSION,
-            files: Vec::new(),
-        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::empty_current()),
         // A real I/O error (permission denied, etc.) is a typed error, not a silent empty.
         Err(err) => Err(crate::CoreError::Manifest {
             message: format!("failed to read {}: {err}", path.display()),
