@@ -27,6 +27,7 @@ import (
 	"go/ast"
 	"go/token"
 	gotypes "go/types"
+	"strconv"
 	"strings"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -54,13 +55,15 @@ var httpMethods = map[string]bool{
 // recognition, NOT an inferred security requirement: generated API security still
 // comes from the user's gnr8 config (CLAUDE.md rule 4).
 type Route struct {
-	Method     string           // "POST"
-	Path       string           // group-relative, normalized: "/", "/list", "/{uuid}"
-	Handler    string           // selector name of the handler arg, e.g. "createGoal"
-	Group      string           // deepest static route group segment, e.g. "books"
-	Middleware []string         // source middleware symbols applied before the handler
-	Secured    bool             // route/group carried middleware
-	Span       facts.SourceSpan // provenance of the METHOD registration call
+	Method          string           // "POST"
+	Path            string           // group-relative, normalized: "/", "/list", "/{uuid}"
+	Handler         string           // selector name of the handler arg, e.g. "createGoal"
+	HandlerKey      string           // resolved *types.Func key, e.g. "example.com/m/pkg@123"
+	HandlerIdentity string           // human-readable package/receiver/name/file identity
+	Group           string           // deepest static route group segment, e.g. "books"
+	Middleware      []string         // source middleware symbols applied before the handler
+	Secured         bool             // route/group carried middleware
+	Span            facts.SourceSpan // provenance of the METHOD registration call
 }
 
 // Recognize walks every target package's syntax and returns the recognized routes
@@ -176,6 +179,7 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 			}
 			return true
 		}
+		handlerFn := HandlerFunc(info, call.Args[len(call.Args)-1])
 
 		prefix := receiverPrefix(info, groups, call)
 		middleware := receiverMiddleware(info, groups, call)
@@ -193,13 +197,15 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		}
 
 		out = append(out, Route{
-			Method:     name,
-			Path:       joinPaths(prefix, normalizePath(pathLit)),
-			Handler:    handler,
-			Group:      groupNameFromPrefix(prefix),
-			Middleware: middleware,
-			Secured:    secured,
-			Span:       spanOf(fset, call.Pos(), call.End()),
+			Method:          name,
+			Path:            joinPaths(prefix, normalizePath(pathLit)),
+			Handler:         handler,
+			HandlerKey:      FuncObjectKey(handlerFn),
+			HandlerIdentity: FuncIdentity(handlerFn, fset),
+			Group:           groupNameFromPrefix(prefix),
+			Middleware:      middleware,
+			Secured:         secured,
+			Span:            spanOf(fset, call.Pos(), call.End()),
 		})
 		return true
 	})
@@ -509,6 +515,71 @@ func handlerSymbol(arg ast.Expr) string {
 	return ""
 }
 
+// HandlerFunc resolves a Gin route handler expression to its semantic function
+// object. The returned identity is the analyzer hand-off; Handler remains only
+// the SDK-facing symbol.
+func HandlerFunc(info *gotypes.Info, arg ast.Expr) *gotypes.Func {
+	if info == nil || arg == nil {
+		return nil
+	}
+	switch e := arg.(type) {
+	case *ast.Ident:
+		fn, _ := info.ObjectOf(e).(*gotypes.Func)
+		return fn
+	case *ast.SelectorExpr:
+		if sel := info.Selections[e]; sel != nil {
+			fn, _ := sel.Obj().(*gotypes.Func)
+			return fn
+		}
+		fn, _ := info.ObjectOf(e.Sel).(*gotypes.Func)
+		return fn
+	default:
+		return nil
+	}
+}
+
+// FuncObjectKey is the stable semantic key shared by route recognition and
+// handler analysis. go/types object positions are identifier positions, matching
+// TypesInfo.Defs for FuncDecl.Name.
+func FuncObjectKey(fn *gotypes.Func) string {
+	if fn == nil || fn.Pkg() == nil || !fn.Pos().IsValid() {
+		return ""
+	}
+	return fn.Pkg().Path() + "@" + strconv.FormatInt(int64(fn.Pos()), 10)
+}
+
+// FuncIdentity renders a human-readable semantic identity for diagnostics and
+// debugging. It is not part of the JSON facts contract.
+func FuncIdentity(fn *gotypes.Func, fset *token.FileSet) string {
+	if fn == nil {
+		return ""
+	}
+	pkgPath := ""
+	if fn.Pkg() != nil {
+		pkgPath = fn.Pkg().Path()
+	}
+	recv := ""
+	if sig, ok := gotypes.Unalias(fn.Type()).(*gotypes.Signature); ok && sig.Recv() != nil {
+		recv = receiverTypeName(sig.Recv().Type())
+	}
+	file, line := positionOf(fset, fn.Pos())
+	if recv == "" {
+		return pkgPath + "." + fn.Name() + "@" + file + ":" + strconv.FormatUint(uint64(line), 10)
+	}
+	return pkgPath + "." + recv + "." + fn.Name() + "@" + file + ":" + strconv.FormatUint(uint64(line), 10)
+}
+
+func receiverTypeName(t gotypes.Type) string {
+	if ptr, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = ptr.Elem()
+	}
+	named, ok := gotypes.Unalias(t).(*gotypes.Named)
+	if !ok || named.Obj() == nil {
+		return ""
+	}
+	return named.Obj().Name()
+}
+
 func middlewareSymbols(info *gotypes.Info, args []ast.Expr) []string {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -629,4 +700,12 @@ func spanOf(fset *token.FileSet, start, end token.Pos) facts.SourceSpan {
 		StartLine: uint32(sp.Line),
 		EndLine:   uint32(ep.Line),
 	}
+}
+
+func positionOf(fset *token.FileSet, pos token.Pos) (string, uint32) {
+	if fset == nil || !pos.IsValid() {
+		return "", 0
+	}
+	p := fset.Position(pos)
+	return p.Filename, uint32(p.Line)
 }

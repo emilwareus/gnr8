@@ -272,13 +272,14 @@ pub(crate) fn build_graph_for_lang(
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
 
-/// Build a Go graph from `fixture_dir`, optionally scoped to Go package patterns.
-pub(crate) fn build_go_graph_with_patterns(
+/// Build a Go graph from `fixture_dir`, with separate route and schema package scopes.
+pub(crate) fn build_go_graph_with_package_scopes(
     fixture_dir: &str,
-    patterns: &[String],
+    route_patterns: &[String],
+    schema_patterns: &[String],
 ) -> Result<crate::graph::ApiGraph, crate::CoreError> {
     let target = helper::resolve_target(fixture_dir);
-    let facts = helper::run_goextract_patterns(&target, patterns)?;
+    let facts = helper::run_goextract_package_scopes(&target, route_patterns, schema_patterns)?;
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
 

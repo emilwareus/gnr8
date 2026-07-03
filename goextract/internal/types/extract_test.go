@@ -264,6 +264,52 @@ type FileRef struct {
 	}
 }
 
+func TestRawMessageSwaggerTypeArrayObject(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/rawmessagefixture\n\ngo 1.22\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package rawmessagefixture
+
+import "encoding/json"
+
+type Event struct {
+	Changes json.RawMessage `+"`json:\"changes\" swaggertype:\"array,object\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load rawmessage fixture: %v", err)
+	}
+	diags := diag.New()
+	schemas := types.Extract(res, diags)
+	event, ok := schemaByName(schemas, "Event")
+	if !ok {
+		t.Fatalf("Event schema not found: %+v", schemas)
+	}
+	field, ok := fieldByJSON(event, "changes")
+	if !ok {
+		t.Fatalf("changes field not found: %+v", event)
+	}
+	if field.Schema.Type != facts.TypeArray {
+		t.Fatalf("RawMessage swaggertype array,object should become array, got %+v", field.Schema)
+	}
+	elem, ok := field.Schema.Of.(*facts.Type)
+	if !ok || elem == nil || elem.Type != facts.TypeAny {
+		t.Fatalf("RawMessage array element should be free-form Any, got %+v", field.Schema.Of)
+	}
+}
+
 func TestFormDTOAndMultipartFileMetadata(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(

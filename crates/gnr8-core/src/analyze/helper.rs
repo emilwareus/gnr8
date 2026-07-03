@@ -89,15 +89,16 @@ pub(crate) fn resolve_target(target_dir: &str) -> String {
 /// - [`CoreError::HelperExit`] if the helper exits non-zero (carries stderr).
 /// - [`CoreError::FactsParse`] if stdout is not the expected JSON facts document.
 pub(crate) fn run_goextract(target_dir: &str) -> Result<facts::GoFacts, CoreError> {
-    run_goextract_with("go", target_dir, &[])
+    run_goextract_with("go", target_dir, &[], &[])
 }
 
-/// Run the `goextract` helper against `target_dir`, scoped to `patterns` when provided.
-pub(crate) fn run_goextract_patterns(
+/// Run the `goextract` helper against `target_dir`, with separate route and schema scopes.
+pub(crate) fn run_goextract_package_scopes(
     target_dir: &str,
-    patterns: &[String],
+    route_patterns: &[String],
+    schema_patterns: &[String],
 ) -> Result<facts::GoFacts, CoreError> {
-    run_goextract_with("go", target_dir, patterns)
+    run_goextract_with("go", target_dir, route_patterns, schema_patterns)
 }
 
 /// Inner driver parameterized on the Go binary name so tests can force a missing
@@ -105,7 +106,8 @@ pub(crate) fn run_goextract_patterns(
 fn run_goextract_with(
     go_bin: &str,
     target_dir: &str,
-    patterns: &[String],
+    route_patterns: &[String],
+    schema_patterns: &[String],
 ) -> Result<facts::GoFacts, CoreError> {
     let mut cmd = if go_bin == "go" {
         Command::new(goextract_binary(go_bin)?)
@@ -117,7 +119,18 @@ fn run_goextract_with(
         cmd
     };
     let dir = checked_sidecar_dir("goextract", goextract_dir())?;
-    cmd.arg(target_dir).args(patterns).current_dir(dir);
+    cmd.arg(target_dir);
+    if route_patterns == schema_patterns {
+        cmd.args(route_patterns);
+    } else {
+        for pattern in route_patterns {
+            cmd.args(["--route-package", pattern]);
+        }
+        for pattern in schema_patterns {
+            cmd.args(["--schema-package", pattern]);
+        }
+    }
+    cmd.current_dir(dir);
     let output = cmd
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
@@ -481,8 +494,12 @@ mod tests {
         fn returns_go_toolchain_missing_when_binary_absent() {
             // A binary name that cannot exist on PATH forces the spawn to fail with
             // an io::Error -> GoToolchainMissing, NOT a panic (GO-06).
-            let result =
-                run_goextract_with("gnr8-nonexistent-go-binary-xyz", "/some/target/dir", &[]);
+            let result = run_goextract_with(
+                "gnr8-nonexistent-go-binary-xyz",
+                "/some/target/dir",
+                &[],
+                &[],
+            );
             let err = result.unwrap_err();
             assert!(
                 matches!(err, CoreError::GoToolchainMissing { .. }),

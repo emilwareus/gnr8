@@ -27,7 +27,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
 
-	if err := run(dir, nil, tmp); err != nil {
+	if err := run(dir, packageScopes{}, tmp); err != nil {
 		t.Fatalf("run goextract: %v", err)
 	}
 	if _, err := tmp.Seek(0, 0); err != nil {

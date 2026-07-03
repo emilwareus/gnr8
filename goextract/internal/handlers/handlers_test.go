@@ -620,6 +620,573 @@ func (s Server) export(c *gin.Context) {
 	}
 }
 
+func TestRouteHandlerIdentityDisambiguatesSameNamedMethods(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/identityhandlers
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	for _, pkg := range []string{"a", "b"} {
+		if err := os.MkdirAll(filepath.Join(dir, "internal", pkg, "ports"), 0o755); err != nil {
+			t.Fatalf("mkdir package %s: %v", pkg, err)
+		}
+		typePrefix := strings.ToUpper(pkg)
+		mustWrite(t, filepath.Join(dir, "internal", pkg, "ports", "handlers.go"), `package ports
+
+import "github.com/gin-gonic/gin"
+
+type Server struct {
+	R *gin.Engine
+	H Handler
+}
+
+type Handler struct{}
+type `+typePrefix+`Request struct { Name string `+"`json:\"name\"`"+` }
+type `+typePrefix+`Response struct { ID string `+"`json:\"id\"`"+` }
+
+func (s Server) Register() {
+	s.R.POST("/`+pkg+`", s.H.Handle)
+}
+
+func (Handler) Handle(c *gin.Context) {
+	var input `+typePrefix+`Request
+	_ = c.ShouldBindJSON(&input)
+	c.JSON(200, `+typePrefix+`Response{})
+}
+`)
+	}
+
+	res, err := load.Load(dir, "./internal/.../ports")
+	if err != nil {
+		t.Fatalf("load identity handlers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/identityhandlers", diags)
+	recognized := routes.Recognize(res)
+	analyzer.ReportRouteHandlerCollisions(recognized, diags)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range recognized {
+		if r.HandlerKey == "" {
+			t.Fatalf("recognized route %s %s should carry handler identity: %+v", r.Method, r.Path, r)
+		}
+		got[r.Path] = analyzer.Analyze(r, diags)
+	}
+	for _, item := range diags.Items() {
+		if strings.Contains(item.Message, "duplicate handler name 'Handle'") {
+			t.Fatalf("resolved route identities should not warn about bare-name Handle collisions: %+v", diags.Items())
+		}
+	}
+	assertBodySuffix(t, got["/a"].RequestBody, "internal/a/ports.ARequest")
+	assertResponseSuffix(t, got["/a"].Responses, 200, "internal/a/ports.AResponse")
+	assertBodySuffix(t, got["/b"].RequestBody, "internal/b/ports.BRequest")
+	assertResponseSuffix(t, got["/b"].Responses, 200, "internal/b/ports.BResponse")
+	if got["/a"].RequestBodyContentType != "application/json" || got["/b"].RequestBodyContentType != "application/json" {
+		t.Fatalf("ShouldBindJSON routes should infer application/json content types: a=%q b=%q", got["/a"].RequestBodyContentType, got["/b"].RequestBodyContentType)
+	}
+}
+
+func TestSamePackageQueryHelpersInferTypeAndRequiredness(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/queryhelpers
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v0.0.0
+	github.com/google/uuid v0.0.0
+)
+
+replace github.com/gin-gonic/gin => ./ginstub
+replace github.com/google/uuid => ./uuidstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "uuidstub"), 0o755); err != nil {
+		t.Fatalf("mkdir uuidstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Query(string) string { return "" }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "uuidstub", "go.mod"), "module github.com/google/uuid\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "uuidstub", "uuid.go"), `package uuid
+
+type UUID [16]byte
+
+var Nil UUID
+
+func Parse(string) (UUID, error) { return UUID{}, nil }
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package queryhelpers
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type Server struct{ R *gin.Engine }
+type Result struct { OK bool `+"`json:\"ok\"`"+` }
+
+func (s Server) Register() {
+	s.R.GET("/search", s.search)
+}
+
+func (s Server) search(c *gin.Context) {
+	branchID, _ := optionalQueryUUID(c, "branchId", uuid.Nil)
+	orgID, _ := requiredQueryUUID(c, "orgId")
+	_, _ = branchID, orgID
+	c.JSON(200, Result{})
+}
+
+func optionalQueryUUID(c *gin.Context, key string, fallback uuid.UUID) (uuid.UUID, error) {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	return uuid.Parse(raw)
+}
+
+func requiredQueryUUID(c *gin.Context, key string) (uuid.UUID, error) {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return uuid.UUID{}, errors.New("missing")
+	}
+	return uuid.Parse(raw)
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load query helpers: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/queryhelpers", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	branch, ok := paramByName(cf.Params, "branchId")
+	if !ok || branch.Required || branch.Schema.Type != facts.TypeWellKnown || branch.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("branchId should be optional uuid query param, got %+v", branch)
+	}
+	org, ok := paramByName(cf.Params, "orgId")
+	if !ok || !org.Required || org.Schema.Type != facts.TypeWellKnown || org.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("orgId should be required uuid query param, got %+v", org)
+	}
+}
+
+func TestGenericJSONBodyHelperInfersRequestBody(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/genericbody
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package genericbody
+
+import "github.com/gin-gonic/gin"
+
+type Server struct{ R *gin.Engine }
+type CreateRequest struct { Name string `+"`json:\"name\"`"+` }
+type CreateResponse struct { ID string `+"`json:\"id\"`"+` }
+
+func (s Server) Register() {
+	s.R.POST("/create", s.create)
+}
+
+func (s Server) create(c *gin.Context) {
+	input, err := parseRequest[CreateRequest](c)
+	_, _ = input, err
+	c.JSON(200, CreateResponse{})
+}
+
+func parseRequest[T any](c *gin.Context) (T, error) {
+	var input T
+	if err := c.ShouldBindJSON(&input); err != nil {
+		return input, err
+	}
+	return input, nil
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load generic body: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/genericbody", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	assertBodySuffix(t, cf.RequestBody, "CreateRequest")
+	if cf.RequestBodyContentType != "application/json" {
+		t.Fatalf("generic JSON helper content type: want application/json got %q", cf.RequestBodyContentType)
+	}
+}
+
+func TestGenericJSONBodyHelperRequiresTypeParamBind(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/genericbodyguard
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package genericbodyguard
+
+import "github.com/gin-gonic/gin"
+
+type Server struct{ R *gin.Engine }
+type Envelope struct { Token string `+"`json:\"token\"`"+` }
+type CreateRequest struct { Name string `+"`json:\"name\"`"+` }
+type CreateResponse struct { ID string `+"`json:\"id\"`"+` }
+
+func (s Server) Register() {
+	s.R.POST("/create", s.create)
+}
+
+func (s Server) create(c *gin.Context) {
+	input, err := parseEnvelope[CreateRequest](c)
+	_, _ = input, err
+	c.JSON(200, CreateResponse{})
+}
+
+func parseEnvelope[T any](c *gin.Context) (T, error) {
+	var zero T
+	var envelope Envelope
+	if err := c.ShouldBindJSON(&envelope); err != nil {
+		return zero, err
+	}
+	return zero, nil
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load generic body guard: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/genericbodyguard", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	if cf.RequestBody != nil || cf.RequestBodyContentType != "" {
+		t.Fatalf("generic helper binding a concrete envelope should not infer CreateRequest body, got body=%+v content_type=%q", cf.RequestBody, cf.RequestBodyContentType)
+	}
+}
+
+func TestGetRawDataWithJSONUsageSynthesizesFreeFormJSONBody(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/rawjsonbody
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) GetRawData() ([]byte, error) { return nil, nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package rawjsonbody
+
+import (
+	"encoding/json"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+type Result struct { OK bool `+"`json:\"ok\"`"+` }
+
+func (s Server) Register() {
+	s.R.POST("/ingest", s.ingest)
+}
+
+func (s Server) ingest(c *gin.Context) {
+	raw, _ := c.GetRawData()
+	var payload map[string]any
+	_ = json.Unmarshal(raw, &payload)
+	c.JSON(200, Result{})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load raw json body: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/rawjsonbody", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	if cf.RequestBody == nil || cf.RequestBody.RefID != "__synthetic.IngestRawJSONRequest" {
+		t.Fatalf("raw JSON body should synthesize free-form request schema, got %+v", cf.RequestBody)
+	}
+	if cf.RequestBodyContentType != "application/json" {
+		t.Fatalf("raw JSON body content type: want application/json got %q", cf.RequestBodyContentType)
+	}
+	if len(cf.Schemas) != 1 || cf.Schemas[0].Body.Type != facts.TypeAny {
+		t.Fatalf("raw JSON body schema should be Any, got %+v", cf.Schemas)
+	}
+}
+
+func TestGetRawDataIgnoresUnrelatedJSONStringEvidence(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/rawjsonbodyguard
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) GetRawData() ([]byte, error) { return nil, nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package rawjsonbodyguard
+
+import (
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+type Result struct { OK bool `+"`json:\"ok\"`"+` }
+
+func (s Server) Register() {
+	s.R.POST("/ingest", s.ingest)
+}
+
+func (s Server) ingest(c *gin.Context) {
+	raw, _ := c.GetRawData()
+	_ = raw
+	_ = strings.Contains("application/json", "json")
+	c.JSON(200, Result{})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load raw json body guard: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/rawjsonbodyguard", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	if cf.RequestBody != nil || cf.RequestBodyContentType != "" || len(cf.Schemas) != 0 {
+		t.Fatalf("unrelated JSON string evidence should not synthesize raw JSON body, got body=%+v content_type=%q schemas=%+v", cf.RequestBody, cf.RequestBodyContentType, cf.Schemas)
+	}
+}
+
+func TestTypedSuccessResponseOutranksErrorishSameStatusBranch(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/successresponse
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package successresponse
+
+import "github.com/gin-gonic/gin"
+
+var fail bool
+
+type Server struct{ R *gin.Engine }
+type ErrorResponse struct { Message string `+"`json:\"message\"`"+` }
+type SuccessResponse struct { ID string `+"`json:\"id\"`"+` }
+
+func (s Server) Register() {
+	s.R.GET("/thing", s.getThing)
+}
+
+func (s Server) getThing(c *gin.Context) {
+	if fail {
+		c.JSON(200, ErrorResponse{})
+		return
+	}
+	c.JSON(200, SuccessResponse{})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load success response: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/successresponse", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	assertResponseSuffix(t, cf.Responses, 200, "SuccessResponse")
+}
+
+func TestSyntheticSuccessResponseOutranksErrorishSameStatusBranch(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/syntheticsuccessresponse
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type H map[string]any
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package syntheticsuccessresponse
+
+import "github.com/gin-gonic/gin"
+
+var fail bool
+
+type Server struct{ R *gin.Engine }
+type ErrorResponse struct { Message string `+"`json:\"message\"`"+` }
+
+func (s Server) Register() {
+	s.R.GET("/thing", s.getThing)
+}
+
+func (s Server) getThing(c *gin.Context) {
+	if fail {
+		c.JSON(200, ErrorResponse{})
+		return
+	}
+	c.JSON(200, gin.H{"id": "ok"})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load synthetic success response: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/syntheticsuccessresponse", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	assertResponseSuffix(t, cf.Responses, 200, "GetThing200Response")
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {
@@ -687,6 +1254,27 @@ func primName(ty facts.Type) string {
 		return p.Prim
 	}
 	return ""
+}
+
+func assertBodySuffix(t *testing.T, body *facts.TypeRef, suffix string) {
+	t.Helper()
+	if body == nil || !strings.HasSuffix(body.RefID, suffix) {
+		t.Fatalf("want body ref suffix %q, got %+v", suffix, body)
+	}
+}
+
+func assertResponseSuffix(t *testing.T, responses []facts.ResponseFact, status uint16, suffix string) {
+	t.Helper()
+	for _, response := range responses {
+		if response.Status != status {
+			continue
+		}
+		if response.Body == nil || !strings.HasSuffix(response.Body.RefID, suffix) {
+			t.Fatalf("response %d: want body suffix %q, got %+v", status, suffix, response.Body)
+		}
+		return
+	}
+	t.Fatalf("missing response %d in %+v", status, responses)
 }
 
 func equalUint16(a, b []uint16) bool {

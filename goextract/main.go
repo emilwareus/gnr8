@@ -6,6 +6,7 @@
 // Usage:
 //
 //	goextract <target-dir> [package-pattern...]
+//	goextract <target-dir> --route-package <pattern> --schema-package <pattern>
 //
 // 02-01 extracts DTO struct/enum schemas + float64/free-form-map diagnostics.
 // Routes/handlers (02-02) and the Rust ApiGraph/inspect (02-03) build on this.
@@ -27,36 +28,92 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: goextract <target-dir>")
+		fmt.Fprintln(os.Stderr, "usage: goextract <target-dir> [package-pattern...] [--route-package <pattern> --schema-package <pattern>]")
 		os.Exit(1)
 	}
 	targetDir := os.Args[1]
-	patterns := os.Args[2:]
+	scopes, err := parseScopes(os.Args[2:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "goextract:", err)
+		os.Exit(1)
+	}
 
-	if err := run(targetDir, patterns, os.Stdout); err != nil {
+	if err := run(targetDir, scopes, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "goextract:", err)
 		os.Exit(1)
 	}
 }
 
+type packageScopes struct {
+	routePatterns  []string
+	schemaPatterns []string
+}
+
+func parseScopes(args []string) (packageScopes, error) {
+	var scopes packageScopes
+	var legacy []string
+	usedFlag := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--route-package":
+			usedFlag = true
+			i++
+			if i >= len(args) {
+				return scopes, fmt.Errorf("--route-package requires a pattern")
+			}
+			scopes.routePatterns = append(scopes.routePatterns, args[i])
+		case "--schema-package":
+			usedFlag = true
+			i++
+			if i >= len(args) {
+				return scopes, fmt.Errorf("--schema-package requires a pattern")
+			}
+			scopes.schemaPatterns = append(scopes.schemaPatterns, args[i])
+		default:
+			if strings.HasPrefix(args[i], "--") {
+				return scopes, fmt.Errorf("unknown argument %q", args[i])
+			}
+			legacy = append(legacy, args[i])
+		}
+	}
+	if usedFlag && len(legacy) > 0 {
+		return scopes, fmt.Errorf("package patterns must use either legacy positional args or --route-package/--schema-package flags, not both")
+	}
+	if !usedFlag {
+		scopes.routePatterns = legacy
+		scopes.schemaPatterns = legacy
+	}
+	return scopes, nil
+}
+
 // run loads the module, builds the facts document, and writes JSON to w. Any hard
 // loader failure is returned as an error; per-package load errors become
 // diagnostics (GO-06) so a partial graph is never silently emitted.
-func run(targetDir string, patterns []string, w *os.File) error {
-	res, err := load.Load(targetDir, patterns...)
+func run(targetDir string, scopes packageScopes, w *os.File) error {
+	routeRes, err := load.Load(targetDir, scopes.routePatterns...)
 	if err != nil {
 		return err
 	}
-
-	diags := diag.New()
-	for _, le := range res.Errors {
-		file, line := splitPos(le.Pos)
-		diags.Warn("go/packages load error: "+le.Msg, file, line)
+	schemaRes := routeRes
+	if !sameStrings(scopes.routePatterns, scopes.schemaPatterns) {
+		schemaRes, err = load.Load(targetDir, scopes.schemaPatterns...)
+		if err != nil {
+			return err
+		}
 	}
 
-	schemas := types.Extract(res, diags)
+	diags := diag.New()
+	addLoadDiagnostics(routeRes, diags)
+	if schemaRes != routeRes {
+		addLoadDiagnostics(schemaRes, diags)
+	}
 
-	module := moduleOf(res)
+	schemas := types.Extract(schemaRes, diags)
+
+	module := moduleOf(routeRes)
+	if module == "" {
+		module = moduleOf(schemaRes)
+	}
 
 	// Recognize the Gin route table, then enrich each route with handler-inferred
 	// request/response/param facts. buildRoutes owns the wiring + the per-route
@@ -68,8 +125,8 @@ func run(targetDir string, patterns []string, w *os.File) error {
 	// the analysis is reentrant rather than depending on process-global setup
 	// ordering. The analyzer keeps duplicate bare-name collisions so they can be
 	// reported after route recognition only when they affect a route (WR-02).
-	analyzer := handlers.NewAnalyzer(res, module, diags)
-	recognized := routes.RecognizeWithDiagnostics(res, diags)
+	analyzer := handlers.NewAnalyzer(routeRes, module, diags)
+	recognized := routes.RecognizeWithDiagnostics(routeRes, diags)
 	analyzer.ReportRouteHandlerCollisions(recognized, diags)
 	routeFacts, syntheticSchemas := buildRoutes(analyzer, recognized, diags)
 	schemas = append(schemas, syntheticSchemas...)
@@ -82,6 +139,25 @@ func run(targetDir string, patterns []string, w *os.File) error {
 	}
 
 	return facts.Marshal(doc, w)
+}
+
+func addLoadDiagnostics(res *load.Result, diags *diag.Accumulator) {
+	for _, le := range res.Errors {
+		file, line := splitPos(le.Pos)
+		diags.Warn("go/packages load error: "+le.Msg, file, line)
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildRoutes maps each recognized Gin route to a router-agnostic RouteFact.
