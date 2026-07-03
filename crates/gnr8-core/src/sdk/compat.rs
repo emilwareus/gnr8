@@ -101,6 +101,84 @@ impl TypeScriptSurfaceDiff {
     }
 }
 
+/// Compatibility contract for SDK public-surface checks.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompatibilityContract {
+    /// Go SDK compatibility requirements and approved drift.
+    pub go: GoCompatibilityContract,
+    /// TypeScript SDK compatibility requirements and approved drift.
+    pub typescript: TypeScriptCompatibilityContract,
+}
+
+/// Go SDK compatibility requirements and approved drift.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoCompatibilityContract {
+    /// Exported types that must exist in the candidate SDK.
+    pub require_exported_types: Vec<String>,
+    /// Exported functions that must exist in the candidate SDK.
+    pub require_exported_functions: Vec<String>,
+    /// Exported methods that must exist in the candidate SDK.
+    pub require_exported_methods: Vec<String>,
+    /// Missing exported types that are explicitly approved.
+    pub allow_missing_exported_types: Vec<String>,
+    /// Missing exported functions that are explicitly approved.
+    pub allow_missing_exported_functions: Vec<String>,
+    /// Missing exported methods that are explicitly approved.
+    pub allow_missing_exported_methods: Vec<String>,
+    /// Exported function signature changes that are explicitly approved, keyed by function name.
+    pub allow_exported_function_signature_changes: Vec<String>,
+    /// Exported method signature changes that are explicitly approved, keyed by `Receiver.Method`.
+    pub allow_exported_method_signature_changes: Vec<String>,
+    /// Missing documentation files that are explicitly approved.
+    pub allow_missing_docs: Vec<String>,
+    /// Package metadata changes that are explicitly approved.
+    pub allow_package_metadata_changes: Vec<String>,
+}
+
+/// TypeScript SDK compatibility requirements and approved drift.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TypeScriptCompatibilityContract {
+    /// Root exports that must exist in the candidate SDK.
+    pub require_root_exports: Vec<String>,
+    /// Model exports that must exist in the candidate SDK.
+    pub require_model_exports: Vec<String>,
+    /// API classes that must exist in the candidate SDK.
+    pub require_api_classes: Vec<String>,
+    /// API factories that must exist in the candidate SDK.
+    pub require_api_factories: Vec<String>,
+    /// Operation methods that must exist in the candidate SDK.
+    pub require_operation_methods: Vec<String>,
+    /// Request aliases that must exist in the candidate SDK.
+    pub require_request_aliases: Vec<String>,
+    /// Missing root exports that are explicitly approved.
+    pub allow_missing_root_exports: Vec<String>,
+    /// Missing model exports that are explicitly approved.
+    pub allow_missing_model_exports: Vec<String>,
+    /// Missing API classes that are explicitly approved.
+    pub allow_missing_api_classes: Vec<String>,
+    /// Missing API factories that are explicitly approved.
+    pub allow_missing_api_factories: Vec<String>,
+    /// Missing operation methods that are explicitly approved.
+    pub allow_missing_operation_methods: Vec<String>,
+    /// Missing request aliases that are explicitly approved.
+    pub allow_missing_request_aliases: Vec<String>,
+    /// Missing interface properties approved as `Interface.property`.
+    pub allow_missing_interface_properties: Vec<String>,
+    /// Interface property changes approved as `Interface.property`.
+    pub allow_interface_property_changes: Vec<String>,
+    /// Operation return type changes approved by operation key.
+    pub allow_operation_return_type_changes: Vec<String>,
+    /// Operation signature changes approved by operation key.
+    pub allow_operation_signature_changes: Vec<String>,
+    /// Export kind mismatches approved by symbol name.
+    pub allow_export_kind_mismatches: Vec<String>,
+    /// Package entry point changes that are explicitly approved.
+    pub allow_package_entry_point_changes: Vec<String>,
+}
+
 /// Extracted Go public surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct GoSurface {
@@ -147,6 +225,32 @@ impl GoSurfaceDiff {
             || !self.missing_docs.is_empty()
             || !self.package_metadata_changes.is_empty()
     }
+}
+
+/// Go compatibility contract evaluation report.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct GoContractEvaluation {
+    /// Whether unapproved drift or missing required symbols remain.
+    pub breaking: bool,
+    /// Required symbols missing from the candidate SDK.
+    pub missing_required: Vec<String>,
+    /// Diff entries that were not approved by the contract.
+    pub unapproved_diff: GoSurfaceDiff,
+    /// Allowance entries that did not match any current diff item.
+    pub stale_allowances: Vec<String>,
+}
+
+/// TypeScript compatibility contract evaluation report.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct TypeScriptContractEvaluation {
+    /// Whether unapproved drift or missing required symbols remain.
+    pub breaking: bool,
+    /// Required symbols missing from the candidate SDK.
+    pub missing_required: Vec<String>,
+    /// Diff entries that were not approved by the contract.
+    pub unapproved_diff: TypeScriptSurfaceDiff,
+    /// Allowance entries that did not match any current diff item.
+    pub stale_allowances: Vec<String>,
 }
 
 /// Changed Go function/method signature.
@@ -252,6 +356,315 @@ pub fn diff_go_dirs(
     let old = extract_go_surface(old_dir)?;
     let new = extract_go_surface(new_dir)?;
     Ok(diff_go_surfaces(&old, &new))
+}
+
+/// Evaluate a Go SDK diff against a compatibility contract.
+#[must_use]
+pub fn evaluate_go_contract(
+    contract: &GoCompatibilityContract,
+    diff: &GoSurfaceDiff,
+    new: &GoSurface,
+) -> GoContractEvaluation {
+    let mut missing_required = Vec::new();
+    require_values(
+        "go.require_exported_types",
+        &contract.require_exported_types,
+        &new.exported_types,
+        &mut missing_required,
+    );
+    require_map_keys(
+        "go.require_exported_functions",
+        &contract.require_exported_functions,
+        &new.exported_functions,
+        &mut missing_required,
+    );
+    require_map_keys(
+        "go.require_exported_methods",
+        &contract.require_exported_methods,
+        &new.exported_methods,
+        &mut missing_required,
+    );
+
+    let mut stale_allowances = Vec::new();
+    stale_string_allowances(
+        "go.allow_missing_exported_types",
+        &contract.allow_missing_exported_types,
+        &diff.missing_exported_types,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "go.allow_missing_exported_functions",
+        &contract.allow_missing_exported_functions,
+        &diff.missing_exported_functions,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "go.allow_missing_exported_methods",
+        &contract.allow_missing_exported_methods,
+        &diff.missing_exported_methods,
+        &mut stale_allowances,
+    );
+    stale_signature_allowances(
+        "go.allow_exported_function_signature_changes",
+        &contract.allow_exported_function_signature_changes,
+        &diff.exported_function_signature_changes,
+        &mut stale_allowances,
+    );
+    stale_signature_allowances(
+        "go.allow_exported_method_signature_changes",
+        &contract.allow_exported_method_signature_changes,
+        &diff.exported_method_signature_changes,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "go.allow_missing_docs",
+        &contract.allow_missing_docs,
+        &diff.missing_docs,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "go.allow_package_metadata_changes",
+        &contract.allow_package_metadata_changes,
+        &diff.package_metadata_changes,
+        &mut stale_allowances,
+    );
+
+    let unapproved_diff = GoSurfaceDiff {
+        missing_exported_types: filter_allowed_strings(
+            &diff.missing_exported_types,
+            &contract.allow_missing_exported_types,
+        ),
+        missing_exported_functions: filter_allowed_strings(
+            &diff.missing_exported_functions,
+            &contract.allow_missing_exported_functions,
+        ),
+        missing_exported_methods: filter_allowed_strings(
+            &diff.missing_exported_methods,
+            &contract.allow_missing_exported_methods,
+        ),
+        exported_function_signature_changes: filter_allowed_signature_changes(
+            &diff.exported_function_signature_changes,
+            &contract.allow_exported_function_signature_changes,
+        ),
+        exported_method_signature_changes: filter_allowed_signature_changes(
+            &diff.exported_method_signature_changes,
+            &contract.allow_exported_method_signature_changes,
+        ),
+        missing_docs: filter_allowed_strings(&diff.missing_docs, &contract.allow_missing_docs),
+        package_metadata_changes: filter_allowed_strings(
+            &diff.package_metadata_changes,
+            &contract.allow_package_metadata_changes,
+        ),
+    };
+    let breaking = !missing_required.is_empty() || unapproved_diff.is_breaking();
+    GoContractEvaluation {
+        breaking,
+        missing_required,
+        unapproved_diff,
+        stale_allowances,
+    }
+}
+
+/// Evaluate a TypeScript SDK diff against a compatibility contract.
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "contract evaluation mirrors each TypeScript diff and allow-list section explicitly"
+)]
+pub fn evaluate_typescript_contract(
+    contract: &TypeScriptCompatibilityContract,
+    diff: &TypeScriptSurfaceDiff,
+    new: &TypeScriptSurface,
+) -> TypeScriptContractEvaluation {
+    let mut missing_required = Vec::new();
+    require_map_keys(
+        "typescript.require_root_exports",
+        &contract.require_root_exports,
+        &new.root_exports,
+        &mut missing_required,
+    );
+    require_map_keys(
+        "typescript.require_model_exports",
+        &contract.require_model_exports,
+        &new.model_exports,
+        &mut missing_required,
+    );
+    require_values(
+        "typescript.require_api_classes",
+        &contract.require_api_classes,
+        &new.api_classes,
+        &mut missing_required,
+    );
+    require_values(
+        "typescript.require_api_factories",
+        &contract.require_api_factories,
+        &new.api_factories,
+        &mut missing_required,
+    );
+    require_values(
+        "typescript.require_operation_methods",
+        &contract.require_operation_methods,
+        &new.operation_methods,
+        &mut missing_required,
+    );
+    require_values(
+        "typescript.require_request_aliases",
+        &contract.require_request_aliases,
+        &new.request_aliases,
+        &mut missing_required,
+    );
+
+    let mut stale_allowances = Vec::new();
+    stale_string_allowances(
+        "typescript.allow_missing_root_exports",
+        &contract.allow_missing_root_exports,
+        &diff.missing_root_exports,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_missing_model_exports",
+        &contract.allow_missing_model_exports,
+        &diff.missing_model_exports,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_missing_api_classes",
+        &contract.allow_missing_api_classes,
+        &diff.missing_api_classes,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_missing_api_factories",
+        &contract.allow_missing_api_factories,
+        &diff.missing_api_factories,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_missing_operation_methods",
+        &contract.allow_missing_operation_methods,
+        &diff.missing_operation_methods,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_missing_request_aliases",
+        &contract.allow_missing_request_aliases,
+        &diff.missing_request_aliases,
+        &mut stale_allowances,
+    );
+    stale_keyed_allowances(
+        "typescript.allow_missing_interface_properties",
+        &contract.allow_missing_interface_properties,
+        diff.missing_interface_properties
+            .iter()
+            .map(ts_missing_interface_property_key),
+        &mut stale_allowances,
+    );
+    stale_keyed_allowances(
+        "typescript.allow_interface_property_changes",
+        &contract.allow_interface_property_changes,
+        diff.interface_property_changes
+            .iter()
+            .map(ts_interface_property_change_key),
+        &mut stale_allowances,
+    );
+    stale_operation_return_allowances(
+        "typescript.allow_operation_return_type_changes",
+        &contract.allow_operation_return_type_changes,
+        &diff.operation_return_type_changes,
+        &mut stale_allowances,
+    );
+    stale_operation_signature_allowances(
+        "typescript.allow_operation_signature_changes",
+        &contract.allow_operation_signature_changes,
+        &diff.operation_signature_changes,
+        &mut stale_allowances,
+    );
+    stale_export_kind_allowances(
+        "typescript.allow_export_kind_mismatches",
+        &contract.allow_export_kind_mismatches,
+        &diff.export_kind_mismatches,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
+        "typescript.allow_package_entry_point_changes",
+        &contract.allow_package_entry_point_changes,
+        &diff.package_entry_point_changes,
+        &mut stale_allowances,
+    );
+
+    let unapproved_diff = TypeScriptSurfaceDiff {
+        missing_root_exports: filter_allowed_strings(
+            &diff.missing_root_exports,
+            &contract.allow_missing_root_exports,
+        ),
+        missing_model_exports: filter_allowed_strings(
+            &diff.missing_model_exports,
+            &contract.allow_missing_model_exports,
+        ),
+        export_kind_mismatches: filter_allowed_export_kind_mismatches(
+            &diff.export_kind_mismatches,
+            &contract.allow_export_kind_mismatches,
+        ),
+        missing_api_classes: filter_allowed_strings(
+            &diff.missing_api_classes,
+            &contract.allow_missing_api_classes,
+        ),
+        missing_api_factories: filter_allowed_strings(
+            &diff.missing_api_factories,
+            &contract.allow_missing_api_factories,
+        ),
+        missing_operation_methods: filter_allowed_strings(
+            &diff.missing_operation_methods,
+            &contract.allow_missing_operation_methods,
+        ),
+        missing_request_aliases: filter_allowed_strings(
+            &diff.missing_request_aliases,
+            &contract.allow_missing_request_aliases,
+        ),
+        missing_interface_properties: filter_allowed_missing_interface_properties(
+            &diff.missing_interface_properties,
+            &contract.allow_missing_interface_properties,
+        ),
+        interface_property_changes: filter_allowed_interface_property_changes(
+            &diff.interface_property_changes,
+            &contract.allow_interface_property_changes,
+        ),
+        interface_required_to_optional: filter_allowed_interface_property_changes(
+            &diff.interface_required_to_optional,
+            &contract.allow_interface_property_changes,
+        ),
+        interface_optional_to_required: filter_allowed_interface_property_changes(
+            &diff.interface_optional_to_required,
+            &contract.allow_interface_property_changes,
+        ),
+        interface_nullable_changes: filter_allowed_interface_property_changes(
+            &diff.interface_nullable_changes,
+            &contract.allow_interface_property_changes,
+        ),
+        interface_type_changes: filter_allowed_interface_property_changes(
+            &diff.interface_type_changes,
+            &contract.allow_interface_property_changes,
+        ),
+        operation_return_type_changes: filter_allowed_operation_return_changes(
+            &diff.operation_return_type_changes,
+            &contract.allow_operation_return_type_changes,
+        ),
+        operation_signature_changes: filter_allowed_operation_signature_changes(
+            &diff.operation_signature_changes,
+            &contract.allow_operation_signature_changes,
+        ),
+        package_entry_point_changes: filter_allowed_strings(
+            &diff.package_entry_point_changes,
+            &contract.allow_package_entry_point_changes,
+        ),
+    };
+    let breaking = !missing_required.is_empty() || unapproved_diff.is_breaking();
+    TypeScriptContractEvaluation {
+        breaking,
+        missing_required,
+        unapproved_diff,
+        stale_allowances,
+    }
 }
 
 /// Extract a Go SDK public surface from a directory.
@@ -398,6 +811,265 @@ pub fn diff_typescript_surfaces(
             &new.package_entry_points,
         ),
     }
+}
+
+/// Suggest high-confidence config snippets for a Go compatibility diff.
+#[must_use]
+pub fn suggest_go_compat(diff: &GoSurfaceDiff) -> Vec<String> {
+    let mut suggestions = BTreeSet::new();
+    for change in &diff.exported_method_signature_changes {
+        if let Some(request) = change.symbol.strip_suffix(".Execute") {
+            suggestions.insert(format!(
+                "GoExecuteCompatibility::preserve_legacy().request(\"{request}\")"
+            ));
+            continue;
+        }
+        let Some((request, setter)) = change.symbol.split_once('.') else {
+            continue;
+        };
+        if request.ends_with("Request") && go_signature_has_any_parameter(&change.old) {
+            suggestions.insert(format!(
+                "GoQuerySetterArgumentPolicy::typed().any_for(\"{request}\", \"{setter}\")"
+            ));
+        }
+    }
+    for missing in &diff.missing_exported_methods {
+        let Some((request, setter)) = missing.split_once('.') else {
+            continue;
+        };
+        if request.ends_with("Request") {
+            suggestions.insert(format!(
+                "GoRequestBuilderAliases::new().body(\"{request}\", \"{setter}\")"
+            ));
+        }
+    }
+    suggestions.into_iter().collect()
+}
+
+fn go_signature_has_any_parameter(signature: &str) -> bool {
+    signature.contains("(any)")
+        || signature.contains("(any,")
+        || signature.contains(", any)")
+        || signature.contains(", any,")
+        || signature.contains(" any)")
+        || signature.contains(" any,")
+}
+
+/// Suggest high-confidence config snippets for a TypeScript compatibility diff.
+#[must_use]
+pub fn suggest_typescript_compat(diff: &TypeScriptSurfaceDiff) -> Vec<String> {
+    let mut suggestions = BTreeSet::new();
+    if !diff.operation_return_type_changes.is_empty() {
+        suggestions
+            .insert("TsSdk::new().compatibility(TsCompatibility::OpenApiGenerator)".to_string());
+        suggestions.insert(".response_policy(TsResponsePolicy::AxiosResponseWrapper)".to_string());
+    }
+    if !diff.interface_optional_to_required.is_empty()
+        || !diff.interface_required_to_optional.is_empty()
+    {
+        suggestions.insert(
+            ".model_property_policy(TsModelPropertyPolicy::OpenApiGeneratorLoose)".to_string(),
+        );
+    }
+    if !diff.interface_nullable_changes.is_empty() {
+        suggestions.insert(
+            ".nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)".to_string(),
+        );
+    }
+    suggestions.into_iter().collect()
+}
+
+fn require_values(
+    label: &str,
+    required: &[String],
+    available: &[String],
+    missing: &mut Vec<String>,
+) {
+    let available: BTreeSet<&str> = available.iter().map(String::as_str).collect();
+    for item in required {
+        if !available.contains(item.as_str()) {
+            missing.push(format!("{label}: {item}"));
+        }
+    }
+}
+
+fn require_map_keys<T>(
+    label: &str,
+    required: &[String],
+    available: &BTreeMap<String, T>,
+    missing: &mut Vec<String>,
+) {
+    for item in required {
+        if !available.contains_key(item) {
+            missing.push(format!("{label}: {item}"));
+        }
+    }
+}
+
+fn filter_allowed_strings(values: &[String], allowed: &[String]) -> Vec<String> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    values
+        .iter()
+        .filter(|value| !allowed.contains(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_signature_changes(
+    changes: &[GoSignatureChange],
+    allowed: &[String],
+) -> Vec<GoSignatureChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.symbol.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_export_kind_mismatches(
+    changes: &[TsExportKindMismatch],
+    allowed: &[String],
+) -> Vec<TsExportKindMismatch> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.symbol.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_missing_interface_properties(
+    changes: &[TsMissingInterfaceProperty],
+    allowed: &[String],
+) -> Vec<TsMissingInterfaceProperty> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(ts_missing_interface_property_key(change).as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_interface_property_changes(
+    changes: &[TsInterfacePropertyChange],
+    allowed: &[String],
+) -> Vec<TsInterfacePropertyChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(ts_interface_property_change_key(change).as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_operation_return_changes(
+    changes: &[TsOperationReturnTypeChange],
+    allowed: &[String],
+) -> Vec<TsOperationReturnTypeChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.operation.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn filter_allowed_operation_signature_changes(
+    changes: &[TsOperationSignatureChange],
+    allowed: &[String],
+) -> Vec<TsOperationSignatureChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.operation.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn stale_string_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[String],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(label, allowed, current.iter().cloned(), stale);
+}
+
+fn stale_signature_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[GoSignatureChange],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.symbol.clone()),
+        stale,
+    );
+}
+
+fn stale_export_kind_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[TsExportKindMismatch],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.symbol.clone()),
+        stale,
+    );
+}
+
+fn stale_operation_return_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[TsOperationReturnTypeChange],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.operation.clone()),
+        stale,
+    );
+}
+
+fn stale_operation_signature_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[TsOperationSignatureChange],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.operation.clone()),
+        stale,
+    );
+}
+
+fn stale_keyed_allowances<I>(label: &str, allowed: &[String], current: I, stale: &mut Vec<String>)
+where
+    I: IntoIterator<Item = String>,
+{
+    let current: BTreeSet<String> = current.into_iter().collect();
+    for item in allowed {
+        if !current.contains(item) {
+            stale.push(format!("{label}: {item}"));
+        }
+    }
+}
+
+fn ts_missing_interface_property_key(change: &TsMissingInterfaceProperty) -> String {
+    format!("{}.{}", change.interface, change.property)
+}
+
+fn ts_interface_property_change_key(change: &TsInterfacePropertyChange) -> String {
+    format!("{}.{}", change.interface, change.property)
 }
 
 #[derive(Default)]
@@ -1506,7 +2178,15 @@ fn operation_signature_changes(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{diff_go_dirs, diff_typescript_dirs, extract_typescript_surface, TsExportKind};
+    use super::{
+        diff_go_dirs, diff_go_surfaces, diff_typescript_dirs, diff_typescript_surfaces,
+        evaluate_go_contract, evaluate_typescript_contract, extract_go_surface,
+        extract_typescript_surface, suggest_go_compat, suggest_typescript_compat,
+        GoCompatibilityContract, GoSignatureChange, GoSurface, GoSurfaceDiff, TsExportKind,
+        TsExportKindMismatch, TsInterfaceProperty, TypeScriptCompatibilityContract,
+        TypeScriptSurface,
+    };
+    use std::collections::BTreeMap;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1775,5 +2455,232 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_contract_allows_selected_drift_and_reports_stale_allowances() {
+        let old = temp_dir("go-contract-old");
+        let new = temp_dir("go-contract-new");
+        std::fs::write(old.join("go.mod"), "module example.com/old\n\ngo 1.23\n").unwrap();
+        std::fs::write(new.join("go.mod"), "module example.com/new\n\ngo 1.23\n").unwrap();
+        std::fs::write(old.join("README.md"), "# Old SDK\n").unwrap();
+        std::fs::write(
+            old.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\ntype BooksAPIService service\nfunc NewConfiguration() *Configuration { return nil }\nfunc (r ApiGetBookRequest) Execute() (*Book, error) { return nil, nil }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("client.go"),
+            "package sdk\n\ntype Configuration struct{}\nfunc NewConfiguration(baseURL string) *Configuration { return nil }\nfunc (r ApiGetBookRequest) Execute(ctx context.Context) (*Book, error) { return nil, nil }\n",
+        )
+        .unwrap();
+
+        let old_surface = extract_go_surface(&old).unwrap();
+        let new_surface = extract_go_surface(&new).unwrap();
+        let diff = diff_go_surfaces(&old_surface, &new_surface);
+        let contract = GoCompatibilityContract {
+            require_exported_types: vec!["Configuration".to_string()],
+            allow_missing_exported_types: vec![
+                "BooksAPIService".to_string(),
+                "StaleType".to_string(),
+            ],
+            allow_exported_function_signature_changes: vec!["NewConfiguration".to_string()],
+            allow_exported_method_signature_changes: vec!["ApiGetBookRequest.Execute".to_string()],
+            allow_missing_docs: vec!["README.md".to_string()],
+            allow_package_metadata_changes: vec![
+                "module: example.com/old -> example.com/new".to_string()
+            ],
+            ..GoCompatibilityContract::default()
+        };
+
+        let evaluation = evaluate_go_contract(&contract, &diff, &new_surface);
+        assert!(!evaluation.breaking, "{evaluation:?}");
+        assert_eq!(
+            evaluation.stale_allowances,
+            vec!["go.allow_missing_exported_types: StaleType".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_contract_fails_missing_required_and_unapproved_drift() {
+        let old = GoSurface {
+            exported_types: vec!["Legacy".to_string()],
+            exported_functions: BTreeMap::from([(
+                "NewClient".to_string(),
+                "func NewClient()".to_string(),
+            )]),
+            ..GoSurface::default()
+        };
+        let new = GoSurface::default();
+        let diff = diff_go_surfaces(&old, &new);
+        let contract = GoCompatibilityContract {
+            require_exported_types: vec!["Required".to_string()],
+            ..GoCompatibilityContract::default()
+        };
+
+        let evaluation = evaluate_go_contract(&contract, &diff, &new);
+        assert!(evaluation.breaking);
+        assert_eq!(
+            evaluation.missing_required,
+            vec!["go.require_exported_types: Required".to_string()]
+        );
+        assert_eq!(
+            evaluation.unapproved_diff.missing_exported_types,
+            vec!["Legacy".to_string()]
+        );
+    }
+
+    #[test]
+    fn typescript_contract_allows_selected_drift_and_reports_stale_allowances() {
+        let old = TypeScriptSurface {
+            root_exports: BTreeMap::from([
+                ("Book".to_string(), TsExportKind::Type),
+                ("Format".to_string(), TsExportKind::Both),
+            ]),
+            model_exports: BTreeMap::from([("Book".to_string(), TsExportKind::Type)]),
+            api_classes: vec!["DefaultApi".to_string()],
+            request_aliases: vec!["CreateBookRequest".to_string()],
+            interface_properties: BTreeMap::from([(
+                "Book".to_string(),
+                BTreeMap::from([(
+                    "title".to_string(),
+                    TsInterfaceProperty {
+                        optional: true,
+                        nullable: true,
+                        ty: "string | null".to_string(),
+                    },
+                )]),
+            )]),
+            operation_return_types: BTreeMap::from([(
+                "DefaultApi.createBook".to_string(),
+                "Promise<AxiosResponse<Book>>".to_string(),
+            )]),
+            operation_signatures: BTreeMap::from([(
+                "DefaultApi.createBook".to_string(),
+                "async createBook(): Promise<AxiosResponse<Book>>".to_string(),
+            )]),
+            ..TypeScriptSurface::default()
+        };
+        let new = TypeScriptSurface {
+            root_exports: BTreeMap::from([
+                ("Book".to_string(), TsExportKind::Type),
+                ("Format".to_string(), TsExportKind::Type),
+            ]),
+            model_exports: BTreeMap::from([("Book".to_string(), TsExportKind::Type)]),
+            api_classes: vec!["DefaultApi".to_string()],
+            interface_properties: BTreeMap::from([(
+                "Book".to_string(),
+                BTreeMap::from([(
+                    "title".to_string(),
+                    TsInterfaceProperty {
+                        optional: false,
+                        nullable: false,
+                        ty: "string".to_string(),
+                    },
+                )]),
+            )]),
+            operation_return_types: BTreeMap::from([(
+                "DefaultApi.createBook".to_string(),
+                "Promise<Book>".to_string(),
+            )]),
+            operation_signatures: BTreeMap::from([(
+                "DefaultApi.createBook".to_string(),
+                "async createBook(): Promise<Book>".to_string(),
+            )]),
+            ..TypeScriptSurface::default()
+        };
+        let diff = diff_typescript_surfaces(&old, &new);
+        let contract = TypeScriptCompatibilityContract {
+            require_root_exports: vec!["Book".to_string()],
+            allow_missing_request_aliases: vec![
+                "CreateBookRequest".to_string(),
+                "StaleRequest".to_string(),
+            ],
+            allow_interface_property_changes: vec!["Book.title".to_string()],
+            allow_operation_return_type_changes: vec!["DefaultApi.createBook".to_string()],
+            allow_operation_signature_changes: vec!["DefaultApi.createBook".to_string()],
+            allow_export_kind_mismatches: vec!["Format".to_string()],
+            ..TypeScriptCompatibilityContract::default()
+        };
+
+        let evaluation = evaluate_typescript_contract(&contract, &diff, &new);
+        assert!(!evaluation.breaking, "{evaluation:?}");
+        assert_eq!(
+            evaluation.stale_allowances,
+            vec!["typescript.allow_missing_request_aliases: StaleRequest".to_string()]
+        );
+    }
+
+    #[test]
+    fn compat_suggestions_include_high_confidence_snippets() {
+        let go = GoSurfaceDiff {
+            missing_exported_methods: vec!["ApiCreateBookRequest.Book".to_string()],
+            exported_method_signature_changes: vec![
+                GoSignatureChange {
+                    symbol: "ApiListBooksRequest.Execute".to_string(),
+                    old: "func (r ApiListBooksRequest) Execute() (*http.Response, error)"
+                        .to_string(),
+                    new: "func (r ApiListBooksRequest) Execute() (*Book, *http.Response, error)"
+                        .to_string(),
+                },
+                GoSignatureChange {
+                    symbol: "ApiListBooksRequest.PageSize".to_string(),
+                    old: "func (r ApiListBooksRequest) PageSize(pageSize any) ApiListBooksRequest"
+                        .to_string(),
+                    new:
+                        "func (r ApiListBooksRequest) PageSize(pageSize int64) ApiListBooksRequest"
+                            .to_string(),
+                },
+            ],
+            ..GoSurfaceDiff::default()
+        };
+        let go_suggestions = suggest_go_compat(&go);
+        assert!(go_suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("GoExecuteCompatibility")));
+        assert!(go_suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("GoQuerySetterArgumentPolicy")));
+        assert!(go_suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("GoRequestBuilderAliases")));
+
+        let ts = super::TypeScriptSurfaceDiff {
+            export_kind_mismatches: vec![TsExportKindMismatch {
+                symbol: "Format".to_string(),
+                old: TsExportKind::Both,
+                new: TsExportKind::Type,
+            }],
+            interface_nullable_changes: vec![super::TsInterfacePropertyChange {
+                interface: "Book".to_string(),
+                property: "title".to_string(),
+                old: TsInterfaceProperty {
+                    optional: true,
+                    nullable: true,
+                    ty: "string | null".to_string(),
+                },
+                new: TsInterfaceProperty {
+                    optional: true,
+                    nullable: false,
+                    ty: "string".to_string(),
+                },
+            }],
+            operation_return_type_changes: vec![super::TsOperationReturnTypeChange {
+                operation: "DefaultApi.createBook".to_string(),
+                old: "Promise<AxiosResponse<Book>>".to_string(),
+                new: "Promise<Book>".to_string(),
+            }],
+            ..super::TypeScriptSurfaceDiff::default()
+        };
+        let ts_suggestions = suggest_typescript_compat(&ts);
+        assert!(ts_suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("TsCompatibility::OpenApiGenerator")));
+        assert!(ts_suggestions
+            .iter()
+            .any(|suggestion| suggestion.contains("TsNullablePolicy")));
     }
 }

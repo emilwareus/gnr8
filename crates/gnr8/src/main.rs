@@ -13,7 +13,7 @@ mod doctor;
 mod render;
 mod watch;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use std::collections::BTreeSet;
@@ -236,15 +236,35 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
 )]
 fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     match action {
-        CompatAction::Typescript { old, new, contract } => {
-            if let Some(contract) = contract {
-                let path = std::path::Path::new(contract);
-                if !path.exists() {
-                    anyhow::bail!("compat contract does not exist: {contract}");
-                }
-            }
-            let diff = gnr8::sdk::compat::diff_typescript_dirs(old, new)?;
-            let breaking = diff.is_breaking();
+        CompatAction::Typescript {
+            old,
+            new,
+            contract,
+            suggest,
+        } => {
+            let contract_path = contract.as_deref();
+            let contract = load_compat_contract(contract_path)?;
+            let old_surface = gnr8::sdk::compat::extract_typescript_surface(old)?;
+            let new_surface = gnr8::sdk::compat::extract_typescript_surface(new)?;
+            let diff = gnr8::sdk::compat::diff_typescript_surfaces(&old_surface, &new_surface);
+            let evaluation = contract.as_ref().map(|contract| {
+                gnr8::sdk::compat::evaluate_typescript_contract(
+                    &contract.typescript,
+                    &diff,
+                    &new_surface,
+                )
+            });
+            let effective_diff = evaluation
+                .as_ref()
+                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
+            let suggestions = if *suggest {
+                gnr8::sdk::compat::suggest_typescript_compat(effective_diff)
+            } else {
+                Vec::new()
+            };
+            let breaking = evaluation
+                .as_ref()
+                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -253,7 +273,10 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     new: &'a str,
                     contract: Option<&'a str>,
                     breaking: bool,
-                    diff: gnr8::sdk::compat::TypeScriptSurfaceDiff,
+                    diff: &'a gnr8::sdk::compat::TypeScriptSurfaceDiff,
+                    contract_evaluation:
+                        Option<&'a gnr8::sdk::compat::TypeScriptContractEvaluation>,
+                    suggestions: &'a [String],
                 }
                 println!(
                     "{}",
@@ -261,74 +284,58 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         language: "typescript",
                         old,
                         new,
-                        contract: contract.as_deref(),
+                        contract: contract_path,
                         breaking,
-                        diff,
+                        diff: &diff,
+                        contract_evaluation: evaluation.as_ref(),
+                        suggestions: &suggestions,
                     })?
                 );
             } else if breaking {
                 output.progress("compat typescript: breaking changes detected");
-                print_compat_list("missing root exports", &diff.missing_root_exports);
-                print_compat_list("missing model exports", &diff.missing_model_exports);
-                print_compat_list("missing API classes", &diff.missing_api_classes);
-                print_compat_list("missing API factories", &diff.missing_api_factories);
-                print_compat_list("missing operation methods", &diff.missing_operation_methods);
-                print_compat_list("missing request aliases", &diff.missing_request_aliases);
-                print_compat_list("package entry changes", &diff.package_entry_point_changes);
-                for missing in &diff.missing_interface_properties {
-                    println!(
-                        "  missing interface property: {}.{}",
-                        missing.interface, missing.property
+                if let Some(evaluation) = &evaluation {
+                    print_compat_list(
+                        "missing required contract symbols",
+                        &evaluation.missing_required,
                     );
                 }
-                for change in &diff.interface_property_changes {
-                    println!(
-                        "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
-                        change.interface,
-                        change.property,
-                        change.old.optional,
-                        change.new.optional,
-                        change.old.nullable,
-                        change.new.nullable,
-                        change.old.ty,
-                        change.new.ty
-                    );
-                }
-                for change in &diff.operation_return_type_changes {
-                    println!(
-                        "  operation return changed: {} ({} -> {})",
-                        change.operation, change.old, change.new
-                    );
-                }
-                for change in &diff.operation_signature_changes {
-                    println!(
-                        "  operation signature changed: {} ({} -> {})",
-                        change.operation, change.old, change.new
-                    );
-                }
-                for mismatch in &diff.export_kind_mismatches {
-                    println!(
-                        "  export kind mismatch: {} ({:?} -> {:?})",
-                        mismatch.symbol, mismatch.old, mismatch.new
-                    );
-                }
+                print_typescript_compat_diff(effective_diff);
             } else {
                 output.progress("compat typescript: compatible");
+            }
+            if !output.json {
+                print_compat_suggestions(&suggestions);
             }
             if breaking {
                 std::process::exit(1);
             }
             Ok(())
         }
-        CompatAction::Go { old, new, contract } => {
-            if let Some(contract) = contract {
-                let path = std::path::Path::new(contract);
-                if !path.exists() {
-                    anyhow::bail!("compat contract does not exist: {contract}");
-                }
-            }
-            let diff = gnr8::sdk::compat::diff_go_dirs(old, new)?;
-            let breaking = diff.is_breaking();
+        CompatAction::Go {
+            old,
+            new,
+            contract,
+            suggest,
+        } => {
+            let contract_path = contract.as_deref();
+            let contract = load_compat_contract(contract_path)?;
+            let old_surface = gnr8::sdk::compat::extract_go_surface(old)?;
+            let new_surface = gnr8::sdk::compat::extract_go_surface(new)?;
+            let diff = gnr8::sdk::compat::diff_go_surfaces(&old_surface, &new_surface);
+            let evaluation = contract.as_ref().map(|contract| {
+                gnr8::sdk::compat::evaluate_go_contract(&contract.go, &diff, &new_surface)
+            });
+            let effective_diff = evaluation
+                .as_ref()
+                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
+            let suggestions = if *suggest {
+                gnr8::sdk::compat::suggest_go_compat(effective_diff)
+            } else {
+                Vec::new()
+            };
+            let breaking = evaluation
+                .as_ref()
+                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -337,7 +344,9 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     new: &'a str,
                     contract: Option<&'a str>,
                     breaking: bool,
-                    diff: gnr8::sdk::compat::GoSurfaceDiff,
+                    diff: &'a gnr8::sdk::compat::GoSurfaceDiff,
+                    contract_evaluation: Option<&'a gnr8::sdk::compat::GoContractEvaluation>,
+                    suggestions: &'a [String],
                 }
                 println!(
                     "{}",
@@ -345,35 +354,27 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         language: "go",
                         old,
                         new,
-                        contract: contract.as_deref(),
+                        contract: contract_path,
                         breaking,
-                        diff,
+                        diff: &diff,
+                        contract_evaluation: evaluation.as_ref(),
+                        suggestions: &suggestions,
                     })?
                 );
             } else if breaking {
                 output.progress("compat go: breaking changes detected");
-                print_compat_list("missing exported types", &diff.missing_exported_types);
-                print_compat_list(
-                    "missing exported functions",
-                    &diff.missing_exported_functions,
-                );
-                print_compat_list("missing exported methods", &diff.missing_exported_methods);
-                print_compat_list("missing docs", &diff.missing_docs);
-                print_compat_list("package metadata changes", &diff.package_metadata_changes);
-                for change in &diff.exported_function_signature_changes {
-                    println!(
-                        "  exported function signature changed: {} ({} -> {})",
-                        change.symbol, change.old, change.new
+                if let Some(evaluation) = &evaluation {
+                    print_compat_list(
+                        "missing required contract symbols",
+                        &evaluation.missing_required,
                     );
                 }
-                for change in &diff.exported_method_signature_changes {
-                    println!(
-                        "  exported method signature changed: {} ({} -> {})",
-                        change.symbol, change.old, change.new
-                    );
-                }
+                print_go_compat_diff(effective_diff);
             } else {
                 output.progress("compat go: compatible");
+            }
+            if !output.json {
+                print_compat_suggestions(&suggestions);
             }
             if breaking {
                 std::process::exit(1);
@@ -381,6 +382,97 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn load_compat_contract(
+    path: Option<&str>,
+) -> Result<Option<gnr8::sdk::compat::CompatibilityContract>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contract_path = Path::new(path);
+    if !contract_path.exists() {
+        anyhow::bail!("compat contract does not exist: {path}");
+    }
+    let text = std::fs::read_to_string(contract_path)
+        .with_context(|| format!("failed to read compat contract: {path}"))?;
+    let contract = toml::from_str(&text)
+        .with_context(|| format!("failed to parse compat contract TOML: {path}"))?;
+    Ok(Some(contract))
+}
+
+fn print_typescript_compat_diff(diff: &gnr8::sdk::compat::TypeScriptSurfaceDiff) {
+    print_compat_list("missing root exports", &diff.missing_root_exports);
+    print_compat_list("missing model exports", &diff.missing_model_exports);
+    print_compat_list("missing API classes", &diff.missing_api_classes);
+    print_compat_list("missing API factories", &diff.missing_api_factories);
+    print_compat_list("missing operation methods", &diff.missing_operation_methods);
+    print_compat_list("missing request aliases", &diff.missing_request_aliases);
+    print_compat_list("package entry changes", &diff.package_entry_point_changes);
+    for missing in &diff.missing_interface_properties {
+        println!(
+            "  missing interface property: {}.{}",
+            missing.interface, missing.property
+        );
+    }
+    for change in &diff.interface_property_changes {
+        println!(
+            "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
+            change.interface,
+            change.property,
+            change.old.optional,
+            change.new.optional,
+            change.old.nullable,
+            change.new.nullable,
+            change.old.ty,
+            change.new.ty
+        );
+    }
+    for change in &diff.operation_return_type_changes {
+        println!(
+            "  operation return changed: {} ({} -> {})",
+            change.operation, change.old, change.new
+        );
+    }
+    for change in &diff.operation_signature_changes {
+        println!(
+            "  operation signature changed: {} ({} -> {})",
+            change.operation, change.old, change.new
+        );
+    }
+    for mismatch in &diff.export_kind_mismatches {
+        println!(
+            "  export kind mismatch: {} ({:?} -> {:?})",
+            mismatch.symbol, mismatch.old, mismatch.new
+        );
+    }
+}
+
+fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
+    print_compat_list("missing exported types", &diff.missing_exported_types);
+    print_compat_list(
+        "missing exported functions",
+        &diff.missing_exported_functions,
+    );
+    print_compat_list("missing exported methods", &diff.missing_exported_methods);
+    print_compat_list("missing docs", &diff.missing_docs);
+    print_compat_list("package metadata changes", &diff.package_metadata_changes);
+    for change in &diff.exported_function_signature_changes {
+        println!(
+            "  exported function signature changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
+    for change in &diff.exported_method_signature_changes {
+        println!(
+            "  exported method signature changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
+}
+
+fn print_compat_suggestions(suggestions: &[String]) {
+    print_compat_list("suggestions", suggestions);
 }
 
 fn print_compat_list(label: &str, values: &[String]) {
