@@ -1114,8 +1114,12 @@ pub(crate) fn emit_compat_client_surface(
     }
     writeln!(body).map_err(sink)?;
     emit_compat_api_client(&mut body, &services)?;
+    let options = GoEmitOptions {
+        compat_model_helpers: true,
+        sdk: GoSdkOptions::default(),
+    };
     for op in &graph.operations {
-        emit_compat_request(&mut body, op, graph, base_path, &query_setters)?;
+        emit_compat_request(&mut body, op, graph, base_path, &query_setters, &options)?;
     }
 
     Ok(file(
@@ -1469,7 +1473,7 @@ pub(crate) fn emit_compat_api_file(
         if return_model != "struct{}" && !success_responses_of(op, graph)?.has_binary_body() {
             needs_json = true;
         }
-        emit_compat_request(&mut body, op, graph, base_path, &query_setters)?;
+        emit_compat_request(&mut body, op, graph, base_path, &query_setters, options)?;
     }
     if needs_json {
         imports.push("encoding/json");
@@ -1824,9 +1828,10 @@ fn emit_compat_request(
     graph: &ApiGraph,
     base_path: &str,
     global_query_setters: &[(String, String)],
+    options: &GoEmitOptions,
 ) -> Result<(), CoreError> {
     let method_name = compat_operation_name(op);
-    let request_name = format!("Api{method_name}Request");
+    let request_name = compat_request_name(op);
     let service = compat_service_name(op);
     let mut path_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location == "path").collect();
@@ -1864,7 +1869,13 @@ fn emit_compat_request(
     };
     let has_extra_query = !global_query_setters.is_empty()
         || !body_field_query_setters.is_empty()
-        || has_multipart_body;
+        || has_multipart_body
+        || options.sdk.query_setter_argument_policy.is_any() && !query_params.is_empty()
+        || !options
+            .sdk
+            .request_builder_aliases
+            .query_aliases_for(&request_name)
+            .is_empty();
     let has_extra_header = !operation_api_key_schemes(graph, op)?.is_empty();
     let return_model = compat_success_return_model(op, graph)?;
 
@@ -1911,13 +1922,29 @@ fn emit_compat_request(
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            emit_compat_query_setter(
-                body,
-                &request_name,
-                &setter,
-                &lower_camel(&param.name),
-                &compat_param_type(param, graph)?,
-            )?;
+            if options.sdk.query_setter_argument_policy.is_any() {
+                emit_compat_extra_query_setter(body, &request_name, &setter, &param.name, "any")?;
+            } else {
+                emit_compat_query_setter(
+                    body,
+                    &request_name,
+                    &setter,
+                    &lower_camel(&param.name),
+                    &compat_param_type(param, graph)?,
+                )?;
+            }
+        }
+    }
+    for alias in options
+        .sdk
+        .request_builder_aliases
+        .query_aliases_for(&request_name)
+    {
+        for setter in compat_method_names(&alias.setter) {
+            if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
+                continue;
+            }
+            emit_compat_extra_query_setter(body, &request_name, &setter, &alias.query_name, "any")?;
         }
     }
     for (setter, query_name) in global_query_setters {
@@ -1962,7 +1989,13 @@ fn emit_compat_request(
             emit_compat_file_setter(body, &request_name, &setter, &compat_arg_name(&setter))?;
         }
     }
-    for setter in body_setters {
+    for setter in options
+        .sdk
+        .request_builder_aliases
+        .body_aliases_for(&request_name)
+        .into_iter()
+        .chain(body_setters)
+    {
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
@@ -1974,8 +2007,28 @@ fn emit_compat_request(
         emit_compat_auth_setter(body, &request_name)?;
     }
 
+    let preserve_legacy_execute = options
+        .sdk
+        .execute_compatibility
+        .preserves(&request_name, &op.id);
     writeln!(body).map_err(sink)?;
-    if return_model == "struct{}" {
+    if preserve_legacy_execute && return_model != "struct{}" {
+        writeln!(
+            body,
+            "func (r {request_name}) Execute() (*http.Response, error) {{"
+        )
+        .map_err(sink)?;
+        writeln!(body, "_, resp, err := r.ExecuteTyped()").map_err(sink)?;
+        writeln!(body, "return resp, err").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body).map_err(sink)?;
+        let return_ty = compat_return_type(&return_model);
+        writeln!(
+            body,
+            "func (r {request_name}) ExecuteTyped() ({return_ty}, *http.Response, error) {{"
+        )
+        .map_err(sink)?;
+    } else if return_model == "struct{}" {
         writeln!(
             body,
             "func (r {request_name}) Execute() (*http.Response, error) {{"
@@ -2106,7 +2159,11 @@ fn emit_compat_body_setter(
 }
 
 fn compat_arg_name(name: &str) -> String {
-    let candidate = lower_camel(name);
+    let mut candidate = lower_camel(name);
+    if name.ends_with("Id") && candidate.ends_with("ID") {
+        candidate.truncate(candidate.len() - 2);
+        candidate.push_str("Id");
+    }
     match candidate.as_str() {
         "any" | "bool" | "byte" | "comparable" | "complex64" | "complex128" | "error"
         | "float32" | "float64" | "int" | "int8" | "int16" | "int32" | "int64" | "rune"
@@ -2491,7 +2548,7 @@ fn compat_query_setters(graph: &ApiGraph) -> Vec<(String, String)> {
     setters.into_iter().collect()
 }
 
-fn compat_method_names(name: &str) -> Vec<String> {
+pub(crate) fn compat_method_names(name: &str) -> Vec<String> {
     const CANONICAL_TO_LEGACY: &[(&str, &str)] = &[
         ("ID", "Id"),
         ("UUID", "Uuid"),
@@ -2565,7 +2622,11 @@ fn compat_service_name(op: &Operation) -> String {
     )
 }
 
-fn compat_operation_name(op: &Operation) -> String {
+pub(crate) fn compat_request_name(op: &Operation) -> String {
+    format!("Api{}Request", compat_operation_name(op))
+}
+
+pub(crate) fn compat_operation_name(op: &Operation) -> String {
     compat_exported(&op.handler)
 }
 
@@ -2621,7 +2682,7 @@ fn filter_compat_body_setters(setters: BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
-fn compat_request_reserved_method(name: &str) -> bool {
+pub(crate) fn compat_request_reserved_method(name: &str) -> bool {
     matches!(name, "Authorization" | "Execute")
 }
 

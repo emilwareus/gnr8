@@ -19,6 +19,7 @@ use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::go::{
+    GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
     GoRequestBuilderScope, GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy,
 };
 use crate::sdk::layout::SdkFileLayout;
@@ -31,8 +32,11 @@ use crate::sdk::typescript::{
     TsSdkOptions,
 };
 use crate::CoreError;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------------------------------
 // Source
@@ -2470,6 +2474,9 @@ pub struct GoSdk {
     required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
     query_time_format: Option<QueryTimeFormat>,
     request_builder_scope: Option<GoRequestBuilderScope>,
+    request_builder_aliases: Option<GoRequestBuilderAliases>,
+    query_setter_argument_policy: Option<GoQuerySetterArgumentPolicy>,
+    execute_compatibility: Option<GoExecuteCompatibility>,
 }
 
 impl GoSdk {
@@ -2488,6 +2495,9 @@ impl GoSdk {
             required_pointer_constructor_policy: None,
             query_time_format: None,
             request_builder_scope: None,
+            request_builder_aliases: None,
+            query_setter_argument_policy: None,
+            execute_compatibility: None,
         }
     }
 
@@ -2565,6 +2575,30 @@ impl GoSdk {
         self
     }
 
+    /// Add request-builder body/query alias setters for OpenAPI Generator-compatible output.
+    #[must_use]
+    pub fn request_builder_aliases(mut self, aliases: GoRequestBuilderAliases) -> Self {
+        self.request_builder_aliases = Some(aliases);
+        self
+    }
+
+    /// Set how OpenAPI Generator-compatible query setter arguments are typed.
+    #[must_use]
+    pub const fn query_setter_argument_policy(
+        mut self,
+        policy: GoQuerySetterArgumentPolicy,
+    ) -> Self {
+        self.query_setter_argument_policy = Some(policy);
+        self
+    }
+
+    /// Configure legacy `Execute` wrappers for selected compatibility request builders.
+    #[must_use]
+    pub fn execute_compatibility(mut self, compatibility: GoExecuteCompatibility) -> Self {
+        self.execute_compatibility = Some(compatibility);
+        self
+    }
+
     /// Enable or disable generated SDK README/reference docs.
     #[must_use]
     pub const fn docs(mut self, enabled: bool) -> Self {
@@ -2611,6 +2645,15 @@ impl GoSdk {
         }
         if let Some(scope) = self.request_builder_scope {
             options.request_builder_scope = scope;
+        }
+        if let Some(aliases) = &self.request_builder_aliases {
+            options.request_builder_aliases = aliases.clone();
+        }
+        if let Some(policy) = self.query_setter_argument_policy {
+            options.query_setter_argument_policy = policy;
+        }
+        if let Some(compatibility) = &self.execute_compatibility {
+            options.execute_compatibility = compatibility.clone();
         }
         options
     }
@@ -3142,6 +3185,234 @@ impl Target for TsSdk {
 // PostProcess
 // ---------------------------------------------------------------------------------------------------
 
+/// Run a formatter or normalizer against generated artifacts before the host writes them.
+#[derive(Debug, Clone)]
+pub struct FormatCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+impl FormatCommand {
+    /// Create a command postprocessor.
+    #[must_use]
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// Set command arguments.
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl PostProcess for FormatCommand {
+    fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
+        let temp = unique_postprocess_dir(&cx.project_root)?;
+        std::fs::create_dir_all(&temp).map_err(|err| CoreError::Io {
+            message: format!(
+                "failed to create post-write temp dir {}: {err}",
+                temp.display()
+            ),
+        })?;
+        let result = self.run_in_temp(out, &temp);
+        let cleanup = std::fs::remove_dir_all(&temp);
+        match (result, cleanup) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(CoreError::Io {
+                message: format!(
+                    "failed to remove post-write temp dir {}: {err}",
+                    temp.display()
+                ),
+            }),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn cache_key_fragment(&self, _cx: &Cx) -> Result<Vec<u8>, CoreError> {
+        let mut fragment = format!("FormatCommand\0{}\0", self.program).into_bytes();
+        for arg in &self.args {
+            fragment.extend(arg.as_bytes());
+            fragment.push(0);
+        }
+        if let Some(path) = resolve_command_path(&self.program) {
+            fragment.extend(path.to_string_lossy().as_bytes());
+            fragment.push(0);
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                fragment.extend(metadata.len().to_string().as_bytes());
+                fragment.push(0);
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                        fragment.extend(duration.as_nanos().to_string().as_bytes());
+                    }
+                }
+            }
+        }
+        Ok(fragment)
+    }
+}
+
+impl FormatCommand {
+    fn run_in_temp(&self, out: &mut Artifacts, temp: &Path) -> Result<(), CoreError> {
+        let artifact_paths: BTreeSet<String> = out
+            .files()
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect();
+        for artifact in out.files() {
+            let path = temp_artifact_path(temp, &artifact.path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| CoreError::Io {
+                    message: format!("failed to create {}: {err}", parent.display()),
+                })?;
+            }
+            std::fs::write(&path, &artifact.text).map_err(|err| CoreError::Io {
+                message: format!("failed to write {}: {err}", path.display()),
+            })?;
+        }
+
+        let output = Command::new(&self.program)
+            .args(&self.args)
+            .current_dir(temp)
+            .output()
+            .map_err(|err| CoreError::Config {
+                message: format!("failed to run post-write command '{}': {err}", self.program),
+            })?;
+        if !output.status.success() {
+            return Err(CoreError::Config {
+                message: format!(
+                    "post-write command '{}' exited with status {:?}:\n{}",
+                    self.program,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+
+        let temp_paths = collect_temp_files(temp)?;
+        for path in &temp_paths {
+            if !artifact_paths.contains(path) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "post-write command '{}' created undeclared artifact '{}'",
+                        self.program, path
+                    ),
+                });
+            }
+        }
+        for artifact_path in artifact_paths {
+            let path = temp_artifact_path(temp, &artifact_path)?;
+            let text = std::fs::read_to_string(&path).map_err(|err| CoreError::Config {
+                message: format!(
+                    "post-write command '{}' removed or invalidated {}: {err}",
+                    self.program,
+                    path.display()
+                ),
+            })?;
+            out.write(artifact_path, text);
+        }
+        Ok(())
+    }
+}
+
+fn unique_postprocess_dir(project_root: &Path) -> Result<PathBuf, CoreError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| CoreError::Io {
+            message: format!("system clock before Unix epoch: {err}"),
+        })?
+        .as_nanos();
+    Ok(std::env::temp_dir().join(format!(
+        "gnr8-post-write-{}-{nanos}",
+        project_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project")
+    )))
+}
+
+fn temp_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, CoreError> {
+    let path = Path::new(rel);
+    if rel.is_empty() || path.is_absolute() {
+        return Err(CoreError::Io {
+            message: format!("unsafe generated artifact path '{rel}'"),
+        });
+    }
+    let mut out = root.to_path_buf();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            _ => {
+                return Err(CoreError::Io {
+                    message: format!("unsafe generated artifact path '{rel}'"),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn collect_temp_files(root: &Path) -> Result<BTreeSet<String>, CoreError> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|err| CoreError::Io {
+            message: format!(
+                "failed to read post-write temp dir {}: {err}",
+                dir.display()
+            ),
+        })? {
+            let entry = entry.map_err(|err| CoreError::Io {
+                message: format!(
+                    "failed to read post-write temp dir {}: {err}",
+                    dir.display()
+                ),
+            })?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|err| CoreError::Io {
+                message: format!(
+                    "failed to inspect post-write temp file {}: {err}",
+                    path.display()
+                ),
+            })?;
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|err| CoreError::Io {
+                        message: format!("failed to relativize post-write temp file: {err}"),
+                    })?
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.insert(rel);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_command_path(program: &str) -> Option<PathBuf> {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        return program_path.is_file().then(|| program_path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
 /// The "Code generated by gnr8" banner line prepended to every generated `.go` file.
 const GENERATED_HEADER: &str = "// Code generated by gnr8. DO NOT EDIT.";
 
@@ -3489,8 +3760,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoGin, GoSdk,
-        GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, FormatCommand,
+        GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
         QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
         SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
@@ -5363,5 +5634,42 @@ func (s Server) create(c *gin.Context) {
             .find(|f| f.path == "sdk/client.go")
             .unwrap();
         assert_eq!(go2.text.matches("Code generated").count(), 1);
+    }
+
+    #[test]
+    fn format_command_rewrites_artifacts_before_host_ownership() {
+        let mut out = Artifacts::new();
+        out.write("generated/openapi.json", "{\"openapi\":\"3.1.0\"}\n");
+        FormatCommand::new("sh")
+            .args([
+                "-c",
+                "printf '{\"openapi\":\"3.1.0\",\"formatted\":true}\\n' > generated/openapi.json",
+            ])
+            .run(&mut out, &cx())
+            .unwrap();
+
+        let artifact = out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "generated/openapi.json")
+            .unwrap();
+        assert_eq!(
+            artifact.text,
+            "{\"openapi\":\"3.1.0\",\"formatted\":true}\n"
+        );
+    }
+
+    #[test]
+    fn format_command_rejects_undeclared_artifacts() {
+        let mut out = Artifacts::new();
+        out.write("generated/openapi.json", "{}\n");
+        let err = FormatCommand::new("sh")
+            .args([
+                "-c",
+                "mkdir -p generated && printf x > generated/extra.json",
+            ])
+            .run(&mut out, &cx())
+            .unwrap_err();
+        assert!(err.to_string().contains("undeclared artifact"), "{err}");
     }
 }
