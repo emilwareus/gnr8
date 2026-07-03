@@ -5220,14 +5220,14 @@ mod tests {
         std::fs::create_dir_all(project.join("internal/dto")).unwrap();
         std::fs::write(
             project.join("go.mod"),
-            r#"module example.com/scoped
+            r"module example.com/scoped
 
 go 1.22
 
 require github.com/gin-gonic/gin v0.0.0
 
 replace github.com/gin-gonic/gin => ./ginstub
-"#,
+",
         )
         .unwrap();
         std::fs::write(
@@ -5237,7 +5237,7 @@ replace github.com/gin-gonic/gin => ./ginstub
         .unwrap();
         std::fs::write(
             project.join("ginstub/gin.go"),
-            r#"package gin
+            r"package gin
 
 type HandlerFunc func(*Context)
 type Engine struct{}
@@ -5246,7 +5246,7 @@ type Context struct{}
 func (e *Engine) POST(string, HandlerFunc) {}
 func (c *Context) ShouldBindJSON(any) error { return nil }
 func (c *Context) JSON(int, any) {}
-"#,
+",
         )
         .unwrap();
         std::fs::write(
