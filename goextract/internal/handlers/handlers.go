@@ -296,7 +296,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	optionalBindPositions := collectOptionalBindPositions(h)
 	hasBodyBind := false
 	allBodyBindsOptional := true
-	delegatedSeen := map[string]bool{}
+	delegatedResponseSeen := map[string]bool{}
+	delegatedBodySeen := map[string]bool{}
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -312,7 +313,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				hasBodyBind = true
 				allBodyBindsOptional = false
 			}
-			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedSeen, contentTypeHint)
+			a.analyzeDelegatedRequestBodies(h, call, &cf, delegatedBodySeen, &hasBodyBind, &allBodyBindsOptional)
+			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedResponseSeen, contentTypeHint)
 			a.analyzePathHelperCall(h, call, &cf, seenParam)
 			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
 			return true
@@ -630,13 +632,39 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	if nestedQueryHelperOutranks(h.info, call, query) {
 		return
 	}
-	param, ok := queryParamFromHelper(h.info, call, query, pname, h.fset)
+	param, ok := a.queryParamFromHelper(h, call, query, pname)
 	if !ok {
 		return
 	}
 	seenParam["query/"+pname] = true
 	cf.Params = append(cf.Params, param)
 	_ = route
+}
+
+func (a *Analyzer) queryParamFromHelper(
+	h handlerDecl,
+	helper *ast.CallExpr,
+	query *ast.CallExpr,
+	name string,
+) (facts.ParamFact, bool) {
+	schema, ok := queryHelperSchema(h.info.TypeOf(helper), helper)
+	if !ok {
+		return facts.ParamFact{}, false
+	}
+	required := queryHelperRequired(h.info, helper, query)
+	if fn := calledFuncObject(h.info, helper.Fun); fn != nil {
+		if callee, ok := a.samePackageCallee(h, fn); ok {
+			required = queryHelperRequiredFromDirectCallee(h.info, helper, callee, query)
+		}
+	}
+	return facts.ParamFact{
+		Name:     name,
+		Location: "query",
+		Required: required,
+		Schema:   schema,
+		Default:  firstLiteral(queryDefaultValue(h.info, query), queryHelperDefault(h.info, helper, query)),
+		Span:     spanOf(h.fset, query.Pos()),
+	}, true
 }
 
 func (a *Analyzer) queryParamFromSamePackageHelper(h handlerDecl, call *ast.CallExpr) (facts.ParamFact, bool) {
@@ -842,6 +870,74 @@ func (a *Analyzer) analyzeDelegatedResponses(
 	})
 }
 
+func (a *Analyzer) analyzeDelegatedRequestBodies(
+	h handlerDecl,
+	call *ast.CallExpr,
+	cf *CodeFacts,
+	seenHelpers map[string]bool,
+	hasBodyBind *bool,
+	allBodyBindsOptional *bool,
+) {
+	if callUsesTypeArgs(call) {
+		return
+	}
+	callee, ok := a.delegatedGinContextHelper(h, call)
+	if !ok {
+		return
+	}
+	key := callee.identityKey()
+	if seenHelpers[key] {
+		return
+	}
+	seenHelpers[key] = true
+
+	optionalBindPositions := collectOptionalBindPositions(callee)
+	ast.Inspect(callee.decl.Body, func(n ast.Node) bool {
+		nested, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(callee.info, nested)
+		if !ok || recvPkg != routes.GinPkgPath {
+			a.analyzeDelegatedRequestBodies(callee, nested, cf, seenHelpers, hasBodyBind, allBodyBindsOptional)
+			return true
+		}
+		switch name {
+		case "ShouldBindJSON", "BindJSON":
+			if ref, _, ok := a.bindRequestType(callee.info, nested); ok {
+				cf.RequestBody = ref
+				cf.RequestBodyContentType = "application/json"
+				*hasBodyBind = true
+				if !optionalBindPositions[nested.Pos()] {
+					*allBodyBindsOptional = false
+				}
+			}
+		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
+			if ref, bound, ok := a.bindRequestType(callee.info, nested); ok {
+				cf.RequestBody = ref
+				cf.RequestBodyContentType = bindContentType(name, callee.info, nested, bound)
+				*hasBodyBind = true
+				if !optionalBindPositions[nested.Pos()] {
+					*allBodyBindsOptional = false
+				}
+			}
+		}
+		return true
+	})
+}
+
+func callUsesTypeArgs(call *ast.CallExpr) bool {
+	if call == nil {
+		return false
+	}
+	switch call.Fun.(type) {
+	case *ast.IndexExpr, *ast.IndexListExpr:
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *Analyzer) delegatedGinContextHelper(h handlerDecl, call *ast.CallExpr) (handlerDecl, bool) {
 	if !callPassesGinContext(h.info, call) {
 		return handlerDecl{}, false
@@ -1040,27 +1136,6 @@ func isGinQueryMethod(name string) bool {
 	}
 }
 
-func queryParamFromHelper(
-	info *gotypes.Info,
-	helper *ast.CallExpr,
-	query *ast.CallExpr,
-	name string,
-	fset *token.FileSet,
-) (facts.ParamFact, bool) {
-	schema, ok := queryHelperSchema(info.TypeOf(helper), helper)
-	if !ok {
-		return facts.ParamFact{}, false
-	}
-	return facts.ParamFact{
-		Name:     name,
-		Location: "query",
-		Required: queryHelperRequired(info, helper, query),
-		Schema:   schema,
-		Default:  firstLiteral(queryDefaultValue(info, query), queryHelperDefault(info, helper, query)),
-		Span:     spanOf(fset, query.Pos()),
-	}, true
-}
-
 func queryDefaultValue(info *gotypes.Info, query *ast.CallExpr) *facts.LiteralValue {
 	if query == nil || selectorName(query.Fun) != "DefaultQuery" || len(query.Args) < 2 {
 		return nil
@@ -1162,6 +1237,37 @@ func queryHelperRequiredFromCallee(info *gotypes.Info, helper *ast.CallExpr, cal
 	return helperReturnsError(info, helper)
 }
 
+func queryHelperRequiredFromDirectCallee(info *gotypes.Info, helper *ast.CallExpr, callee handlerDecl, query *ast.CallExpr) bool {
+	lowerName := strings.ToLower(selectorName(helper.Fun))
+	if strings.Contains(lowerName, "optional") {
+		return false
+	}
+	if queryHelperDefault(info, helper, query) != nil {
+		return false
+	}
+	if queryDefaultValue(info, query) != nil {
+		return false
+	}
+	if selectorName(query.Fun) == "DefaultQuery" || selectorName(query.Fun) == "GetQuery" {
+		return false
+	}
+	if strings.Contains(lowerName, "required") {
+		return true
+	}
+	sig := signatureOf(info, helper.Fun)
+	if sig != nil && sig.Params() != nil {
+		for i, arg := range helper.Args {
+			if i >= sig.Params().Len() || !exprContainsCall(arg, query) {
+				continue
+			}
+			if helperParamEmptyStringTolerant(callee, sig.Params().At(i)) {
+				return false
+			}
+		}
+	}
+	return helperReturnsError(info, helper)
+}
+
 func signatureOf(info *gotypes.Info, expr ast.Expr) *gotypes.Signature {
 	sig, _ := gotypes.Unalias(info.TypeOf(expr)).(*gotypes.Signature)
 	return sig
@@ -1221,7 +1327,7 @@ func helperEmptyStringTolerant(h handlerDecl, query *ast.CallExpr) bool {
 			if !ok || len(ret.Results) == 0 {
 				continue
 			}
-			if isNilIdent(ret.Results[len(ret.Results)-1]) {
+			if returnTreatsEmptyStringAsOptional(ret) {
 				found = true
 				return false
 			}
@@ -1229,6 +1335,47 @@ func helperEmptyStringTolerant(h handlerDecl, query *ast.CallExpr) bool {
 		return true
 	})
 	return found
+}
+
+func helperParamEmptyStringTolerant(h handlerDecl, param *gotypes.Var) bool {
+	if h.decl == nil || h.decl.Body == nil || param == nil {
+		return false
+	}
+	queryVars := map[gotypes.Object]bool{param: true}
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok || !exprChecksEmptyString(h.info, ifStmt.Cond, queryVars) {
+			return true
+		}
+		for _, stmt := range ifStmt.Body.List {
+			ret, ok := stmt.(*ast.ReturnStmt)
+			if !ok || len(ret.Results) == 0 {
+				continue
+			}
+			if returnTreatsEmptyStringAsOptional(ret) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func returnTreatsEmptyStringAsOptional(ret *ast.ReturnStmt) bool {
+	if ret == nil || len(ret.Results) < 2 || !isNilIdent(ret.Results[len(ret.Results)-1]) {
+		return false
+	}
+	for _, result := range ret.Results[:len(ret.Results)-1] {
+		if isNilIdent(result) {
+			return true
+		}
+	}
+	return false
 }
 
 func queryResultVars(h handlerDecl, query *ast.CallExpr) map[gotypes.Object]bool {

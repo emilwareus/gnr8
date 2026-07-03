@@ -14,6 +14,8 @@
 mod emit;
 mod gofmt;
 
+use std::collections::BTreeSet;
+
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
@@ -204,6 +206,7 @@ fn generate_go_openapi_generator_compat_files(
     if let Some(error_model) = &options.error_model {
         validate_go_error_model_name(error_model)?;
     }
+    validate_go_compat_options(graph, &options)?;
     let resolved_aliases = aliases.resolve(graph)?;
     let compat_options = emit::GoEmitOptions {
         compat_model_helpers: true,
@@ -247,12 +250,137 @@ fn generate_go_openapi_generator_compat_files(
     Ok(files)
 }
 
+fn validate_go_compat_options(
+    graph: &ApiGraph,
+    options: &GoSdkOptions,
+) -> Result<(), crate::CoreError> {
+    let request_names: BTreeSet<String> = graph
+        .operations
+        .iter()
+        .map(emit::compat_request_name)
+        .collect();
+    let operation_ids: BTreeSet<&str> = graph.operations.iter().map(|op| op.id.as_str()).collect();
+
+    for request in options.request_builder_aliases.request_names() {
+        if !request_names.contains(&request) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk request_builder_aliases references unknown request builder '{request}'"
+                ),
+            });
+        }
+    }
+    for (request, aliases) in &options.request_builder_aliases.body {
+        for alias in aliases {
+            validate_go_exported_method_name(alias, "request_builder_aliases body setter")?;
+        }
+        if !request_names.contains(request) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk request_builder_aliases references unknown request builder '{request}'"
+                ),
+            });
+        }
+    }
+    for (request, aliases) in &options.request_builder_aliases.query {
+        for alias in aliases {
+            validate_go_exported_method_name(
+                &alias.setter,
+                "request_builder_aliases query setter",
+            )?;
+        }
+        if !request_names.contains(request) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk request_builder_aliases references unknown request builder '{request}'"
+                ),
+            });
+        }
+    }
+    validate_go_request_builder_alias_conflicts(options)?;
+    for request in options.execute_compatibility.request_names() {
+        if !request_names.contains(request) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk execute_compatibility references unknown request builder '{request}'"
+                ),
+            });
+        }
+    }
+    for operation in options.execute_compatibility.operation_names() {
+        if !operation_ids.contains(operation.as_str()) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk execute_compatibility references unknown operation '{operation}'"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_go_request_builder_alias_conflicts(
+    options: &GoSdkOptions,
+) -> Result<(), crate::CoreError> {
+    for request in options.request_builder_aliases.request_names() {
+        let mut methods = BTreeSet::new();
+        for alias in options.request_builder_aliases.body_aliases_for(&request) {
+            validate_go_request_builder_alias_method(&request, &alias, &mut methods)?;
+        }
+        for alias in options.request_builder_aliases.query_aliases_for(&request) {
+            validate_go_request_builder_alias_method(&request, &alias.setter, &mut methods)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_go_request_builder_alias_method(
+    request: &str,
+    alias: &str,
+    methods: &mut BTreeSet<String>,
+) -> Result<(), crate::CoreError> {
+    for method in emit::compat_method_names(alias) {
+        if emit::compat_request_reserved_method(&method) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk request_builder_aliases for '{request}' conflicts with reserved method '{method}'"
+                ),
+            });
+        }
+        if !methods.insert(method.clone()) {
+            return Err(crate::CoreError::Config {
+                message: format!(
+                    "GoSdk request_builder_aliases for '{request}' contains conflicting method '{method}'"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Wrap a raw emitted file as a named [`SdkFile`] before batched formatting.
 fn raw_go_file(name: impl Into<String>, raw: impl Into<String>) -> SdkFile {
     SdkFile {
         name: name.into(),
         contents: raw.into(),
     }
+}
+
+fn validate_go_exported_method_name(name: &str, field: &str) -> Result<(), crate::CoreError> {
+    if is_go_identifier(name)
+        && !is_go_keyword(name)
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(crate::CoreError::Config {
+        message: format!(
+            "GoSdk {field} must be a valid exported Go method identifier, got '{name}'"
+        ),
+    })
 }
 
 fn validate_go_error_model_name(name: &str) -> Result<(), crate::CoreError> {
@@ -320,7 +448,10 @@ mod tests {
         ApiGraph, Field, Param, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
         Type, WellKnown,
     };
-    use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
+    use crate::sdk::go::{
+        GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases, GoSdkOptions,
+        QueryTimeFormat, RequiredPointerConstructorPolicy,
+    };
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
@@ -1100,6 +1231,190 @@ mod tests {
         assert!(
             model.contains("this.TargetDirection = &targetDirection"),
             "{model}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_emits_request_builder_aliases() {
+        if !gofmt_available() {
+            eprintln!("skipping request builder aliases test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        graph.operations[0].handler = "createThingPost".to_string();
+        graph.operations[0].id = "createThingPost".to_string();
+        graph.operations[0].group = Some("thing".to_string());
+        graph.operations[1].handler = "updateThingPost".to_string();
+        graph.operations[1].id = "updateThingPost".to_string();
+        graph.operations[1].group = Some("thing".to_string());
+
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases = GoRequestBuilderAliases::new()
+            .body("ApiCreateThingPostRequest", "Thing")
+            .body("ApiCreateThingPostRequest", "Input")
+            .query("ApiUpdateThingPostRequest", "BranchId", "branchId");
+
+        let files = generate_files_with_profile_options(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.name == "api_thing.go")
+            .unwrap()
+            .contents
+            .as_str();
+        for snippet in [
+            "func (r ApiCreateThingPostRequest) Thing(thing any) ApiCreateThingPostRequest",
+            "func (r ApiCreateThingPostRequest) Input(input any) ApiCreateThingPostRequest",
+            "func (r ApiUpdateThingPostRequest) BranchId(branchId any) ApiUpdateThingPostRequest",
+            "r.extraQuery[\"branchId\"] = branchId",
+        ] {
+            assert!(api.contains(snippet), "missing {snippet}:\n{api}");
+        }
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_can_emit_any_query_setters() {
+        if !gofmt_available() {
+            eprintln!("skipping any query setters test: gofmt unavailable");
+            return;
+        }
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.query_setter_argument_policy = GoQuerySetterArgumentPolicy::Any;
+
+        let files = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiListGoalsRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            api.contains(
+                "func (r ApiListGoalsRequest) Aggregation(aggregation any) ApiListGoalsRequest"
+            ),
+            "{api}"
+        );
+        assert!(
+            api.contains("r.extraQuery[\"aggregation\"] = aggregation"),
+            "{api}"
+        );
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_preserves_selected_legacy_execute() {
+        if !gofmt_available() {
+            eprintln!("skipping execute compatibility test: gofmt unavailable");
+            return;
+        }
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.execute_compatibility =
+            GoExecuteCompatibility::preserve_legacy().request("ApiListGoalsRequest");
+
+        let files = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap();
+        let list_api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiListGoalsRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            list_api.contains("func (r ApiListGoalsRequest) Execute() (*http.Response, error)"),
+            "{list_api}"
+        );
+        assert!(
+            list_api.contains("_, resp, err := r.ExecuteTyped()"),
+            "{list_api}"
+        );
+        assert!(
+            list_api.contains("func (r ApiListGoalsRequest) ExecuteTyped() (*ListGoalsOutput, *http.Response, error)"),
+            "{list_api}"
+        );
+
+        let create_api = files
+            .iter()
+            .find(|file| file.contents.contains("type ApiCreateGoalRequest struct"))
+            .unwrap()
+            .contents
+            .as_str();
+        assert!(
+            create_api.contains(
+                "func (r ApiCreateGoalRequest) Execute() (*CommandMessage, *http.Response, error)"
+            ),
+            "{create_api}"
+        );
+        assert!(!create_api.contains("ExecuteTyped()"), "{create_api}");
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_unknown_execute_selector() {
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.execute_compatibility =
+            GoExecuteCompatibility::preserve_legacy().request("ApiMissingRequest");
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown request builder"), "{err}");
+    }
+
+    #[test]
+    fn go_openapi_generator_profile_rejects_conflicting_request_builder_aliases() {
+        let profile = SdkProfile::go_openapi_generator_compat();
+        let mut options = GoSdkOptions::for_profile(&profile);
+        options.request_builder_aliases = GoRequestBuilderAliases::new()
+            .body("ApiCreateGoalRequest", "ThingID")
+            .query("ApiCreateGoalRequest", "ThingId", "thingId");
+
+        let err = generate_files_with_profile_options(
+            &sample_graph(),
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            &SdkTypeAliases::default(),
+            &profile,
+            options,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("conflicting method"),
+            "unexpected error: {err}"
         );
     }
 

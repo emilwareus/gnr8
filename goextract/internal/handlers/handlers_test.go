@@ -939,6 +939,222 @@ func parseEnvelope[T any](c *gin.Context) (T, error) {
 	}
 }
 
+func TestDelegatedSamePackageJSONBindHelperInfersRequestBody(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/delegatedbody
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package delegatedbody
+
+import "github.com/gin-gonic/gin"
+
+type HttpServer struct{ R *gin.Engine }
+type CreateEventInput struct { Name string `+"`json:\"name\"`"+` }
+type CreatedResponse struct { OK bool `+"`json:\"ok\"`"+` }
+type ErrorResponse struct { Message string `+"`json:\"message\"`"+` }
+
+func (h HttpServer) Register() {
+	h.R.POST("/events", h.publishEvent)
+}
+
+func (h HttpServer) publishEvent(c *gin.Context) {
+	input, err := h.bindEventInput(c)
+	if err != nil {
+		c.JSON(400, ErrorResponse{})
+		return
+	}
+	_ = input
+	c.JSON(201, CreatedResponse{})
+}
+
+func (h HttpServer) bindEventInput(c *gin.Context) (CreateEventInput, error) {
+	var input CreateEventInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		return CreateEventInput{}, err
+	}
+	return input, nil
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load delegated body: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/delegatedbody", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	assertBodySuffix(t, cf.RequestBody, "CreateEventInput")
+	if !cf.RequestBodyRequired || cf.RequestBodyContentType != "application/json" {
+		t.Fatalf("delegated JSON bind should be required application/json, got required=%v content_type=%q", cf.RequestBodyRequired, cf.RequestBodyContentType)
+	}
+}
+
+func TestHelperBasedQueryPatternsInferConcreteSchemasRequirednessAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/querypatterns
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v0.0.0
+	github.com/google/uuid v0.0.0
+)
+
+replace github.com/gin-gonic/gin => ./ginstub
+replace github.com/google/uuid => ./uuidstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "uuidstub"), 0o755); err != nil {
+		t.Fatalf("mkdir uuidstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Query(string) string { return "" }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "uuidstub", "go.mod"), "module github.com/google/uuid\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "uuidstub", "uuid.go"), `package uuid
+
+type UUID [16]byte
+
+var Nil UUID
+
+func Parse(string) (UUID, error) { return UUID{}, nil }
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package querypatterns
+
+import (
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type Server struct{ R *gin.Engine }
+type Result struct { OK bool `+"`json:\"ok\"`"+` }
+
+func (s Server) Register() {
+	s.R.GET("/things", s.listThings)
+}
+
+func (s Server) listThings(c *gin.Context) {
+	branchID, branchErr := optionalQueryUUID(c, "branchId")
+	id, idErr := requiredQueryUUID(c, "id")
+	pageSize, pageErr := optionalUintQuery(c, "pageSize", 20)
+	startDate, timeErr := ParseTime(c.Query("startDate"))
+	_, _, _, _, _, _, _, _ = branchID, branchErr, id, idErr, pageSize, pageErr, startDate, timeErr
+	c.JSON(200, Result{})
+}
+
+func optionalQueryUUID(c *gin.Context, key string) (*uuid.UUID, error) {
+	value := c.Query(key)
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func requiredQueryUUID(c *gin.Context, key string) (uuid.UUID, error) {
+	value := c.Query(key)
+	if value == "" {
+		return uuid.Nil, errors.New("missing")
+	}
+	return uuid.Parse(value)
+}
+
+func optionalUintQuery(c *gin.Context, key string, defaultValue uint) (uint, error) {
+	value := c.Query(key)
+	if value == "" {
+		return defaultValue, nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint(parsed), nil
+}
+
+func ParseTime(value string) (*time.Time, error) {
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load query patterns: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/querypatterns", diags)
+	var cf handlers.CodeFacts
+	for _, r := range routes.Recognize(res) {
+		cf = analyzer.Analyze(r, diags)
+	}
+	branch, ok := paramByName(cf.Params, "branchId")
+	if !ok || branch.Required || branch.Schema.Type != facts.TypeWellKnown || branch.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("branchId should be optional uuid query param, got %+v", branch)
+	}
+	id, ok := paramByName(cf.Params, "id")
+	if !ok || !id.Required || id.Schema.Type != facts.TypeWellKnown || id.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("id should be required uuid query param, got %+v", id)
+	}
+	pageSize, ok := paramByName(cf.Params, "pageSize")
+	if !ok || pageSize.Required || primName(pageSize.Schema) != facts.PrimInt || pageSize.Default == nil || pageSize.Default.Type != "number" || pageSize.Default.Value != "20" {
+		t.Fatalf("pageSize should be optional int query param with default 20, got %+v", pageSize)
+	}
+	startDate, ok := paramByName(cf.Params, "startDate")
+	if !ok || startDate.Required || startDate.Schema.Type != facts.TypeWellKnown || startDate.Schema.Of != facts.WellKnownDateTime {
+		t.Fatalf("startDate should be optional date_time query param, got %+v", startDate)
+	}
+	for _, item := range diags.Items() {
+		if strings.Contains(item.Message, "untyped query param") {
+			t.Fatalf("typed helper query params should not emit untyped diagnostics: %+v", item)
+		}
+	}
+}
+
 func TestGetRawDataWithJSONUsageSynthesizesFreeFormJSONBody(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/rawjsonbody

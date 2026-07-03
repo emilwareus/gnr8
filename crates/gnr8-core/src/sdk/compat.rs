@@ -412,6 +412,13 @@ struct ParsedTsFile {
     operation_signatures: BTreeMap<String, String>,
 }
 
+#[derive(Default)]
+struct TsInterfaceState {
+    name: String,
+    depth: i32,
+    property: String,
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single-pass parser state is easier to audit together"
@@ -420,7 +427,7 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
     let mut parsed = ParsedTsFile::default();
     let mut current_api_class: Option<(String, i32)> = None;
     let mut current_api_factory: Option<(String, i32)> = None;
-    let mut current_interface: Option<(String, i32)> = None;
+    let mut current_interface: Option<TsInterfaceState> = None;
     for raw in text.lines() {
         let line = raw.trim();
         let mut starts_api_class = false;
@@ -437,7 +444,11 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
                 .or_default();
             let depth = brace_delta(line);
             if depth > 0 {
-                current_interface = Some((name.to_string(), depth));
+                current_interface = Some(TsInterfaceState {
+                    name: name.to_string(),
+                    depth,
+                    property: String::new(),
+                });
                 starts_interface = true;
             }
         } else if let Some(name) = strip_export_decl(line, "type") {
@@ -509,18 +520,12 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         }
 
         let mut close_interface = false;
-        if let Some((interface_name, depth)) = &mut current_interface {
+        if let Some(interface) = &mut current_interface {
             if !starts_interface {
-                if let Some((property, shape)) = parse_interface_property(line) {
-                    parsed
-                        .interface_properties
-                        .entry(interface_name.clone())
-                        .or_default()
-                        .insert(property, shape);
-                }
-                *depth += brace_delta(line);
+                collect_interface_property(line, interface, &mut parsed.interface_properties);
+                interface.depth += brace_delta(line);
             }
-            if *depth <= 0 {
+            if interface.depth <= 0 {
                 close_interface = true;
             }
         }
@@ -529,6 +534,79 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         }
     }
     parsed
+}
+
+fn collect_interface_property(
+    line: &str,
+    state: &mut TsInterfaceState,
+    properties: &mut BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+) {
+    if state.property.is_empty()
+        && (line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.starts_with('[')
+            || line.starts_with('}'))
+    {
+        return;
+    }
+    if !state.property.is_empty() {
+        state.property.push(' ');
+    }
+    state.property.push_str(line);
+    if !interface_property_decl_complete(&state.property) {
+        return;
+    }
+    if let Some((property, shape)) = parse_interface_property(&state.property) {
+        properties
+            .entry(state.name.clone())
+            .or_default()
+            .insert(property, shape);
+    }
+    state.property.clear();
+}
+
+fn interface_property_decl_complete(decl: &str) -> bool {
+    let mut quote = None;
+    let mut escape = false;
+    let mut angle_depth = 0_u32;
+    let mut square_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    for ch in decl.chars() {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '[' => square_depth += 1,
+            ']' if square_depth > 0 => square_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            ';' | ','
+                if angle_depth == 0
+                    && square_depth == 0
+                    && brace_depth == 0
+                    && paren_depth == 0 =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn brace_delta(line: &str) -> i32 {
@@ -1411,6 +1489,55 @@ mod tests {
         assert_eq!(
             diff.operation_signature_changes[0].new,
             "async createBook(): Promise<Book>"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_diff_normalizes_multiline_interface_property_types() {
+        let old = temp_dir("ts-old-multiline-property");
+        let new = temp_dir("ts-new-multiline-property");
+        for dir in [&old, &new] {
+            std::fs::write(
+                dir.join("index.ts"),
+                "export interface BranchApiInterface extends LegacyApiInterface {\n  /** Delete a branch. */\n  ingestBranchesBranchIdDelete: LegacyApiMethod<\n    models.CommandMessage,\n    [request: { branchId: string }]\n  >;\n}\n",
+            )
+            .unwrap();
+        }
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert!(
+            diff.interface_type_changes.is_empty(),
+            "unchanged multiline property type should not diff: {:?}",
+            diff.interface_type_changes
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_diff_still_reports_real_multiline_interface_property_type_changes() {
+        let old = temp_dir("ts-old-real-multiline-property");
+        let new = temp_dir("ts-new-real-multiline-property");
+        std::fs::write(
+            old.join("index.ts"),
+            "export interface BranchApiInterface {\n  ingestBranchesBranchIdDelete: LegacyApiMethod<\n    models.CommandMessage,\n    [request: { branchId: string }]\n  >;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            "export interface BranchApiInterface {\n  ingestBranchesBranchIdDelete: LegacyApiMethod<\n    models.OtherMessage,\n    [request: { branchId: string }]\n  >;\n}\n",
+        )
+        .unwrap();
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert_eq!(diff.interface_type_changes.len(), 1);
+        assert_eq!(
+            diff.interface_type_changes[0].property,
+            "ingestBranchesBranchIdDelete"
         );
 
         let _ = std::fs::remove_dir_all(old);

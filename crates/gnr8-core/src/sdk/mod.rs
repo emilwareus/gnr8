@@ -253,6 +253,18 @@ pub trait PostProcess {
     ///
     /// Returns a typed [`CoreError`] if the post-processing step fails. Never panics.
     fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
+
+    /// Extra cache key material for this post-processor.
+    ///
+    /// Command-backed post-processors include their command line and executable metadata here so
+    /// artifact-cache hits cannot hide formatter changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the post-processor cannot compute stable cache-key input.
+    fn cache_key_fragment(&self, _cx: &Cx) -> Result<Vec<u8>, CoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The composed generation pipeline: the user builds this and hands it to [`crate::runner::run`].
@@ -301,6 +313,12 @@ impl Pipeline {
     pub fn post(mut self, p: impl PostProcess + 'static) -> Self {
         self.posts.push(Box::new(p));
         self
+    }
+
+    /// Append a post-write command/hook that rewrites generated artifacts before the host owns them.
+    #[must_use]
+    pub fn post_write(self, p: impl PostProcess + 'static) -> Self {
+        self.post(p)
     }
 
     /// Project-relative output anchors declared by every target in this pipeline.
@@ -422,7 +440,8 @@ impl Pipeline {
         // Collect diagnostics off the frozen IR (clone so the borrow ends before targets read `ir`).
         let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
         let target_inputs = self.target_cache_input_files(cx)?;
-        let cache_key = artifact_cache_key(&ir, cx, &target_inputs)?;
+        let post_cache_key = self.post_cache_key(cx)?;
+        let cache_key = artifact_cache_key(&ir, cx, &target_inputs, &post_cache_key)?;
         if compact_cache_hit && artifact_cache_exists(cx, &cache_key) {
             return Ok(RunOutcome {
                 artifacts: Artifacts::new(),
@@ -465,6 +484,15 @@ impl Pipeline {
         files.dedup();
         Ok(files)
     }
+
+    fn post_cache_key(&self, cx: &Cx) -> Result<Vec<u8>, CoreError> {
+        let mut out = Vec::new();
+        for post in &self.posts {
+            out.extend(post.cache_key_fragment(cx)?);
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -481,6 +509,7 @@ fn artifact_cache_key(
     ir: &ApiGraph,
     cx: &Cx,
     target_inputs: &[PathBuf],
+    post_cache_key: &[u8],
 ) -> Result<String, CoreError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-artifact-cache-v3\n");
@@ -494,6 +523,8 @@ fn artifact_cache_key(
     hasher.update(config_surface_fingerprint(cx).as_bytes());
     hasher.update(b"\n");
     hasher.update(hash_files(target_inputs, &cx.project_root).as_bytes());
+    hasher.update(b"\n");
+    hasher.update(post_cache_key);
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -853,13 +884,16 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, GoGin, GoSdk, GroupOperations,
-        Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
-        OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam, RenameOperation, RenameType,
-        SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk,
+        GroupOperations, Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
+        RenameOperation, RenameType, SdkOperationAliases, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
-    pub use super::go::{GoRequestBuilderScope, QueryTimeFormat, RequiredPointerConstructorPolicy};
+    pub use super::go::{
+        GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
+        GoRequestBuilderScope, QueryTimeFormat, RequiredPointerConstructorPolicy,
+    };
     pub use super::layout::SdkFileLayout;
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;

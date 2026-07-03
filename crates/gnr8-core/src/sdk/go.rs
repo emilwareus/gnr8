@@ -1,5 +1,7 @@
 //! Go SDK surface policies.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::sdk::profile::SdkProfile;
 
 /// How OpenAPI Generator-compatible model constructors accept required pointer fields.
@@ -82,6 +84,144 @@ impl GoRequestBuilderScope {
     }
 }
 
+/// How OpenAPI Generator-compatible query setter arguments are typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GoQuerySetterArgumentPolicy {
+    /// Use the query parameter's generated Go type.
+    #[default]
+    Typed,
+    /// Accept `any` and serialize through compatibility query helpers.
+    Any,
+}
+
+impl GoQuerySetterArgumentPolicy {
+    /// Use typed query setter arguments.
+    #[must_use]
+    pub const fn typed() -> Self {
+        Self::Typed
+    }
+
+    /// Accept `any` query setter arguments.
+    #[must_use]
+    pub const fn any() -> Self {
+        Self::Any
+    }
+
+    pub(crate) const fn is_any(self) -> bool {
+        matches!(self, Self::Any)
+    }
+}
+
+/// Additional methods to emit on OpenAPI Generator-compatible request builders.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoRequestBuilderAliases {
+    pub(crate) body: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) query: BTreeMap<String, BTreeSet<GoRequestBuilderQueryAlias>>,
+}
+
+/// A query setter alias for a single request builder.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GoRequestBuilderQueryAlias {
+    pub(crate) setter: String,
+    pub(crate) query_name: String,
+}
+
+impl GoRequestBuilderAliases {
+    /// Create an empty request-builder alias set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add an alias body setter to a request builder type.
+    #[must_use]
+    pub fn body(mut self, request: impl Into<String>, setter: impl Into<String>) -> Self {
+        self.body
+            .entry(request.into())
+            .or_default()
+            .insert(setter.into());
+        self
+    }
+
+    /// Add an alias query setter to a request builder type.
+    #[must_use]
+    pub fn query(
+        mut self,
+        request: impl Into<String>,
+        setter: impl Into<String>,
+        query_name: impl Into<String>,
+    ) -> Self {
+        self.query
+            .entry(request.into())
+            .or_default()
+            .insert(GoRequestBuilderQueryAlias {
+                setter: setter.into(),
+                query_name: query_name.into(),
+            });
+        self
+    }
+
+    pub(crate) fn body_aliases_for(&self, request: &str) -> Vec<String> {
+        self.body
+            .get(request)
+            .map(|aliases| aliases.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn query_aliases_for(&self, request: &str) -> Vec<GoRequestBuilderQueryAlias> {
+        self.query
+            .get(request)
+            .map(|aliases| aliases.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn request_names(&self) -> BTreeSet<String> {
+        self.body.keys().chain(self.query.keys()).cloned().collect()
+    }
+}
+
+/// Compatibility wrappers for OpenAPI Generator-compatible `Execute` methods.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GoExecuteCompatibility {
+    preserve_legacy_requests: BTreeSet<String>,
+    preserve_legacy_operations: BTreeSet<String>,
+}
+
+impl GoExecuteCompatibility {
+    /// Preserve selected old `Execute() (*http.Response, error)` signatures.
+    #[must_use]
+    pub fn preserve_legacy() -> Self {
+        Self::default()
+    }
+
+    /// Preserve the legacy `Execute` signature for a request builder type.
+    #[must_use]
+    pub fn request(mut self, request: impl Into<String>) -> Self {
+        self.preserve_legacy_requests.insert(request.into());
+        self
+    }
+
+    /// Preserve the legacy `Execute` signature for an operation id.
+    #[must_use]
+    pub fn operation(mut self, operation: impl Into<String>) -> Self {
+        self.preserve_legacy_operations.insert(operation.into());
+        self
+    }
+
+    pub(crate) fn preserves(&self, request: &str, operation: &str) -> bool {
+        self.preserve_legacy_requests.contains(request)
+            || self.preserve_legacy_operations.contains(operation)
+    }
+
+    pub(crate) fn request_names(&self) -> &BTreeSet<String> {
+        &self.preserve_legacy_requests
+    }
+
+    pub(crate) fn operation_names(&self) -> &BTreeSet<String> {
+        &self.preserve_legacy_operations
+    }
+}
+
 /// Go SDK compatibility options exposed by [`crate::sdk::builtins::GoSdk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GoSdkOptions {
@@ -89,6 +229,9 @@ pub(crate) struct GoSdkOptions {
     pub(crate) required_pointer_constructor_policy: RequiredPointerConstructorPolicy,
     pub(crate) query_time_format: QueryTimeFormat,
     pub(crate) request_builder_scope: GoRequestBuilderScope,
+    pub(crate) request_builder_aliases: GoRequestBuilderAliases,
+    pub(crate) query_setter_argument_policy: GoQuerySetterArgumentPolicy,
+    pub(crate) execute_compatibility: GoExecuteCompatibility,
 }
 
 impl GoSdkOptions {
@@ -98,6 +241,9 @@ impl GoSdkOptions {
             required_pointer_constructor_policy: RequiredPointerConstructorPolicy::PointerParam,
             query_time_format: QueryTimeFormat::Default,
             request_builder_scope: GoRequestBuilderScope::Operation,
+            request_builder_aliases: GoRequestBuilderAliases::default(),
+            query_setter_argument_policy: GoQuerySetterArgumentPolicy::Typed,
+            execute_compatibility: GoExecuteCompatibility::default(),
         }
     }
 
