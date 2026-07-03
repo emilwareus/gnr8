@@ -237,14 +237,11 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
 fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     match action {
         CompatAction::Typescript { old, new, contract } => {
-            if let Some(contract) = contract {
-                let path = std::path::Path::new(contract);
-                if !path.exists() {
-                    anyhow::bail!("compat contract does not exist: {contract}");
-                }
-            }
+            let contract_config = load_compat_contract(contract.as_deref())?;
             let diff = gnr8::sdk::compat::diff_typescript_dirs(old, new)?;
-            let breaking = diff.is_breaking();
+            let unallowed_missing_docs =
+                unallowed_missing_docs(&diff.missing_docs, &contract_config);
+            let breaking = diff.has_code_breaks() || !unallowed_missing_docs.is_empty();
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -253,6 +250,8 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     new: &'a str,
                     contract: Option<&'a str>,
                     breaking: bool,
+                    docs_breaking: bool,
+                    allowed_missing_docs: Vec<String>,
                     diff: gnr8::sdk::compat::TypeScriptSurfaceDiff,
                 }
                 println!(
@@ -263,6 +262,11 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         new,
                         contract: contract.as_deref(),
                         breaking,
+                        docs_breaking: diff.has_doc_breaks(),
+                        allowed_missing_docs: allowed_missing_docs(
+                            &diff.missing_docs,
+                            &unallowed_missing_docs
+                        ),
                         diff,
                     })?
                 );
@@ -275,6 +279,7 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                 print_compat_list("missing operation methods", &diff.missing_operation_methods);
                 print_compat_list("missing request aliases", &diff.missing_request_aliases);
                 print_compat_list("package entry changes", &diff.package_entry_point_changes);
+                print_compat_list("missing docs", &unallowed_missing_docs);
                 for missing in &diff.missing_interface_properties {
                     println!(
                         "  missing interface property: {}.{}",
@@ -321,14 +326,11 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
             Ok(())
         }
         CompatAction::Go { old, new, contract } => {
-            if let Some(contract) = contract {
-                let path = std::path::Path::new(contract);
-                if !path.exists() {
-                    anyhow::bail!("compat contract does not exist: {contract}");
-                }
-            }
+            let contract_config = load_compat_contract(contract.as_deref())?;
             let diff = gnr8::sdk::compat::diff_go_dirs(old, new)?;
-            let breaking = diff.is_breaking();
+            let unallowed_missing_docs =
+                unallowed_missing_docs(&diff.missing_docs, &contract_config);
+            let breaking = diff.has_code_breaks() || !unallowed_missing_docs.is_empty();
             if output.json {
                 #[derive(serde::Serialize)]
                 struct CompatReport<'a> {
@@ -337,6 +339,8 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     new: &'a str,
                     contract: Option<&'a str>,
                     breaking: bool,
+                    docs_breaking: bool,
+                    allowed_missing_docs: Vec<String>,
                     diff: gnr8::sdk::compat::GoSurfaceDiff,
                 }
                 println!(
@@ -347,6 +351,11 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                         new,
                         contract: contract.as_deref(),
                         breaking,
+                        docs_breaking: diff.has_doc_breaks(),
+                        allowed_missing_docs: allowed_missing_docs(
+                            &diff.missing_docs,
+                            &unallowed_missing_docs
+                        ),
                         diff,
                     })?
                 );
@@ -358,7 +367,7 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
                     &diff.missing_exported_functions,
                 );
                 print_compat_list("missing exported methods", &diff.missing_exported_methods);
-                print_compat_list("missing docs", &diff.missing_docs);
+                print_compat_list("missing docs", &unallowed_missing_docs);
                 print_compat_list("package metadata changes", &diff.package_metadata_changes);
                 for change in &diff.exported_function_signature_changes {
                     println!(
@@ -381,6 +390,58 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CompatContract {
+    #[serde(default)]
+    allow: CompatAllow,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CompatAllow {
+    #[serde(default)]
+    docs_layout_migration: bool,
+    #[serde(default)]
+    missing_docs: Vec<String>,
+}
+
+fn load_compat_contract(path: Option<&str>) -> Result<CompatContract> {
+    let Some(path) = path else {
+        return Ok(CompatContract::default());
+    };
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        anyhow::bail!("compat contract does not exist: {}", path.display());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let contract = toml::from_str(&text)?;
+    Ok(contract)
+}
+
+fn unallowed_missing_docs(missing_docs: &[String], contract: &CompatContract) -> Vec<String> {
+    if contract.allow.docs_layout_migration {
+        return Vec::new();
+    }
+    missing_docs
+        .iter()
+        .filter(|doc| {
+            !contract
+                .allow
+                .missing_docs
+                .iter()
+                .any(|allowed| allowed == *doc)
+        })
+        .cloned()
+        .collect()
+}
+
+fn allowed_missing_docs(missing_docs: &[String], unallowed: &[String]) -> Vec<String> {
+    missing_docs
+        .iter()
+        .filter(|doc| !unallowed.iter().any(|unallowed| unallowed == *doc))
+        .cloned()
+        .collect()
 }
 
 fn print_compat_list(label: &str, values: &[String]) {
@@ -1567,7 +1628,10 @@ fn fmt_duration(duration: Duration) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::reconcile_doctor_source_probe;
+    use super::{
+        allowed_missing_docs, reconcile_doctor_source_probe, unallowed_missing_docs, CompatAllow,
+        CompatContract,
+    };
     use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
@@ -1607,5 +1671,36 @@ mod tests {
 
         assert_eq!(language, "configured");
         assert!(present);
+    }
+
+    #[test]
+    fn compat_contract_can_allow_all_docs_layout_migration() {
+        let contract = CompatContract {
+            allow: CompatAllow {
+                docs_layout_migration: true,
+                missing_docs: Vec::new(),
+            },
+        };
+        let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
+
+        assert!(unallowed_missing_docs(&missing, &contract).is_empty());
+    }
+
+    #[test]
+    fn compat_contract_can_allow_selected_missing_docs_only() {
+        let contract = CompatContract {
+            allow: CompatAllow {
+                docs_layout_migration: false,
+                missing_docs: vec!["docs/Book.md".to_string()],
+            },
+        };
+        let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
+        let unallowed = unallowed_missing_docs(&missing, &contract);
+
+        assert_eq!(unallowed, vec!["docs/BooksApi.md".to_string()]);
+        assert_eq!(
+            allowed_missing_docs(&missing, &unallowed),
+            vec!["docs/Book.md".to_string()]
+        );
     }
 }

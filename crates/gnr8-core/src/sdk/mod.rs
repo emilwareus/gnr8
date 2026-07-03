@@ -30,6 +30,7 @@
 pub mod builtins;
 pub mod bundle;
 pub mod compat;
+pub mod docs;
 pub(crate) mod emit_common;
 pub mod go;
 pub mod layout;
@@ -890,6 +891,7 @@ pub mod prelude {
         RenameOperation, RenameType, SdkOperationAliases, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
+    pub use super::docs::SdkDocs;
     pub use super::go::{
         GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
         GoRequestBuilderScope, QueryTimeFormat, RequiredPointerConstructorPolicy,

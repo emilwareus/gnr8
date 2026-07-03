@@ -33,13 +33,15 @@ fn main() -> std::process::ExitCode {
                 TsSdk::new()
                     .module("@acme/books")
                     .to("generated/typescript")
-                    .profile(SdkProfile::typescript_fetch_compat()),
+                    .profile(SdkProfile::typescript_fetch_compat())
+                    .docs(SdkDocs::openapi_generator_compat().dir("docs")),
             )
             .target(
                 GoSdk::new()
                     .module("example.com/acme/books")
                     .to("generated/go")
-                    .profile(SdkProfile::go_openapi_generator_compat()),
+                    .profile(SdkProfile::go_openapi_generator_compat())
+                    .docs(SdkDocs::both()),
             ),
     )
 }
@@ -88,17 +90,61 @@ TsSdk::new()
             .model_file_template("models/{schema_kebab}.ts"),
     )
     .package_metadata(true)
-    .docs(true);
+    .docs(SdkDocs::both());
 
 GoSdk::new()
     .module("example.com/acme/books")
     .to("generated/go")
     .profile(SdkProfile::go_openapi_generator_compat())
-    .layout(SdkFileLayout::split().root_operations().root_models());
+    .layout(SdkFileLayout::split().root_operations().root_models())
+    .docs(SdkDocs::openapi_generator_compat().dir("docs"));
 ```
 
 Use `.source_only()` when a parent package or monorepo already owns docs/package metadata. Use
 `.without_docs()` or `.package_metadata(false)` when only one of those categories should be suppressed.
+Existing `.docs(true)` and `.docs(false)` calls still work; pass `SdkDocs` when the docs layout itself
+is part of the migration contract.
+
+Generated documentation modes:
+
+```rust
+GoSdk::new()
+    .docs(SdkDocs::reference()); // README.md + reference.md
+
+TsSdk::new()
+    .docs(SdkDocs::openapi_generator_compat().dir("docs")); // docs/BooksApi.md, docs/Book.md
+
+GoSdk::new()
+    .docs(SdkDocs::both().readme_links(true)); // both layouts with README links
+```
+
+`SdkDocs::openapi_generator_compat()` emits one markdown file per API group and one per model under
+the configured docs directory. Filenames are derived from generated SDK symbols, so a `books` group
+gets `docs/BooksApi.md` and a `CreateBookRequest` model gets `docs/CreateBookRequest.md`.
+
+## Docs Compatibility Contracts
+
+`gnr8 compat` reports missing docs separately from code API breaks. A migration can intentionally
+accept docs-layout churn without accepting code API breakage by passing a TOML contract:
+
+```toml
+[allow]
+docs_layout_migration = true
+```
+
+or allow only known removed docs:
+
+```toml
+[allow]
+missing_docs = ["docs/InternalDebugApi.md"]
+```
+
+Then run:
+
+```bash
+gnr8 compat typescript --old old-typescript-sdk --new generated/typescript --contract compat.toml
+gnr8 compat go --old old-go-sdk --new generated/go --contract compat.toml
+```
 
 ## Production Migration Patches
 
