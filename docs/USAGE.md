@@ -102,9 +102,13 @@ gnr8 --json compat typescript \
   --suggest
 ```
 
-Contract files are TOML. Every key is optional and defaults to an empty list.
+Contract files are TOML. Every key is optional and defaults to `false` or an empty list.
 
 ```toml
+[allow]
+docs_layout_migration = false
+missing_docs = []
+
 [go]
 require_exported_types = []
 require_exported_functions = []
@@ -136,6 +140,7 @@ allow_operation_return_type_changes = []     # "Class.method" or "Factory.method
 allow_operation_signature_changes = []       # "Class.method" or "Factory.method"
 allow_export_kind_mismatches = []
 allow_package_entry_point_changes = []
+allow_missing_docs = []
 ```
 
 Example gate:

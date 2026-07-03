@@ -39,6 +39,8 @@ pub struct TypeScriptSurface {
     pub operation_signatures: BTreeMap<String, String>,
     /// Package entry point fields.
     pub package_entry_points: BTreeMap<String, String>,
+    /// Documentation files present in the SDK package.
+    pub docs: Vec<String>,
 }
 
 /// TypeScript surface diff report.
@@ -76,6 +78,8 @@ pub struct TypeScriptSurfaceDiff {
     pub operation_signature_changes: Vec<TsOperationSignatureChange>,
     /// Package entry points changed or removed.
     pub package_entry_point_changes: Vec<String>,
+    /// Documentation files present in old but missing in new.
+    pub missing_docs: Vec<String>,
 }
 
 impl TypeScriptSurfaceDiff {
@@ -98,6 +102,34 @@ impl TypeScriptSurfaceDiff {
             || !self.operation_return_type_changes.is_empty()
             || !self.operation_signature_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
+            || !self.missing_docs.is_empty()
+    }
+
+    /// Whether this report contains code or package-surface breaking changes.
+    #[must_use]
+    pub fn has_code_breaks(&self) -> bool {
+        !self.missing_root_exports.is_empty()
+            || !self.missing_model_exports.is_empty()
+            || !self.export_kind_mismatches.is_empty()
+            || !self.missing_api_classes.is_empty()
+            || !self.missing_api_factories.is_empty()
+            || !self.missing_operation_methods.is_empty()
+            || !self.missing_request_aliases.is_empty()
+            || !self.missing_interface_properties.is_empty()
+            || !self.interface_property_changes.is_empty()
+            || !self.interface_required_to_optional.is_empty()
+            || !self.interface_optional_to_required.is_empty()
+            || !self.interface_nullable_changes.is_empty()
+            || !self.interface_type_changes.is_empty()
+            || !self.operation_return_type_changes.is_empty()
+            || !self.operation_signature_changes.is_empty()
+            || !self.package_entry_point_changes.is_empty()
+    }
+
+    /// Whether this report contains documentation-layout breaking changes.
+    #[must_use]
+    pub fn has_doc_breaks(&self) -> bool {
+        !self.missing_docs.is_empty()
     }
 }
 
@@ -105,10 +137,22 @@ impl TypeScriptSurfaceDiff {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompatibilityContract {
+    /// Cross-language compatibility allowances.
+    pub allow: CompatibilityAllow,
     /// Go SDK compatibility requirements and approved drift.
     pub go: GoCompatibilityContract,
     /// TypeScript SDK compatibility requirements and approved drift.
     pub typescript: TypeScriptCompatibilityContract,
+}
+
+/// Cross-language compatibility allowances.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompatibilityAllow {
+    /// Approve a one-time documentation layout migration for all missing docs.
+    pub docs_layout_migration: bool,
+    /// Missing documentation files that are explicitly approved for every SDK language.
+    pub missing_docs: Vec<String>,
 }
 
 /// Go SDK compatibility requirements and approved drift.
@@ -177,6 +221,8 @@ pub struct TypeScriptCompatibilityContract {
     pub allow_export_kind_mismatches: Vec<String>,
     /// Package entry point changes that are explicitly approved.
     pub allow_package_entry_point_changes: Vec<String>,
+    /// Missing documentation files that are explicitly approved.
+    pub allow_missing_docs: Vec<String>,
 }
 
 /// Extracted Go public surface.
@@ -224,6 +270,23 @@ impl GoSurfaceDiff {
             || !self.exported_method_signature_changes.is_empty()
             || !self.missing_docs.is_empty()
             || !self.package_metadata_changes.is_empty()
+    }
+
+    /// Whether this report contains code or package-surface breaking changes.
+    #[must_use]
+    pub fn has_code_breaks(&self) -> bool {
+        !self.missing_exported_types.is_empty()
+            || !self.missing_exported_functions.is_empty()
+            || !self.missing_exported_methods.is_empty()
+            || !self.exported_function_signature_changes.is_empty()
+            || !self.exported_method_signature_changes.is_empty()
+            || !self.package_metadata_changes.is_empty()
+    }
+
+    /// Whether this report contains documentation-layout breaking changes.
+    #[must_use]
+    pub fn has_doc_breaks(&self) -> bool {
+        !self.missing_docs.is_empty()
     }
 }
 
@@ -591,6 +654,12 @@ pub fn evaluate_typescript_contract(
         &diff.package_entry_point_changes,
         &mut stale_allowances,
     );
+    stale_string_allowances(
+        "typescript.allow_missing_docs",
+        &contract.allow_missing_docs,
+        &diff.missing_docs,
+        &mut stale_allowances,
+    );
 
     let unapproved_diff = TypeScriptSurfaceDiff {
         missing_root_exports: filter_allowed_strings(
@@ -657,6 +726,7 @@ pub fn evaluate_typescript_contract(
             &diff.package_entry_point_changes,
             &contract.allow_package_entry_point_changes,
         ),
+        missing_docs: filter_allowed_strings(&diff.missing_docs, &contract.allow_missing_docs),
     };
     let breaking = !missing_required.is_empty() || unapproved_diff.is_breaking();
     TypeScriptContractEvaluation {
@@ -693,7 +763,7 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
         exported_types: exported_types.into_iter().collect(),
         exported_functions,
         exported_methods,
-        docs: go_doc_files(dir)?,
+        docs: doc_files(dir)?,
         package_metadata: go_package_metadata(dir)?,
     })
 }
@@ -770,6 +840,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         operation_return_types,
         operation_signatures,
         package_entry_points: package_entry_points(dir)?,
+        docs: doc_files(dir)?,
     })
 }
 
@@ -810,6 +881,7 @@ pub fn diff_typescript_surfaces(
             &old.package_entry_points,
             &new.package_entry_points,
         ),
+        missing_docs: missing_values(&old.docs, &new.docs),
     }
 }
 
@@ -1934,7 +2006,7 @@ fn go_package_metadata(dir: &Path) -> Result<BTreeMap<String, String>, CoreError
     Ok(out)
 }
 
-fn go_doc_files(dir: &Path) -> Result<Vec<String>, CoreError> {
+fn doc_files(dir: &Path) -> Result<Vec<String>, CoreError> {
     let mut out = Vec::new();
     collect_doc_files(dir, dir, &mut out)?;
     out.sort();
@@ -1943,15 +2015,18 @@ fn go_doc_files(dir: &Path) -> Result<Vec<String>, CoreError> {
 
 fn collect_doc_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), CoreError> {
     let entries = std::fs::read_dir(dir).map_err(|err| CoreError::Workspace {
-        message: format!("failed to read Go SDK dir {}: {err}", dir.display()),
+        message: format!("failed to read SDK doc dir {}: {err}", dir.display()),
     })?;
     for entry in entries {
         let entry = entry.map_err(|err| CoreError::Workspace {
-            message: format!("failed to read Go SDK dir entry {}: {err}", dir.display()),
+            message: format!("failed to read SDK doc dir entry {}: {err}", dir.display()),
         })?;
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().and_then(|name| name.to_str()) == Some("vendor") {
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("vendor" | "node_modules")
+            ) {
                 continue;
             }
             collect_doc_files(root, &path, out)?;
@@ -1959,7 +2034,10 @@ fn collect_doc_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(
             let rel = path
                 .strip_prefix(root)
                 .map_err(|err| CoreError::Workspace {
-                    message: format!("failed to relativize Go doc file {}: {err}", path.display()),
+                    message: format!(
+                        "failed to relativize SDK doc file {}: {err}",
+                        path.display()
+                    ),
                 })?
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -2248,6 +2326,7 @@ mod tests {
             "createBook(): Promise<AxiosResponse<Book>>"
         );
         assert_eq!(surface.request_aliases, vec!["CreateBookRequest"]);
+        assert!(surface.docs.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2287,6 +2366,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(old.join("api.ts"), "export interface CreateBookRequest {}\nexport class DefaultApi {\n  async createBook(): Promise<AxiosResponse<Book>> { return response; }\n}\nexport const DefaultApiFactory = function () {\n  return {\n    createBook(): Promise<AxiosResponse<Book>> { return api.createBook(); },\n  };\n};\n").unwrap();
+        std::fs::create_dir_all(old.join("docs")).unwrap();
+        std::fs::write(old.join("docs/Book.md"), "# Book\n").unwrap();
+        std::fs::write(old.join("docs/BooksApi.md"), "# BooksApi\n").unwrap();
         std::fs::write(
             new.join("models.ts"),
             "export interface Book {\n  title: string;\n}\nexport type Format = \"hardcover\";\n",
@@ -2331,6 +2413,10 @@ mod tests {
         assert_eq!(
             diff.operation_signature_changes[0].new,
             "async createBook(): Promise<Book>"
+        );
+        assert_eq!(
+            diff.missing_docs,
+            vec!["docs/Book.md".to_string(), "docs/BooksApi.md".to_string()]
         );
 
         let _ = std::fs::remove_dir_all(old);

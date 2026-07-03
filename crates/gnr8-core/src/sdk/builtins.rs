@@ -17,6 +17,7 @@ use super::{
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
+use crate::sdk::docs::{write_sdk_docs, SdkDocs};
 use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::go::{
     GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
@@ -33,7 +34,6 @@ use crate::sdk::typescript::{
 };
 use crate::CoreError;
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2702,7 +2702,7 @@ pub struct GoSdk {
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
-    docs: bool,
+    docs: SdkDocs,
     package_metadata: bool,
     error_model: Option<String>,
     required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
@@ -2724,7 +2724,7 @@ impl GoSdk {
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
-            docs: true,
+            docs: SdkDocs::default(),
             package_metadata: true,
             error_model: None,
             required_pointer_constructor_policy: None,
@@ -2846,16 +2846,16 @@ impl GoSdk {
         self
     }
 
-    /// Enable or disable generated SDK README/reference docs.
+    /// Configure generated SDK documentation output.
     #[must_use]
-    pub const fn docs(mut self, enabled: bool) -> Self {
-        self.docs = enabled;
+    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
+        self.docs = docs.into();
         self
     }
 
     /// Disable generated SDK README/reference docs.
     #[must_use]
-    pub const fn without_docs(self) -> Self {
+    pub fn without_docs(self) -> Self {
         self.docs(false)
     }
 
@@ -2868,7 +2868,7 @@ impl GoSdk {
 
     /// Emit source files only, without docs or package metadata.
     #[must_use]
-    pub const fn source_only(self) -> Self {
+    pub fn source_only(self) -> Self {
         self.docs(false).package_metadata(false)
     }
 
@@ -2934,7 +2934,7 @@ impl Target for GoSdk {
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
-        let _model = SdkModel::build(
+        let model = SdkModel::build(
             ir,
             &package,
             &ir.base_path,
@@ -2952,9 +2952,7 @@ impl Target for GoSdk {
             self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        if self.docs {
-            write_sdk_docs(out, &self.dir, "Go", &package, ir);
-        }
+        write_sdk_docs(out, &self.dir, "Go", &package, ir, &model, &self.docs)?;
         if self.package_metadata {
             out.write(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
@@ -2994,7 +2992,7 @@ pub struct PySdk {
     model_style: PyModelStyle,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
-    docs: bool,
+    docs: SdkDocs,
 }
 
 impl PySdk {
@@ -3008,7 +3006,7 @@ impl PySdk {
             model_style: PyModelStyle::default(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
-            docs: true,
+            docs: SdkDocs::default(),
         }
     }
 
@@ -3069,22 +3067,22 @@ impl PySdk {
         self
     }
 
-    /// Enable or disable generated SDK README/reference docs.
+    /// Configure generated SDK documentation output.
     #[must_use]
-    pub const fn docs(mut self, enabled: bool) -> Self {
-        self.docs = enabled;
+    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
+        self.docs = docs.into();
         self
     }
 
     /// Disable generated SDK README/reference docs.
     #[must_use]
-    pub const fn without_docs(self) -> Self {
+    pub fn without_docs(self) -> Self {
         self.docs(false)
     }
 
     /// Emit source files only, without generated docs.
     #[must_use]
-    pub const fn source_only(self) -> Self {
+    pub fn source_only(self) -> Self {
         self.docs(false)
     }
 
@@ -3120,7 +3118,7 @@ impl Target for PySdk {
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
         // OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let _model = SdkModel::build(
+        let model = SdkModel::build(
             ir,
             &package,
             &ir.base_path,
@@ -3137,9 +3135,7 @@ impl Target for PySdk {
             &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        if self.docs {
-            write_sdk_docs(out, &self.dir, "Python", &package, ir);
-        }
+        write_sdk_docs(out, &self.dir, "Python", &package, ir, &model, &self.docs)?;
         Ok(())
     }
 
@@ -3172,7 +3168,7 @@ pub struct TsSdk {
     layout: SdkFileLayout,
     aliases: SdkTypeAliases,
     profile: SdkProfile,
-    docs: bool,
+    docs: SdkDocs,
     package_metadata: Option<bool>,
     model_property_policy: Option<TsModelPropertyPolicy>,
     nullable_policy: Option<TsNullablePolicy>,
@@ -3192,7 +3188,7 @@ impl TsSdk {
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
-            docs: true,
+            docs: SdkDocs::default(),
             package_metadata: None,
             model_property_policy: None,
             nullable_policy: None,
@@ -3246,16 +3242,16 @@ impl TsSdk {
         self
     }
 
-    /// Enable or disable generated SDK README/reference docs.
+    /// Configure generated SDK documentation output.
     #[must_use]
-    pub const fn docs(mut self, enabled: bool) -> Self {
-        self.docs = enabled;
+    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
+        self.docs = docs.into();
         self
     }
 
     /// Disable generated SDK README/reference docs.
     #[must_use]
-    pub const fn without_docs(self) -> Self {
+    pub fn without_docs(self) -> Self {
         self.docs(false)
     }
 
@@ -3268,7 +3264,7 @@ impl TsSdk {
 
     /// Emit source files only, without docs or package metadata.
     #[must_use]
-    pub const fn source_only(self) -> Self {
+    pub fn source_only(self) -> Self {
         self.docs(false).package_metadata(false)
     }
 
@@ -3385,7 +3381,7 @@ impl Target for TsSdk {
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
         // the OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let _model = SdkModel::build(
+        let model = SdkModel::build(
             ir,
             &package,
             &ir.base_path,
@@ -3415,9 +3411,15 @@ impl Target for TsSdk {
             files.retain(|file| file.name != "package.json");
         }
         write_sdk_files(out, &self.dir, files)?;
-        if self.docs {
-            write_sdk_docs(out, &self.dir, "TypeScript", &package, ir);
-        }
+        write_sdk_docs(
+            out,
+            &self.dir,
+            "TypeScript",
+            &package,
+            ir,
+            &model,
+            &self.docs,
+        )?;
         Ok(())
     }
 
@@ -3758,18 +3760,6 @@ fn write_sdk_files(
     Ok(())
 }
 
-fn write_sdk_docs(out: &mut Artifacts, dir: &str, language: &str, package: &str, ir: &ApiGraph) {
-    let dir = dir.trim_end_matches('/');
-    out.write(
-        format!("{dir}/README.md"),
-        sdk_readme(language, package, ir),
-    );
-    out.write(
-        format!("{dir}/reference.md"),
-        sdk_reference(language, package, ir),
-    );
-}
-
 fn ts_package_json(package: &str, axios: bool) -> String {
     let dependencies = if axios {
         "\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  },"
@@ -3795,117 +3785,6 @@ fn ts_package_json(package: &str, axios: bool) -> String {
         quoted_string_literal(package),
         dependencies
     )
-}
-
-fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
-    let mut text = format!(
-        "# {title} {language} SDK\n\n\
-         This directory is generated by `gnr8`. Do not edit generated files directly; edit \
-         `.gnr8/src/main.rs` or the source service, then run `gnr8 generate`.\n\n\
-         ## Package\n\n\
-         - Language: {language}\n\
-         - Package/module: `{package}`\n\
-         - Base path: `{base_path}`\n\
-         - Operations: {operation_count}\n\
-         - Schemas: {schema_count}\n\n\
-         ## Agent workflow\n\n\
-         1. Read `reference.md` in this directory for operation and schema names.\n\
-         2. Construct the generated `Client` with the service base URL.\n\
-         3. Pass typed request models and path/query parameters according to the generated method signatures.\n\
-         4. Handle generated `APIError`/`ApiError` values for non-2xx responses.\n\n",
-        title = ir.title,
-        base_path = ir.base_path,
-        operation_count = ir.operations.len(),
-        schema_count = ir.schemas.len()
-    );
-    match language {
-        "Go" => text.push_str(
-            "## Go quick start\n\n\
-             ```go\n\
-             client := sdk.NewClient(\"https://api.example.com\")\n\
-             // Call methods on client with context.Context first.\n\
-             ```\n",
-        ),
-        "Python" => text.push_str(
-            "## Python quick start\n\n\
-             ```python\n\
-             from sdk import Client\n\
-             client = Client(\"https://api.example.com\")\n\
-             # Call generated methods with typed models from this package.\n\
-             ```\n",
-        ),
-        "TypeScript" => text.push_str(
-            "## TypeScript quick start\n\n\
-             ```typescript\n\
-             import { Client } from './client';\n\
-             const client = new Client('https://api.example.com');\n\
-             // Call generated async methods with typed request objects.\n\
-             ```\n",
-        ),
-        _ => {}
-    }
-    text
-}
-
-fn sdk_reference(language: &str, package: &str, ir: &ApiGraph) -> String {
-    let mut text = format!(
-        "# SDK Reference\n\n\
-         Generated by `gnr8` for `{package}` ({language}).\n\n\
-         ## Operations\n\n\
-         | Method | Path | Operation | Request | Responses |\n\
-         |--|--|--|--|--|\n"
-    );
-    for op in &ir.operations {
-        let request = op
-            .request_body
-            .as_ref()
-            .map_or("-", |request| request.ref_id.as_str());
-        let responses = op
-            .responses
-            .iter()
-            .map(|response| response.status.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(
-            text,
-            "| {} | `{}` | `{}` | `{}` | {} |",
-            op.method, op.path, op.id, request, responses
-        );
-    }
-    text.push_str("\n## Schemas\n\n| Schema | Kind |\n|--|--|\n");
-    for schema in &ir.schemas {
-        let _ = writeln!(
-            text,
-            "| `{}` | {} |",
-            schema.name,
-            sdk_schema_kind(&schema.body)
-        );
-    }
-    if !ir.diagnostics.is_empty() {
-        text.push_str("\n## Diagnostics\n\n");
-        for diagnostic in &ir.diagnostics {
-            let _ = writeln!(
-                text,
-                "- {}: {} ({}:{})",
-                diagnostic.severity, diagnostic.message, diagnostic.file, diagnostic.line
-            );
-        }
-    }
-    text
-}
-
-fn sdk_schema_kind(schema: &Type) -> &'static str {
-    match schema {
-        Type::Object(_) => "object",
-        Type::Enum(_) => "enum",
-        Type::Primitive(_) => "primitive",
-        Type::WellKnown(_) => "well-known",
-        Type::Array(_) => "array",
-        Type::Map { .. } => "map",
-        Type::Named(_) => "reference",
-        Type::Union(_) => "union",
-        Type::Any {} => "any",
-    }
 }
 
 fn collect_static_include(
@@ -4023,6 +3902,7 @@ mod tests {
     use crate::graph::{
         ApiGraph, Diagnostic, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
     };
+    use crate::sdk::docs::SdkDocs;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
@@ -5828,6 +5708,100 @@ mod tests {
                 "source_only should not emit {path}"
             );
         }
+    }
+
+    #[test]
+    fn sdk_docs_openapi_generator_compat_emits_per_symbol_markdown() {
+        let mut ir = ApiGraph {
+            title: "Bookstore".to_string(),
+            base_path: "/api".to_string(),
+            ..ApiGraph::default()
+        };
+        ir.schemas.push(Schema {
+            id: "Book".to_string(),
+            name: "Book".to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "title".to_string(),
+                required: true,
+                optional: false,
+                nullable: false,
+                schema: Type::Primitive(Prim::String),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: span(),
+        });
+        ir.schemas.push(Schema {
+            id: "CreateBookRequest".to_string(),
+            name: "CreateBookRequest".to_string(),
+            body: Type::Object(Vec::new()),
+            enum_source_order: Vec::new(),
+            provenance: span(),
+        });
+        ir.operations.push(Operation {
+            id: "createBook".to_string(),
+            method: "POST".to_string(),
+            path: "/books".to_string(),
+            handler: "createBook".to_string(),
+            group: Some("books".to_string()),
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: Some(SchemaRef {
+                ref_id: "CreateBookRequest".to_string(),
+            }),
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![Response {
+                status: 201,
+                body: Some(SchemaRef {
+                    ref_id: "Book".to_string(),
+                }),
+                body_kind: "json".to_string(),
+                content_type: None,
+                content_types: Vec::new(),
+            }],
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: span(),
+        });
+
+        let mut out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore")
+            .to("generated/sdk-ts")
+            .docs(SdkDocs::both())
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+
+        let paths = out
+            .files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "generated/sdk-ts/README.md",
+            "generated/sdk-ts/reference.md",
+            "generated/sdk-ts/docs/README.md",
+            "generated/sdk-ts/docs/BooksApi.md",
+            "generated/sdk-ts/docs/Book.md",
+            "generated/sdk-ts/docs/CreateBookRequest.md",
+        ] {
+            assert!(
+                paths.contains(&expected),
+                "expected {expected} in generated paths: {paths:?}"
+            );
+        }
+        let readme = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/README.md")
+            .unwrap();
+        assert!(readme.text.contains("[SDK reference](reference.md)"));
+        assert!(readme
+            .text
+            .contains("[OpenAPI Generator-compatible docs](docs/README.md)"));
     }
 
     #[test]

@@ -125,12 +125,120 @@ export const DefaultApiFactory = function () {
     (old, new)
 }
 
+fn write_typescript_docs_compat_pair(root: &Path) -> (PathBuf, PathBuf) {
+    let old = root.join("old-ts-docs");
+    let new = root.join("new-ts-docs");
+    let model = "export interface Book {\n  title: string;\n}\n";
+    let api = r"export class BooksApi {
+  async listBooks(): Promise<Book[]> { return books; }
+}
+";
+    write_typescript_sdk(&old, model, api);
+    write_typescript_sdk(&new, model, api);
+    std::fs::create_dir_all(old.join("docs")).expect("create docs dir");
+    std::fs::write(old.join("docs/BooksApi.md"), "# BooksApi\n").expect("write API doc");
+    std::fs::write(old.join("docs/Book.md"), "# Book\n").expect("write model doc");
+    (old, new)
+}
+
 fn string_array_contains(value: &serde_json::Value, needle: &str) -> bool {
     value
         .as_array()
         .unwrap_or_else(|| panic!("expected array, got {value:?}"))
         .iter()
         .any(|item| item.as_str() == Some(needle))
+}
+
+#[test]
+fn compat_typescript_missing_docs_are_breaking_without_contract() {
+    let root = unique_temp_dir("ts-docs-no-contract");
+    let (old, new) = write_typescript_docs_compat_pair(&root);
+
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "typescript".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "missing docs should fail without an allowlist\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(report["language"], "typescript");
+    assert_eq!(report["breaking"], true);
+    assert_eq!(report["docs_breaking"], true);
+    assert!(string_array_contains(
+        &report["diff"]["missing_docs"],
+        "docs/Book.md"
+    ));
+    assert!(string_array_contains(
+        &report["diff"]["missing_docs"],
+        "docs/BooksApi.md"
+    ));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn compat_typescript_contract_allows_docs_layout_migration() {
+    let root = unique_temp_dir("ts-docs-contract");
+    let (old, new) = write_typescript_docs_compat_pair(&root);
+    let contract = root.join("compat.toml");
+    std::fs::write(
+        &contract,
+        r"[allow]
+docs_layout_migration = true
+",
+    )
+    .expect("write contract");
+
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "typescript".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+            "--contract".to_string(),
+            contract.display().to_string(),
+        ],
+    );
+
+    assert!(
+        ok,
+        "docs layout migration allowlist should exit zero\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(report["breaking"], false);
+    assert_eq!(report["docs_breaking"], false);
+    assert!(string_array_contains(
+        &report["allowed_missing_docs"],
+        "docs/Book.md"
+    ));
+    assert!(string_array_contains(
+        &report["allowed_missing_docs"],
+        "docs/BooksApi.md"
+    ));
+    assert_eq!(
+        report["contract_evaluation"]["unapproved_diff"]["missing_docs"]
+            .as_array()
+            .expect("unapproved missing docs")
+            .len(),
+        0
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

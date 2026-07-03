@@ -132,9 +132,13 @@ and unapproved diff items fail the command; stale allowances are reported in `--
 `--suggest` adds high-confidence migration snippets to human output and to the JSON `suggestions`
 array.
 
-Contract keys are optional arrays:
+Contract keys are optional arrays, except `allow.docs_layout_migration`, which defaults to `false`:
 
 ```toml
+[allow]
+docs_layout_migration = false
+missing_docs = []
+
 [go]
 require_exported_types = []
 require_exported_functions = []
@@ -166,6 +170,7 @@ allow_operation_return_type_changes = []
 allow_operation_signature_changes = []
 allow_export_kind_mismatches = []
 allow_package_entry_point_changes = []
+allow_missing_docs = []
 ```
 
 For OpenAPI Generator migrations, use compatibility profiles first and clean profiles later:
