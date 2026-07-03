@@ -18,7 +18,7 @@ use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -1154,6 +1154,7 @@ fn regenerate_bundle(
         &bundle.output_anchors,
         force,
     )?;
+    save_verified_noop_stamp_from_artifacts(root, bundle, &outcome);
     Ok(outcome)
 }
 
@@ -1172,9 +1173,6 @@ fn cached_artifact_metadata(
     root: &std::path::Path,
     bundle: &gnr8::runner::ArtifactBundle,
 ) -> Option<Vec<gnr8::sdk::ArtifactMetadata>> {
-    if !bundle.artifacts.is_empty() {
-        return None;
-    }
     let key = bundle.artifact_cache_key.as_deref()?;
     gnr8::sdk::load_artifact_cache_metadata(root, key)
 }
@@ -1207,9 +1205,35 @@ struct VerifiedNoopStamp {
     output_anchors: Vec<String>,
     artifact_paths: Vec<String>,
     input_roots: Vec<String>,
+    #[serde(default)]
+    input_fast_files: Vec<FastFileStamp>,
+    #[serde(default)]
+    output_artifact_fast_files: Vec<FastFileStamp>,
+    #[serde(default)]
+    output_dir_fast_stamps: Vec<FastDirStamp>,
+    #[serde(default)]
     input_files: Vec<gnr8::sdk::FileStamp>,
+    #[serde(default)]
     output_files: Vec<gnr8::sdk::FileStamp>,
     diagnostics: Vec<gnr8::graph::Diagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct FastFileStamp {
+    path: String,
+    len: u64,
+    modified_ns: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+struct FastDirStamp {
+    path: String,
+    modified_ns: u128,
+}
+
+struct FastOutputStamps {
+    artifact_files: Vec<FastFileStamp>,
+    dirs: Vec<FastDirStamp>,
 }
 
 struct CachedNoop {
@@ -1221,17 +1245,19 @@ struct CachedNoop {
 
 fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     let stamp = load_verified_noop_stamp(root)?;
-    let current_inputs = collect_hot_input_stamps(root, &stamp.input_roots)?;
-    if current_inputs != stamp.input_files {
+    let current_inputs = collect_hot_input_fast_stamps(root, &stamp.input_roots)?;
+    if current_inputs != stamp.input_fast_files {
         return None;
     }
     let current_outputs =
-        collect_verified_file_stamps(root, &stamp.output_anchors, &stamp.artifact_paths)?;
-    if current_outputs != stamp.output_files {
+        collect_verified_fast_output_stamps(root, &stamp.output_anchors, &stamp.artifact_paths)?;
+    if current_outputs.artifact_files != stamp.output_artifact_fast_files
+        || current_outputs.dirs != stamp.output_dir_fast_stamps
+    {
         return None;
     }
-    let source_files = stamp.input_files.len();
-    let artifact_files = stamp.output_files.len();
+    let source_files = stamp.input_fast_files.len();
+    let artifact_files = stamp.artifact_paths.len();
     Some(CachedNoop {
         outcome: gnr8::lifecycle::GenerateOutcome {
             written: Vec::new(),
@@ -1256,8 +1282,11 @@ fn verified_noop_outcome(
         return None;
     }
     let artifact_paths = artifact_paths(metadata);
-    let current = collect_verified_file_stamps(root, &bundle.output_anchors, &artifact_paths)?;
-    if current != stamp.output_files {
+    let current =
+        collect_verified_fast_output_stamps(root, &bundle.output_anchors, &artifact_paths)?;
+    if current.artifact_files != stamp.output_artifact_fast_files
+        || current.dirs != stamp.output_dir_fast_stamps
+    {
         return None;
     }
     Some(gnr8::lifecycle::GenerateOutcome {
@@ -1277,6 +1306,28 @@ fn save_verified_noop_stamp(
     metadata: &[gnr8::sdk::ArtifactMetadata],
     outcome: &gnr8::lifecycle::GenerateOutcome,
 ) {
+    save_verified_noop_stamp_for_paths(root, bundle, artifact_paths(metadata), outcome);
+}
+
+fn save_verified_noop_stamp_from_artifacts(
+    root: &std::path::Path,
+    bundle: &gnr8::runner::ArtifactBundle,
+    outcome: &gnr8::lifecycle::GenerateOutcome,
+) {
+    let paths = bundle
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
+    save_verified_noop_stamp_for_paths(root, bundle, paths, outcome);
+}
+
+fn save_verified_noop_stamp_for_paths(
+    root: &std::path::Path,
+    bundle: &gnr8::runner::ArtifactBundle,
+    artifact_paths: Vec<String>,
+    outcome: &gnr8::lifecycle::GenerateOutcome,
+) {
     if !outcome.written.is_empty() || !outcome.skipped.is_empty() || !outcome.deleted.is_empty() {
         return;
     }
@@ -1286,13 +1337,13 @@ fn save_verified_noop_stamp(
     if bundle.cache_input_roots.is_empty() || bundle.cache_input_stamps.is_empty() {
         return;
     }
-    let artifact_paths = artifact_paths(metadata);
-    let Some(output_files) =
-        collect_verified_file_stamps(root, &bundle.output_anchors, &artifact_paths)
+    let Some(output_fast) =
+        collect_verified_fast_output_stamps(root, &bundle.output_anchors, &artifact_paths)
     else {
         return;
     };
-    let Some(input_files) = combine_input_stamps(root, &bundle.cache_input_stamps) else {
+    let Some(input_fast_files) = collect_hot_input_fast_stamps(root, &bundle.cache_input_roots)
+    else {
         return;
     };
     let stamp = VerifiedNoopStamp {
@@ -1300,8 +1351,11 @@ fn save_verified_noop_stamp(
         output_anchors: bundle.output_anchors.clone(),
         artifact_paths,
         input_roots: bundle.cache_input_roots.clone(),
-        input_files,
-        output_files,
+        input_fast_files,
+        output_artifact_fast_files: output_fast.artifact_files,
+        output_dir_fast_stamps: output_fast.dirs,
+        input_files: Vec::new(),
+        output_files: Vec::new(),
         diagnostics: bundle.diagnostics.clone(),
     };
     let path = verified_noop_stamp_path(root);
@@ -1317,20 +1371,66 @@ fn save_verified_noop_stamp(
     let _ = std::fs::write(path, bytes);
 }
 
-fn collect_verified_file_stamps(
+fn collect_verified_fast_output_stamps(
     root: &std::path::Path,
     output_anchors: &[String],
     artifact_paths: &[String],
-) -> Option<Vec<gnr8::sdk::FileStamp>> {
-    let mut paths = std::collections::BTreeSet::new();
-    for path in artifact_paths {
-        paths.insert(path.clone());
-    }
+) -> Option<FastOutputStamps> {
+    let artifact_paths: Vec<std::path::PathBuf> =
+        artifact_paths.iter().map(|path| root.join(path)).collect();
+    let artifact_files = stamp_fast_project_files(root, &artifact_paths)?;
+    let mut dirs = std::collections::BTreeSet::new();
     for anchor in output_anchors {
-        collect_anchor_stamp_paths(root, anchor, &mut paths)?;
+        collect_anchor_dir_stamp_paths(root, anchor, &mut dirs)?;
     }
-    let paths: Vec<std::path::PathBuf> = paths.into_iter().map(|path| root.join(path)).collect();
-    gnr8::sdk::stamp_project_output_paths(root, &paths)
+    let dirs: Vec<std::path::PathBuf> = dirs.into_iter().collect();
+    let dirs = stamp_fast_project_dirs(root, &dirs)?;
+    Some(FastOutputStamps {
+        artifact_files,
+        dirs,
+    })
+}
+
+fn collect_anchor_dir_stamp_paths(
+    root: &std::path::Path,
+    anchor: &str,
+    paths: &mut std::collections::BTreeSet<std::path::PathBuf>,
+) -> Option<()> {
+    if anchor.is_empty()
+        || std::path::Path::new(anchor).components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return None;
+    }
+    let anchor_path = root.join(anchor);
+    if anchor_path.is_file() {
+        if let Some(parent) = anchor_path.parent() {
+            paths.insert(parent.to_path_buf());
+        }
+        return Some(());
+    }
+    if !anchor_path.is_dir() {
+        return Some(());
+    }
+    paths.insert(anchor_path.clone());
+    let mut stack = vec![anchor_path];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                paths.insert(path.clone());
+                stack.push(path);
+            }
+        }
+    }
+    Some(())
 }
 
 fn artifact_paths(metadata: &[gnr8::sdk::ArtifactMetadata]) -> Vec<String> {
@@ -1346,58 +1446,52 @@ fn load_verified_noop_stamp(root: &std::path::Path) -> Option<VerifiedNoopStamp>
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
-fn combine_input_stamps(
+fn collect_hot_input_fast_stamps(
     root: &std::path::Path,
-    source_stamps: &[gnr8::sdk::FileStamp],
-) -> Option<Vec<gnr8::sdk::FileStamp>> {
-    let mut stamps = source_stamps.to_vec();
-    stamps.extend(host_config_stamps(root)?);
+    input_roots: &[String],
+) -> Option<Vec<FastFileStamp>> {
+    if input_roots.is_empty() {
+        return None;
+    }
+    let mut stamps = Vec::new();
+    for input_root in input_roots {
+        collect_hot_input_file_stamps(root, &root.join(input_root), &mut stamps)?;
+    }
+    collect_host_config_fast_stamps(root, &mut stamps)?;
     stamps.sort();
     Some(stamps)
 }
 
-fn collect_hot_input_stamps(
+fn collect_host_config_fast_stamps(
     root: &std::path::Path,
-    input_roots: &[String],
-) -> Option<Vec<gnr8::sdk::FileStamp>> {
-    if input_roots.is_empty() {
-        return None;
-    }
-    let mut paths = Vec::new();
-    for input_root in input_roots {
-        collect_hot_input_files(&root.join(input_root), &mut paths)?;
-    }
-    paths.extend(host_config_paths(root));
-    gnr8::sdk::stamp_project_paths(root, &paths)
-}
-
-fn host_config_stamps(root: &std::path::Path) -> Option<Vec<gnr8::sdk::FileStamp>> {
-    gnr8::sdk::stamp_project_paths(root, &host_config_paths(root))
-}
-
-fn host_config_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
+    out: &mut Vec<FastFileStamp>,
+) -> Option<()> {
     let gnr8_dir = root.join(".gnr8");
-    collect_hot_input_files(&gnr8_dir.join("src"), &mut paths);
+    let _ = collect_hot_input_file_stamps(root, &gnr8_dir.join("src"), out);
     for name in ["Cargo.toml", "Cargo.lock"] {
         let path = gnr8_dir.join(name);
         if path.is_file() {
-            paths.push(path);
+            push_fast_file_stamp(root, &path, out)?;
         }
     }
     if let Ok(exe) = std::env::current_exe() {
-        paths.push(exe);
+        push_fast_file_stamp(root, &exe, out)?;
     }
-    paths
+    Some(())
 }
 
-fn collect_hot_input_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Option<()> {
+fn collect_hot_input_file_stamps(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<FastFileStamp>,
+) -> Option<()> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries {
         let entry = entry.ok()?;
         let path = entry.path();
         let name = path.file_name().and_then(|name| name.to_str())?;
-        if path.is_dir() {
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
             if matches!(
                 name,
                 ".context"
@@ -1410,58 +1504,109 @@ fn collect_hot_input_files(dir: &std::path::Path, out: &mut Vec<std::path::PathB
             ) {
                 continue;
             }
-            collect_hot_input_files(&path, out)?;
-        } else if path.is_file() {
-            out.push(path);
+            collect_hot_input_file_stamps(root, &path, out)?;
+        } else if kind.is_file() {
+            push_fast_file_stamp(root, &path, out)?;
         }
     }
-    out.sort();
     Some(())
 }
 
-fn collect_anchor_stamp_paths(
+fn push_fast_file_stamp(
     root: &std::path::Path,
-    anchor: &str,
-    paths: &mut std::collections::BTreeSet<String>,
+    path: &std::path::Path,
+    out: &mut Vec<FastFileStamp>,
 ) -> Option<()> {
-    if anchor.is_empty()
-        || std::path::Path::new(anchor).components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
-    {
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() {
         return None;
     }
-    let anchor_path = root.join(anchor);
-    if anchor_path.is_file() {
-        paths.insert(anchor.to_string());
-        return Some(());
-    }
-    if !anchor_path.is_dir() {
-        return Some(());
-    }
-    let mut stack = vec![anchor_path];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
-        for entry in entries {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let kind = entry.file_type().ok()?;
-            if kind.is_dir() {
-                stack.push(path);
-            } else if kind.is_file() {
-                let rel = path
-                    .strip_prefix(root)
-                    .ok()?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                paths.insert(rel);
-            }
-        }
-    }
+    out.push(FastFileStamp {
+        path: fast_project_relative_path(root, path),
+        len: metadata.len(),
+        modified_ns: fast_modified_ns(&metadata),
+    });
     Some(())
+}
+
+fn stamp_fast_project_files(
+    root: &Path,
+    paths: &[std::path::PathBuf],
+) -> Option<Vec<FastFileStamp>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let workers = std::thread::available_parallelism().map_or(4, usize::from);
+    let workers = workers.clamp(1, paths.len());
+    if workers == 1 || paths.len() < 512 {
+        return stamp_fast_project_files_serial(root, paths);
+    }
+    let chunk_size = paths.len().div_ceil(workers);
+
+    let mut stamps = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in paths.chunks(chunk_size) {
+            handles.push(scope.spawn(move || stamp_fast_project_files_serial(root, chunk)));
+        }
+
+        let mut stamps = Vec::with_capacity(paths.len());
+        for handle in handles {
+            let chunk = handle.join().ok()??;
+            stamps.extend(chunk);
+        }
+        Some(stamps)
+    })?;
+    stamps.sort();
+    Some(stamps)
+}
+
+fn stamp_fast_project_files_serial(
+    root: &Path,
+    paths: &[std::path::PathBuf],
+) -> Option<Vec<FastFileStamp>> {
+    let mut stamps = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        stamps.push(FastFileStamp {
+            path: fast_project_relative_path(root, path),
+            len: metadata.len(),
+            modified_ns: fast_modified_ns(&metadata),
+        });
+    }
+    stamps.sort();
+    Some(stamps)
+}
+
+fn stamp_fast_project_dirs(root: &Path, paths: &[std::path::PathBuf]) -> Option<Vec<FastDirStamp>> {
+    let mut stamps = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        stamps.push(FastDirStamp {
+            path: fast_project_relative_path(root, path),
+            modified_ns: fast_modified_ns(&metadata),
+        });
+    }
+    stamps.sort();
+    Some(stamps)
+}
+
+fn fast_project_relative_path(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+fn fast_modified_ns(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {

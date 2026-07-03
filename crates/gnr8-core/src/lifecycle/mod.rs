@@ -862,6 +862,24 @@ pub fn regenerate_cached_with_anchors(
         return Ok(None);
     }
 
+    if !force
+        && plan
+            .files
+            .iter()
+            .all(|file| matches!(file.action, WriteAction::Unchanged))
+        && manifest_matches_metadata(&manifest, artifacts)
+    {
+        return Ok(Some(GenerateOutcome {
+            written: Vec::new(),
+            unchanged: artifacts
+                .iter()
+                .map(|artifact| artifact.path.clone())
+                .collect(),
+            skipped: Vec::new(),
+            deleted: Vec::new(),
+        }));
+    }
+
     let mut out = GenerateOutcome::default();
     for file in &plan.files {
         match file.action {
@@ -889,6 +907,13 @@ pub fn regenerate_cached_with_anchors(
     manifest.prune_to(&current_paths_vec);
     manifest.save(&gnr8_dir)?;
     Ok(Some(out))
+}
+
+fn manifest_matches_metadata(manifest: &Manifest, artifacts: &[ArtifactMetadata]) -> bool {
+    manifest.files.len() == artifacts.len()
+        && artifacts
+            .iter()
+            .all(|artifact| manifest.recorded_hash(&artifact.path) == Some(artifact.hash.as_str()))
 }
 
 fn read_artifacts_from_disk(

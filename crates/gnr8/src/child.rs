@@ -271,15 +271,17 @@ fn child_invocation(project_root: &Path, manifest: &Path, subcommand: &str) -> C
 
 fn fresh_child_binary(project_root: &Path, manifest: &Path) -> Option<PathBuf> {
     let package = package_name(manifest)?;
-    let binary = project_root
-        .join(WORKSPACE_DIR)
-        .join("target")
-        .join("debug")
-        .join(package);
-    if !binary.is_file() || !is_executable_fresh(&binary, project_root, manifest) {
-        return None;
+    for profile in ["release", "debug"] {
+        let binary = project_root
+            .join(WORKSPACE_DIR)
+            .join("target")
+            .join(profile)
+            .join(&package);
+        if binary.is_file() && is_executable_fresh(&binary, project_root, manifest) {
+            return Some(binary);
+        }
     }
-    Some(binary)
+    None
 }
 
 fn is_executable_fresh(binary: &Path, project_root: &Path, manifest: &Path) -> bool {

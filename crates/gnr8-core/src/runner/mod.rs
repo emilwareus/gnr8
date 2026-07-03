@@ -155,10 +155,7 @@ fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
         outcome.artifacts.into_files(),
         outcome.diagnostics,
         pipeline.output_anchors(),
-        outcome
-            .artifact_cache_hit
-            .then_some(outcome.artifact_cache_key)
-            .flatten(),
+        outcome.artifact_cache_key,
         pipeline.cache_input_roots(cx),
         pipeline.cache_input_stamps(cx),
     );
