@@ -150,7 +150,9 @@ func (a *Analyzer) ReportRouteHandlerCollisions(recognized []routes.Route, diags
 	}
 	routeHandlers := map[string]bool{}
 	for _, route := range recognized {
-		routeHandlers[route.Handler] = true
+		if route.HandlerKey == "" {
+			routeHandlers[route.Handler] = true
+		}
 	}
 	for _, collision := range a.collisions {
 		if routeHandlers[collision.name] {
@@ -237,7 +239,14 @@ func buildDeclObjectIndex(res *load.Result) map[string]handlerDecl {
 					continue
 				}
 				decl := handlerDecl{decl: fn, info: pkg.TypesInfo, fset: res.Fset, pkgPath: pkg.PkgPath}
-				out[funcDeclObjectKey(pkg.PkgPath, fn.Name.Pos())] = decl
+				key := ""
+				if obj, ok := pkg.TypesInfo.Defs[fn.Name].(*gotypes.Func); ok {
+					key = routes.FuncObjectKey(obj)
+				}
+				if key == "" {
+					key = funcDeclObjectKey(pkg.PkgPath, fn.Name.Pos())
+				}
+				out[key] = decl
 			}
 		}
 	}
@@ -252,10 +261,7 @@ func funcDeclObjectKey(pkgPath string, pos token.Pos) string {
 }
 
 func funcObjectKey(fn *gotypes.Func) string {
-	if fn == nil || fn.Pkg() == nil {
-		return ""
-	}
-	return funcDeclObjectKey(fn.Pkg().Path(), fn.Pos())
+	return routes.FuncObjectKey(fn)
 }
 
 func (a *Analyzer) samePackageCallee(h handlerDecl, fn *gotypes.Func) (handlerDecl, bool) {
@@ -275,7 +281,7 @@ func (a *Analyzer) samePackageCallee(h handlerDecl, fn *gotypes.Func) (handlerDe
 // panic (defensive — GO-06). The module prefix used to qualify schema refs is read
 // from the Analyzer's per-invocation context (WR-03), not a package global.
 func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFacts {
-	h, ok := a.idx[route.Handler]
+	h, ok := a.handlerForRoute(route)
 	if !ok || h.decl == nil || h.decl.Body == nil {
 		return CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	}
@@ -299,6 +305,13 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
+			if ref, schema, ok := a.bodyFromGenericJSONHelper(h, call); ok {
+				cf.RequestBody = ref
+				cf.RequestBodyContentType = "application/json"
+				cf.Schemas = append(cf.Schemas, schema...)
+				hasBodyBind = true
+				allBodyBindsOptional = false
+			}
 			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedSeen, contentTypeHint)
 			a.analyzePathHelperCall(h, call, &cf, seenParam)
 			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
@@ -308,6 +321,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		case "ShouldBindJSON", "BindJSON":
 			if ref, _, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
+				cf.RequestBodyContentType = "application/json"
 				hasBodyBind = true
 				if !optionalBindPositions[call.Pos()] {
 					allBodyBindsOptional = false
@@ -401,10 +415,26 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			Span: spanOf(h.fset, declPos(h.decl)),
 		})
 	}
+	if cf.RequestBody == nil {
+		if schema := a.rawJSONRequestSchema(h, route.Handler); schema != nil {
+			cf.RequestBody = &facts.TypeRef{RefID: schema.ID}
+			cf.RequestBodyContentType = "application/json"
+			cf.Schemas = append(cf.Schemas, *schema)
+		}
+	}
 	if hasBodyBind {
 		cf.RequestBodyRequired = !allBodyBindsOptional
 	}
 	return cf
+}
+
+func (a *Analyzer) handlerForRoute(route routes.Route) (handlerDecl, bool) {
+	if route.HandlerKey != "" {
+		h, ok := a.declsByObject[route.HandlerKey]
+		return h, ok
+	}
+	h, ok := a.idx[route.Handler]
+	return h, ok
 }
 
 func collectOptionalBindPositions(h handlerDecl) map[token.Pos]bool {
@@ -582,6 +612,13 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	cf *CodeFacts,
 	seenParam map[string]bool,
 ) {
+	if param, ok := a.queryParamFromSamePackageHelper(h, call); ok {
+		if !seenParam["query/"+param.Name] {
+			seenParam["query/"+param.Name] = true
+			cf.Params = append(cf.Params, param)
+		}
+		return
+	}
 	query, ok := firstQueryCall(h.info, call)
 	if !ok || query == call {
 		return
@@ -600,6 +637,71 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	seenParam["query/"+pname] = true
 	cf.Params = append(cf.Params, param)
 	_ = route
+}
+
+func (a *Analyzer) queryParamFromSamePackageHelper(h handlerDecl, call *ast.CallExpr) (facts.ParamFact, bool) {
+	if !callPassesGinContext(h.info, call) {
+		return facts.ParamFact{}, false
+	}
+	fn := calledFuncObject(h.info, call.Fun)
+	callee, ok := a.samePackageCallee(h, fn)
+	if !ok {
+		return facts.ParamFact{}, false
+	}
+	sig, ok := gotypes.Unalias(h.info.TypeOf(call.Fun)).(*gotypes.Signature)
+	if !ok || sig.Params() == nil {
+		return facts.ParamFact{}, false
+	}
+	schema, ok := queryHelperSchema(h.info.TypeOf(call), call)
+	if !ok {
+		return facts.ParamFact{}, false
+	}
+	for i := 0; i < len(call.Args) && i < sig.Params().Len(); i++ {
+		pname, ok := stringArg(call, i)
+		if !ok {
+			continue
+		}
+		query, ok := helperQueryCallWithVar(callee, sig.Params().At(i))
+		if !ok {
+			continue
+		}
+		return facts.ParamFact{
+			Name:     pname,
+			Location: "query",
+			Required: queryHelperRequiredFromCallee(h.info, call, callee, query),
+			Schema:   schema,
+			Default:  firstLiteral(queryDefaultValue(callee.info, query), queryHelperDefaultFromArgs(h.info, call, sig)),
+			Span:     spanOf(h.fset, call.Pos()),
+		}, true
+	}
+	return facts.ParamFact{}, false
+}
+
+func helperQueryCallWithVar(h handlerDecl, keyVar *gotypes.Var) (*ast.CallExpr, bool) {
+	if h.decl == nil || h.decl.Body == nil || keyVar == nil {
+		return nil, false
+	}
+	var found *ast.CallExpr
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(h.info, call)
+		if !ok || recvPkg != routes.GinPkgPath || !isGinQueryMethod(name) || len(call.Args) == 0 {
+			return true
+		}
+		id, ok := call.Args[0].(*ast.Ident)
+		if ok && h.info.ObjectOf(id) == keyVar {
+			found = call
+			return false
+		}
+		return true
+	})
+	return found, found != nil
 }
 
 func (a *Analyzer) analyzePathHelperCall(
@@ -750,6 +852,88 @@ func (a *Analyzer) delegatedGinContextHelper(h handlerDecl, call *ast.CallExpr) 
 		return handlerDecl{}, false
 	}
 	return callee, true
+}
+
+func (a *Analyzer) bodyFromGenericJSONHelper(
+	h handlerDecl,
+	call *ast.CallExpr,
+) (*facts.TypeRef, []facts.SchemaFact, bool) {
+	if !callPassesGinContext(h.info, call) {
+		return nil, nil, false
+	}
+	fn := calledFuncObject(h.info, call.Fun)
+	callee, ok := a.samePackageCallee(h, fn)
+	if !ok || !helperBindsJSONTypeParam(callee) {
+		return nil, nil, false
+	}
+	typeArgs := callTypeArgs(h.info, call)
+	if len(typeArgs) != 1 {
+		return nil, nil, false
+	}
+	id, ok := a.namedTypeID(typeArgs[0])
+	if !ok {
+		return nil, nil, false
+	}
+	return &facts.TypeRef{RefID: id}, nil, true
+}
+
+func helperBindsJSONTypeParam(h handlerDecl) bool {
+	if h.decl == nil || h.decl.Body == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(h.info, call)
+		if ok && recvPkg == routes.GinPkgPath && (name == "ShouldBindJSON" || name == "BindJSON") && bindArgIsTypeParam(h.info, call) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func bindArgIsTypeParam(info *gotypes.Info, call *ast.CallExpr) bool {
+	if info == nil || call == nil || len(call.Args) == 0 {
+		return false
+	}
+	unary, ok := call.Args[0].(*ast.UnaryExpr)
+	if !ok || unary.Op != token.AND {
+		return false
+	}
+	_, ok = gotypes.Unalias(info.TypeOf(unary.X)).(*gotypes.TypeParam)
+	return ok
+}
+
+func callTypeArgs(info *gotypes.Info, call *ast.CallExpr) []gotypes.Type {
+	if info == nil || call == nil {
+		return nil
+	}
+	var exprs []ast.Expr
+	switch fun := call.Fun.(type) {
+	case *ast.IndexExpr:
+		exprs = []ast.Expr{fun.Index}
+	case *ast.IndexListExpr:
+		exprs = fun.Indices
+	default:
+		return nil
+	}
+	out := make([]gotypes.Type, 0, len(exprs))
+	for _, expr := range exprs {
+		t := info.TypeOf(expr)
+		if t == nil {
+			return nil
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 func callPassesGinContext(info *gotypes.Info, call *ast.CallExpr) bool {
@@ -955,6 +1139,34 @@ func queryHelperRequired(info *gotypes.Info, helper *ast.CallExpr, query *ast.Ca
 	return false
 }
 
+func queryHelperRequiredFromCallee(info *gotypes.Info, helper *ast.CallExpr, callee handlerDecl, query *ast.CallExpr) bool {
+	lowerName := strings.ToLower(selectorName(helper.Fun))
+	if strings.Contains(lowerName, "optional") {
+		return false
+	}
+	if queryHelperDefaultFromArgs(info, helper, signatureOf(info, helper.Fun)) != nil {
+		return false
+	}
+	if queryDefaultValue(callee.info, query) != nil {
+		return false
+	}
+	if selectorName(query.Fun) == "DefaultQuery" || selectorName(query.Fun) == "GetQuery" {
+		return false
+	}
+	if strings.Contains(lowerName, "required") {
+		return true
+	}
+	if helperEmptyStringTolerant(callee, query) {
+		return false
+	}
+	return helperReturnsError(info, helper)
+}
+
+func signatureOf(info *gotypes.Info, expr ast.Expr) *gotypes.Signature {
+	sig, _ := gotypes.Unalias(info.TypeOf(expr)).(*gotypes.Signature)
+	return sig
+}
+
 func queryHelperDefault(info *gotypes.Info, helper *ast.CallExpr, query *ast.CallExpr) *facts.LiteralValue {
 	sig, ok := gotypes.Unalias(info.TypeOf(helper.Fun)).(*gotypes.Signature)
 	if !ok || sig.Params() == nil {
@@ -976,6 +1188,101 @@ func queryHelperDefault(info *gotypes.Info, helper *ast.CallExpr, query *ast.Cal
 		}
 	}
 	return nil
+}
+
+func queryHelperDefaultFromArgs(info *gotypes.Info, helper *ast.CallExpr, sig *gotypes.Signature) *facts.LiteralValue {
+	if sig == nil || sig.Params() == nil {
+		return nil
+	}
+	for i, arg := range helper.Args {
+		if i >= sig.Params().Len() || !isDefaultParamName(sig.Params().At(i).Name()) {
+			continue
+		}
+		if value := literalValue(info, arg); value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func helperEmptyStringTolerant(h handlerDecl, query *ast.CallExpr) bool {
+	queryVars := queryResultVars(h, query)
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok || !exprChecksEmptyString(h.info, ifStmt.Cond, queryVars) {
+			return true
+		}
+		for _, stmt := range ifStmt.Body.List {
+			ret, ok := stmt.(*ast.ReturnStmt)
+			if !ok || len(ret.Results) == 0 {
+				continue
+			}
+			if isNilIdent(ret.Results[len(ret.Results)-1]) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func queryResultVars(h handlerDecl, query *ast.CallExpr) map[gotypes.Object]bool {
+	out := map[gotypes.Object]bool{}
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, rhs := range assign.Rhs {
+			if i >= len(assign.Lhs) || !exprContainsCall(rhs, query) {
+				continue
+			}
+			id, ok := assign.Lhs[i].(*ast.Ident)
+			if ok {
+				if obj := h.info.ObjectOf(id); obj != nil {
+					out[obj] = true
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func exprChecksEmptyString(info *gotypes.Info, expr ast.Expr, queryVars map[gotypes.Object]bool) bool {
+	switch node := expr.(type) {
+	case *ast.BinaryExpr:
+		if node.Op == token.EQL || node.Op == token.NEQ {
+			return (exprIsQueryValue(info, node.X, queryVars) && isEmptyStringLiteral(node.Y)) ||
+				(isEmptyStringLiteral(node.X) && exprIsQueryValue(info, node.Y, queryVars))
+		}
+		return exprChecksEmptyString(info, node.X, queryVars) || exprChecksEmptyString(info, node.Y, queryVars)
+	case *ast.ParenExpr:
+		return exprChecksEmptyString(info, node.X, queryVars)
+	}
+	return false
+}
+
+func exprIsQueryValue(info *gotypes.Info, expr ast.Expr, queryVars map[gotypes.Object]bool) bool {
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if selectorName(call.Fun) == "TrimSpace" && len(call.Args) == 1 {
+			return exprIsQueryValue(info, call.Args[0], queryVars)
+		}
+		name, recvPkg, ok := routes.GinMethod(info, call)
+		return ok && recvPkg == routes.GinPkgPath && isGinQueryMethod(name)
+	}
+	id, ok := expr.(*ast.Ident)
+	return ok && queryVars[info.ObjectOf(id)]
+}
+
+func isNilIdent(expr ast.Expr) bool {
+	id, ok := expr.(*ast.Ident)
+	return ok && id.Name == "nil"
 }
 
 func exprContainsCall(expr ast.Expr, target *ast.CallExpr) bool {
@@ -1170,6 +1477,15 @@ func syntheticFormSchemaIdentity(handler string) (id string, name string) {
 	return "__synthetic." + name, name
 }
 
+func syntheticRawJSONRequestSchemaIdentity(handler string) (id string, name string) {
+	base := exportedIdentifier(handler)
+	if base == "" {
+		base = "Request"
+	}
+	name = base + "RawJSONRequest"
+	return "__synthetic." + name, name
+}
+
 func syntheticResponseSchemaIdentity(handler string, status uint16) (id string, name string) {
 	base := exportedIdentifier(handler)
 	if base == "" {
@@ -1286,11 +1602,12 @@ func (a *Analyzer) analyzeJSON(
 		file, line := positionOf(h.fset, call.Pos())
 		diags.DynamicResponse(route.Handler, "response body does not resolve to a named type", file, line)
 	}
-	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+	file, line := positionOf(h.fset, call.Pos())
+	a.addJSONResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,
 		Body:         body,
 		ContentTypes: []string{"application/json"},
-	}, false)
+	}, route, diags, file, line)
 }
 
 func (a *Analyzer) analyzeStatus(
@@ -1460,6 +1777,73 @@ func (a *Analyzer) addResponse(
 	cf.Responses = append(cf.Responses, response)
 }
 
+func (a *Analyzer) addJSONResponse(
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	response facts.ResponseFact,
+	route routes.Route,
+	diags *diag.Accumulator,
+	file string,
+	line uint32,
+) {
+	if !seenStatus[response.Status] {
+		a.addResponse(cf, seenStatus, provisionalStatus, response, false)
+		return
+	}
+	idx := responseIndex(cf.Responses, response.Status)
+	if idx < 0 {
+		return
+	}
+	if provisionalStatus[response.Status] {
+		cf.Responses[idx] = response
+		provisionalStatus[response.Status] = false
+		return
+	}
+	if response.Status < 200 || response.Status > 299 {
+		return
+	}
+	existing := cf.Responses[idx]
+	existingPriority := successResponsePriority(existing)
+	newPriority := successResponsePriority(response)
+	switch {
+	case newPriority > existingPriority:
+		cf.Responses[idx] = response
+	case newPriority == existingPriority && newPriority >= 3 && response.Body != nil && existing.Body != nil && response.Body.RefID != existing.Body.RefID:
+		if diags != nil {
+			diags.Warn("conflicting typed success responses for "+route.Handler+" status "+strconv.FormatUint(uint64(response.Status), 10)+"; keeping first response body "+existing.Body.RefID+" (GO-05)", file, line)
+		}
+	}
+}
+
+func responseIndex(responses []facts.ResponseFact, status uint16) int {
+	for i := range responses {
+		if responses[i].Status == status {
+			return i
+		}
+	}
+	return -1
+}
+
+func successResponsePriority(response facts.ResponseFact) int {
+	if response.Body == nil {
+		return 0
+	}
+	if isErrorishRef(response.Body.RefID) {
+		return 1
+	}
+	if strings.HasPrefix(response.Body.RefID, "__synthetic.") {
+		return 2
+	}
+	return 3
+}
+
+func isErrorishRef(ref string) bool {
+	parts := strings.Split(ref, ".")
+	name := strings.ToLower(parts[len(parts)-1])
+	return strings.Contains(name, "error") || strings.Contains(name, "problem") || strings.Contains(name, "failure")
+}
+
 func responseContentType(contentType string) string {
 	if contentType == "" {
 		return "application/octet-stream"
@@ -1526,6 +1910,10 @@ func calledFuncObject(info *gotypes.Info, fun ast.Expr) *gotypes.Func {
 		return nil
 	}
 	switch f := fun.(type) {
+	case *ast.IndexExpr:
+		return calledFuncObject(info, f.X)
+	case *ast.IndexListExpr:
+		return calledFuncObject(info, f.X)
 	case *ast.Ident:
 		fn, _ := info.ObjectOf(f).(*gotypes.Func)
 		return fn
@@ -1539,6 +1927,198 @@ func calledFuncObject(info *gotypes.Info, fun ast.Expr) *gotypes.Func {
 	default:
 		return nil
 	}
+}
+
+func (a *Analyzer) rawJSONRequestSchema(h handlerDecl, handler string) *facts.SchemaFact {
+	if !handlerUsesRawJSONBody(h) {
+		return nil
+	}
+	id, name := syntheticRawJSONRequestSchemaIdentity(handler)
+	return &facts.SchemaFact{
+		ID:   id,
+		Name: name,
+		Body: facts.AnyType(),
+		Span: spanOf(h.fset, declPos(h.decl)),
+	}
+}
+
+func handlerUsesRawJSONBody(h handlerDecl) bool {
+	if h.decl == nil || h.decl.Body == nil {
+		return false
+	}
+	rawVars := rawDataVars(h)
+	if len(rawVars) == 0 {
+		return false
+	}
+	if rawDataUsedByEncodingJSON(h, rawVars) {
+		return true
+	}
+	return hasJSONContentTypeEvidence(h)
+}
+
+func rawDataVars(h handlerDecl) map[gotypes.Object]bool {
+	out := map[gotypes.Object]bool{}
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			for i, rhs := range node.Rhs {
+				if i >= len(node.Lhs) || !isGinGetRawDataCall(h.info, rhs) {
+					continue
+				}
+				if id, ok := node.Lhs[i].(*ast.Ident); ok {
+					if obj := h.info.ObjectOf(id); obj != nil {
+						out[obj] = true
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for i, rhs := range node.Values {
+				if i >= len(node.Names) || !isGinGetRawDataCall(h.info, rhs) {
+					continue
+				}
+				if obj := h.info.ObjectOf(node.Names[i]); obj != nil {
+					out[obj] = true
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func isGinGetRawDataCall(info *gotypes.Info, expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	name, recvPkg, ok := routes.GinMethod(info, call)
+	return ok && recvPkg == routes.GinPkgPath && name == "GetRawData"
+}
+
+func rawDataUsedByEncodingJSON(h handlerDecl, rawVars map[gotypes.Object]bool) bool {
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn := calledFuncObject(h.info, call.Fun)
+		if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != "encoding/json" {
+			return true
+		}
+		switch fn.Name() {
+		case "Unmarshal", "Valid":
+			if len(call.Args) > 0 && exprUsesObject(h.info, call.Args[0], rawVars) {
+				found = true
+				return false
+			}
+		case "Compact", "Indent", "HTMLEscape":
+			if len(call.Args) > 1 && exprUsesObject(h.info, call.Args[1], rawVars) {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func exprUsesObject(info *gotypes.Info, expr ast.Expr, targets map[gotypes.Object]bool) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if targets[info.ObjectOf(id)] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func hasJSONContentTypeEvidence(h handlerDecl) bool {
+	found := false
+	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if expr, ok := n.(*ast.BinaryExpr); ok {
+			if exprMentionsGinContentType(h.info, expr) && exprHasStringLiteral(expr, "application/json") {
+				found = true
+				return false
+			}
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if callSubtreeHasStringLiteral(call, "application/json") && exprMentionsGinContentType(h.info, call) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func exprMentionsGinContentType(info *gotypes.Info, expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(info, call)
+		if ok && recvPkg == routes.GinPkgPath && name == "ContentType" {
+			found = true
+			return false
+		}
+		if ok && recvPkg == routes.GinPkgPath && name == "GetHeader" {
+			key, ok := stringArg(call, 0)
+			if ok && strings.EqualFold(key, "Content-Type") {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func exprHasStringLiteral(expr ast.Expr, value string) bool {
+	return callSubtreeHasStringLiteral(expr, value)
+}
+
+func callSubtreeHasStringLiteral(root ast.Node, value string) bool {
+	found := false
+	ast.Inspect(root, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		unquoted, err := strconv.Unquote(lit.Value)
+		if err == nil && strings.EqualFold(unquoted, value) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func isByteSlice(t gotypes.Type) bool {

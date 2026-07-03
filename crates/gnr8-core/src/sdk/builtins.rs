@@ -47,7 +47,8 @@ use std::path::Path;
 #[derive(Debug, Default, Clone)]
 pub struct GoGin {
     inputs: Vec<String>,
-    package_patterns: Vec<String>,
+    route_package_patterns: Vec<String>,
+    schema_package_patterns: Vec<String>,
 }
 
 impl GoGin {
@@ -76,7 +77,31 @@ impl GoGin {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.package_patterns = patterns.into_iter().map(Into::into).collect();
+        let patterns: Vec<String> = patterns.into_iter().map(Into::into).collect();
+        self.route_package_patterns.clone_from(&patterns);
+        self.schema_package_patterns = patterns;
+        self
+    }
+
+    /// Scope Go route recognition and handler analysis to the given `go/packages` patterns.
+    #[must_use]
+    pub fn route_packages<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.route_package_patterns = patterns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Scope Go schema extraction to the given `go/packages` patterns.
+    #[must_use]
+    pub fn schema_packages<I, S>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.schema_package_patterns = patterns.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -108,13 +133,21 @@ impl Source for GoGin {
         // process cwd (an absolute input is left as-is by `Path::join`). This matches the lifecycle's
         // input-resolution and keeps span provenance relative to the same root.
         let resolved = cx.project_root.join(input);
-        let cache_key = go_gin_cache_key(&resolved, &self.package_patterns, cx);
+        let cache_key = go_gin_cache_key(
+            &resolved,
+            &self.route_package_patterns,
+            &self.schema_package_patterns,
+            cx,
+        );
         if let Some(cached) = load_go_gin_cache(cx, &cache_key) {
             return Ok(cached);
         }
         let input_arg = resolved.to_string_lossy();
-        let graph =
-            crate::analyze::build_go_graph_with_patterns(&input_arg, &self.package_patterns)?;
+        let graph = crate::analyze::build_go_graph_with_package_scopes(
+            &input_arg,
+            &self.route_package_patterns,
+            &self.schema_package_patterns,
+        )?;
         save_go_gin_cache(cx, &cache_key, &graph);
         Ok(graph)
     }
@@ -134,14 +167,25 @@ fn single_input_cache_root(
     Some(vec![project_root.join(single)])
 }
 
-fn go_gin_cache_key(input: &Path, package_patterns: &[String], cx: &Cx) -> String {
+fn go_gin_cache_key(
+    input: &Path,
+    route_package_patterns: &[String],
+    schema_package_patterns: &[String],
+    cx: &Cx,
+) -> String {
     let mut files = Vec::new();
     collect_cache_input_files(input, &mut files);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-go-gin-source-cache-v2\n");
+    hasher.update(b"gnr8-go-gin-source-cache-v3\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
-    for pattern in package_patterns {
+    hasher.update(b"routes\n");
+    for pattern in route_package_patterns {
+        hasher.update(pattern.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"schemas\n");
+    for pattern in schema_package_patterns {
         hasher.update(pattern.as_bytes());
         hasher.update(b"\0");
     }
@@ -3445,7 +3489,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoSdk,
+        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, GoGin, GoSdk,
         GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
         QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
@@ -5166,6 +5210,101 @@ mod tests {
             ),
             "Flask with many inputs must be a Config error"
         );
+    }
+
+    #[test]
+    fn go_gin_supports_separate_route_and_schema_packages() {
+        let project = temp_project("go-gin-scopes");
+        std::fs::create_dir_all(project.join("ginstub")).unwrap();
+        std::fs::create_dir_all(project.join("internal/api")).unwrap();
+        std::fs::create_dir_all(project.join("internal/dto")).unwrap();
+        std::fs::write(
+            project.join("go.mod"),
+            r#"module example.com/scoped
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("ginstub/go.mod"),
+            "module github.com/gin-gonic/gin\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("ginstub/gin.go"),
+            r#"package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("internal/dto/models.go"),
+            r#"package dto
+
+type CreateRequest struct {
+	Name string `json:"name"`
+}
+
+type CreateResponse struct {
+	ID string `json:"id"`
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("internal/api/handlers.go"),
+            r#"package api
+
+import (
+	"example.com/scoped/internal/dto"
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+
+func (s Server) Register() {
+	s.R.POST("/items", s.create)
+}
+
+func (s Server) create(c *gin.Context) {
+	var input dto.CreateRequest
+	_ = c.ShouldBindJSON(&input)
+	c.JSON(200, dto.CreateResponse{})
+}
+"#,
+        )
+        .unwrap();
+
+        let graph = GoGin::new()
+            .inputs(["."])
+            .route_packages(["./internal/api"])
+            .schema_packages(["./internal/dto"])
+            .load(&Cx::new(project))
+            .unwrap();
+
+        assert_eq!(graph.operations.len(), 1);
+        let op = &graph.operations[0];
+        assert_eq!(op.path, "/items");
+        assert_eq!(
+            op.request_body.as_ref().map(|body| body.ref_id.as_str()),
+            Some("internal/dto.CreateRequest")
+        );
+        assert!(graph
+            .schemas
+            .iter()
+            .any(|schema| schema.id == "internal/dto.CreateResponse"));
     }
 
     #[test]
