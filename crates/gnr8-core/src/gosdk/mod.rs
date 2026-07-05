@@ -17,7 +17,7 @@ mod gofmt;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::graph::{ApiGraph, Operation};
-use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
     operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
@@ -164,7 +164,7 @@ pub(crate) fn generate_files_with_profile_options(
             OperationFileSplit::Compact => {
                 files.push(raw_go_file(
                     "operations.go",
-                    emit::emit_operations(graph, package, base_path, &ops)?,
+                    emit::emit_operations_without_facades(graph, package, base_path, &ops)?,
                 ));
             }
             OperationFileSplit::PerEndpoint => {
@@ -217,7 +217,9 @@ pub(crate) fn generate_files_with_profile_options(
         ));
     }
 
+    check_unique_file_names(&files, "Go SDK")?;
     let mut files = gofmt::gofmt_files(files)?;
+    check_unique_file_names(&files, "Go SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
 }
@@ -283,7 +285,9 @@ fn generate_go_openapi_generator_compat_files(
             emit::emit_model_schema_with_options(graph, package, schema, &compat_options)?,
         ));
     }
+    check_unique_file_names(&files, "Go SDK")?;
     let mut files = gofmt::gofmt_files(files)?;
+    check_unique_file_names(&files, "Go SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
 }
@@ -962,6 +966,23 @@ mod tests {
     }
 
     #[test]
+    fn split_operation_template_rejects_duplicate_rendered_files() {
+        if !gofmt_available() {
+            eprintln!("skipping split duplicate layout test: gofmt unavailable");
+            return;
+        }
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("api_{service_snake}.go");
+        let err =
+            generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate SDK file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn split_layout_emits_group_facades_once() {
         if !gofmt_available() {
             eprintln!("skipping split facade test: gofmt unavailable");
@@ -976,6 +997,38 @@ mod tests {
         assert!(
             out.contains("// ==== gnr8:file facades.go ===="),
             "split layout should emit a dedicated facade file:\n{out}"
+        );
+        assert_eq!(out.matches("type GoalsAPI struct").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("func (c *Client) Goals() *GoalsAPI").count(),
+            1,
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn split_layout_with_compact_operations_emits_group_facades_once() {
+        if !gofmt_available() {
+            eprintln!("skipping split compact operations facade test: gofmt unavailable");
+            return;
+        }
+        let mut graph = sample_graph();
+        for op in &mut graph.operations {
+            op.group = Some("Goals".to_string());
+        }
+        let layout = SdkFileLayout::split().compact_operations();
+        let out = generate_with_layout(&graph, "goalservice", "/goal", &layout).unwrap();
+        assert!(
+            out.contains("// ==== gnr8:file operations.go ===="),
+            "compact operations should emit operations.go:\n{out}"
+        );
+        assert!(
+            !out.contains("// ==== gnr8:file api_goals.go ===="),
+            "compact operations should not emit split operation files:\n{out}"
+        );
+        assert!(
+            out.contains("// ==== gnr8:file facades.go ===="),
+            "split layout should keep facades in a dedicated file:\n{out}"
         );
         assert_eq!(out.matches("type GoalsAPI struct").count(), 1, "{out}");
         assert_eq!(

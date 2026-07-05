@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, file_stem, is_json_object_key, join_path, operation_api_key_headers,
+    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
     path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of, SuccessResponses,
 };
@@ -377,12 +377,15 @@ pub(crate) fn emit_models_openapi_generator_compat(
 pub(crate) fn emit_model_schema_with_policies(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
+    models_module: &str,
     model_property_policy: TsModelPropertyPolicy,
     nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut out = String::new();
-    out.push_str("import type * as models from \"./index\";\n\n");
+    let models_module = quoted_string_literal(models_module);
+    writeln!(out, "import type * as models from {models_module};").map_err(sink)?;
+    writeln!(out).map_err(sink)?;
     match &schema.body {
         Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
         Type::Object(fields) => emit_interface_with_policies(
@@ -409,13 +412,11 @@ pub(crate) fn emit_model_schema_with_policies(
 }
 
 /// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
+    let canonical_module = quoted_string_literal(canonical_module);
     format!(
-        "import type {{ {} }} from \"./{}\";\n\nexport type {} = {};\n",
-        alias.canonical,
-        file_stem(&alias.canonical),
-        alias.alias,
-        alias.canonical
+        "import type {{ {} }} from {canonical_module};\n\nexport type {} = {};\n",
+        alias.canonical, alias.alias, alias.canonical
     )
 }
 
@@ -671,6 +672,14 @@ pub(crate) fn emit_operations(
     Ok(out)
 }
 
+pub(crate) fn emit_split_operation_surface(ops: &[&Operation]) -> Result<String, CoreError> {
+    let mut out = String::new();
+    emit_group_getters(&mut out, ops)?;
+    out.push_str("}\n");
+    emit_group_facades(&mut out, ops)?;
+    Ok(out)
+}
+
 pub(crate) fn emit_operation_module(
     graph: &ApiGraph,
     base_path: &str,
@@ -690,12 +699,6 @@ pub(crate) fn emit_operation_module(
             base_path,
             OperationEmitStyle::PrototypeFunction,
         )?;
-        let method = operation_method_name(op);
-        writeln!(out, "\ndeclare module \"{client_module}\" {{").map_err(sink)?;
-        writeln!(out, "  interface Client {{").map_err(sink)?;
-        writeln!(out, "    {method}: typeof {method};").map_err(sink)?;
-        writeln!(out, "  }}").map_err(sink)?;
-        writeln!(out, "}}").map_err(sink)?;
     }
     Ok(out)
 }
@@ -1311,22 +1314,6 @@ pub(crate) fn emit_index_with_models(
             writeln!(out, "  {name},").map_err(sink)?;
         }
         writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
-    }
-    Ok(out)
-}
-
-/// Emit `models/index.ts` for split-model layout.
-pub(crate) fn emit_models_index(
-    graph: &ApiGraph,
-    aliases: &[ResolvedTypeAlias],
-) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "TypeScript SDK")?;
-    let mut out = String::new();
-    for schema in &graph.schemas {
-        writeln!(out, "export * from \"./{}\";", file_stem(&schema.name)).map_err(sink)?;
-    }
-    for alias in aliases {
-        writeln!(out, "export * from \"./{}\";", file_stem(&alias.alias)).map_err(sink)?;
     }
     Ok(out)
 }

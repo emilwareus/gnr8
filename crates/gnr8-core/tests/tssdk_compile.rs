@@ -155,6 +155,49 @@ fn materialize_sdk() -> PathBuf {
     dir
 }
 
+fn materialize_split_sdk() -> PathBuf {
+    use gnr8::sdk::prelude::SdkFileLayout;
+
+    let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+        .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
+    for op in &mut graph.operations {
+        op.group = Some("Books".to_string());
+    }
+    let layout = SdkFileLayout::split()
+        .operation_file_template("apis/{service_snake}.ts")
+        .model_file_template("types/{schema_kebab}.ts");
+    let bundle = gnr8::tssdk::generate_with_layout(&graph, PACKAGE, &graph.base_path, &layout)
+        .expect("split tssdk::generate_with_layout must succeed");
+    let dir = unique_temp_dir("split-ok");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
+        .expect("write_to_dir must materialize the split SDK");
+    dir
+}
+
+fn collect_ts_files(dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read generated SDK dir") {
+            let entry = entry.expect("read generated SDK entry");
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else if path.extension().is_some_and(|ext| ext == "ts") {
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("generated file under SDK dir")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    files.sort();
+    files
+}
+
 fn materialize_axios_sdk() -> PathBuf {
     use gnr8::sdk::prelude::*;
 
@@ -275,6 +318,34 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     assert!(
         result.is_ok(),
         "tsc --noEmit --strict --lib es2022,dom must type-check the generated SDK (exit 0): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn split_generated_sdk_with_group_facades_typechecks_with_vendored_tsc() {
+    if !toolchain_available() {
+        eprintln!("skipping split tssdk_compile: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_split_sdk();
+    let ts_files = collect_ts_files(&dir);
+    let ts_file_refs: Vec<&str> = ts_files.iter().map(String::as_str).collect();
+
+    assert!(
+        ts_files.iter().any(|file| file == "apis/api_books.ts"),
+        "expected split operation file in generated SDK: {ts_files:?}"
+    );
+    assert!(
+        ts_files.iter().any(|file| file == "types/book.ts"),
+        "expected custom model file in generated SDK: {ts_files:?}"
+    );
+
+    let result = run_tsc(&ts_file_refs, &dir);
+    assert!(
+        result.is_ok(),
+        "split SDK with grouped facades and custom file templates must type-check: {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

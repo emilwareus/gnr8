@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Operation};
-use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
     operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
@@ -100,6 +100,10 @@ pub fn generate_with_options(
     Ok(bundle.to_string())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "SDK generation orchestration keeps file ordering, split layout, and metadata in one deterministic pass"
+)]
 pub(crate) fn generate_files_with_options(
     graph: &ApiGraph,
     package: &str,
@@ -173,10 +177,9 @@ pub(crate) fn generate_files_with_options(
     }
 
     if layout.is_split() {
-        files.push(SdkFile {
-            name: crate::sdk::emit_common::file_in_dir(Some(model_dir), "__init__.py"),
-            contents: emit::emit_models_init(graph, &resolved_aliases),
-        });
+        let model_init_name = crate::sdk::emit_common::file_in_dir(Some(model_dir), "__init__.py");
+        let mut schema_file_names = BTreeMap::new();
+        let mut model_imports = Vec::new();
         for schema in &graph.schemas {
             let default_name = crate::sdk::emit_common::file_in_dir(
                 Some(model_dir),
@@ -187,18 +190,84 @@ pub(crate) fn generate_files_with_options(
             } else {
                 default_name
             };
+            validate_python_module_file_name(&name)?;
+            model_imports.push((
+                python_relative_module(&model_init_name, &name),
+                schema.name.clone(),
+            ));
+            schema_file_names.insert(schema.name.clone(), name);
+        }
+        let mut alias_file_names = BTreeMap::new();
+        for alias in &resolved_aliases {
+            let name = crate::sdk::emit_common::file_in_dir(
+                Some(model_dir),
+                &format!("{}.py", file_stem(&alias.alias)),
+            );
+            validate_python_module_file_name(&name)?;
+            model_imports.push((
+                python_relative_module(&model_init_name, &name),
+                alias.alias.clone(),
+            ));
+            alias_file_names.insert(alias.alias.clone(), name);
+        }
+        let model_package_files: Vec<String> = schema_file_names
+            .values()
+            .chain(alias_file_names.values())
+            .cloned()
+            .collect();
+        for init in package_init_files(model_package_files.iter().map(String::as_str)) {
+            if init != model_init_name {
+                files.push(SdkFile {
+                    name: init,
+                    contents: String::new(),
+                });
+            }
+        }
+        files.push(SdkFile {
+            name: model_init_name,
+            contents: emit::emit_models_init(&model_imports),
+        });
+        for schema in &graph.schemas {
+            let name = schema_file_names
+                .get(&schema.name)
+                .ok_or_else(|| crate::CoreError::SdkGen {
+                    message: format!(
+                        "schema {} did not have a precomputed Python file",
+                        schema.name
+                    ),
+                })?
+                .clone();
+            let dep_modules: BTreeMap<String, String> = schema_file_names
+                .iter()
+                .map(|(model, file)| (model.clone(), python_relative_module(&name, file)))
+                .collect();
             files.push(SdkFile {
                 name,
-                contents: emit::emit_model_schema(graph, schema, model_style)?,
+                contents: emit::emit_model_schema(graph, schema, model_style, &dep_modules)?,
             });
         }
         for alias in &resolved_aliases {
+            let name = alias_file_names
+                .get(&alias.alias)
+                .ok_or_else(|| crate::CoreError::SdkGen {
+                    message: format!(
+                        "alias {} did not have a precomputed Python file",
+                        alias.alias
+                    ),
+                })?
+                .clone();
+            let canonical = schema_file_names.get(&alias.canonical).ok_or_else(|| {
+                crate::CoreError::SdkGen {
+                    message: format!(
+                        "type alias {} references unknown canonical model {}",
+                        alias.alias, alias.canonical
+                    ),
+                }
+            })?;
+            let canonical_module = python_relative_module(&name, canonical);
             files.push(SdkFile {
-                name: crate::sdk::emit_common::file_in_dir(
-                    Some(model_dir),
-                    &format!("{}.py", file_stem(&alias.alias)),
-                ),
-                contents: emit::emit_model_alias(alias),
+                name,
+                contents: emit::emit_model_alias(alias, &canonical_module),
             });
         }
     } else {
@@ -213,6 +282,7 @@ pub(crate) fn generate_files_with_options(
         });
     }
 
+    check_unique_file_names(&files, "Python SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
 }
@@ -231,8 +301,11 @@ fn generate_operation_files(
         OperationFileSplit::Compact => {}
         OperationFileSplit::PerEndpoint => {
             for op in ops {
-                let name =
-                    operation_file_name(layout, op, &format!("api_{}.py", file_stem(&op.id)))?;
+                let name = python_operation_file_name(
+                    layout,
+                    op,
+                    &format!("api_{}.py", file_stem(&op.id)),
+                )?;
                 files.push(SdkFile {
                     contents: emit_operation_file(
                         graph,
@@ -249,7 +322,7 @@ fn generate_operation_files(
         }
         OperationFileSplit::PerTag => {
             for (group, group_ops) in operation_groups(&ops) {
-                let name = operation_group_file_name(
+                let name = python_operation_group_file_name(
                     layout,
                     &group,
                     &format!("api_{}.py", file_stem(&group)),
@@ -338,6 +411,29 @@ fn py_relative_prefix(file_name: &str) -> String {
     ".".repeat(file_name.matches('/').count() + 1)
 }
 
+fn python_relative_module(from_file: &str, to_file: &str) -> String {
+    let from_dir: Vec<&str> = from_file.rsplit_once('/').map_or(Vec::new(), |(dir, _)| {
+        dir.split('/').filter(|part| !part.is_empty()).collect()
+    });
+    let to_without_ext = to_file.strip_suffix(".py").unwrap_or(to_file);
+    let to_parts: Vec<&str> = to_without_ext
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let common = from_dir
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let dot_count = from_dir.len().saturating_sub(common) + 1;
+    let mut out = ".".repeat(dot_count);
+    let rest: Vec<&str> = to_parts.iter().skip(common).copied().collect();
+    if !rest.is_empty() {
+        out.push_str(&rest.join("."));
+    }
+    out
+}
+
 fn emit_operation_module_imports(
     layout: &SdkFileLayout,
     graph: &ApiGraph,
@@ -366,7 +462,7 @@ fn operation_file_names(
         OperationFileSplit::Compact => {}
         OperationFileSplit::PerEndpoint => {
             for op in ops {
-                names.push(operation_file_name(
+                names.push(python_operation_file_name(
                     layout,
                     op,
                     &format!("api_{}.py", file_stem(&op.id)),
@@ -375,7 +471,7 @@ fn operation_file_names(
         }
         OperationFileSplit::PerTag => {
             for group in operation_groups(&ops).into_keys() {
-                names.push(operation_group_file_name(
+                names.push(python_operation_group_file_name(
                     layout,
                     &group,
                     &format!("api_{}.py", file_stem(&group)),
@@ -384,6 +480,45 @@ fn operation_file_names(
         }
     }
     Ok(names)
+}
+
+fn python_operation_file_name(
+    layout: &SdkFileLayout,
+    op: &Operation,
+    default_file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let name = operation_file_name(layout, op, default_file_name)?;
+    validate_python_module_file_name(&name)?;
+    Ok(name)
+}
+
+fn python_operation_group_file_name(
+    layout: &SdkFileLayout,
+    group: &str,
+    default_file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let name = operation_group_file_name(layout, group, default_file_name)?;
+    validate_python_module_file_name(&name)?;
+    Ok(name)
+}
+
+fn validate_python_module_file_name(name: &str) -> Result<(), crate::CoreError> {
+    let Some(module_path) = name.strip_suffix(".py") else {
+        return Err(crate::CoreError::SdkGen {
+            message: format!("Python SDK split file {name:?} must end with .py"),
+        });
+    };
+    for segment in module_path.split('/') {
+        if segment.is_empty() || emit::safe_ident(segment) != segment {
+            return Err(crate::CoreError::SdkGen {
+                message: format!(
+                    "Python SDK split file {name:?} is not importable; \
+                     every package and module path segment must be a valid Python identifier"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn package_init_files<'a>(file_names: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -626,6 +761,30 @@ mod tests {
     }
 
     #[test]
+    fn split_operation_template_rejects_non_importable_python_module_names() {
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("apis/{operation_kebab}.py");
+        let err = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("not importable"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn split_operation_template_rejects_duplicate_rendered_files() {
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("api_{service_snake}.py");
+        let err = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate SDK file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn split_layout_can_place_models_in_a_configured_package_directory() {
         let layout = SdkFileLayout::split().model_dir("schemas");
         let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
@@ -640,6 +799,26 @@ mod tests {
         assert!(
             out.contains("from .schemas import ("),
             "__init__.py should re-export from the configured model package:\n{out}"
+        );
+    }
+
+    #[test]
+    fn split_model_template_updates_model_package_imports() {
+        let layout = SdkFileLayout::split()
+            .model_dir("schemas")
+            .model_file_template("types/{schema_snake}.py");
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"types/__init__.py"), "{names:?}");
+        assert!(names.contains(&"types/book.py"), "{names:?}");
+        assert!(
+            out.contains("from ..types.book import Book"),
+            "schemas/__init__.py should import actual rendered model paths:\n{out}"
+        );
+        assert!(
+            out.contains("from .schemas import ("),
+            "root __init__.py and client.py should import the configured model package:\n{out}"
         );
     }
 }

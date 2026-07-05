@@ -19,6 +19,8 @@
 //! FIXED + sorted by each emitter's push order, and `to_string` is byte-identical across runs
 //! (determinism).
 
+use std::collections::BTreeSet;
+
 /// One generated SDK file: its on-disk name (e.g. `client.go`) and its emitted contents.
 #[derive(Debug, Clone)]
 pub(crate) struct SdkFile {
@@ -33,6 +35,24 @@ pub(crate) struct SdkFile {
 pub(crate) struct SdkBundle {
     /// Files in their fixed, sorted emission order (see module docs).
     pub(crate) files: Vec<SdkFile>,
+}
+
+pub(crate) fn check_unique_file_names(
+    files: &[SdkFile],
+    target: &str,
+) -> Result<(), crate::CoreError> {
+    let mut seen = BTreeSet::new();
+    for file in files {
+        if !seen.insert(file.name.as_str()) {
+            return Err(crate::CoreError::SdkGen {
+                message: format!(
+                    "{target} generated duplicate SDK file {:?}; adjust the SDK file layout templates",
+                    file.name
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The frame marker prefix; `<name>` and the trailing ` ====` complete the line.

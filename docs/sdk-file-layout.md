@@ -90,7 +90,7 @@ The same split-by-tag mode is configured on each target:
 GoSdk::new()
     .module("example.com/acme/sdk")
     .to("generated/go")
-    .layout(SdkFileLayout::split());
+    .layout(SdkFileLayout::split().operation_dir("apis"));
 
 PySdk::new()
     .module("example.com/acme/sdk")
@@ -165,17 +165,31 @@ The endpoint split mode is also available on every SDK target:
 GoSdk::new()
     .module("example.com/acme/sdk")
     .to("generated/go")
-    .layout(SdkFileLayout::split().operations_per_endpoint());
+    .layout(
+        SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_dir("apis"),
+    );
 
 PySdk::new()
     .module("example.com/acme/sdk")
     .to("generated/python")
-    .layout(SdkFileLayout::split().operations_per_endpoint());
+    .layout(
+        SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_dir("apis")
+            .model_dir("models"),
+    );
 
 TsSdk::new()
     .module("@acme/sdk")
     .to("generated/typescript")
-    .layout(SdkFileLayout::split().operations_per_endpoint());
+    .layout(
+        SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_dir("apis")
+            .model_dir("models"),
+    );
 ```
 
 Typical output:
@@ -184,6 +198,7 @@ Typical output:
 generated/go/
   client.go
   errors.go
+  facades.go
   apis/api_create_book.go
   apis/api_list_books.go
   apis/api_list_authors.go
@@ -250,12 +265,20 @@ SdkFileLayout::split()
 
 SdkFileLayout::split()
     .operations_per_tag()
+    .model_dir("schemas")
     .operation_file_template("apis/{service_snake}.py")
     .model_file_template("schemas/{schema_snake}.py");
 ```
 
 If a per-tag operation template uses an operation placeholder such as `{operation_snake}`, generation
 fails with a typed SDK generation error because there is no single operation name for a grouped file.
+Generation also fails if two generated files render to the same path; adjust the split mode or
+template so every operation and model file has a unique path.
+
+For Python SDK operation files, every package and module path segment rendered by
+`.operation_file_template(...)` must be a valid Python identifier. Use snake-case placeholders such as
+`{service_snake}` or `{operation_snake}` rather than kebab-case placeholders for Python operation
+modules.
 
 ## Keeping Operations Compact
 
