@@ -20,14 +20,14 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
-use crate::sdk::bundle::{SdkBundle, SdkFile};
+use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
-    model_file_name, operation_api_key_schemes, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    validate_sdk_base_path,
+    model_file_name, operation_api_key_schemes, operation_file_name, operation_group_file_name,
+    operation_group_name, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, validate_sdk_base_path,
 };
-use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::sdk::typescript::{TsBarrelExports, TsResponsePolicy, TsSdkOptions};
@@ -87,6 +87,10 @@ pub(crate) fn generate_files_with_layout(
     generate_files_with_layout_options(graph, package, base_path, layout, aliases, &options)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "SDK generation orchestration keeps file ordering, split layout, and profile options in one deterministic pass"
+)]
 fn generate_files_with_layout_options(
     graph: &ApiGraph,
     package: &str,
@@ -106,12 +110,19 @@ fn generate_files_with_layout_options(
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     let model_dir = layout.model_dir_ref().unwrap_or("models");
+    let split_operations =
+        layout.is_split() && !matches!(layout.operation_split(), OperationFileSplit::Compact);
     let mut client = emit::emit_client_with_models(
         package,
         model_dir.trim_matches('/'),
         !auth_headers.is_empty(),
     );
-    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    if split_operations {
+        client.push_str(&emit::emit_split_operation_surface(&ops)?);
+        client.push_str(&emit_operation_module_imports(layout, graph)?);
+    } else {
+        client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    }
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -132,33 +143,76 @@ fn generate_files_with_layout_options(
         )?,
     });
 
+    if split_operations {
+        files.extend(generate_operation_files(
+            graph,
+            base_path,
+            layout,
+            model_dir.trim_matches('/'),
+        )?);
+    }
+
     if layout.is_split() {
-        files.push(SdkFile {
-            name: file_in_dir(Some(model_dir), "index.ts"),
-            contents: emit::emit_models_index(graph, &resolved_aliases)?,
-        });
+        let model_index_name = file_in_dir(Some(model_dir), "index.ts");
+        let mut model_exports = Vec::new();
+        let mut schema_file_names = BTreeMap::new();
         for schema in &graph.schemas {
             let default_name =
                 file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
             let name = if layout.model_file_template_ref().is_some() {
-                model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
+                ts_model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
             } else {
                 default_name
             };
+            model_exports.push(ts_relative_module(&model_index_name, &name));
+            schema_file_names.insert(schema.name.clone(), name);
+        }
+        for alias in &resolved_aliases {
+            let name = file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias)));
+            validate_ts_file_name(&name)?;
+            model_exports.push(ts_relative_module(&model_index_name, &name));
+        }
+        files.push(SdkFile {
+            name: model_index_name.clone(),
+            contents: emit_ts_models_index(&model_exports),
+        });
+        for schema in &graph.schemas {
+            let name = schema_file_names
+                .get(&schema.name)
+                .ok_or_else(|| crate::CoreError::SdkGen {
+                    message: format!(
+                        "schema {} did not have a precomputed TypeScript file",
+                        schema.name
+                    ),
+                })?
+                .clone();
+            let models_module = ts_relative_module(&name, &model_index_name);
             files.push(SdkFile {
                 name,
                 contents: emit::emit_model_schema_with_policies(
                     graph,
                     schema,
+                    &models_module,
                     options.model_properties,
                     options.nullable,
                 )?,
             });
         }
         for alias in &resolved_aliases {
+            let name = file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias)));
+            validate_ts_file_name(&name)?;
+            let canonical = schema_file_names.get(&alias.canonical).ok_or_else(|| {
+                crate::CoreError::SdkGen {
+                    message: format!(
+                        "type alias {} references unknown canonical model {}",
+                        alias.alias, alias.canonical
+                    ),
+                }
+            })?;
+            let canonical_module = ts_relative_module(&name, canonical);
             files.push(SdkFile {
-                name: file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias))),
-                contents: emit::emit_model_alias(alias),
+                name,
+                contents: emit::emit_model_alias(alias, &canonical_module),
             });
         }
     } else {
@@ -173,8 +227,268 @@ fn generate_files_with_layout_options(
         });
     }
 
+    check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
+}
+
+fn emit_ts_models_index(exports: &[String]) -> String {
+    let mut out = String::new();
+    for module in exports {
+        let module = quoted_string_literal(module);
+        out.push_str("export * from ");
+        out.push_str(&module);
+        out.push_str(";\n");
+    }
+    out
+}
+
+fn generate_operation_files(
+    graph: &ApiGraph,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    model_module: &str,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut files = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                let name =
+                    ts_operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(graph, base_path, &[op], model_module, &name)?,
+                    name,
+                });
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for (group, group_ops) in operation_groups(&ops) {
+                let name = ts_operation_group_file_name(
+                    layout,
+                    &group,
+                    &format!("api_{}.ts", file_stem(&group)),
+                )?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(
+                        graph,
+                        base_path,
+                        &group_ops,
+                        model_module,
+                        &name,
+                    )?,
+                    name,
+                });
+            }
+        }
+    }
+    for index in ts_barrel_files(files.iter().map(|file| file.name.as_str())) {
+        files.push(SdkFile {
+            name: index,
+            contents: String::new(),
+        });
+    }
+    Ok(files)
+}
+
+fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
+    let mut groups: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in ops {
+        groups
+            .entry(operation_group_name(op).to_string())
+            .or_default()
+            .push(*op);
+    }
+    groups
+}
+
+fn emit_operation_file(
+    graph: &ApiGraph,
+    base_path: &str,
+    ops: &[&Operation],
+    model_module: &str,
+    file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let root = ts_relative_root(file_name);
+    emit::emit_operation_module(
+        graph,
+        base_path,
+        ops,
+        &format!("{root}client"),
+        &format!("{root}errors"),
+        &format!("{root}{model_module}"),
+    )
+}
+
+fn ts_relative_root(file_name: &str) -> String {
+    let depth = file_name.matches('/').count();
+    if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
+    }
+}
+
+fn ts_relative_module(from_file: &str, to_file: &str) -> String {
+    let from_dir: Vec<&str> = from_file.rsplit_once('/').map_or(Vec::new(), |(dir, _)| {
+        dir.split('/').filter(|part| !part.is_empty()).collect()
+    });
+    let to_without_ext = to_file.strip_suffix(".ts").unwrap_or(to_file);
+    let to_parts: Vec<&str> = to_without_ext
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let common = from_dir
+        .iter()
+        .zip(to_parts.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts: Vec<&str> = Vec::new();
+    parts.extend(std::iter::repeat_n(
+        "..",
+        from_dir.len().saturating_sub(common),
+    ));
+    parts.extend(to_parts.iter().skip(common).copied());
+    if parts.first().is_some_and(|part| *part == "..") {
+        parts.join("/")
+    } else {
+        format!("./{}", parts.join("/"))
+    }
+}
+
+fn ts_operation_file_name(
+    layout: &SdkFileLayout,
+    op: &Operation,
+    default_file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let name = operation_file_name(layout, op, default_file_name)?;
+    validate_ts_file_name(&name)?;
+    Ok(name)
+}
+
+fn ts_operation_group_file_name(
+    layout: &SdkFileLayout,
+    group: &str,
+    default_file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let name = operation_group_file_name(layout, group, default_file_name)?;
+    validate_ts_file_name(&name)?;
+    Ok(name)
+}
+
+fn ts_model_file_name(
+    layout: &SdkFileLayout,
+    schema: &crate::graph::Schema,
+    default_file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let name = model_file_name(layout, schema, default_file_name)?;
+    validate_ts_file_name(&name)?;
+    Ok(name)
+}
+
+fn validate_ts_file_name(name: &str) -> Result<(), crate::CoreError> {
+    if std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+    {
+        return Ok(());
+    }
+    Err(crate::CoreError::SdkGen {
+        message: format!("TypeScript SDK split file {name:?} must end with .ts"),
+    })
+}
+
+fn emit_operation_module_imports(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<String, crate::CoreError> {
+    let mut out = String::new();
+    let mut client_interface = String::new();
+    let mut assignments = String::new();
+    for (index, (file, methods)) in operation_file_methods(layout, graph)?
+        .into_iter()
+        .enumerate()
+    {
+        let module = file.trim_end_matches(".ts");
+        for (method_index, method) in methods.into_iter().enumerate() {
+            let binding = format!("operation{index}_{method_index}");
+            let specifier = quoted_string_literal(&format!("./{module}"));
+            out.push_str("import { ");
+            out.push_str(&method);
+            out.push_str(" as ");
+            out.push_str(&binding);
+            out.push_str(" } from ");
+            out.push_str(&specifier);
+            out.push_str(";\n");
+            client_interface.push_str("  ");
+            client_interface.push_str(&method);
+            client_interface.push_str(": typeof ");
+            client_interface.push_str(&binding);
+            client_interface.push_str(";\n");
+            assignments.push_str("Client.prototype.");
+            assignments.push_str(&method);
+            assignments.push_str(" = ");
+            assignments.push_str(&binding);
+            assignments.push_str(";\n");
+        }
+    }
+    if !client_interface.is_empty() {
+        out.push_str("\nexport interface Client {\n");
+        out.push_str(&client_interface);
+        out.push_str("}\n");
+    }
+    if !assignments.is_empty() {
+        out.push('\n');
+        out.push_str(&assignments);
+    }
+    Ok(out)
+}
+
+fn operation_file_methods(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut files = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                files.push((
+                    ts_operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?,
+                    vec![emit::operation_method_name(op)],
+                ));
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for (group, ops) in operation_groups(&ops) {
+                files.push((
+                    ts_operation_group_file_name(
+                        layout,
+                        &group,
+                        &format!("api_{}.ts", file_stem(&group)),
+                    )?,
+                    ops.into_iter().map(emit::operation_method_name).collect(),
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn ts_barrel_files<'a>(file_names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut indexes = Vec::new();
+    for name in file_names {
+        let Some((dir, _)) = name.rsplit_once('/') else {
+            continue;
+        };
+        let index = format!("{dir}/index.ts");
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+    indexes
 }
 
 #[cfg(test)]
@@ -270,6 +584,7 @@ fn generate_openapi_generator_compat_files(
             contents: emit_axios_package_json(package),
         },
     ];
+    check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
 }
@@ -313,6 +628,7 @@ fn generate_typescript_fetch_compat_files(
             contents: emit_fetch_package_json(package),
         },
     ];
+    check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
 }
@@ -2520,6 +2836,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "api_default.ts",
                 "client.ts",
                 "errors.ts",
                 "index.ts",
@@ -2533,6 +2850,14 @@ mod tests {
             !names.contains(&"models.ts"),
             "split layout must not emit compact models.ts"
         );
+        assert!(
+            out.contains("import { createBook as operation0_0 } from \"./api_default\";"),
+            "client.ts should import split operation functions:\n{out}"
+        );
+        assert!(
+            out.contains("Client.prototype.createBook = operation0_0;"),
+            "client.ts should attach split operation functions to Client:\n{out}"
+        );
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2541,9 +2866,85 @@ mod tests {
             std::env::temp_dir().join(format!("gnr8-tssdk-split-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write_to_dir(&out, &dir).unwrap();
+        assert!(dir.join("api_default.ts").is_file());
         assert!(dir.join("models/book.ts").is_file());
         assert!(dir.join("models/index.ts").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_can_emit_one_operation_file_per_endpoint() {
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"api_create_book.ts"), "{names:?}");
+        assert!(names.contains(&"api_list_books.ts"), "{names:?}");
+    }
+
+    #[test]
+    fn split_layout_preserves_group_facades() {
+        let mut graph = sample_graph();
+        for op in &mut graph.operations {
+            op.group = Some("Books".to_string());
+        }
+        let out = generate_with_layout(&graph, "bookstore", "/", &SdkFileLayout::split()).unwrap();
+        assert!(
+            out.contains("get books(): BooksApi"),
+            "split client should keep grouped facade getters:\n{out}"
+        );
+        assert!(
+            out.contains("export class BooksApi"),
+            "split client should keep grouped facade classes:\n{out}"
+        );
+    }
+
+    #[test]
+    fn split_operation_template_rejects_duplicate_rendered_files() {
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("api_{service_snake}.ts");
+        let err = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate SDK file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn split_operation_template_rejects_non_ts_files() {
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("api_{operation_snake}.js");
+        let err = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("must end with .ts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn split_model_template_rejects_non_ts_files() {
+        let layout = SdkFileLayout::split().model_file_template("models/{schema_snake}.js");
+        let err = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap_err();
+        assert!(
+            err.to_string().contains("must end with .ts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn split_operation_import_escapes_custom_module_specifiers() {
+        let mut graph = sample_graph();
+        graph.operations[0].id = "create\"Book".to_string();
+        let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
+            .operation_file_template("api_{operation}.ts");
+        let out = generate_with_layout(&graph, "bookstore", "/", &layout).unwrap();
+        assert!(
+            out.contains("from \"./api_create\\\"Book\";"),
+            "client.ts should escape generated module specifiers:\n{out}"
+        );
     }
 
     #[test]
@@ -2559,5 +2960,25 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("} from \"./schemas\";"), "{out}");
+    }
+
+    #[test]
+    fn split_model_template_updates_model_barrel_paths() {
+        let layout = SdkFileLayout::split()
+            .model_dir("schemas")
+            .model_file_template("types/{schema_kebab}.ts");
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        assert!(
+            out.contains("export * from \"../types/book\";"),
+            "schemas/index.ts should export actual rendered model paths:\n{out}"
+        );
+        assert!(
+            out.contains("export * from \"../types/created-message\";"),
+            "schemas/index.ts should preserve kebab model file names:\n{out}"
+        );
+        assert!(
+            out.contains("import type * as models from \"../schemas/index\";"),
+            "custom model files should import the configured model barrel:\n{out}"
+        );
     }
 }

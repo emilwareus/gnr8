@@ -2776,7 +2776,12 @@ impl GoSdk {
     /// Use the split layout for larger SDKs.
     #[must_use]
     pub fn split_files(self) -> Self {
-        self.layout(SdkFileLayout::split().root_operations().root_models())
+        self.layout(
+            SdkFileLayout::split()
+                .operations_per_endpoint()
+                .root_operations()
+                .root_models(),
+        )
     }
 
     /// Add compatibility type aliases to the generated SDK surface.
@@ -3036,7 +3041,11 @@ impl PySdk {
     /// Use the split layout for larger SDKs.
     #[must_use]
     pub fn split_files(self) -> Self {
-        self.layout(SdkFileLayout::split().model_dir("models"))
+        self.layout(
+            SdkFileLayout::split()
+                .operations_per_endpoint()
+                .model_dir("models"),
+        )
     }
 
     /// Use Pydantic v2 `BaseModel` models. This is the default.
@@ -3225,7 +3234,11 @@ impl TsSdk {
     /// Use the split layout for larger SDKs.
     #[must_use]
     pub fn split_files(self) -> Self {
-        self.layout(SdkFileLayout::split().model_dir("models"))
+        self.layout(
+            SdkFileLayout::split()
+                .operations_per_endpoint()
+                .model_dir("models"),
+        )
     }
 
     /// Add compatibility type aliases to the generated SDK surface.

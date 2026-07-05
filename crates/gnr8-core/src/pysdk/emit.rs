@@ -23,11 +23,12 @@
 //! iteration). Every un-representable fact (a dangling `$ref`) returns [`crate::CoreError::SdkGen`];
 //! there is no production `unwrap`/`expect`/`panic` (RUST-04).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, file_stem, is_json_object_key, join_path, operation_api_key_headers,
+    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
     path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of,
 };
@@ -218,6 +219,10 @@ pub(crate) fn snake(name: &str) -> String {
         .map(|w| w.to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join("_")
+}
+
+pub(crate) fn operation_method_name(op: &Operation) -> String {
+    snake(&op.handler)
 }
 
 /// Convert an enum member value to a `SCREAMING_SNAKE` identifier: `out-of-stock` → `OUT_OF_STOCK`.
@@ -541,6 +546,7 @@ pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
     model_style: PyModelStyle,
+    dep_modules: &BTreeMap<String, String>,
 ) -> Result<String, CoreError> {
     // Forward-ref imports are needed ONLY for an object model's field types; an enum has none, and an
     // alias body is a string literal whose names `ruff` never reads (so importing them would be F401).
@@ -561,13 +567,13 @@ pub(crate) fn emit_model_schema(
         out.push('\n');
         writeln!(out, "if TYPE_CHECKING:").map_err(sink)?;
         for dep in deps {
-            writeln!(
-                out,
-                "    from .{} import {}",
-                crate::sdk::emit_common::file_stem(&dep),
-                dep
-            )
-            .map_err(sink)?;
+            let module = dep_modules.get(&dep).ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "schema '{}' depends on model {dep:?}, but no Python module was generated for it",
+                    schema.name
+                ),
+            })?;
+            writeln!(out, "    from {module} import {dep}").map_err(sink)?;
         }
         out.push_str("\n\n");
     }
@@ -591,10 +597,9 @@ pub(crate) fn emit_model_schema(
 }
 
 /// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
     format!(
-        "from __future__ import annotations\n\nfrom .{} import {} as {}\n\n__all__ = [\"{}\"]\n",
-        file_stem(&alias.canonical),
+        "from __future__ import annotations\n\nfrom {canonical_module} import {} as {}\n\n__all__ = [\"{}\"]\n",
         alias.canonical,
         alias.alias,
         alias.alias
@@ -602,31 +607,20 @@ pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
 }
 
 /// Emit `models/__init__.py` for split-model layout.
-pub(crate) fn emit_models_init(graph: &ApiGraph, aliases: &[ResolvedTypeAlias]) -> String {
+pub(crate) fn emit_models_init(imports: &[(String, String)]) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
-    // isort orders relative imports by MODULE (the file stem), which need not match the graph's
-    // id-sorted schema order — so sort the import lines by stem here to stay I001-clean.
-    let mut imports: Vec<(String, String)> = graph
-        .schemas
-        .iter()
-        .map(|s| (file_stem(&s.name), s.name.clone()))
-        .chain(
-            aliases
-                .iter()
-                .map(|a| (file_stem(&a.alias), a.alias.clone())),
-        )
-        .collect();
+    // isort orders relative imports by MODULE, which need not match graph order or custom templates.
+    let mut imports = imports.to_vec();
     imports.sort();
-    for (stem, name) in &imports {
-        let _ = writeln!(out, "from .{stem} import {name}");
+    for (module, name) in &imports {
+        let _ = writeln!(out, "from {module} import {name}");
     }
     out.push_str("\n__all__ = [\n");
-    for schema in &graph.schemas {
-        let _ = writeln!(out, "    \"{}\",", schema.name);
-    }
-    for alias in aliases {
-        let _ = writeln!(out, "    \"{}\",", alias.alias);
+    let mut names: Vec<&str> = imports.iter().map(|(_, name)| name.as_str()).collect();
+    names.sort_unstable();
+    for name in names {
+        let _ = writeln!(out, "    \"{name}\",");
     }
     out.push_str("]\n\n");
     out.push_str("_types_namespace = {name: globals()[name] for name in __all__}\n");

@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, file_stem, is_json_object_key, join_path, operation_api_key_headers,
+    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
     path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of, SuccessResponses,
 };
@@ -66,6 +66,10 @@ pub(crate) fn camel(name: &str) -> String {
         }
     }
     out
+}
+
+pub(crate) fn operation_method_name(op: &Operation) -> String {
+    camel(&op.handler)
 }
 
 /// Escape an arbitrary wire string into a TypeScript double-quoted string literal (the quotes
@@ -373,12 +377,15 @@ pub(crate) fn emit_models_openapi_generator_compat(
 pub(crate) fn emit_model_schema_with_policies(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
+    models_module: &str,
     model_property_policy: TsModelPropertyPolicy,
     nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut out = String::new();
-    out.push_str("import type * as models from \"./index\";\n\n");
+    let models_module = quoted_string_literal(models_module);
+    writeln!(out, "import type * as models from {models_module};").map_err(sink)?;
+    writeln!(out).map_err(sink)?;
     match &schema.body {
         Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
         Type::Object(fields) => emit_interface_with_policies(
@@ -405,13 +412,11 @@ pub(crate) fn emit_model_schema_with_policies(
 }
 
 /// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
+pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
+    let canonical_module = quoted_string_literal(canonical_module);
     format!(
-        "import type {{ {} }} from \"./{}\";\n\nexport type {} = {};\n",
-        alias.canonical,
-        file_stem(&alias.canonical),
-        alias.alias,
-        alias.canonical
+        "import type {{ {} }} from {canonical_module};\n\nexport type {} = {};\n",
+        alias.canonical, alias.alias, alias.canonical
     )
 }
 
@@ -575,23 +580,8 @@ pub(crate) fn emit_client(package: &str) -> String {
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
-    has_auth: bool,
+    _has_auth: bool,
 ) -> String {
-    let api_key_option = if has_auth {
-        "  apiKey?: string;\n  apiKeys?: Record<string, string>;\n"
-    } else {
-        ""
-    };
-    let api_key_field = if has_auth {
-        "  private readonly apiKey?: string;\n  private readonly apiKeys: Record<string, string>;\n"
-    } else {
-        ""
-    };
-    let api_key_assign = if has_auth {
-        "    this.apiKey = opts.apiKey;\n    this.apiKeys = opts.apiKeys ?? {};\n"
-    } else {
-        ""
-    };
     format!(
         "\
 import {{ ApiError }} from \"./errors\";
@@ -600,16 +590,45 @@ import * as models from \"./{model_module}\";
 export interface ClientOptions {{
   baseUrl: string;
   fetch?: typeof fetch;
-{api_key_option}}}
+  apiKey?: string;
+  apiKeys?: Record<string, string>;
+}}
 
 export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
-{api_key_field}
+  private readonly apiKey?: string;
+  private readonly apiKeys: Record<string, string>;
+
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
-{api_key_assign}  }}
+    this.apiKey = opts.apiKey;
+    this.apiKeys = opts.apiKeys ?? {{}};
+  }}
+
+  _apiKey(...names: string[]): string | undefined {{
+    for (const name of names) {{
+      const value = this.apiKeys[name];
+      if (value !== undefined) {{
+        return value;
+      }}
+    }}
+    return this.apiKey;
+  }}
+
+  async _request(
+    method: string,
+    path: string,
+    headers: Record<string, string>,
+    body?: unknown,
+  ): Promise<Response> {{
+    return await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }});
+  }}
 "
     )
 }
@@ -622,8 +641,8 @@ export class Client {{
 /// - interpolates each path param through `encodeURIComponent(String(value))` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape` / Python `urllib.quote(safe='')`); builds the query with a
 ///   `URLSearchParams`; joins `base_path` + `op.path`;
-/// - `await`s `this.fetchFn`, throws `ApiError` for non-2xx responses, and returns decoded JSON only
-///   for success statuses that declare a body model.
+/// - dispatches through `this._request`, throws `ApiError` for non-2xx responses, and returns decoded
+///   JSON only for success statuses that declare a body model.
 ///
 /// # Errors
 ///
@@ -638,12 +657,49 @@ pub(crate) fn emit_operations(
     let mut out = String::new();
     for op in ops {
         out.push('\n');
-        emit_operation(&mut out, op, graph, base_path)?;
+        emit_operation(
+            &mut out,
+            op,
+            graph,
+            base_path,
+            OperationEmitStyle::ClassMethod,
+        )?;
     }
     emit_group_getters(&mut out, ops)?;
     // Close the `class Client {` opened by emit_client.
     out.push_str("}\n");
     emit_group_facades(&mut out, ops)?;
+    Ok(out)
+}
+
+pub(crate) fn emit_split_operation_surface(ops: &[&Operation]) -> Result<String, CoreError> {
+    let mut out = String::new();
+    emit_group_getters(&mut out, ops)?;
+    out.push_str("}\n");
+    emit_group_facades(&mut out, ops)?;
+    Ok(out)
+}
+
+pub(crate) fn emit_operation_module(
+    graph: &ApiGraph,
+    base_path: &str,
+    ops: &[&Operation],
+    client_module: &str,
+    errors_module: &str,
+    models_module: &str,
+) -> Result<String, CoreError> {
+    let mut out = format!(
+        "import type {{ Client }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
+    );
+    for op in ops {
+        emit_operation(
+            &mut out,
+            op,
+            graph,
+            base_path,
+            OperationEmitStyle::PrototypeFunction,
+        )?;
+    }
     Ok(out)
 }
 
@@ -667,10 +723,18 @@ fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
         return Ok(());
     }
     let method_names: BTreeSet<String> = ops.iter().map(|op| camel(&op.handler)).collect();
-    let mut properties: BTreeSet<String> = ["apiKey", "baseUrl", "constructor", "fetchFn"]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect();
+    let mut properties: BTreeSet<String> = [
+        "_apiKey",
+        "_request",
+        "apiKey",
+        "apiKeys",
+        "baseUrl",
+        "constructor",
+        "fetchFn",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect();
     let mut class_names = BTreeMap::new();
     for group in groups.keys() {
         let property = camel(group);
@@ -858,13 +922,24 @@ fn emit_facade_signature(out: &mut String, method: &str, lit: &str) -> Result<()
 }
 
 /// Emit a single operation method (2-space indented as a `Client` method body).
+#[derive(Clone, Copy)]
+enum OperationEmitStyle {
+    ClassMethod,
+    PrototypeFunction,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one operation emitter keeps signature, path, query, dispatch, and split-mode wrappers in one deterministic pass"
+)]
 fn emit_operation(
     out: &mut String,
     op: &Operation,
     graph: &ApiGraph,
     base_path: &str,
+    style: OperationEmitStyle,
 ) -> Result<(), CoreError> {
-    let method_name = camel(&op.handler);
+    let method_name = operation_method_name(op);
     let abs = join_path(base_path, &op.path);
     let tokens = path_tokens(&abs);
 
@@ -949,12 +1024,24 @@ fn emit_operation(
     } else {
         "Promise<void>".to_string()
     };
-    writeln!(
-        out,
-        "{}",
-        ts_method_signature(&method_name, &args, &ret_promise)
-    )
-    .map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => {
+            writeln!(
+                out,
+                "{}",
+                ts_method_signature(&method_name, &args, &ret_promise)
+            )
+            .map_err(sink)?;
+        }
+        OperationEmitStyle::PrototypeFunction => {
+            writeln!(
+                out,
+                "{}",
+                ts_prototype_signature(&method_name, &args, &ret_promise)
+            )
+            .map_err(sink)?;
+        }
+    }
 
     emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
     emit_op_query(
@@ -972,8 +1059,21 @@ fn emit_operation(
         TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
         &auth_headers,
     )?;
-    writeln!(out, "  }}").map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
+        OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
     Ok(())
+}
+
+fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> String {
+    let mut out = format!("export const {name} = async function (\n");
+    out.push_str("  this: Client,\n");
+    for arg in args {
+        let _ = writeln!(out, "  {arg},");
+    }
+    let _ = write!(out, "): {ret_promise} {{");
+    out
 }
 
 /// Emit the `let path = …` line for one operation: a template literal with each path param
@@ -1085,7 +1185,7 @@ fn emit_op_dispatch(
         let local = format!("apiKey{idx}");
         writeln!(
             out,
-            "    const {local} = this.apiKeys[{}] ?? this.apiKey;",
+            "    const {local} = this._apiKey({});",
             quoted_string_literal(header)
         )
         .map_err(sink)?;
@@ -1109,23 +1209,19 @@ fn emit_op_dispatch(
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    writeln!(
-        out,
-        "    const res = await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{"
-    )
-    .map_err(sink)?;
-    writeln!(out, "      method: \"{method}\",").map_err(sink)?;
-    writeln!(out, "      headers,").map_err(sink)?;
-    if request_body.is_required() {
-        writeln!(out, "      body: JSON.stringify(body),").map_err(sink)?;
-    } else if request_body.is_present() {
+    if request_body.is_present() {
         writeln!(
             out,
-            "      body: body === undefined ? undefined : JSON.stringify(body),"
+            "    const res = await this._request(\"{method}\", path, headers, body);"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "    const res = await this._request(\"{method}\", path, headers);"
         )
         .map_err(sink)?;
     }
-    writeln!(out, "    }});").map_err(sink)?;
     writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
     writeln!(
         out,
@@ -1218,22 +1314,6 @@ pub(crate) fn emit_index_with_models(
             writeln!(out, "  {name},").map_err(sink)?;
         }
         writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
-    }
-    Ok(out)
-}
-
-/// Emit `models/index.ts` for split-model layout.
-pub(crate) fn emit_models_index(
-    graph: &ApiGraph,
-    aliases: &[ResolvedTypeAlias],
-) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "TypeScript SDK")?;
-    let mut out = String::new();
-    for schema in &graph.schemas {
-        writeln!(out, "export * from \"./{}\";", file_stem(&schema.name)).map_err(sink)?;
-    }
-    for alias in aliases {
-        writeln!(out, "export * from \"./{}\";", file_stem(&alias.alias)).map_err(sink)?;
     }
     Ok(out)
 }
@@ -1762,10 +1842,9 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("body: JSON.stringify(body),"),
-                "body op serializes the body:\n{out}"
+                out.contains("const res = await this._request(\"POST\", path, headers, body);"),
+                "body op dispatches through the shared request helper:\n{out}"
             );
-            assert!(out.contains("method: \"POST\","), "{out}");
         }
 
         #[test]
@@ -1935,11 +2014,11 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("const apiKey0 = this.apiKeys[\"X-API-Key\"] ?? this.apiKey;"),
+                out.contains("const apiKey0 = this._apiKey(\"X-API-Key\");"),
                 "{out}"
             );
             assert!(
-                out.contains("const apiKey1 = this.apiKeys[\"X_API_Key\"] ?? this.apiKey;"),
+                out.contains("const apiKey1 = this._apiKey(\"X_API_Key\");"),
                 "{out}"
             );
             assert!(
@@ -1971,9 +2050,9 @@ mod tests {
             g.operations[0].security_overrides_global = true;
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
-            assert!(out.contains("this.apiKeys[\"X-CSRF-Token\"]"), "{out}");
+            assert!(out.contains("this._apiKey(\"X-CSRF-Token\")"), "{out}");
             assert!(
-                !out.contains("this.apiKeys[\"X-API-Key\"]"),
+                !out.contains("this._apiKey(\"X-API-Key\")"),
                 "imported operation security override must not inherit global auth:\n{out}"
             );
         }

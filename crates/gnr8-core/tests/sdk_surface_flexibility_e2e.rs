@@ -90,6 +90,7 @@ fn generated_sdks_support_configurable_surface_and_compile() {
         .to("go-sdk")
         .layout(
             SdkFileLayout::split()
+                .operations_per_endpoint()
                 .operation_file_template("api_{service_snake}_{operation_snake}.go")
                 .model_file_template("model_{schema_snake}.go"),
         )
@@ -129,8 +130,9 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     assert!(go_op.contains("authorization"), "{go_op}");
     assert!(root.join("go-sdk/aliases.go").exists());
 
-    let py_client = std::fs::read_to_string(root.join("pysdk/client.py")).expect("read py client");
-    assert!(py_client.contains("authorization"), "{py_client}");
+    let py_op = std::fs::read_to_string(root.join("pysdk/api_goals.py"))
+        .expect("read grouped Python operation");
+    assert!(py_op.contains("authorization"), "{py_op}");
     let py_model = std::fs::read_to_string(root.join("pysdk/models/create_goal_input.py"))
         .expect("read py model");
     assert!(py_model.contains("BaseModel"), "{py_model}");
@@ -138,7 +140,9 @@ fn generated_sdks_support_configurable_surface_and_compile() {
 
     let ts_client = std::fs::read_to_string(root.join("ts-sdk/client.ts")).expect("read ts client");
     assert!(ts_client.contains("apiKey?: string"), "{ts_client}");
-    assert!(ts_client.contains("authorization"), "{ts_client}");
+    let ts_op = std::fs::read_to_string(root.join("ts-sdk/api_goals.ts"))
+        .expect("read grouped TypeScript operation");
+    assert!(ts_op.contains("authorization"), "{ts_op}");
     assert!(root.join("ts-sdk/models/create_goal_payload.ts").exists());
 
     if command_available("go", "version") {

@@ -232,6 +232,10 @@ fn service_name(op: &Operation) -> &str {
     op.group.as_deref().unwrap_or("default")
 }
 
+pub(crate) fn operation_group_name(op: &Operation) -> &str {
+    service_name(op)
+}
+
 fn render_file_template(template: &str, vars: &[(&str, String)]) -> Result<String, CoreError> {
     let mut out = String::new();
     let mut rest = template;
@@ -283,6 +287,25 @@ pub(crate) fn operation_file_name(
                 ("service", service.to_string()),
                 ("service_snake", file_stem(service)),
                 ("service_kebab", kebab_stem(service)),
+            ],
+        );
+    }
+    Ok(file_in_dir(layout.operation_dir_ref(), default_file_name))
+}
+
+/// Resolve the split operation file name for all operations in one tag/group.
+pub(crate) fn operation_group_file_name(
+    layout: &SdkFileLayout,
+    group: &str,
+    default_file_name: &str,
+) -> Result<String, CoreError> {
+    if let Some(template) = layout.operation_file_template_ref() {
+        return render_file_template(
+            template,
+            &[
+                ("service", group.to_string()),
+                ("service_snake", file_stem(group)),
+                ("service_kebab", kebab_stem(group)),
             ],
         );
     }
