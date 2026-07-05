@@ -160,6 +160,40 @@ cd examples/bookstore
 # see generated/openapi.yaml and generated/sdk/
 ```
 
+## GitHub Action
+
+Use the official action to fail CI when generated OpenAPI, SDKs, CLIs, or other `.gnr8` artifacts are
+stale:
+
+```yaml
+name: gnr8
+
+on: [push, pull_request]
+
+jobs:
+  check-generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: emilwareus/gnr8@v0
+        with:
+          setup-go: "true" # for Go/Gin projects; use setup-python/setup-node for other source stacks
+```
+
+For multiple `.gnr8` projects in one repo:
+
+```yaml
+- uses: emilwareus/gnr8@v0
+  with:
+    working-directories: |
+      services/api
+      services/admin-api
+```
+
+The action restores and saves `.gnr8/cache` plus `.gnr8/target`, so repeated `gnr8 check` runs can use
+gnr8's verified no-op path. `gnr8 check` exits non-zero if a fresh generation would write different
+artifacts.
+
 ---
 
 ## Status

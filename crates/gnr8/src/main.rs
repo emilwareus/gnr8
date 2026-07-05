@@ -1019,12 +1019,15 @@ fn run_check(output: Output) -> Result<()> {
             let mut bundle = child::run_child(&root, "__emit")?;
             pipeline_elapsed = Some(pipeline_start.elapsed());
             let source_files = bundle.cache_input_stamps.len();
-            let artifact_files = bundle.artifacts.len();
+            let mut artifact_files = bundle.artifacts.len();
             let diagnostics = bundle.diagnostics.clone();
             output.progress("check: planning writes");
             let plan_start = Instant::now();
-            let plan = plan_bundle(&root, &mut bundle)?;
+            let plan = plan_check_bundle(&root, &mut bundle)?;
             plan_elapsed = Some(plan_start.elapsed());
+            if artifact_files == 0 {
+                artifact_files = plan.files.len();
+            }
             (plan, diagnostics, "pipeline", source_files, artifact_files)
         };
 
@@ -1085,7 +1088,7 @@ fn run_check(output: Output) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if has_drift {
         output.progress(format!(
-            "check: not up to date ({} stale, {} drifted; run `gnr8 check -v` for paths)",
+            "check: not up to date ({} stale, {} drifted; run `gnr8 generate`, or `gnr8 check -v` for paths)",
             stale.len(),
             drifted.len()
         ));
@@ -1167,6 +1170,50 @@ fn plan_bundle(
     }
     ensure_bundle_artifacts(root, bundle)?;
     gnr8::lifecycle::plan_only(root, &bundle.artifacts)
+}
+
+fn plan_check_bundle(
+    root: &std::path::Path,
+    bundle: &mut gnr8::runner::ArtifactBundle,
+) -> Result<gnr8::lifecycle::WritePlan, gnr8::CoreError> {
+    let mut plan = plan_bundle(root, bundle)?;
+    normalize_unowned_identical_outputs_for_check(root, &mut plan);
+    if !plan.has_drift() {
+        save_verified_noop_stamp_from_plan(root, bundle, &plan);
+    }
+    Ok(plan)
+}
+
+fn save_verified_noop_stamp_from_plan(
+    root: &std::path::Path,
+    bundle: &gnr8::runner::ArtifactBundle,
+    plan: &gnr8::lifecycle::WritePlan,
+) {
+    let paths = plan.files.iter().map(|file| file.path.clone()).collect();
+    let outcome = gnr8::lifecycle::GenerateOutcome {
+        written: Vec::new(),
+        unchanged: plan.files.iter().map(|file| file.path.clone()).collect(),
+        skipped: Vec::new(),
+        deleted: Vec::new(),
+    };
+    save_verified_noop_stamp_for_paths(root, bundle, paths, &outcome);
+}
+
+fn normalize_unowned_identical_outputs_for_check(
+    root: &std::path::Path,
+    plan: &mut gnr8::lifecycle::WritePlan,
+) {
+    for file in &mut plan.files {
+        if file.action != gnr8::lifecycle::WriteAction::UserEdited {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(root.join(&file.path)) else {
+            continue;
+        };
+        if gnr8::manifest::blake3_hex(&bytes) == file.new_hash {
+            file.action = gnr8::lifecycle::WriteAction::Unchanged;
+        }
+    }
 }
 
 fn cached_artifact_metadata(

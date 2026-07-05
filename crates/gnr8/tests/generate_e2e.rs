@@ -188,5 +188,32 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         "gnr8 check must report up-to-date after a no-op generate:\n{out}"
     );
 
+    // 5. A fresh CI checkout has committed generated artifacts but no local .gnr8/cache/manifest.json.
+    //    `gnr8 check` must still pass when those artifacts are byte-identical to a fresh generation.
+    std::fs::remove_dir_all(root.join(".gnr8").join("cache")).expect("remove .gnr8/cache");
+    let (ok, out, err) = run_gnr8(&root, &["check"]);
+    assert!(
+        ok && out.contains("up to date"),
+        "gnr8 check must pass in a fresh checkout without local cache when outputs match.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+
+    // 6. If source changes after generation, `gnr8 check` must fail before SDKs are regenerated.
+    let main_go = root.join("main.go");
+    let source = std::fs::read_to_string(&main_go).expect("read main.go");
+    let changed_source = source.replace(
+        "type ThingResponse struct {\n\tID   string `json:\"id\"`\n\tName string `json:\"name\"`\n}",
+        "type ThingResponse struct {\n\tID     string `json:\"id\"`\n\tName   string `json:\"name\"`\n\tStatus string `json:\"status\"`\n}",
+    );
+    assert_ne!(
+        source, changed_source,
+        "source fixture replacement must match"
+    );
+    std::fs::write(&main_go, changed_source).expect("change source");
+    let (ok, out, err) = run_gnr8(&root, &["check"]);
+    assert!(
+        !ok && out.contains("not up to date"),
+        "gnr8 check must fail when source changes require regenerated artifacts.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
