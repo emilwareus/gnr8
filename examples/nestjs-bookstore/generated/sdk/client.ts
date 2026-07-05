@@ -10,14 +10,16 @@ export class Client {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
 
-
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchFn = opts.fetch ?? fetch;
   }
 
-
-  async listBooks(genre: string, cursor?: string, sort?: string): Promise<models.ListBooksResponse> {
+  async listBooks(
+    genre: string,
+    cursor?: string,
+    sort?: string,
+  ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
     const searchParams = new URLSearchParams();
     searchParams.set("genre", String(genre));
@@ -45,7 +47,6 @@ export class Client {
     throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
-
   async createBook(body: models.BookDto): Promise<models.CreatedMessage> {
     let path = `/books/`;
     const headers: Record<string, string> = {};
@@ -64,8 +65,10 @@ export class Client {
     throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
-
-  async getBook(bookId: number, fmt?: models.BookFormat): Promise<models.BookOrError> {
+  async getBook(
+    bookId: number,
+    fmt?: models.BookFormat,
+  ): Promise<models.BookOrError> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
@@ -89,8 +92,10 @@ export class Client {
     throw new ApiError(res.status, await res.json().catch(() => null));
   }
 
-
-  async updateBook(bookId: number, body: models.BookFilters): Promise<models.CreatedMessage> {
+  async updateBook(
+    bookId: number,
+    body: models.BookFilters,
+  ): Promise<models.CreatedMessage> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";

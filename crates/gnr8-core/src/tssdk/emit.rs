@@ -606,7 +606,6 @@ export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
 {api_key_field}
-
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
@@ -710,13 +709,9 @@ fn emit_group_facades(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
         writeln!(out, "  constructor(private readonly client: Client) {{}}").map_err(sink)?;
         for op in group_ops {
             let method = camel(&op.handler);
-            writeln!(
-                out,
-                "\n  {method}(...args: Parameters<Client[{}]>): ReturnType<Client[{}]> {{",
-                ts_string_literal(&method),
-                ts_string_literal(&method)
-            )
-            .map_err(sink)?;
+            let lit = ts_string_literal(&method);
+            out.push('\n');
+            emit_facade_signature(out, &method, &lit)?;
             writeln!(out, "    return this.client.{method}(...args);").map_err(sink)?;
             writeln!(out, "  }}").map_err(sink)?;
         }
@@ -825,6 +820,43 @@ fn resolve_op_args<'op>(
     })
 }
 
+/// Render a class method's `async` signature at 2-space indent, wrapping the parameter list one per line
+/// when the single-line form would exceed Prettier's default 80-column `printWidth` — so the emitted TS
+/// is already prettier-clean (CLAUDE.md rule 2: no formatter dependency). When wrapped, each parameter
+/// sits at 4-space indent with a trailing comma (the trailing comma Prettier keeps), and the return type
+/// closes at 2-space indent. An empty parameter list is never wrapped (nothing to break).
+fn ts_method_signature(name: &str, args: &[String], ret_promise: &str) -> String {
+    let one_line = format!("  async {name}({}): {ret_promise} {{", args.join(", "));
+    // Compare display columns (chars), not UTF-8 bytes — Prettier's printWidth is a column count, so a
+    // non-ASCII type (e.g. an inline enum with accented literals) must not trip a spurious wrap.
+    if args.is_empty() || one_line.chars().count() <= 80 {
+        return one_line;
+    }
+    let mut out = format!("  async {name}(\n");
+    for arg in args {
+        let _ = writeln!(out, "    {arg},");
+    }
+    let _ = write!(out, "  ): {ret_promise} {{");
+    out
+}
+
+/// Emit a group facade's delegator signature (`{method}(...args: Parameters<...>): ReturnType<...> {`),
+/// wrapping to multi-line when the single-line form exceeds Prettier's 80-col `printWidth` — the parallel
+/// of [`ts_method_signature`] for the facade path. A rest parameter (`...args`) takes NO trailing comma
+/// when wrapped (TS forbids it), which is why this cannot reuse [`ts_method_signature`].
+fn emit_facade_signature(out: &mut String, method: &str, lit: &str) -> Result<(), CoreError> {
+    let one_line =
+        format!("  {method}(...args: Parameters<Client[{lit}]>): ReturnType<Client[{lit}]> {{");
+    if one_line.chars().count() <= 80 {
+        writeln!(out, "{one_line}").map_err(sink)?;
+    } else {
+        writeln!(out, "  {method}(").map_err(sink)?;
+        writeln!(out, "    ...args: Parameters<Client[{lit}]>").map_err(sink)?;
+        writeln!(out, "  ): ReturnType<Client[{lit}]> {{").map_err(sink)?;
+    }
+    Ok(())
+}
+
 /// Emit a single operation method (2-space indented as a `Client` method body).
 fn emit_operation(
     out: &mut String,
@@ -919,8 +951,8 @@ fn emit_operation(
     };
     writeln!(
         out,
-        "\n  async {method_name}({}): {ret_promise} {{",
-        args.join(", ")
+        "{}",
+        ts_method_signature(&method_name, &args, &ret_promise)
     )
     .map_err(sink)?;
 
@@ -1737,6 +1769,32 @@ mod tests {
         }
 
         #[test]
+        fn grouped_facade_signature_wraps_to_prettier_80_col_width() {
+            // A non-default group emits a facade class whose delegator line is 91 cols (> Prettier's
+            // 80-col printWidth), so it MUST wrap one-per-line with NO trailing comma after the `...args`
+            // rest parameter (a trailing comma there is a TS syntax error). Regression guard for the
+            // facade path, which the (group-less) nestjs fixture in `sdk_lint` never exercises.
+            let mut g = ops_graph();
+            for op in &mut g.operations {
+                if op.handler == "createBook" {
+                    op.group = Some("books".to_string());
+                }
+            }
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let out = emit_operations(&g, "bookstore", "/", &ops).unwrap();
+            assert!(
+                out.contains("export class BooksApi {"),
+                "facade class:\n{out}"
+            );
+            assert!(
+                out.contains(
+                    "  createBook(\n    ...args: Parameters<Client[\"createBook\"]>\n  ): ReturnType<Client[\"createBook\"]> {"
+                ),
+                "facade delegator must wrap without a rest-param trailing comma:\n{out}"
+            );
+        }
+
+        #[test]
         fn required_body_precedes_required_query_param() {
             let mut g = ops_graph();
             g.operations[0].params.push(crate::graph::Param {
@@ -1752,9 +1810,11 @@ mod tests {
                 },
             });
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            // The single-line form exceeds Prettier's 80-col printWidth, so the signature wraps one
+            // parameter per line (still body-before-query).
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book, tenant: string): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "required body must stay before required query params:\n{out}"
             );
@@ -1779,9 +1839,10 @@ mod tests {
                 .responses
                 .sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            // Wrapped to satisfy Prettier's 80-col printWidth.
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book): Promise<models.CreatedMessage | undefined> {"
+                    "  async createBook(\n    body: models.Book,\n  ): Promise<models.CreatedMessage | undefined> {"
                 ),
                 "bodyless alternate success should make the return type optional:\n{out}"
             );

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
+
 
 class Author(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -11,11 +12,12 @@ class Author(BaseModel):
     name: str
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "Author":
+    def from_dict(cls, _data: dict[str, Any]) -> Author:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
 
 class Book(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -23,15 +25,16 @@ class Book(BaseModel):
     format: BookFormat
     id: int
     rating: Optional[Union[int, float]] = Field(default=None)
-    tags: Optional[List[str]] = Field(default=None)
+    tags: Optional[list[str]] = Field(default=None)
     title: str
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "Book":
+    def from_dict(cls, _data: dict[str, Any]) -> Book:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
 
 class BookFilters(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -41,17 +44,20 @@ class BookFilters(BaseModel):
     sort: Optional[Literal["asc", "desc"]] = Field(default=None)
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "BookFilters":
+    def from_dict(cls, _data: dict[str, Any]) -> BookFilters:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
 
 class BookFormat(str, enum.Enum):
     HARDCOVER = "hardcover"
     PAPERBACK = "paperback"
 
+
 BookOrError = "Union[Book, OutOfStock]"
+
 
 class CreatedMessage(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
@@ -59,32 +65,34 @@ class CreatedMessage(BaseModel):
     message: str
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "CreatedMessage":
+    def from_dict(cls, _data: dict[str, Any]) -> CreatedMessage:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
 
 class ListBooksResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    books: List[Book]
+    books: list[Book]
     next_cursor: Optional[str]
     total: int
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "ListBooksResponse":
+    def from_dict(cls, _data: dict[str, Any]) -> ListBooksResponse:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+
 
 class OutOfStock(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     reason: str
 
     @classmethod
-    def from_dict(cls, _data: Dict[str, Any]) -> "OutOfStock":
+    def from_dict(cls, _data: dict[str, Any]) -> OutOfStock:
         return cls.model_validate(_data)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)

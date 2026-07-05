@@ -9,7 +9,10 @@ from typing import Any, Optional
 from pydantic import BaseModel
 
 from .errors import ApiError
-from .models import *  # noqa: F401,F403  (re-export models for return-type annotations)
+from .models import (
+    OrderConfirmation,
+    OrderInput,
+)
 
 
 class Client:
@@ -26,8 +29,15 @@ class Client:
         self._api_key = api_key
         self._opener = opener or urllib.request.build_opener()
 
-    def _do(self, method: str, path: str, *, body: Optional[Any] = None, auth_headers: Optional[tuple[str, ...]] = None) -> tuple:
-        # Pydantic v2 request models need alias-aware JSON-mode dumping before json.dumps.
+    def _do(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[Any] = None,
+        auth_headers: Optional[tuple[str, ...]] = None,
+    ) -> tuple:
+        # Dump Pydantic v2 request models (alias-aware, JSON mode) before json.dumps.
         if isinstance(body, BaseModel):
             body = body.model_dump(mode="json", by_alias=True, exclude_unset=True)
 

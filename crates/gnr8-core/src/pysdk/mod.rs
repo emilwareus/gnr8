@@ -123,11 +123,13 @@ pub(crate) fn generate_files_with_options(
     });
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let model_refs = emit::client_referenced_models(graph, &ops)?;
     let mut client = emit::emit_client_with_models(
         package,
         &model_module,
         model_style,
         !auth_headers.is_empty(),
+        &model_refs,
     );
     client.push_str(&emit::emit_operations_with_style(
         graph,
@@ -398,8 +400,8 @@ mod tests {
         assert!(names.contains(&"schemas/book.py"));
         assert!(names.contains(&"schemas/__init__.py"));
         assert!(
-            out.contains("from .schemas import *"),
-            "client.py should import the configured model package:\n{out}"
+            out.contains("from .schemas import ("),
+            "client.py should import the configured model package explicitly:\n{out}"
         );
         assert!(
             out.contains("from .schemas import ("),

@@ -53,6 +53,7 @@ gates:
 	cargo test -p gnr8-cli
 	cargo test -p gnr8 --test snapshot_graph --test snapshot_diagnostics --test snapshot_openapi --test snapshot_sdk --test determinism --test sdk_compile --test pysdk_compile --test tssdk_compile --test sdk_pipeline --test lifecycle
 	cargo test -p gnr8 --test snapshot_nestjs_graph --test snapshot_nestjs_openapi
+	cargo test -p gnr8 --test sdk_lint
 
 # Restore the `typescript` toolchain for gnr8's OWN test suite (the nestjs snapshot extraction +
 # the tssdk_compile typecheck). gnr8 ships NO typescript — in real use `tsextract` borrows the user's

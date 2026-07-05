@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 
 class ApiError(Exception):
@@ -14,7 +14,7 @@ class ApiError(Exception):
         status_code: int,
         message: str = "",
         slug: str = "",
-        hints: Optional[List[Any]] = None,
+        hints: Optional[list[Any]] = None,
     ) -> None:
         super().__init__(f"{status_code} {message} ({slug})")
         self.status_code = status_code
