@@ -1,0 +1,58 @@
+name: generated-sdk-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generated-sdk-check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gnr8-check:
+    name: gnr8 check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tsextract/package-lock.json
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Restore TypeScript sidecar dependency
+        run: npm ci --silent
+        working-directory: tsextract
+
+      - name: Check committed generated SDKs
+        uses: ./
+        with:
+          install-method: source
+          setup-rust: "false"
+          working-directories: |
+            examples/bookstore
+            examples/taskflow
+            examples/fastapi-bookstore
+            examples/flask-bookstore
+            examples/nestjs-bookstore

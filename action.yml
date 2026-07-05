@@ -1,0 +1,211 @@
+name: gnr8 check
+description: Check that gnr8-generated OpenAPI, SDK, and CLI artifacts are up to date.
+
+inputs:
+  working-directories:
+    description: Newline-separated project directories containing .gnr8/Cargo.toml.
+    required: false
+    default: "."
+  gnr8-binary:
+    description: Optional path to an existing gnr8 binary. When set, install-method is ignored.
+    required: false
+    default: ""
+  install-method:
+    description: How to install gnr8 when gnr8-binary is not set. Use "release", "source", or "path".
+    required: false
+    default: "release"
+  version:
+    description: Release tag to install when install-method is "release". Use "latest" for the latest release.
+    required: false
+    default: "latest"
+  extra-args:
+    description: Extra arguments passed to `gnr8 check`.
+    required: false
+    default: ""
+  cache:
+    description: Restore and save .gnr8/cache plus .gnr8/target for fast repeated checks.
+    required: false
+    default: "true"
+  cache-key-prefix:
+    description: Prefix for the GitHub Actions cache key.
+    required: false
+    default: "gnr8"
+  setup-rust:
+    description: Install a Rust toolchain for .gnr8 child crates and source installs.
+    required: false
+    default: "true"
+  rust-toolchain:
+    description: Rust toolchain passed to dtolnay/rust-toolchain.
+    required: false
+    default: "stable"
+  setup-go:
+    description: Install Go before running gnr8 check.
+    required: false
+    default: "false"
+  go-version:
+    description: Go version passed to actions/setup-go.
+    required: false
+    default: "stable"
+  setup-python:
+    description: Install Python before running gnr8 check.
+    required: false
+    default: "false"
+  python-version:
+    description: Python version passed to actions/setup-python.
+    required: false
+    default: "3.x"
+  setup-node:
+    description: Install Node.js before running gnr8 check.
+    required: false
+    default: "false"
+  node-version:
+    description: Node.js version passed to actions/setup-node.
+    required: false
+    default: "lts/*"
+
+outputs:
+  cache-hit:
+    description: Whether the gnr8 project cache restored an exact match.
+    value: ${{ steps.gnr8-cache.outputs.cache-hit }}
+  binary:
+    description: Path to the gnr8 binary used by the action.
+    value: ${{ steps.binary.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust
+      if: ${{ inputs.setup-rust == 'true' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+
+    - name: Set up Go
+      if: ${{ inputs.setup-go == 'true' }}
+      uses: actions/setup-go@v6
+      with:
+        go-version: ${{ inputs.go-version }}
+        check-latest: true
+
+    - name: Set up Python
+      if: ${{ inputs.setup-python == 'true' }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Set up Node.js
+      if: ${{ inputs.setup-node == 'true' }}
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Resolve gnr8 project cache paths
+      id: projects
+      shell: bash
+      env:
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+      run: |
+        set -euo pipefail
+        dirs=()
+        while IFS= read -r dir || [[ -n "$dir" ]]; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          [[ -z "$dir" || "$dir" == \#* ]] && continue
+          dirs+=("$dir")
+        done <<< "$WORKING_DIRECTORIES"
+
+        if [[ "${#dirs[@]}" -eq 0 ]]; then
+          echo "gnr8 action: no working directories configured" >&2
+          exit 2
+        fi
+
+        {
+          echo "cache_paths<<EOF"
+          for dir in "${dirs[@]}"; do
+            printf '%s/.gnr8/cache\n' "$dir"
+            printf '%s/.gnr8/target\n' "$dir"
+          done
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore gnr8 project cache
+      id: gnr8-cache
+      if: ${{ inputs.cache == 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.projects.outputs.cache_paths }}
+        key: ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-${{ github.ref_name }}-${{ github.sha }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-${{ github.ref_name }}-
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-
+          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-
+
+    - name: Install gnr8 release
+      if: ${{ inputs.gnr8-binary == '' && inputs.install-method == 'release' }}
+      shell: bash
+      env:
+        GNR8_RELEASE_TAG: ${{ inputs.version }}
+        GNR8_BIN_DIR: ${{ runner.temp }}/gnr8-bin
+      run: |
+        set -euo pipefail
+        "$GITHUB_ACTION_PATH/scripts/install.sh"
+        echo "$GNR8_BIN_DIR" >> "$GITHUB_PATH"
+
+    - name: Build gnr8 from action source
+      if: ${{ inputs.gnr8-binary == '' && inputs.install-method == 'source' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo build --release -p gnr8-cli --locked --manifest-path "$GITHUB_ACTION_PATH/Cargo.toml"
+
+    - name: Resolve gnr8 binary
+      id: binary
+      shell: bash
+      env:
+        INPUT_BINARY: ${{ inputs.gnr8-binary }}
+        INSTALL_METHOD: ${{ inputs.install-method }}
+        RELEASE_BIN: ${{ runner.temp }}/gnr8-bin/gnr8
+      run: |
+        set -euo pipefail
+        if [[ -n "$INPUT_BINARY" ]]; then
+          bin="$INPUT_BINARY"
+        elif [[ "$INSTALL_METHOD" == "source" ]]; then
+          bin="$GITHUB_ACTION_PATH/target/release/gnr8"
+        else
+          bin="$RELEASE_BIN"
+        fi
+
+        if [[ "$INSTALL_METHOD" == "path" && -z "$INPUT_BINARY" ]]; then
+          bin="$(command -v gnr8)"
+        fi
+
+        if [[ ! -x "$bin" ]]; then
+          echo "gnr8 action: binary is not executable: $bin" >&2
+          exit 2
+        fi
+        echo "path=$bin" >> "$GITHUB_OUTPUT"
+        "$bin" --version
+
+    - name: Run gnr8 check
+      shell: bash
+      env:
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+        GNR8_BIN: ${{ steps.binary.outputs.path }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+      run: |
+        set -euo pipefail
+        dirs=()
+        while IFS= read -r dir || [[ -n "$dir" ]]; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          [[ -z "$dir" || "$dir" == \#* ]] && continue
+          dirs+=("$dir")
+        done <<< "$WORKING_DIRECTORIES"
+
+        for dir in "${dirs[@]}"; do
+          echo "::group::gnr8 check $dir"
+          # EXTRA_ARGS is intentionally shell-split so callers can pass flags like "--json -v".
+          # shellcheck disable=SC2086
+          (cd "$dir" && "$GNR8_BIN" check $EXTRA_ARGS)
+          echo "::endgroup::"
+        done
