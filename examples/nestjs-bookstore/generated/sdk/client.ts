@@ -4,15 +4,44 @@ import * as models from "./models";
 export interface ClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
+  apiKey?: string;
+  apiKeys?: Record<string, string>;
 }
 
 export class Client {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly apiKey?: string;
+  private readonly apiKeys: Record<string, string>;
 
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchFn = opts.fetch ?? fetch;
+    this.apiKey = opts.apiKey;
+    this.apiKeys = opts.apiKeys ?? {};
+  }
+
+  _apiKey(...names: string[]): string | undefined {
+    for (const name of names) {
+      const value = this.apiKeys[name];
+      if (value !== undefined) {
+        return value;
+      }
+    }
+    return this.apiKey;
+  }
+
+  async _request(
+    method: string,
+    path: string,
+    headers: Record<string, string>,
+    body?: unknown,
+  ): Promise<Response> {
+    return await this.fetchFn(`${this.baseUrl}${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
   }
 
   async listBooks(
@@ -34,10 +63,7 @@ export class Client {
       path = path + "?" + qs;
     }
     const headers: Record<string, string> = {};
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
-      method: "GET",
-      headers,
-    });
+    const res = await this._request("GET", path, headers);
     if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
@@ -51,11 +77,7 @@ export class Client {
     let path = `/books/`;
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+    const res = await this._request("POST", path, headers, body);
     if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
@@ -79,10 +101,7 @@ export class Client {
       path = path + "?" + qs;
     }
     const headers: Record<string, string> = {};
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
-      method: "GET",
-      headers,
-    });
+    const res = await this._request("GET", path, headers);
     if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }
@@ -99,11 +118,7 @@ export class Client {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
-    const res = await this.fetchFn(`${this.baseUrl}${path}`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify(body),
-    });
+    const res = await this._request("PUT", path, headers, body);
     if (res.status < 200 || res.status >= 300) {
       throw new ApiError(res.status, await res.json().catch(() => null));
     }

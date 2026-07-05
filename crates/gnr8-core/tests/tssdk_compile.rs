@@ -164,7 +164,7 @@ fn materialize_split_sdk() -> PathBuf {
         op.group = Some("Books".to_string());
     }
     let layout = SdkFileLayout::split()
-        .operation_file_template("apis/{service_snake}.ts")
+        .operation_file_template("apis/api_{service_snake}.ts")
         .model_file_template("types/{schema_kebab}.ts");
     let bundle = gnr8::tssdk::generate_with_layout(&graph, PACKAGE, &graph.base_path, &layout)
         .expect("split tssdk::generate_with_layout must succeed");
@@ -338,7 +338,7 @@ fn split_generated_sdk_with_group_facades_typechecks_with_vendored_tsc() {
         "expected split operation file in generated SDK: {ts_files:?}"
     );
     assert!(
-        ts_files.iter().any(|file| file == "types/book.ts"),
+        ts_files.iter().any(|file| file == "types/book-dto.ts"),
         "expected custom model file in generated SDK: {ts_files:?}"
     );
 
