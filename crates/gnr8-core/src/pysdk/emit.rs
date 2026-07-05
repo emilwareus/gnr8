@@ -1233,7 +1233,9 @@ fn resolve_op_args<'op>(
 /// formatter from re-collapsing it).
 fn method_def(name: &str, args: &[String], ret: &str) -> String {
     let one_line = format!("    def {name}({}) -> {ret}:", args.join(", "));
-    if one_line.len() <= 88 {
+    // Compare display columns (chars), not UTF-8 bytes — ruff's line-length is a column count, so a
+    // non-ASCII identifier/hint must not trip a spurious wrap.
+    if one_line.chars().count() <= 88 {
         return one_line;
     }
     let mut out = format!("    def {name}(\n");

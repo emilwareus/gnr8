@@ -98,21 +98,30 @@ fn go_sdk_is_gofmt_and_go_vet_clean() {
         .expect("gosdk::generate must succeed");
     let dir = unique_temp_dir("go");
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize Go SDK");
-    // A hermetic, stdlib-only module so `go vet` builds offline (mirrors sdk_compile's zero-require mod).
-    std::fs::write(dir.join("go.mod"), "module gnr8sdklint\n\ngo 1.26\n").expect("write go.mod");
+    // A hermetic, stdlib-only module so `go vet` builds offline. A LOW `go` directive keeps the module
+    // buildable by any modern Go (the generated SDK uses only long-stable stdlib), so an older CI Go does
+    // not try to fetch a newer toolchain — which `GOTOOLCHAIN=local` + `GOPROXY=off` below also forbids.
+    std::fs::write(dir.join("go.mod"), "module gnr8sdklint\n\ngo 1.21\n").expect("write go.mod");
 
-    // gofmt -l lists files that are NOT gofmt-clean; clean output must be empty.
-    let (_ok, unformatted, _err) = run("gofmt", &["-l", "."], &dir, &[]);
+    // gofmt -l lists files that are NOT gofmt-clean; a clean run exits 0 with empty stdout. Assert the
+    // exit code too: an unparseable file prints to STDERR with empty stdout, which would otherwise pass.
+    let (fmt_ok, unformatted, fmt_err) = run("gofmt", &["-l", "."], &dir, &[]);
     assert!(
-        unformatted.trim().is_empty(),
-        "generated Go SDK is not gofmt-clean; gofmt -l listed:\n{unformatted}"
+        fmt_ok && unformatted.trim().is_empty(),
+        "generated Go SDK is not gofmt-clean:\ngofmt -l listed:\n{unformatted}\nstderr:\n{fmt_err}"
     );
 
     let (vet_ok, vet_out, vet_err) = run(
         "go",
         &["vet", "./..."],
         &dir,
-        &[("GOPROXY", "off"), ("GOFLAGS", "-mod=mod")],
+        // `GOTOOLCHAIN=local` forbids downloading a toolchain (paired with `GOPROXY=off` for a fully
+        // offline, hermetic vet); `-mod=mod` avoids a vendor/sum requirement for the zero-require module.
+        &[
+            ("GOPROXY", "off"),
+            ("GOFLAGS", "-mod=mod"),
+            ("GOTOOLCHAIN", "local"),
+        ],
     );
     assert!(
         vet_ok,
