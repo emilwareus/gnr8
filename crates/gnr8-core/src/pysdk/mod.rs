@@ -13,13 +13,16 @@
 
 mod emit;
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
-    validate_sdk_base_path,
+    operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
 };
-use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::SdkTypeAliases;
 
@@ -123,7 +126,13 @@ pub(crate) fn generate_files_with_options(
     });
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
-    let model_refs = emit::client_referenced_models(graph, &ops)?;
+    let split_operations =
+        layout.is_split() && !matches!(layout.operation_split(), OperationFileSplit::Compact);
+    let model_refs = if split_operations {
+        Vec::new()
+    } else {
+        emit::client_referenced_models(graph, &ops)?
+    };
     let mut client = emit::emit_client_with_models(
         package,
         &model_module,
@@ -131,13 +140,17 @@ pub(crate) fn generate_files_with_options(
         !auth_headers.is_empty(),
         &model_refs,
     );
-    client.push_str(&emit::emit_operations_with_style(
-        graph,
-        package,
-        base_path,
-        &ops,
-        model_style,
-    )?);
+    if split_operations {
+        client.push_str(&emit_operation_module_imports(layout, graph)?);
+    } else {
+        client.push_str(&emit::emit_operations_with_style(
+            graph,
+            package,
+            base_path,
+            &ops,
+            model_style,
+        )?);
+    }
     files.push(SdkFile {
         name: "client.py".to_string(),
         contents: client,
@@ -147,6 +160,17 @@ pub(crate) fn generate_files_with_options(
         name: "errors.py".to_string(),
         contents: emit::emit_errors(package),
     });
+
+    if split_operations {
+        files.extend(generate_operation_files(
+            graph,
+            package,
+            base_path,
+            layout,
+            model_style,
+            &model_module,
+        )?);
+    }
 
     if layout.is_split() {
         files.push(SdkFile {
@@ -191,6 +215,196 @@ pub(crate) fn generate_files_with_options(
 
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
+}
+
+fn generate_operation_files(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    model_style: PyModelStyle,
+    model_module: &str,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut files = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                let name =
+                    operation_file_name(layout, op, &format!("api_{}.py", file_stem(&op.id)))?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(
+                        graph,
+                        package,
+                        base_path,
+                        &[op],
+                        model_style,
+                        model_module,
+                        &name,
+                    )?,
+                    name,
+                });
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for (group, group_ops) in operation_groups(&ops) {
+                let name = operation_group_file_name(
+                    layout,
+                    &group,
+                    &format!("api_{}.py", file_stem(&group)),
+                )?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(
+                        graph,
+                        package,
+                        base_path,
+                        &group_ops,
+                        model_style,
+                        model_module,
+                        &name,
+                    )?,
+                    name,
+                });
+            }
+        }
+    }
+    for dir in package_init_files(files.iter().map(|file| file.name.as_str())) {
+        files.push(SdkFile {
+            name: dir,
+            contents: String::new(),
+        });
+    }
+    Ok(files)
+}
+
+fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
+    let mut groups: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in ops {
+        groups
+            .entry(operation_group_name(op).to_string())
+            .or_default()
+            .push(*op);
+    }
+    groups
+}
+
+fn emit_operation_file(
+    graph: &ApiGraph,
+    package: &str,
+    base_path: &str,
+    ops: &[&Operation],
+    model_style: PyModelStyle,
+    model_module: &str,
+    file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let mut out = String::from("from __future__ import annotations\n\n");
+    out.push_str("import json\n");
+    out.push_str("import urllib.parse\n");
+    out.push_str("from typing import Any, Optional\n\n");
+    let prefix = py_relative_prefix(file_name);
+    let _ = writeln!(out, "from {prefix}client import Client");
+    let model_refs = emit::client_referenced_models(graph, ops)?;
+    if !model_refs.is_empty() {
+        let _ = writeln!(out, "from {prefix}{model_module} import (");
+        for model in &model_refs {
+            out.push_str("    ");
+            out.push_str(model);
+            out.push_str(",\n");
+        }
+        out.push_str(")\n");
+    }
+    out.push('\n');
+
+    let methods = emit::emit_operations_with_style(graph, package, base_path, ops, model_style)?;
+    out.push_str(&unindent_python_methods(&methods));
+    out.push('\n');
+    for op in ops {
+        let method = emit::operation_method_name(op);
+        let _ = writeln!(out, "Client.{method} = {method}");
+    }
+    Ok(out)
+}
+
+fn unindent_python_methods(methods: &str) -> String {
+    let mut out = String::new();
+    for line in methods.split_inclusive('\n') {
+        out.push_str(line.strip_prefix("    ").unwrap_or(line));
+    }
+    out
+}
+
+fn py_relative_prefix(file_name: &str) -> String {
+    ".".repeat(file_name.matches('/').count() + 1)
+}
+
+fn emit_operation_module_imports(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<String, crate::CoreError> {
+    let files = operation_file_names(layout, graph)?;
+    let mut out = String::new();
+    for file in files {
+        let module = file.trim_end_matches(".py").replace('/', ".");
+        let alias = module.replace('.', "_");
+        if let Some((package, leaf)) = module.rsplit_once('.') {
+            let _ = writeln!(out, "from .{package} import {leaf} as _{alias}");
+        } else {
+            let _ = writeln!(out, "from . import {module} as _{alias}");
+        }
+    }
+    Ok(out)
+}
+
+fn operation_file_names(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<Vec<String>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut names = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                names.push(operation_file_name(
+                    layout,
+                    op,
+                    &format!("api_{}.py", file_stem(&op.id)),
+                )?);
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for group in operation_groups(&ops).into_keys() {
+                names.push(operation_group_file_name(
+                    layout,
+                    &group,
+                    &format!("api_{}.py", file_stem(&group)),
+                )?);
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn package_init_files<'a>(file_names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut dirs = Vec::new();
+    for name in file_names {
+        let Some((dir, _)) = name.rsplit_once('/') else {
+            continue;
+        };
+        let mut current = String::new();
+        for part in dir.split('/') {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(part);
+            let init = format!("{current}/__init__.py");
+            if !dirs.contains(&init) {
+                dirs.push(init);
+            }
+        }
+    }
+    dirs
 }
 
 /// Split a generated SDK bundle String into its `(file_name, contents)` pairs.
@@ -366,6 +580,7 @@ mod tests {
             names,
             vec![
                 "__init__.py",
+                "api_default.py",
                 "client.py",
                 "errors.py",
                 "models/__init__.py",
@@ -378,6 +593,14 @@ mod tests {
             !names.contains(&"models.py"),
             "split layout must not emit compact models.py"
         );
+        assert!(
+            out.contains("from . import api_default as _api_default"),
+            "client.py should import split operation modules:\n{out}"
+        );
+        assert!(
+            out.contains("Client.create_book = create_book"),
+            "operation module should attach methods to Client:\n{out}"
+        );
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -386,9 +609,20 @@ mod tests {
             std::env::temp_dir().join(format!("gnr8-pysdk-split-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write_to_dir(&out, &dir).unwrap();
+        assert!(dir.join("api_default.py").is_file());
         assert!(dir.join("models/book.py").is_file());
         assert!(dir.join("models/__init__.py").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_can_emit_one_operation_file_per_endpoint() {
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"api_create_book.py"), "{names:?}");
+        assert!(names.contains(&"api_list_books.py"), "{names:?}");
     }
 
     #[test]

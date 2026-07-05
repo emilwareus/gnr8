@@ -261,6 +261,7 @@ TsSdk::new()
     .profile(SdkProfile::typescript_fetch_compat())
     .layout(
         SdkFileLayout::split()
+            .operations_per_endpoint()
             .operation_file_template("apis/{service_kebab}/{operation_kebab}.ts")
             .model_file_template("models/{schema_kebab}.ts"),
     )
@@ -273,6 +274,9 @@ GoSdk::new()
     .profile(SdkProfile::go_openapi_generator_compat())
     .source_only(); // suppress docs and package metadata when an outer package owns them
 ```
+
+For the complete compact, per-tag, per-endpoint, and template file-layout rules, see
+[`docs/sdk-file-layout.md`](sdk-file-layout.md).
 
 Go OpenAPI Generator compatibility controls can be selected by old request-builder type name, operation
 id, or graph route. Route/operation selectors are resolved during generation and fail with a config

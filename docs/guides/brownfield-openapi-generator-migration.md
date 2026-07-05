@@ -86,6 +86,7 @@ TsSdk::new()
     .profile(SdkProfile::typescript_axios_compat())
     .layout(
         SdkFileLayout::split()
+            .operations_per_endpoint()
             .operation_file_template("apis/{service_kebab}/{operation_kebab}.ts")
             .model_file_template("models/{schema_kebab}.ts"),
     )

@@ -23,11 +23,11 @@ use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
-    model_file_name, operation_api_key_schemes, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    validate_sdk_base_path,
+    model_file_name, operation_api_key_schemes, operation_file_name, operation_group_file_name,
+    operation_group_name, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, validate_sdk_base_path,
 };
-use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::sdk::typescript::{TsBarrelExports, TsResponsePolicy, TsSdkOptions};
@@ -106,12 +106,19 @@ fn generate_files_with_layout_options(
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     let model_dir = layout.model_dir_ref().unwrap_or("models");
+    let split_operations =
+        layout.is_split() && !matches!(layout.operation_split(), OperationFileSplit::Compact);
     let mut client = emit::emit_client_with_models(
         package,
         model_dir.trim_matches('/'),
         !auth_headers.is_empty(),
     );
-    client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    if split_operations {
+        client.push_str("}\n");
+        client.push_str(&emit_operation_module_imports(layout, graph)?);
+    } else {
+        client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
+    }
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -131,6 +138,15 @@ fn generate_files_with_layout_options(
             &resolved_aliases,
         )?,
     });
+
+    if split_operations {
+        files.extend(generate_operation_files(
+            graph,
+            base_path,
+            layout,
+            model_dir.trim_matches('/'),
+        )?);
+    }
 
     if layout.is_split() {
         files.push(SdkFile {
@@ -175,6 +191,173 @@ fn generate_files_with_layout_options(
 
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
+}
+
+fn generate_operation_files(
+    graph: &ApiGraph,
+    base_path: &str,
+    layout: &SdkFileLayout,
+    model_module: &str,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut files = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                let name =
+                    operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(graph, base_path, &[op], model_module, &name)?,
+                    name,
+                });
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for (group, group_ops) in operation_groups(&ops) {
+                let name = operation_group_file_name(
+                    layout,
+                    &group,
+                    &format!("api_{}.ts", file_stem(&group)),
+                )?;
+                files.push(SdkFile {
+                    contents: emit_operation_file(
+                        graph,
+                        base_path,
+                        &group_ops,
+                        model_module,
+                        &name,
+                    )?,
+                    name,
+                });
+            }
+        }
+    }
+    for index in ts_barrel_files(files.iter().map(|file| file.name.as_str())) {
+        files.push(SdkFile {
+            name: index,
+            contents: String::new(),
+        });
+    }
+    Ok(files)
+}
+
+fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
+    let mut groups: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in ops {
+        groups
+            .entry(operation_group_name(op).to_string())
+            .or_default()
+            .push(*op);
+    }
+    groups
+}
+
+fn emit_operation_file(
+    graph: &ApiGraph,
+    base_path: &str,
+    ops: &[&Operation],
+    model_module: &str,
+    file_name: &str,
+) -> Result<String, crate::CoreError> {
+    let root = ts_relative_root(file_name);
+    emit::emit_operation_module(
+        graph,
+        base_path,
+        ops,
+        &format!("{root}client"),
+        &format!("{root}errors"),
+        &format!("{root}{model_module}"),
+    )
+}
+
+fn ts_relative_root(file_name: &str) -> String {
+    let depth = file_name.matches('/').count();
+    if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
+    }
+}
+
+fn emit_operation_module_imports(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<String, crate::CoreError> {
+    let mut out = String::new();
+    let mut assignments = String::new();
+    for (index, (file, methods)) in operation_file_methods(layout, graph)?
+        .into_iter()
+        .enumerate()
+    {
+        let module = file.trim_end_matches(".ts");
+        for (method_index, method) in methods.into_iter().enumerate() {
+            let binding = format!("operation{index}_{method_index}");
+            out.push_str("import { ");
+            out.push_str(&method);
+            out.push_str(" as ");
+            out.push_str(&binding);
+            out.push_str(" } from \"./");
+            out.push_str(module);
+            out.push_str("\";\n");
+            assignments.push_str("Client.prototype.");
+            assignments.push_str(&method);
+            assignments.push_str(" = ");
+            assignments.push_str(&binding);
+            assignments.push_str(";\n");
+        }
+    }
+    if !assignments.is_empty() {
+        out.push('\n');
+        out.push_str(&assignments);
+    }
+    Ok(out)
+}
+
+fn operation_file_methods(
+    layout: &SdkFileLayout,
+    graph: &ApiGraph,
+) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    let mut files = Vec::new();
+    match layout.operation_split() {
+        OperationFileSplit::Compact => {}
+        OperationFileSplit::PerEndpoint => {
+            for op in ops {
+                files.push((
+                    operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?,
+                    vec![emit::operation_method_name(op)],
+                ));
+            }
+        }
+        OperationFileSplit::PerTag => {
+            for (group, ops) in operation_groups(&ops) {
+                files.push((
+                    operation_group_file_name(
+                        layout,
+                        &group,
+                        &format!("api_{}.ts", file_stem(&group)),
+                    )?,
+                    ops.into_iter().map(emit::operation_method_name).collect(),
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn ts_barrel_files<'a>(file_names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut indexes = Vec::new();
+    for name in file_names {
+        let Some((dir, _)) = name.rsplit_once('/') else {
+            continue;
+        };
+        let index = format!("{dir}/index.ts");
+        if !indexes.contains(&index) {
+            indexes.push(index);
+        }
+    }
+    indexes
 }
 
 #[cfg(test)]
@@ -2520,6 +2703,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "api_default.ts",
                 "client.ts",
                 "errors.ts",
                 "index.ts",
@@ -2533,6 +2717,14 @@ mod tests {
             !names.contains(&"models.ts"),
             "split layout must not emit compact models.ts"
         );
+        assert!(
+            out.contains("import { createBook as operation0_0 } from \"./api_default\";"),
+            "client.ts should import split operation functions:\n{out}"
+        );
+        assert!(
+            out.contains("Client.prototype.createBook = operation0_0;"),
+            "client.ts should attach split operation functions to Client:\n{out}"
+        );
 
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2541,9 +2733,20 @@ mod tests {
             std::env::temp_dir().join(format!("gnr8-tssdk-split-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write_to_dir(&out, &dir).unwrap();
+        assert!(dir.join("api_default.ts").is_file());
         assert!(dir.join("models/book.ts").is_file());
         assert!(dir.join("models/index.ts").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_layout_can_emit_one_operation_file_per_endpoint() {
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        let files = split_bundle(&out);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"api_create_book.ts"), "{names:?}");
+        assert!(names.contains(&"api_list_books.ts"), "{names:?}");
     }
 
     #[test]

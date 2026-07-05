@@ -8,6 +8,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdkFileLayout {
     kind: SdkFileLayoutKind,
+    operation_split: OperationFileSplit,
     operation_dir: Option<String>,
     model_dir: Option<String>,
     operation_file_template: Option<String>,
@@ -20,6 +21,7 @@ impl SdkFileLayout {
     pub fn compact() -> Self {
         Self {
             kind: SdkFileLayoutKind::Compact,
+            operation_split: OperationFileSplit::Compact,
             operation_dir: None,
             model_dir: None,
             operation_file_template: None,
@@ -32,6 +34,7 @@ impl SdkFileLayout {
     pub fn split() -> Self {
         Self {
             kind: SdkFileLayoutKind::Split,
+            operation_split: OperationFileSplit::PerTag,
             operation_dir: None,
             model_dir: None,
             operation_file_template: None,
@@ -56,6 +59,32 @@ impl SdkFileLayout {
     #[must_use]
     pub fn root_operations(mut self) -> Self {
         self.operation_dir = None;
+        self
+    }
+
+    /// Keep operation methods in the compact client/operations file while other split layout features,
+    /// such as split model files, can still be used.
+    #[must_use]
+    pub const fn compact_operations(mut self) -> Self {
+        self.operation_split = OperationFileSplit::Compact;
+        self
+    }
+
+    /// Emit split client operation files grouped by operation tag/group.
+    ///
+    /// The tag/group is [`crate::graph::Operation::group`], usually set by
+    /// [`crate::sdk::builtins::GroupOperations`] or imported from the first OpenAPI tag. Untagged
+    /// operations use the synthetic `"default"` group.
+    #[must_use]
+    pub const fn operations_per_tag(mut self) -> Self {
+        self.operation_split = OperationFileSplit::PerTag;
+        self
+    }
+
+    /// Emit one split client operation file per endpoint/operation.
+    #[must_use]
+    pub const fn operations_per_endpoint(mut self) -> Self {
+        self.operation_split = OperationFileSplit::PerEndpoint;
         self
     }
 
@@ -112,6 +141,12 @@ impl SdkFileLayout {
         matches!(self.kind, SdkFileLayoutKind::Split)
     }
 
+    /// How split layouts distribute generated client operation methods across files.
+    #[must_use]
+    pub const fn operation_split(&self) -> OperationFileSplit {
+        self.operation_split
+    }
+
     /// Relative directory for split operation files, if configured.
     #[must_use]
     pub fn operation_dir_ref(&self) -> Option<&str> {
@@ -149,6 +184,17 @@ enum SdkFileLayoutKind {
     Split,
 }
 
+/// How a split SDK layout distributes generated client operation methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationFileSplit {
+    /// Keep operation methods in the compact client/operations file.
+    Compact,
+    /// Emit one operation file per tag/group.
+    PerTag,
+    /// Emit one operation file per endpoint/operation.
+    PerEndpoint,
+}
+
 #[cfg(test)]
 mod tests {
     use super::SdkFileLayout;
@@ -182,7 +228,23 @@ mod tests {
     fn split_layout_defaults_to_package_root_files() {
         let layout = SdkFileLayout::split();
         assert!(layout.is_split());
+        assert_eq!(layout.operation_split(), super::OperationFileSplit::PerTag);
         assert_eq!(layout.operation_dir_ref(), None);
         assert_eq!(layout.model_dir_ref(), None);
+    }
+
+    #[test]
+    fn split_layout_can_choose_endpoint_operation_files() {
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        assert_eq!(
+            layout.operation_split(),
+            super::OperationFileSplit::PerEndpoint
+        );
+    }
+
+    #[test]
+    fn split_layout_can_keep_operations_compact() {
+        let layout = SdkFileLayout::split().compact_operations();
+        assert_eq!(layout.operation_split(), super::OperationFileSplit::Compact);
     }
 }

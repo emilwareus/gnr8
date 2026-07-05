@@ -14,17 +14,17 @@
 mod emit;
 mod gofmt;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
-    operation_file_name, validate_sdk_base_path,
+    operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
 };
 use crate::sdk::go::GoSdkOptions;
 use crate::sdk::go::{GoQuerySetterArgumentPolicy, GoRequestBuilderAliases};
-use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 
@@ -160,10 +160,35 @@ pub(crate) fn generate_files_with_profile_options(
     }
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
-        for op in &ops {
-            let raw = emit::emit_operations_without_facades(graph, package, base_path, &[*op])?;
-            let name = operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
-            files.push(raw_go_file(name, raw));
+        match layout.operation_split() {
+            OperationFileSplit::Compact => {
+                files.push(raw_go_file(
+                    "operations.go",
+                    emit::emit_operations(graph, package, base_path, &ops)?,
+                ));
+            }
+            OperationFileSplit::PerEndpoint => {
+                for op in &ops {
+                    let raw =
+                        emit::emit_operations_without_facades(graph, package, base_path, &[*op])?;
+                    let name =
+                        operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
+                    files.push(raw_go_file(name, raw));
+                }
+            }
+            OperationFileSplit::PerTag => {
+                for (group, group_ops) in operation_groups(&ops) {
+                    let raw = emit::emit_operations_without_facades(
+                        graph, package, base_path, &group_ops,
+                    )?;
+                    let name = operation_group_file_name(
+                        layout,
+                        &group,
+                        &format!("api_{}.go", file_stem(&group)),
+                    )?;
+                    files.push(raw_go_file(name, raw));
+                }
+            }
         }
         if let Some(raw) = emit::emit_facades(graph, package, &ops)? {
             files.push(raw_go_file("facades.go", raw));
@@ -195,6 +220,17 @@ pub(crate) fn generate_files_with_profile_options(
     let mut files = gofmt::gofmt_files(files)?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
+}
+
+fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
+    let mut groups: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
+    for op in ops {
+        groups
+            .entry(operation_group_name(op).to_string())
+            .or_default()
+            .push(*op);
+    }
+    groups
 }
 
 fn generate_go_openapi_generator_compat_files(
@@ -879,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn split_layout_emits_one_operation_file_and_one_model_file_per_item() {
+    fn split_layout_defaults_to_one_operation_file_per_tag() {
         if !gofmt_available() {
             eprintln!("skipping split layout test: gofmt unavailable");
             return;
@@ -892,9 +928,7 @@ mod tests {
         )
         .unwrap();
         for marker in [
-            "// ==== gnr8:file api_create_goal.go ====",
-            "// ==== gnr8:file api_list_goals.go ====",
-            "// ==== gnr8:file api_update_goal.go ====",
+            "// ==== gnr8:file api_default.go ====",
             "// ==== gnr8:file model_create_goal_input.go ====",
             "// ==== gnr8:file model_target_direction.go ====",
         ] {
@@ -908,6 +942,23 @@ mod tests {
             !out.contains("// ==== gnr8:file models.go ===="),
             "split layout must not emit the compact models file:\n{out}"
         );
+    }
+
+    #[test]
+    fn split_layout_can_emit_one_operation_file_per_endpoint() {
+        if !gofmt_available() {
+            eprintln!("skipping split endpoint layout test: gofmt unavailable");
+            return;
+        }
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap();
+        for marker in [
+            "// ==== gnr8:file api_create_goal.go ====",
+            "// ==== gnr8:file api_list_goals.go ====",
+            "// ==== gnr8:file api_update_goal.go ====",
+        ] {
+            assert!(out.contains(marker), "missing {marker}:\n{out}");
+        }
     }
 
     #[test]
@@ -941,6 +992,7 @@ mod tests {
             return;
         }
         let layout = SdkFileLayout::split()
+            .operations_per_endpoint()
             .operation_dir("apis")
             .model_dir("types");
         let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap();

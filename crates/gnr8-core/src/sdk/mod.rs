@@ -897,7 +897,7 @@ pub mod prelude {
         GoRequestBuilderOperationAliases, GoRequestBuilderScope, QueryTimeFormat,
         RequiredPointerConstructorPolicy,
     };
-    pub use super::layout::SdkFileLayout;
+    pub use super::layout::{OperationFileSplit, SdkFileLayout};
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::profile::SdkProfile;

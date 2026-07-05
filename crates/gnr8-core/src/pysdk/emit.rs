@@ -220,6 +220,10 @@ pub(crate) fn snake(name: &str) -> String {
         .join("_")
 }
 
+pub(crate) fn operation_method_name(op: &Operation) -> String {
+    snake(&op.handler)
+}
+
 /// Convert an enum member value to a `SCREAMING_SNAKE` identifier: `out-of-stock` → `OUT_OF_STOCK`.
 pub(crate) fn screaming_snake(value: &str) -> String {
     split_words(value)
