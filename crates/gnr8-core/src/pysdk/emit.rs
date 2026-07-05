@@ -45,35 +45,170 @@ fn sink(err: std::fmt::Error) -> CoreError {
     }
 }
 
-/// The fixed, deterministic import header at the top of `models.py`.
+/// Join import sections into a canonical `isort`/`ruff`-ordered block.
 ///
-/// Python tolerates unused imports at runtime (unlike `go build`), so a FIXED header is emitted rather
-/// than a computed set — deterministic by construction (no `BTreeSet` to iterate). `from __future__
-/// import annotations` makes every annotation a lazy string, sidestepping Python-3.9 generic-subscription
-/// concerns (`List[..]`/`Optional[..]`) and forward-reference ordering between models.
-const DATACLASS_MODELS_HEADER: &str = "\
-from __future__ import annotations
-
-import enum
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
-";
-
-/// The fixed, deterministic import header for Pydantic v2 model files.
-const PYDANTIC_MODELS_HEADER: &str = "\
-from __future__ import annotations
-
-import enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
-
-from pydantic import BaseModel, ConfigDict, Field
-";
-
-fn models_header(model_style: PyModelStyle) -> &'static str {
-    match model_style {
-        PyModelStyle::Pydantic => PYDANTIC_MODELS_HEADER,
-        PyModelStyle::Dataclass => DATACLASS_MODELS_HEADER,
+/// Each `section` is already in its own intra-section order; sections are emitted in the order given
+/// (by convention: `__future__`, stdlib, third-party, first-party) separated by exactly one blank line,
+/// with empty sections dropped. The returned block ends with a single trailing newline (or is empty when
+/// nothing is imported). Computing the block per file — rather than emitting one FIXED superset header —
+/// is what keeps the output free of unused imports (`ruff` F401) while staying deterministic: the same
+/// graph yields the same section lists yields the same bytes (PYSDK-03).
+fn import_block(sections: &[Vec<String>]) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    for section in sections {
+        if !section.is_empty() {
+            blocks.push(section.join("\n"));
+        }
     }
+    let mut out = blocks.join("\n\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Build a `from typing import ...` line for exactly the `typing` names a file uses, in `ruff`/`isort`
+/// `order_by_type` order (the SCREAMING `TYPE_CHECKING` constant first, then the capitalized names
+/// alphabetically). Returns `None` when the file references no `typing` name (so no line is emitted and
+/// no unused import lands — F401). `Dict`/`List` are deliberately absent: those map to the PEP 585
+/// builtins `dict`/`list` (see [`py_type`]), which need no import.
+fn typing_import_line(m: &ModelImports) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    if m.type_checking {
+        names.push("TYPE_CHECKING");
+    }
+    if m.any {
+        names.push("Any");
+    }
+    if m.literal {
+        names.push("Literal");
+    }
+    if m.optional {
+        names.push("Optional");
+    }
+    if m.union {
+        names.push("Union");
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!("from typing import {}", names.join(", ")))
+    }
+}
+
+/// Which imports a model FILE needs, derived from the schemas it contains (one source of truth, no fixed
+/// superset). Every flag is set ONLY when a construct is actually emitted, so the header carries no unused
+/// import (`ruff` F401) — the divergence from the old fixed-header scheme. This is a bag of independent
+/// feature flags (one per importable symbol), so bools are the natural representation.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Default)]
+struct ModelImports {
+    /// `import enum` — a named `enum.Enum` class is emitted.
+    enum_class: bool,
+    /// A Pydantic `BaseModel`/`ConfigDict` (or a `@dataclass`) object model is emitted.
+    object_model: bool,
+    /// A Pydantic `Field(...)` right-hand side is emitted (a field needs an alias or a default).
+    field: bool,
+    /// `if TYPE_CHECKING:` split-model forward-ref imports are emitted.
+    type_checking: bool,
+    any: bool,
+    literal: bool,
+    optional: bool,
+    union: bool,
+}
+
+/// Accumulate the `typing` constructs a `Type` uses into [`ModelImports`] (recursing through
+/// arrays/maps/unions/inline objects). A nested inline `Type::Enum` needs `Literal`; a `Type::Union`
+/// needs `Union`; a `Type::Any` needs `Any`. Named refs and primitives need nothing. Nullability/optional
+/// axes are handled at the field level (they drive `Optional`), not here.
+fn accumulate_type_imports(schema: &Type, m: &mut ModelImports) {
+    match schema {
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Named(_) => {}
+        Type::Any {} => m.any = true,
+        Type::Array(items) => accumulate_type_imports(items, m),
+        Type::Map { value, .. } => accumulate_type_imports(value, m),
+        Type::Enum(_) => m.literal = true,
+        Type::Union(variants) => {
+            m.union = true;
+            for variant in variants {
+                accumulate_type_imports(variant, m);
+            }
+        }
+        Type::Object(fields) => {
+            for field in fields {
+                accumulate_type_imports(&field.schema, m);
+            }
+        }
+    }
+}
+
+/// Compute the [`ModelImports`] for the given schemas (all schemas for a compact `models.py`; a single
+/// schema for a split model file). `type_checking` is threaded in by the split path when it emits an
+/// `if TYPE_CHECKING:` block. A NON-object/NON-enum schema body is emitted as a module-level string alias
+/// (`X = "Union[..]"`) whose type names live only inside an opaque string literal — `ruff` does not read
+/// them, so it contributes NO `typing` import (importing `Union` for it would be an F401).
+fn compute_model_imports(schemas: &[&crate::graph::Schema], type_checking: bool) -> ModelImports {
+    let mut m = ModelImports {
+        type_checking,
+        ..ModelImports::default()
+    };
+    for schema in schemas {
+        match &schema.body {
+            Type::Enum(_) => m.enum_class = true,
+            Type::Object(fields) => {
+                m.object_model = true;
+                for field in fields {
+                    if field.optional || field.nullable {
+                        m.optional = true;
+                    }
+                    if needs_alias(field) || field.optional {
+                        m.field = true;
+                    }
+                    accumulate_type_imports(&field.schema, &mut m);
+                }
+            }
+            // Alias body: emitted as a string literal — see the doc comment above; no imports.
+            _ => {}
+        }
+    }
+    // Every object model's `from_dict`/`to_dict` signatures reference `dict[str, Any]`.
+    if m.object_model {
+        m.any = true;
+    }
+    m
+}
+
+/// Assemble the import header for a model file from its computed [`ModelImports`] and style.
+fn model_header(m: &ModelImports, model_style: PyModelStyle) -> String {
+    let mut stdlib: Vec<String> = Vec::new();
+    if m.enum_class {
+        stdlib.push("import enum".to_string());
+    }
+    if let PyModelStyle::Dataclass = model_style {
+        if m.object_model {
+            stdlib.push("from dataclasses import dataclass".to_string());
+        }
+    }
+    if let Some(line) = typing_import_line(m) {
+        stdlib.push(line);
+    }
+
+    let mut third_party: Vec<String> = Vec::new();
+    if let PyModelStyle::Pydantic = model_style {
+        if m.object_model {
+            let mut names = vec!["BaseModel", "ConfigDict"];
+            if m.field {
+                names.push("Field");
+            }
+            third_party.push(format!("from pydantic import {}", names.join(", ")));
+        }
+    }
+
+    import_block(&[
+        vec!["from __future__ import annotations".to_string()],
+        stdlib,
+        third_party,
+    ])
 }
 
 /// Convert an identifier to `snake_case` (Python method/attribute name): `createBook` → `create_book`.
@@ -236,7 +371,11 @@ pub(crate) fn py_type(
         // RFC-3339 `str`; a uuid/email/uri is a `str`) — A7. No `datetime` import, so model instances
         // marshal cleanly through `json`.
         Type::WellKnown(_) => "str".to_string(),
-        Type::Array(items) => format!("List[{}]", py_type(items, false, graph)?),
+        // PEP 585 builtin generics (`list[..]`/`dict[..]`), NOT `typing.List`/`Dict` — the modern
+        // spelling `ruff` UP006/UP035 require, and import-free. `from __future__ import annotations`
+        // keeps every annotation a lazy string, and Pydantic's runtime resolution of `list`/`dict`
+        // subscription works on Python 3.9+ (PEP 585), so this stays 3.9-safe.
+        Type::Array(items) => format!("list[{}]", py_type(items, false, graph)?),
         Type::Map { key, value } => {
             if !is_json_object_key(key) {
                 return Err(CoreError::SdkGen {
@@ -245,7 +384,7 @@ pub(crate) fn py_type(
                     ),
                 });
             }
-            format!("Dict[str, {}]", py_type(value, false, graph)?)
+            format!("dict[str, {}]", py_type(value, false, graph)?)
         }
         Type::Any {} => "Any".to_string(),
         Type::Named(ref_id) => {
@@ -334,13 +473,20 @@ pub(crate) fn emit_models_with_style_and_aliases(
     model_style: PyModelStyle,
     aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
-    let mut out = String::new();
-    out.push_str(models_header(model_style));
-
     check_unique_schema_names(graph, "Python SDK")?;
 
+    let schema_refs: Vec<&crate::graph::Schema> = graph.schemas.iter().collect();
+    let mut out = model_header(&compute_model_imports(&schema_refs, false), model_style);
+
+    // The first top-level item is separated from the import block by isort's `lines-after-imports`: two
+    // blank lines before a class/enum def, but only one before a bare alias assignment (a simple
+    // statement). Every LATER item gets two blank lines (`ruff format` around defs). Getting the first
+    // gap right is what keeps a leading alias I001-clean.
+    let mut first = true;
     for schema in &graph.schemas {
-        out.push('\n');
+        let is_def = matches!(&schema.body, Type::Enum(_) | Type::Object(_));
+        out.push_str(top_level_separator(first, is_def));
+        first = false;
         match &schema.body {
             // A named enum (top-level Schema body) → a `class X(str, enum.Enum)`. The `str` mixin makes
             // `json.dumps` serialize the member value as its string — the twin of Go's `type X string`.
@@ -371,13 +517,23 @@ pub(crate) fn emit_models_with_style_and_aliases(
             }
         }
     }
-    if !aliases.is_empty() {
-        out.push('\n');
-        for alias in aliases {
-            writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
-        }
+    for alias in aliases {
+        out.push_str(top_level_separator(first, false));
+        first = false;
+        writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
     }
     Ok(out)
+}
+
+/// The blank-line separator before a top-level item: two blank lines everywhere `ruff format` wants them
+/// around defs, except the VERY FIRST item after the import block when it is a bare alias assignment —
+/// isort's `lines-after-imports` allows only one blank line before a simple statement there (I001).
+fn top_level_separator(first: bool, is_def: bool) -> &'static str {
+    if first && !is_def {
+        "\n"
+    } else {
+        "\n\n"
+    }
 }
 
 /// Emit one model schema into its own Python module.
@@ -386,10 +542,23 @@ pub(crate) fn emit_model_schema(
     schema: &crate::graph::Schema,
     model_style: PyModelStyle,
 ) -> Result<String, CoreError> {
-    let mut out = String::new();
-    out.push_str(models_header(model_style));
-    let deps = model_dependencies(&schema.body, graph, &schema.name);
-    if !deps.is_empty() {
+    // Forward-ref imports are needed ONLY for an object model's field types; an enum has none, and an
+    // alias body is a string literal whose names `ruff` never reads (so importing them would be F401).
+    let deps = match &schema.body {
+        Type::Object(_) => model_dependencies(&schema.body, graph, &schema.name),
+        _ => Vec::new(),
+    };
+    let imports = compute_model_imports(&[schema], !deps.is_empty());
+    let mut out = model_header(&imports, model_style);
+    if deps.is_empty() {
+        // No forward-ref block: separate the class/enum from the imports by two blank lines, but a bare
+        // alias assignment by only one (isort `lines-after-imports`, matching the compact path).
+        let is_def = matches!(&schema.body, Type::Enum(_) | Type::Object(_));
+        out.push_str(top_level_separator(true, is_def));
+    } else {
+        // A TYPE_CHECKING block (objects only) sits one blank line below the imports; the class then
+        // follows two blank lines below the block.
+        out.push('\n');
         writeln!(out, "if TYPE_CHECKING:").map_err(sink)?;
         for dep in deps {
             writeln!(
@@ -400,8 +569,8 @@ pub(crate) fn emit_model_schema(
             )
             .map_err(sink)?;
         }
+        out.push_str("\n\n");
     }
-    out.push('\n');
     match &schema.body {
         Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
         Type::Object(fields) => {
@@ -436,21 +605,21 @@ pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias) -> String {
 pub(crate) fn emit_models_init(graph: &ApiGraph, aliases: &[ResolvedTypeAlias]) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
-    for schema in &graph.schemas {
-        let _ = writeln!(
-            out,
-            "from .{} import {}",
-            file_stem(&schema.name),
-            schema.name
-        );
-    }
-    for alias in aliases {
-        let _ = writeln!(
-            out,
-            "from .{} import {}",
-            file_stem(&alias.alias),
-            alias.alias
-        );
+    // isort orders relative imports by MODULE (the file stem), which need not match the graph's
+    // id-sorted schema order — so sort the import lines by stem here to stay I001-clean.
+    let mut imports: Vec<(String, String)> = graph
+        .schemas
+        .iter()
+        .map(|s| (file_stem(&s.name), s.name.clone()))
+        .chain(
+            aliases
+                .iter()
+                .map(|a| (file_stem(&a.alias), a.alias.clone())),
+        )
+        .collect();
+    imports.sort();
+    for (stem, name) in &imports {
+        let _ = writeln!(out, "from .{stem} import {name}");
     }
     out.push_str("\n__all__ = [\n");
     for schema in &graph.schemas {
@@ -643,12 +812,12 @@ fn emit_pydantic_model(
     writeln!(out, "    @classmethod").map_err(sink)?;
     writeln!(
         out,
-        "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+        "    def from_dict(cls, _data: dict[str, Any]) -> {name}:"
     )
     .map_err(sink)?;
     writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
     writeln!(out).map_err(sink)?;
-    writeln!(out, "    def to_dict(self) -> Dict[str, Any]:").map_err(sink)?;
+    writeln!(out, "    def to_dict(self) -> dict[str, Any]:").map_err(sink)?;
     writeln!(
         out,
         "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
@@ -670,7 +839,7 @@ fn emit_dataclass(
         writeln!(out, "    @classmethod").map_err(sink)?;
         writeln!(
             out,
-            "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+            "    def from_dict(cls, _data: dict[str, Any]) -> {name}:"
         )
         .map_err(sink)?;
         writeln!(out, "        return cls()").map_err(sink)?;
@@ -712,7 +881,7 @@ fn emit_dataclass(
     writeln!(out, "    @classmethod").map_err(sink)?;
     writeln!(
         out,
-        "    def from_dict(cls, _data: Dict[str, Any]) -> \"{name}\":"
+        "    def from_dict(cls, _data: dict[str, Any]) -> {name}:"
     )
     .map_err(sink)?;
     writeln!(out, "        return cls(").map_err(sink)?;
@@ -745,7 +914,7 @@ pub(crate) fn emit_errors(_package: &str) -> String {
     "\
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 
 class ApiError(Exception):
@@ -759,7 +928,7 @@ class ApiError(Exception):
         status_code: int,
         message: str = \"\",
         slug: str = \"\",
-        hints: Optional[List[Any]] = None,
+        hints: Optional[list[Any]] = None,
     ) -> None:
         super().__init__(f\"{status_code} {message} ({slug})\")
         self.status_code = status_code
@@ -783,28 +952,92 @@ class ApiError(Exception):
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", PyModelStyle::default(), false)
+    emit_client_with_models(package, "models", PyModelStyle::default(), false, &[])
 }
 
-/// Emit `client.py` with a configurable model package import path.
+/// The set of model class names `client.py` references (each operation's request-body model and typed
+/// success-response model), sorted + de-duplicated. These are imported EXPLICITLY (never `from .models
+/// import *`) so the file carries no star import — `ruff` F403 (star import) / F405 (name may be
+/// undefined) are structurally impossible, and every imported name is genuinely used (F401-clean).
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on a dangling request-body / response `$ref` (surfaced by the same
+/// resolvers the operation emitter uses).
+pub(crate) fn client_referenced_models(
+    graph: &ApiGraph,
+    ops: &[&Operation],
+) -> Result<Vec<String>, CoreError> {
+    let mut names: Vec<String> = Vec::new();
+    for op in ops {
+        if let Some(body) = request_body_model_of(op, graph)? {
+            names.push(body.model);
+        }
+        if let Some(model) = success_responses_of(op, graph)?.body_model {
+            names.push(model);
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Emit `client.py` with a configurable model package import path and the explicit set of model names to
+/// import (from [`client_referenced_models`]).
+#[allow(clippy::too_many_lines)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     model_style: PyModelStyle,
     has_auth: bool,
+    model_refs: &[String],
 ) -> String {
-    let (extra_import, body_encode, body_comment) = match model_style {
+    let (body_encode, body_comment) = match model_style {
         PyModelStyle::Pydantic => (
-            "from pydantic import BaseModel\n",
             "        if isinstance(body, BaseModel):\n            body = body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n",
-            "        # Pydantic v2 request models need alias-aware JSON-mode dumping before json.dumps.\n",
+            "        # Dump Pydantic v2 request models (alias-aware, JSON mode) before json.dumps.\n",
         ),
         PyModelStyle::Dataclass => (
-            "import dataclasses\n",
             "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n",
             "        # Dataclass request models need conversion before json.dumps.\n",
         ),
     };
+
+    // --- Import header, assembled per file in canonical isort order (no unused imports, F401-clean). ---
+    let mut stdlib: Vec<String> = Vec::new();
+    if let PyModelStyle::Dataclass = model_style {
+        stdlib.push("import dataclasses".to_string());
+    }
+    stdlib.push("import json".to_string());
+    stdlib.push("import urllib.error".to_string());
+    stdlib.push("import urllib.parse".to_string());
+    stdlib.push("import urllib.request".to_string());
+    stdlib.push("from typing import Any, Optional".to_string());
+
+    let mut third_party: Vec<String> = Vec::new();
+    if let PyModelStyle::Pydantic = model_style {
+        third_party.push("from pydantic import BaseModel".to_string());
+    }
+
+    let mut first_party: Vec<String> = vec!["from .errors import ApiError".to_string()];
+    if !model_refs.is_empty() {
+        // A parenthesized, one-name-per-line import with a trailing comma: the "magic trailing comma"
+        // keeps `ruff format` from collapsing it and stays stable regardless of the name count.
+        let mut import = format!("from .{model_module} import (\n");
+        for name in model_refs {
+            let _ = writeln!(import, "    {name},");
+        }
+        import.push(')');
+        first_party.push(import);
+    }
+
+    let header = import_block(&[
+        vec!["from __future__ import annotations".to_string()],
+        stdlib,
+        third_party,
+        first_party,
+    ]);
+
     let auth_init = if has_auth {
         "        api_keys: Optional[dict[str, str]] = None,\n"
     } else {
@@ -820,20 +1053,11 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
-    let out = format!(
+    // The `_do` signature is pre-exploded (one parameter per line, trailing comma) because the single-
+    // line form exceeds the 88-column limit — matching `ruff format` so the output is format-stable.
+    format!(
         "\
-from __future__ import annotations
-
-import json
-import urllib.error
-import urllib.parse
-import urllib.request
-from typing import Any, Optional
-
-{extra_import}
-from .errors import ApiError
-from .models import *  # noqa: F401,F403  (re-export models for return-type annotations)
-
+{header}
 
 class Client:
     \"\"\"SDK client over urllib (no requests/httpx).\"\"\"
@@ -849,7 +1073,14 @@ class Client:
         self._api_key = api_key
 {auth_field}        self._opener = opener or urllib.request.build_opener()
 
-    def _do(self, method: str, path: str, *, body: Optional[Any] = None, auth_headers: Optional[tuple[str, ...]] = None) -> tuple:
+    def _do(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[Any] = None,
+        auth_headers: Optional[tuple[str, ...]] = None,
+    ) -> tuple:
 {body_comment}{body_encode}
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
         req = urllib.request.Request(self._base_url + path, data=data, method=method)
@@ -876,15 +1107,7 @@ class Client:
             decoded.get(\"hints\"),
         )
 "
-    );
-    if model_module == "models" {
-        out
-    } else {
-        out.replace(
-            "from .models import *",
-            &format!("from .{model_module} import *"),
-        )
-    }
+    )
 }
 
 /// Emit `client.py`'s operation methods (appended to the client file by [`generate`]).
@@ -1003,6 +1226,24 @@ fn resolve_op_args<'op>(
     })
 }
 
+/// Render a method `def` header at 4-space (Client-method) indent, wrapping to one-argument-per-line
+/// when the single-line form would exceed the 88-column limit — matching `ruff format` so the emitted
+/// source is already format-stable (CLAUDE.md rule 2: no formatter dependency). When exploded, each
+/// argument sits at 8-space indent with a trailing comma (the "magic trailing comma" that keeps the
+/// formatter from re-collapsing it).
+fn method_def(name: &str, args: &[String], ret: &str) -> String {
+    let one_line = format!("    def {name}({}) -> {ret}:", args.join(", "));
+    if one_line.len() <= 88 {
+        return one_line;
+    }
+    let mut out = format!("    def {name}(\n");
+    for arg in args {
+        let _ = writeln!(out, "        {arg},");
+    }
+    let _ = write!(out, "    ) -> {ret}:");
+    out
+}
+
 /// Emit a single operation method (4-space indented as a `Client` method body).
 #[allow(clippy::too_many_lines)]
 fn emit_operation(
@@ -1082,12 +1323,7 @@ fn emit_operation(
         args.push(format!("{ident}=None"));
     }
 
-    writeln!(
-        out,
-        "    def {method_name}({}) -> {return_hint}:",
-        args.join(", ")
-    )
-    .map_err(sink)?;
+    writeln!(out, "{}", method_def(&method_name, &args, &return_hint)).map_err(sink)?;
 
     // Build the path: f-string interpolation with each path param percent-escaped (V5). The token order
     // matches path_params order (set-equality was already asserted), so path_idents aligns by position.
@@ -1481,12 +1717,12 @@ mod tests {
         fn array_and_map_and_any_map_to_typing_generics() {
             let g = ApiGraph::default();
             let arr = Type::Array(Box::new(Type::Primitive(Prim::String)));
-            assert_eq!(py_type(&arr, false, &g).unwrap(), "List[str]");
+            assert_eq!(py_type(&arr, false, &g).unwrap(), "list[str]");
             let map = Type::Map {
                 key: Box::new(Type::Primitive(Prim::String)),
                 value: Box::new(Type::Primitive(Prim::String)),
             };
-            assert_eq!(py_type(&map, false, &g).unwrap(), "Dict[str, str]");
+            assert_eq!(py_type(&map, false, &g).unwrap(), "dict[str, str]");
             assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "Any");
         }
 
@@ -1614,11 +1850,15 @@ mod tests {
                 "every module starts with the lazy-annotation future import:\n{out}"
             );
             assert!(out.contains("import enum"), "{out}");
+            // The typing import is COMPUTED per file: only the names this sample actually uses, with
+            // `Dict`/`List` gone (they map to the PEP 585 builtins) and no unused `TYPE_CHECKING`.
             assert!(
-                out.contains(
-                    "from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union"
-                ),
+                out.contains("from typing import Any, Literal, Optional, Union"),
                 "{out}"
+            );
+            assert!(
+                !out.contains("Dict[") && !out.contains("List[") && !out.contains("TYPE_CHECKING"),
+                "computed header must drop Dict/List/TYPE_CHECKING:\n{out}"
             );
             assert!(
                 out.contains("from pydantic import BaseModel, ConfigDict, Field"),
@@ -1635,12 +1875,12 @@ mod tests {
         fn pydantic_models_keep_from_dict_and_to_dict_compat_methods() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(
-                out.contains("def from_dict(cls, _data: Dict[str, Any]) -> \"Book\":"),
+                out.contains("def from_dict(cls, _data: dict[str, Any]) -> Book:"),
                 "Pydantic models should keep legacy decode compatibility:\n{out}"
             );
             assert!(out.contains("return cls.model_validate(_data)"), "{out}");
             assert!(
-                out.contains("def to_dict(self) -> Dict[str, Any]:"),
+                out.contains("def to_dict(self) -> dict[str, Any]:"),
                 "Pydantic models should keep legacy encode compatibility:\n{out}"
             );
             assert!(
@@ -2117,7 +2357,7 @@ mod tests {
                 emit_models_with_style(&graph_from(facts), "pkg", PyModelStyle::Dataclass).unwrap();
             // a from_dict classmethod is emitted; nested object field recurses; nested array maps.
             assert!(
-                out.contains("def from_dict(cls, _data: Dict[str, Any])"),
+                out.contains("def from_dict(cls, _data: dict[str, Any])"),
                 "{out}"
             );
             assert!(

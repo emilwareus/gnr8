@@ -606,7 +606,6 @@ export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
 {api_key_field}
-
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
@@ -825,6 +824,24 @@ fn resolve_op_args<'op>(
     })
 }
 
+/// Render a class method's `async` signature at 2-space indent, wrapping the parameter list one per line
+/// when the single-line form would exceed Prettier's default 80-column `printWidth` — so the emitted TS
+/// is already prettier-clean (CLAUDE.md rule 2: no formatter dependency). When wrapped, each parameter
+/// sits at 4-space indent with a trailing comma (the trailing comma Prettier keeps), and the return type
+/// closes at 2-space indent. An empty parameter list is never wrapped (nothing to break).
+fn ts_method_signature(name: &str, args: &[String], ret_promise: &str) -> String {
+    let one_line = format!("  async {name}({}): {ret_promise} {{", args.join(", "));
+    if args.is_empty() || one_line.len() <= 80 {
+        return one_line;
+    }
+    let mut out = format!("  async {name}(\n");
+    for arg in args {
+        let _ = writeln!(out, "    {arg},");
+    }
+    let _ = write!(out, "  ): {ret_promise} {{");
+    out
+}
+
 /// Emit a single operation method (2-space indented as a `Client` method body).
 fn emit_operation(
     out: &mut String,
@@ -919,8 +936,8 @@ fn emit_operation(
     };
     writeln!(
         out,
-        "\n  async {method_name}({}): {ret_promise} {{",
-        args.join(", ")
+        "{}",
+        ts_method_signature(&method_name, &args, &ret_promise)
     )
     .map_err(sink)?;
 
@@ -1752,9 +1769,11 @@ mod tests {
                 },
             });
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            // The single-line form exceeds Prettier's 80-col printWidth, so the signature wraps one
+            // parameter per line (still body-before-query).
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book, tenant: string): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "required body must stay before required query params:\n{out}"
             );
@@ -1779,9 +1798,10 @@ mod tests {
                 .responses
                 .sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            // Wrapped to satisfy Prettier's 80-col printWidth.
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book): Promise<models.CreatedMessage | undefined> {"
+                    "  async createBook(\n    body: models.Book,\n  ): Promise<models.CreatedMessage | undefined> {"
                 ),
                 "bodyless alternate success should make the return type optional:\n{out}"
             );
