@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::graph::{ApiGraph, Field, Operation, Param, Prim, RuntimePolicy, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
@@ -592,16 +592,28 @@ export class ApiError extends Error {
 /// `--lib es2022,dom`).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", false, false, false)
+    emit_client_with_models(
+        package,
+        "models",
+        false,
+        false,
+        false,
+        &RuntimePolicy::default(),
+    )
 }
 
 /// Emit `client.ts` with a configurable model-barrel import path.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated runtime client is one fixed source block with options, hooks, retry helpers, and transport helpers"
+)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     _has_api_key_auth: bool,
     has_bearer_auth: bool,
     has_basic_auth: bool,
+    runtime: &RuntimePolicy,
 ) -> String {
     let bearer_option = if has_bearer_auth {
         "  bearerToken?: string;\n"
@@ -643,17 +655,59 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
+    let default_timeout = ts_timeout_value(runtime.default_timeout_ms);
+    let max_retries = runtime.max_retries;
+    let retry_statuses = ts_retry_status_array(runtime);
+    let retry_unsafe_methods = runtime.retry_unsafe_methods;
     format!(
         "\
 import {{ ApiError }} from \"./errors\";
 import * as models from \"./{model_module}\";
+
+export interface RequestOptions {{
+  timeoutMs?: number;
+  maxRetries?: number;
+  idempotencyKey?: string;
+  metadata?: Record<string, string>;
+}}
+
+export interface HookContext {{
+  operationId: string;
+  method: string;
+  pathTemplate: string;
+  url: string;
+  headers: Record<string, string>;
+  requestMetadata: Record<string, string>;
+  status?: number;
+  responseHeaders?: Headers;
+}}
+
+export type RequestHook = (context: HookContext, init: RequestInit) => void | Promise<void>;
+export type ResponseHook = (context: HookContext, response: Response) => void | Promise<void>;
+export type ErrorHook = (context: HookContext, error: unknown) => void | Promise<void>;
+
+export interface ClientHooks {{
+  request?: RequestHook[];
+  response?: ResponseHook[];
+  error?: ErrorHook[];
+}}
 
 export interface ClientOptions {{
   baseUrl: string;
   fetch?: typeof fetch;
   apiKey?: string;
   apiKeys?: Record<string, string>;
+  timeoutMs?: number;
+  maxRetries?: number;
+  hooks?: ClientHooks;
 {bearer_option}{basic_option}
+}}
+
+interface RuntimeRequestContext {{
+  operationId: string;
+  pathTemplate: string;
+  idempotent?: boolean;
+  idempotencyKeyHeader?: string;
 }}
 
 export class Client {{
@@ -661,6 +715,11 @@ export class Client {{
   private readonly fetchFn: typeof fetch;
   private readonly apiKey?: string;
   private readonly apiKeys: Record<string, string>;
+  private readonly timeoutMs?: number;
+  private readonly maxRetries: number;
+  private readonly retryStatuses: Set<number>;
+  private readonly retryUnsafeMethods: boolean;
+  private readonly hooks: Required<ClientHooks>;
 {bearer_field}{basic_field}
 
   constructor(opts: ClientOptions) {{
@@ -668,6 +727,15 @@ export class Client {{
     this.fetchFn = opts.fetch ?? fetch;
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {{}};
+    this.timeoutMs = opts.timeoutMs ?? {default_timeout};
+    this.maxRetries = opts.maxRetries ?? {max_retries};
+    this.retryStatuses = new Set<number>({retry_statuses});
+    this.retryUnsafeMethods = {retry_unsafe_methods};
+    this.hooks = {{
+      request: opts.hooks?.request ?? [],
+      response: opts.hooks?.response ?? [],
+      error: opts.hooks?.error ?? [],
+    }};
 {bearer_init}{basic_init}
   }}
 
@@ -687,15 +755,142 @@ export class Client {{
     path: string,
     headers: Record<string, string>,
     body?: unknown,
+    requestContext?: RuntimeRequestContext,
+    options: RequestOptions = {{}},
   ): Promise<Response> {{
-    return await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    }});
+    const context = requestContext ?? {{ operationId: \"\", pathTemplate: path }};
+    const url = `${{this.baseUrl}}${{path}}`;
+    const requestMetadata = options.metadata ?? {{}};
+    if (context.idempotent === true && options.idempotencyKey !== undefined) {{
+      headers[context.idempotencyKeyHeader ?? \"Idempotency-Key\"] = options.idempotencyKey;
+    }}
+    const maxRetries = Math.max(0, options.maxRetries ?? this.maxRetries);
+    const retryAttempts =
+      this.retryUnsafeMethods || context.idempotent === true || this._retryableMethod(method)
+        ? maxRetries
+        : 0;
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    const bodyText = body === undefined ? undefined : JSON.stringify(body);
+    let lastError: unknown = undefined;
+    for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {{
+      const controller = timeoutMs !== undefined && timeoutMs > 0 ? new AbortController() : undefined;
+      const timeoutId =
+        controller === undefined ? undefined : setTimeout(() => controller.abort(), timeoutMs);
+      const init: RequestInit = {{
+        method,
+        headers,
+        body: bodyText,
+        signal: controller?.signal,
+      }};
+      const hookContext: HookContext = {{
+        operationId: context.operationId,
+        method,
+        pathTemplate: context.pathTemplate,
+        url,
+        headers: {{ ...headers }},
+        requestMetadata,
+      }};
+      try {{
+        for (const hook of this.hooks.request) {{
+          await hook(hookContext, init);
+        }}
+        const response = await this.fetchFn(url, init);
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
+        }}
+        hookContext.status = response.status;
+        hookContext.responseHeaders = response.headers;
+        for (const hook of this.hooks.response) {{
+          await hook(hookContext, response);
+        }}
+        if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {{
+          await this._sleep(this._retryDelayMs(response));
+          continue;
+        }}
+        if (response.status < 200 || response.status >= 300) {{
+          const error = new ApiError(response.status, {{ headers: response.headers }});
+          for (const hook of this.hooks.error) {{
+            await hook(hookContext, error);
+          }}
+        }}
+        return response;
+      }} catch (error) {{
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
+        }}
+        lastError = error;
+        if (attempt < retryAttempts) {{
+          continue;
+        }}
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+        throw error;
+      }}
+    }}
+    throw lastError ?? new Error(\"request failed without response\");
+  }}
+
+  private _retryableMethod(method: string): boolean {{
+    return method === \"GET\" || method === \"HEAD\" || method === \"OPTIONS\" || method === \"PUT\" || method === \"DELETE\";
+  }}
+
+  private _shouldRetryStatus(status: number): boolean {{
+    return this.retryStatuses.has(status) || status >= 500;
+  }}
+
+  private _retryDelayMs(response: Response): number {{
+    const retryAfter = response.headers.get(\"Retry-After\");
+    if (retryAfter === null) {{
+      return 0;
+    }}
+    const seconds = Number.parseInt(retryAfter, 10);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+  }}
+
+  private async _sleep(ms: number): Promise<void> {{
+    if (ms <= 0) {{
+      return;
+    }}
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }}
 "
     )
+}
+
+fn ts_timeout_value(timeout_ms: Option<u64>) -> String {
+    timeout_ms.map_or_else(|| "30000".to_string(), |ms| ms.to_string())
+}
+
+fn ts_retry_status_array(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if runtime.max_retries > 0 && statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    let joined = statuses
+        .into_iter()
+        .map(|status| status.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
+}
+
+struct TsOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn ts_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> TsOperationRuntime<'a> {
+    let policy = graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id);
+    TsOperationRuntime {
+        idempotent: policy.is_some_and(|policy| policy.idempotent),
+        idempotency_key_header: policy.and_then(|policy| policy.idempotency_key_header.as_deref()),
+    }
 }
 
 /// Emit `client.ts`'s operation methods (appended to the client file by [`generate`]).
@@ -754,7 +949,7 @@ pub(crate) fn emit_operation_module(
     models_module: &str,
 ) -> Result<String, CoreError> {
     let mut out = format!(
-        "import type {{ Client }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
+        "import type {{ Client, RequestOptions }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
     );
     for op in ops {
         emit_operation(
@@ -1086,6 +1281,7 @@ fn emit_operation(
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}?: {ty}"));
     }
+    args.push("options?: RequestOptions".to_string());
 
     let ret_promise = if return_model.is_some() || success.has_binary_body() {
         format!("Promise<{return_ty}>")
@@ -1129,6 +1325,8 @@ fn emit_operation(
         &auth_headers,
         &auth_http,
         &error_bodies,
+        op,
+        graph,
     )?;
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
@@ -1303,6 +1501,10 @@ fn emit_error_throw_branch(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "operation dispatch emission needs the operation, graph, auth, response, and body facts at one write site"
+)]
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
@@ -1311,6 +1513,8 @@ fn emit_op_dispatch(
     auth_headers: &[String],
     auth_http: &[HttpAuthScheme],
     error_bodies: &[ErrorResponseBody],
+    op: &Operation,
+    graph: &ApiGraph,
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -1353,16 +1557,25 @@ fn emit_op_dispatch(
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
+    let runtime = ts_operation_runtime(graph, op);
+    let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
+    let context = format!(
+        "{{ operationId: {}, pathTemplate: {}, idempotent: {}, idempotencyKeyHeader: {} }}",
+        quoted_string_literal(&op.id),
+        quoted_string_literal(&op.path),
+        runtime.idempotent,
+        quoted_string_literal(idempotency_header),
+    );
     if request_body.is_present() {
         writeln!(
             out,
-            "    const res = await this._request(\"{method}\", path, headers, body);"
+            "    const res = await this._request(\"{method}\", path, headers, body, {context}, options);"
         )
         .map_err(sink)?;
     } else {
         writeln!(
             out,
-            "    const res = await this._request(\"{method}\", path, headers);"
+            "    const res = await this._request(\"{method}\", path, headers, undefined, {context}, options);"
         )
         .map_err(sink)?;
     }
@@ -1431,7 +1644,9 @@ pub(crate) fn emit_index_with_models(
 
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
-    out.push_str("export type { ClientOptions } from \"./client\";\n");
+    out.push_str(
+        "export type { ClientHooks, ClientOptions, ErrorHook, HookContext, RequestHook, RequestOptions, ResponseHook } from \"./client\";\n",
+    );
     out.push_str("export { ApiError } from \"./errors\";\n");
     out.push_str("export type { ApiErrorInit } from \"./errors\";\n");
 
@@ -1956,7 +2171,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "camel method, typed body, typed return:\n{out}"
             );
@@ -1980,8 +2195,32 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("const res = await this._request(\"POST\", path, headers, body);"),
+                out.contains(
+                    "const res = await this._request(\"POST\", path, headers, body, { operationId: \"createBook\""
+                ) && out.contains("}, options);"),
                 "body op dispatches through the shared request helper:\n{out}"
+            );
+        }
+
+        #[test]
+        fn operation_dispatch_includes_idempotency_runtime_context() {
+            let mut g = ops_graph();
+            g.operation_runtime = vec![crate::graph::OperationRuntimePolicy {
+                operation_id: "createBook".to_string(),
+                idempotent: true,
+                idempotency_key_header: Some("X-Idempotency-Key".to_string()),
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains(
+                    "{ operationId: \"createBook\", pathTemplate: \"/books\", idempotent: true, idempotencyKeyHeader: \"X-Idempotency-Key\" }"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("const res = await this._request(\"POST\", path, headers, body,")
+                    && out.contains("}, options);"),
+                "{out}"
             );
         }
 
@@ -2031,7 +2270,7 @@ mod tests {
             // parameter per line (still body-before-query).
             assert!(
                 out.contains(
-                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n  ): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "required body must stay before required query params:\n{out}"
             );
@@ -2059,7 +2298,7 @@ mod tests {
             // Wrapped to satisfy Prettier's 80-col printWidth.
             assert!(
                 out.contains(
-                    "  async createBook(\n    body: models.Book,\n  ): Promise<models.CreatedMessage | undefined> {"
+                    "  async createBook(\n    body: models.Book,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage | undefined> {"
                 ),
                 "bodyless alternate success should make the return type optional:\n{out}"
             );
@@ -2078,7 +2317,9 @@ mod tests {
                 "path param must be percent-escaped (V5) via a backslash-free template literal:\n{out}"
             );
             assert!(
-                out.contains("async getBook(bookId: number): Promise<models.Book> {"),
+                out.contains(
+                    "  async getBook(\n    bookId: number,\n    options?: RequestOptions,\n  ): Promise<models.Book> {"
+                ),
                 "{out}"
             );
         }
@@ -2098,7 +2339,9 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
             assert!(
-                out.contains("async getBook(bookId: number): Promise<Blob> {"),
+                out.contains(
+                    "async getBook(bookId: number, options?: RequestOptions): Promise<Blob> {"
+                ),
                 "binary success should return Blob:\n{out}"
             );
             assert!(out.contains("return await res.blob();"), "{out}");
@@ -2113,7 +2356,9 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("async listBooks(cursor?: string): Promise<void> {"),
+                out.contains(
+                    "async listBooks(cursor?: string, options?: RequestOptions): Promise<void> {"
+                ),
                 "{out}"
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
@@ -2367,7 +2612,9 @@ mod tests {
             let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
             // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
             assert!(
-                out.contains("async search(q: string, page?: string): Promise<void> {"),
+                out.contains(
+                    "  async search(\n    q: string,\n    page?: string,\n    options?: RequestOptions,\n  ): Promise<void> {"
+                ),
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
@@ -2437,6 +2684,7 @@ mod tests {
 
     mod client_errors_index {
         use super::{emit_client, emit_client_with_models, emit_errors, emit_index, ops_graph};
+        use crate::graph::RuntimePolicy;
 
         #[test]
         fn client_uses_fetch_with_an_injectable_transport_and_no_third_party_imports() {
@@ -2455,7 +2703,14 @@ mod tests {
 
         #[test]
         fn client_emits_http_auth_options_when_needed() {
-            let out = emit_client_with_models("bookstore", "models", false, true, true);
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                false,
+                true,
+                true,
+                &crate::graph::RuntimePolicy::default(),
+            );
             assert!(out.contains("bearerToken?: string;"), "{out}");
             assert!(
                 out.contains("basicAuth?: { username: string; password: string };"),
@@ -2472,6 +2727,54 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("return `Basic ${btoa(raw)}`;"), "{out}");
+        }
+
+        #[test]
+        fn client_emits_runtime_options_retries_and_hooks() {
+            let runtime = RuntimePolicy {
+                default_timeout_ms: Some(1_234),
+                max_retries: 2,
+                retry_statuses: vec![429, 408],
+                retry_unsafe_methods: true,
+                hooks: Vec::new(),
+            };
+            let out = emit_client_with_models("bookstore", "models", false, false, false, &runtime);
+            assert!(out.contains("export interface RequestOptions {"), "{out}");
+            assert!(out.contains("timeoutMs?: number;"), "{out}");
+            assert!(out.contains("maxRetries?: number;"), "{out}");
+            assert!(out.contains("idempotencyKey?: string;"), "{out}");
+            assert!(out.contains("export interface HookContext {"), "{out}");
+            assert!(out.contains("operationId: string;"), "{out}");
+            assert!(out.contains("pathTemplate: string;"), "{out}");
+            assert!(
+                out.contains("requestMetadata: Record<string, string>;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.timeoutMs = opts.timeoutMs ?? 1234;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.maxRetries = opts.maxRetries ?? 2;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.retryStatuses = new Set<number>([408, 429]);"),
+                "{out}"
+            );
+            assert!(out.contains("this.retryUnsafeMethods = true;"), "{out}");
+            assert!(
+                out.contains("for (const hook of this.hooks.request)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const hook of this.hooks.response)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const hook of this.hooks.error)"),
+                "{out}"
+            );
         }
 
         #[test]

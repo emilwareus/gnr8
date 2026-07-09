@@ -252,6 +252,68 @@ fn http_auth_graph() -> gnr8::graph::ApiGraph {
     .expect("http auth graph json")
 }
 
+fn runtime_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "createUnsafe",
+              "method": "POST",
+              "path": "/unsafe",
+              "handler": "createUnsafe",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "createIdempotent",
+              "method": "POST",
+              "path": "/idempotent",
+              "handler": "createIdempotent",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 3, "end_line": 3 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("runtime graph json");
+    graph.runtime = gnr8::graph::RuntimePolicy {
+        default_timeout_ms: Some(5_000),
+        max_retries: 0,
+        retry_statuses: vec![408, 429],
+        retry_unsafe_methods: false,
+        hooks: Vec::new(),
+    };
+    graph.operation_runtime = vec![gnr8::graph::OperationRuntimePolicy {
+        operation_id: "createIdempotent".to_string(),
+        idempotent: true,
+        idempotency_key_header: Some("Idempotency-Key".to_string()),
+    }];
+    graph
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]
@@ -574,6 +636,175 @@ func TestBearerAndBasicAuthAreSent(t *testing.T) {{
     assert!(
         test.is_ok(),
         "go test ./... (http auth smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test writes one fixed generated-SDK Go program so failures show the exact smoke source"
+)]
+fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile runtime smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = runtime_graph();
+    let dir = materialize_sdk_from_graph("runtime", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+type runtimeEvent struct {{
+	Kind string
+	OperationID string
+	Method string
+	PathTemplate string
+	Trace string
+	StatusCode int
+}}
+
+func hasRuntimeEvent(events []runtimeEvent, want runtimeEvent) bool {{
+	for _, event := range events {{
+		if event == want {{
+			return true
+		}}
+	}}
+	return false
+}}
+
+func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
+	counts := map[string]int{{}}
+	idempotencyKeys := []string{{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		key := r.Method + " " + r.URL.Path
+		counts[key]++
+		switch r.URL.Path {{
+		case "/api/items":
+			if counts[key] == 1 {{
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}}
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/unsafe":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/api/idempotent":
+			idempotencyKeys = append(idempotencyKeys, r.Header.Get("Idempotency-Key"))
+			if counts[key] == 1 {{
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}}
+	}}))
+	defer srv.Close()
+
+	events := []runtimeEvent{{}}
+	c := NewClient(
+		srv.URL,
+		WithTimeout(5*time.Second),
+		WithMaxRetries(0),
+		WithRequestHook(func(_ context.Context, ctx RequestContext, _ *http.Request) error {{
+			events = append(events, runtimeEvent{{
+				Kind: "request",
+				OperationID: ctx.OperationID,
+				Method: ctx.Method,
+				PathTemplate: ctx.PathTemplate,
+				Trace: ctx.RequestMetadata["trace"],
+			}})
+			return nil
+		}}),
+		WithResponseHook(func(_ context.Context, ctx RequestContext, _ *http.Response) error {{
+			events = append(events, runtimeEvent{{
+				Kind: "response",
+				OperationID: ctx.OperationID,
+				StatusCode: ctx.StatusCode,
+			}})
+			return nil
+		}}),
+		WithErrorHook(func(_ context.Context, ctx RequestContext, _ error) {{
+			events = append(events, runtimeEvent{{
+				Kind: "error",
+				OperationID: ctx.OperationID,
+				StatusCode: ctx.StatusCode,
+			}})
+		}}),
+	)
+
+	_, err := c.ListItems(
+		context.Background(),
+		WithRequestMaxRetries(1),
+		WithRequestTimeout(5*time.Second),
+		WithRequestMetadata(map[string]string{{"trace": "runtime"}}),
+	)
+	if err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+	if counts["GET /api/items"] != 2 {{
+		t.Fatalf("GET /api/items count = %d, want 2", counts["GET /api/items"])
+	}}
+
+	_, err = c.CreateUnsafe(context.Background(), WithRequestMaxRetries(1))
+	if err == nil {{
+		t.Fatalf("CreateUnsafe must return an APIError")
+	}}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.StatusCode != http.StatusInternalServerError {{
+		t.Fatalf("CreateUnsafe error = %#v, want *APIError status 500", err)
+	}}
+	if counts["POST /api/unsafe"] != 1 {{
+		t.Fatalf("POST /api/unsafe count = %d, want 1", counts["POST /api/unsafe"])
+	}}
+
+	_, err = c.CreateIdempotent(
+		context.Background(),
+		WithRequestMaxRetries(1),
+		WithIdempotencyKey("idem-1"),
+	)
+	if err != nil {{
+		t.Fatalf("CreateIdempotent returned error: %v", err)
+	}}
+	if counts["POST /api/idempotent"] != 2 {{
+		t.Fatalf("POST /api/idempotent count = %d, want 2", counts["POST /api/idempotent"])
+	}}
+	if len(idempotencyKeys) != 2 || idempotencyKeys[0] != "idem-1" || idempotencyKeys[1] != "idem-1" {{
+		t.Fatalf("idempotency keys = %#v, want two idem-1 values", idempotencyKeys)
+	}}
+
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "request", OperationID: "listItems", Method: "GET", PathTemplate: "/items", Trace: "runtime"}}) {{
+		t.Fatalf("missing listItems request event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 500}}) {{
+		t.Fatalf("missing listItems 500 response event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 204}}) {{
+		t.Fatalf("missing listItems 204 response event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "error", OperationID: "createUnsafe", StatusCode: 500}}) {{
+		t.Fatalf("missing createUnsafe error event in %#v", events)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("runtime_test.go"), smoke).expect("write runtime_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (runtime smoke) must pass: {test:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

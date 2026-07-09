@@ -147,6 +147,7 @@ pub(crate) fn generate_files_with_options(
         http_auth.bearer,
         http_auth.basic,
         &model_refs,
+        &graph.runtime,
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);

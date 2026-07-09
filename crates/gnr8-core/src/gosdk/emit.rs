@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
+use crate::graph::{ApiGraph, Field, Operation, Prim, RuntimePolicy, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, join_path, operation_api_key_headers,
     operation_api_key_queries, operation_api_key_schemes, operation_http_auth_schemes, path_tokens,
@@ -985,11 +985,16 @@ fn compat_constructor_requires_field(_owner_name: &str, field: &Field) -> bool {
 /// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
 /// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
 /// hard-coded fixture name.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated runtime client is one fixed source block with options, hooks, retry helpers, and transport helpers"
+)]
 pub(crate) fn emit_client(
     package: &str,
     has_api_key_auth: bool,
     has_bearer_auth: bool,
     has_basic_auth: bool,
+    runtime: &RuntimePolicy,
 ) -> String {
     let api_key_field = if has_api_key_auth {
         "apiKey string\napiKeys map[string]string\n"
@@ -1026,6 +1031,12 @@ pub(crate) fn emit_client(
     } else {
         ""
     };
+    let default_timeout = runtime
+        .default_timeout_ms
+        .map_or_else(|| "30 * time.Second".to_string(), go_duration_ms);
+    let retry_statuses = go_retry_status_map(runtime);
+    let retry_unsafe_methods = runtime.retry_unsafe_methods;
+    let max_retries = runtime.max_retries;
     let body = format!(
         "\
 // Client is the {package} SDK entrypoint. Tag-grouped operation methods hang
@@ -1033,6 +1044,13 @@ pub(crate) fn emit_client(
 type Client struct {{
 baseURL string
 httpClient *http.Client
+timeout time.Duration
+maxRetries int
+retryStatuses map[int]bool
+retryUnsafeMethods bool
+requestHooks []RequestHook
+responseHooks []ResponseHook
+errorHooks []ErrorHook
 {api_key_field}{bearer_field}{basic_field}}}
 
 // Option mutates a Client during construction (functional-options pattern).
@@ -1041,6 +1059,86 @@ type Option func(*Client)
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {{
 return func(c *Client) {{ c.httpClient = hc }}
+}}
+
+// WithTimeout sets the client-level default request timeout.
+func WithTimeout(timeout time.Duration) Option {{
+return func(c *Client) {{ c.timeout = timeout }}
+}}
+
+// WithMaxRetries sets the client-level default retry count.
+func WithMaxRetries(maxRetries int) Option {{
+return func(c *Client) {{ c.maxRetries = maxRetries }}
+}}
+
+// WithRequestHook installs a hook that runs before each HTTP attempt.
+func WithRequestHook(hook RequestHook) Option {{
+return func(c *Client) {{ c.requestHooks = append(c.requestHooks, hook) }}
+}}
+
+// WithResponseHook installs a hook that runs after each HTTP response.
+func WithResponseHook(hook ResponseHook) Option {{
+return func(c *Client) {{ c.responseHooks = append(c.responseHooks, hook) }}
+}}
+
+// WithErrorHook installs a hook that runs for transport failures and final non-2xx responses.
+func WithErrorHook(hook ErrorHook) Option {{
+return func(c *Client) {{ c.errorHooks = append(c.errorHooks, hook) }}
+}}
+
+// RequestOptions overrides runtime behavior for one operation call.
+type RequestOptions struct {{
+Timeout time.Duration
+MaxRetries *int
+IdempotencyKey string
+Metadata map[string]string
+}}
+
+// RequestOption mutates per-request runtime options.
+type RequestOption func(*RequestOptions)
+
+// WithRequestTimeout overrides the timeout for one operation call.
+func WithRequestTimeout(timeout time.Duration) RequestOption {{
+return func(o *RequestOptions) {{ o.Timeout = timeout }}
+}}
+
+// WithRequestMaxRetries overrides max retries for one operation call.
+func WithRequestMaxRetries(maxRetries int) RequestOption {{
+return func(o *RequestOptions) {{ o.MaxRetries = &maxRetries }}
+}}
+
+// WithIdempotencyKey sets the idempotency key sent by explicitly idempotent operations.
+func WithIdempotencyKey(key string) RequestOption {{
+return func(o *RequestOptions) {{ o.IdempotencyKey = key }}
+}}
+
+// WithRequestMetadata attaches hook-visible metadata to one operation call.
+func WithRequestMetadata(metadata map[string]string) RequestOption {{
+return func(o *RequestOptions) {{ o.Metadata = metadata }}
+}}
+
+// RequestContext describes one generated SDK transport attempt.
+type RequestContext struct {{
+OperationID string
+Method string
+PathTemplate string
+URL string
+Headers http.Header
+RequestMetadata map[string]string
+StatusCode int
+ResponseHeaders http.Header
+}}
+
+type RequestHook func(context.Context, RequestContext, *http.Request) error
+type ResponseHook func(context.Context, RequestContext, *http.Response) error
+type ErrorHook func(context.Context, RequestContext, error)
+
+type runtimeRequestOptions struct {{
+OperationID string
+PathTemplate string
+Idempotent bool
+IdempotencyKeyHeader string
+Options RequestOptions
 }}
 {api_key_option}
 {bearer_option}
@@ -1051,7 +1149,11 @@ return func(c *Client) {{ c.httpClient = hc }}
 func NewClient(baseURL string, opts ...Option) *Client {{
 c := &Client{{
 baseURL: baseURL,
-httpClient: &http.Client{{Timeout: 30 * time.Second}},
+httpClient: &http.Client{{Timeout: {default_timeout}}},
+timeout: {default_timeout},
+maxRetries: {max_retries},
+retryStatuses: {retry_statuses},
+retryUnsafeMethods: {retry_unsafe_methods},
 {api_key_init}
 }}
 for _, opt := range opts {{
@@ -1059,9 +1161,179 @@ opt(c)
 }}
 return c
 }}
+
+func newRequestOptions(opts ...RequestOption) RequestOptions {{
+var options RequestOptions
+for _, opt := range opts {{
+opt(&options)
+}}
+return options
+}}
+
+func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {{
+timeout := c.timeout
+if runtime.Options.Timeout > 0 {{
+timeout = runtime.Options.Timeout
+}}
+ctx := req.Context()
+var cancel context.CancelFunc
+if timeout > 0 {{
+ctx, cancel = context.WithTimeout(ctx, timeout)
+defer cancel()
+req = req.Clone(ctx)
+}}
+if runtime.Idempotent && runtime.Options.IdempotencyKey != \"\" {{
+header := runtime.IdempotencyKeyHeader
+if header == \"\" {{
+header = \"Idempotency-Key\"
+}}
+req.Header.Set(header, runtime.Options.IdempotencyKey)
+}}
+maxRetries := c.maxRetries
+if runtime.Options.MaxRetries != nil {{
+maxRetries = *runtime.Options.MaxRetries
+}}
+if maxRetries < 0 {{
+maxRetries = 0
+}}
+allowRetries := c.retryUnsafeMethods || runtime.Idempotent || retryableMethod(req.Method)
+if !allowRetries {{
+maxRetries = 0
+}}
+var lastErr error
+for attempt := 0; attempt <= maxRetries; attempt++ {{
+attemptReq, err := cloneRequestForAttempt(req, attempt)
+if err != nil {{
+return nil, err
+}}
+ctx := requestContext(runtime, attemptReq)
+for _, hook := range c.requestHooks {{
+if err := hook(attemptReq.Context(), ctx, attemptReq); err != nil {{
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+}}
+resp, err := c.httpClient.Do(attemptReq)
+if err != nil {{
+lastErr = err
+if attempt < maxRetries {{
+continue
+}}
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+ctx.StatusCode = resp.StatusCode
+ctx.ResponseHeaders = resp.Header.Clone()
+for _, hook := range c.responseHooks {{
+if err := hook(attemptReq.Context(), ctx, resp); err != nil {{
+_ = resp.Body.Close()
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+}}
+if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {{
+sleepRetryAfter(resp)
+_, _ = io.Copy(io.Discard, resp.Body)
+_ = resp.Body.Close()
+continue
+}}
+if resp.StatusCode < 200 || resp.StatusCode >= 300 {{
+c.callErrorHooks(attemptReq.Context(), ctx, &APIError{{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get(\"X-Request-ID\")}})
+}}
+return resp, nil
+}}
+if lastErr != nil {{
+return nil, lastErr
+}}
+return nil, errors.New(\"request failed without response\")
+}}
+
+func cloneRequestForAttempt(req *http.Request, attempt int) (*http.Request, error) {{
+cloned := req.Clone(req.Context())
+if attempt == 0 || req.Body == nil {{
+return cloned, nil
+}}
+if req.GetBody == nil {{
+return nil, errors.New(\"request body cannot be replayed for retry\")
+}}
+body, err := req.GetBody()
+if err != nil {{
+return nil, err
+}}
+cloned.Body = body
+return cloned, nil
+}}
+
+func requestContext(runtime runtimeRequestOptions, req *http.Request) RequestContext {{
+return RequestContext{{
+OperationID: runtime.OperationID,
+Method: req.Method,
+PathTemplate: runtime.PathTemplate,
+URL: req.URL.String(),
+Headers: req.Header.Clone(),
+RequestMetadata: runtime.Options.Metadata,
+}}
+}}
+
+func (c *Client) callErrorHooks(ctx context.Context, requestContext RequestContext, err error) {{
+for _, hook := range c.errorHooks {{
+hook(ctx, requestContext, err)
+}}
+}}
+
+func retryableMethod(method string) bool {{
+switch method {{
+case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+return true
+default:
+return false
+}}
+}}
+
+func shouldRetryStatus(status int, retryStatuses map[int]bool) bool {{
+return retryStatuses[status] || status >= 500
+}}
+
+func sleepRetryAfter(resp *http.Response) {{
+retryAfter := resp.Header.Get(\"Retry-After\")
+if retryAfter == \"\" {{
+return
+}}
+seconds, err := strconv.Atoi(retryAfter)
+if err != nil || seconds <= 0 {{
+return
+}}
+time.Sleep(time.Duration(seconds) * time.Second)
+}}
 "
     );
-    file(package, &["net/http", "time"], &body)
+    file(
+        package,
+        &["context", "errors", "io", "net/http", "strconv", "time"],
+        &body,
+    )
+}
+
+fn go_duration_ms(timeout_ms: u64) -> String {
+    format!("{timeout_ms} * time.Millisecond")
+}
+
+fn go_retry_status_map(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if runtime.max_retries > 0 && statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    if statuses.is_empty() {
+        return "map[int]bool{}".to_string();
+    }
+    let entries = statuses
+        .into_iter()
+        .map(|status| format!("{status}: true"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("map[int]bool{{{entries}}}")
 }
 
 /// Emit language-native compatibility aliases.
@@ -3519,6 +3791,7 @@ fn emit_operation(
             args.push(format!("in *{}", body_model.model));
         }
     }
+    args.push("opts ...RequestOption".to_string());
 
     writeln!(
         body,
@@ -3710,8 +3983,21 @@ fn emit_request_dispatch(
         }
     }
 
+    let runtime = go_operation_runtime(graph, op);
+    let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
     // Execute.
-    writeln!(body, "resp, err := c.httpClient.Do(req)").map_err(sink)?;
+    writeln!(body, "resp, err := c.do(req, runtimeRequestOptions{{").map_err(sink)?;
+    writeln!(body, "OperationID: {},", quoted_string_literal(&op.id)).map_err(sink)?;
+    writeln!(body, "PathTemplate: {},", quoted_string_literal(&op.path)).map_err(sink)?;
+    writeln!(body, "Idempotent: {},", runtime.idempotent).map_err(sink)?;
+    writeln!(
+        body,
+        "IdempotencyKeyHeader: {},",
+        quoted_string_literal(idempotency_header)
+    )
+    .map_err(sink)?;
+    writeln!(body, "Options: newRequestOptions(opts...),").map_err(sink)?;
+    writeln!(body, "}})").map_err(sink)?;
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
@@ -3764,6 +4050,28 @@ fn emit_request_dispatch(
         }
     }
     Ok(())
+}
+
+struct GoOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn go_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> GoOperationRuntime<'a> {
+    graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+        .map_or(
+            GoOperationRuntime {
+                idempotent: false,
+                idempotency_key_header: None,
+            },
+            |policy| GoOperationRuntime {
+                idempotent: policy.idempotent,
+                idempotency_key_header: policy.idempotency_key_header.as_deref(),
+            },
+        )
 }
 
 fn go_status_match(expr: &str, statuses: &[u16]) -> String {
@@ -4917,7 +5225,13 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client("goalservice", false, false, false);
+            let out = emit_client(
+                "goalservice",
+                false,
+                false,
+                false,
+                &crate::graph::RuntimePolicy::default(),
+            );
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -4927,7 +5241,13 @@ mod tests {
                 "{out}"
             );
             assert!(!out.contains("func WithAPIKey(key string) Option"), "{out}");
-            let secured = emit_client("goalservice", true, true, true);
+            let secured = emit_client(
+                "goalservice",
+                true,
+                true,
+                true,
+                &crate::graph::RuntimePolicy::default(),
+            );
             assert!(
                 secured.contains("func WithAPIKey(key string) Option"),
                 "{secured}"

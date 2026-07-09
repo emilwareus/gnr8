@@ -109,6 +109,10 @@ pub(crate) fn generate_files_with_profile(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Go SDK framing keeps layout/profile decisions in one deterministic file ordering pass"
+)]
 pub(crate) fn generate_files_with_profile_options(
     graph: &ApiGraph,
     package: &str,
@@ -142,7 +146,13 @@ pub(crate) fn generate_files_with_profile_options(
     let has_api_key_auth = !auth_credentials.is_empty();
     files.push(raw_go_file(
         "client.go",
-        emit::emit_client(package, has_api_key_auth, http_auth.bearer, http_auth.basic),
+        emit::emit_client(
+            package,
+            has_api_key_auth,
+            http_auth.bearer,
+            http_auth.basic,
+            &graph.runtime,
+        ),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
     if emit_compat_surface {

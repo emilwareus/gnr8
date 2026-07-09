@@ -120,6 +120,7 @@ fn generate_files_with_layout_options(
         !auth_credentials.is_empty(),
         http_auth.bearer,
         http_auth.basic,
+        &graph.runtime,
     );
     if split_operations {
         client.push_str(&emit::emit_split_operation_surface(&ops)?);

@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::graph::{ApiGraph, Field, Operation, Param, Prim, RuntimePolicy, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
@@ -966,7 +966,66 @@ pub(crate) fn emit_client(package: &str) -> String {
         false,
         false,
         &[],
+        &RuntimePolicy::default(),
     )
+}
+
+fn py_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+fn py_timeout_value(timeout_ms: Option<u64>) -> String {
+    timeout_ms.map_or_else(
+        || "30.0".to_string(),
+        |ms| format!("{}.{:03}", ms / 1000, ms % 1000),
+    )
+}
+
+fn py_retry_status_tuple(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if runtime.max_retries > 0 && statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    match statuses.as_slice() {
+        [] => "()".to_string(),
+        [single] => format!("({single},)"),
+        many => {
+            let joined = many
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({joined})")
+        }
+    }
+}
+
+struct PyOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn py_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> PyOperationRuntime<'a> {
+    graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+        .map_or(
+            PyOperationRuntime {
+                idempotent: false,
+                idempotency_key_header: None,
+            },
+            |policy| PyOperationRuntime {
+                idempotent: policy.idempotent,
+                idempotency_key_header: policy.idempotency_key_header.as_deref(),
+            },
+        )
 }
 
 /// The set of model class names `client.py` references (each operation's request-body model and typed
@@ -1002,6 +1061,10 @@ pub(crate) fn client_referenced_models(
 /// Emit `client.py` with a configurable model package import path and the explicit set of model names to
 /// import (from [`client_referenced_models`]).
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Python client emitter is parameterized by layout/auth/model/runtime facts without a builder object"
+)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
@@ -1010,6 +1073,7 @@ pub(crate) fn emit_client_with_models(
     has_bearer_auth: bool,
     has_basic_auth: bool,
     model_refs: &[String],
+    runtime: &RuntimePolicy,
 ) -> String {
     let (body_encode, body_comment) = match model_style {
         PyModelStyle::Pydantic => (
@@ -1031,10 +1095,11 @@ pub(crate) fn emit_client_with_models(
         stdlib.push("import dataclasses".to_string());
     }
     stdlib.push("import json".to_string());
+    stdlib.push("import time".to_string());
     stdlib.push("import urllib.error".to_string());
     stdlib.push("import urllib.parse".to_string());
     stdlib.push("import urllib.request".to_string());
-    stdlib.push("from typing import Any, Optional".to_string());
+    stdlib.push("from typing import Any, Callable, Optional".to_string());
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
@@ -1107,19 +1172,78 @@ pub(crate) fn emit_client_with_models(
     };
     let mut auth_loop = String::new();
     if has_api_key_auth {
-        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                req.add_header(header, key)\n");
+        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                headers[header] = key\n");
     }
     if has_bearer_auth {
-        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            req.add_header(\"Authorization\", f\"Bearer {self._bearer_token}\")\n");
+        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\"\n");
     }
     if has_basic_auth {
-        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            req.add_header(\"Authorization\", \"Basic \" + base64.b64encode(raw).decode(\"ascii\"))\n");
+        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            headers[\"Authorization\"] = \"Basic \" + base64.b64encode(raw).decode(\"ascii\")\n");
     }
+    let default_timeout = py_timeout_value(runtime.default_timeout_ms);
+    let max_retries = runtime.max_retries;
+    let retry_statuses = py_retry_status_tuple(runtime);
+    let retry_unsafe_methods = py_bool(runtime.retry_unsafe_methods);
     // The `_do` signature is pre-exploded (one parameter per line, trailing comma) because the single-
     // line form exceeds the 88-column limit — matching `ruff format` so the output is format-stable.
     format!(
         "\
 {header}
+
+class RequestOptions:
+    \"\"\"Per-request SDK runtime overrides.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> None:
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.idempotency_key = idempotency_key
+        self.metadata = metadata or {{}}
+
+
+class HookContext:
+    \"\"\"Context passed to generated SDK runtime hooks.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        method: str,
+        path_template: str,
+        url: str,
+        headers: dict[str, str],
+        request_metadata: dict[str, str],
+    ) -> None:
+        self.operation_id = operation_id
+        self.method = method
+        self.path_template = path_template
+        self.url = url
+        self.headers = headers
+        self.request_metadata = request_metadata
+        self.status: Optional[int] = None
+        self.response_headers: dict[str, str] = {{}}
+
+
+class ClientHooks:
+    \"\"\"Generated SDK runtime hooks.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        request: Optional[list[Callable[[HookContext, urllib.request.Request], None]]] = None,
+        response: Optional[list[Callable[[HookContext], None]]] = None,
+        error: Optional[list[Callable[[HookContext, BaseException], None]]] = None,
+    ) -> None:
+        self.request = request or []
+        self.response = response or []
+        self.error = error or []
+
 
 class Client:
     \"\"\"SDK client over urllib (no requests/httpx).\"\"\"
@@ -1130,10 +1254,18 @@ class Client:
         *,
         api_key: Optional[str] = None,
 {auth_init}{bearer_init}{basic_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+        timeout: Optional[float] = {default_timeout},
+        max_retries: int = {max_retries},
+        hooks: Optional[ClientHooks] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
 {auth_field}{bearer_field}{basic_field}        self._opener = opener or urllib.request.build_opener()
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._retry_statuses = {retry_statuses}
+        self._retry_unsafe_methods = {retry_unsafe_methods}
+        self._hooks = hooks or ClientHooks()
 
     def _do(
         self,
@@ -1142,17 +1274,97 @@ class Client:
         *,
         body: Optional[Any] = None,
 {auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}
+        operation_id: str,
+        path_template: str,
+        request_options: Optional[RequestOptions] = None,
+        idempotent: bool = False,
+        idempotency_key_header: str = \"Idempotency-Key\",
     ) -> tuple:
 {body_comment}{body_encode}
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
-        req = urllib.request.Request(self._base_url + path, data=data, method=method)
+        options = request_options or RequestOptions()
+        timeout = options.timeout if options.timeout is not None else self._timeout
+        max_retries = options.max_retries if options.max_retries is not None else self._max_retries
+        if max_retries < 0:
+            max_retries = 0
+        if not (
+            self._retry_unsafe_methods
+            or idempotent
+            or method in (\"GET\", \"HEAD\", \"OPTIONS\", \"PUT\", \"DELETE\")
+        ):
+            max_retries = 0
+        headers: dict[str, str] = {{}}
         if data is not None:
-            req.add_header(\"Content-Type\", \"application/json\")
-{auth_loop}        try:
-            with self._opener.open(req) as resp:
-                return resp.status, dict(resp.headers.items()), resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers.items()), e.read()
+            headers[\"Content-Type\"] = \"application/json\"
+{auth_loop}        if idempotent and options.idempotency_key:
+            headers[idempotency_key_header] = options.idempotency_key
+        url = self._base_url + path
+        last_error: Optional[BaseException] = None
+        for attempt in range(max_retries + 1):
+            req = urllib.request.Request(url, data=data, method=method)
+            for key, value in headers.items():
+                req.add_header(key, value)
+            context = HookContext(
+                operation_id=operation_id,
+                method=method,
+                path_template=path_template,
+                url=url,
+                headers=dict(headers),
+                request_metadata=dict(options.metadata),
+            )
+            try:
+                for hook in self._hooks.request:
+                    hook(context, req)
+                try:
+                    with self._opener.open(req, timeout=timeout) as resp:
+                        status = resp.status
+                        response_headers = dict(resp.headers.items())
+                        raw = resp.read()
+                except urllib.error.HTTPError as e:
+                    status = e.code
+                    response_headers = dict(e.headers.items())
+                    raw = e.read()
+                context.status = status
+                context.response_headers = response_headers
+                for hook in self._hooks.response:
+                    hook(context)
+                if self._should_retry_status(status) and attempt < max_retries:
+                    self._sleep_retry_after(response_headers)
+                    continue
+                if status < 200 or status >= 300:
+                    self._call_error_hooks(
+                        context,
+                        ApiError(status, \"\", \"\", headers=response_headers, raw_body=raw),
+                    )
+                return status, response_headers, raw
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt < max_retries:
+                    continue
+                self._call_error_hooks(context, e)
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(\"request failed without response\")
+
+    def _should_retry_status(self, status: int) -> bool:
+        return status in self._retry_statuses or status >= 500
+
+    @staticmethod
+    def _sleep_retry_after(headers: dict[str, str]) -> None:
+        retry_after = headers.get(\"Retry-After\") or headers.get(\"retry-after\")
+        if not retry_after:
+            return
+        try:
+            seconds = int(retry_after)
+        except ValueError:
+            return
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def _call_error_hooks(self, context: HookContext, error: BaseException) -> None:
+        for hook in self._hooks.error:
+            hook(context, error)
 
     @staticmethod
     def _raise(
@@ -1405,6 +1617,7 @@ fn emit_operation(
     for ident in &optional_query_idents {
         args.push(format!("{ident}=None"));
     }
+    args.push("request_options: Optional[RequestOptions] = None".to_string());
 
     writeln!(out, "{}", method_def(&method_name, &args, &return_hint)).map_err(sink)?;
 
@@ -1493,10 +1706,18 @@ fn emit_operation(
     } else {
         format!(", {}", auth_args.join(", "))
     };
+    let runtime = py_operation_runtime(graph, op);
+    let runtime_arg = format!(
+        ", operation_id={}, path_template={}, request_options=request_options, idempotent={}, idempotency_key_header={}",
+        quoted_string_literal(&op.id),
+        quoted_string_literal(&op.path),
+        py_bool(runtime.idempotent),
+        quoted_string_literal(runtime.idempotency_key_header.unwrap_or("Idempotency-Key")),
+    );
     writeln!(
         out,
-        "        _status, _headers, _raw = self._do(\"{}\", path{body_arg}{auth_arg})",
-        op.method
+        "        _status, _headers, _raw = self._do(\"{}\", path{body_arg}{auth_arg}{runtime_arg})",
+        op.method,
     )
     .map_err(sink)?;
     writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
@@ -1600,7 +1821,7 @@ pub(crate) fn emit_init_with_models(
 ) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
-    out.push_str("from .client import Client\n");
+    out.push_str("from .client import Client, ClientHooks, HookContext, RequestOptions\n");
     out.push_str("from .errors import ApiError\n");
 
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
@@ -1615,6 +1836,9 @@ pub(crate) fn emit_init_with_models(
 
     out.push_str("\n__all__ = [\n");
     out.push_str("    \"Client\",\n");
+    out.push_str("    \"ClientHooks\",\n");
+    out.push_str("    \"HookContext\",\n");
+    out.push_str("    \"RequestOptions\",\n");
     out.push_str("    \"ApiError\",\n");
     for name in &names {
         let _ = writeln!(out, "    \"{name}\",");
@@ -2120,7 +2344,10 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book) -> CreatedMessage:"),
+                out.contains("def create_book(")
+                    && out.contains("body: Book")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> CreatedMessage:"),
                 "snake method, typed body, typed return:\n{out}"
             );
             assert!(
@@ -2141,7 +2368,7 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("self._do(\"POST\", path, body=body)"),
+                out.contains("self._do(\"POST\", path, body=body, operation_id=\"createBook\""),
                 "body op passes body to _do:\n{out}"
             );
         }
@@ -2163,7 +2390,10 @@ mod tests {
             });
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book, tenant) -> CreatedMessage:"),
+                out.contains("body: Book")
+                    && out.contains("tenant")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> CreatedMessage:"),
                 "required body must stay before required query params:\n{out}"
             );
             assert!(out.contains("_query[\"tenant\"] = tenant"), "{out}");
@@ -2184,7 +2414,10 @@ mod tests {
                 .sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book) -> Optional[CreatedMessage]:"),
+                out.contains("def create_book(")
+                    && out.contains("body: Book")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Optional[CreatedMessage]:"),
                 "bodyless alternate success should make the return hint optional:\n{out}"
             );
             assert!(
@@ -2205,7 +2438,10 @@ mod tests {
                 "path param must be percent-escaped (V5) with a backslash-free f-string (PYSDK-02):\n{out}"
             );
             assert!(
-                out.contains("def get_book(self, book_id) -> Book:"),
+                out.contains("def get_book(")
+                    && out.contains("book_id")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Book:"),
                 "{out}"
             );
         }
@@ -2215,7 +2451,10 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> Any:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Any:"),
                 "{out}"
             );
             assert!(out.contains("if cursor is not None:"), "{out}");
@@ -2283,7 +2522,7 @@ mod tests {
             ];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("self._do(\"GET\", path, auth_bearer=True, auth_basic=True)"),
+                out.contains("self._do(\"GET\", path, auth_bearer=True, auth_basic=True, operation_id=\"listBooks\""),
                 "{out}"
             );
         }
@@ -2301,7 +2540,10 @@ mod tests {
             op.responses[0].content_types = vec!["application/pdf".to_string()];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> bytes:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> bytes:"),
                 "{out}"
             );
             assert!(out.contains("if _status in (200,):"), "{out}");
@@ -2333,7 +2575,10 @@ mod tests {
             op.responses.sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> Optional[bytes]:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Optional[bytes]:"),
                 "{out}"
             );
             assert!(out.contains("return _raw"), "{out}");
@@ -2398,6 +2643,7 @@ mod tests {
                 true,
                 true,
                 &[],
+                &crate::graph::RuntimePolicy::default(),
             );
             assert!(out.contains("import base64"), "{out}");
             assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
@@ -2610,7 +2856,11 @@ mod tests {
             let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
             // required `q` is positional (no `=None`), optional `page` keeps the default.
             assert!(
-                out.contains("def search(self, q, page=None) -> Any:"),
+                out.contains("def search(")
+                    && out.contains("q,")
+                    && out.contains("page=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Any:"),
                 "{out}"
             );
             // required `q` is unconditionally written; optional `page` is guarded.

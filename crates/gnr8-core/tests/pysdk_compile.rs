@@ -256,6 +256,68 @@ fn auth_graph() -> gnr8::graph::ApiGraph {
     .expect("auth graph json")
 }
 
+fn runtime_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "createUnsafe",
+              "method": "POST",
+              "path": "/unsafe",
+              "handler": "createUnsafe",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "createIdempotent",
+              "method": "POST",
+              "path": "/idempotent",
+              "handler": "createIdempotent",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 3, "end_line": 3 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("runtime graph json");
+    graph.runtime = gnr8::graph::RuntimePolicy {
+        default_timeout_ms: Some(5_000),
+        max_retries: 0,
+        retry_statuses: vec![408, 429],
+        retry_unsafe_methods: false,
+        hooks: Vec::new(),
+    };
+    graph.operation_runtime = vec![gnr8::graph::OperationRuntimePolicy {
+        operation_id: "createIdempotent".to_string(),
+        idempotent: true,
+        idempotency_key_header: Some("Idempotency-Key".to_string()),
+    }];
+    graph
+}
+
 /// PYSDK-02 (a)+(b) + PYSDK-01: the generated SDK `py_compile`s every file (syntax), `import`s cleanly
 /// (executes the class bodies — Pydantic model definitions, 3.9 annotation spellings), and carries
 /// ZERO third-party HTTP imports (supply-chain assertion, grepped over the written files).
@@ -523,6 +585,100 @@ if __name__ == "__main__":
     main()
 "#;
 
+const RUNTIME_DRIVER: &str = r#"import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import bookstore
+
+
+events = []
+
+
+class _Handler(BaseHTTPRequestHandler):
+    counts = {"GET /api/items": 0, "POST /api/unsafe": 0, "POST /api/idempotent": 0}
+    idempotency_keys = []
+
+    def log_message(self, *args):
+        pass
+
+    def _send_empty(self, code):
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        key = f"{self.command} {self.path}"
+        _Handler.counts[key] += 1
+        self._send_empty(500 if _Handler.counts[key] == 1 else 204)
+
+    def do_POST(self):
+        key = f"{self.command} {self.path}"
+        _Handler.counts[key] += 1
+        if self.path == "/api/idempotent":
+            _Handler.idempotency_keys.append(self.headers.get("Idempotency-Key"))
+            self._send_empty(500 if _Handler.counts[key] == 1 else 204)
+        else:
+            self._send_empty(500)
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def request_hook(context, request):
+            events.append(("request", context.operation_id, context.method, context.path_template, context.request_metadata.get("trace")))
+
+        def response_hook(context):
+            events.append(("response", context.operation_id, context.status))
+
+        def error_hook(context, error):
+            events.append(("error", context.operation_id, context.status, type(error).__name__))
+
+        client = bookstore.Client(
+            f"http://127.0.0.1:{port}",
+            timeout=5.0,
+            max_retries=0,
+            hooks=bookstore.ClientHooks(
+                request=[request_hook],
+                response=[response_hook],
+                error=[error_hook],
+            ),
+            opener=urllib.request.build_opener(),
+        )
+
+        retry_once = bookstore.RequestOptions(max_retries=1, timeout=5.0, metadata={"trace": "runtime"})
+        assert client.list_items(request_options=retry_once) is None
+        assert _Handler.counts["GET /api/items"] == 2, _Handler.counts
+
+        try:
+            client.create_unsafe(request_options=bookstore.RequestOptions(max_retries=1))
+        except bookstore.ApiError as e:
+            assert e.status_code == 500, e.status_code
+        else:
+            raise AssertionError("unsafe POST must not retry and must raise")
+        assert _Handler.counts["POST /api/unsafe"] == 1, _Handler.counts
+
+        idem = bookstore.RequestOptions(max_retries=1, idempotency_key="idem-1")
+        assert client.create_idempotent(request_options=idem) is None
+        assert _Handler.counts["POST /api/idempotent"] == 2, _Handler.counts
+        assert _Handler.idempotency_keys == ["idem-1", "idem-1"], _Handler.idempotency_keys
+
+        assert ("request", "listItems", "GET", "/items", "runtime") in events, events
+        assert ("response", "listItems", 500) in events, events
+        assert ("response", "listItems", 204) in events, events
+        assert any(event[:3] == ("error", "createUnsafe", 500) for event in events), events
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 /// PYSDK-02 (c): the generated SDK round-trips against a stdlib `http.server` via an injected
 /// `OpenerDirector` — a 2xx model decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
 /// is written to a file under the package PARENT and run by path so `import bookstore` resolves.
@@ -570,6 +726,31 @@ fn generated_sdk_sends_auth_against_stdlib_http_server() {
     assert!(
         result.is_ok(),
         "the stdlib auth driver must pass (query API key + bearer + basic): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+/// RUN-01..07: generated Python SDK runtime controls are observable end-to-end against a stdlib
+/// server. A retryable GET retries via per-request `max_retries`, an unsafe POST does not retry, an
+/// explicitly idempotent POST retries with the same idempotency key, and hooks receive operation
+/// context/status/metadata.
+#[test]
+fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_stdlib_http_server() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile runtime round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let graph = runtime_graph();
+    let dir = materialize_sdk_from_graph("runtime", &graph, &graph.base_path);
+    let driver = dir.join("runtime_driver.py");
+    std::fs::write(&driver, RUNTIME_DRIVER).expect("write runtime driver");
+
+    let driver_str = driver.to_str().expect("utf-8 path");
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "the stdlib runtime driver must pass (retries + idempotency + hooks): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
