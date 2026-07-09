@@ -460,21 +460,28 @@ fn operation_file_methods(
         OperationFileSplit::Compact => {}
         OperationFileSplit::PerEndpoint => {
             for op in ops {
+                let mut methods = vec![emit::operation_method_name(op)];
+                methods.extend(emit::pagination_method_names(graph, op));
                 files.push((
                     ts_operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?,
-                    vec![emit::operation_method_name(op)],
+                    methods,
                 ));
             }
         }
         OperationFileSplit::PerTag => {
             for (group, ops) in operation_groups(&ops) {
+                let mut methods = Vec::new();
+                for op in ops {
+                    methods.push(emit::operation_method_name(op));
+                    methods.extend(emit::pagination_method_names(graph, op));
+                }
                 files.push((
                     ts_operation_group_file_name(
                         layout,
                         &group,
                         &format!("api_{}.ts", file_stem(&group)),
                     )?,
-                    ops.into_iter().map(emit::operation_method_name).collect(),
+                    methods,
                 ));
             }
         }

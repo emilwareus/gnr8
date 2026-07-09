@@ -379,7 +379,7 @@ fn emit_operation_file(
     let mut out = String::from("from __future__ import annotations\n\n");
     out.push_str("import json\n");
     out.push_str("import urllib.parse\n");
-    out.push_str("from typing import Any, Optional\n\n");
+    out.push_str("from typing import Any, Iterator, Optional\n\n");
     let prefix = py_relative_prefix(file_name);
     let _ = writeln!(out, "from {prefix}client import Client");
     let model_refs = emit::client_referenced_models(graph, ops)?;
@@ -398,8 +398,11 @@ fn emit_operation_file(
     out.push_str(&unindent_python_methods(&methods));
     out.push('\n');
     for op in ops {
-        let method = emit::operation_method_name(op);
-        let _ = writeln!(out, "Client.{method} = {method}");
+        let mut methods = vec![emit::operation_method_name(op)];
+        methods.extend(emit::pagination_method_names(graph, op));
+        for method in methods {
+            let _ = writeln!(out, "Client.{method} = {method}");
+        }
     }
     Ok(out)
 }

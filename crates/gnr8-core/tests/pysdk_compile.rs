@@ -318,6 +318,98 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
     graph
 }
 
+fn pagination_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [
+                {
+                  "name": "cursor",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 200, "body": { "ref_id": "dto.ItemPage" } } ],
+              "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.Item",
+              "name": "Item",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "id",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.ItemPage",
+              "name": "ItemPage",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "items",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "next_cursor",
+                  "required": false,
+                  "optional": true,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("pagination graph json");
+    graph.pagination = vec![gnr8::graph::PaginationPolicy {
+        operation_id: "listItems".to_string(),
+        mode: gnr8::graph::PaginationMode::Cursor,
+        items_field: "items".to_string(),
+        cursor_param: Some("cursor".to_string()),
+        next_cursor_field: Some("next_cursor".to_string()),
+        page_param: None,
+        page_size_param: None,
+        offset_param: None,
+        limit_param: None,
+        termination: gnr8::graph::PaginationTermination::NoNextCursor,
+    }];
+    graph
+}
+
 /// PYSDK-02 (a)+(b) + PYSDK-01: the generated SDK `py_compile`s every file (syntax), `import`s cleanly
 /// (executes the class bodies — Pydantic model definitions, 3.9 annotation spellings), and carries
 /// ZERO third-party HTTP imports (supply-chain assertion, grepped over the written files).
@@ -679,6 +771,73 @@ if __name__ == "__main__":
     main()
 "#;
 
+const PAGINATION_DRIVER: &str = r#"import json
+import threading
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import bookstore
+
+
+class _Handler(BaseHTTPRequestHandler):
+    seen = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        cursor = query.get("cursor", [""])[0]
+        _Handler.seen.append(cursor)
+        if parsed.path != "/api/items":
+            raise AssertionError(f"unexpected path {parsed.path}")
+        if cursor == "":
+            payload = {"items": [{"id": "a"}], "next_cursor": "n2"}
+        elif cursor == "n2":
+            payload = {"items": [{"id": "b"}], "next_cursor": ""}
+        else:
+            raise AssertionError(f"unexpected cursor {cursor}")
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = bookstore.Client(
+            f"http://127.0.0.1:{port}",
+            opener=urllib.request.build_opener(),
+        )
+        raw = client.list_items()
+        assert raw.items[0]["id"] == "a", raw
+
+        _Handler.seen.clear()
+        pages = list(client.list_items_pages())
+        assert [page.items[0]["id"] for page in pages] == ["a", "b"], pages
+        assert _Handler.seen == ["", "n2"], _Handler.seen
+
+        _Handler.seen.clear()
+        items = list(client.iter_list_items())
+        assert [item["id"] for item in items] == ["a", "b"], items
+        assert _Handler.seen == ["", "n2"], _Handler.seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 /// PYSDK-02 (c): the generated SDK round-trips against a stdlib `http.server` via an injected
 /// `OpenerDirector` — a 2xx model decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
 /// is written to a file under the package PARENT and run by path so `import bookstore` resolves.
@@ -751,6 +910,29 @@ fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_stdlib_http_
     assert!(
         result.is_ok(),
         "the stdlib runtime driver must pass (retries + idempotency + hooks): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+/// PAGE-03/PAGE-04: generated Python SDK pagination helpers iterate explicit cursor policies while
+/// keeping the raw operation callable.
+#[test]
+fn generated_sdk_pagination_helpers_work_against_stdlib_http_server() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile pagination round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let graph = pagination_graph();
+    let dir = materialize_sdk_from_graph("pagination", &graph, &graph.base_path);
+    let driver = dir.join("pagination_driver.py");
+    std::fs::write(&driver, PAGINATION_DRIVER).expect("write pagination driver");
+
+    let driver_str = driver.to_str().expect("utf-8 path");
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "the stdlib pagination driver must pass (pages + items + raw method): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

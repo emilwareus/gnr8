@@ -314,6 +314,98 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
     graph
 }
 
+fn pagination_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [
+                {
+                  "name": "cursor",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 200, "body": { "ref_id": "dto.ItemPage" } } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.Item",
+              "name": "Item",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "id",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.ItemPage",
+              "name": "ItemPage",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "items",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "nextCursor",
+                  "required": false,
+                  "optional": true,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("pagination graph json");
+    graph.pagination = vec![gnr8::graph::PaginationPolicy {
+        operation_id: "listItems".to_string(),
+        mode: gnr8::graph::PaginationMode::Cursor,
+        items_field: "items".to_string(),
+        cursor_param: Some("cursor".to_string()),
+        next_cursor_field: Some("nextCursor".to_string()),
+        page_param: None,
+        page_size_param: None,
+        offset_param: None,
+        limit_param: None,
+        termination: gnr8::graph::PaginationTermination::NoNextCursor,
+    }];
+    graph
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]
@@ -805,6 +897,103 @@ func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
     assert!(
         test.is_ok(),
         "go test ./... (runtime smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_pagination_helpers_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile pagination smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = pagination_graph();
+    let dir = materialize_sdk_from_graph("pagination", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestPaginationHelpers(t *testing.T) {{
+	seen := []string{{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		if r.URL.Path != "/api/items" {{
+			t.Errorf("path = %s, want /api/items", r.URL.Path)
+		}}
+		cursor := r.URL.Query().Get("cursor")
+		seen = append(seen, cursor)
+		w.Header().Set("Content-Type", "application/json")
+		switch cursor {{
+		case "":
+			_ = json.NewEncoder(w).Encode(ItemPage{{
+				Items: []Item{{{{ID: "a"}}}},
+				NextCursor: "n2",
+			}})
+		case "n2":
+			_ = json.NewEncoder(w).Encode(ItemPage{{
+				Items: []Item{{{{ID: "b"}}}},
+				NextCursor: "",
+			}})
+		default:
+			t.Errorf("cursor = %q, want empty or n2", cursor)
+			w.WriteHeader(http.StatusBadRequest)
+		}}
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	raw, err := c.ListItems(context.Background(), ListItemsParams{{}})
+	if err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+	if len(raw.Items) != 1 || raw.Items[0].ID != "a" {{
+		t.Fatalf("raw.Items = %#v, want first item a", raw.Items)
+	}}
+
+	seen = nil
+	pages, err := c.ListItemsPages(context.Background(), ListItemsParams{{}})
+	if err != nil {{
+		t.Fatalf("ListItemsPages returned error: %v", err)
+	}}
+	if len(pages) != 2 || pages[0].Items[0].ID != "a" || pages[1].Items[0].ID != "b" {{
+		t.Fatalf("pages = %#v, want a then b", pages)
+	}}
+	if len(seen) != 2 || seen[0] != "" || seen[1] != "n2" {{
+		t.Fatalf("seen cursors = %#v, want empty then n2", seen)
+	}}
+
+	seen = nil
+	items := []string{{}}
+	err = c.IterateListItems(context.Background(), ListItemsParams{{}}, func(item Item) bool {{
+		items = append(items, item.ID)
+		return true
+	}})
+	if err != nil {{
+		t.Fatalf("IterateListItems returned error: %v", err)
+	}}
+	if len(items) != 2 || items[0] != "a" || items[1] != "b" {{
+		t.Fatalf("items = %#v, want a then b", items)
+	}}
+	if len(seen) != 2 || seen[0] != "" || seen[1] != "n2" {{
+		t.Fatalf("seen cursors = %#v, want empty then n2", seen)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("pagination_test.go"), smoke).expect("write pagination_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (pagination smoke) must pass: {test:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

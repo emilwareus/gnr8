@@ -29,7 +29,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, RuntimePolicy, Type};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
+    Prim, RuntimePolicy, Type,
+};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
@@ -71,6 +74,14 @@ pub(crate) fn camel(name: &str) -> String {
 
 pub(crate) fn operation_method_name(op: &Operation) -> String {
     camel(&op.handler)
+}
+
+fn upper_camel_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 /// Escape an arbitrary wire string into a TypeScript double-quoted string literal (the quotes
@@ -924,6 +935,7 @@ pub(crate) fn emit_operations(
             base_path,
             OperationEmitStyle::ClassMethod,
         )?;
+        emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::ClassMethod)?;
     }
     emit_group_getters(&mut out, ops)?;
     // Close the `class Client {` opened by emit_client.
@@ -959,8 +971,20 @@ pub(crate) fn emit_operation_module(
             base_path,
             OperationEmitStyle::PrototypeFunction,
         )?;
+        emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::PrototypeFunction)?;
     }
     Ok(out)
+}
+
+pub(crate) fn pagination_method_names(graph: &ApiGraph, op: &Operation) -> Vec<String> {
+    if pagination_policy_for(graph, op).is_none() {
+        return Vec::new();
+    }
+    let method = operation_method_name(op);
+    vec![
+        format!("{method}Pages"),
+        format!("iterate{}", upper_camel_first(&method)),
+    ]
 }
 
 fn grouped_ops<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
@@ -1164,6 +1188,19 @@ fn ts_method_signature(name: &str, args: &[String], ret_promise: &str) -> String
     out
 }
 
+fn ts_async_generator_method_signature(name: &str, args: &[String], ret: &str) -> String {
+    let one_line = format!("  async *{name}({}): {ret} {{", args.join(", "));
+    if args.is_empty() || one_line.chars().count() <= 80 {
+        return one_line;
+    }
+    let mut out = format!("  async *{name}(\n");
+    for arg in args {
+        let _ = writeln!(out, "    {arg},");
+    }
+    let _ = write!(out, "  ): {ret} {{");
+    out
+}
+
 /// Emit a group facade's delegator signature (`{method}(...args: Parameters<...>): ReturnType<...> {`),
 /// wrapping to multi-line when the single-line form exceeds Prettier's 80-col `printWidth` — the parallel
 /// of [`ts_method_signature`] for the facade path. A rest parameter (`...args`) takes NO trailing comma
@@ -1335,6 +1372,389 @@ fn emit_operation(
     Ok(())
 }
 
+struct TsPaginationInfo {
+    page_type: String,
+    item_type: String,
+    items_expr: String,
+    next_cursor_expr: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "TypeScript pagination helper emission writes page and item async generators in one deterministic source block"
+)]
+fn emit_pagination_helpers(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    style: OperationEmitStyle,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = operation_method_name(op);
+    let pages_name = format!("{method_name}Pages");
+    let items_name = format!("iterate{}", upper_camel_first(&method_name));
+    let info = ts_pagination_info(graph, op, policy)?;
+    let TsPaginationArgs { args, call_args } = ts_pagination_args(op, graph)?;
+
+    match style {
+        OperationEmitStyle::ClassMethod => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_method_signature(
+                    &pages_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.page_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+        OperationEmitStyle::PrototypeFunction => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_prototype_signature(
+                    &pages_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.page_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+    }
+    emit_ts_pagination_initialization(out, op, policy)?;
+    writeln!(out, "    while (true) {{").map_err(sink)?;
+    writeln!(
+        out,
+        "      const page = await this.{method_name}({});",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(out, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(out, "      if (items.length === 0) {{").map_err(sink)?;
+        writeln!(out, "        break;").map_err(sink)?;
+        writeln!(out, "      }}").map_err(sink)?;
+    }
+    writeln!(out, "      yield page;").map_err(sink)?;
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_expr = info
+                .next_cursor_expr
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                    "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                    op.id
+                ),
+                })?;
+            let cursor_ident = ts_query_ident(op, cursor_param)?;
+            writeln!(out, "      const nextCursor = {next_expr};").map_err(sink)?;
+            writeln!(
+                out,
+                "      if (nextCursor === undefined || nextCursor === null || nextCursor === \"\") {{"
+            )
+            .map_err(sink)?;
+            writeln!(out, "        break;").map_err(sink)?;
+            writeln!(out, "      }}").map_err(sink)?;
+            writeln!(out, "      {cursor_ident} = nextCursor;").map_err(sink)?;
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let page_ident = ts_query_ident(op, page_param)?;
+            writeln!(out, "      {page_ident} += 1;").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let offset_ident = ts_query_ident(op, offset_param)?;
+            writeln!(out, "      {offset_ident} += items.length;").map_err(sink)?;
+        }
+    }
+    writeln!(out, "    }}").map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
+        OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
+
+    match style {
+        OperationEmitStyle::ClassMethod => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_method_signature(
+                    &items_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.item_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+        OperationEmitStyle::PrototypeFunction => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_prototype_signature(
+                    &items_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.item_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+    }
+    writeln!(
+        out,
+        "    for await (const page of this.{pages_name}({})) {{",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "      for (const item of {} ?? []) {{",
+        info.items_expr
+    )
+    .map_err(sink)?;
+    writeln!(out, "        yield item;").map_err(sink)?;
+    writeln!(out, "      }}").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
+        OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
+    Ok(())
+}
+
+fn emit_ts_pagination_initialization(
+    out: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            if ts_query_param(op, page_param)?.required {
+                return Ok(());
+            }
+            let ident = ts_query_ident(op, page_param)?;
+            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
+            writeln!(out, "      {ident} = 1;").map_err(sink)?;
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            if ts_query_param(op, offset_param)?.required {
+                return Ok(());
+            }
+            let ident = ts_query_ident(op, offset_param)?;
+            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
+            writeln!(out, "      {ident} = 0;").map_err(sink)?;
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+struct TsPaginationArgs {
+    args: Vec<String>,
+    call_args: Vec<String>,
+}
+
+fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationArgs, CoreError> {
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    let mut args: Vec<String> = Vec::new();
+    let mut call_args: Vec<String> = Vec::new();
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}: {ty}"));
+        call_args.push(ident.clone());
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: models.{}", body.model));
+        call_args.push("body".to_string());
+    }
+    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}: {ty}"));
+        call_args.push(ident.clone());
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body?: models.{}", body.model));
+        call_args.push("body".to_string());
+    }
+    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}?: {ty}"));
+        call_args.push(ident.clone());
+    }
+    args.push("options?: RequestOptions".to_string());
+    call_args.push("options".to_string());
+    Ok(TsPaginationArgs { args, call_args })
+}
+
+fn ts_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<TsPaginationInfo, CoreError> {
+    validate_ts_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_model = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_model
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_model
+            ),
+        });
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_expr = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(ts_property_access("page", &field.json_name))
+    } else {
+        None
+    };
+    Ok(TsPaginationInfo {
+        page_type: format!("models.{page_model}"),
+        item_type: ts_type(item_schema, false, graph, "models.")?,
+        items_expr: ts_property_access("page", &items.json_name),
+        next_cursor_expr,
+    })
+}
+
+fn ts_property_access(base: &str, property: &str) -> String {
+    if is_ident(property) {
+        format!("{base}.{property}")
+    } else {
+        format!("{base}[{}]", ts_string_literal(property))
+    }
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn ts_query_param<'a>(op: &'a Operation, param_name: &str) -> Result<&'a Param, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn ts_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError> {
+    ts_query_param(op, param_name).map(|param| camel(&param.name))
+}
+
+fn validate_ts_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = ts_query_param(op, param_name)?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> String {
     let mut out = format!("export const {name} = async function (\n");
     out.push_str("  this: Client,\n");
@@ -1342,6 +1762,16 @@ fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> Str
         let _ = writeln!(out, "  {arg},");
     }
     let _ = write!(out, "): {ret_promise} {{");
+    out
+}
+
+fn ts_async_generator_prototype_signature(name: &str, args: &[String], ret: &str) -> String {
+    let mut out = format!("export const {name} = async function* (\n");
+    out.push_str("  this: Client,\n");
+    for arg in args {
+        let _ = writeln!(out, "  {arg},");
+    }
+    let _ = write!(out, "): {ret} {{");
     out
 }
 
@@ -2220,6 +2650,131 @@ mod tests {
             assert!(
                 out.contains("const res = await this._request(\"POST\", path, headers, body,")
                     && out.contains("}, options);"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        #[expect(
+            clippy::too_many_lines,
+            reason = "the synthetic pagination graph is embedded inline so the helper regression is self-contained"
+        )]
+        fn pagination_policy_emits_async_page_and_item_helpers() {
+            let mut g: ApiGraph = serde_json::from_str(
+                r#"{
+                  "module": "app",
+                  "operations": [
+                    {
+                      "id": "listBooks",
+                      "method": "GET",
+                      "path": "/books",
+                      "handler": "listBooks",
+                      "params": [
+                        {
+                          "name": "cursor",
+                          "location": "query",
+                          "required": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+                        }
+                      ],
+                      "request_body": null,
+                      "responses": [
+                        { "status": 200, "body": { "ref_id": "dto.BookPage" } }
+                      ],
+                      "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+                    }
+                  ],
+                  "schemas": [
+                    {
+                      "id": "dto.Book",
+                      "name": "Book",
+                      "body": { "type": "object", "of": [
+                        {
+                          "json_name": "id",
+                          "required": true,
+                          "optional": false,
+                          "nullable": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "description": null,
+                          "example": null
+                        }
+                      ] },
+                      "provenance": { "file": "models.ts", "start_line": 1, "end_line": 1 }
+                    },
+                    {
+                      "id": "dto.BookPage",
+                      "name": "BookPage",
+                      "body": { "type": "object", "of": [
+                        {
+                          "json_name": "items",
+                          "required": true,
+                          "optional": false,
+                          "nullable": false,
+                          "schema": { "type": "array", "of": { "type": "named", "of": "dto.Book" } },
+                          "description": null,
+                          "example": null
+                        },
+                        {
+                          "json_name": "nextCursor",
+                          "required": false,
+                          "optional": true,
+                          "nullable": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "description": null,
+                          "example": null
+                        }
+                      ] },
+                      "provenance": { "file": "models.ts", "start_line": 2, "end_line": 2 }
+                    }
+                  ],
+                  "diagnostics": [],
+                  "base_path": "/",
+                  "title": "API",
+                  "security": []
+                }"#,
+            )
+            .unwrap();
+            g.pagination = vec![crate::graph::PaginationPolicy {
+                operation_id: "listBooks".to_string(),
+                mode: crate::graph::PaginationMode::Cursor,
+                items_field: "items".to_string(),
+                cursor_param: Some("cursor".to_string()),
+                next_cursor_field: Some("nextCursor".to_string()),
+                page_param: None,
+                page_size_param: None,
+                offset_param: None,
+                limit_param: None,
+                termination: crate::graph::PaginationTermination::NoNextCursor,
+            }];
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let out = emit_operations(&g, "bookstore", "/", &ops).unwrap();
+            assert!(
+                out.contains(
+                    "  async listBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): Promise<models.BookPage> {"
+                ),
+                "raw method must remain available:\n{out}"
+            );
+            assert!(
+                out.contains(
+                    "  async *listBooksPages(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.BookPage> {"
+                ),
+                "{out}"
+            );
+            assert!(out.contains("const nextCursor = page.nextCursor;"), "{out}");
+            assert!(out.contains("cursor = nextCursor;"), "{out}");
+            assert!(
+                out.contains(
+                    "  async *iterateListBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.Book> {"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("for await (const page of this.listBooksPages(cursor, options)) {"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const item of page.items ?? []) {"),
                 "{out}"
             );
         }

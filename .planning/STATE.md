@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: "Production-ready SDK adoption"
 status: in_progress
-stopped_at: Phase 3 complete; Phase 4 SDK runtime ergonomics pending
-last_updated: "2026-07-09T10:46:00.000Z"
-last_activity: 2026-07-09 — Completed Phase 3 Plan 3 stable grouping selectors
+stopped_at: Phase 4 complete; Phase 5 API metadata and common content types pending
+last_updated: "2026-07-09T11:05:00.000Z"
+last_activity: 2026-07-09 — Completed Phase 4 SDK runtime ergonomics
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 16
-  completed_plans: 8
-  percent: 60
+  completed_plans: 11
+  percent: 80
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-07-09)
 
 ## Current Position
 
-Phase: Phase 4 — SDK Runtime Ergonomics
+Phase: Phase 5 — API Metadata And Common Content Types
 Plan: Planning pending
-Status: Phase 4 pending
-Last activity: 2026-07-09 — Stable SDK surface and readiness completed
+Status: Phase 5 pending
+Last activity: 2026-07-09 — SDK runtime ergonomics completed
 
 ## Performance Metrics
 
@@ -136,4 +136,4 @@ Resume file: None
 
 ## Operator Next Steps
 
-- Start Phase 4: SDK runtime ergonomics
+- Start Phase 5: API metadata and common content types

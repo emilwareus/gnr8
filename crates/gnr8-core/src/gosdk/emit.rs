@@ -23,7 +23,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Prim, RuntimePolicy, Schema, Type, WellKnown};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Prim,
+    RuntimePolicy, Schema, Type, WellKnown,
+};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, join_path, operation_api_key_headers,
     operation_api_key_queries, operation_api_key_schemes, operation_http_auth_schemes, path_tokens,
@@ -3619,6 +3622,7 @@ fn emit_operations_inner(
         }
         first = false;
         emit_operation(&mut body, op, graph, base_path)?;
+        emit_pagination_helpers(&mut body, op, graph)?;
     }
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
@@ -3827,6 +3831,369 @@ fn emit_operation(
         writeln!(body, "return out, nil").map_err(sink)?;
     }
     writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+struct GoPaginationInfo {
+    page_type: String,
+    item_type: String,
+    items_field: String,
+    next_cursor_field: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Go pagination helper emission writes page and item helpers in one deterministic source block"
+)]
+fn emit_pagination_helpers(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = exported(&op.handler);
+    let pages_name = format!("{method_name}Pages");
+    let items_name = format!("Iterate{method_name}");
+    let info = go_pagination_info(graph, op, policy)?;
+    let PaginationArgs { args, call_args } = go_pagination_args(op, graph)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "// {pages_name} follows the configured pagination policy for {method_name}."
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "func (c *Client) {pages_name}({}) ([]{}, error) {{",
+        args.join(", "),
+        info.page_type
+    )
+    .map_err(sink)?;
+    writeln!(body, "var pages []{}", info.page_type).map_err(sink)?;
+    emit_go_pagination_initialization(body, op, policy)?;
+    writeln!(body, "for {{").map_err(sink)?;
+    writeln!(
+        body,
+        "page, err := c.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    writeln!(body, "return nil, err").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "break").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "pages = append(pages, page)").map_err(sink)?;
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_field = info.next_cursor_field.as_deref().ok_or_else(|| {
+                CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                        op.id
+                    ),
+                }
+            })?;
+            let param = go_query_param(op, cursor_param)?;
+            let param_field = exported(&param.name);
+            writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
+            writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
+            writeln!(body, "break").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            if param.required {
+                writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
+            } else {
+                writeln!(body, "params.{param_field} = &nextCursor").map_err(sink)?;
+            }
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let param = go_query_param(op, page_param)?;
+            let field = exported(&param.name);
+            if param.required {
+                writeln!(body, "params.{field} += 1").map_err(sink)?;
+            } else {
+                writeln!(body, "*params.{field} += 1").map_err(sink)?;
+            }
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let param = go_query_param(op, offset_param)?;
+            let field = exported(&param.name);
+            writeln!(body, "itemCount := int64(len(page.{}))", info.items_field).map_err(sink)?;
+            if param.required {
+                writeln!(body, "params.{field} += itemCount").map_err(sink)?;
+            } else {
+                writeln!(body, "*params.{field} += itemCount").map_err(sink)?;
+            }
+        }
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "return pages, nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let mut iter_args = args.clone();
+    let opts = iter_args.pop().ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination helper for operation '{}' has no opts argument",
+            op.id
+        ),
+    })?;
+    iter_args.push(format!("yield func({}) bool", info.item_type));
+    iter_args.push(opts);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "// {items_name} visits every item from {pages_name} until yield returns false."
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "func (c *Client) {items_name}({}) error {{",
+        iter_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "pages, err := c.{pages_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    writeln!(body, "return err").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "for _, page := range pages {{").map_err(sink)?;
+    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
+    writeln!(body, "if !yield(item) {{").map_err(sink)?;
+    writeln!(body, "return nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "return nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_go_pagination_initialization(
+    body: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            if go_query_param(op, page_param)?.required {
+                return Ok(());
+            }
+            let field = exported(page_param);
+            writeln!(body, "if params.{field} == nil {{").map_err(sink)?;
+            writeln!(body, "initialPage := int64(1)").map_err(sink)?;
+            writeln!(body, "params.{field} = &initialPage").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            if go_query_param(op, offset_param)?.required {
+                return Ok(());
+            }
+            let field = exported(offset_param);
+            writeln!(body, "if params.{field} == nil {{").map_err(sink)?;
+            writeln!(body, "initialOffset := int64(0)").map_err(sink)?;
+            writeln!(body, "params.{field} = &initialOffset").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+struct PaginationArgs {
+    args: Vec<String>,
+    call_args: Vec<String>,
+}
+
+fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs, CoreError> {
+    let method_name = exported(&op.handler);
+    let path_params: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|p| p.location == "path")
+        .map(|p| p.name.as_str())
+        .collect();
+    let query_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+
+    let mut args = vec!["ctx context.Context".to_string()];
+    let mut call_args = vec!["ctx".to_string()];
+    for p in &path_params {
+        let ident = lower_camel(p);
+        args.push(format!("{ident} string"));
+        call_args.push(ident);
+    }
+    if !query_params.is_empty() {
+        args.push(format!("params {method_name}Params"));
+        call_args.push("params".to_string());
+    }
+    if let Some(body_model) = &body_model {
+        if body_model.required {
+            args.push(format!("in {}", body_model.model));
+        } else {
+            args.push(format!("in *{}", body_model.model));
+        }
+        call_args.push("in".to_string());
+    }
+    args.push("opts ...RequestOption".to_string());
+    call_args.push("opts...".to_string());
+    Ok(PaginationArgs { args, call_args })
+}
+
+fn go_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<GoPaginationInfo, CoreError> {
+    validate_go_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_type = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_type)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_type
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_type
+            ),
+        });
+    };
+    let options = GoEmitOptions::default();
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_field = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(go_field_name(&field.json_name, &options))
+    } else {
+        None
+    };
+    Ok(GoPaginationInfo {
+        page_type,
+        item_type: go_type(item_schema, false, graph)?,
+        items_field: go_field_name(&items.json_name, &options),
+        next_cursor_field,
+    })
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn go_query_param<'a>(
+    op: &'a Operation,
+    param_name: &str,
+) -> Result<&'a crate::graph::Param, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn validate_go_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = go_query_param(op, param_name)?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
+    }
     Ok(())
 }
 

@@ -88,26 +88,26 @@ installable, operationally credible SDKs.
 
 ### Pagination
 
-- [ ] **PAGE-01**: A `.gnr8` pipeline author can explicitly mark cursor-paginated operations with request
+- [x] **PAGE-01**: A `.gnr8` pipeline author can explicitly mark cursor-paginated operations with request
   cursor param, response next-cursor field, response items field, and optional page-size param.
-- [ ] **PAGE-02**: A `.gnr8` pipeline author can explicitly mark page/offset-paginated operations with
+- [x] **PAGE-02**: A `.gnr8` pipeline author can explicitly mark page/offset-paginated operations with
   page/page-size or offset/limit params, response items field, and termination policy.
-- [ ] **PAGE-03**: An SDK consumer can use idiomatic iterator/page helpers for configured paginated operations.
-- [ ] **PAGE-04**: An SDK consumer can still call the raw operation method for paginated operations.
+- [x] **PAGE-03**: An SDK consumer can use idiomatic iterator/page helpers for configured paginated operations.
+- [x] **PAGE-04**: An SDK consumer can still call the raw operation method for paginated operations.
 
 ### SDK Runtime Policy
 
-- [ ] **RUN-01**: An SDK consumer can configure client-level timeout and per-request timeout overrides.
-- [ ] **RUN-02**: An SDK consumer can configure client-level max retries and per-request retry overrides.
-- [ ] **RUN-03**: Generated SDKs retry only network errors, `408`, `429`, and `5xx` by default and respect
+- [x] **RUN-01**: An SDK consumer can configure client-level timeout and per-request timeout overrides.
+- [x] **RUN-02**: An SDK consumer can configure client-level max retries and per-request retry overrides.
+- [x] **RUN-03**: Generated SDKs retry only network errors, `408`, `429`, and `5xx` by default and respect
   `Retry-After` where straightforward.
-- [ ] **RUN-04**: Generated SDKs do not retry unsafe mutations such as `POST` or `PATCH` unless the operation
+- [x] **RUN-04**: Generated SDKs do not retry unsafe mutations such as `POST` or `PATCH` unless the operation
   is explicitly marked idempotent.
-- [ ] **RUN-05**: Generated SDKs preserve the same idempotency key across retries for explicitly idempotent
+- [x] **RUN-05**: Generated SDKs preserve the same idempotency key across retries for explicitly idempotent
   operations.
-- [ ] **RUN-06**: An SDK consumer can install request, response, and error hooks/middleware at client
+- [x] **RUN-06**: An SDK consumer can install request, response, and error hooks/middleware at client
   construction time.
-- [ ] **RUN-07**: Hook context includes operation ID, method, path template, resolved URL, headers, request
+- [x] **RUN-07**: Hook context includes operation ID, method, path template, resolved URL, headers, request
   metadata, status, and response headers.
 
 ### API Metadata And Content Types

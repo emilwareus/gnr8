@@ -26,7 +26,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, RuntimePolicy, Type};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
+    Prim, RuntimePolicy, Type,
+};
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
@@ -1049,6 +1052,9 @@ pub(crate) fn client_referenced_models(
         if let Some(model) = success_responses_of(op, graph)?.body_model {
             names.push(model);
         }
+        if let Some(item_model) = pagination_item_model_name(graph, op) {
+            names.push(item_model.to_string());
+        }
         for error_body in error_response_bodies_of(op, graph)? {
             names.push(error_body.model);
         }
@@ -1056,6 +1062,33 @@ pub(crate) fn client_referenced_models(
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+fn pagination_item_model_name<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a str> {
+    let policy = pagination_policy_for(graph, op)?;
+    let success = success_responses_of(op, graph).ok()?;
+    let page_model = success.body_model?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)?;
+    let Type::Object(fields) = &schema.body else {
+        return None;
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)?;
+    let Type::Array(item_schema) = &items.schema else {
+        return None;
+    };
+    let Type::Named(ref_id) = item_schema.as_ref() else {
+        return None;
+    };
+    graph
+        .schemas
+        .iter()
+        .find(|schema| &schema.id == ref_id)
+        .map(|schema| schema.name.as_str())
 }
 
 /// Emit `client.py` with a configurable model package import path and the explicit set of model names to
@@ -1099,7 +1132,7 @@ pub(crate) fn emit_client_with_models(
     stdlib.push("import urllib.error".to_string());
     stdlib.push("import urllib.parse".to_string());
     stdlib.push("import urllib.request".to_string());
-    stdlib.push("from typing import Any, Callable, Optional".to_string());
+    stdlib.push("from typing import Any, Callable, Iterator, Optional".to_string());
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
@@ -1436,8 +1469,17 @@ pub(crate) fn emit_operations_with_style(
     for op in ops {
         out.push('\n');
         emit_operation(&mut out, op, graph, base_path, model_style)?;
+        emit_pagination_helpers(&mut out, op, graph, model_style)?;
     }
     Ok(out)
+}
+
+pub(crate) fn pagination_method_names(graph: &ApiGraph, op: &Operation) -> Vec<String> {
+    if pagination_policy_for(graph, op).is_none() {
+        return Vec::new();
+    }
+    let method = operation_method_name(op);
+    vec![format!("{method}_pages"), format!("iter_{method}")]
 }
 
 /// The keyword/digit-safe, collision-checked Python identifiers for one operation's arguments.
@@ -1771,6 +1813,331 @@ fn emit_operation(
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
+    }
+    Ok(())
+}
+
+struct PyPaginationInfo {
+    page_model: String,
+    item_type: String,
+    items_ident: String,
+    next_cursor_ident: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Python pagination helper emission writes page and item helpers in one deterministic source block"
+)]
+fn emit_pagination_helpers(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    model_style: PyModelStyle,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = operation_method_name(op);
+    let pages_name = format!("{method_name}_pages");
+    let items_name = format!("iter_{method_name}");
+    let info = py_pagination_info(graph, op, policy, model_style)?;
+    let (args, call_args) = py_pagination_args(op, graph)?;
+
+    writeln!(out).map_err(sink)?;
+    writeln!(
+        out,
+        "{}",
+        method_def(
+            &pages_name,
+            &args,
+            &format!("Iterator[{}]", info.page_model)
+        )
+    )
+    .map_err(sink)?;
+    emit_pagination_initialization(out, policy)?;
+    writeln!(out, "        while True:").map_err(sink)?;
+    writeln!(
+        out,
+        "            _page = self.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(out, "            _items = _page.{} or []", info.items_ident).map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(out, "            if not _items:").map_err(sink)?;
+        writeln!(out, "                break").map_err(sink)?;
+    }
+    writeln!(out, "            yield _page").map_err(sink)?;
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_ident = info.next_cursor_ident.as_deref().ok_or_else(|| {
+                CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                        op.id
+                    ),
+                }
+            })?;
+            let cursor_ident = py_query_ident(op, cursor_param)?;
+            writeln!(out, "            _next_cursor = _page.{next_ident}").map_err(sink)?;
+            writeln!(out, "            if not _next_cursor:").map_err(sink)?;
+            writeln!(out, "                break").map_err(sink)?;
+            writeln!(out, "            {cursor_ident} = _next_cursor").map_err(sink)?;
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let page_ident = py_query_ident(op, page_param)?;
+            writeln!(out, "            {page_ident} += 1").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let offset_ident = py_query_ident(op, offset_param)?;
+            writeln!(out, "            {offset_ident} += len(_items)").map_err(sink)?;
+        }
+    }
+
+    writeln!(out).map_err(sink)?;
+    writeln!(
+        out,
+        "{}",
+        method_def(&items_name, &args, &format!("Iterator[{}]", info.item_type))
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "        for _page in self.{pages_name}({}):",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "            for _item in _page.{} or []:",
+        info.items_ident
+    )
+    .map_err(sink)?;
+    writeln!(out, "                yield _item").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_pagination_initialization(
+    out: &mut String,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            let ident = safe_ident(&snake(page_param));
+            writeln!(out, "        if {ident} is None:").map_err(sink)?;
+            writeln!(out, "            {ident} = 1").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            let ident = safe_ident(&snake(offset_param));
+            writeln!(out, "        if {ident} is None:").map_err(sink)?;
+            writeln!(out, "            {ident} = 0").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn py_pagination_args(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<(Vec<String>, Vec<String>), CoreError> {
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    let mut args: Vec<String> = vec!["self".to_string()];
+    let mut call_args: Vec<String> = Vec::new();
+    for ident in &path_idents {
+        args.push(ident.clone());
+        call_args.push(format!("{ident}={ident}"));
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: {}", body.model));
+        call_args.push("body=body".to_string());
+    }
+    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        let hint = py_type(&param.schema, false, graph)?;
+        args.push(format!("{ident}: {hint}"));
+        call_args.push(format!("{ident}={ident}"));
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body: Optional[{}] = None", body.model));
+        call_args.push("body=body".to_string());
+    }
+    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        let hint = py_type(&param.schema, false, graph)?;
+        args.push(format!("{ident}: Optional[{hint}] = None"));
+        call_args.push(format!("{ident}={ident}"));
+    }
+    args.push("request_options: Optional[RequestOptions] = None".to_string());
+    call_args.push("request_options=request_options".to_string());
+    Ok((args, call_args))
+}
+
+fn py_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+    model_style: PyModelStyle,
+) -> Result<PyPaginationInfo, CoreError> {
+    validate_numeric_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_model = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_model
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_model
+            ),
+        });
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_ident = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(py_field_ident(field, model_style))
+    } else {
+        None
+    };
+    Ok(PyPaginationInfo {
+        page_model,
+        item_type: py_type(item_schema, false, graph)?,
+        items_ident: py_field_ident(items, model_style),
+        next_cursor_ident,
+    })
+}
+
+fn py_field_ident(field: &Field, model_style: PyModelStyle) -> String {
+    match model_style {
+        PyModelStyle::Pydantic => pydantic_field_ident(field),
+        PyModelStyle::Dataclass => safe_ident(&field.json_name),
+    }
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn py_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .map(|param| safe_ident(&snake(&param.name)))
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn validate_numeric_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = op
+            .params
+            .iter()
+            .find(|param| param.location == "query" && param.name == param_name)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing query parameter '{}'",
+                    op.id, param_name
+                ),
+            })?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
     }
     Ok(())
 }
