@@ -1698,6 +1698,22 @@ impl ApplySecurity {
         }
     }
 
+    /// An `apiKey`-in-`query` scheme: `id` is the OpenAPI scheme id (e.g. `"ApiKeyQueryAuth"`),
+    /// `param_name` is the credential query parameter (e.g. `"api_key"`).
+    #[must_use]
+    pub fn api_key_query(id: impl Into<String>, param_name: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: param_name.into(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
     /// Apply this scheme only to operations matched by `selector`.
     #[must_use]
     pub fn when(mut self, selector: OperationSelector) -> Self {

@@ -160,6 +160,40 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
     .expect("optional body graph json")
 }
 
+fn query_api_key_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": [
+            {
+              "id": "QueryAuth",
+              "kind": "apiKey",
+              "location": "query",
+              "name": "api_key"
+            }
+          ]
+        }"#,
+    )
+    .expect("query api-key graph json")
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]
@@ -346,6 +380,58 @@ func TestOptionalBodyNilDoesNotSendJSON(t *testing.T) {{
     std::fs::write(dir.join("optional_body_test.go"), smoke).expect("write optional smoke");
     let test = run_go(&["test", "./..."], &dir);
     assert!(test.is_ok(), "go test ./... must succeed: {test:?}");
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_sends_query_api_key() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile query auth smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = query_api_key_graph();
+    let dir = materialize_sdk_from_graph("query-api-key", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestQueryAPIKeyIsSent(t *testing.T) {{
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		if r.Method != http.MethodGet {{
+			t.Errorf("method = %s, want GET", r.Method)
+		}}
+		if r.URL.Path != "/api/items" {{
+			t.Errorf("path = %s, want /api/items", r.URL.Path)
+		}}
+		if got := r.URL.Query().Get("api_key"); got != "secret" {{
+			t.Errorf("api_key query = %q, want secret", got)
+		}}
+		w.WriteHeader(http.StatusNoContent)
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, WithAPIKey("secret"))
+	if _, err := c.ListItems(context.Background()); err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("query_auth_test.go"), smoke).expect("write query_auth_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (query auth smoke) must pass: {test:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }

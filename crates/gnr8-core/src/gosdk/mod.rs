@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
+    api_key_credential_names, check_unique_schema_names, file_stem, model_file_name,
     operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
 };
 use crate::sdk::go::GoSdkOptions;
@@ -127,7 +127,7 @@ pub(crate) fn generate_files_with_profile_options(
     }
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_headers = api_key_header_names(graph)?;
+    let auth_credentials = api_key_credential_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
     let emit_compat_surface =
         profile.is_go_openapi_generator_compat() || aliases.has_source_prefix_aliases();
@@ -139,7 +139,7 @@ pub(crate) fn generate_files_with_profile_options(
     // Fixed leading files (sorted: client.go before errors.go).
     files.push(raw_go_file(
         "client.go",
-        emit::emit_client(package, !auth_headers.is_empty()),
+        emit::emit_client(package, !auth_credentials.is_empty()),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
     if emit_compat_surface {

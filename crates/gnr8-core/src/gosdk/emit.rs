@@ -25,9 +25,9 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_schemes,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, SuccessResponses,
+    check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_queries,
+    operation_api_key_schemes, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, SuccessResponses,
 };
 use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -2649,11 +2649,14 @@ fn emit_compat_execute_body(
         writeln!(body, "}}").map_err(sink)?;
     }
     for scheme in operation_api_key_schemes(graph, op)? {
+        if scheme.location != ApiKeyLocation::Header {
+            continue;
+        }
         writeln!(
             body,
             "compatApplyAPIKey(req, r.ctx, {}, {})",
             quoted_string_literal(&scheme.id),
-            quoted_string_literal(&scheme.header)
+            quoted_string_literal(&scheme.name)
         )
         .map_err(sink)?;
     }
@@ -3479,6 +3482,7 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
     // The return type is the success model when one exists, else an empty struct.
     let return_model = if success.has_binary_body() {
         "[]byte".to_string()
@@ -3533,6 +3537,7 @@ fn emit_operation(
         &query_params,
         &success,
         &auth_headers,
+        &auth_queries,
     )?;
     if !dispatch_returns {
         writeln!(body, "return out, nil").map_err(sink)?;
@@ -3555,6 +3560,7 @@ fn emit_request_dispatch(
     query_params: &[&crate::graph::Param],
     success: &SuccessResponses,
     auth_headers: &[String],
+    auth_queries: &[String],
 ) -> Result<(), CoreError> {
     let body_model = request_body_model_of(op, graph)?;
     let has_body = body_model.is_some();
@@ -3611,7 +3617,7 @@ fn emit_request_dispatch(
     }
 
     // Query parameter encoding.
-    if !query_params.is_empty() {
+    if !query_params.is_empty() || !auth_queries.is_empty() {
         writeln!(body, "q := req.URL.Query()").map_err(sink)?;
         for p in query_params {
             let field = exported(&p.name);
@@ -3629,6 +3635,18 @@ fn emit_request_dispatch(
                 writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
                 writeln!(body, "}}").map_err(sink)?;
             }
+        }
+        for query in auth_queries {
+            writeln!(
+                body,
+                "if key := c.apiKeys[{}]; key != \"\" {{",
+                quoted_string_literal(query)
+            )
+            .map_err(sink)?;
+            writeln!(body, "q.Set({}, key)", quoted_string_literal(query)).map_err(sink)?;
+            writeln!(body, "}} else if c.apiKey != \"\" {{").map_err(sink)?;
+            writeln!(body, "q.Set({}, c.apiKey)", quoted_string_literal(query)).map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
         }
         writeln!(body, "req.URL.RawQuery = q.Encode()").map_err(sink)?;
     }

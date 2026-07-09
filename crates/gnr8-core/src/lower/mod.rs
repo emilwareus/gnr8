@@ -42,7 +42,7 @@ use model::{
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
-const SUPPORTED_API_KEY_LOCATION: &str = "header";
+const SUPPORTED_API_KEY_LOCATIONS: &[&str] = &["header", "query"];
 
 /// The only security scheme kind the `PoC` supports.
 const SUPPORTED_SCHEME_KIND: &str = "apiKey";
@@ -190,11 +190,13 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
     let mut requirements = Vec::with_capacity(schemes.len());
     let mut components = Vec::with_capacity(schemes.len());
     for scheme in schemes {
-        if scheme.kind != SUPPORTED_SCHEME_KIND || scheme.location != SUPPORTED_API_KEY_LOCATION {
+        if scheme.kind != SUPPORTED_SCHEME_KIND
+            || !SUPPORTED_API_KEY_LOCATIONS.contains(&scheme.location.as_str())
+        {
             return Err(crate::CoreError::Lowering {
                 message: format!(
-                    "unsupported security scheme '{}': the PoC supports kind=\"{SUPPORTED_SCHEME_KIND}\" \
-                     in=\"{SUPPORTED_API_KEY_LOCATION}\" only (got kind=\"{}\" location=\"{}\")",
+                    "unsupported security scheme '{}': supported SDK/OpenAPI auth is kind=\"{SUPPORTED_SCHEME_KIND}\" \
+                     in=\"header\" or in=\"query\" (got kind=\"{}\" location=\"{}\")",
                     scheme.id, scheme.kind, scheme.location
                 ),
             });
@@ -1454,6 +1456,23 @@ mod tests {
         assert!(yaml.contains("type: apiKey"), "{yaml}");
         assert!(yaml.contains("in: header"), "{yaml}");
         assert!(yaml.contains("name: X-API-Key"), "{yaml}");
+    }
+
+    #[test]
+    fn api_key_query_security_is_emitted_in_components() {
+        let config = vec![SecurityScheme {
+            id: "QueryAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "query".to_string(),
+            name: "api_key".to_string(),
+            global: true,
+        }];
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap();
+        assert!(yaml.contains("- QueryAuth: []"), "{yaml}");
+        assert!(yaml.contains("QueryAuth:"), "{yaml}");
+        assert!(yaml.contains("type: apiKey"), "{yaml}");
+        assert!(yaml.contains("in: query"), "{yaml}");
+        assert!(yaml.contains("name: api_key"), "{yaml}");
     }
 
     #[test]

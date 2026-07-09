@@ -87,10 +87,25 @@ pub(crate) fn file_in_dir(dir: Option<&str>, file_name: &str) -> String {
 /// Resolve every API-key header the built-in SDK clients may need to send.
 pub(crate) fn api_key_header_names(graph: &ApiGraph) -> Result<Vec<String>, CoreError> {
     let schemes = api_key_security_schemes(graph)?;
-    let mut headers: Vec<String> = schemes.values().cloned().collect();
+    let mut headers: Vec<String> = schemes
+        .values()
+        .filter_map(|scheme| match scheme.location {
+            ApiKeyLocation::Header => Some(scheme.name.clone()),
+            ApiKeyLocation::Query => None,
+        })
+        .collect();
     headers.sort();
     headers.dedup();
     Ok(headers)
+}
+
+/// Resolve every API-key credential name the built-in SDK clients may need to send.
+pub(crate) fn api_key_credential_names(graph: &ApiGraph) -> Result<Vec<String>, CoreError> {
+    let schemes = api_key_security_schemes(graph)?;
+    let mut names: Vec<String> = schemes.values().map(|scheme| scheme.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Resolve the API-key headers required by one operation, including global schemes.
@@ -100,11 +115,31 @@ pub(crate) fn operation_api_key_headers(
 ) -> Result<Vec<String>, CoreError> {
     let mut headers: Vec<String> = operation_api_key_schemes(graph, op)?
         .into_iter()
-        .map(|scheme| scheme.header)
+        .filter_map(|scheme| match scheme.location {
+            ApiKeyLocation::Header => Some(scheme.name),
+            ApiKeyLocation::Query => None,
+        })
         .collect();
     headers.sort();
     headers.dedup();
     Ok(headers)
+}
+
+/// Resolve the API-key query parameter names required by one operation, including global schemes.
+pub(crate) fn operation_api_key_queries(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<String>, CoreError> {
+    let mut queries: Vec<String> = operation_api_key_schemes(graph, op)?
+        .into_iter()
+        .filter_map(|scheme| match scheme.location {
+            ApiKeyLocation::Header => None,
+            ApiKeyLocation::Query => Some(scheme.name),
+        })
+        .collect();
+    queries.sort();
+    queries.dedup();
+    Ok(queries)
 }
 
 /// One operation-scoped API-key scheme after global inheritance and id/header validation.
@@ -112,8 +147,19 @@ pub(crate) fn operation_api_key_headers(
 pub(crate) struct OperationApiKeyScheme {
     /// The OpenAPI security scheme id.
     pub(crate) id: String,
-    /// The apiKey header name.
-    pub(crate) header: String,
+    /// The apiKey credential name.
+    pub(crate) name: String,
+    /// Where the apiKey credential is sent.
+    pub(crate) location: ApiKeyLocation,
+}
+
+/// Supported apiKey credential locations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiKeyLocation {
+    /// HTTP header.
+    Header,
+    /// Query parameter.
+    Query,
 }
 
 /// Resolve the API-key schemes required by one operation, including global schemes.
@@ -138,7 +184,7 @@ pub(crate) fn operation_api_key_schemes(
 
     let mut out = Vec::new();
     for scheme_id in scheme_ids {
-        let Some(header) = schemes.get(&scheme_id) else {
+        let Some(scheme) = schemes.get(&scheme_id) else {
             return Err(CoreError::SdkGen {
                 message: format!(
                     "operation '{}' references unknown security scheme '{}'",
@@ -148,35 +194,72 @@ pub(crate) fn operation_api_key_schemes(
         };
         out.push(OperationApiKeyScheme {
             id: scheme_id,
-            header: header.clone(),
+            name: scheme.name.clone(),
+            location: scheme.location,
         });
     }
-    out.sort_by(|a, b| a.header.cmp(&b.header).then_with(|| a.id.cmp(&b.id)));
+    out.sort_by(|a, b| {
+        location_sort_key(a.location)
+            .cmp(&location_sort_key(b.location))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     out.dedup();
     Ok(out)
 }
 
-fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, String>, CoreError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiKeyScheme {
+    name: String,
+    location: ApiKeyLocation,
+}
+
+fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, ApiKeyScheme>, CoreError> {
     let mut schemes = BTreeMap::new();
     for scheme in &graph.security {
-        if scheme.kind != "apiKey" || scheme.location != "header" {
+        if scheme.kind != "apiKey" {
             return Err(CoreError::SdkGen {
                 message: format!(
-                    "SDK targets support apiKey/header security only, got scheme '{}' as {}/{}",
+                    "SDK targets support apiKey/header and apiKey/query security only, got scheme '{}' as {}/{}",
                     scheme.id, scheme.kind, scheme.location
                 ),
             });
         }
-        if let Some(existing) = schemes.insert(scheme.id.clone(), scheme.name.clone()) {
+        let location = match scheme.location.as_str() {
+            "header" => ApiKeyLocation::Header,
+            "query" => ApiKeyLocation::Query,
+            _ => {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "SDK targets support apiKey/header and apiKey/query security only, got scheme '{}' as {}/{}",
+                        scheme.id, scheme.kind, scheme.location
+                    ),
+                });
+            }
+        };
+        if let Some(existing) = schemes.insert(
+            scheme.id.clone(),
+            ApiKeyScheme {
+                name: scheme.name.clone(),
+                location,
+            },
+        ) {
             return Err(CoreError::SdkGen {
                 message: format!(
-                    "duplicate security scheme id '{}' uses headers '{}' and '{}'",
-                    scheme.id, existing, scheme.name
+                    "duplicate security scheme id '{}' uses credentials '{}' and '{}'",
+                    scheme.id, existing.name, scheme.name
                 ),
             });
         }
     }
     Ok(schemes)
+}
+
+fn location_sort_key(location: ApiKeyLocation) -> u8 {
+    match location {
+        ApiKeyLocation::Header => 0,
+        ApiKeyLocation::Query => 1,
+    }
 }
 
 /// Reject duplicate graph schema names before a target turns them into top-level symbols.
@@ -564,7 +647,9 @@ pub(crate) fn request_body_model_of(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_stem, operation_api_key_headers, success_responses_of};
+    use super::{
+        file_stem, operation_api_key_headers, operation_api_key_queries, success_responses_of,
+    };
     use crate::graph::{ApiGraph, Operation, Response, SecurityScheme, SourceSpan};
 
     #[test]
@@ -673,6 +758,45 @@ mod tests {
             operation_api_key_headers(&graph, &op)?,
             vec!["X-CSRF-Token"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_api_key_queries_honor_global_and_public_override() -> Result<(), crate::CoreError>
+    {
+        let graph = ApiGraph {
+            security: vec![SecurityScheme {
+                id: "QueryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: "api_key".to_string(),
+                global: true,
+            }],
+            ..ApiGraph::default()
+        };
+        let mut op = Operation {
+            id: "list".to_string(),
+            method: "GET".to_string(),
+            path: "/items".to_string(),
+            handler: "list".to_string(),
+            group: None,
+            middleware: Vec::new(),
+            params: vec![],
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![],
+            security: vec![],
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        assert_eq!(operation_api_key_queries(&graph, &op)?, vec!["api_key"]);
+        op.security_overrides_global = true;
+        assert!(operation_api_key_queries(&graph, &op)?.is_empty());
         Ok(())
     }
 }

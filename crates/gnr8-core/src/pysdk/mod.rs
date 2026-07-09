@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
+    api_key_credential_names, check_unique_schema_names, file_stem, model_file_name,
     operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
@@ -116,7 +116,7 @@ pub(crate) fn generate_files_with_options(
     check_unique_schema_names(graph, "Python SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_headers = api_key_header_names(graph)?;
+    let auth_credentials = api_key_credential_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
@@ -141,7 +141,7 @@ pub(crate) fn generate_files_with_options(
         package,
         &model_module,
         model_style,
-        !auth_headers.is_empty(),
+        !auth_credentials.is_empty(),
         &model_refs,
     );
     if split_operations {

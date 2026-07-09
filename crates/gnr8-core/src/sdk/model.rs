@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::graph::{ApiGraph, Type};
-use crate::sdk::emit_common::api_key_header_names;
+use crate::sdk::emit_common::{api_key_credential_names, api_key_header_names};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
@@ -46,6 +46,8 @@ pub struct SdkModel {
 pub struct SdkAuth {
     /// Header names used for API-key auth.
     pub api_key_headers: Vec<String>,
+    /// Query parameter names used for API-key auth.
+    pub api_key_queries: Vec<String>,
 }
 
 /// A generated service/group.
@@ -280,7 +282,11 @@ impl SdkModel {
         let package = package.into();
         let base_path = base_path.into();
         let api_key_headers = api_key_header_names(graph)?;
-        let auth = (!api_key_headers.is_empty()).then_some(SdkAuth { api_key_headers });
+        let api_key_queries = api_key_query_names(graph)?;
+        let auth = (!api_key_credential_names(graph)?.is_empty()).then_some(SdkAuth {
+            api_key_headers,
+            api_key_queries,
+        });
         let resolved_aliases = aliases
             .resolve(graph)?
             .into_iter()
@@ -442,6 +448,19 @@ fn response_model(
         body_kind: response.body_kind.clone(),
         content_types,
     })
+}
+
+fn api_key_query_names(graph: &ApiGraph) -> Result<Vec<String>, CoreError> {
+    api_key_credential_names(graph)?;
+    let mut queries: Vec<String> = graph
+        .security
+        .iter()
+        .filter(|scheme| scheme.kind == "apiKey" && scheme.location == "query")
+        .map(|scheme| scheme.name.clone())
+        .collect();
+    queries.sort();
+    queries.dedup();
+    Ok(queries)
 }
 
 fn schema_name_by_ref(graph: &ApiGraph, ref_id: &str) -> Result<String, CoreError> {

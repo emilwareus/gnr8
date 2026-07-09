@@ -147,7 +147,7 @@ endpoint surfaces.
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete | 2026-06-26 |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 3/3 | Complete | 2026-06-26 |
 | 1. SDK Semantic Model Foundation | v3.0 | 1/1 | Complete | 2026-07-09 |
-| 2. Auth And Typed Error Runtime | v3.0 | 0/? | Planned | — |
+| 2. Auth And Typed Error Runtime | v3.0 | 1/? | In Progress | — |
 | 3. Stable SDK Surface And Readiness | v3.0 | 0/? | Planned | — |
 | 4. SDK Runtime Ergonomics | v3.0 | 0/? | Planned | — |
 | 5. API Metadata And Common Content Types | v3.0 | 0/? | Planned | — |

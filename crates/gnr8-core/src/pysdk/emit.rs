@@ -29,8 +29,8 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of,
+    operation_api_key_queries, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -1273,6 +1273,7 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1351,7 +1352,7 @@ fn emit_operation(
     // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
     // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
     // the wire key stays the ORIGINAL `p.name`.
-    if !query_params.is_empty() {
+    if !query_params.is_empty() || !auth_queries.is_empty() {
         writeln!(out, "        _query = {{}}").map_err(sink)?;
         for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
             writeln!(out, "        _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
@@ -1359,6 +1360,23 @@ fn emit_operation(
         for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
             writeln!(out, "        if {ident} is not None:").map_err(sink)?;
             writeln!(out, "            _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
+        }
+        for query in &auth_queries {
+            writeln!(
+                out,
+                "        _auth_query_{} = self._api_keys.get({}) or self._api_key",
+                safe_ident(&snake(query)),
+                quoted_string_literal(query)
+            )
+            .map_err(sink)?;
+            writeln!(out, "        if _auth_query_{}:", safe_ident(&snake(query))).map_err(sink)?;
+            writeln!(
+                out,
+                "            _query[{}] = _auth_query_{}",
+                quoted_string_literal(query),
+                safe_ident(&snake(query))
+            )
+            .map_err(sink)?;
         }
         writeln!(out, "        if _query:").map_err(sink)?;
         writeln!(
@@ -2101,6 +2119,33 @@ mod tests {
             assert!(
                 !out.contains(", body=body"),
                 "query op has no body arg:\n{out}"
+            );
+        }
+
+        #[test]
+        fn query_api_key_auth_is_appended_to_query_string() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "QueryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: "api_key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains(
+                    "_auth_query_api_key = self._api_keys.get(\"api_key\") or self._api_key"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("_query[\"api_key\"] = _auth_query_api_key"),
+                "{out}"
+            );
+            assert!(
+                out.contains("path = path + \"?\" + urllib.parse.urlencode(_query)"),
+                "{out}"
             );
         }
 

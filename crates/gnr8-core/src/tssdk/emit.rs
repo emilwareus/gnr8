@@ -32,8 +32,8 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, SuccessResponses,
+    operation_api_key_queries, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -963,6 +963,7 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
@@ -1051,6 +1052,7 @@ fn emit_operation(
         &required_query_idents,
         &optional_query,
         &optional_query_idents,
+        &auth_queries,
     )?;
     emit_op_dispatch(
         out,
@@ -1115,8 +1117,9 @@ fn emit_op_query(
     required_query_idents: &[String],
     optional_query: &[&Param],
     optional_query_idents: &[String],
+    auth_queries: &[String],
 ) -> Result<(), CoreError> {
-    if query_params.is_empty() {
+    if query_params.is_empty() && auth_queries.is_empty() {
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
@@ -1134,6 +1137,23 @@ fn emit_op_query(
             out,
             "      searchParams.set(\"{}\", String({ident}));",
             p.name
+        )
+        .map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    for (idx, query) in auth_queries.iter().enumerate() {
+        let local = format!("apiKeyQuery{idx}");
+        writeln!(
+            out,
+            "    const {local} = this._apiKey({});",
+            quoted_string_literal(query)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      searchParams.set({}, {local});",
+            quoted_string_literal(query)
         )
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
@@ -1989,6 +2009,28 @@ mod tests {
                 !out.contains("JSON.stringify(body)"),
                 "query op has no body:\n{out}"
             );
+        }
+
+        #[test]
+        fn query_api_key_auth_is_appended_to_query_string() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "QueryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: "api_key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("const apiKeyQuery0 = this._apiKey(\"api_key\");"),
+                "{out}"
+            );
+            assert!(
+                out.contains("searchParams.set(\"api_key\", apiKeyQuery0);"),
+                "{out}"
+            );
+            assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
         }
 
         #[test]

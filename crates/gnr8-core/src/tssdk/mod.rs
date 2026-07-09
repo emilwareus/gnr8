@@ -22,10 +22,11 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
+    api_key_credential_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
     model_file_name, operation_api_key_schemes, operation_file_name, operation_group_file_name,
     operation_group_name, path_tokens, path_tokens_match, quoted_string_literal,
     request_body_model_of, split_words, success_responses_of, validate_sdk_base_path,
+    ApiKeyLocation,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
@@ -103,7 +104,7 @@ fn generate_files_with_layout_options(
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_headers = api_key_header_names(graph)?;
+    let auth_credentials = api_key_credential_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
@@ -115,7 +116,7 @@ fn generate_files_with_layout_options(
     let mut client = emit::emit_client_with_models(
         package,
         model_dir.trim_matches('/'),
-        !auth_headers.is_empty(),
+        !auth_credentials.is_empty(),
     );
     if split_operations {
         client.push_str(&emit::emit_split_operation_surface(&ops)?);
@@ -1252,9 +1253,12 @@ fn operation_auth_header_names(
 ) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for scheme in operation_api_key_schemes(graph, op)? {
-        let names = grouped.entry(scheme.header.clone()).or_default();
+        if scheme.location != ApiKeyLocation::Header {
+            continue;
+        }
+        let names = grouped.entry(scheme.name.clone()).or_default();
         names.push(scheme.id);
-        names.push(scheme.header);
+        names.push(scheme.name);
     }
     for names in grouped.values_mut() {
         names.sort();
