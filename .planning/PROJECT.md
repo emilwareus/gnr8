@@ -26,6 +26,20 @@ router-agnostic. New sources/targets ship as `.gnr8/` code-as-config built-ins. 
 
 Design brief: `docs/milestone-v2-multi-language.md`.
 
+## Current Milestone: v3.0 Production-ready SDK adoption
+
+**Goal:** Make `gnr8` a production-ready SDK publishing pipeline where server source drives OpenAPI 3.1
+and installable, operationally credible SDKs.
+
+**Target features:**
+- A shared SDK semantic model/runtime contract that prevents Go/Python/TypeScript emitter drift.
+- Graph-driven auth, typed error parity, stable operation naming, and resource grouping.
+- `doctor` SDK readiness checks and package metadata/local package validation.
+- SDK runtime ergonomics: pagination helpers, conservative retries/timeouts/idempotency, and transport hooks.
+- Public API product metadata: operation summaries/descriptions/examples/error responses and common content types.
+
+Design brief: `thoughts/research/adoption-support.md`.
+
 ## Requirements
 
 ### Validated
@@ -47,7 +61,16 @@ Design brief: `docs/milestone-v2-multi-language.md`.
 
 ### Active
 
-(None — v2.0 shipped. Next milestone defined via `/gsd:new-milestone`.)
+- Deliver a shared SDK planning layer so package, service, operation, schema, auth, errors, runtime policy,
+  docs metadata, and file plans are derived once before target-language rendering. — v3.0
+- Make auth graph-driven across OpenAPI and every generated SDK target. — v3.0
+- Make typed non-2xx error handling consistent across generated SDK targets and OpenAPI artifact input. — v3.0
+- Stabilize operation IDs, SDK names, and resource grouping so SDK public surfaces do not drift accidentally. — v3.0
+- Expose generated SDK readiness through `gnr8 doctor` for user projects. — v3.0
+- Generate installable package metadata and local package validation for supported SDK targets. — v3.0
+- Add explicit pagination policies and SDK helpers for common list/search operations. — v3.0
+- Add conservative SDK runtime policies for timeouts, retries, idempotency, and transport hooks. — v3.0
+- Support operation metadata, examples, documented error responses, and common content types in OpenAPI and SDK docs. — v3.0
 
 ## Current State
 
@@ -78,11 +101,9 @@ and **TypeScript (NestJS)**. 6 phases / 19 plans / 43 tasks.
 
 ## Next Milestone Goals
 
-Candidate directions (not yet scoped, define via `/gsd:new-milestone`): retire the gnr8-core OSS known-debt
-(hand-rolled JSON/hashing, stdlib-only `goextract`); additional source frontends (Hono/typed-Express/Fastify,
-Rust) + a Rust SDK target (FUT-01..03); a stdlib-pure TypeScript extraction path that retires the `typescript`
-toolchain requirement (FUT-04); packaged/relocatable sidecars; the deferred TsSdk hardening (backlog 999.x);
-deeper incremental graph invalidation if benchmarks justify it.
+v3.0 is scoped to production-ready SDK adoption. The milestone intentionally does not add server stubs,
+older OpenAPI output profiles, generic template overrides, registry publishing automation, docs-site
+generation, Terraform/CLI/React helpers, or vendor-extension parity.
 
 ### Out of Scope
 
@@ -106,6 +127,7 @@ Key source documents:
 - `thoughts/DECISION.md` — accepted and proposed product decisions.
 - `thoughts/FEATURE.md` — feature ledger.
 - `thoughts/research/` — research notes for native Go extraction, SDK structure, code-as-config UX, lifecycle, incrementality, OpenAPI, and multi-language direction.
+- `thoughts/research/adoption-support.md` — validated v3.0 adoption support research and scope.
 - `thoughts/skills/rust-best-practices/` — vendored implementation guidance.
 
 The core product bet is that a small Rust engine can own orchestration, graph management, OpenAPI lowering, SDK generation, diagnostics, and watch-mode lifecycle while using official language tooling where it provides semantic truth.
@@ -156,4 +178,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-26 after shipping milestone v2.0*
+*Last updated: 2026-07-09 after starting milestone v3.0*

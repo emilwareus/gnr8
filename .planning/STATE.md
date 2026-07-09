@@ -1,34 +1,34 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.0
-milestone_name: "Multi-language: TypeScript & Python (parse + generate)"
-status: Awaiting next milestone
-stopped_at: Completed 01-03-PLAN.md (phase 01 complete)
-last_updated: "2026-06-26T06:38:40.618Z"
-last_activity: 2026-06-26 — Milestone v2.0 completed and archived
+milestone: v3.0
+milestone_name: "Production-ready SDK adoption"
+status: ready_to_plan
+stopped_at: Milestone roadmap created
+last_updated: "2026-07-09T00:00:00.000Z"
+last_activity: 2026-07-09 — Milestone v3.0 started
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 19
-  completed_plans: 19
-  percent: 100
+  total_phases: 5
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-25)
+See: .planning/PROJECT.md (updated 2026-07-09)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Milestone complete
+**Current focus:** Milestone v3.0 — Production-ready SDK adoption
 
 ## Current Position
 
-Phase: Milestone v2.0 complete
+Phase: Not started (Phase 1 ready for planning)
 Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-06-26 — Milestone v2.0 completed and archived
+Status: Roadmap ready
+Last activity: 2026-07-09 — Milestone v3.0 requirements and roadmap created
 
 ## Performance Metrics
 
