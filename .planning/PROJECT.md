@@ -2,7 +2,9 @@
 
 ## What This Is
 
-`gnr8` is a Rust-based code generation tool for code-first API projects. The first milestone is a Go-to-Go proof of concept: analyze Go service code, build an internal API graph, emit OpenAPI, and generate a usable Go SDK.
+`gnr8` is a Rust-based code generation tool for code-first API projects. It analyzes real server source,
+builds an internal API graph, emits OpenAPI 3.1, and generates installable SDKs without making OpenAPI
+the internal source of truth.
 
 The product is for developers who are frustrated by fragmented Swagger/OpenAPI and SDK toolchains that are slow, annotation-heavy, hard to customize, and poor at save-time incremental workflows.
 
@@ -26,7 +28,7 @@ router-agnostic. New sources/targets ship as `.gnr8/` code-as-config built-ins. 
 
 Design brief: `docs/milestone-v2-multi-language.md`.
 
-## Current Milestone: v3.0 Production-ready SDK adoption
+## Shipped Milestone: v3.0 Production-ready SDK adoption ✅ 2026-07-09
 
 **Goal:** Make `gnr8` a production-ready SDK publishing pipeline where server source drives OpenAPI 3.1
 and installable, operationally credible SDKs.
@@ -42,7 +44,7 @@ Design brief: `thoughts/research/adoption-support.md`.
 
 ## Requirements
 
-### Validated
+### Validated Through v2.0
 
 - ✓ Build a narrow Go source to Go SDK proof of concept before adding other languages. — v1.0
 - ✓ Own the native extraction, graph, OpenAPI lowering, and SDK generation pipeline instead of wrapping existing generators. — v1.0 (goextract → ApiGraph → lower/sdk, no wrapped generators)
@@ -59,20 +61,40 @@ Design brief: `thoughts/research/adoption-support.md`.
 - ✓ TypeScript SDK target — dependency-free (built-in `fetch` + typed interfaces). — v2.0 (`TsSdk`; hermetic `tsc --noEmit` typecheck)
 - ✓ FastAPI + NestJS examples with `.gnr8/` lifecycles and real committed output. — v2.0 (`examples/{fastapi,nestjs}-bookstore`; `make examples-check` cross-language determinism gate)
 
-### Active
+### Validated In v3.0
 
-- Deliver a shared SDK planning layer so package, service, operation, schema, auth, errors, runtime policy,
+- ✓ Deliver a shared SDK planning layer so package, service, operation, schema, auth, errors, runtime policy,
   docs metadata, and file plans are derived once before target-language rendering. — v3.0
-- Make auth graph-driven across OpenAPI and every generated SDK target. — v3.0
-- Make typed non-2xx error handling consistent across generated SDK targets and OpenAPI artifact input. — v3.0
-- Stabilize operation IDs, SDK names, and resource grouping so SDK public surfaces do not drift accidentally. — v3.0
-- Expose generated SDK readiness through `gnr8 doctor` for user projects. — v3.0
-- Generate installable package metadata and local package validation for supported SDK targets. — v3.0
-- Add explicit pagination policies and SDK helpers for common list/search operations. — v3.0
-- Add conservative SDK runtime policies for timeouts, retries, idempotency, and transport hooks. — v3.0
-- Support operation metadata, examples, documented error responses, and common content types in OpenAPI and SDK docs. — v3.0
+- ✓ Make auth graph-driven across OpenAPI and every generated SDK target. — v3.0
+- ✓ Make typed non-2xx error handling consistent across generated SDK targets and OpenAPI artifact input. — v3.0
+- ✓ Stabilize operation IDs, SDK names, and resource grouping so SDK public surfaces do not drift accidentally. — v3.0
+- ✓ Expose generated SDK readiness through `gnr8 doctor` for user projects. — v3.0
+- ✓ Generate installable package metadata and local package validation for supported SDK targets. — v3.0
+- ✓ Add explicit pagination policies and SDK helpers for common list/search operations. — v3.0
+- ✓ Add conservative SDK runtime policies for timeouts, retries, idempotency, and transport hooks. — v3.0
+- ✓ Support operation metadata, examples, documented error responses, and common content types in OpenAPI and SDK docs. — v3.0
 
 ## Current State
+
+**Shipped v3.0** (2026-07-09): production-ready SDK adoption across the existing Go, Python, and
+TypeScript target languages. The shared SDK model now carries docs metadata, auth, errors, runtime
+policy, pagination, package metadata, and file-plan facts into all emitters; SDKs support graph-driven
+auth, typed errors, stable grouped surfaces, readiness checks, local package metadata, publishing recipes,
+pagination helpers, conservative retry/timeout/idempotency policies, hooks, operation docs/examples, and
+common request media types.
+
+- **SDK semantics:** one shared SDK planning layer feeds Go/Python/TypeScript renderers and keeps naming,
+  grouping, docs metadata, auth, error, runtime, pagination, and package facts deterministic.
+- **Runtime behavior:** generated SDKs expose configured auth, typed API errors, client/per-request
+  timeouts and retries, idempotency-key preservation, and request/response/error hooks.
+- **Adoption readiness:** `gnr8 doctor --json` reports OpenAPI and SDK readiness; generated packages include
+  Go module, Python project, TypeScript package metadata, local validation hooks, and publishing recipes.
+- **API surface coverage:** operation documentation transforms propagate summaries, descriptions, tags,
+  deprecation, examples, response docs, and documented JSON errors into OpenAPI and SDK docs; SDK request
+  bodies cover JSON, text, form-urlencoded, multipart, and binary uploads.
+- **Quality:** full `cargo test -p gnr8`, `cargo clippy -p gnr8 --all-targets -- -D warnings`,
+  `cargo clippy -p gnr8-cli --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check`
+  passed on 2026-07-09.
 
 **Shipped v2.0** (2026-06-26): the `ApiGraph` IR proven a true language-neutral narrow waist —
 code-first parsing **and** dependency-free SDK generation for **Go (Gin)**, **Python (FastAPI + Flask)**,
@@ -101,20 +123,21 @@ and **TypeScript (NestJS)**. 6 phases / 19 plans / 43 tasks.
 
 ## Next Milestone Goals
 
-v3.0 is scoped to production-ready SDK adoption. The milestone intentionally does not add server stubs,
-older OpenAPI output profiles, generic template overrides, registry publishing automation, docs-site
-generation, Terraform/CLI/React helpers, or vendor-extension parity.
+The next milestone has not been selected. v3.0 intentionally did not add server stubs, older OpenAPI
+output profiles, generic template overrides, registry publishing automation, docs-site generation,
+Terraform/CLI/React helpers, or vendor-extension parity.
 
 ### Out of Scope
 
-- Multi-language source support in the first milestone — Go must prove the model first.
-- Multi-language SDK targets in the first milestone — Go SDK quality comes first.
-- Dynamic plugin loading — defer until repeated extension pressure proves the need.
-- Macro-heavy configuration APIs — plain Rust code should come first.
-- Full Go framework coverage — support one or two route styles for the PoC.
-- Full OpenAPI 3.2 feature coverage — emit a useful modern OpenAPI artifact first.
-- Arbitrary handler body interpretation — start with typed handlers and simple patterns.
-- Wrapping Swaggo, oapi-codegen, OpenAPI Generator, or similar tools as the core engine — existing tools are comparison targets only.
+- Server stub generation.
+- Older OpenAPI output profiles and broad OpenAPI version compatibility.
+- Generic template override/custom generator authoring.
+- Registry publishing automation and credential management.
+- Docs-site generation.
+- Terraform, CLI, React hooks, and broad webhook helper generation.
+- Vendor-extension parity with OpenAPI Generator, Speakeasy, Stainless, Fern, or Kiota.
+- OAuth/OIDC token acquisition flows, mTLS, AWS SigV4, HMAC signing, CSRF/session-cookie workflows.
+- XML, protobuf, arbitrary custom media types, and every OpenAPI encoding edge case.
 
 ## Context
 
@@ -178,4 +201,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-07-09 after starting milestone v3.0*
+*Last updated: 2026-07-09 after completing milestone v3.0*

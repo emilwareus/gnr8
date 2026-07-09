@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: "Production-ready SDK adoption"
-status: in_progress
-stopped_at: Phase 4 complete; Phase 5 API metadata and common content types pending
-last_updated: "2026-07-09T11:05:00.000Z"
-last_activity: 2026-07-09 — Completed Phase 4 SDK runtime ergonomics
+status: complete
+stopped_at: v3.0 complete; all five phases implemented and verified
+last_updated: "2026-07-09T13:30:00.000Z"
+last_activity: 2026-07-09 — Completed Phase 5 API metadata and common content types
 progress:
   total_phases: 5
-  completed_phases: 4
-  total_plans: 16
-  completed_plans: 11
-  percent: 80
+  completed_phases: 5
+  total_plans: 13
+  completed_plans: 13
+  percent: 100
 ---
 
 # Project State
@@ -21,20 +21,20 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-09)
 
 **Core value:** Generate accurate OpenAPI and SDK outputs from real source code quickly, with code-based customization and minimal duplicated API descriptions.
-**Current focus:** Milestone v3.0 — Production-ready SDK adoption
+**Current focus:** Milestone v3.0 — Production-ready SDK adoption completed
 
 ## Current Position
 
-Phase: Phase 5 — API Metadata And Common Content Types
-Plan: Planning pending
-Status: Phase 5 pending
-Last activity: 2026-07-09 — SDK runtime ergonomics completed
+Phase: Complete
+Plan: Complete
+Status: v3.0 complete
+Last activity: 2026-07-09 — API metadata and common content types completed
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 7 (this milestone)
+- Total plans completed: 13 (this milestone)
 - Average duration: N/A
 - Total execution time: 0.0 hours
 
@@ -46,33 +46,14 @@ Last activity: 2026-07-09 — SDK runtime ergonomics completed
 | 02 | 4 | - | - |
 | 03 | 3 | - | - |
 | 04 | 3 | - | - |
-| 05 | 3 | - | - |
-| 06 | 3 | - | - |
+| 05 | 2 | - | - |
 
 **Recent Trend:**
 
 - Last 5 plans: N/A
 - Trend: N/A
 
-*Updated after each plan completion. v1.0 velocity (14 plans, ~10min avg) archived in .planning/milestones/v1.0-*.*
-| Phase 01 P01 | 23 | 3 tasks | 8 files |
-| Phase 01 P03 | 38 | 3 tasks | 23 files |
-| Phase 02 P01 | 18 | 3 tasks | 7 files |
-| Phase 02 P02 | 22 | 3 tasks | 13 files |
-| Phase 02 P03 | 40 | 3 tasks | 14 files |
-| Phase 02 P04 | 35 | 3 tasks | 10 files |
-| Phase 03 P01 | 20m | 3 tasks | 4 files |
-| Phase 03 P02 | 10m | 2 tasks | 3 files |
-| Phase 03 P03 | 35m | 2 tasks | 1 files |
-| Phase 04 P01 | 6m | 3 tasks | 10 files |
-| Phase 04 P02 | 8min | 2 tasks | 9 files |
-| Phase 04 P03 | 14min | 3 tasks | 14 files |
-| Phase 05 P01 | 18min | 3 tasks | 4 files |
-| Phase 05 P02 | 9min | 2 tasks | 3 files |
-| Phase 05 P03 | 11min | 2 tasks | 3 files |
-| Phase 06 P01 | 7min | 3 tasks | 4 files |
-| Phase 06 P02 | 18min | 3 tasks | 26 files |
-| Phase 06 P03 | 9min | 4 tasks | 4 files |
+*Detailed historical velocity rows are archived with their milestone phase artifacts.*
 
 ## Accumulated Context
 
@@ -113,7 +94,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-None yet.
+None.
 
 ### Blockers/Concerns
 
@@ -136,4 +117,4 @@ Resume file: None
 
 ## Operator Next Steps
 
-- Start Phase 5: API metadata and common content types
+- Review and ship the v3.0 branch, or start the next milestone with `$gsd-new-milestone`.
