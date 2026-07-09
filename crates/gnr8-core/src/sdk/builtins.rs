@@ -2750,6 +2750,7 @@ pub struct GoSdk {
     profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: bool,
+    package_info: SdkPackageMetadata,
     error_model: Option<String>,
     required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
     query_time_format: Option<QueryTimeFormat>,
@@ -2772,6 +2773,7 @@ impl GoSdk {
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
             package_metadata: true,
+            package_info: SdkPackageMetadata::default(),
             error_model: None,
             required_pointer_constructor_policy: None,
             query_time_format: None,
@@ -2917,6 +2919,13 @@ impl GoSdk {
         self
     }
 
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        self.package_info = metadata;
+        self
+    }
+
     /// Emit source files only, without docs or package metadata.
     #[must_use]
     pub fn source_only(self) -> Self {
@@ -3009,6 +3018,10 @@ impl Target for GoSdk {
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
                 format!("module {}\n\ngo {}\n", self.module, self.go_version),
             );
+            out.write(
+                format!("{}/PUBLISHING.md", self.dir.trim_end_matches('/')),
+                publishing_recipe("Go", &self.module, &self.package_info)?,
+            );
         }
         Ok(())
     }
@@ -3045,7 +3058,7 @@ pub struct PySdk {
     profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: bool,
-    package_version: String,
+    package_info: SdkPackageMetadata,
 }
 
 impl PySdk {
@@ -3061,7 +3074,7 @@ impl PySdk {
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
             package_metadata: true,
-            package_version: "0.1.0".to_string(),
+            package_info: SdkPackageMetadata::default(),
         }
     }
 
@@ -3149,7 +3162,14 @@ impl PySdk {
     /// Set the generated Python package version.
     #[must_use]
     pub fn package_version(mut self, version: impl Into<String>) -> Self {
-        self.package_version = version.into();
+        self.package_info = self.package_info.clone().version(version);
+        self
+    }
+
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        self.package_info = metadata;
         self
     }
 
@@ -3208,14 +3228,20 @@ impl Target for PySdk {
             &self.aliases,
         )?;
         if self.package_metadata {
+            let dist_name = self.package_info.resolved_name(&model.package)?;
             files.push(super::bundle::SdkFile {
                 name: "pyproject.toml".to_string(),
                 contents: pyproject_toml(
                     &model.package,
-                    &self.package_version,
+                    &dist_name,
+                    &self.package_info,
                     self.model_style,
                     &files,
                 )?,
+            });
+            files.push(super::bundle::SdkFile {
+                name: "PUBLISHING.md".to_string(),
+                contents: publishing_recipe("Python", &dist_name, &self.package_info)?,
             });
             files.sort_by(|a, b| a.name.cmp(&b.name));
         }
@@ -3263,6 +3289,7 @@ pub struct TsSdk {
     profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: Option<bool>,
+    package_info: SdkPackageMetadata,
     model_property_policy: Option<TsModelPropertyPolicy>,
     nullable_policy: Option<TsNullablePolicy>,
     response_policy: Option<TsResponsePolicy>,
@@ -3283,6 +3310,7 @@ impl TsSdk {
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
             package_metadata: None,
+            package_info: SdkPackageMetadata::default(),
             model_property_policy: None,
             nullable_policy: None,
             response_policy: None,
@@ -3356,6 +3384,13 @@ impl TsSdk {
     #[must_use]
     pub const fn package_metadata(mut self, enabled: bool) -> Self {
         self.package_metadata = Some(enabled);
+        self
+    }
+
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        self.package_info = metadata;
         self
     }
 
@@ -3497,15 +3532,23 @@ impl Target for TsSdk {
             &options,
         )?;
         if self.effective_package_metadata() {
-            if !files.iter().any(|file| file.name == "package.json") {
-                files.push(super::bundle::SdkFile {
-                    name: "package.json".to_string(),
-                    contents: ts_package_json(&package, self.profile.is_typescript_axios_compat()),
-                });
-                files.sort_by(|a, b| a.name.cmp(&b.name));
-            }
+            files.retain(|file| file.name != "package.json" && file.name != "PUBLISHING.md");
+            let package_name = self.package_info.resolved_name(&package)?;
+            files.push(super::bundle::SdkFile {
+                name: "package.json".to_string(),
+                contents: ts_package_json(
+                    &package_name,
+                    &self.package_info,
+                    self.profile.is_typescript_axios_compat(),
+                )?,
+            });
+            files.push(super::bundle::SdkFile {
+                name: "PUBLISHING.md".to_string(),
+                contents: publishing_recipe("TypeScript", &package_name, &self.package_info)?,
+            });
+            files.sort_by(|a, b| a.name.cmp(&b.name));
         } else {
-            files.retain(|file| file.name != "package.json");
+            files.retain(|file| file.name != "package.json" && file.name != "PUBLISHING.md");
         }
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(
@@ -3530,6 +3573,118 @@ impl Target for TsSdk {
         } else {
             vec![self.dir.trim_end_matches('/').to_string()]
         }
+    }
+}
+
+/// Package-manager metadata shared by generated SDK targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SdkPackageMetadata {
+    registry_name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    repository_url: Option<String>,
+    homepage_url: Option<String>,
+    documentation_url: Option<String>,
+    keywords: Vec<String>,
+}
+
+impl SdkPackageMetadata {
+    /// Empty metadata: targets derive package name from their module/import path and use version
+    /// `0.1.0`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the registry/distribution package name.
+    #[must_use]
+    pub fn registry_name(mut self, name: impl Into<String>) -> Self {
+        self.registry_name = Some(name.into());
+        self
+    }
+
+    /// Alias for [`Self::registry_name`].
+    #[must_use]
+    pub fn name(self, name: impl Into<String>) -> Self {
+        self.registry_name(name)
+    }
+
+    /// Set the package version.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Set a human-readable package description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the SPDX license expression or license label.
+    #[must_use]
+    pub fn license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
+        self
+    }
+
+    /// Set the repository URL.
+    #[must_use]
+    pub fn repository(mut self, url: impl Into<String>) -> Self {
+        self.repository_url = Some(url.into());
+        self
+    }
+
+    /// Set the homepage URL.
+    #[must_use]
+    pub fn homepage(mut self, url: impl Into<String>) -> Self {
+        self.homepage_url = Some(url.into());
+        self
+    }
+
+    /// Set the documentation URL.
+    #[must_use]
+    pub fn documentation(mut self, url: impl Into<String>) -> Self {
+        self.documentation_url = Some(url.into());
+        self
+    }
+
+    /// Add one package keyword.
+    #[must_use]
+    pub fn keyword(mut self, keyword: impl Into<String>) -> Self {
+        self.keywords.push(keyword.into());
+        self
+    }
+
+    /// Replace package keywords.
+    #[must_use]
+    pub fn keywords<I, S>(mut self, keywords: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.keywords = keywords.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn resolved_name(&self, default: &str) -> Result<String, CoreError> {
+        let name = self.registry_name.as_deref().unwrap_or(default);
+        validate_metadata_value("package name", name)?;
+        Ok(name.to_string())
+    }
+
+    fn resolved_version(&self) -> Result<String, CoreError> {
+        let version = self.version.as_deref().unwrap_or("0.1.0");
+        validate_metadata_value("package version", version)?;
+        if version.chars().any(char::is_whitespace) {
+            return Err(CoreError::Config {
+                message: "package version must contain no whitespace".to_string(),
+            });
+        }
+        Ok(version.to_string())
     }
 }
 
@@ -3858,23 +4013,19 @@ fn write_sdk_files(
 }
 
 fn pyproject_toml(
-    package: &str,
-    version: &str,
+    import_package: &str,
+    distribution_name: &str,
+    metadata: &SdkPackageMetadata,
     model_style: PyModelStyle,
     files: &[super::bundle::SdkFile],
 ) -> Result<String, CoreError> {
-    if version.trim().is_empty() || version.chars().any(char::is_whitespace) {
-        return Err(CoreError::Config {
-            message: "PySdk package_version must be non-empty and contain no whitespace"
-                .to_string(),
-        });
-    }
+    let version = metadata.resolved_version()?;
     let dependencies = if model_style.is_pydantic() {
         "\ndependencies = [\"pydantic>=2\"]"
     } else {
         "\ndependencies = []"
     };
-    let packages = pyproject_packages(package, files);
+    let packages = pyproject_packages(import_package, files);
     let package_list = packages
         .iter()
         .map(|(name, _dir)| quoted_string_literal(name))
@@ -3891,6 +4042,7 @@ fn pyproject_toml(
             ),
         );
     }
+    let project_optional = pyproject_optional_metadata(metadata)?;
     Ok(format!(
         "[build-system]\n\
 requires = [\"setuptools>=68\", \"wheel\"]\n\
@@ -3898,14 +4050,15 @@ build-backend = \"setuptools.build_meta\"\n\n\
 [project]\n\
 name = {}\n\
 version = {}\n\
-requires-python = \">=3.9\"{}\n\n\
+requires-python = \">=3.9\"{}{}\n\n\
 [tool.setuptools]\n\
 packages = [{}]\n\n\
 [tool.setuptools.package-dir]\n\
 {}",
-        quoted_string_literal(package),
-        quoted_string_literal(version),
+        quoted_string_literal(distribution_name),
+        quoted_string_literal(&version),
         dependencies,
+        project_optional,
         package_list,
         package_dirs
     ))
@@ -3928,17 +4081,68 @@ fn pyproject_packages(package: &str, files: &[super::bundle::SdkFile]) -> Vec<(S
     packages
 }
 
-fn ts_package_json(package: &str, axios: bool) -> String {
+fn pyproject_optional_metadata(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    if let Some(description) = &metadata.description {
+        validate_metadata_value("package description", description)?;
+        out.push_str("\ndescription = ");
+        out.push_str(&quoted_string_literal(description));
+    }
+    if let Some(license) = &metadata.license {
+        validate_metadata_value("package license", license)?;
+        out.push_str("\nlicense = { text = ");
+        out.push_str(&quoted_string_literal(license));
+        out.push_str(" }");
+    }
+    if !metadata.keywords.is_empty() {
+        validate_metadata_values("package keyword", &metadata.keywords)?;
+        out.push_str("\nkeywords = [");
+        out.push_str(&quoted_array(&metadata.keywords));
+        out.push(']');
+    }
+    let urls = pyproject_urls(metadata)?;
+    if !urls.is_empty() {
+        out.push_str("\n\n[project.urls]\n");
+        out.push_str(&urls);
+    }
+    Ok(out)
+}
+
+fn pyproject_urls(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    for (label, value) in [
+        ("Repository", &metadata.repository_url),
+        ("Homepage", &metadata.homepage_url),
+        ("Documentation", &metadata.documentation_url),
+    ] {
+        let Some(url) = value else {
+            continue;
+        };
+        validate_metadata_value("package URL", url)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("{label} = {}\n", quoted_string_literal(url)),
+        );
+    }
+    Ok(out)
+}
+
+fn ts_package_json(
+    package: &str,
+    metadata: &SdkPackageMetadata,
+    axios: bool,
+) -> Result<String, CoreError> {
+    let version = metadata.resolved_version()?;
     let dependencies = if axios {
         "\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  },"
     } else {
         ""
     };
-    format!(
+    Ok(format!(
         "{{
   \"name\": {},
-  \"version\": \"0.1.0\",
-  \"type\": \"module\",{}
+  \"version\": {},
+  \"type\": \"module\",{}{}
   \"main\": \"./index.js\",
   \"module\": \"./index.js\",
   \"types\": \"./index.d.ts\",
@@ -3951,8 +4155,114 @@ fn ts_package_json(package: &str, axios: bool) -> String {
 }}
 ",
         quoted_string_literal(package),
-        dependencies
-    )
+        quoted_string_literal(&version),
+        dependencies,
+        ts_optional_package_fields(metadata)?
+    ))
+}
+
+fn ts_optional_package_fields(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    if let Some(description) = &metadata.description {
+        validate_metadata_value("package description", description)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n  \"description\": {},",
+                quoted_string_literal(description)
+            ),
+        );
+    }
+    if let Some(license) = &metadata.license {
+        validate_metadata_value("package license", license)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"license\": {},", quoted_string_literal(license)),
+        );
+    }
+    if let Some(repository) = &metadata.repository_url {
+        validate_metadata_value("package repository", repository)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n  \"repository\": {{ \"type\": \"git\", \"url\": {} }},",
+                quoted_string_literal(repository)
+            ),
+        );
+    }
+    if let Some(homepage) = &metadata.homepage_url {
+        validate_metadata_value("package homepage", homepage)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"homepage\": {},", quoted_string_literal(homepage)),
+        );
+    }
+    if !metadata.keywords.is_empty() {
+        validate_metadata_values("package keyword", &metadata.keywords)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"keywords\": [{}],", quoted_array(&metadata.keywords)),
+        );
+    }
+    Ok(out)
+}
+
+fn publishing_recipe(
+    language: &str,
+    package: &str,
+    metadata: &SdkPackageMetadata,
+) -> Result<String, CoreError> {
+    let version = metadata.resolved_version()?;
+    let mut out = format!(
+        "# Publishing {language} SDK\n\n\
+Package: `{package}`\n\
+Version: `{version}`\n\n\
+`gnr8` never stores registry credentials and never uploads packages. Run these commands in this \
+generated SDK directory after reviewing the generated files.\n\n"
+    );
+    match language {
+        "Go" => out.push_str(
+            "1. `go test ./...`\n\
+2. `go vet ./...`\n\
+3. Tag and publish from your repository using your normal Go module release process.\n",
+        ),
+        "Python" => out.push_str(
+            "1. `python3 -m py_compile *.py`\n\
+2. `python3 -m build`\n\
+3. Upload with your own credentials, for example `python3 -m twine upload dist/*`.\n",
+        ),
+        "TypeScript" => out.push_str(
+            "1. `npm pack --dry-run`\n\
+2. `npm publish --dry-run`\n\
+3. Publish with your own npm credentials when the dry run matches expectations.\n",
+        ),
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn quoted_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| quoted_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_metadata_values(field: &str, values: &[String]) -> Result<(), CoreError> {
+    for value in values {
+        validate_metadata_value(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_metadata_value(field: &str, value: &str) -> Result<(), CoreError> {
+    if value.trim().is_empty() || value.contains('\n') || value.contains('\r') {
+        return Err(CoreError::Config {
+            message: format!("{field} must be non-empty and stay on one line"),
+        });
+    }
+    Ok(())
 }
 
 fn collect_static_include(
@@ -4063,8 +4373,9 @@ mod tests {
         sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, FormatCommand,
         GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
-        QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
+        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
@@ -5839,6 +6150,7 @@ mod tests {
         let target = GoSdk::new()
             .module_path("example.com/bookstore/sdk")
             .go_version("1.26.4")
+            .package(SdkPackageMetadata::new().version("1.2.3"))
             .to("generated/sdk-go");
 
         let mut out = Artifacts::new();
@@ -5853,6 +6165,16 @@ mod tests {
             go_mod.text,
             "module example.com/bookstore/sdk\n\ngo 1.26.4\n"
         );
+        let publishing = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-go/PUBLISHING.md")
+            .expect("GoSdk must emit a publishing recipe with package metadata");
+        assert!(publishing.text.contains("Version: `1.2.3`"));
+        assert!(publishing.text.contains("go test ./..."));
+        assert!(publishing
+            .text
+            .contains("never stores registry credentials"));
     }
 
     #[test]
@@ -5868,6 +6190,7 @@ mod tests {
 
         for path in [
             "generated/sdk-go/go.mod",
+            "generated/sdk-go/PUBLISHING.md",
             "generated/sdk-go/README.md",
             "generated/sdk-go/reference.md",
         ] {
@@ -6024,7 +6347,17 @@ mod tests {
         let ir = ApiGraph::default();
         let target = PySdk::new()
             .module("example.com/bookstore/sdk")
-            .package_version("1.2.3")
+            .package(
+                SdkPackageMetadata::new()
+                    .name("bookstore-sdk")
+                    .version("1.2.3")
+                    .description("Bookstore SDK")
+                    .license("MIT")
+                    .repository("https://example.com/repo.git")
+                    .homepage("https://example.com")
+                    .documentation("https://example.com/docs")
+                    .keywords(["bookstore", "sdk"]),
+            )
             .to("generated/sdk-py");
 
         let mut out = Artifacts::new();
@@ -6041,7 +6374,7 @@ mod tests {
             pyproject.text
         );
         assert!(
-            pyproject.text.contains("name = \"sdk\""),
+            pyproject.text.contains("name = \"bookstore-sdk\""),
             "{}",
             pyproject.text
         );
@@ -6056,10 +6389,34 @@ mod tests {
             pyproject.text
         );
         assert!(
+            pyproject.text.contains("description = \"Bookstore SDK\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("license = { text = \"MIT\" }"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject
+                .text
+                .contains("Repository = \"https://example.com/repo.git\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
             pyproject.text.contains("\"sdk\" = \".\""),
             "{}",
             pyproject.text
         );
+        let publishing = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-py/PUBLISHING.md")
+            .expect("PySdk must emit a publishing recipe with package metadata");
+        assert!(publishing.text.contains("Package: `bookstore-sdk`"));
+        assert!(publishing.text.contains("python3 -m build"));
     }
 
     #[test]
@@ -6077,6 +6434,7 @@ mod tests {
             "generated/sdk-py/README.md",
             "generated/sdk-py/reference.md",
             "generated/sdk-py/pyproject.toml",
+            "generated/sdk-py/PUBLISHING.md",
         ] {
             assert!(
                 !out.files().iter().any(|file| file.path == path),
@@ -6165,6 +6523,16 @@ mod tests {
             .module("@example/bookstore-sdk")
             .to("generated/sdk-ts")
             .profile(SdkProfile::typescript_fetch_compat())
+            .package(
+                SdkPackageMetadata::new()
+                    .name("@example/bookstore-sdk")
+                    .version("2.0.0")
+                    .description("Bookstore SDK")
+                    .license("MIT")
+                    .repository("https://example.com/repo.git")
+                    .homepage("https://example.com")
+                    .keywords(["bookstore", "sdk"]),
+            )
             .generate(&ir, &mut compat_out, &cx())
             .unwrap();
         let package_json = compat_out
@@ -6172,7 +6540,24 @@ mod tests {
             .iter()
             .find(|file| file.path == "generated/sdk-ts/package.json")
             .expect("typescript-fetch compat should emit package metadata by default");
+        let parsed_package: serde_json::Value =
+            serde_json::from_str(&package_json.text).expect("package.json must parse as JSON");
+        assert_eq!(parsed_package["name"], "@example/bookstore-sdk");
         assert!(package_json.text.contains("\"types\": \"./index.d.ts\""));
+        assert!(package_json.text.contains("\"version\": \"2.0.0\""));
+        assert!(package_json
+            .text
+            .contains("\"description\": \"Bookstore SDK\""));
+        assert!(package_json.text.contains("\"license\": \"MIT\""));
+        assert!(package_json
+            .text
+            .contains("\"keywords\": [\"bookstore\", \"sdk\"]"));
+        let ts_publishing = compat_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/PUBLISHING.md")
+            .expect("TsSdk must emit a publishing recipe with package metadata");
+        assert!(ts_publishing.text.contains("npm pack --dry-run"));
 
         let mut axios_out = Artifacts::new();
         TsSdk::new()
@@ -6199,6 +6584,7 @@ mod tests {
 
         for path in [
             "generated/sdk-ts/package.json",
+            "generated/sdk-ts/PUBLISHING.md",
             "generated/sdk-ts/README.md",
             "generated/sdk-ts/reference.md",
         ] {

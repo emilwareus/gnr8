@@ -74,7 +74,7 @@ installable, operationally credible SDKs.
 
 ### Package Metadata
 
-- [ ] **PKG-01**: A `.gnr8` pipeline author can configure package/import/module name, registry package name,
+- [x] **PKG-01**: A `.gnr8` pipeline author can configure package/import/module name, registry package name,
   version, description, license/SPDX, repository URL, homepage/docs URL, and keywords.
 - [x] **PKG-02**: A generated Go SDK includes coherent `go.mod` metadata.
 - [x] **PKG-03**: A generated TypeScript SDK includes valid `package.json`, `exports`, `types`, and runtime
@@ -83,7 +83,7 @@ installable, operationally credible SDKs.
   metadata.
 - [x] **PKG-05**: A gnr8 user can run local package validation such as `npm pack --dry-run`, Python build/import
   checks, and Go module/list/test checks where reasonable.
-- [ ] **PKG-06**: A gnr8 user can follow generated or documented publishing recipes without `gnr8` storing
+- [x] **PKG-06**: A gnr8 user can follow generated or documented publishing recipes without `gnr8` storing
   registry credentials or performing registry uploads.
 
 ### Pagination

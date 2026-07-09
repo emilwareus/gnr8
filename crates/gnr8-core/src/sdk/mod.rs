@@ -901,8 +901,9 @@ pub mod prelude {
         ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk,
         GroupOperations, Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
-        RenameOperation, RenameType, SdkOperationAliases, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        RenameOperation, RenameType, SdkOperationAliases, SdkPackageMetadata, SetBasePath,
+        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
+        TsSdk,
     };
     pub use super::docs::SdkDocs;
     pub use super::go::{
