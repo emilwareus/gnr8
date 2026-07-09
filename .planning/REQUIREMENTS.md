@@ -51,12 +51,12 @@ installable, operationally credible SDKs.
 
 ### Stable SDK Surface
 
-- [ ] **SURF-01**: A `.gnr8` pipeline author can assign stable operation IDs and receive collision diagnostics.
-- [ ] **SURF-02**: A `.gnr8` pipeline author can group operations by imported OpenAPI tags, path prefix,
+- [x] **SURF-01**: A `.gnr8` pipeline author can assign stable operation IDs and receive collision diagnostics.
+- [x] **SURF-02**: A `.gnr8` pipeline author can group operations by imported OpenAPI tags, path prefix,
   source module/package, or explicit configuration.
-- [ ] **SURF-03**: An SDK consumer can use grouped SDK clients where configured, while existing flat clients
+- [x] **SURF-03**: An SDK consumer can use grouped SDK clients where configured, while existing flat clients
   remain available as a fallback/default where appropriate.
-- [ ] **SURF-04**: A gnr8 maintainer can verify the same operation/group/name facts drive OpenAPI output,
+- [x] **SURF-04**: A gnr8 maintainer can verify the same operation/group/name facts drive OpenAPI output,
   SDK methods, generated docs, and `gnr8 compat`.
 
 ### SDK Readiness

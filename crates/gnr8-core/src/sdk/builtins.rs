@@ -1918,6 +1918,8 @@ pub struct GroupOperations {
 #[derive(Debug, Clone)]
 enum GroupRule {
     PathPrefix { prefix: String, group: String },
+    SourcePrefix { prefix: String, group: String },
+    ExistingGroup { existing: String, group: String },
     Operation { id: String, group: String },
 }
 
@@ -1933,6 +1935,26 @@ impl GroupOperations {
     pub fn by_path_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
         self.rules.push(GroupRule::PathPrefix {
             prefix: prefix.into(),
+            group: group.into(),
+        });
+        self
+    }
+
+    /// Group operations whose source provenance file starts with `prefix`.
+    #[must_use]
+    pub fn by_source_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::SourcePrefix {
+            prefix: prefix.into(),
+            group: group.into(),
+        });
+        self
+    }
+
+    /// Group operations by a source/imported tag already present on the graph.
+    #[must_use]
+    pub fn by_tag(mut self, tag: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::ExistingGroup {
+            existing: tag.into(),
             group: group.into(),
         });
         self
@@ -1956,6 +1978,22 @@ impl Transform for GroupOperations {
                 let matched = match rule {
                     GroupRule::PathPrefix { prefix, group } => {
                         if op.path.starts_with(prefix) {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    GroupRule::SourcePrefix { prefix, group } => {
+                        if op.provenance.file.starts_with(prefix) {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    GroupRule::ExistingGroup { existing, group } => {
+                        if op.group.as_deref() == Some(existing.as_str()) {
                             op.group = Some(group.clone());
                             true
                         } else {
@@ -4398,6 +4436,35 @@ mod tests {
         }
     }
 
+    fn grouped_test_operation(
+        id: &str,
+        method: &str,
+        path: &str,
+        group: Option<&str>,
+        file: &str,
+    ) -> Operation {
+        Operation {
+            id: id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler: id.to_string(),
+            group: group.map(str::to_string),
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: Vec::new(),
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: file.to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }
+    }
+
     fn temp_project(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5378,50 +5445,42 @@ mod tests {
     fn group_operations_overrides_matches_and_preserves_source_groups() {
         let mut ir = ApiGraph {
             operations: vec![
-                Operation {
-                    id: "login".to_string(),
-                    method: "POST".to_string(),
-                    path: "/auth/login".to_string(),
-                    handler: "login".to_string(),
-                    group: Some("auth".to_string()),
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "download".to_string(),
-                    method: "GET".to_string(),
-                    path: "/files/{fileId}".to_string(),
-                    handler: "download".to_string(),
-                    group: Some("files".to_string()),
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
+                grouped_test_operation(
+                    "login",
+                    "POST",
+                    "/auth/login",
+                    Some("auth"),
+                    "app/auth/routes.py",
+                ),
+                grouped_test_operation(
+                    "download",
+                    "GET",
+                    "/files/{fileId}",
+                    Some("files"),
+                    "app/files/routes.py",
+                ),
+                grouped_test_operation(
+                    "createAdmin",
+                    "POST",
+                    "/admin/users",
+                    Some("Admin"),
+                    "app/admin/routes.py",
+                ),
             ],
             ..ApiGraph::default()
         };
 
         GroupOperations::new()
             .by_operation("login", "session")
+            .by_source_prefix("app/files", "downloads")
+            .by_tag("Admin", "backoffice")
             .by_path_prefix("/missing", "unused")
             .apply(&mut ir, &cx())
             .unwrap();
 
         assert_eq!(ir.operations[0].group.as_deref(), Some("session"));
-        assert_eq!(ir.operations[1].group.as_deref(), Some("files"));
+        assert_eq!(ir.operations[1].group.as_deref(), Some("downloads"));
+        assert_eq!(ir.operations[2].group.as_deref(), Some("backoffice"));
     }
 
     #[test]
