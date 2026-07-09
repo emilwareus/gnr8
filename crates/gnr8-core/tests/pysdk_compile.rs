@@ -98,23 +98,7 @@ fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Materialize the generated SDK into a fresh temp dir as an importable `<dir>/bookstore/` package,
-/// returning the temp dir (the package PARENT). Python needs NO manifest analog to the Go `go.mod`.
-///
-/// The four files go under `<dir>/bookstore/` so `__init__.py`'s relative imports (`from .client import
-/// Client`) resolve and `python3 -c "import bookstore"` works with `<dir>` as the current dir.
-fn materialize_sdk() -> PathBuf {
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 2 build_graph must succeed (requires python3 for the pyextract sidecar)");
-    // `base_path` is the graph's single source of truth (the FastAPI fixture's is "/"); pass it through
-    // exactly as a Pipeline would (CLAUDE.md rules 3 & 4).
-    let bundle = gnr8::pysdk::generate(&graph, PACKAGE, &graph.base_path)
-        .expect("pysdk::generate must succeed");
-    let dir = unique_temp_dir("ok");
-    let pkg_dir = dir.join(PACKAGE);
-    std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
-        .expect("write_to_dir must materialize the SDK");
+fn write_pydantic_stub(dir: &Path) {
     std::fs::write(
         dir.join("pydantic.py"),
         r#"class ConfigDict(dict):
@@ -166,7 +150,110 @@ class BaseModel:
 "#,
     )
     .expect("write pydantic stub");
+}
+
+/// Materialize the generated SDK into a fresh temp dir as an importable `<dir>/bookstore/` package,
+/// returning the temp dir (the package PARENT). Python needs NO manifest analog to the Go `go.mod`.
+///
+/// The four files go under `<dir>/bookstore/` so `__init__.py`'s relative imports (`from .client import
+/// Client`) resolve and `python3 -c "import bookstore"` works with `<dir>` as the current dir.
+fn materialize_sdk_from_graph(
+    label: &str,
+    graph: &gnr8::graph::ApiGraph,
+    base_path: &str,
+) -> PathBuf {
+    let bundle =
+        gnr8::pysdk::generate(graph, PACKAGE, base_path).expect("pysdk::generate must succeed");
+    let dir = unique_temp_dir(label);
+    let pkg_dir = dir.join(PACKAGE);
+    std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
+        .expect("write_to_dir must materialize the SDK");
+    write_pydantic_stub(&dir);
     dir
+}
+
+fn materialize_sdk() -> PathBuf {
+    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+        .expect("Phase 2 build_graph must succeed (requires python3 for the pyextract sidecar)");
+    // `base_path` is the graph's single source of truth (the FastAPI fixture's is "/"); pass it through
+    // exactly as a Pipeline would (CLAUDE.md rules 3 & 4).
+    materialize_sdk_from_graph("ok", &graph, &graph.base_path)
+}
+
+fn auth_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "getBearer",
+              "method": "GET",
+              "path": "/bearer",
+              "handler": "getBearer",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BearerAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "getBasic",
+              "method": "GET",
+              "path": "/basic",
+              "handler": "getBasic",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BasicAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "main.py", "start_line": 3, "end_line": 3 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "API",
+          "security": [
+            {
+              "id": "QueryAuth",
+              "kind": "apiKey",
+              "location": "query",
+              "name": "api_key",
+              "global": true
+            },
+            {
+              "id": "BearerAuth",
+              "kind": "http",
+              "location": "",
+              "name": "bearer",
+              "global": false
+            },
+            {
+              "id": "BasicAuth",
+              "kind": "http",
+              "location": "",
+              "name": "basic",
+              "global": false
+            }
+          ]
+        }"#,
+    )
+    .expect("auth graph json")
 }
 
 /// PYSDK-02 (a)+(b) + PYSDK-01: the generated SDK `py_compile`s every file (syntax), `import`s cleanly
@@ -376,6 +463,66 @@ if __name__ == "__main__":
     main()
 "#;
 
+const AUTH_DRIVER: &str = r#"import threading
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import bookstore
+
+
+class _Handler(BaseHTTPRequestHandler):
+    seen = []
+
+    def log_message(self, *args):
+        pass
+
+    def _send_no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        _Handler.seen.append(parsed.path)
+        if parsed.path == "/api/items":
+            query = urllib.parse.parse_qs(parsed.query)
+            assert query.get("api_key") == ["secret"], query
+        elif parsed.path == "/api/bearer":
+            assert self.headers.get("Authorization") == "Bearer secret-token", self.headers
+        elif parsed.path == "/api/basic":
+            assert self.headers.get("Authorization") == "Basic dXNlcjpwYXNz", self.headers
+        else:
+            raise AssertionError(f"unexpected path {parsed.path}")
+        self._send_no_content()
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = bookstore.Client(
+            f"http://127.0.0.1:{port}",
+            api_key="secret",
+            bearer_token="secret-token",
+            basic_auth=("user", "pass"),
+            opener=urllib.request.build_opener(),
+        )
+        assert client.list_items() is None
+        assert client.get_bearer() is None
+        assert client.get_basic() is None
+        assert _Handler.seen == ["/api/items", "/api/bearer", "/api/basic"], _Handler.seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 /// PYSDK-02 (c): the generated SDK round-trips against a stdlib `http.server` via an injected
 /// `OpenerDirector` — a 2xx model decode AND a 4xx → typed `ApiError(is_not_found())`. The driver
 /// is written to a file under the package PARENT and run by path so `import bookstore` resolves.
@@ -400,6 +547,29 @@ fn generated_sdk_round_trips_against_stdlib_http_server() {
     assert!(
         result.is_ok(),
         "the stdlib http.server round-trip driver must pass (2xx model + 4xx ApiError): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+/// AUTH-04: generated Python SDK auth settings are observable at runtime against a stdlib HTTP server:
+/// query API-key, bearer token, and basic auth all reach the request generated by the client.
+#[test]
+fn generated_sdk_sends_auth_against_stdlib_http_server() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile auth round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let graph = auth_graph();
+    let dir = materialize_sdk_from_graph("auth", &graph, &graph.base_path);
+    let driver = dir.join("auth_driver.py");
+    std::fs::write(&driver, AUTH_DRIVER).expect("write auth driver");
+
+    let driver_str = driver.to_str().expect("utf-8 path");
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "the stdlib auth driver must pass (query API key + bearer + basic): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

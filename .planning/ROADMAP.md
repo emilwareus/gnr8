@@ -44,8 +44,8 @@ Full detail: `.planning/milestones/v2.0-ROADMAP.md` · Audit: `.planning/milesto
 Full requirements: `.planning/REQUIREMENTS.md` · Research: `thoughts/research/adoption-support.md`
 
 - [x] Phase 1: SDK Semantic Model Foundation — introduce the shared SDK planning layer used by all SDK targets.
-- [ ] Phase 2: Auth And Typed Error Runtime — auth and typed error behavior implemented; runtime auth
-      verification remains before closing the phase.
+- [x] Phase 2: Auth And Typed Error Runtime — auth and typed error behavior implemented and verified
+      across available SDK runtime toolchains.
 - [ ] Phase 3: Stable SDK Surface And Readiness — stabilize naming/grouping, expose SDK readiness in `doctor`, and normalize package metadata.
 - [ ] Phase 4: SDK Runtime Ergonomics — add pagination helpers, conservative retries/timeouts/idempotency, and transport hooks.
 - [ ] Phase 5: API Metadata And Common Content Types — propagate operation metadata/examples/error docs and round out common content types.
@@ -148,7 +148,7 @@ endpoint surfaces.
 | 5. TypeScript Target — `TsSdk` | v2.0 | 3/3 | Complete | 2026-06-26 |
 | 6. Cross-Language Hardening + Examples + Docs | v2.0 | 3/3 | Complete | 2026-06-26 |
 | 1. SDK Semantic Model Foundation | v3.0 | 1/1 | Complete | 2026-07-09 |
-| 2. Auth And Typed Error Runtime | v3.0 | 3/4 | In Progress | — |
+| 2. Auth And Typed Error Runtime | v3.0 | 4/4 | Complete | 2026-07-09 |
 | 3. Stable SDK Surface And Readiness | v3.0 | 0/? | Planned | — |
 | 4. SDK Runtime Ergonomics | v3.0 | 0/? | Planned | — |
 | 5. API Metadata And Common Content Types | v3.0 | 0/? | Planned | — |

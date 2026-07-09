@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress.
+Complete.
 
 ## Completed Plans
 
@@ -14,6 +14,9 @@ In progress.
 - 02-03 Typed SDK Error Runtime: added shared non-2xx response-body resolution, enriched Go/Python/
   TypeScript base SDK error objects with status, headers/request ID, raw body, parsed JSON body, and
   decoded declared error-body access, plus Go/Python runtime smoke and target generator assertions.
+- 02-04 Cross-Target Auth Runtime Smoke: added Python stdlib HTTP runtime smoke for query API-key,
+  bearer, and basic auth, complementing the existing Go runtime smoke. TypeScript runtime execution
+  remains skip-gated by the local Node/tsc availability.
 
 ## Verification
 
@@ -41,7 +44,12 @@ Plan 3 verification passed on 2026-07-09:
 - `cargo test -p gnr8 body_op_has -- --nocapture`
 - `cargo clippy -p gnr8 --all-targets -- -D warnings`
 
+Plan 4 verification passed on 2026-07-09:
+
+- `cargo test -p gnr8 generated_sdk -- --nocapture`
+- `cargo test -p gnr8 auth -- --nocapture`
+- `cargo clippy -p gnr8 --all-targets -- -D warnings`
+
 ## Remaining
 
-- Cross-target auth runtime smoke coverage beyond the existing Go smoke tests where local toolchains are
-  available.
+None for Phase 2.
