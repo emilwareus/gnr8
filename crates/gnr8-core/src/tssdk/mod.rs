@@ -1596,11 +1596,10 @@ fn emit_axios_operation_method(
         "    if (response.status < 200 || response.status >= 300) {{"
     )
     .map_err(ts_mod_sink)?;
-    writeln!(
-        out,
-        "      throw new ApiError(response.status, response.data);"
-    )
-    .map_err(ts_mod_sink)?;
+    writeln!(out, "      throw new ApiError(response.status, {{").map_err(ts_mod_sink)?;
+    writeln!(out, "        body: response.data,").map_err(ts_mod_sink)?;
+    writeln!(out, "        jsonBody: response.data,").map_err(ts_mod_sink)?;
+    writeln!(out, "      }});").map_err(ts_mod_sink)?;
     writeln!(out, "    }}").map_err(ts_mod_sink)?;
     if success.has_binary_body() {
         if response_policy == TsResponsePolicy::DataOnly && success.has_bodyless_alternative() {
@@ -2126,8 +2125,10 @@ mod tests {
     #[test]
     fn generated_client_contains_the_operation_methods_and_models_the_enum() {
         let out = generate(&sample_graph(), "bookstore", "/").unwrap();
-        assert!(out.contains("async createBook(body: models.Book)"), "{out}");
-        assert!(out.contains("async listBooks(cursor?: string)"), "{out}");
+        assert!(out.contains("async createBook("), "{out}");
+        assert!(out.contains("body: models.Book"), "{out}");
+        assert!(out.contains("async listBooks("), "{out}");
+        assert!(out.contains("cursor?: string"), "{out}");
         assert!(
             out.contains("export type BookFormat = \"hardcover\" | \"paperback\";"),
             "{out}"

@@ -31,7 +31,7 @@ use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, join_path, operation_api_key_headers,
     operation_api_key_queries, operation_api_key_schemes, operation_http_auth_schemes, path_tokens,
     path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, ApiKeyLocation, HttpAuthScheme, SuccessResponses,
+    success_responses_of, ApiKeyLocation, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
 use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -3615,6 +3615,7 @@ fn emit_operations_inner(
     include_facades: bool,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
+    let body_encodings = request_body_encodings(ops, graph)?;
     let mut first = true;
     for op in ops {
         if !first {
@@ -3624,12 +3625,48 @@ fn emit_operations_inner(
         emit_operation(&mut body, op, graph, base_path)?;
         emit_pagination_helpers(&mut body, op, graph)?;
     }
+    emit_request_body_helpers(&mut body, &body_encodings)?;
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
     // need strconv/time. This stays correct when split layout emits one operation per file.
     let mut imports: Vec<&str> = vec!["context", "encoding/json", "io", "net/http"];
-    if ops.iter().any(|op| op.request_body.is_some()) {
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::Json
+                | RequestBodyEncoding::Multipart
+                | RequestBodyEncoding::Binary
+        )
+    }) {
         imports.push("bytes");
+    }
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::Text | RequestBodyEncoding::FormUrlEncoded
+        )
+    }) {
+        imports.push("strings");
+    }
+    if body_encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Text))
+    {
+        imports.push("fmt");
+    }
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart
+        )
+    }) {
+        imports.extend(["fmt", "net/url", "reflect", "strings"]);
+    }
+    if body_encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart))
+    {
+        imports.push("mime/multipart");
     }
     let mut needs_io = ops
         .iter()
@@ -4197,6 +4234,92 @@ fn validate_go_pagination_params(
     Ok(())
 }
 
+fn emit_required_request_body(
+    body: &mut String,
+    encoding: RequestBodyEncoding,
+) -> Result<(), CoreError> {
+    match encoding {
+        RequestBodyEncoding::Json => {
+            writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody := bytes.NewReader(payload)").map_err(sink)?;
+        }
+        RequestBodyEncoding::Text => {
+            writeln!(body, "reqBody := strings.NewReader(fmt.Sprint(in))").map_err(sink)?;
+        }
+        RequestBodyEncoding::FormUrlEncoded => {
+            writeln!(body, "reqBody, err := encodeFormBody(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Multipart => {
+            writeln!(
+                body,
+                "reqBody, reqContentType, err := encodeMultipartBody(in)"
+            )
+            .map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Binary => {
+            writeln!(body, "reqBody := bytes.NewReader([]byte(in))").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_optional_request_body(
+    body: &mut String,
+    encoding: RequestBodyEncoding,
+) -> Result<(), CoreError> {
+    writeln!(body, "var reqBody io.Reader").map_err(sink)?;
+    if encoding == RequestBodyEncoding::Multipart {
+        writeln!(body, "var reqContentType string").map_err(sink)?;
+    }
+    writeln!(body, "if in != nil {{").map_err(sink)?;
+    match encoding {
+        RequestBodyEncoding::Json => {
+            writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
+        }
+        RequestBodyEncoding::Text => {
+            writeln!(body, "reqBody = strings.NewReader(fmt.Sprint(*in))").map_err(sink)?;
+        }
+        RequestBodyEncoding::FormUrlEncoded => {
+            writeln!(body, "var err error").map_err(sink)?;
+            writeln!(body, "reqBody, err = encodeFormBody(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Multipart => {
+            writeln!(body, "var err error").map_err(sink)?;
+            writeln!(body, "var reader *bytes.Reader").map_err(sink)?;
+            writeln!(
+                body,
+                "reader, reqContentType, err = encodeMultipartBody(in)"
+            )
+            .map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody = reader").map_err(sink)?;
+        }
+        RequestBodyEncoding::Binary => {
+            writeln!(body, "reqBody = bytes.NewReader([]byte(*in))").map_err(sink)?;
+        }
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
 /// Emit the body-marshal → URL → request-build → query → auth → execute → decode sequence of a method.
 ///
 /// Split out of [`emit_operation`] so each half stays under the clippy `too_many_lines` ceiling; the
@@ -4216,26 +4339,16 @@ fn emit_request_dispatch(
 ) -> Result<(), CoreError> {
     let body_model = request_body_model_of(op, graph)?;
     let has_body = body_model.is_some();
-    let has_required_body = body_model.as_ref().is_some_and(|body| body.required);
     let has_decode = success.body_model.is_some();
     let has_binary = success.has_binary_body();
 
     // Body marshalling.
-    if has_required_body {
-        writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
-        writeln!(body, "if err != nil {{").map_err(sink)?;
-        writeln!(body, "return out, err").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
-        writeln!(body, "reqBody := bytes.NewReader(payload)").map_err(sink)?;
-    } else if has_body {
-        writeln!(body, "var reqBody io.Reader").map_err(sink)?;
-        writeln!(body, "if in != nil {{").map_err(sink)?;
-        writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
-        writeln!(body, "if err != nil {{").map_err(sink)?;
-        writeln!(body, "return out, err").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
-        writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
+    if let Some(body_info) = &body_model {
+        if body_info.required {
+            emit_required_request_body(body, body_info.encoding)?;
+        } else {
+            emit_optional_request_body(body, body_info.encoding)?;
+        }
     }
 
     // URL construction: baseURL + absolute path with path params interpolated.
@@ -4252,20 +4365,23 @@ fn emit_request_dispatch(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    if has_required_body {
-        writeln!(
-            body,
-            "req.Header.Set(\"Content-Type\", \"application/json\")"
-        )
-        .map_err(sink)?;
-    } else if has_body {
-        writeln!(body, "if in != nil {{").map_err(sink)?;
-        writeln!(
-            body,
-            "req.Header.Set(\"Content-Type\", \"application/json\")"
-        )
-        .map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
+    if let Some(body_info) = &body_model {
+        let content_type = quoted_string_literal(&body_info.content_type);
+        if body_info.required {
+            if body_info.encoding == RequestBodyEncoding::Multipart {
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+            } else {
+                writeln!(body, "req.Header.Set(\"Content-Type\", {content_type})").map_err(sink)?;
+            }
+        } else {
+            writeln!(body, "if in != nil {{").map_err(sink)?;
+            if body_info.encoding == RequestBodyEncoding::Multipart {
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+            } else {
+                writeln!(body, "req.Header.Set(\"Content-Type\", {content_type})").map_err(sink)?;
+            }
+            writeln!(body, "}}").map_err(sink)?;
+        }
     }
 
     // Query parameter encoding.
@@ -4546,6 +4662,227 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
         }
     }
     Ok(extra.into_iter().collect())
+}
+
+fn request_body_encodings(
+    ops: &[&Operation],
+    graph: &ApiGraph,
+) -> Result<Vec<RequestBodyEncoding>, CoreError> {
+    let mut encodings = Vec::new();
+    for op in ops {
+        if let Some(body) = request_body_model_of(op, graph)? {
+            encodings.push(body.encoding);
+        }
+    }
+    encodings.sort_by_key(|encoding| match encoding {
+        RequestBodyEncoding::Json => 0_u8,
+        RequestBodyEncoding::Text => 1,
+        RequestBodyEncoding::FormUrlEncoded => 2,
+        RequestBodyEncoding::Multipart => 3,
+        RequestBodyEncoding::Binary => 4,
+    });
+    encodings.dedup();
+    Ok(encodings)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "request media helper emission writes fixed Go helper source blocks in one deterministic section"
+)]
+fn emit_request_body_helpers(
+    body: &mut String,
+    encodings: &[RequestBodyEncoding],
+) -> Result<(), CoreError> {
+    let needs_form = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::FormUrlEncoded));
+    let needs_multipart = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart));
+    if !needs_form && !needs_multipart {
+        return Ok(());
+    }
+    if needs_form {
+        writeln!(
+            body,
+            r"
+func encodeFormBody(v any) (*strings.Reader, error) {{
+values := url.Values{{}}
+if err := addFormValues(values, v); err != nil {{
+return nil, err
+}}
+return strings.NewReader(values.Encode()), nil
+}}
+"
+        )
+        .map_err(sink)?;
+    }
+    if needs_multipart {
+        writeln!(
+            body,
+            r#"
+func encodeMultipartBody(v any) (*bytes.Reader, string, error) {{
+var buf bytes.Buffer
+writer := multipart.NewWriter(&buf)
+if err := addMultipartValues(writer, v); err != nil {{
+return nil, "", err
+}}
+if err := writer.Close(); err != nil {{
+return nil, "", err
+}}
+return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
+}}
+"#
+        )
+        .map_err(sink)?;
+    }
+    writeln!(
+        body,
+        r#"
+func addFormValues(values url.Values, value any) error {{
+if value == nil {{
+return nil
+}}
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {{
+if reflected.IsNil() {{
+return nil
+}}
+reflected = reflected.Elem()
+}}
+if reflected.Kind() != reflect.Struct {{
+return fmt.Errorf("form body must be a struct")
+}}
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {{
+field := typ.Field(i)
+if field.PkgPath != "" {{
+continue
+}}
+name, omitempty := formFieldName(field)
+if name == "" || name == "-" {{
+continue
+}}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {{
+continue
+}}
+values.Set(name, formValue(fieldValue.Interface()))
+}}
+return nil
+}}
+
+func formFieldName(field reflect.StructField) (string, bool) {{
+tag := field.Tag.Get("form")
+if tag == "" {{
+tag = field.Tag.Get("json")
+}}
+if tag == "-" {{
+return "-", false
+}}
+omitempty := false
+if tag != "" {{
+parts := strings.Split(tag, ",")
+for _, option := range parts[1:] {{
+if option == "omitempty" {{
+omitempty = true
+}}
+}}
+if parts[0] != "" {{
+return parts[0], omitempty
+}}
+}}
+return field.Name, omitempty
+}}
+
+func formValue(value any) string {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return ""
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return ""
+}}
+return formValue(v.Elem().Interface())
+}}
+if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {{
+return fmt.Sprint(value)
+}}
+parts := make([]string, 0, v.Len())
+for i := 0; i < v.Len(); i++ {{
+parts = append(parts, formValue(v.Index(i).Interface()))
+}}
+return strings.Join(parts, ",")
+}}
+"#
+    )
+    .map_err(sink)?;
+    if needs_multipart {
+        writeln!(
+            body,
+            r#"
+func addMultipartValues(writer *multipart.Writer, value any) error {{
+if value == nil {{
+return nil
+}}
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {{
+if reflected.IsNil() {{
+return nil
+}}
+reflected = reflected.Elem()
+}}
+if reflected.Kind() != reflect.Struct {{
+return fmt.Errorf("multipart body must be a struct")
+}}
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {{
+field := typ.Field(i)
+if field.PkgPath != "" {{
+continue
+}}
+name, omitempty := formFieldName(field)
+if name == "" || name == "-" {{
+continue
+}}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {{
+continue
+}}
+if err := writeMultipartField(writer, name, fieldValue.Interface()); err != nil {{
+return err
+}}
+}}
+return nil
+}}
+
+func writeMultipartField(writer *multipart.Writer, name string, value any) error {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return writer.WriteField(name, "")
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return nil
+}}
+return writeMultipartField(writer, name, v.Elem().Interface())
+}}
+if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {{
+part, err := writer.CreateFormFile(name, name)
+if err != nil {{
+return err
+}}
+_, err = part.Write(v.Bytes())
+return err
+}}
+return writer.WriteField(name, formValue(value))
+}}
+"#
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
 }
 
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
@@ -5234,7 +5571,7 @@ mod tests {
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
-                    "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
+                    "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput, opts ...RequestOption) (CommandMessage, error)"
                 ),
                 "ctx must be first, body typed, return the 201 model:\n{out}"
             );
@@ -5260,7 +5597,7 @@ mod tests {
             );
             assert!(
                 out.contains(
-                    "func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (GoalResponse, error)"
+                    "func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...RequestOption) (GoalResponse, error)"
                 ),
                 "{out}"
             );
@@ -5286,7 +5623,7 @@ mod tests {
                 .collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) ([]byte, error)"),
+                out.contains("func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...RequestOption) ([]byte, error)"),
                 "binary success should return raw bytes:\n{out}"
             );
             assert!(out.contains("data, err := io.ReadAll(resp.Body)"), "{out}");
@@ -5315,7 +5652,7 @@ mod tests {
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("func (c *Client) MarkRead(ctx context.Context, in *MarkReadRequest) (struct{}, error)"),
+                out.contains("func (c *Client) MarkRead(ctx context.Context, in *MarkReadRequest, opts ...RequestOption) (struct{}, error)"),
                 "optional bodies must take a pointer input:\n{out}"
             );
             assert!(

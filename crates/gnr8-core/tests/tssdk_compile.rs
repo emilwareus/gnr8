@@ -155,6 +155,151 @@ fn materialize_sdk() -> PathBuf {
     dir
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the media graph is an explicit JSON fixture covering four content types"
+)]
+fn media_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "postText",
+              "method": "POST",
+              "path": "/text",
+              "handler": "postText",
+              "params": [],
+              "request_body": { "ref_id": "dto.TextBody" },
+              "request_body_required": true,
+              "request_body_content_type": "text/plain",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "postForm",
+              "method": "POST",
+              "path": "/form",
+              "handler": "postForm",
+              "params": [],
+              "request_body": { "ref_id": "dto.FormBody" },
+              "request_body_required": true,
+              "request_body_content_type": "application/x-www-form-urlencoded",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "postMultipart",
+              "method": "POST",
+              "path": "/multipart",
+              "handler": "postMultipart",
+              "params": [],
+              "request_body": { "ref_id": "dto.MultipartBody" },
+              "request_body_required": true,
+              "request_body_content_type": "multipart/form-data",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "postBinary",
+              "method": "POST",
+              "path": "/binary",
+              "handler": "postBinary",
+              "params": [],
+              "request_body": { "ref_id": "dto.UploadBytes" },
+              "request_body_required": true,
+              "request_body_content_type": "application/octet-stream",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.FormBody",
+              "name": "FormBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "count",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "name",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.MultipartBody",
+              "name": "MultipartBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "file",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bytes" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "title",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.TextBody",
+              "name": "TextBody",
+              "body": { "type": "primitive", "of": { "prim": "string" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "dto.UploadBytes",
+              "name": "UploadBytes",
+              "body": { "type": "primitive", "of": { "prim": "bytes" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("media graph json")
+}
+
+fn materialize_media_sdk() -> PathBuf {
+    let graph = media_graph();
+    let bundle = gnr8::tssdk::generate(&graph, PACKAGE, &graph.base_path)
+        .expect("media tssdk::generate must succeed");
+    let dir = unique_temp_dir("media");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
+        .expect("write_to_dir must materialize the media SDK");
+    dir
+}
+
 fn materialize_split_sdk() -> PathBuf {
     use gnr8::sdk::prelude::SdkFileLayout;
 
@@ -318,6 +463,41 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     assert!(
         result.is_ok(),
         "tsc --noEmit --strict --lib es2022,dom must type-check the generated SDK (exit 0): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_media_request_bodies_typecheck_with_consumer() {
+    if !toolchain_available() {
+        eprintln!("skipping tssdk_compile media typecheck: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_media_sdk();
+    std::fs::write(
+        dir.join("media_consumer.ts"),
+        r#"
+import { Client } from "./index";
+
+async function smoke(client: Client): Promise<void> {
+  await client.postText("hello");
+  await client.postForm({ name: "Ada", count: 3 });
+  await client.postMultipart({ title: "Report", file: new Uint8Array([1, 2, 3]) });
+  await client.postBinary(new Uint8Array([1, 2, 3]));
+}
+
+void smoke;
+"#,
+    )
+    .expect("write media consumer");
+
+    let ts_files = collect_ts_files(&dir);
+    let ts_file_refs: Vec<&str> = ts_files.iter().map(String::as_str).collect();
+    let result = run_tsc(&ts_file_refs, &dir);
+    assert!(
+        result.is_ok(),
+        "media SDK and consumer must type-check (text + form + multipart + binary): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

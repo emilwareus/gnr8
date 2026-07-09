@@ -586,10 +586,31 @@ pub(crate) struct ErrorResponseBody {
 /// The request-body shape an SDK operation can accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequestBodyModel {
+    /// The referenced request schema id.
+    pub(crate) schema_id: String,
     /// The referenced request model name.
     pub(crate) model: String,
     /// Whether callers must provide the body.
     pub(crate) required: bool,
+    /// Request media type.
+    pub(crate) content_type: String,
+    /// Runtime body encoder requested by the media type.
+    pub(crate) encoding: RequestBodyEncoding,
+}
+
+/// Request body media encoding supported by generated SDKs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestBodyEncoding {
+    /// JSON request body.
+    Json,
+    /// Raw UTF-8 `text/plain` request body.
+    Text,
+    /// `application/x-www-form-urlencoded` request body.
+    FormUrlEncoded,
+    /// `multipart/form-data` request body.
+    Multipart,
+    /// Raw binary upload request body.
+    Binary,
 }
 
 impl SuccessResponses {
@@ -766,10 +787,70 @@ pub(crate) fn request_body_model_of(
                 op.id, body.ref_id
             ),
         })?;
+    let content_type = op
+        .request_body_content_type
+        .clone()
+        .unwrap_or_else(|| "application/json".to_string());
+    let encoding = request_body_encoding(&content_type).ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "operation '{}' request body content type '{}' is unsupported by generated SDKs; \
+             supported request media types are application/json, text/plain, \
+             application/x-www-form-urlencoded, multipart/form-data, and application/octet-stream",
+            op.id, content_type
+        ),
+    })?;
+    validate_request_body_schema(op, model, encoding)?;
     Ok(Some(RequestBodyModel {
+        schema_id: model.id.clone(),
         model: model.name.clone(),
         required: op.request_body_required,
+        content_type,
+        encoding,
     }))
+}
+
+fn request_body_encoding(content_type: &str) -> Option<RequestBodyEncoding> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "application/json" => Some(RequestBodyEncoding::Json),
+        "text/plain" => Some(RequestBodyEncoding::Text),
+        "application/x-www-form-urlencoded" => Some(RequestBodyEncoding::FormUrlEncoded),
+        "multipart/form-data" => Some(RequestBodyEncoding::Multipart),
+        "application/octet-stream" => Some(RequestBodyEncoding::Binary),
+        _ => None,
+    }
+}
+
+fn validate_request_body_schema(
+    op: &Operation,
+    schema: &Schema,
+    encoding: RequestBodyEncoding,
+) -> Result<(), CoreError> {
+    let ok = match encoding {
+        RequestBodyEncoding::Json => true,
+        RequestBodyEncoding::Text => matches!(
+            &schema.body,
+            Type::Primitive(Prim::String) | Type::WellKnown(_) | Type::Enum(_) | Type::Named(_)
+        ),
+        RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart => {
+            matches!(&schema.body, Type::Object(_))
+        }
+        RequestBodyEncoding::Binary => matches!(&schema.body, Type::Primitive(Prim::Bytes)),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(CoreError::SdkGen {
+        message: format!(
+            "operation '{}' request body schema '{}' cannot be encoded as {:?}",
+            op.id, schema.name, encoding
+        ),
+    })
 }
 
 #[cfg(test)]

@@ -148,6 +148,7 @@ pub(crate) fn generate_files_with_options(
         http_auth.basic,
         &model_refs,
         &graph.runtime,
+        !split_operations && !graph.pagination.is_empty(),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);
@@ -379,7 +380,15 @@ fn emit_operation_file(
     let mut out = String::from("from __future__ import annotations\n\n");
     out.push_str("import json\n");
     out.push_str("import urllib.parse\n");
-    out.push_str("from typing import Any, Iterator, Optional\n\n");
+    if ops.iter().any(|op| {
+        graph
+            .pagination
+            .iter()
+            .any(|policy| policy.operation_id == op.id)
+    }) {
+        out.push_str("from collections.abc import Iterator\n");
+    }
+    out.push_str("from typing import Any, Optional\n\n");
     let prefix = py_relative_prefix(file_name);
     let _ = writeln!(out, "from {prefix}client import Client");
     let model_refs = emit::client_referenced_models(graph, ops)?;
@@ -661,8 +670,10 @@ mod tests {
     #[test]
     fn generated_client_contains_the_operation_methods_and_models_the_enum() {
         let out = generate(&sample_graph(), "bookstore", "/").unwrap();
-        assert!(out.contains("def create_book(self, body: Book)"), "{out}");
-        assert!(out.contains("def list_books(self, cursor=None)"), "{out}");
+        assert!(out.contains("def create_book("), "{out}");
+        assert!(out.contains("body: Book"), "{out}");
+        assert!(out.contains("def list_books("), "{out}");
+        assert!(out.contains("cursor=None"), "{out}");
         assert!(out.contains("class BookFormat(str, enum.Enum):"), "{out}");
         assert!(out.contains("class Book(BaseModel):"), "{out}");
         assert!(out.contains("from pydantic import BaseModel"), "{out}");

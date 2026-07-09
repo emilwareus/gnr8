@@ -102,7 +102,14 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
 
     let ts_client = artifact(&outcome, "generated/ts/client.ts");
     assert!(
-        ts_client.contains("const res = await this._request(\"PATCH\", path, headers, body);"),
+        ts_client.contains("headers[\"Content-Type\"] = \"application/json\";"),
+        "{ts_client}"
+    );
+    assert!(
+        ts_client.contains("const res = await this._request(")
+            && ts_client.contains("\"PATCH\",")
+            && ts_client.contains("body,")
+            && ts_client.contains("operationId: \"updateItem\","),
         "{ts_client}"
     );
     assert!(ts_client.contains("Promise<Blob>"), "{ts_client}");

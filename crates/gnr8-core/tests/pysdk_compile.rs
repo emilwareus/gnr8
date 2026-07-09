@@ -256,6 +256,141 @@ fn auth_graph() -> gnr8::graph::ApiGraph {
     .expect("auth graph json")
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the media graph is an explicit JSON fixture covering four content types"
+)]
+fn media_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "postText",
+              "method": "POST",
+              "path": "/text",
+              "handler": "postText",
+              "params": [],
+              "request_body": { "ref_id": "dto.TextBody" },
+              "request_body_required": true,
+              "request_body_content_type": "text/plain",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "postForm",
+              "method": "POST",
+              "path": "/form",
+              "handler": "postForm",
+              "params": [],
+              "request_body": { "ref_id": "dto.FormBody" },
+              "request_body_required": true,
+              "request_body_content_type": "application/x-www-form-urlencoded",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "postMultipart",
+              "method": "POST",
+              "path": "/multipart",
+              "handler": "postMultipart",
+              "params": [],
+              "request_body": { "ref_id": "dto.MultipartBody" },
+              "request_body_required": true,
+              "request_body_content_type": "multipart/form-data",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "postBinary",
+              "method": "POST",
+              "path": "/binary",
+              "handler": "postBinary",
+              "params": [],
+              "request_body": { "ref_id": "dto.UploadBytes" },
+              "request_body_required": true,
+              "request_body_content_type": "application/octet-stream",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.py", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.FormBody",
+              "name": "FormBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "count",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "name",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.MultipartBody",
+              "name": "MultipartBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "file",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bytes" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "title",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.TextBody",
+              "name": "TextBody",
+              "body": { "type": "primitive", "of": { "prim": "string" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "dto.UploadBytes",
+              "name": "UploadBytes",
+              "body": { "type": "primitive", "of": { "prim": "bytes" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.py", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("media graph json")
+}
+
 fn runtime_graph() -> gnr8::graph::ApiGraph {
     let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
         r#"{
@@ -677,6 +812,74 @@ if __name__ == "__main__":
     main()
 "#;
 
+const MEDIA_DRIVER: &str = r#"import threading
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import bookstore
+
+
+class _Handler(BaseHTTPRequestHandler):
+    seen = []
+
+    def log_message(self, *args):
+        pass
+
+    def _send_no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        _Handler.seen.append(self.path)
+        if self.path == "/text":
+            assert self.headers.get("Content-Type") == "text/plain", self.headers
+            assert body == b"hello", body
+        elif self.path == "/form":
+            assert self.headers.get("Content-Type") == "application/x-www-form-urlencoded", self.headers
+            values = urllib.parse.parse_qs(body.decode("utf-8"))
+            assert values == {"count": ["3"], "name": ["Ada"]}, values
+        elif self.path == "/multipart":
+            assert self.headers.get("Content-Type", "").startswith("multipart/form-data; boundary="), self.headers
+            assert b'name="title"' in body, body
+            assert b"Report" in body, body
+            assert b'name="file"; filename="file"' in body, body
+            assert b"abc123" in body, body
+        elif self.path == "/binary":
+            assert self.headers.get("Content-Type") == "application/octet-stream", self.headers
+            assert body == b"raw-bytes", body
+        else:
+            raise AssertionError(f"unexpected path {self.path}")
+        self._send_no_content()
+
+
+def main():
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = bookstore.Client(
+            f"http://127.0.0.1:{port}",
+            opener=urllib.request.build_opener(),
+        )
+        assert client.post_text("hello") is None
+        assert client.post_form(bookstore.FormBody(name="Ada", count=3)) is None
+        assert client.post_multipart(bookstore.MultipartBody(title="Report", file=b"abc123")) is None
+        assert client.post_binary(b"raw-bytes") is None
+        assert _Handler.seen == ["/text", "/form", "/multipart", "/binary"], _Handler.seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 const RUNTIME_DRIVER: &str = r#"import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -885,6 +1088,30 @@ fn generated_sdk_sends_auth_against_stdlib_http_server() {
     assert!(
         result.is_ok(),
         "the stdlib auth driver must pass (query API key + bearer + basic): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+/// MEDIA-01: generated Python SDK clients send the common request body media types with the correct
+/// body encoder and `Content-Type`: text/plain, application/x-www-form-urlencoded, multipart/form-data,
+/// and application/octet-stream.
+#[test]
+fn generated_sdk_media_request_bodies_work_against_stdlib_http_server() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile media round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let graph = media_graph();
+    let dir = materialize_sdk_from_graph("media", &graph, &graph.base_path);
+    let driver = dir.join("media_driver.py");
+    std::fs::write(&driver, MEDIA_DRIVER).expect("write media driver");
+
+    let driver_str = driver.to_str().expect("utf-8 path");
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "the stdlib media driver must pass (text + form + multipart + binary): {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

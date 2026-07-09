@@ -37,7 +37,7 @@ use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
     path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, ErrorResponseBody, HttpAuthScheme, SuccessResponses,
+    success_responses_of, ErrorResponseBody, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -693,9 +693,18 @@ export interface HookContext {{
   responseHeaders?: Headers;
 }}
 
-export type RequestHook = (context: HookContext, init: RequestInit) => void | Promise<void>;
-export type ResponseHook = (context: HookContext, response: Response) => void | Promise<void>;
-export type ErrorHook = (context: HookContext, error: unknown) => void | Promise<void>;
+export type RequestHook = (
+  context: HookContext,
+  init: RequestInit,
+) => void | Promise<void>;
+export type ResponseHook = (
+  context: HookContext,
+  response: Response,
+) => void | Promise<void>;
+export type ErrorHook = (
+  context: HookContext,
+  error: unknown,
+) => void | Promise<void>;
 
 export interface ClientHooks {{
   request?: RequestHook[];
@@ -711,8 +720,7 @@ export interface ClientOptions {{
   timeoutMs?: number;
   maxRetries?: number;
   hooks?: ClientHooks;
-{bearer_option}{basic_option}
-}}
+{bearer_option}{basic_option}}}
 
 interface RuntimeRequestContext {{
   operationId: string;
@@ -732,7 +740,6 @@ export class Client {{
   private readonly retryUnsafeMethods: boolean;
   private readonly hooks: Required<ClientHooks>;
 {bearer_field}{basic_field}
-
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
@@ -747,8 +754,7 @@ export class Client {{
       response: opts.hooks?.response ?? [],
       error: opts.hooks?.error ?? [],
     }};
-{bearer_init}{basic_init}
-  }}
+{bearer_init}{basic_init}  }}
 
   _apiKey(...names: string[]): string | undefined {{
     for (const name of names) {{
@@ -760,6 +766,62 @@ export class Client {{
     return this.apiKey;
   }}
 {bearer_helper}{basic_helper}
+  private _encodeBody(body: unknown): BodyInit | undefined {{
+    if (body === undefined) {{
+      return undefined;
+    }}
+    if (
+      body instanceof URLSearchParams ||
+      body instanceof FormData ||
+      body instanceof Blob ||
+      body instanceof ArrayBuffer ||
+      typeof body === \"string\"
+    ) {{
+      return body;
+    }}
+    if (ArrayBuffer.isView(body)) {{
+      return new Blob([body as unknown as BlobPart]);
+    }}
+    return JSON.stringify(body);
+  }}
+
+  private _formBody(body: unknown): URLSearchParams {{
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(
+      body as Record<string, unknown>,
+    )) {{
+      if (value === undefined || value === null) {{
+        continue;
+      }}
+      if (Array.isArray(value)) {{
+        for (const item of value) {{
+          params.append(key, String(item));
+        }}
+      }} else {{
+        params.set(key, String(value));
+      }}
+    }}
+    return params;
+  }}
+
+  private _multipartBody(body: unknown): FormData {{
+    const form = new FormData();
+    for (const [key, value] of Object.entries(
+      body as Record<string, unknown>,
+    )) {{
+      if (value === undefined || value === null) {{
+        continue;
+      }}
+      if (value instanceof Blob) {{
+        form.append(key, value);
+      }} else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {{
+        form.append(key, new Blob([value as BlobPart]), key);
+      }} else {{
+        form.append(key, String(value));
+      }}
+    }}
+    return form;
+  }}
 
   async _request(
     method: string,
@@ -773,24 +835,32 @@ export class Client {{
     const url = `${{this.baseUrl}}${{path}}`;
     const requestMetadata = options.metadata ?? {{}};
     if (context.idempotent === true && options.idempotencyKey !== undefined) {{
-      headers[context.idempotencyKeyHeader ?? \"Idempotency-Key\"] = options.idempotencyKey;
+      headers[context.idempotencyKeyHeader ?? \"Idempotency-Key\"] =
+        options.idempotencyKey;
     }}
     const maxRetries = Math.max(0, options.maxRetries ?? this.maxRetries);
     const retryAttempts =
-      this.retryUnsafeMethods || context.idempotent === true || this._retryableMethod(method)
+      this.retryUnsafeMethods ||
+      context.idempotent === true ||
+      this._retryableMethod(method)
         ? maxRetries
         : 0;
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
-    const bodyText = body === undefined ? undefined : JSON.stringify(body);
+    const bodyPayload = this._encodeBody(body);
     let lastError: unknown = undefined;
     for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {{
-      const controller = timeoutMs !== undefined && timeoutMs > 0 ? new AbortController() : undefined;
+      const controller =
+        timeoutMs !== undefined && timeoutMs > 0
+          ? new AbortController()
+          : undefined;
       const timeoutId =
-        controller === undefined ? undefined : setTimeout(() => controller.abort(), timeoutMs);
+        controller === undefined
+          ? undefined
+          : setTimeout(() => controller.abort(), timeoutMs);
       const init: RequestInit = {{
         method,
         headers,
-        body: bodyText,
+        body: bodyPayload,
         signal: controller?.signal,
       }};
       const hookContext: HookContext = {{
@@ -814,12 +884,17 @@ export class Client {{
         for (const hook of this.hooks.response) {{
           await hook(hookContext, response);
         }}
-        if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {{
+        if (
+          this._shouldRetryStatus(response.status) &&
+          attempt < retryAttempts
+        ) {{
           await this._sleep(this._retryDelayMs(response));
           continue;
         }}
         if (response.status < 200 || response.status >= 300) {{
-          const error = new ApiError(response.status, {{ headers: response.headers }});
+          const error = new ApiError(response.status, {{
+            headers: response.headers,
+          }});
           for (const hook of this.hooks.error) {{
             await hook(hookContext, error);
           }}
@@ -843,7 +918,13 @@ export class Client {{
   }}
 
   private _retryableMethod(method: string): boolean {{
-    return method === \"GET\" || method === \"HEAD\" || method === \"OPTIONS\" || method === \"PUT\" || method === \"DELETE\";
+    return (
+      method === \"GET\" ||
+      method === \"HEAD\" ||
+      method === \"OPTIONS\" ||
+      method === \"PUT\" ||
+      method === \"DELETE\"
+    );
   }}
 
   private _shouldRetryStatus(status: number): boolean {{
@@ -1305,14 +1386,14 @@ fn emit_operation(
         args.push(format!("{ident}: {ty}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: models.{}", body.model));
+        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
     }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body?: models.{}", body.model));
+        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
@@ -1358,7 +1439,7 @@ fn emit_operation(
         out,
         &op.method,
         &success,
-        TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
+        TsRequestBody::from_body(body_model.as_ref()),
         &auth_headers,
         &auth_http,
         &error_bodies,
@@ -1611,7 +1692,7 @@ fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationAr
         call_args.push(ident.clone());
     }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: models.{}", body.model));
+        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
         call_args.push("body".to_string());
     }
     for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
@@ -1620,7 +1701,7 @@ fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationAr
         call_args.push(ident.clone());
     }
     if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body?: models.{}", body.model));
+        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
         call_args.push("body".to_string());
     }
     for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
@@ -1867,15 +1948,27 @@ fn emit_op_query(
 #[derive(Clone, Copy)]
 enum TsRequestBody {
     None,
-    Optional,
-    Required,
+    Optional {
+        encoding: RequestBodyEncoding,
+        content_type: &'static str,
+    },
+    Required {
+        encoding: RequestBodyEncoding,
+        content_type: &'static str,
+    },
 }
 
 impl TsRequestBody {
-    fn from_required(required: Option<bool>) -> Self {
-        match required {
-            Some(true) => Self::Required,
-            Some(false) => Self::Optional,
+    fn from_body(body: Option<&crate::sdk::emit_common::RequestBodyModel>) -> Self {
+        match body {
+            Some(body) if body.required => Self::Required {
+                encoding: body.encoding,
+                content_type: ts_static_content_type(&body.content_type),
+            },
+            Some(body) => Self::Optional {
+                encoding: body.encoding,
+                content_type: ts_static_content_type(&body.content_type),
+            },
             None => Self::None,
         }
     }
@@ -1885,8 +1978,113 @@ impl TsRequestBody {
     }
 
     fn is_required(self) -> bool {
-        matches!(self, Self::Required)
+        matches!(self, Self::Required { .. })
     }
+
+    fn encoding(self) -> Option<RequestBodyEncoding> {
+        match self {
+            Self::None => None,
+            Self::Optional { encoding, .. } | Self::Required { encoding, .. } => Some(encoding),
+        }
+    }
+
+    fn content_type(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Optional { content_type, .. } | Self::Required { content_type, .. } => {
+                Some(content_type)
+            }
+        }
+    }
+}
+
+fn ts_static_content_type(content_type: &str) -> &'static str {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "text/plain" => "text/plain",
+        "application/x-www-form-urlencoded" => "application/x-www-form-urlencoded",
+        "multipart/form-data" => "multipart/form-data",
+        "application/octet-stream" => "application/octet-stream",
+        _ => "application/json",
+    }
+}
+
+fn ts_request_body_arg_type(
+    body: &crate::sdk::emit_common::RequestBodyModel,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    match body.encoding {
+        RequestBodyEncoding::Text => Ok("string".to_string()),
+        RequestBodyEncoding::Binary => Ok("Blob | ArrayBuffer | Uint8Array".to_string()),
+        RequestBodyEncoding::Multipart => ts_multipart_request_body_arg_type(body, graph),
+        RequestBodyEncoding::Json | RequestBodyEncoding::FormUrlEncoded => {
+            Ok(format!("models.{}", body.model))
+        }
+    }
+}
+
+fn ts_multipart_request_body_arg_type(
+    body: &crate::sdk::emit_common::RequestBodyModel,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.id == body.schema_id)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "multipart request body model '{}' references missing schema '{}'",
+                body.model, body.schema_id
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "multipart request body model '{}' must be an object schema",
+                body.model
+            ),
+        });
+    };
+    let mut parts = Vec::with_capacity(fields.len());
+    for field in fields {
+        let key = if is_ident(&field.json_name) {
+            field.json_name.clone()
+        } else {
+            ts_string_literal(&field.json_name)
+        };
+        let optional = if field.required && !field.optional {
+            ""
+        } else {
+            "?"
+        };
+        let ty = ts_multipart_field_type(&field.schema, field.nullable, graph)?;
+        parts.push(format!("{key}{optional}: {ty}"));
+    }
+    Ok(format!("{{ {} }}", parts.join("; ")))
+}
+
+fn ts_multipart_field_type(
+    schema: &Type,
+    nullable: bool,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    let mut ty = match schema {
+        Type::Primitive(Prim::Bytes) => "Blob | ArrayBuffer | Uint8Array".to_string(),
+        Type::Array(items) if matches!(items.as_ref(), Type::Primitive(Prim::Bytes)) => {
+            "Array<Blob | ArrayBuffer | Uint8Array>".to_string()
+        }
+        _ => ts_type(schema, false, graph, "models.")?,
+    };
+    if nullable {
+        ty.push_str(" | null");
+    }
+    Ok(ty)
 }
 
 fn emit_error_throw_branch(
@@ -1931,9 +2129,52 @@ fn emit_error_throw_branch(
     Ok(())
 }
 
+fn emit_ts_request_body_arg(
+    out: &mut String,
+    request_body: TsRequestBody,
+) -> Result<&'static str, CoreError> {
+    let Some(encoding) = request_body.encoding() else {
+        return Ok("undefined");
+    };
+    match encoding {
+        RequestBodyEncoding::FormUrlEncoded => {
+            if request_body.is_required() {
+                writeln!(out, "    const requestBody = this._formBody(body);").map_err(sink)?;
+            } else {
+                writeln!(
+                    out,
+                    "    const requestBody = body === undefined ? undefined : this._formBody(body);"
+                )
+                .map_err(sink)?;
+            }
+            Ok("requestBody")
+        }
+        RequestBodyEncoding::Multipart => {
+            if request_body.is_required() {
+                writeln!(out, "    const requestBody = this._multipartBody(body);")
+                    .map_err(sink)?;
+            } else {
+                writeln!(
+                    out,
+                    "    const requestBody = body === undefined ? undefined : this._multipartBody(body);"
+                )
+                .map_err(sink)?;
+            }
+            Ok("requestBody")
+        }
+        RequestBodyEncoding::Json | RequestBodyEncoding::Text | RequestBodyEncoding::Binary => {
+            Ok("body")
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "operation dispatch emission needs the operation, graph, auth, response, and body facts at one write site"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "operation dispatch emission writes the complete fetch request path in one deterministic block"
 )]
 fn emit_op_dispatch(
     out: &mut String,
@@ -1977,38 +2218,64 @@ fn emit_op_dispatch(
         writeln!(out, "    }}").map_err(sink)?;
     }
     if request_body.is_required() {
-        writeln!(out, "    headers[\"Content-Type\"] = \"application/json\";").map_err(sink)?;
+        if request_body.encoding() != Some(RequestBodyEncoding::Multipart) {
+            let content_type = request_body.content_type().unwrap_or("application/json");
+            writeln!(
+                out,
+                "    headers[\"Content-Type\"] = {};",
+                quoted_string_literal(content_type)
+            )
+            .map_err(sink)?;
+        }
     } else if request_body.is_present() {
         writeln!(out, "    if (body !== undefined) {{").map_err(sink)?;
-        writeln!(
-            out,
-            "      headers[\"Content-Type\"] = \"application/json\";"
-        )
-        .map_err(sink)?;
+        if request_body.encoding() != Some(RequestBodyEncoding::Multipart) {
+            let content_type = request_body.content_type().unwrap_or("application/json");
+            writeln!(
+                out,
+                "      headers[\"Content-Type\"] = {};",
+                quoted_string_literal(content_type)
+            )
+            .map_err(sink)?;
+        }
         writeln!(out, "    }}").map_err(sink)?;
     }
     let runtime = ts_operation_runtime(graph, op);
     let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
-    let context = format!(
-        "{{ operationId: {}, pathTemplate: {}, idempotent: {}, idempotencyKeyHeader: {} }}",
-        quoted_string_literal(&op.id),
-        quoted_string_literal(&op.path),
-        runtime.idempotent,
-        quoted_string_literal(idempotency_header),
-    );
-    if request_body.is_present() {
-        writeln!(
-            out,
-            "    const res = await this._request(\"{method}\", path, headers, body, {context}, options);"
-        )
-        .map_err(sink)?;
+    let request_body_arg = emit_ts_request_body_arg(out, request_body)?;
+    let body_arg = if request_body.is_present() {
+        request_body_arg
     } else {
-        writeln!(
-            out,
-            "    const res = await this._request(\"{method}\", path, headers, undefined, {context}, options);"
-        )
-        .map_err(sink)?;
-    }
+        "undefined"
+    };
+    writeln!(out, "    const res = await this._request(").map_err(sink)?;
+    writeln!(out, "      \"{method}\",").map_err(sink)?;
+    writeln!(out, "      path,").map_err(sink)?;
+    writeln!(out, "      headers,").map_err(sink)?;
+    writeln!(out, "      {body_arg},").map_err(sink)?;
+    writeln!(out, "      {{").map_err(sink)?;
+    writeln!(
+        out,
+        "        operationId: {},",
+        quoted_string_literal(&op.id)
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "        pathTemplate: {},",
+        quoted_string_literal(&op.path)
+    )
+    .map_err(sink)?;
+    writeln!(out, "        idempotent: {},", runtime.idempotent).map_err(sink)?;
+    writeln!(
+        out,
+        "        idempotencyKeyHeader: {},",
+        quoted_string_literal(idempotency_header)
+    )
+    .map_err(sink)?;
+    writeln!(out, "      }},").map_err(sink)?;
+    writeln!(out, "      options,").map_err(sink)?;
+    writeln!(out, "    );").map_err(sink)?;
     emit_error_throw_branch(out, error_bodies)?;
     if success.has_binary_body() {
         writeln!(
@@ -2074,9 +2341,15 @@ pub(crate) fn emit_index_with_models(
 
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
-    out.push_str(
-        "export type { ClientHooks, ClientOptions, ErrorHook, HookContext, RequestHook, RequestOptions, ResponseHook } from \"./client\";\n",
-    );
+    out.push_str("export type {\n");
+    out.push_str("  ClientHooks,\n");
+    out.push_str("  ClientOptions,\n");
+    out.push_str("  ErrorHook,\n");
+    out.push_str("  HookContext,\n");
+    out.push_str("  RequestHook,\n");
+    out.push_str("  RequestOptions,\n");
+    out.push_str("  ResponseHook,\n");
+    out.push_str("} from \"./client\";\n");
     out.push_str("export { ApiError } from \"./errors\";\n");
     out.push_str("export type { ApiErrorInit } from \"./errors\";\n");
 
@@ -2625,9 +2898,11 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains(
-                    "const res = await this._request(\"POST\", path, headers, body, { operationId: \"createBook\""
-                ) && out.contains("}, options);"),
+                out.contains("const res = await this._request(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body,")
+                    && out.contains("operationId: \"createBook\",")
+                    && out.contains("options,"),
                 "body op dispatches through the shared request helper:\n{out}"
             );
         }
@@ -2642,14 +2917,17 @@ mod tests {
             }];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains(
-                    "{ operationId: \"createBook\", pathTemplate: \"/books\", idempotent: true, idempotencyKeyHeader: \"X-Idempotency-Key\" }"
-                ),
+                out.contains("operationId: \"createBook\",")
+                    && out.contains("pathTemplate: \"/books\",")
+                    && out.contains("idempotent: true,")
+                    && out.contains("idempotencyKeyHeader: \"X-Idempotency-Key\","),
                 "{out}"
             );
             assert!(
-                out.contains("const res = await this._request(\"POST\", path, headers, body,")
-                    && out.contains("}, options);"),
+                out.contains("const res = await this._request(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body,")
+                    && out.contains("options,"),
                 "{out}"
             );
         }

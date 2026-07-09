@@ -34,7 +34,7 @@ use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
     operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
     path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, HttpAuthScheme,
+    success_responses_of, HttpAuthScheme, RequestBodyEncoding,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -918,7 +918,7 @@ from typing import Any, Optional
 class ApiError(Exception):
     \"\"\"Raised by operation methods on a non-success response.
 
-    Carries the HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
+    Carries status, response metadata, raw body, parsed JSON, and decoded error body.
     \"\"\"
 
     def __init__(
@@ -970,6 +970,7 @@ pub(crate) fn emit_client(package: &str) -> String {
         false,
         &[],
         &RuntimePolicy::default(),
+        false,
     )
 }
 
@@ -1006,6 +1007,16 @@ fn py_retry_status_tuple(runtime: &RuntimePolicy) -> String {
                 .join(", ");
             format!("({joined})")
         }
+    }
+}
+
+fn py_body_encoding(encoding: RequestBodyEncoding) -> &'static str {
+    match encoding {
+        RequestBodyEncoding::Json => "json",
+        RequestBodyEncoding::Text => "text",
+        RequestBodyEncoding::FormUrlEncoded => "form",
+        RequestBodyEncoding::Multipart => "multipart",
+        RequestBodyEncoding::Binary => "binary",
     }
 }
 
@@ -1098,6 +1109,10 @@ fn pagination_item_model_name<'a>(graph: &'a ApiGraph, op: &Operation) -> Option
     clippy::too_many_arguments,
     reason = "the Python client emitter is parameterized by layout/auth/model/runtime facts without a builder object"
 )]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the Python client emitter receives independent auth and pagination feature switches"
+)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
@@ -1107,16 +1122,11 @@ pub(crate) fn emit_client_with_models(
     has_basic_auth: bool,
     model_refs: &[String],
     runtime: &RuntimePolicy,
+    has_pagination: bool,
 ) -> String {
-    let (body_encode, body_comment) = match model_style {
-        PyModelStyle::Pydantic => (
-            "        if isinstance(body, BaseModel):\n            body = body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n",
-            "        # Dump Pydantic v2 request models (alias-aware, JSON mode) before json.dumps.\n",
-        ),
-        PyModelStyle::Dataclass => (
-            "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n",
-            "        # Dataclass request models need conversion before json.dumps.\n",
-        ),
+    let body_value = match model_style {
+        PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            return body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n        return body\n",
+        PyModelStyle::Dataclass => "        if body is not None and dataclasses.is_dataclass(body):\n            return dataclasses.asdict(body)\n        return body\n",
     };
 
     // --- Import header, assembled per file in canonical isort order (no unused imports, F401-clean). ---
@@ -1132,7 +1142,13 @@ pub(crate) fn emit_client_with_models(
     stdlib.push("import urllib.error".to_string());
     stdlib.push("import urllib.parse".to_string());
     stdlib.push("import urllib.request".to_string());
-    stdlib.push("from typing import Any, Callable, Iterator, Optional".to_string());
+    let collections = if has_pagination {
+        "from collections.abc import Callable, Iterator"
+    } else {
+        "from collections.abc import Callable"
+    };
+    stdlib.push(collections.to_string());
+    stdlib.push("from typing import Any, Optional".to_string());
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
@@ -1269,7 +1285,9 @@ class ClientHooks:
     def __init__(
         self,
         *,
-        request: Optional[list[Callable[[HookContext, urllib.request.Request], None]]] = None,
+        request: Optional[
+            list[Callable[[HookContext, urllib.request.Request], None]]
+        ] = None,
         response: Optional[list[Callable[[HookContext], None]]] = None,
         error: Optional[list[Callable[[HookContext, BaseException], None]]] = None,
     ) -> None:
@@ -1300,24 +1318,86 @@ class Client:
         self._retry_unsafe_methods = {retry_unsafe_methods}
         self._hooks = hooks or ClientHooks()
 
+    def _body_value(self, body: Any) -> Any:
+{body_value}
+    def _encode_body(
+        self,
+        body: Optional[Any],
+        body_encoding: str,
+        content_type: str,
+    ) -> tuple[Optional[bytes], str]:
+        if body is None:
+            return None, content_type
+        if body_encoding == \"binary\":
+            if isinstance(body, bytes):
+                return body, content_type
+            if isinstance(body, bytearray):
+                return bytes(body), content_type
+            raise TypeError(\"binary request bodies must be bytes or bytearray\")
+        if body_encoding == \"text\":
+            return str(body).encode(), content_type
+        value = self._body_value(body)
+        if body_encoding == \"json\":
+            return json.dumps(value).encode(), content_type
+        if body_encoding == \"form\":
+            encoded = urllib.parse.urlencode(value, doseq=True).encode()
+            return encoded, content_type
+        if body_encoding == \"multipart\":
+            boundary = \"gnr8-boundary\"
+            return (
+                self._encode_multipart(value, boundary),
+                f\"multipart/form-data; boundary={{boundary}}\",
+            )
+        raise ValueError(f\"unsupported request body encoding: {{body_encoding}}\")
+
+    def _encode_multipart(self, value: Any, boundary: str) -> bytes:
+        if not isinstance(value, dict):
+            raise TypeError(\"multipart request bodies must encode to a dict\")
+        out = bytearray()
+        for key, item in value.items():
+            if item is None:
+                continue
+            out.extend(f\"--{{boundary}}\\r\\n\".encode())
+            if isinstance(item, (bytes, bytearray)):
+                out.extend(
+                    (
+                        f'Content-Disposition: form-data; name=\"{{key}}\"; '
+                        f'filename=\"{{key}}\"\\r\\n'
+                        \"Content-Type: application/octet-stream\\r\\n\\r\\n\"
+                    ).encode()
+                )
+                out.extend(bytes(item))
+                out.extend(b\"\\r\\n\")
+            else:
+                out.extend(
+                    f'Content-Disposition: form-data; name=\"{{key}}\"\\r\\n\\r\\n'.encode()
+                )
+                out.extend(str(item).encode())
+                out.extend(b\"\\r\\n\")
+        out.extend(f\"--{{boundary}}--\\r\\n\".encode())
+        return bytes(out)
+
     def _do(
         self,
         method: str,
         path: str,
         *,
         body: Optional[Any] = None,
-{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}
-        operation_id: str,
+{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}        operation_id: str,
         path_template: str,
+        content_type: str = \"application/json\",
+        body_encoding: str = \"json\",
         request_options: Optional[RequestOptions] = None,
         idempotent: bool = False,
         idempotency_key_header: str = \"Idempotency-Key\",
     ) -> tuple:
-{body_comment}{body_encode}
-        data = json.dumps(body).encode(\"utf-8\") if body is not None else None
+        data, content_type = self._encode_body(body, body_encoding, content_type)
         options = request_options or RequestOptions()
         timeout = options.timeout if options.timeout is not None else self._timeout
-        max_retries = options.max_retries if options.max_retries is not None else self._max_retries
+        if options.max_retries is not None:
+            max_retries = options.max_retries
+        else:
+            max_retries = self._max_retries
         if max_retries < 0:
             max_retries = 0
         if not (
@@ -1328,7 +1408,7 @@ class Client:
             max_retries = 0
         headers: dict[str, str] = {{}}
         if data is not None:
-            headers[\"Content-Type\"] = \"application/json\"
+            headers[\"Content-Type\"] = content_type
 {auth_loop}        if idempotent and options.idempotency_key:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
@@ -1367,7 +1447,13 @@ class Client:
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
                         context,
-                        ApiError(status, \"\", \"\", headers=response_headers, raw_body=raw),
+                        ApiError(
+                            status,
+                            \"\",
+                            \"\",
+                            headers=response_headers,
+                            raw_body=raw,
+                        ),
                     )
                 return status, response_headers, raw
             except urllib.error.URLError as e:
@@ -1728,40 +1814,41 @@ fn emit_operation(
     }
 
     // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
-    let body_arg = if body_model.is_some() {
-        ", body=body"
-    } else {
-        ""
-    };
-    let mut auth_args = Vec::new();
+    let mut do_args = vec![quoted_string_literal(&op.method), "path".to_string()];
+    if let Some(body) = body_model.as_ref() {
+        do_args.push("body=body".to_string());
+        do_args.push(format!(
+            "content_type={}",
+            quoted_string_literal(&body.content_type)
+        ));
+        do_args.push(format!(
+            "body_encoding={}",
+            quoted_string_literal(py_body_encoding(body.encoding))
+        ));
+    }
     if !auth_headers.is_empty() {
-        auth_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
+        do_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
     }
     if auth_http.contains(&HttpAuthScheme::Bearer) {
-        auth_args.push("auth_bearer=True".to_string());
+        do_args.push("auth_bearer=True".to_string());
     }
     if auth_http.contains(&HttpAuthScheme::Basic) {
-        auth_args.push("auth_basic=True".to_string());
+        do_args.push("auth_basic=True".to_string());
     }
-    let auth_arg = if auth_args.is_empty() {
-        String::new()
-    } else {
-        format!(", {}", auth_args.join(", "))
-    };
     let runtime = py_operation_runtime(graph, op);
-    let runtime_arg = format!(
-        ", operation_id={}, path_template={}, request_options=request_options, idempotent={}, idempotency_key_header={}",
-        quoted_string_literal(&op.id),
-        quoted_string_literal(&op.path),
-        py_bool(runtime.idempotent),
+    do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
+    do_args.push(format!("path_template={}", quoted_string_literal(&op.path)));
+    do_args.push("request_options=request_options".to_string());
+    do_args.push(format!("idempotent={}", py_bool(runtime.idempotent)));
+    do_args.push(format!(
+        "idempotency_key_header={}",
         quoted_string_literal(runtime.idempotency_key_header.unwrap_or("Idempotency-Key")),
-    );
-    writeln!(
-        out,
-        "        _status, _headers, _raw = self._do(\"{}\", path{body_arg}{auth_arg}{runtime_arg})",
-        op.method,
-    )
-    .map_err(sink)?;
+    ));
+    writeln!(out, "        _status, _headers, _raw = self._do(").map_err(sink)?;
+    for arg in do_args {
+        writeln!(out, "            {arg},").map_err(sink)?;
+    }
+    writeln!(out, "        )").map_err(sink)?;
     writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
     for error_body in &error_bodies {
         writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
@@ -2735,7 +2822,12 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("self._do(\"POST\", path, body=body, operation_id=\"createBook\""),
+                out.contains("_status, _headers, _raw = self._do(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body=body,")
+                    && out.contains("content_type=\"application/json\",")
+                    && out.contains("body_encoding=\"json\",")
+                    && out.contains("operation_id=\"createBook\","),
                 "body op passes body to _do:\n{out}"
             );
         }
@@ -2889,7 +2981,11 @@ mod tests {
             ];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("self._do(\"GET\", path, auth_bearer=True, auth_basic=True, operation_id=\"listBooks\""),
+                out.contains("_status, _headers, _raw = self._do(")
+                    && out.contains("\"GET\",")
+                    && out.contains("auth_bearer=True,")
+                    && out.contains("auth_basic=True,")
+                    && out.contains("operation_id=\"listBooks\","),
                 "{out}"
             );
         }
@@ -3011,6 +3107,7 @@ mod tests {
                 true,
                 &[],
                 &crate::graph::RuntimePolicy::default(),
+                false,
             );
             assert!(out.contains("import base64"), "{out}");
             assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
@@ -3019,7 +3116,7 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("req.add_header(\"Authorization\", f\"Bearer {self._bearer_token}\")"),
+                out.contains("headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""),
                 "{out}"
             );
             assert!(

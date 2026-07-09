@@ -252,6 +252,141 @@ fn http_auth_graph() -> gnr8::graph::ApiGraph {
     .expect("http auth graph json")
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the media graph is an explicit JSON fixture covering four content types"
+)]
+fn media_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/media",
+          "operations": [
+            {
+              "id": "postText",
+              "method": "POST",
+              "path": "/text",
+              "handler": "postText",
+              "params": [],
+              "request_body": { "ref_id": "dto.TextBody" },
+              "request_body_required": true,
+              "request_body_content_type": "text/plain",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "postForm",
+              "method": "POST",
+              "path": "/form",
+              "handler": "postForm",
+              "params": [],
+              "request_body": { "ref_id": "dto.FormBody" },
+              "request_body_required": true,
+              "request_body_content_type": "application/x-www-form-urlencoded",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "postMultipart",
+              "method": "POST",
+              "path": "/multipart",
+              "handler": "postMultipart",
+              "params": [],
+              "request_body": { "ref_id": "dto.MultipartBody" },
+              "request_body_required": true,
+              "request_body_content_type": "multipart/form-data",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "postBinary",
+              "method": "POST",
+              "path": "/binary",
+              "handler": "postBinary",
+              "params": [],
+              "request_body": { "ref_id": "dto.UploadBytes" },
+              "request_body_required": true,
+              "request_body_content_type": "application/octet-stream",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.FormBody",
+              "name": "FormBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "count",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "name",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.MultipartBody",
+              "name": "MultipartBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "file",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bytes" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "title",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.TextBody",
+              "name": "TextBody",
+              "body": { "type": "primitive", "of": { "prim": "string" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "dto.UploadBytes",
+              "name": "UploadBytes",
+              "body": { "type": "primitive", "of": { "prim": "bytes" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("media graph json")
+}
+
 fn runtime_graph() -> gnr8::graph::ApiGraph {
     let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
         r#"{
@@ -542,6 +677,81 @@ func TestDeleteGoalBadRequestAPIError(t *testing.T) {
 }
 "#;
 
+const MEDIA_SMOKE_TEMPLATE: &str = r#"package __PKG__
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestMediaRequestBodies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/text":
+			if got := r.Header.Get("Content-Type"); got != "text/plain" {
+				t.Errorf("text Content-Type = %q, want text/plain", got)
+			}
+			if string(body) != "hello" {
+				t.Errorf("text body = %q, want hello", string(body))
+			}
+		case "/form":
+			if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+				t.Errorf("form Content-Type = %q, want application/x-www-form-urlencoded", got)
+			}
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Fatalf("form body did not parse: %v", err)
+			}
+			if values.Get("name") != "Ada" || values.Get("count") != "3" {
+				t.Errorf("form body = %q, want name=Ada and count=3", string(body))
+			}
+		case "/multipart":
+			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data; boundary=") {
+				t.Errorf("multipart Content-Type = %q, want multipart/form-data boundary", got)
+			}
+			text := string(body)
+			for _, want := range []string{`name="title"`, "Report", `name="file"; filename="file"`, "abc123"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("multipart body missing %q:\n%s", want, text)
+				}
+			}
+		case "/binary":
+			if got := r.Header.Get("Content-Type"); got != "application/octet-stream" {
+				t.Errorf("binary Content-Type = %q, want application/octet-stream", got)
+			}
+			if string(body) != "raw-bytes" {
+				t.Errorf("binary body = %q, want raw-bytes", string(body))
+			}
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+	if _, err := c.PostText(ctx, "hello"); err != nil {
+		t.Fatalf("PostText returned error: %v", err)
+	}
+	if _, err := c.PostForm(ctx, FormBody{Name: "Ada", Count: 3}); err != nil {
+		t.Fatalf("PostForm returned error: %v", err)
+	}
+	if _, err := c.PostMultipart(ctx, MultipartBody{Title: "Report", File: []byte("abc123")}); err != nil {
+		t.Fatalf("PostMultipart returned error: %v", err)
+	}
+	if _, err := c.PostBinary(ctx, []byte("raw-bytes")); err != nil {
+		t.Fatalf("PostBinary returned error: %v", err)
+	}
+}
+"#;
+
 /// SDK-05 + SDK-04: a fixed httptest smoke test constructs the Client, calls `CreateGoal` (POST /goal/)
 /// asserting method/path/body + the decoded response, and exercises a declared 4xx `DeleteGoal` path
 /// that must surface a `*APIError` with a typed error body. `go test ./...` must pass.
@@ -564,6 +774,27 @@ fn generated_sdk_passes_httptest_smoke() {
     assert!(
         test.is_ok(),
         "go test ./... (httptest smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_media_request_bodies_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile media smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = media_graph();
+    let dir = materialize_sdk_from_graph("media", &graph, "/");
+    let pkg = package_clause(&dir);
+    let smoke = MEDIA_SMOKE_TEMPLATE.replace("__PKG__", &pkg);
+    std::fs::write(dir.join("media_smoke_test.go"), smoke).expect("write media_smoke_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (media request body smoke) must pass: {test:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
