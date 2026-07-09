@@ -80,6 +80,14 @@ fn import_openapi_document(
     importer.import()
 }
 
+pub(super) fn validate_openapi_artifact(text: &str, path: &Path) -> Result<(), CoreError> {
+    let root = parse_json_or_yaml(text, path)?;
+    detect_version(&root, path)?;
+    validate_operation_ids(&root, path)?;
+    validate_schema_names(&root, path)?;
+    validate_local_refs(&root, path)
+}
+
 fn read_text(path: &Path) -> Result<String, CoreError> {
     std::fs::read_to_string(path).map_err(|err| CoreError::Io {
         message: format!("failed to read OpenAPI source '{}': {err}", path.display()),
@@ -121,6 +129,120 @@ fn detect_version(root: &Value, path: &Path) -> Result<SpecVersion, CoreError> {
                 path.display()
             ),
         })
+    }
+}
+
+fn validate_operation_ids(root: &Value, path: &Path) -> Result<(), CoreError> {
+    let Some(paths) = root.get("paths").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut seen = BTreeSet::new();
+    for (route, item) in paths {
+        let Some(methods) = item.as_object() else {
+            continue;
+        };
+        for (method, operation) in methods {
+            if !is_openapi_method(method) {
+                continue;
+            }
+            let Some(id) = operation.get("operationId").and_then(Value::as_str) else {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "OpenAPI artifact '{}' operation {} {} is missing operationId",
+                        path.display(),
+                        method.to_ascii_uppercase(),
+                        route
+                    ),
+                });
+            };
+            if id.trim().is_empty() || id.chars().any(char::is_whitespace) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "OpenAPI artifact '{}' operation {} {} has unstable operationId {:?}",
+                        path.display(),
+                        method.to_ascii_uppercase(),
+                        route,
+                        id
+                    ),
+                });
+            }
+            if !seen.insert(id.to_string()) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "OpenAPI artifact '{}' contains duplicate operationId {:?}",
+                        path.display(),
+                        id
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_openapi_method(method: &str) -> bool {
+    matches!(
+        method,
+        "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace"
+    )
+}
+
+fn validate_schema_names(root: &Value, path: &Path) -> Result<(), CoreError> {
+    let Some(schemas) = root
+        .pointer("/components/schemas")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    for name in schemas.keys() {
+        if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "OpenAPI artifact '{}' contains unstable schema name {:?}",
+                    path.display(),
+                    name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_refs(root: &Value, path: &Path) -> Result<(), CoreError> {
+    let mut refs = Vec::new();
+    collect_ref_values(root, &mut refs);
+    for ref_value in refs {
+        let Some(fragment) = ref_value.strip_prefix('#') else {
+            continue;
+        };
+        if root.pointer(fragment).is_none() {
+            return Err(CoreError::Config {
+                message: format!(
+                    "OpenAPI artifact '{}' contains unresolved local ref {ref_value:?}",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_ref_values<'a>(value: &'a Value, refs: &mut Vec<&'a str>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(ref_value) = map.get("$ref").and_then(Value::as_str) {
+                refs.push(ref_value);
+            }
+            for child in map.values() {
+                collect_ref_values(child, refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_ref_values(item, refs);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -1704,6 +1826,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::load_openapi;
+    use super::validate_openapi_artifact;
     use super::{detect_version, import_openapi_document, parse_json_or_yaml, SpecVersion};
     use crate::analyze::facts::{Prim, Type};
     use crate::lower::to_openapi;
@@ -1740,6 +1863,52 @@ mod tests {
         assert_eq!(
             detect_version(&oas31, path).unwrap(),
             SpecVersion::OpenApi31
+        );
+    }
+
+    #[test]
+    fn validate_openapi_artifact_checks_local_refs_and_operation_ids() {
+        let path = std::path::Path::new("generated/openapi.yaml");
+        let valid = r##"{
+  "openapi": "3.1.0",
+  "info": { "title": "Ready API", "version": "1.0.0" },
+  "paths": {
+    "/books": {
+      "get": {
+        "operationId": "listBooks",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Book" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Book": { "type": "object" }
+    }
+  }
+}"##;
+        validate_openapi_artifact(valid, path).unwrap();
+
+        let broken_ref = valid.replace("#/components/schemas/Book", "#/components/schemas/Missing");
+        let err = validate_openapi_artifact(&broken_ref, path).unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved local ref"),
+            "unexpected error: {err}"
+        );
+
+        let missing_id = valid.replace("\"operationId\": \"listBooks\",\n", "");
+        let err = validate_openapi_artifact(&missing_id, path).unwrap_err();
+        assert!(
+            err.to_string().contains("missing operationId"),
+            "unexpected error: {err}"
         );
     }
 

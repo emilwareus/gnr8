@@ -3044,6 +3044,8 @@ pub struct PySdk {
     aliases: SdkTypeAliases,
     profile: SdkProfile,
     docs: SdkDocs,
+    package_metadata: bool,
+    package_version: String,
 }
 
 impl PySdk {
@@ -3058,6 +3060,8 @@ impl PySdk {
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
+            package_metadata: true,
+            package_version: "0.1.0".to_string(),
         }
     }
 
@@ -3135,10 +3139,24 @@ impl PySdk {
         self.docs(false)
     }
 
+    /// Enable or disable package metadata files such as `pyproject.toml`.
+    #[must_use]
+    pub const fn package_metadata(mut self, enabled: bool) -> Self {
+        self.package_metadata = enabled;
+        self
+    }
+
+    /// Set the generated Python package version.
+    #[must_use]
+    pub fn package_version(mut self, version: impl Into<String>) -> Self {
+        self.package_version = version.into();
+        self
+    }
+
     /// Emit source files only, without generated docs.
     #[must_use]
     pub fn source_only(self) -> Self {
-        self.docs(false)
+        self.docs(false).package_metadata(false)
     }
 
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
@@ -3181,7 +3199,7 @@ impl Target for PySdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::pysdk::generate_files_with_options(
+        let mut files = crate::pysdk::generate_files_with_options(
             ir,
             &model.package,
             &model.base_path,
@@ -3189,6 +3207,18 @@ impl Target for PySdk {
             self.model_style,
             &self.aliases,
         )?;
+        if self.package_metadata {
+            files.push(super::bundle::SdkFile {
+                name: "pyproject.toml".to_string(),
+                contents: pyproject_toml(
+                    &model.package,
+                    &self.package_version,
+                    self.model_style,
+                    &files,
+                )?,
+            });
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(
             out,
@@ -3825,6 +3855,77 @@ fn write_sdk_files(
         out.write(format!("{dir}/{}", file.name), file.contents);
     }
     Ok(())
+}
+
+fn pyproject_toml(
+    package: &str,
+    version: &str,
+    model_style: PyModelStyle,
+    files: &[super::bundle::SdkFile],
+) -> Result<String, CoreError> {
+    if version.trim().is_empty() || version.chars().any(char::is_whitespace) {
+        return Err(CoreError::Config {
+            message: "PySdk package_version must be non-empty and contain no whitespace"
+                .to_string(),
+        });
+    }
+    let dependencies = if model_style.is_pydantic() {
+        "\ndependencies = [\"pydantic>=2\"]"
+    } else {
+        "\ndependencies = []"
+    };
+    let packages = pyproject_packages(package, files);
+    let package_list = packages
+        .iter()
+        .map(|(name, _dir)| quoted_string_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut package_dirs = String::new();
+    for (name, dir) in &packages {
+        let _ = std::fmt::Write::write_fmt(
+            &mut package_dirs,
+            format_args!(
+                "{} = {}\n",
+                quoted_string_literal(name),
+                quoted_string_literal(dir)
+            ),
+        );
+    }
+    Ok(format!(
+        "[build-system]\n\
+requires = [\"setuptools>=68\", \"wheel\"]\n\
+build-backend = \"setuptools.build_meta\"\n\n\
+[project]\n\
+name = {}\n\
+version = {}\n\
+requires-python = \">=3.9\"{}\n\n\
+[tool.setuptools]\n\
+packages = [{}]\n\n\
+[tool.setuptools.package-dir]\n\
+{}",
+        quoted_string_literal(package),
+        quoted_string_literal(version),
+        dependencies,
+        package_list,
+        package_dirs
+    ))
+}
+
+fn pyproject_packages(package: &str, files: &[super::bundle::SdkFile]) -> Vec<(String, String)> {
+    let mut packages = vec![(package.to_string(), ".".to_string())];
+    for file in files {
+        let Some(dir) = file.name.strip_suffix("/__init__.py") else {
+            continue;
+        };
+        if dir.is_empty() {
+            continue;
+        }
+        let dotted = dir.replace('/', ".");
+        packages.push((format!("{package}.{dotted}"), dir.to_string()));
+    }
+    packages.sort();
+    packages.dedup();
+    packages
 }
 
 fn ts_package_json(package: &str, axios: bool) -> String {
@@ -5919,7 +6020,50 @@ mod tests {
     }
 
     #[test]
-    fn pysdk_source_only_omits_docs() {
+    fn pysdk_target_emits_pyproject_metadata() {
+        let ir = ApiGraph::default();
+        let target = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .package_version("1.2.3")
+            .to("generated/sdk-py");
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+
+        let pyproject = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-py/pyproject.toml")
+            .expect("PySdk must emit pyproject.toml package metadata");
+        assert!(
+            pyproject.text.contains("[build-system]"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("name = \"sdk\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("version = \"1.2.3\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("dependencies = [\"pydantic>=2\"]"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("\"sdk\" = \".\""),
+            "{}",
+            pyproject.text
+        );
+    }
+
+    #[test]
+    fn pysdk_source_only_omits_docs_and_package_metadata() {
         let ir = ApiGraph::default();
         let target = PySdk::new()
             .module("example.com/bookstore/sdk")
@@ -5932,6 +6076,7 @@ mod tests {
         for path in [
             "generated/sdk-py/README.md",
             "generated/sdk-py/reference.md",
+            "generated/sdk-py/pyproject.toml",
         ] {
             assert!(
                 !out.files().iter().any(|file| file.path == path),

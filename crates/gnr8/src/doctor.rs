@@ -93,6 +93,60 @@ pub(crate) struct DoctorSummary {
     pub(crate) informational_diagnostics: usize,
 }
 
+/// SDK/OpenAPI readiness for one generated target.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SdkReadiness {
+    /// Target language/artifact kind (`"go"`, `"python"`, `"typescript"`, or `"openapi"`).
+    pub(crate) language: String,
+    /// Project-relative target output path.
+    pub(crate) output_path: String,
+    /// Required target toolchain/check runner.
+    pub(crate) toolchain: String,
+    /// Stable status string: `"ready"` or `"not_ready"`.
+    pub(crate) status: String,
+    /// Empty when ready; actionable failure reason when not ready.
+    pub(crate) reason: String,
+}
+
+impl SdkReadiness {
+    /// Build a ready target entry.
+    #[must_use]
+    pub(crate) fn ready(
+        language: impl Into<String>,
+        output_path: impl Into<String>,
+        toolchain: impl Into<String>,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            output_path: output_path.into(),
+            toolchain: toolchain.into(),
+            status: "ready".to_string(),
+            reason: String::new(),
+        }
+    }
+
+    /// Build an actionable not-ready target entry.
+    #[must_use]
+    pub(crate) fn not_ready(
+        language: impl Into<String>,
+        output_path: impl Into<String>,
+        toolchain: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            output_path: output_path.into(),
+            toolchain: toolchain.into(),
+            status: "not_ready".to_string(),
+            reason: reason.into(),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.status == "ready"
+    }
+}
+
 /// Runtime facts collected by the impure doctor shell.
 #[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct DoctorRuntime {
@@ -123,6 +177,8 @@ pub(crate) struct DoctorReport {
     pub(crate) outputs: OutputHealth,
     /// The informational analysis diagnostics (the unsupported patterns the pipeline reported).
     pub(crate) diagnostics: Vec<DoctorDiagnostic>,
+    /// Per generated SDK/OpenAPI target readiness checks.
+    pub(crate) sdk_readiness: Vec<SdkReadiness>,
     /// The informational-vs-actionable header counts.
     pub(crate) summary: DoctorSummary,
     /// Runtime resolution facts.
@@ -237,6 +293,7 @@ impl DoctorReport {
             lifecycle,
             outputs,
             diagnostics,
+            sdk_readiness: Vec::new(),
             summary: DoctorSummary {
                 actionable_problems: 0,
                 informational_diagnostics: 0,
@@ -251,6 +308,16 @@ impl DoctorReport {
         };
         report.healthy = !report.has_actionable_problem();
         report
+    }
+
+    /// Attach SDK/OpenAPI readiness facts collected by the `run_doctor` shell.
+    #[must_use]
+    pub(crate) fn with_sdk_readiness(mut self, sdk_readiness: Vec<SdkReadiness>) -> Self {
+        self.sdk_readiness = sdk_readiness;
+        let actionable = self.actionable_problem_count();
+        self.summary.actionable_problems = actionable;
+        self.healthy = !self.has_actionable_problem();
+        self
     }
 
     /// Attach runtime/timing facts collected by the `run_doctor` shell.
@@ -281,6 +348,11 @@ impl DoctorReport {
         }
         count += self.outputs.stale.len();
         count += self.outputs.drifted.len();
+        count += self
+            .sdk_readiness
+            .iter()
+            .filter(|readiness| !readiness.is_ready())
+            .count();
         count
     }
 
@@ -295,6 +367,10 @@ impl DoctorReport {
             || !self.lifecycle.pipeline_runs
             || !self.outputs.stale.is_empty()
             || !self.outputs.drifted.is_empty()
+            || self
+                .sdk_readiness
+                .iter()
+                .any(|readiness| !readiness.is_ready())
     }
 
     /// Render the grouped human report (LIFECYCLE / OUTPUTS / DIAGNOSTICS) into a String, mirroring the
@@ -357,6 +433,8 @@ impl DoctorReport {
             let _ = writeln!(out, "  (all outputs up to date)");
         }
 
+        render_sdk_readiness(&mut out, &self.sdk_readiness);
+
         // DIAGNOSTICS group — explicitly labeled informational so the expected PoC WARNs are not
         // mistaken for failures.
         let _ = writeln!(
@@ -393,6 +471,28 @@ impl DoctorReport {
             );
         }
         out
+    }
+}
+
+fn render_sdk_readiness(out: &mut String, readiness: &[SdkReadiness]) {
+    let _ = writeln!(out, "\nSDK READINESS ({} target(s))", readiness.len());
+    if readiness.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    }
+    for entry in readiness {
+        if entry.is_ready() {
+            let _ = writeln!(
+                out,
+                "  {} {}: ready ({})",
+                entry.language, entry.output_path, entry.toolchain
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  {} {}: NOT READY ({}) — {}",
+                entry.language, entry.output_path, entry.toolchain, entry.reason
+            );
+        }
     }
 }
 
@@ -594,6 +694,7 @@ mod tests {
             "lifecycle",
             "outputs",
             "diagnostics",
+            "sdk_readiness",
             "summary",
             "runtime",
             "timings_ms",
@@ -623,6 +724,26 @@ mod tests {
         .collect();
         assert_eq!(lkeys, lexpected, "lifecycle --json field set drifted");
         assert_eq!(lifecycle["language"], serde_json::json!("go"));
+    }
+
+    #[test]
+    fn sdk_readiness_failures_are_actionable() {
+        let report = DoctorReport::assemble(true, true, "go", true, None, Some(&clean_plan()))
+            .with_sdk_readiness(vec![super::SdkReadiness::not_ready(
+                "go",
+                "generated/go",
+                "go test ./...; go vet ./...",
+                "generated package does not compile",
+            )]);
+
+        assert!(report.has_actionable_problem());
+        assert!(!report.healthy);
+        assert_eq!(report.summary.actionable_problems, 1);
+        let text = report.render_human();
+        assert!(
+            text.contains("SDK READINESS"),
+            "human report must render SDK readiness:\n{text}"
+        );
     }
 
     /// `render_human` emits the three group headers and a trailing verdict line.

@@ -25,28 +25,28 @@ installable, operationally credible SDKs.
 
 ### Auth
 
-- [ ] **AUTH-01**: A `.gnr8` pipeline author can declare global and per-operation auth requirements that
+- [x] **AUTH-01**: A `.gnr8` pipeline author can declare global and per-operation auth requirements that
   lower consistently into OpenAPI 3.1 and generated SDKs.
-- [ ] **AUTH-02**: An SDK consumer can configure API key header/query auth, bearer token auth, or basic auth
+- [x] **AUTH-02**: An SDK consumer can configure API key header/query auth, bearer token auth, or basic auth
   once at client construction and have protected operations send the correct credentials.
-- [ ] **AUTH-03**: An SDK consumer can call unauthenticated operations without sending configured credentials
+- [x] **AUTH-03**: An SDK consumer can call unauthenticated operations without sending configured credentials
   when the operation is explicitly marked public.
-- [ ] **AUTH-04**: A gnr8 maintainer can run runtime smoke tests that verify outgoing auth headers/query
+- [x] **AUTH-04**: A gnr8 maintainer can run runtime smoke tests that verify outgoing auth headers/query
   params for Go, Python, and TypeScript SDKs.
-- [ ] **AUTH-05**: A `.gnr8` pipeline author gets a clear diagnostic when a security scheme is valid OpenAPI
+- [x] **AUTH-05**: A `.gnr8` pipeline author gets a clear diagnostic when a security scheme is valid OpenAPI
   but unsupported by a generated SDK target.
 
 ### Typed Errors
 
-- [ ] **ERR-01**: An SDK consumer gets one exported base SDK error type per target language for every non-2xx
+- [x] **ERR-01**: An SDK consumer gets one exported base SDK error type per target language for every non-2xx
   response.
-- [ ] **ERR-02**: An SDK consumer can inspect status code, response headers/request ID, raw body, and parsed
+- [x] **ERR-02**: An SDK consumer can inspect status code, response headers/request ID, raw body, and parsed
   JSON body from an SDK error.
-- [ ] **ERR-03**: An SDK consumer can access a decoded declared error response schema when an operation
+- [x] **ERR-03**: An SDK consumer can access a decoded declared error response schema when an operation
   documents a JSON error body.
-- [ ] **ERR-04**: A gnr8 maintainer can verify explicit status errors resolve before range/default errors
+- [x] **ERR-04**: A gnr8 maintainer can verify explicit status errors resolve before range/default errors
   across OpenAPI-imported and code-first graphs.
-- [ ] **ERR-05**: A gnr8 maintainer can prove Go, Python, and TypeScript error behavior through compile/type
+- [x] **ERR-05**: A gnr8 maintainer can prove Go, Python, and TypeScript error behavior through compile/type
   checks and runtime smoke tests.
 
 ### Stable SDK Surface
@@ -61,27 +61,27 @@ installable, operationally credible SDKs.
 
 ### SDK Readiness
 
-- [ ] **READY-01**: A gnr8 user can run `gnr8 doctor --json` and see an `sdk_readiness` section for each
+- [x] **READY-01**: A gnr8 user can run `gnr8 doctor --json` and see an `sdk_readiness` section for each
   configured SDK target.
-- [ ] **READY-02**: A gnr8 user can see target language, output path, required target toolchain, readiness
+- [x] **READY-02**: A gnr8 user can see target language, output path, required target toolchain, readiness
   status, and failure reason for each SDK target.
-- [ ] **READY-03**: `gnr8 doctor` reports actionable failures for generated Go compile/vet checks, Python
+- [x] **READY-03**: `gnr8 doctor` reports actionable failures for generated Go compile/vet checks, Python
   `py_compile` plus import checks, and TypeScript package/typecheck smoke checks where toolchains are available.
-- [ ] **READY-04**: `gnr8 doctor` reports OpenAPI readiness for emitted OpenAPI 3.1 parseability, local ref
+- [x] **READY-04**: `gnr8 doctor` reports OpenAPI readiness for emitted OpenAPI 3.1 parseability, local ref
   resolution, operation ID stability, and schema-name stability.
-- [ ] **READY-05**: Informational source diagnostics remain non-blocking unless they directly block SDK
+- [x] **READY-05**: Informational source diagnostics remain non-blocking unless they directly block SDK
   generation or readiness.
 
 ### Package Metadata
 
 - [ ] **PKG-01**: A `.gnr8` pipeline author can configure package/import/module name, registry package name,
   version, description, license/SPDX, repository URL, homepage/docs URL, and keywords.
-- [ ] **PKG-02**: A generated Go SDK includes coherent `go.mod` metadata.
-- [ ] **PKG-03**: A generated TypeScript SDK includes valid `package.json`, `exports`, `types`, and runtime
+- [x] **PKG-02**: A generated Go SDK includes coherent `go.mod` metadata.
+- [x] **PKG-03**: A generated TypeScript SDK includes valid `package.json`, `exports`, `types`, and runtime
   dependency metadata where needed.
-- [ ] **PKG-04**: A generated Python SDK can include a valid `pyproject.toml` with build-system and project
+- [x] **PKG-04**: A generated Python SDK can include a valid `pyproject.toml` with build-system and project
   metadata.
-- [ ] **PKG-05**: A gnr8 user can run local package validation such as `npm pack --dry-run`, Python build/import
+- [x] **PKG-05**: A gnr8 user can run local package validation such as `npm pack --dry-run`, Python build/import
   checks, and Go module/list/test checks where reasonable.
 - [ ] **PKG-06**: A gnr8 user can follow generated or documented publishing recipes without `gnr8` storing
   registry credentials or performing registry uploads.

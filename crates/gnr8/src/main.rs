@@ -16,8 +16,9 @@ mod watch;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 fn main() -> Result<()> {
@@ -1748,6 +1749,415 @@ fn reconcile_doctor_source_probe(
     initial
 }
 
+fn collect_sdk_readiness(
+    root: &Path,
+    bundle: &mut gnr8::runner::ArtifactBundle,
+) -> Vec<doctor::SdkReadiness> {
+    if let Err(err) = ensure_bundle_artifacts(root, bundle) {
+        return vec![doctor::SdkReadiness::not_ready(
+            "artifacts",
+            "generated",
+            "artifact cache",
+            err.to_string(),
+        )];
+    }
+
+    let groups = artifact_groups_by_anchor(bundle);
+    groups
+        .into_iter()
+        .filter_map(|(anchor, artifacts)| readiness_for_artifact_group(&anchor, &artifacts))
+        .collect()
+}
+
+fn artifact_groups_by_anchor(
+    bundle: &gnr8::runner::ArtifactBundle,
+) -> BTreeMap<String, Vec<gnr8::sdk::Artifact>> {
+    let mut groups: BTreeMap<String, Vec<gnr8::sdk::Artifact>> = BTreeMap::new();
+    for anchor in &bundle.output_anchors {
+        let normalized = anchor.trim_end_matches('/').to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        let prefix = format!("{normalized}/");
+        let artifacts = bundle
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.path == normalized || artifact.path.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !artifacts.is_empty() {
+            groups.insert(normalized, artifacts);
+        }
+    }
+    groups
+}
+
+fn readiness_for_artifact_group(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+) -> Option<doctor::SdkReadiness> {
+    if let Some(openapi) = artifacts
+        .iter()
+        .find(|artifact| is_openapi_artifact(&artifact.path, &artifact.text))
+    {
+        return Some(validate_openapi_target(&openapi.path, &openapi.text));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "go"))
+    {
+        return Some(validate_go_target(anchor, artifacts));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "py"))
+    {
+        return Some(validate_python_target(anchor, artifacts));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "ts"))
+    {
+        return Some(validate_typescript_target(anchor, artifacts));
+    }
+    None
+}
+
+fn is_openapi_artifact(path: &str, text: &str) -> bool {
+    let openapi_like = text.contains("openapi:")
+        || text.contains("\"openapi\"")
+        || text.contains("swagger:")
+        || text.contains("\"swagger\"");
+    (path_extension_is(path, "yaml")
+        || path_extension_is(path, "yml")
+        || path_extension_is(path, "json"))
+        && openapi_like
+}
+
+fn path_extension_is(path: &str, ext: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(ext))
+}
+
+fn validate_openapi_target(path: &str, text: &str) -> doctor::SdkReadiness {
+    match gnr8::sdk::validate_openapi_artifact(text, Path::new(path)) {
+        Ok(()) => doctor::SdkReadiness::ready("openapi", path, "built-in OpenAPI parser"),
+        Err(err) => doctor::SdkReadiness::not_ready(
+            "openapi",
+            path,
+            "built-in OpenAPI parser",
+            err.to_string(),
+        ),
+    }
+}
+
+fn validate_go_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "go test ./...; go vet ./...";
+    if let Err(reason) = command_available("go", &["version"]) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "go") else {
+        return doctor::SdkReadiness::not_ready(
+            "go",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated Go SDK for readiness",
+        );
+    };
+    if !materialized.target_dir.join("go.mod").is_file() {
+        return doctor::SdkReadiness::not_ready(
+            "go",
+            anchor,
+            TOOLCHAIN,
+            "generated Go SDK is missing go.mod package metadata",
+        );
+    }
+    if let Err(reason) = command_success_in(
+        "go",
+        &["test", "./..."],
+        &materialized.target_dir,
+        &[("GOPROXY", "off")],
+    ) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    if let Err(reason) = command_success_in(
+        "go",
+        &["vet", "./..."],
+        &materialized.target_dir,
+        &[("GOPROXY", "off")],
+    ) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    doctor::SdkReadiness::ready("go", anchor, TOOLCHAIN)
+}
+
+fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "python3 -m py_compile; import package";
+    if let Err(reason) = command_available("python3", &["--version"]) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "python") else {
+        return doctor::SdkReadiness::not_ready(
+            "python",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated Python SDK for readiness",
+        );
+    };
+    let py_files = artifacts
+        .iter()
+        .filter(|artifact| path_extension_is(&artifact.path, "py"))
+        .map(|artifact| materialized.root.join(&artifact.path))
+        .collect::<Vec<_>>();
+    if py_files.is_empty() {
+        return doctor::SdkReadiness::not_ready(
+            "python",
+            anchor,
+            TOOLCHAIN,
+            "generated Python SDK contains no .py files",
+        );
+    }
+    if let Err(reason) = python_compile(&py_files) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    if let Err(reason) = python_import_package(&materialized.target_dir) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    doctor::SdkReadiness::ready("python", anchor, TOOLCHAIN)
+}
+
+fn validate_typescript_target(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "node + typescript --noEmit --strict";
+    if let Err(reason) = command_available("node", &["--version"]) {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+    }
+    let Some(tsc) = typescript_compiler_path() else {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "typescript compiler not found; run `make tsextract-deps` or install the TypeScript toolchain",
+        );
+    };
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "typescript") else {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated TypeScript SDK for readiness",
+        );
+    };
+    if materialized.target_dir.join("package.json").is_file()
+        && command_available("npm", &["--version"]).is_ok()
+    {
+        if let Err(reason) =
+            command_success_in("npm", &["pack", "--dry-run"], &materialized.target_dir, &[])
+        {
+            return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+        }
+    }
+    let ts_files = artifacts
+        .iter()
+        .filter(|artifact| path_extension_is(&artifact.path, "ts"))
+        .map(|artifact| materialized.root.join(&artifact.path))
+        .collect::<Vec<_>>();
+    if ts_files.is_empty() {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "generated TypeScript SDK contains no .ts files",
+        );
+    }
+    if let Err(reason) = typescript_typecheck(&tsc, &ts_files, &materialized.target_dir) {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+    }
+    doctor::SdkReadiness::ready("typescript", anchor, TOOLCHAIN)
+}
+
+struct MaterializedTarget {
+    root: PathBuf,
+    target_dir: PathBuf,
+}
+
+fn materialize_artifact_group(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+    label: &str,
+) -> Result<MaterializedTarget, String> {
+    let root = unique_doctor_temp_dir(label)?;
+    for artifact in artifacts {
+        let path = safe_temp_artifact_path(&root, &artifact.path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create readiness temp dir '{}': {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&path, &artifact.text).map_err(|err| {
+            format!(
+                "failed to write readiness temp file '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    let target_dir = safe_temp_artifact_path(&root, anchor)?;
+    Ok(MaterializedTarget { root, target_dir })
+}
+
+fn unique_doctor_temp_dir(label: &str) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system clock before Unix epoch: {err}"))?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "gnr8-doctor-readiness-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "failed to create readiness temp dir '{}': {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn safe_temp_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return Err(format!("artifact path {rel:?} must be project-relative"));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "artifact path {rel:?} must not escape the project root"
+        ));
+    }
+    Ok(root.join(path))
+}
+
+fn command_available(program: &str, args: &[&str]) -> Result<(), String> {
+    command_success_in(program, args, Path::new("."), &[])
+}
+
+fn command_success_in(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(&str, &str)],
+) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run `{}`: {err}", command_label(program, args)))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "`{}` failed: {}",
+        command_label(program, args),
+        command_output_excerpt(&output)
+    ))
+}
+
+fn command_label(program: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn command_output_excerpt(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("command exited non-zero without output")
+        .to_string()
+}
+
+fn python_compile(files: &[PathBuf]) -> Result<(), String> {
+    let args = std::iter::once("-m".to_string())
+        .chain(std::iter::once("py_compile".to_string()))
+        .chain(files.iter().map(|path| path.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    command_success_in("python3", &arg_refs, Path::new("."), &[])
+}
+
+fn python_import_package(package_dir: &Path) -> Result<(), String> {
+    let init = package_dir.join("__init__.py");
+    if !init.is_file() {
+        return Err("generated Python SDK is missing __init__.py".to_string());
+    }
+    let code = "\
+import importlib.util
+import sys
+init_path = sys.argv[1]
+package_dir = sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    'gnr8_sdk_check',
+    init_path,
+    submodule_search_locations=[package_dir],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+";
+    let init_arg = init.to_string_lossy().into_owned();
+    let dir_arg = package_dir.to_string_lossy().into_owned();
+    command_success_in(
+        "python3",
+        &["-c", code, &init_arg, &dir_arg],
+        package_dir.parent().unwrap_or_else(|| Path::new(".")),
+        &[],
+    )
+}
+
+fn typescript_compiler_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tsextract")
+        .join("node_modules")
+        .join("typescript")
+        .join("lib")
+        .join("tsc.js");
+    path.is_file().then_some(path)
+}
+
+fn typescript_typecheck(tsc: &Path, files: &[PathBuf], cwd: &Path) -> Result<(), String> {
+    let mut args = vec![
+        tsc.to_string_lossy().into_owned(),
+        "--noEmit".to_string(),
+        "--strict".to_string(),
+        "--lib".to_string(),
+        "es2022,dom".to_string(),
+    ];
+    args.extend(files.iter().map(|path| path.to_string_lossy().into_owned()));
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    command_success_in("node", &arg_refs, cwd, &[])
+}
+
 /// Run `gnr8 doctor`: a health aggregator that runs the user's `.gnr8/` pipeline once and reports its
 /// diagnostics + drift (HARD-01 / D-01, D-02). Mirrors `run_check`'s shell-vs-decision split (this is
 /// the impure shell; the pure grouping + exit policy lives in [`doctor::DoctorReport`]).
@@ -1788,6 +2198,10 @@ fn run_doctor(output: Output) -> Result<()> {
         .as_ref()
         .map(|bundle| bundle.output_anchors.clone())
         .unwrap_or_default();
+    let sdk_readiness = bundle
+        .as_mut()
+        .map(|bundle| collect_sdk_readiness(&root, bundle))
+        .unwrap_or_default();
     let drift = bundle.as_mut().and_then(|b| plan_bundle(&root, b).ok());
 
     let report = doctor::DoctorReport::assemble(
@@ -1798,6 +2212,7 @@ fn run_doctor(output: Output) -> Result<()> {
         diagnostics,
         drift.as_ref(),
     )
+    .with_sdk_readiness(sdk_readiness)
     .with_runtime(
         doctor::DoctorRuntime {
             binary_path: std::env::current_exe()

@@ -49,6 +49,19 @@ use crate::graph::{ApiGraph, Diagnostic};
 use crate::manifest::blake3_hex;
 use crate::CoreError;
 
+/// Validate a generated OpenAPI artifact enough for `gnr8 doctor` readiness.
+///
+/// This reuses the OpenAPI source parser's JSON/YAML parsing and version detection, then checks local
+/// `$ref`s plus operation/schema naming facts that make an emitted document consumable.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when the artifact is not parseable OpenAPI 3.x or has broken local
+/// references / unstable names.
+pub fn validate_openapi_artifact(text: &str, path: &Path) -> Result<(), CoreError> {
+    openapi_source::validate_openapi_artifact(text, path)
+}
+
 /// The execution context handed to every stage.
 ///
 /// Carries the project root every relative path (a source's input dir, a target's output path) is
