@@ -15,7 +15,10 @@ use super::{
     collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
-use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
+use crate::graph::{
+    ApiGraph, OperationRuntimePolicy, PaginationMode, PaginationPolicy, PaginationTermination,
+    Response, RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SecurityScheme, Type,
+};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
 use crate::sdk::emit_common::quoted_string_literal;
@@ -1620,6 +1623,8 @@ pub struct ApplySecurity {
 /// or boolean composition.
 #[derive(Debug, Clone)]
 pub enum OperationSelector {
+    /// Match one operation id exactly.
+    OperationId(String),
     /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
     PathPrefix(String),
     /// Match operations whose HTTP method is one of these uppercase method names.
@@ -1633,6 +1638,12 @@ pub enum OperationSelector {
 }
 
 impl OperationSelector {
+    /// Match one operation id exactly.
+    #[must_use]
+    pub fn operation(id: impl Into<String>) -> Self {
+        Self::OperationId(id.into())
+    }
+
     /// Match operations whose graph path, or base-path-joined path, starts with `prefix`.
     #[must_use]
     pub fn path_prefix(prefix: impl Into<String>) -> Self {
@@ -1814,6 +1825,7 @@ fn operation_selector_matches(
     base_path: &str,
 ) -> bool {
     match selector {
+        OperationSelector::OperationId(id) => op.id == *id,
         OperationSelector::PathPrefix(prefix) => {
             op.path.starts_with(prefix)
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
@@ -1830,6 +1842,417 @@ fn operation_selector_matches(
             .iter()
             .all(|selector| operation_selector_matches(selector, op, base_path)),
     }
+}
+
+/// Configure generated SDK runtime defaults.
+#[derive(Debug, Clone)]
+pub struct ConfigureSdkRuntime {
+    policy: RuntimePolicy,
+}
+
+impl ConfigureSdkRuntime {
+    /// Create a no-op SDK runtime policy builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            policy: RuntimePolicy::default(),
+        }
+    }
+
+    /// Set the client-level default timeout in milliseconds.
+    #[must_use]
+    pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.policy.default_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Set the client-level default max retry count.
+    #[must_use]
+    pub fn max_retries(mut self, max_retries: u8) -> Self {
+        self.policy.max_retries = max_retries;
+        if max_retries > 0 && self.policy.retry_statuses.is_empty() {
+            self.policy.retry_statuses = vec![408, 429];
+        }
+        self
+    }
+
+    /// Override exact retryable status codes. Generated runtimes also treat every `5xx` status as
+    /// retryable when retries are enabled.
+    #[must_use]
+    pub fn retry_statuses<I>(mut self, statuses: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.policy.retry_statuses = statuses.into_iter().collect();
+        self
+    }
+
+    /// Allow generated runtimes to retry unsafe methods without per-operation idempotency metadata.
+    #[must_use]
+    pub const fn retry_unsafe_methods(mut self, enabled: bool) -> Self {
+        self.policy.retry_unsafe_methods = enabled;
+        self
+    }
+
+    /// Enable generated request hooks.
+    #[must_use]
+    pub fn request_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Request);
+        self
+    }
+
+    /// Enable generated response hooks.
+    #[must_use]
+    pub fn response_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Response);
+        self
+    }
+
+    /// Enable generated error hooks.
+    #[must_use]
+    pub fn error_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Error);
+        self
+    }
+}
+
+impl Default for ConfigureSdkRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transform for ConfigureSdkRuntime {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        let mut policy = self.policy.clone();
+        policy.retry_statuses.sort_unstable();
+        policy.retry_statuses.dedup();
+        for status in &policy.retry_statuses {
+            if *status < 400 || *status > 599 {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "SDK runtime retry status {status} is invalid; expected an HTTP 4xx/5xx status"
+                    ),
+                });
+            }
+        }
+        policy.hooks.sort_by_key(|hook| match hook {
+            RuntimeHookKind::Request => 0_u8,
+            RuntimeHookKind::Response => 1,
+            RuntimeHookKind::Error => 2,
+        });
+        policy.hooks.dedup();
+        ir.runtime = policy;
+        Ok(())
+    }
+}
+
+/// Mark matched operations as explicitly idempotent for generated SDK retry policy.
+#[derive(Debug, Clone)]
+pub struct MarkIdempotent {
+    selector: OperationSelector,
+    idempotency_key_header: Option<String>,
+}
+
+impl MarkIdempotent {
+    /// Mark one operation id as idempotent.
+    #[must_use]
+    pub fn operation(id: impl Into<String>) -> Self {
+        Self {
+            selector: OperationSelector::operation(id),
+            idempotency_key_header: Some("Idempotency-Key".to_string()),
+        }
+    }
+
+    /// Mark operations matched by `selector` as idempotent.
+    #[must_use]
+    pub fn when(selector: OperationSelector) -> Self {
+        Self {
+            selector,
+            idempotency_key_header: Some("Idempotency-Key".to_string()),
+        }
+    }
+
+    /// Set the header generated clients use for consumer-supplied idempotency keys.
+    #[must_use]
+    pub fn idempotency_key_header(mut self, header: impl Into<String>) -> Self {
+        self.idempotency_key_header = Some(header.into());
+        self
+    }
+}
+
+impl Transform for MarkIdempotent {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if self
+            .idempotency_key_header
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(CoreError::Config {
+                message: "idempotency key header must not be empty".to_string(),
+            });
+        }
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.operation_runtime.clone();
+        for op in &ir.operations {
+            if operation_selector_matches(&self.selector, op, &base_path) {
+                matched += 1;
+                upsert_operation_runtime(
+                    &mut policies,
+                    OperationRuntimePolicy {
+                        operation_id: op.id.clone(),
+                        idempotent: true,
+                        idempotency_key_header: self.idempotency_key_header.clone(),
+                    },
+                );
+            }
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "idempotency policy did not match any operations".to_string(),
+            });
+        }
+        ir.operation_runtime = policies;
+        Ok(())
+    }
+}
+
+/// Configure generated SDK pagination helpers for matched operations.
+#[derive(Debug, Clone)]
+pub struct ConfigurePagination {
+    selector: OperationSelector,
+    mode: PaginationMode,
+    items_field: String,
+    cursor_param: Option<String>,
+    next_cursor_field: Option<String>,
+    page_param: Option<String>,
+    page_size_param: Option<String>,
+    offset_param: Option<String>,
+    limit_param: Option<String>,
+    termination: PaginationTermination,
+}
+
+impl ConfigurePagination {
+    /// Configure cursor pagination.
+    #[must_use]
+    pub fn cursor(
+        selector: OperationSelector,
+        cursor_param: impl Into<String>,
+        next_cursor_field: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Cursor,
+            items_field: items_field.into(),
+            cursor_param: Some(cursor_param.into()),
+            next_cursor_field: Some(next_cursor_field.into()),
+            page_param: None,
+            page_size_param: None,
+            offset_param: None,
+            limit_param: None,
+            termination: PaginationTermination::NoNextCursor,
+        }
+    }
+
+    /// Configure page-number pagination.
+    #[must_use]
+    pub fn page(
+        selector: OperationSelector,
+        page_param: impl Into<String>,
+        page_size_param: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Page,
+            items_field: items_field.into(),
+            cursor_param: None,
+            next_cursor_field: None,
+            page_param: Some(page_param.into()),
+            page_size_param: Some(page_size_param.into()),
+            offset_param: None,
+            limit_param: None,
+            termination: PaginationTermination::EmptyItems,
+        }
+    }
+
+    /// Configure offset/limit pagination.
+    #[must_use]
+    pub fn offset(
+        selector: OperationSelector,
+        offset_param: impl Into<String>,
+        limit_param: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Offset,
+            items_field: items_field.into(),
+            cursor_param: None,
+            next_cursor_field: None,
+            page_param: None,
+            page_size_param: None,
+            offset_param: Some(offset_param.into()),
+            limit_param: Some(limit_param.into()),
+            termination: PaginationTermination::EmptyItems,
+        }
+    }
+
+    /// Set the optional page-size parameter for cursor pagination.
+    #[must_use]
+    pub fn page_size_param(mut self, page_size_param: impl Into<String>) -> Self {
+        self.page_size_param = Some(page_size_param.into());
+        self
+    }
+
+    /// Terminate generated helpers when the returned items field is empty.
+    #[must_use]
+    pub const fn stop_when_empty_items(mut self) -> Self {
+        self.termination = PaginationTermination::EmptyItems;
+        self
+    }
+}
+
+impl Transform for ConfigurePagination {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        self.validate()?;
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.pagination.clone();
+        for op in &ir.operations {
+            if !operation_selector_matches(&self.selector, op, &base_path) {
+                continue;
+            }
+            self.validate_operation_params(op)?;
+            matched += 1;
+            upsert_pagination(
+                &mut policies,
+                PaginationPolicy {
+                    operation_id: op.id.clone(),
+                    mode: self.mode,
+                    items_field: self.items_field.clone(),
+                    cursor_param: self.cursor_param.clone(),
+                    next_cursor_field: self.next_cursor_field.clone(),
+                    page_param: self.page_param.clone(),
+                    page_size_param: self.page_size_param.clone(),
+                    offset_param: self.offset_param.clone(),
+                    limit_param: self.limit_param.clone(),
+                    termination: self.termination,
+                },
+            );
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "pagination policy did not match any operations".to_string(),
+            });
+        }
+        ir.pagination = policies;
+        Ok(())
+    }
+}
+
+impl ConfigurePagination {
+    fn validate(&self) -> Result<(), CoreError> {
+        let required = match self.mode {
+            PaginationMode::Cursor => [
+                self.cursor_param.as_deref(),
+                self.next_cursor_field.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+            PaginationMode::Page => [
+                self.page_param.as_deref(),
+                self.page_size_param.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+            PaginationMode::Offset => [
+                self.offset_param.as_deref(),
+                self.limit_param.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+        };
+        if required.iter().any(|value| value.is_none_or(str::is_empty)) {
+            return Err(CoreError::Config {
+                message: "pagination policy fields must not be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_operation_params(&self, op: &crate::graph::Operation) -> Result<(), CoreError> {
+        for param in self.required_request_params() {
+            if !op
+                .params
+                .iter()
+                .any(|candidate| candidate.location == "query" && candidate.name == param)
+            {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "pagination policy for operation '{}' references missing query parameter '{}'",
+                        op.id, param
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn required_request_params(&self) -> Vec<&str> {
+        match self.mode {
+            PaginationMode::Cursor => self
+                .cursor_param
+                .iter()
+                .chain(self.page_size_param.iter())
+                .map(String::as_str)
+                .collect(),
+            PaginationMode::Page => self
+                .page_param
+                .iter()
+                .chain(self.page_size_param.iter())
+                .map(String::as_str)
+                .collect(),
+            PaginationMode::Offset => self
+                .offset_param
+                .iter()
+                .chain(self.limit_param.iter())
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+}
+
+fn upsert_operation_runtime(
+    policies: &mut Vec<OperationRuntimePolicy>,
+    policy: OperationRuntimePolicy,
+) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+}
+
+fn upsert_pagination(policies: &mut Vec<PaginationPolicy>, policy: PaginationPolicy) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
 }
 
 fn middleware_symbol_matches(actual: &str, expected: &str) -> bool {
@@ -4408,19 +4831,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, FormatCommand,
-        GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
-        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
-        Transform, TsSdk,
+        sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk, QueryParam, SdkOperationAliases,
+        SdkPackageMetadata, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
-        ApiGraph, Diagnostic, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+        ApiGraph, Diagnostic, Field, Operation, PaginationMode, PaginationTermination, Param, Prim,
+        Response, RuntimeHookKind, Schema, SchemaRef, SourceSpan, Type,
     };
     use crate::sdk::docs::SdkDocs;
+    use crate::sdk::layout::SdkFileLayout;
+    use crate::sdk::model::SdkModel;
     use crate::sdk::profile::SdkProfile;
+    use crate::sdk::surface::SdkTypeAliases;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
 
@@ -4462,6 +4889,17 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
             },
+        }
+    }
+
+    fn query_param(name: &str, required: bool) -> Param {
+        Param {
+            name: name.to_string(),
+            location: "query".to_string(),
+            required,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: span(),
         }
     }
 
@@ -5481,6 +5919,144 @@ mod tests {
         assert_eq!(ir.operations[0].group.as_deref(), Some("session"));
         assert_eq!(ir.operations[1].group.as_deref(), Some("downloads"));
         assert_eq!(ir.operations[2].group.as_deref(), Some("backoffice"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_runtime_and_pagination_transforms_populate_model_facts() {
+        let mut list =
+            grouped_test_operation("listBooks", "GET", "/books", Some("Books"), "books.py");
+        list.params = vec![query_param("cursor", false), query_param("limit", false)];
+        list.responses = vec![Response {
+            status: 200,
+            body: None,
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        }];
+        let mut create =
+            grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
+        create.responses = vec![Response {
+            status: 201,
+            body: None,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+        }];
+        let mut ir = ApiGraph {
+            operations: vec![create, list],
+            ..ApiGraph::default()
+        };
+
+        ConfigureSdkRuntime::new()
+            .timeout_ms(2_000)
+            .max_retries(3)
+            .request_hooks()
+            .response_hooks()
+            .error_hooks()
+            .apply(&mut ir, &cx())
+            .unwrap();
+        MarkIdempotent::operation("createBook")
+            .idempotency_key_header("X-Idempotency-Key")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ConfigurePagination::cursor(
+            OperationSelector::operation("listBooks"),
+            "cursor",
+            "nextCursor",
+            "items",
+        )
+        .page_size_param("limit")
+        .apply(&mut ir, &cx())
+        .unwrap();
+
+        assert_eq!(ir.runtime.default_timeout_ms, Some(2_000));
+        assert_eq!(ir.runtime.max_retries, 3);
+        assert_eq!(ir.runtime.retry_statuses, vec![408, 429]);
+        assert_eq!(
+            ir.runtime.hooks,
+            vec![
+                RuntimeHookKind::Request,
+                RuntimeHookKind::Response,
+                RuntimeHookKind::Error
+            ]
+        );
+        assert_eq!(ir.operation_runtime[0].operation_id, "createBook");
+        assert!(ir.operation_runtime[0].idempotent);
+        assert_eq!(
+            ir.operation_runtime[0].idempotency_key_header.as_deref(),
+            Some("X-Idempotency-Key")
+        );
+        assert_eq!(ir.pagination[0].operation_id, "listBooks");
+        assert_eq!(ir.pagination[0].mode, PaginationMode::Cursor);
+        assert_eq!(
+            ir.pagination[0].termination,
+            PaginationTermination::NoNextCursor
+        );
+
+        let model = SdkModel::build(
+            &ir,
+            "books",
+            "/",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+        assert_eq!(model.runtime.default_timeout_ms, Some(2_000));
+        assert_eq!(model.runtime.max_retries, 3);
+        assert_eq!(model.runtime.retry_statuses, vec![408, 429]);
+        let create = model
+            .operations
+            .iter()
+            .find(|op| op.id == "createBook")
+            .unwrap();
+        assert!(create.runtime.idempotent);
+        assert_eq!(
+            create.runtime.idempotency_key_header.as_deref(),
+            Some("X-Idempotency-Key")
+        );
+        let list = model
+            .operations
+            .iter()
+            .find(|op| op.id == "listBooks")
+            .unwrap();
+        assert_eq!(
+            list.pagination.as_ref().unwrap().cursor_param.as_deref(),
+            Some("cursor")
+        );
+        assert_eq!(
+            list.pagination.as_ref().unwrap().page_size_param.as_deref(),
+            Some("limit")
+        );
+    }
+
+    #[test]
+    fn pagination_transform_rejects_missing_query_parameter() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "listBooks",
+                "GET",
+                "/books",
+                Some("Books"),
+                "books.py",
+            )],
+            ..ApiGraph::default()
+        };
+
+        let err = ConfigurePagination::cursor(
+            OperationSelector::operation("listBooks"),
+            "cursor",
+            "nextCursor",
+            "items",
+        )
+        .apply(&mut ir, &cx())
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references missing query parameter 'cursor'"),
+            "{err}"
+        );
     }
 
     #[test]

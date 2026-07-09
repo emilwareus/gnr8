@@ -898,12 +898,12 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk,
-        GroupOperations, Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
-        RenameOperation, RenameType, SdkOperationAliases, SdkPackageMetadata, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
-        TsSdk,
+        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, EnumOrder, FastApi,
+        Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs,
+        OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam, RenameOperation, RenameType,
+        SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
     pub use super::docs::SdkDocs;
     pub use super::go::{
@@ -923,7 +923,9 @@ pub mod prelude {
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,
     };
-    pub use crate::graph::SecurityScheme;
+    pub use crate::graph::{
+        PaginationMode, PaginationTermination, RuntimeHookKind, SecurityScheme,
+    };
 }
 
 #[cfg(test)]

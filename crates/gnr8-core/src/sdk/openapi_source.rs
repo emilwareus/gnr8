@@ -294,6 +294,9 @@ impl Importer {
                 .unwrap_or("API")
                 .to_string(),
             security,
+            runtime: crate::graph::RuntimePolicy::default(),
+            operation_runtime: Vec::new(),
+            pagination: Vec::new(),
         })
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::graph::{ApiGraph, Type};
+use crate::graph::{ApiGraph, PaginationMode, PaginationTermination, RuntimeHookKind, Type};
 use crate::sdk::emit_common::{api_key_credential_names, api_key_header_names};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::profile::SdkProfile;
@@ -82,6 +82,10 @@ pub struct SdkOperation {
     pub success_responses: Vec<SdkResponse>,
     /// Error responses keyed by status.
     pub error_responses: Vec<SdkResponse>,
+    /// Operation runtime policy.
+    pub runtime: SdkOperationRuntime,
+    /// Pagination helper policy, when configured.
+    pub pagination: Option<SdkPagination>,
 }
 
 /// Operation auth requirements after global/per-operation graph metadata is resolved.
@@ -187,6 +191,38 @@ pub struct SdkRuntimePolicy {
     pub retry_unsafe_methods: bool,
     /// Runtime hook kinds requested by the plan.
     pub hooks: Vec<SdkHookKind>,
+}
+
+/// Per-operation runtime behavior shared by SDK targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkOperationRuntime {
+    /// Whether unsafe-method retries are allowed for this operation.
+    pub idempotent: bool,
+    /// Header used for a consumer-supplied idempotency key.
+    pub idempotency_key_header: Option<String>,
+}
+
+/// Explicit pagination helper policy for one operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkPagination {
+    /// Pagination shape.
+    pub mode: PaginationMode,
+    /// Response field containing page items.
+    pub items_field: String,
+    /// Request cursor parameter for cursor pagination.
+    pub cursor_param: Option<String>,
+    /// Response next-cursor field for cursor pagination.
+    pub next_cursor_field: Option<String>,
+    /// Request page-number parameter for page pagination.
+    pub page_param: Option<String>,
+    /// Request page-size parameter for cursor/page pagination.
+    pub page_size_param: Option<String>,
+    /// Request offset parameter for offset pagination.
+    pub offset_param: Option<String>,
+    /// Request limit parameter for offset pagination.
+    pub limit_param: Option<String>,
+    /// Termination rule used by generated helpers.
+    pub termination: PaginationTermination,
 }
 
 /// Runtime hook phase.
@@ -367,6 +403,8 @@ impl SdkModel {
                 response_schemas,
                 success_responses,
                 error_responses: op_error_responses,
+                runtime: operation_runtime(graph, &op.id),
+                pagination: operation_pagination(graph, &op.id),
             });
         }
         let schema_docs = graph
@@ -403,11 +441,20 @@ impl SdkModel {
                 responses: error_responses,
             },
             runtime: SdkRuntimePolicy {
-                default_timeout_ms: None,
-                max_retries: 0,
-                retry_statuses: Vec::new(),
-                retry_unsafe_methods: false,
-                hooks: Vec::new(),
+                default_timeout_ms: graph.runtime.default_timeout_ms,
+                max_retries: graph.runtime.max_retries,
+                retry_statuses: effective_retry_statuses(graph),
+                retry_unsafe_methods: graph.runtime.retry_unsafe_methods,
+                hooks: graph
+                    .runtime
+                    .hooks
+                    .iter()
+                    .map(|hook| match hook {
+                        RuntimeHookKind::Request => SdkHookKind::Request,
+                        RuntimeHookKind::Response => SdkHookKind::Response,
+                        RuntimeHookKind::Error => SdkHookKind::Error,
+                    })
+                    .collect(),
             },
             docs_metadata: SdkDocsMetadata {
                 title: graph.title.clone(),
@@ -430,6 +477,51 @@ impl SdkModel {
             },
         })
     }
+}
+
+fn effective_retry_statuses(graph: &ApiGraph) -> Vec<u16> {
+    let mut statuses = graph.runtime.retry_statuses.clone();
+    if graph.runtime.max_retries > 0 && statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    statuses
+}
+
+fn operation_runtime(graph: &ApiGraph, operation_id: &str) -> SdkOperationRuntime {
+    graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
+        .map_or(
+            SdkOperationRuntime {
+                idempotent: false,
+                idempotency_key_header: None,
+            },
+            |policy| SdkOperationRuntime {
+                idempotent: policy.idempotent,
+                idempotency_key_header: policy.idempotency_key_header.clone(),
+            },
+        )
+}
+
+fn operation_pagination(graph: &ApiGraph, operation_id: &str) -> Option<SdkPagination> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
+        .map(|policy| SdkPagination {
+            mode: policy.mode,
+            items_field: policy.items_field.clone(),
+            cursor_param: policy.cursor_param.clone(),
+            next_cursor_field: policy.next_cursor_field.clone(),
+            page_param: policy.page_param.clone(),
+            page_size_param: policy.page_size_param.clone(),
+            offset_param: policy.offset_param.clone(),
+            limit_param: policy.limit_param.clone(),
+            termination: policy.termination,
+        })
 }
 
 fn response_model(
