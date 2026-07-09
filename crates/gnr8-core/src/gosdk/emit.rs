@@ -25,10 +25,10 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_queries,
-    operation_api_key_schemes, operation_http_auth_schemes, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    ApiKeyLocation, HttpAuthScheme, SuccessResponses,
+    check_unique_schema_names, error_response_bodies_of, join_path, operation_api_key_headers,
+    operation_api_key_queries, operation_api_key_schemes, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, ApiKeyLocation, HttpAuthScheme, SuccessResponses,
 };
 use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -3219,7 +3219,7 @@ fn emit_compat_alias_constructors(
     Ok(())
 }
 
-/// Emit `errors.go`: the typed `APIError` (status + decoded body) + `Error()` + `IsNotFound()`.
+/// Emit `errors.go`: the typed `APIError` (status + headers + raw/decoded body) + helpers.
 ///
 /// The `Error()` string is prefixed with the SDK `package` (derived from config, the single source) so
 /// the message names the actual SDK rather than a hard-coded fixture name.
@@ -3227,9 +3227,14 @@ pub(crate) fn emit_errors(package: &str) -> String {
     let body = format!(
         "\
 // APIError is returned by operation methods on non-2xx responses. It exposes the
-// HTTP status and the decoded error body (message/slug/hints).
+// HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
 type APIError struct {{
 StatusCode int
+Headers http.Header
+RequestID string
+RawBody []byte
+JSONBody any
+Body any
 Message string
 Slug string
 Hints []string
@@ -3245,78 +3250,54 @@ func (e *APIError) IsNotFound() bool {{
 return e.StatusCode == 404
 }}
 
-func apiErrorStringValue(v any) string {{
+func apiErrorObject(body any) map[string]any {{
+object, ok := body.(map[string]any)
+if !ok {{
+return nil
+}}
+return object
+}}
+
+func apiErrorStringField(body any, key string) string {{
+object := apiErrorObject(body)
+if object == nil {{
+return \"\"
+}}
+v := object[key]
 switch value := v.(type) {{
 case string:
 return value
-case *string:
-if value == nil {{
-return \"\"
-}}
-return *value
 default:
 return \"\"
 }}
 }}
 
-func apiErrorStringSliceValue(v any) []string {{
+func apiErrorStringSliceField(body any, key string) []string {{
+object := apiErrorObject(body)
+if object == nil {{
+return nil
+}}
+v := object[key]
 switch value := v.(type) {{
 case []string:
 return value
-case *[]string:
-if value == nil {{
-return nil
+case []any:
+out := make([]string, 0, len(value))
+for _, item := range value {{
+text, ok := item.(string)
+if !ok {{
+continue
 }}
-return *value
+out = append(out, text)
+}}
+return out
 default:
 return nil
 }}
 }}
 "
     );
-    file(package, &["fmt"], &body)
-}
-
-/// The fields of the typed `APIError` envelope the non-2xx branch can populate from a decoded
-/// error body. Each maps a Go field on `APIError` to the json field name the error model must carry
-/// for that assignment to be emitted (so the SDK only ever reads a field the resolved struct has).
-const API_ERROR_FIELDS: &[(&str, &str)] =
-    &[("Message", "message"), ("Slug", "slug"), ("Hints", "hints")];
-
-/// Resolve the per-operation error model (the lowest-status non-2xx response body) from the graph.
-///
-/// Mirrors the success-response resolver for the error side (CR-01): rather than hard-coding a Go type literally
-/// named `HttpError`, the non-2xx branch decodes into whatever type the graph's error response
-/// actually references. An operation with no typed non-2xx body yields `None`, and the caller
-/// decodes into a generator-owned anonymous struct instead so the SDK never references a type the
-/// graph does not define.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the error response body `$ref` is dangling.
-fn error_model_of<'g>(
-    op: &Operation,
-    graph: &'g ApiGraph,
-) -> Result<Option<&'g Schema>, CoreError> {
-    for resp in &op.responses {
-        if !(200..300).contains(&resp.status) {
-            let Some(body) = &resp.body else {
-                continue;
-            };
-            let model = graph
-                .schemas
-                .iter()
-                .find(|s| s.id == body.ref_id)
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "operation '{}' error response references dangling $ref '{}'",
-                        op.id, body.ref_id
-                    ),
-                })?;
-            return Ok(Some(model));
-        }
-    }
-    Ok(None)
+    file(package, &["fmt", "net/http"], &body)
 }
 
 /// Emit the single `operations.go` resource surface: ctx-first typed methods on `*Client`.
@@ -3370,7 +3351,7 @@ fn emit_operations_inner(
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
     // need strconv/time. This stays correct when split layout emits one operation per file.
-    let mut imports: Vec<&str> = vec!["context", "encoding/json", "net/http"];
+    let mut imports: Vec<&str> = vec!["context", "encoding/json", "io", "net/http"];
     if ops.iter().any(|op| op.request_body.is_some()) {
         imports.push("bytes");
     }
@@ -3793,71 +3774,45 @@ fn go_status_match(expr: &str, statuses: &[u16]) -> String {
         .join(" || ")
 }
 
-/// Emit the non-2xx error-decode block: decode the response body into the operation's error model
-/// (or a generator-owned anonymous struct when none is typed) and return a populated `*APIError`.
-///
-/// CR-01: the error type and the fields copied into `APIError` are derived from the graph's actual
-/// error response schema — never a hard-coded `HttpError`. Only the [`API_ERROR_FIELDS`] entries
-/// whose json field the resolved error struct actually declares are copied, so the SDK never reads a
-/// field the user's type does not provide. When the resolved struct carries none of those fields (or
-/// there is no typed error body), the SDK decodes into a small anonymous struct exposing exactly the
-/// fields `APIError` consumes, so a graph whose error model is shaped differently still compiles.
+/// Emit the non-2xx error-decode block: read raw bytes once, parse generic JSON once, decode any
+/// explicit status error schema, then return a populated `*APIError`.
 fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result<(), CoreError> {
-    // Which APIError fields the resolved error struct can supply (by its declared json fields). A
-    // named error model's body is a neutral Type::Object; a non-object body declares no usable fields.
-    let error_model = error_model_of(op, graph)?;
-    let usable: Vec<(&str, &str)> = error_model.map_or_else(Vec::new, |model| {
-        let model_fields: &[Field] = match &model.body {
-            Type::Object(fields) => fields,
-            // A non-object error body declares no named fields to copy into APIError.
-            Type::Primitive(_)
-            | Type::WellKnown(_)
-            | Type::Array(_)
-            | Type::Map { .. }
-            | Type::Named(_)
-            | Type::Enum(_)
-            | Type::Union(_)
-            | Type::Any {} => &[],
-        };
-        API_ERROR_FIELDS
-            .iter()
-            .copied()
-            .filter(|(_, json_name)| model_fields.iter().any(|f| f.json_name == *json_name))
-            .collect()
-    });
-
-    if let (Some(model), false) = (error_model, usable.is_empty()) {
-        // The graph's error model is named + carries at least one APIError field: decode into it.
-        writeln!(body, "var apiErr {}", model.name).map_err(sink)?;
-    } else {
-        // No typed error body, or its shape shares no APIError field: decode into a generator-owned
-        // anonymous struct so the SDK never references a user type it cannot rely on (CR-01 fallback).
-        writeln!(body, "var apiErr struct {{").map_err(sink)?;
-        writeln!(body, "Message string `json:\"message\"`").map_err(sink)?;
-        writeln!(body, "Slug string `json:\"slug\"`").map_err(sink)?;
-        writeln!(body, "Hints []string `json:\"hints\"`").map_err(sink)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
+    writeln!(body, "rawBody, _ := io.ReadAll(resp.Body)").map_err(sink)?;
+    writeln!(body, "var jsonBody any").map_err(sink)?;
+    writeln!(body, "if len(rawBody) > 0 {{").map_err(sink)?;
+    writeln!(body, "_ = json.Unmarshal(rawBody, &jsonBody)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "var typedBody any").map_err(sink)?;
+    if !error_bodies.is_empty() {
+        writeln!(body, "switch resp.StatusCode {{").map_err(sink)?;
+        for error_body in &error_bodies {
+            writeln!(body, "case {}:", error_body.status).map_err(sink)?;
+            writeln!(body, "var decoded {}", error_body.model).map_err(sink)?;
+            writeln!(body, "if len(rawBody) > 0 {{").map_err(sink)?;
+            writeln!(body, "_ = json.Unmarshal(rawBody, &decoded)").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "typedBody = decoded").map_err(sink)?;
+        }
         writeln!(body, "}}").map_err(sink)?;
     }
-    writeln!(body, "_ = json.NewDecoder(resp.Body).Decode(&apiErr)").map_err(sink)?;
+    writeln!(body, "if typedBody == nil {{").map_err(sink)?;
+    writeln!(body, "typedBody = jsonBody").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "return out, &APIError{{").map_err(sink)?;
     writeln!(body, "StatusCode: resp.StatusCode,").map_err(sink)?;
-    if error_model.is_none() || usable.is_empty() {
-        // Anonymous fallback struct: all three fields are present, copy them all.
-        for (go_field, _) in API_ERROR_FIELDS {
-            writeln!(body, "{go_field}: apiErr.{go_field},").map_err(sink)?;
-        }
-    } else {
-        // Typed error model: copy only the fields it declares (others stay APIError's zero value).
-        for (go_field, json_name) in &usable {
-            let src = exported(json_name);
-            let expr = match *go_field {
-                "Hints" => format!("apiErrorStringSliceValue(apiErr.{src})"),
-                "Message" | "Slug" => format!("apiErrorStringValue(apiErr.{src})"),
-                _ => format!("apiErr.{src}"),
-            };
-            writeln!(body, "{go_field}: {expr},").map_err(sink)?;
-        }
-    }
+    writeln!(body, "Headers: resp.Header.Clone(),").map_err(sink)?;
+    writeln!(body, "RequestID: resp.Header.Get(\"X-Request-ID\"),").map_err(sink)?;
+    writeln!(body, "RawBody: rawBody,").map_err(sink)?;
+    writeln!(body, "JSONBody: jsonBody,").map_err(sink)?;
+    writeln!(body, "Body: typedBody,").map_err(sink)?;
+    writeln!(body, "Message: apiErrorStringField(jsonBody, \"message\"),").map_err(sink)?;
+    writeln!(body, "Slug: apiErrorStringField(jsonBody, \"slug\"),").map_err(sink)?;
+    writeln!(
+        body,
+        "Hints: apiErrorStringSliceField(jsonBody, \"hints\"),"
+    )
+    .map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
@@ -4705,47 +4660,40 @@ mod tests {
         #[test]
         fn error_decode_uses_the_graphs_error_model_name_not_a_hardcoded_httperror() {
             // CR-01 generality: a graph whose error response model is named `ApiError` (NOT
-            // `HttpError`) must emit `var apiErr ApiError`, referencing the type the graph actually
+            // `HttpError`) must decode into `ApiError`, referencing the type the graph actually
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("var apiErr ApiError"),
+                out.contains("var decoded ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
             );
             assert!(
-                !out.contains("var apiErr HttpError"),
+                !out.contains("var decoded HttpError"),
                 "error decode must NOT reference a hard-coded `HttpError`:\n{out}"
             );
-            // It still populates the APIError from the resolved struct's fields.
-            assert!(
-                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
-                "{out}"
-            );
-            assert!(
-                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
-                "{out}"
-            );
+            assert!(out.contains("typedBody = decoded"), "{out}");
+            assert!(out.contains("Body: typedBody,"), "{out}");
         }
 
         #[test]
-        fn error_decode_falls_back_to_an_anonymous_struct_when_no_error_response_exists() {
+        fn error_decode_falls_back_to_parsed_json_when_no_error_response_exists() {
             // An operation with no typed non-2xx response has no graph error model; the SDK must NOT
-            // fabricate a dependency on a named type — it decodes into a generator-owned anonymous
-            // struct exposing exactly the fields APIError consumes, so it always compiles.
+            // fabricate a dependency on a named type. It exposes the parsed JSON body as the generic
+            // Body fallback.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("var apiErr struct {"),
-                "absent error model must decode into an anonymous struct:\n{out}"
+                out.contains("typedBody = jsonBody"),
+                "absent error model must fall back to parsed JSON:\n{out}"
             );
             assert!(
-                !out.contains("var apiErr HttpError"),
+                !out.contains("var decoded HttpError"),
                 "absent error model must not reference any named error type:\n{out}"
             );
-            assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+            assert!(!out.contains("switch resp.StatusCode {"), "{out}");
         }
 
         #[test]
@@ -4939,23 +4887,26 @@ mod tests {
         }
 
         #[test]
-        fn error_decode_only_copies_fields_the_error_model_declares() {
-            // A graph whose error model carries only `message` (no `slug`/`hints`) must copy ONLY
-            // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
+        fn error_decode_reads_standard_fields_from_generic_json_body() {
+            // Standard message/slug/hints fields are read from the parsed JSON object, not from the
+            // declared model type, so a narrower error model still compiles.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
-            // The synthetic error model in error_model_graph declares message + slug only.
             assert!(
-                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
+                out.contains("Message: apiErrorStringField(jsonBody, \"message\"),"),
                 "{out}"
             );
             assert!(
-                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
+                out.contains("Slug: apiErrorStringField(jsonBody, \"slug\"),"),
                 "{out}"
             );
             assert!(
-                !out.contains("Hints: apiErr.Hints,"),
+                out.contains("Hints: apiErrorStringSliceField(jsonBody, \"hints\"),"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("apiErr.Hints"),
                 "must not read a `Hints` field the error model does not declare:\n{out}"
             );
         }
@@ -4999,8 +4950,13 @@ mod tests {
             let out = emit_errors("goalservice");
             assert!(out.contains("type APIError struct"), "{out}");
             assert!(out.contains("StatusCode int"), "{out}");
+            assert!(out.contains("Headers http.Header"), "{out}");
+            assert!(out.contains("RawBody []byte"), "{out}");
+            assert!(out.contains("JSONBody any"), "{out}");
+            assert!(out.contains("Body any"), "{out}");
             assert!(out.contains("func (e *APIError) Error() string"), "{out}");
-            assert!(out.contains("import \"fmt\""), "{out}");
+            assert!(out.contains("\"fmt\""), "{out}");
+            assert!(out.contains("\"net/http\""), "{out}");
         }
     }
 

@@ -31,10 +31,10 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    operation_api_key_queries, operation_http_auth_schemes, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    HttpAuthScheme, SuccessResponses,
+    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
+    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, ErrorResponseBody, HttpAuthScheme, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -544,17 +544,35 @@ fn emit_interface_with_policies(
     Ok(())
 }
 
-/// Emit `errors.ts`: the typed `ApiError extends Error` carrying the HTTP status + decoded body, with an
-/// `isNotFound()` helper. `package` is unused in the body but kept for call-site symmetry with the twin.
+/// Emit `errors.ts`: the typed `ApiError extends Error` carrying status, response metadata, and body.
 pub(crate) fn emit_errors(_package: &str) -> String {
     "\
+export interface ApiErrorInit {
+  headers?: Headers;
+  requestId?: string;
+  rawBody?: string;
+  jsonBody?: unknown;
+  body?: unknown;
+}
+
 export class ApiError extends Error {
+  public readonly headers: Headers;
+  public readonly requestId?: string;
+  public readonly rawBody: string;
+  public readonly jsonBody: unknown;
+  public readonly body: unknown;
+
   constructor(
     public readonly status: number,
-    public readonly body: unknown,
+    init: ApiErrorInit = {},
   ) {
     super(`HTTP ${status}`);
     this.name = \"ApiError\";
+    this.headers = init.headers ?? new Headers();
+    this.requestId = init.requestId;
+    this.rawBody = init.rawBody ?? \"\";
+    this.jsonBody = init.jsonBody ?? null;
+    this.body = init.body ?? this.jsonBody;
   }
 
   isNotFound(): boolean {
@@ -1009,6 +1027,7 @@ fn emit_operation(
 
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
     let auth_queries = operation_api_key_queries(graph, op)?;
     let auth_http = operation_http_auth_schemes(graph, op)?;
@@ -1109,6 +1128,7 @@ fn emit_operation(
         TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
         &auth_headers,
         &auth_http,
+        &error_bodies,
     )?;
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
@@ -1241,7 +1261,48 @@ impl TsRequestBody {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn emit_error_throw_branch(
+    out: &mut String,
+    error_bodies: &[ErrorResponseBody],
+) -> Result<(), CoreError> {
+    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
+    writeln!(out, "      const rawBody = await res.text();").map_err(sink)?;
+    writeln!(out, "      let jsonBody: unknown = null;").map_err(sink)?;
+    writeln!(out, "      try {{").map_err(sink)?;
+    writeln!(
+        out,
+        "        jsonBody = rawBody ? JSON.parse(rawBody) : null;"
+    )
+    .map_err(sink)?;
+    writeln!(out, "      }} catch {{").map_err(sink)?;
+    writeln!(out, "        jsonBody = null;").map_err(sink)?;
+    writeln!(out, "      }}").map_err(sink)?;
+    writeln!(out, "      let errorBody: unknown = jsonBody;").map_err(sink)?;
+    for error_body in error_bodies {
+        writeln!(out, "      if (res.status === {}) {{", error_body.status).map_err(sink)?;
+        writeln!(
+            out,
+            "        errorBody = jsonBody as models.{};",
+            error_body.model
+        )
+        .map_err(sink)?;
+        writeln!(out, "      }}").map_err(sink)?;
+    }
+    writeln!(out, "      throw new ApiError(res.status, {{").map_err(sink)?;
+    writeln!(out, "        headers: res.headers,").map_err(sink)?;
+    writeln!(
+        out,
+        "        requestId: res.headers.get(\"x-request-id\") ?? undefined,"
+    )
+    .map_err(sink)?;
+    writeln!(out, "        rawBody,").map_err(sink)?;
+    writeln!(out, "        jsonBody,").map_err(sink)?;
+    writeln!(out, "        body: errorBody,").map_err(sink)?;
+    writeln!(out, "      }});").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    Ok(())
+}
+
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
@@ -1249,6 +1310,7 @@ fn emit_op_dispatch(
     request_body: TsRequestBody,
     auth_headers: &[String],
     auth_http: &[HttpAuthScheme],
+    error_bodies: &[ErrorResponseBody],
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -1304,13 +1366,7 @@ fn emit_op_dispatch(
         )
         .map_err(sink)?;
     }
-    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
-    writeln!(
-        out,
-        "      throw new ApiError(res.status, await res.json().catch(() => null));"
-    )
-    .map_err(sink)?;
-    writeln!(out, "    }}").map_err(sink)?;
+    emit_error_throw_branch(out, error_bodies)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -1321,11 +1377,7 @@ fn emit_op_dispatch(
         writeln!(out, "      return await res.blob();").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
         if !success.has_bodyless_alternative() {
-            writeln!(
-                out,
-                "    throw new ApiError(res.status, await res.json().catch(() => null));"
-            )
-            .map_err(sink)?;
+            writeln!(out, "    throw new ApiError(res.status);").map_err(sink)?;
         }
     } else if let Some(model) = success.body_model.as_deref() {
         writeln!(
@@ -1337,11 +1389,7 @@ fn emit_op_dispatch(
         writeln!(out, "      return (await res.json()) as models.{model};").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
         if !success.has_bodyless_alternative() {
-            writeln!(
-                out,
-                "    throw new ApiError(res.status, await res.json().catch(() => null));"
-            )
-            .map_err(sink)?;
+            writeln!(out, "    throw new ApiError(res.status);").map_err(sink)?;
         }
     }
     Ok(())
@@ -1385,6 +1433,7 @@ pub(crate) fn emit_index_with_models(
     out.push_str("export { Client } from \"./client\";\n");
     out.push_str("export type { ClientOptions } from \"./client\";\n");
     out.push_str("export { ApiError } from \"./errors\";\n");
+    out.push_str("export type { ApiErrorInit } from \"./errors\";\n");
 
     // Every named schema becomes a top-level symbol in models.ts (interface or type) — re-export them
     // all as types (interfaces and `type` aliases are type-only re-exports).
@@ -1916,7 +1965,13 @@ mod tests {
                 "rejects only non-2xx statuses:\n{out}"
             );
             assert!(
-                out.contains("throw new ApiError(res.status, await res.json().catch(() => null));"),
+                out.contains("const rawBody = await res.text();")
+                    && out.contains("throw new ApiError(res.status, {"),
+                "{out}"
+            );
+            assert!(out.contains("if (res.status === 409) {"), "{out}");
+            assert!(
+                out.contains("errorBody = jsonBody as models.OutOfStock;"),
                 "{out}"
             );
             // typed return casts the decoded JSON to the response interface.
@@ -2427,7 +2482,10 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("public readonly status: number,"), "{out}");
-            assert!(out.contains("public readonly body: unknown,"), "{out}");
+            assert!(out.contains("public readonly headers: Headers;"), "{out}");
+            assert!(out.contains("public readonly rawBody: string;"), "{out}");
+            assert!(out.contains("public readonly jsonBody: unknown;"), "{out}");
+            assert!(out.contains("public readonly body: unknown;"), "{out}");
             assert!(out.contains("isNotFound(): boolean {"), "{out}");
             assert!(out.contains("return this.status === 404;"), "{out}");
         }
@@ -2441,6 +2499,10 @@ mod tests {
             );
             assert!(
                 out.contains("export { ApiError } from \"./errors\";"),
+                "{out}"
+            );
+            assert!(
+                out.contains("export type { ApiErrorInit } from \"./errors\";"),
                 "{out}"
             );
             assert!(out.contains("  Book,"), "{out}");

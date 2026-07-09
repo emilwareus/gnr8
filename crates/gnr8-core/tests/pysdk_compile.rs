@@ -280,14 +280,15 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
 }
 
 /// The hermetic round-trip driver: a stdlib-only Python program that stands up a fake backend, injects
-/// an `OpenerDirector` into the generated `Client`, and asserts a 2xx Pydantic-model round-trip plus a
-/// 4xx → typed `ApiError`. Written to a FILE and run by path (NEVER `-c "<interpolated data>"`, threat
+/// an `OpenerDirector` into the generated `Client`, and asserts a 2xx Pydantic-model round-trip plus
+/// a 4xx → fallback `ApiError` path. Written to a FILE and run by path (NEVER `-c "<interpolated
+/// data>"`, threat
 /// T-03-03-01 / V13). It uses ONLY the Python stdlib (`http.server`/`threading`/`json`/`urllib`) — no
 /// fastapi/uvicorn/requests/httpx/pytest, no `pip install` (CLAUDE.md rule 2, threat T-03-03-04).
 ///
 /// Backend shape (matches the `FastAPI` fixture's committed graph):
-/// - `do_POST` is the `create_book` path (`/`): replies `201` with a `CreatedMessage`-shaped body.
-/// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with a typed-error body.
+/// - `do_POST` is the `create_book` path (`/`): replies `201` with a `CreatedMessage` body.
+/// - `do_GET` is the `get_book` path (`/{book_id}`): replies `404` with an undeclared fallback body.
 ///
 /// The body passed to `create_book` is an actual `Book` Pydantic-style instance (CR-01 regression
 /// coverage): the generated `_do` now marshals `BaseModel` values via `model_dump` before
@@ -310,6 +311,8 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        if code >= 400:
+            self.send_header("X-Request-ID", f"req-{code}")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -319,7 +322,7 @@ class _Handler(BaseHTTPRequestHandler):
         _ = self.rfile.read(length)  # drain the request body
         self._send(201, {"message": "ok", "id": 1})
 
-    def do_GET(self):  # the get_book path (GET /{book_id}): 404 -> typed error body
+    def do_GET(self):  # the get_book path (GET /{book_id}): 404 -> fallback error body
         self._send(404, {"message": "not found", "slug": "book_not_found"})
 
 
@@ -347,13 +350,21 @@ def main():
         assert created.id == 1, created.id
         assert created.message == "ok", created.message
 
-        # 4xx: get_book(999) hits the 404 path -> a typed ApiError (urllib raises HTTPError, which the
-        # generated _do catches and turns into a (404, body) pair -> _raise -> ApiError) (Pitfall 6).
+        # 4xx without a declared error model: get_book(999) hits the 404 path -> ApiError with fallback
+        # JSON body plus response metadata and standard message/slug fields (Pitfall 6).
         try:
             client.get_book(999)
         except bookstore.ApiError as e:
             assert e.status_code == 404, e.status_code
             assert e.is_not_found(), "is_not_found() must be true for a 404"
+            assert e.request_id == "req-404", e.request_id
+            assert e.headers.get("X-Request-ID") == "req-404", e.headers
+            assert b"book_not_found" in e.raw_body, e.raw_body
+            assert e.json_body["slug"] == "book_not_found", e.json_body
+            assert isinstance(e.body, dict), type(e.body)
+            assert e.body["slug"] == "book_not_found", e.body
+            assert e.message == "not found", e.message
+            assert e.slug == "book_not_found", e.slug
         else:
             raise SystemExit("get_book(999) must raise ApiError on a 404")
     finally:

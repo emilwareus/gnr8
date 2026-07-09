@@ -11,8 +11,9 @@
 //!
 //! The smoke test constructs the `Client` via `NewClient(srv.URL)`, calls `CreateGoal` (POST `/goal/`)
 //! and asserts method/path/body + the decoded `CommandMessageWithUUID.UUID` (SDK-05 exercised), and
-//! exercises a 4xx path — a `DeleteGoal` against a stub returning 404 must surface a `*APIError` with
-//! `StatusCode == 404` (SDK-04 typed error). A `go build`/`go test` non-zero exit maps to a captured
+//! exercises a 4xx path — a `DeleteGoal` against a stub returning the declared 400 `HttpError` must
+//! surface a `*APIError` with a typed `Body` (SDK-04 typed error). A `go build`/`go test` non-zero exit
+//! maps to a captured
 //! stderr failure (or `CoreError::GoBuild` in the harness helper), never a panic (threat T-03-03-04).
 //!
 //! Requires the Go toolchain (present on dev + CI, go 1.26); skips gracefully (early return) if it is
@@ -284,23 +285,7 @@ fn generated_sdk_go_builds_clean() {
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }
 
-/// SDK-05 + SDK-04: a fixed httptest smoke test constructs the Client, calls `CreateGoal` (POST /goal/)
-/// asserting method/path/body + the decoded response, and exercises a 4xx `DeleteGoal` path that must
-/// surface a `*APIError` with `StatusCode` == 404. `go test ./...` must pass.
-#[test]
-fn generated_sdk_passes_httptest_smoke() {
-    if !go_available() {
-        eprintln!("skipping sdk_compile smoke: go toolchain unavailable");
-        return;
-    }
-    let dir = materialize_sdk();
-    let pkg = package_clause(&dir);
-
-    // A FIXED smoke *_test.go written by the harness (NOT part of the snapshot-ed SDK bundle — the
-    // bundle stays production-SDK-only, RESEARCH Open Q2 recommendation b). It shares the SDK's package
-    // (read from the written files) so it can call unexported helpers and the package types directly.
-    let smoke = format!(
-        r#"package {pkg}
+const HTTPTEST_SMOKE_TEMPLATE: &str = r#"package __PKG__
 
 import (
 	"context"
@@ -313,70 +298,112 @@ import (
 )
 
 // SDK-05: CreateGoal sends POST /goal/ with the marshaled body and decodes the 201 response.
-func TestCreateGoalSmoke(t *testing.T) {{
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
-		if r.Method != http.MethodPost {{
+func TestCreateGoalSmoke(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
-		}}
-		if r.URL.Path != "/goal/" {{
+		}
+		if r.URL.Path != "/goal/" {
 			t.Errorf("path = %s, want /goal/", r.URL.Path)
-		}}
+		}
 		body, _ := io.ReadAll(r.Body)
-		if !strings.Contains(string(body), "\"name\":\"my-goal\"") {{
+		if !strings.Contains(string(body), "\"name\":\"my-goal\"") {
 			t.Errorf("request body = %s, want it to contain name=my-goal", string(body))
-		}}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(CommandMessageWithUUID{{Message: "ok", UUID: "goal-123"}})
-	}}))
+		_ = json.NewEncoder(w).Encode(CommandMessageWithUUID{Message: "ok", UUID: "goal-123"})
+	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL)
-	out, err := c.CreateGoal(context.Background(), CreateGoalInput{{Name: "my-goal"}})
-	if err != nil {{
+	out, err := c.CreateGoal(context.Background(), CreateGoalInput{Name: "my-goal"})
+	if err != nil {
 		t.Fatalf("CreateGoal returned error: %v", err)
-	}}
-	if out.UUID != "goal-123" {{
+	}
+	if out.UUID != "goal-123" {
 		t.Fatalf("out.UUID = %q, want goal-123", out.UUID)
-	}}
-	if out.Message != "ok" {{
+	}
+	if out.Message != "ok" {
 		t.Fatalf("out.Message = %q, want ok", out.Message)
-	}}
-}}
+	}
+}
 
-// SDK-04: a 404 with an HttpError body must surface a *APIError carrying StatusCode == 404.
-func TestDeleteGoalNotFoundAPIError(t *testing.T) {{
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
-		if r.Method != http.MethodDelete {{
+// SDK-04: a declared 400 with an HttpError body must surface a *APIError with a typed Body.
+func TestDeleteGoalBadRequestAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
 			t.Errorf("method = %s, want DELETE", r.Method)
-		}}
-		if r.URL.Path != "/goal/missing-uuid" {{
+		}
+		if r.URL.Path != "/goal/missing-uuid" {
 			t.Errorf("path = %s, want /goal/missing-uuid", r.URL.Path)
-		}}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(HttpError{{Message: "not found", Slug: "goal_not_found"}})
-	}}))
+		w.Header().Set("X-Request-ID", "req-400")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: "bad_request"})
+	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL)
 	_, err := c.DeleteGoal(context.Background(), "missing-uuid")
-	if err == nil {{
-		t.Fatalf("DeleteGoal on a 404 must return an error")
-	}}
+	if err == nil {
+		t.Fatalf("DeleteGoal on a 400 must return an error")
+	}
 	apiErr, ok := err.(*APIError)
-	if !ok {{
+	if !ok {
 		t.Fatalf("error type = %T, want *APIError", err)
-	}}
-	if apiErr.StatusCode != 404 {{
-		t.Fatalf("StatusCode = %d, want 404", apiErr.StatusCode)
-	}}
-	if !apiErr.IsNotFound() {{
-		t.Fatalf("IsNotFound() = false, want true for a 404")
-	}}
-}}
-"#
-    );
+	}
+	if apiErr.StatusCode != 400 {
+		t.Fatalf("StatusCode = %d, want 400", apiErr.StatusCode)
+	}
+	if apiErr.IsNotFound() {
+		t.Fatalf("IsNotFound() = true, want false for a 400")
+	}
+	if apiErr.RequestID != "req-400" {
+		t.Fatalf("RequestID = %q, want req-400", apiErr.RequestID)
+	}
+	if got := apiErr.Headers.Get("X-Request-ID"); got != "req-400" {
+		t.Fatalf("Headers.Get(X-Request-ID) = %q, want req-400", got)
+	}
+	if !strings.Contains(string(apiErr.RawBody), "bad_request") {
+		t.Fatalf("RawBody = %s, want bad_request", string(apiErr.RawBody))
+	}
+	if apiErr.JSONBody == nil {
+		t.Fatalf("JSONBody = nil, want parsed JSON")
+	}
+	typed, ok := apiErr.Body.(HttpError)
+	if !ok {
+		t.Fatalf("Body type = %T, want HttpError", apiErr.Body)
+	}
+	if typed.Slug != "bad_request" {
+		t.Fatalf("Body.Slug = %q, want bad_request", typed.Slug)
+	}
+	if apiErr.Message != "bad request" {
+		t.Fatalf("Message = %q, want bad request", apiErr.Message)
+	}
+	if apiErr.Slug != "bad_request" {
+		t.Fatalf("Slug = %q, want bad_request", apiErr.Slug)
+	}
+}
+"#;
+
+/// SDK-05 + SDK-04: a fixed httptest smoke test constructs the Client, calls `CreateGoal` (POST /goal/)
+/// asserting method/path/body + the decoded response, and exercises a declared 4xx `DeleteGoal` path
+/// that must surface a `*APIError` with a typed error body. `go test ./...` must pass.
+#[test]
+fn generated_sdk_passes_httptest_smoke() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile smoke: go toolchain unavailable");
+        return;
+    }
+    let dir = materialize_sdk();
+    let pkg = package_clause(&dir);
+
+    // A FIXED smoke *_test.go written by the harness (NOT part of the snapshot-ed SDK bundle — the
+    // bundle stays production-SDK-only, RESEARCH Open Q2 recommendation b). It shares the SDK's package
+    // (read from the written files) so it can call unexported helpers and the package types directly.
+    let smoke = HTTPTEST_SMOKE_TEMPLATE.replace("__PKG__", &pkg);
     std::fs::write(dir.join("smoke_test.go"), smoke).expect("write smoke_test.go");
 
     let test = run_go(&["test", "./..."], &dir);

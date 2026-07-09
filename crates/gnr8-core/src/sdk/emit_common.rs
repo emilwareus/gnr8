@@ -574,6 +574,15 @@ pub(crate) struct SuccessResponses {
     pub(crate) binary_content_type: Option<String>,
 }
 
+/// One declared non-2xx JSON error response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ErrorResponseBody {
+    /// HTTP status for the declared error response.
+    pub(crate) status: u16,
+    /// Referenced error body model name.
+    pub(crate) model: String,
+}
+
 /// The request-body shape an SDK operation can accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequestBodyModel {
@@ -594,6 +603,42 @@ impl SuccessResponses {
     pub(crate) fn has_binary_body(&self) -> bool {
         !self.binary_statuses.is_empty()
     }
+}
+
+/// Resolve declared non-2xx JSON error body models for one operation.
+///
+/// The graph currently represents only explicit numeric statuses, not `default` or ranges, so the
+/// returned list is sorted by explicit status and used before language fallback behavior.
+pub(crate) fn error_response_bodies_of(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<Vec<ErrorResponseBody>, CoreError> {
+    let mut out = Vec::new();
+    for resp in &op.responses {
+        if (200..300).contains(&resp.status) || resp.body_kind != "json" {
+            continue;
+        }
+        let Some(body) = &resp.body else {
+            continue;
+        };
+        let model = graph
+            .schemas
+            .iter()
+            .find(|s| s.id == body.ref_id)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' error response references dangling $ref '{}'",
+                    op.id, body.ref_id
+                ),
+            })?;
+        out.push(ErrorResponseBody {
+            status: resp.status,
+            model: model.name.clone(),
+        });
+    }
+    out.sort_by_key(|body| body.status);
+    out.dedup();
+    Ok(out)
 }
 
 /// Resolve all 2xx responses for one operation.

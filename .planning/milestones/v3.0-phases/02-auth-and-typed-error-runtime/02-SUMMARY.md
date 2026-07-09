@@ -11,6 +11,9 @@ In progress.
 - 02-02 Bearer And Basic Auth: added `ApplySecurity::bearer` / `ApplySecurity::basic`, OpenAPI
   `http` security lowering/import, shared operation-scoped HTTP auth resolution, Go/Python/TypeScript
   client auth options, Authorization header emission, and Go bearer/basic runtime smoke.
+- 02-03 Typed SDK Error Runtime: added shared non-2xx response-body resolution, enriched Go/Python/
+  TypeScript base SDK error objects with status, headers/request ID, raw body, parsed JSON body, and
+  decoded declared error-body access, plus Go/Python runtime smoke and target generator assertions.
 
 ## Verification
 
@@ -31,6 +34,14 @@ Plan 2 verification passed on 2026-07-09:
 - `cargo test -p gnr8 generated_sdk -- --nocapture`
 - `cargo clippy -p gnr8 --all-targets -- -D warnings`
 
+Plan 3 verification passed on 2026-07-09:
+
+- `cargo test -p gnr8 error -- --nocapture`
+- `cargo test -p gnr8 generated_sdk -- --nocapture`
+- `cargo test -p gnr8 body_op_has -- --nocapture`
+- `cargo clippy -p gnr8 --all-targets -- -D warnings`
+
 ## Remaining
 
-- Richer typed error runtime payloads across Go/Python/TypeScript.
+- Cross-target auth runtime smoke coverage beyond the existing Go smoke tests where local toolchains are
+  available.

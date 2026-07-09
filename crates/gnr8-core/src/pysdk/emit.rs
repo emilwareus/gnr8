@@ -28,10 +28,10 @@ use std::fmt::Write as _;
 
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    operation_api_key_queries, operation_http_auth_schemes, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    HttpAuthScheme,
+    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
+    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, HttpAuthScheme,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -901,7 +901,7 @@ fn emit_dataclass(
     Ok(())
 }
 
-/// Emit `errors.py`: the typed `ApiError(Exception)` with status/message/slug/hints + `is_not_found()`.
+/// Emit `errors.py`: the typed `ApiError(Exception)` with status, response metadata, and decoded body.
 ///
 /// `package` is unused in the body (no package clause in Python) but kept for call-site symmetry with
 /// the Go twin's `emit_errors`. The `from __future__ import annotations` header keeps annotations lazy.
@@ -915,7 +915,7 @@ from typing import Any, Optional
 class ApiError(Exception):
     \"\"\"Raised by operation methods on a non-success response.
 
-    Carries the HTTP status and the decoded error body (message/slug/hints).
+    Carries the HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
     \"\"\"
 
     def __init__(
@@ -924,9 +924,20 @@ class ApiError(Exception):
         message: str = \"\",
         slug: str = \"\",
         hints: Optional[list[Any]] = None,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        request_id: str = \"\",
+        raw_body: bytes = b\"\",
+        json_body: Any = None,
+        body: Any = None,
     ) -> None:
         super().__init__(f\"{status_code} {message} ({slug})\")
         self.status_code = status_code
+        self.headers = headers or {}
+        self.request_id = request_id
+        self.raw_body = raw_body
+        self.json_body = json_body
+        self.body = body
         self.message = message
         self.slug = slug
         self.hints = hints if hints is not None else []
@@ -978,6 +989,9 @@ pub(crate) fn client_referenced_models(
         }
         if let Some(model) = success_responses_of(op, graph)?.body_model {
             names.push(model);
+        }
+        for error_body in error_response_bodies_of(op, graph)? {
+            names.push(error_body.model);
         }
     }
     names.sort();
@@ -1136,23 +1150,39 @@ class Client:
             req.add_header(\"Content-Type\", \"application/json\")
 {auth_loop}        try:
             with self._opener.open(req) as resp:
-                return resp.status, resp.read()
+                return resp.status, dict(resp.headers.items()), resp.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            return e.code, dict(e.headers.items()), e.read()
 
     @staticmethod
-    def _raise(status: int, raw: bytes) -> None:
+    def _raise(
+        status: int,
+        headers: dict[str, str],
+        raw: bytes,
+        error_model: Optional[type] = None,
+    ) -> None:
         try:
-            decoded = json.loads(raw) if raw else {{}}
+            json_body = json.loads(raw) if raw else None
         except ValueError:
-            decoded = {{}}
-        if not isinstance(decoded, dict):
-            decoded = {{}}
+            json_body = None
+        body = json_body
+        if error_model is not None and isinstance(json_body, dict):
+            try:
+                body = error_model.from_dict(json_body)
+            except Exception:
+                body = json_body
+        decoded = json_body if isinstance(json_body, dict) else {{}}
+        request_id = headers.get(\"X-Request-ID\") or headers.get(\"x-request-id\", \"\")
         raise ApiError(
             status,
             decoded.get(\"message\", \"\"),
             decoded.get(\"slug\", \"\"),
             decoded.get(\"hints\"),
+            headers=headers,
+            request_id=request_id,
+            raw_body=raw,
+            json_body=json_body,
+            body=body,
         )
 "
     )
@@ -1326,6 +1356,7 @@ fn emit_operation(
 
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
     let auth_queries = operation_api_key_queries(graph, op)?;
     let auth_http = operation_http_auth_schemes(graph, op)?;
@@ -1464,12 +1495,21 @@ fn emit_operation(
     };
     writeln!(
         out,
-        "        _status, _raw = self._do(\"{}\", path{body_arg}{auth_arg})",
+        "        _status, _headers, _raw = self._do(\"{}\", path{body_arg}{auth_arg})",
         op.method
     )
     .map_err(sink)?;
     writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
-    writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
+    for error_body in &error_bodies {
+        writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
+        writeln!(
+            out,
+            "                self._raise(_status, _headers, _raw, {})",
+            error_body.model
+        )
+        .map_err(sink)?;
+    }
+    writeln!(out, "            self._raise(_status, _headers, _raw)").map_err(sink)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -1481,7 +1521,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
+            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
         }
     } else if let Some(model) = &return_model {
         writeln!(
@@ -1506,7 +1546,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
+            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
@@ -2087,7 +2127,15 @@ mod tests {
                 out.contains("if _status < 200 or _status >= 300:"),
                 "rejects only non-2xx statuses:\n{out}"
             );
-            assert!(out.contains("self._raise(_status, _raw)"), "{out}");
+            assert!(out.contains("if _status == 409:"), "{out}");
+            assert!(
+                out.contains("self._raise(_status, _headers, _raw, OutOfStock)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("self._raise(_status, _headers, _raw)"),
+                "{out}"
+            );
             assert!(
                 out.contains("return CreatedMessage.model_validate(_data)"),
                 "{out}"

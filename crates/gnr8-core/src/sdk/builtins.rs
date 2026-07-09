@@ -4881,7 +4881,7 @@ mod tests {
             .text
             .as_str();
         assert!(
-            operations.contains("var apiErr ErrorResponse"),
+            operations.contains("var decoded ErrorResponse"),
             "Go SDK should decode non-2xx graph responses into ErrorResponse:\n{operations}"
         );
     }
