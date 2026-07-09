@@ -67,8 +67,7 @@ pub(crate) struct PathItem {
 
 /// One HTTP operation (an `operationId` + its params/body/responses).
 ///
-/// There is no `summary` here: those were doc-comment-annotation facts and have been removed
-/// (CLAUDE.md rules 1 & 3). `tags` are static source route-group names, not annotations.
+/// Summary/description/deprecation/tags are graph-owned documentation policy, not source annotations.
 // `operation_id` mirrors the spec's `operationId` key; the field name intentionally echoes the
 // struct, so the field-name lint is silenced here rather than renamed away from the spec term.
 #[allow(clippy::struct_field_names)]
@@ -76,7 +75,13 @@ pub(crate) struct PathItem {
 pub(crate) struct Operation {
     /// Stable, unique operation id (the graph operation id).
     pub operation_id: String,
-    /// Static source route-group tags.
+    /// Optional short operation summary.
+    pub summary: Option<String>,
+    /// Optional longer operation description.
+    pub description: Option<String>,
+    /// Whether the operation is deprecated.
+    pub deprecated: bool,
+    /// Public operation tags.
     pub tags: Vec<String>,
     /// Operation-level security requirements.
     pub security: Vec<SecurityRequirement>,
@@ -111,6 +116,8 @@ pub(crate) struct RequestBody {
     pub content_type: String,
     /// The JSON-pointer name of the referenced schema (bare component name).
     pub schema_ref: String,
+    /// Named examples for this media type.
+    pub examples: Vec<MediaExample>,
 }
 
 /// One response keyed by status code.
@@ -126,6 +133,21 @@ pub(crate) struct ResponseObj {
     pub binary: bool,
     /// Whether this response is a server-sent event stream (`text/event-stream`).
     pub event_stream: bool,
+    /// Named examples for this response media type.
+    pub examples: Vec<MediaExample>,
+}
+
+/// One named media example.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct MediaExample {
+    /// Example key under the `OpenAPI` `examples` map.
+    pub name: String,
+    /// Optional short example summary.
+    pub summary: Option<String>,
+    /// Optional longer example description.
+    pub description: Option<String>,
+    /// JSON-compatible example value.
+    pub value: serde_json::Value,
 }
 
 /// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.

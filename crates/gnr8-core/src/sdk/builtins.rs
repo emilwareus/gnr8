@@ -16,8 +16,9 @@ use super::{
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
-    ApiGraph, OperationRuntimePolicy, PaginationMode, PaginationPolicy, PaginationTermination,
-    Response, RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SecurityScheme, Type,
+    ApiGraph, MediaExample, OperationDocsPolicy, OperationRuntimePolicy, PaginationMode,
+    PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy, RuntimeHookKind,
+    RuntimePolicy, Schema, SchemaRef, SecurityScheme, Type,
 };
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
@@ -2226,6 +2227,420 @@ impl ConfigurePagination {
                 .collect(),
         }
     }
+}
+
+/// Configure public operation documentation and documented JSON error responses.
+#[derive(Debug, Clone)]
+pub struct DocumentOperation {
+    selector: OperationSelector,
+    summary: Option<String>,
+    description: Option<String>,
+    deprecated: Option<bool>,
+    tags: Vec<String>,
+    request_examples: Vec<MediaExample>,
+    response_docs: Vec<ResponseDocsPolicy>,
+    error_responses: Vec<DocumentedJsonErrorResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentedJsonErrorResponse {
+    status: u16,
+    schema: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDocumentedJsonErrorResponse {
+    status: u16,
+    schema_ref: String,
+    description: Option<String>,
+}
+
+impl DocumentOperation {
+    /// Document operations matched by `selector`.
+    #[must_use]
+    pub fn when(selector: OperationSelector) -> Self {
+        Self {
+            selector,
+            summary: None,
+            description: None,
+            deprecated: None,
+            tags: Vec::new(),
+            request_examples: Vec::new(),
+            response_docs: Vec::new(),
+            error_responses: Vec::new(),
+        }
+    }
+
+    /// Set a short operation summary.
+    #[must_use]
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Set a longer operation description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Mark the operation deprecated.
+    #[must_use]
+    pub const fn deprecated(mut self) -> Self {
+        self.deprecated = Some(true);
+        self
+    }
+
+    /// Add a public operation tag.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Add public operation tags.
+    #[must_use]
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags.extend(tags.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set a response description for a status.
+    #[must_use]
+    pub fn response_description(mut self, status: u16, description: impl Into<String>) -> Self {
+        self.response_docs.push(ResponseDocsPolicy {
+            status,
+            description: Some(description.into()),
+            examples: Vec::new(),
+        });
+        self
+    }
+
+    /// Add a JSON request example for `application/json`.
+    #[must_use]
+    pub fn request_example_json(
+        self,
+        name: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.request_example(name, "application/json", value)
+    }
+
+    /// Add a text request example for `text/plain`.
+    #[must_use]
+    pub fn request_example_text(self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.request_example(name, "text/plain", serde_json::Value::String(value.into()))
+    }
+
+    /// Add a request example for a specific media type.
+    #[must_use]
+    pub fn request_example(
+        mut self,
+        name: impl Into<String>,
+        content_type: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.request_examples
+            .push(media_example(name, content_type, value));
+        self
+    }
+
+    /// Add a JSON response example for `application/json`.
+    #[must_use]
+    pub fn response_example_json(
+        self,
+        status: u16,
+        name: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.response_example(status, name, "application/json", value)
+    }
+
+    /// Add a text response example for `text/plain`.
+    #[must_use]
+    pub fn response_example_text(
+        self,
+        status: u16,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.response_example(
+            status,
+            name,
+            "text/plain",
+            serde_json::Value::String(value.into()),
+        )
+    }
+
+    /// Add a response example for a specific media type.
+    #[must_use]
+    pub fn response_example(
+        mut self,
+        status: u16,
+        name: impl Into<String>,
+        content_type: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.response_docs.push(ResponseDocsPolicy {
+            status,
+            description: None,
+            examples: vec![media_example(name, content_type, value)],
+        });
+        self
+    }
+
+    /// Add or replace a documented JSON error response on matched operations.
+    #[must_use]
+    pub fn json_error_response(
+        mut self,
+        status: u16,
+        schema: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.error_responses.push(DocumentedJsonErrorResponse {
+            status,
+            schema: schema.into(),
+            description: Some(description.into()),
+        });
+        self
+    }
+}
+
+impl Transform for DocumentOperation {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        self.validate()?;
+        let resolved_errors = self
+            .error_responses
+            .iter()
+            .map(|error| {
+                Ok(ResolvedDocumentedJsonErrorResponse {
+                    status: error.status,
+                    schema_ref: resolve_schema_ref(
+                        ir,
+                        &error.schema,
+                        "documented JSON error response schema",
+                    )?,
+                    description: error.description.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.operation_docs.clone();
+        for index in 0..ir.operations.len() {
+            if !operation_selector_matches(&self.selector, &ir.operations[index], &base_path) {
+                continue;
+            }
+            matched += 1;
+            let operation_id = ir.operations[index].id.clone();
+            apply_documented_error_responses(&mut ir.operations[index], &resolved_errors);
+            let mut policy = policies
+                .iter()
+                .find(|existing| existing.operation_id == operation_id)
+                .cloned()
+                .unwrap_or_else(|| OperationDocsPolicy {
+                    operation_id,
+                    summary: None,
+                    description: None,
+                    deprecated: false,
+                    tags: Vec::new(),
+                    request_examples: Vec::new(),
+                    responses: Vec::new(),
+                });
+            apply_documentation_policy_updates(&mut policy, self, &resolved_errors);
+            upsert_operation_docs(&mut policies, policy);
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "operation documentation policy did not match any operations".to_string(),
+            });
+        }
+        ir.operation_docs = policies;
+        Ok(())
+    }
+}
+
+impl DocumentOperation {
+    fn validate(&self) -> Result<(), CoreError> {
+        validate_optional_metadata_value("operation summary", self.summary.as_deref())?;
+        validate_optional_metadata_value("operation description", self.description.as_deref())?;
+        validate_metadata_values("operation tag", &self.tags)?;
+        for example in &self.request_examples {
+            validate_media_example(example)?;
+        }
+        for response in &self.response_docs {
+            validate_http_status(response.status, "response documentation status")?;
+            validate_optional_metadata_value(
+                "response description",
+                response.description.as_deref(),
+            )?;
+            for example in &response.examples {
+                validate_media_example(example)?;
+            }
+        }
+        for response in &self.error_responses {
+            validate_http_status(response.status, "documented error response status")?;
+            if response.status < 400 {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "documented JSON error response status {} is not a 4xx/5xx status",
+                        response.status
+                    ),
+                });
+            }
+            validate_optional_metadata_value(
+                "documented error response description",
+                response.description.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn media_example(
+    name: impl Into<String>,
+    content_type: impl Into<String>,
+    value: impl Into<serde_json::Value>,
+) -> MediaExample {
+    MediaExample {
+        name: name.into(),
+        content_type: content_type.into(),
+        summary: None,
+        description: None,
+        value: value.into(),
+    }
+}
+
+fn apply_documented_error_responses(
+    op: &mut crate::graph::Operation,
+    responses: &[ResolvedDocumentedJsonErrorResponse],
+) {
+    for response in responses {
+        op.responses
+            .retain(|existing| existing.status != response.status);
+        op.responses.push(Response {
+            status: response.status,
+            body: Some(SchemaRef {
+                ref_id: response.schema_ref.clone(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        });
+        op.responses.sort_by_key(|existing| existing.status);
+    }
+}
+
+fn apply_documentation_policy_updates(
+    policy: &mut OperationDocsPolicy,
+    update: &DocumentOperation,
+    errors: &[ResolvedDocumentedJsonErrorResponse],
+) {
+    if update.summary.is_some() {
+        policy.summary.clone_from(&update.summary);
+    }
+    if update.description.is_some() {
+        policy.description.clone_from(&update.description);
+    }
+    if let Some(deprecated) = update.deprecated {
+        policy.deprecated = deprecated;
+    }
+    policy.tags.extend(update.tags.iter().cloned());
+    policy.tags.sort();
+    policy.tags.dedup();
+    for example in &update.request_examples {
+        upsert_media_example(&mut policy.request_examples, example.clone());
+    }
+    for error in errors {
+        upsert_response_docs(
+            &mut policy.responses,
+            ResponseDocsPolicy {
+                status: error.status,
+                description: error.description.clone(),
+                examples: Vec::new(),
+            },
+        );
+    }
+    for response in &update.response_docs {
+        upsert_response_docs(&mut policy.responses, response.clone());
+    }
+}
+
+fn upsert_operation_docs(policies: &mut Vec<OperationDocsPolicy>, policy: OperationDocsPolicy) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+}
+
+fn upsert_response_docs(responses: &mut Vec<ResponseDocsPolicy>, update: ResponseDocsPolicy) {
+    if let Some(existing) = responses
+        .iter_mut()
+        .find(|existing| existing.status == update.status)
+    {
+        if update.description.is_some() {
+            existing.description = update.description;
+        }
+        for example in update.examples {
+            upsert_media_example(&mut existing.examples, example);
+        }
+    } else {
+        responses.push(update);
+    }
+    responses.sort_by_key(|response| response.status);
+}
+
+fn upsert_media_example(examples: &mut Vec<MediaExample>, example: MediaExample) {
+    if let Some(existing) = examples.iter_mut().find(|existing| {
+        existing.name == example.name
+            && existing
+                .content_type
+                .eq_ignore_ascii_case(&example.content_type)
+    }) {
+        *existing = example;
+    } else {
+        examples.push(example);
+    }
+    examples.sort_by(|a, b| {
+        a.content_type
+            .cmp(&b.content_type)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn validate_media_example(example: &MediaExample) -> Result<(), CoreError> {
+    validate_metadata_value("media example name", &example.name)?;
+    validate_metadata_value("media example content type", &example.content_type)?;
+    validate_optional_metadata_value("media example summary", example.summary.as_deref())?;
+    validate_optional_metadata_value("media example description", example.description.as_deref())
+}
+
+fn validate_optional_metadata_value(field: &str, value: Option<&str>) -> Result<(), CoreError> {
+    if let Some(value) = value {
+        validate_metadata_value(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_http_status(status: u16, field: &str) -> Result<(), CoreError> {
+    if (100..=599).contains(&status) {
+        return Ok(());
+    }
+    Err(CoreError::Config {
+        message: format!("{field} {status} is invalid; expected an HTTP status 100..599"),
+    })
 }
 
 fn upsert_operation_runtime(
@@ -4832,18 +5247,19 @@ mod tests {
 
     use super::{
         sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
-        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
-        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
-        OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk, QueryParam, SdkOperationAliases,
-        SdkPackageMetadata, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
+        DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
+        Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
+        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
         ApiGraph, Diagnostic, Field, Operation, PaginationMode, PaginationTermination, Param, Prim,
         Response, RuntimeHookKind, Schema, SchemaRef, SourceSpan, Type,
     };
-    use crate::sdk::docs::SdkDocs;
+    use crate::sdk::docs::{write_sdk_docs, SdkDocs};
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::model::SdkModel;
     use crate::sdk::profile::SdkProfile;
@@ -6028,6 +6444,129 @@ mod tests {
         assert_eq!(
             list.pagination.as_ref().unwrap().page_size_param.as_deref(),
             Some("limit")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operation_documentation_transform_populates_openapi_and_sdk_docs() {
+        let mut create =
+            grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
+        create.request_body = Some(SchemaRef {
+            ref_id: "app.BookInput".to_string(),
+        });
+        create.responses = vec![Response {
+            status: 201,
+            body: Some(SchemaRef {
+                ref_id: "app.Book".to_string(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        }];
+        let mut ir = ApiGraph {
+            operations: vec![create],
+            schemas: vec![
+                Schema {
+                    id: "app.ApiError".to_string(),
+                    name: "ApiError".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.Book".to_string(),
+                    name: "Book".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.BookInput".to_string(),
+                    name: "BookInput".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        DocumentOperation::when(OperationSelector::operation("createBook"))
+            .summary("Create a book")
+            .description("Creates a book from catalog input.")
+            .deprecated()
+            .tags(["Catalog", "Books"])
+            .request_example_json("minimal", serde_json::json!({ "title": "Dune" }))
+            .response_description(201, "Book created")
+            .response_example_json(201, "created", serde_json::json!({ "id": "book_1" }))
+            .json_error_response(422, "ApiError", "Validation failed")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let yaml = crate::lower::to_openapi(&ir, "books", "/", &[]).unwrap();
+        assert!(yaml.contains("summary: Create a book"), "{yaml}");
+        assert!(yaml.contains("deprecated: true"), "{yaml}");
+        assert!(yaml.contains("tags: [Books, Catalog]"), "{yaml}");
+        assert!(yaml.contains("'422':"), "{yaml}");
+        assert!(yaml.contains("description: Validation failed"), "{yaml}");
+        assert!(yaml.contains("examples:"), "{yaml}");
+        assert!(yaml.contains("minimal:"), "{yaml}");
+        assert!(yaml.contains(r#"value: {"title":"Dune"}"#), "{yaml}");
+
+        let model = SdkModel::build(
+            &ir,
+            "books",
+            "/",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+        let docs = model
+            .docs_metadata
+            .operations
+            .iter()
+            .find(|docs| docs.operation_id == "createBook")
+            .unwrap();
+        assert_eq!(docs.summary.as_deref(), Some("Create a book"));
+        assert!(docs.deprecated);
+        assert_eq!(docs.tags, vec!["Books", "Catalog"]);
+
+        let mut out = Artifacts::new();
+        write_sdk_docs(
+            &mut out,
+            "sdk",
+            "Go",
+            "books",
+            &ir,
+            &model,
+            &SdkDocs::both(),
+        )
+        .unwrap();
+        let reference = out
+            .files()
+            .iter()
+            .find(|file| file.path == "sdk/reference.md")
+            .unwrap();
+        assert!(
+            reference.text.contains("Create a book")
+                && reference.text.contains("Validation failed")
+                && reference.text.contains("`minimal` (`application/json`)"),
+            "{}",
+            reference.text
+        );
+        let api_docs = out
+            .files()
+            .iter()
+            .find(|file| file.path == "sdk/docs/BooksApi.md")
+            .unwrap();
+        assert!(
+            api_docs.text.contains("Deprecated: yes")
+                && api_docs.text.contains("Book created")
+                && api_docs.text.contains("ApiError.md"),
+            "{}",
+            api_docs.text
         );
     }
 

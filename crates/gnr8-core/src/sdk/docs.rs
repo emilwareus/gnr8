@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Type};
+use crate::graph::{ApiGraph, Field, MediaExample, OperationDocsPolicy, Type};
 use crate::sdk::bundle::safe_frame_name;
 use crate::sdk::emit_common::split_words;
 use crate::sdk::model::{SdkModel, SdkSchema, SdkSchemaKind, SdkService};
@@ -322,6 +322,7 @@ fn sdk_reference(language: &str, package: &str, ir: &ApiGraph) -> String {
             op.method, op.path, op.id, request, responses
         );
     }
+    append_reference_operation_docs(&mut text, ir);
     text.push_str("\n## Schemas\n\n| Schema | Kind |\n|--|--|\n");
     for schema in &ir.schemas {
         let _ = writeln!(
@@ -388,6 +389,15 @@ fn api_doc_page(
             "### `{}`\n\n- Method: `{}`\n- Path: `{}`\n- SDK operation: `{}`\n",
             operation.id, operation.method, absolute_path, operation.handler
         );
+        append_operation_docs(
+            &mut text,
+            model,
+            ir.operations
+                .iter()
+                .find(|raw| raw.id == operation.id)
+                .and_then(|raw| operation_docs_policy(ir, &raw.id)),
+            &operation.id,
+        );
         if let Some(request_schema) = &operation.request_schema {
             let _ = writeln!(
                 text,
@@ -418,6 +428,159 @@ fn api_doc_page(
         text.push('\n');
     }
     text
+}
+
+fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
+    if ir.operation_docs.is_empty() {
+        return;
+    }
+    text.push_str("\n## Operation Documentation\n\n");
+    for policy in &ir.operation_docs {
+        let Some(op) = ir
+            .operations
+            .iter()
+            .find(|candidate| candidate.id == policy.operation_id)
+        else {
+            continue;
+        };
+        let _ = writeln!(text, "### `{}`\n", op.id);
+        append_policy_body(text, None, Some(policy));
+    }
+}
+
+fn append_operation_docs(
+    text: &mut String,
+    model: &SdkModel,
+    policy: Option<&OperationDocsPolicy>,
+    operation_id: &str,
+) {
+    let docs = model
+        .docs_metadata
+        .operations
+        .iter()
+        .find(|docs| docs.operation_id == operation_id);
+    if docs.is_none() && policy.is_none() {
+        return;
+    }
+    let has_metadata = docs.is_some_and(|docs| {
+        docs.summary.is_some()
+            || docs.description.is_some()
+            || docs.deprecated
+            || !docs.tags.is_empty()
+    }) || policy.is_some_and(|policy| {
+        policy.summary.is_some()
+            || policy.description.is_some()
+            || policy.deprecated
+            || !policy.tags.is_empty()
+            || !policy.request_examples.is_empty()
+            || policy
+                .responses
+                .iter()
+                .any(|response| response.description.is_some() || !response.examples.is_empty())
+    });
+    if !has_metadata {
+        return;
+    }
+    text.push_str("#### Documentation\n\n");
+    append_policy_body(text, docs, policy);
+}
+
+fn append_policy_body(
+    text: &mut String,
+    docs: Option<&crate::sdk::model::SdkOperationDocs>,
+    policy: Option<&OperationDocsPolicy>,
+) {
+    let summary = docs
+        .and_then(|docs| docs.summary.as_deref())
+        .or_else(|| policy.and_then(|policy| policy.summary.as_deref()));
+    if let Some(summary) = summary {
+        let _ = writeln!(text, "- Summary: {summary}");
+    }
+    let deprecated = docs.map_or_else(
+        || policy.is_some_and(|policy| policy.deprecated),
+        |docs| docs.deprecated,
+    );
+    if deprecated {
+        text.push_str("- Deprecated: yes\n");
+    }
+    let tags = docs
+        .map(|docs| docs.tags.as_slice())
+        .filter(|tags| !tags.is_empty())
+        .or_else(|| {
+            policy
+                .map(|policy| policy.tags.as_slice())
+                .filter(|tags| !tags.is_empty())
+        });
+    if let Some(tags) = tags {
+        let joined = tags
+            .iter()
+            .map(|tag| format!("`{tag}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(text, "- Tags: {joined}");
+    }
+    let description = docs
+        .and_then(|docs| docs.description.as_deref())
+        .or_else(|| policy.and_then(|policy| policy.description.as_deref()));
+    if let Some(description) = description {
+        let _ = writeln!(text, "\n{description}\n");
+    } else if docs.is_some() || policy.is_some() {
+        text.push('\n');
+    }
+    if let Some(policy) = policy {
+        append_examples(text, "Request examples", &policy.request_examples);
+        for response in &policy.responses {
+            if response.description.is_none() && response.examples.is_empty() {
+                continue;
+            }
+            let _ = writeln!(text, "- Response `{}`:", response.status);
+            if let Some(description) = &response.description {
+                let _ = writeln!(text, "  - Description: {description}");
+            }
+            append_examples_with_indent(text, "Examples", &response.examples, "  ");
+        }
+        if !policy.request_examples.is_empty()
+            || policy
+                .responses
+                .iter()
+                .any(|response| response.description.is_some() || !response.examples.is_empty())
+        {
+            text.push('\n');
+        }
+    }
+}
+
+fn append_examples(text: &mut String, label: &str, examples: &[MediaExample]) {
+    append_examples_with_indent(text, label, examples, "");
+}
+
+fn append_examples_with_indent(
+    text: &mut String,
+    label: &str,
+    examples: &[MediaExample],
+    indent: &str,
+) {
+    if examples.is_empty() {
+        return;
+    }
+    let _ = writeln!(text, "{indent}- {label}:");
+    for example in examples {
+        let value = serde_json::to_string(&example.value).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(
+            text,
+            "{indent}  - `{}` (`{}`): `{}`",
+            example.name, example.content_type, value
+        );
+    }
+}
+
+fn operation_docs_policy<'a>(
+    ir: &'a ApiGraph,
+    operation_id: &str,
+) -> Option<&'a OperationDocsPolicy> {
+    ir.operation_docs
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
 }
 
 fn model_doc_page(language: &str, package: &str, ir: &ApiGraph, schema: &SdkSchema) -> String {

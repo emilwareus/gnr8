@@ -898,12 +898,13 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, EnumOrder, FastApi,
-        Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs,
-        OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
-        OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam, RenameOperation, RenameType,
-        SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, DocumentOperation,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
+        RenameOperation, RenameType, SdkOperationAliases, SdkPackageMetadata, SetBasePath,
+        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
+        TsSdk,
     };
     pub use super::docs::SdkDocs;
     pub use super::go::{

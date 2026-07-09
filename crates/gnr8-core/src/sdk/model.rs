@@ -376,17 +376,28 @@ impl SdkModel {
                     content_types: response.content_types.clone(),
                 });
             }
-            let tags = if service == "default" {
-                Vec::new()
-            } else {
-                vec![service.clone()]
-            };
+            let docs_policy = graph
+                .operation_docs
+                .iter()
+                .find(|policy| policy.operation_id == op.id);
+            let tags = docs_policy
+                .filter(|policy| !policy.tags.is_empty())
+                .map_or_else(
+                    || {
+                        if service == "default" {
+                            Vec::new()
+                        } else {
+                            vec![service.clone()]
+                        }
+                    },
+                    |policy| policy.tags.clone(),
+                );
             operation_docs.push(SdkOperationDocs {
                 operation_id: op.id.clone(),
                 service: service.clone(),
-                summary: None,
-                description: None,
-                deprecated: false,
+                summary: docs_policy.and_then(|policy| policy.summary.clone()),
+                description: docs_policy.and_then(|policy| policy.description.clone()),
+                deprecated: docs_policy.is_some_and(|policy| policy.deprecated),
                 tags,
             });
             operations.push(SdkOperation {

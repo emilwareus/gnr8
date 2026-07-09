@@ -31,13 +31,13 @@ pub use crate::analyze::facts::{FieldFact as Field, Prim, Type, WellKnown};
 ///
 /// ## Generation metadata (set by transforms, read by targets)
 ///
-/// `base_path`, `title`, `security`, runtime policy, and pagination policy are **not** extracted from the source — they are facts the
-/// typed source cannot express (the mount prefix is often a runtime value; the title is author
-/// metadata; auth lives in middleware; retry and pagination behavior are product decisions,
-/// CLAUDE.md rule 4). They live on the graph as plain metadata that a [`crate::sdk::Transform`] sets
-/// and a [`crate::sdk::Target`] reads, then passes to the existing lowering and SDK emitters. They
-/// default to a root-mounted, untitled, unsecured API with no runtime helpers, so a bare `build_graph`
-/// graph still lowers.
+/// `base_path`, `title`, `security`, runtime policy, pagination policy, and documentation policy are
+/// **not** extracted from the source — they are facts the typed source cannot express (the mount prefix
+/// is often a runtime value; the title is author metadata; auth lives in middleware; retry,
+/// pagination, and public docs are product decisions, CLAUDE.md rule 4). They live on the graph as
+/// plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads, then passes
+/// to the existing lowering and SDK emitters. They default to a root-mounted, untitled, unsecured API
+/// with no runtime helpers, so a bare `build_graph` graph still lowers.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiGraph {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
@@ -67,6 +67,9 @@ pub struct ApiGraph {
     /// Explicit generated SDK pagination metadata, keyed by operation id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pagination: Vec<PaginationPolicy>,
+    /// Operation documentation metadata, keyed by operation id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_docs: Vec<OperationDocsPolicy>,
 }
 
 /// The default API base path (`"/"`, a root-mounted service) used when no transform sets one.
@@ -93,6 +96,7 @@ impl Default for ApiGraph {
             runtime: RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
 }
@@ -199,6 +203,61 @@ pub enum PaginationTermination {
     NoNextCursor,
     /// Stop when the configured items field is empty.
     EmptyItems,
+}
+
+/// Operation documentation metadata configured by code-as-config transforms.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OperationDocsPolicy {
+    /// Operation id this documentation policy applies to.
+    pub operation_id: String,
+    /// Optional short operation summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional longer operation description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the operation is deprecated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deprecated: bool,
+    /// Public operation tags. Empty means use the source-derived group tag, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Named request examples keyed by media type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_examples: Vec<MediaExample>,
+    /// Response documentation keyed by status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses: Vec<ResponseDocsPolicy>,
+}
+
+/// Response documentation metadata for one status code.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResponseDocsPolicy {
+    /// HTTP status this documentation applies to.
+    pub status: u16,
+    /// Optional response description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Named response examples keyed by media type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<MediaExample>,
+}
+
+/// One named media example.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaExample {
+    /// Example key under the `OpenAPI` `examples` map.
+    pub name: String,
+    /// Media type this example belongs to.
+    pub content_type: String,
+    /// Optional short example summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional longer example description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON-compatible example value.
+    pub value: serde_json::Value,
 }
 
 #[expect(
@@ -468,6 +527,7 @@ impl ApiGraph {
             runtime: RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
 }

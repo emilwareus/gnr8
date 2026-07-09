@@ -297,6 +297,7 @@ impl Importer {
             runtime: crate::graph::RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
+            operation_docs: Vec::new(),
         })
     }
 
