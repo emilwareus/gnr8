@@ -1714,6 +1714,36 @@ impl ApplySecurity {
         }
     }
 
+    /// An HTTP bearer scheme: `id` is the OpenAPI scheme id (e.g. `"BearerAuth"`).
+    #[must_use]
+    pub fn bearer(id: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "bearer".to_string(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
+    /// An HTTP basic scheme: `id` is the OpenAPI scheme id (e.g. `"BasicAuth"`).
+    #[must_use]
+    pub fn basic(id: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "basic".to_string(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
     /// Apply this scheme only to operations matched by `selector`.
     #[must_use]
     pub fn when(mut self, selector: OperationSelector) -> Self {

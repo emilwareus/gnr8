@@ -167,7 +167,142 @@ pub(crate) fn operation_api_key_schemes(
     graph: &ApiGraph,
     op: &Operation,
 ) -> Result<Vec<OperationApiKeyScheme>, CoreError> {
-    let schemes = api_key_security_schemes(graph)?;
+    let schemes = supported_security_schemes(graph)?;
+    let scheme_ids = operation_security_ids(graph, op);
+
+    let mut out = Vec::new();
+    for scheme_id in scheme_ids {
+        let Some(scheme) = schemes.get(&scheme_id) else {
+            return Err(unknown_security_scheme_error(op, &scheme_id));
+        };
+        if let SupportedAuthScheme::ApiKey(scheme) = scheme {
+            out.push(OperationApiKeyScheme {
+                id: scheme_id,
+                name: scheme.name.clone(),
+                location: scheme.location,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        location_sort_key(a.location)
+            .cmp(&location_sort_key(b.location))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out.dedup();
+    Ok(out)
+}
+
+/// Supported HTTP security scheme variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HttpAuthScheme {
+    /// HTTP bearer token auth.
+    Bearer,
+    /// HTTP basic auth.
+    Basic,
+}
+
+/// SDK-wide HTTP auth features required by a graph.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpAuthFeatures {
+    /// At least one HTTP bearer security scheme is declared.
+    pub(crate) bearer: bool,
+    /// At least one HTTP basic security scheme is declared.
+    pub(crate) basic: bool,
+}
+
+/// Resolve which HTTP auth helpers the generated SDK client must expose.
+pub(crate) fn http_auth_features(graph: &ApiGraph) -> Result<HttpAuthFeatures, CoreError> {
+    let schemes = supported_security_schemes(graph)?;
+    let mut features = HttpAuthFeatures::default();
+    for scheme in schemes.values() {
+        match scheme {
+            SupportedAuthScheme::ApiKey(_) => {}
+            SupportedAuthScheme::Http(HttpAuthScheme::Bearer) => features.bearer = true,
+            SupportedAuthScheme::Http(HttpAuthScheme::Basic) => features.basic = true,
+        }
+    }
+    Ok(features)
+}
+
+/// Resolve the HTTP auth schemes required by one operation, including global schemes.
+pub(crate) fn operation_http_auth_schemes(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<HttpAuthScheme>, CoreError> {
+    let schemes = supported_security_schemes(graph)?;
+    let scheme_ids = operation_security_ids(graph, op);
+    let mut out = Vec::new();
+    for scheme_id in scheme_ids {
+        let Some(scheme) = schemes.get(&scheme_id) else {
+            return Err(unknown_security_scheme_error(op, &scheme_id));
+        };
+        if let SupportedAuthScheme::Http(scheme) = scheme {
+            out.push(*scheme);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupportedAuthScheme {
+    ApiKey(ApiKeyScheme),
+    Http(HttpAuthScheme),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApiKeyScheme {
+    name: String,
+    location: ApiKeyLocation,
+}
+
+fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, ApiKeyScheme>, CoreError> {
+    let supported = supported_security_schemes(graph)?;
+    let mut schemes = BTreeMap::new();
+    for (id, scheme) in supported {
+        if let SupportedAuthScheme::ApiKey(scheme) = scheme {
+            schemes.insert(id, scheme);
+        }
+    }
+    Ok(schemes)
+}
+
+fn supported_security_schemes(
+    graph: &ApiGraph,
+) -> Result<BTreeMap<String, SupportedAuthScheme>, CoreError> {
+    let mut schemes = BTreeMap::new();
+    for scheme in &graph.security {
+        let auth = match scheme.kind.as_str() {
+            "apiKey" => {
+                let location = match scheme.location.as_str() {
+                    "header" => ApiKeyLocation::Header,
+                    "query" => ApiKeyLocation::Query,
+                    _ => return Err(unsupported_security_scheme_error(scheme)),
+                };
+                SupportedAuthScheme::ApiKey(ApiKeyScheme {
+                    name: scheme.name.clone(),
+                    location,
+                })
+            }
+            "http" if scheme.location.is_empty() => match scheme.name.as_str() {
+                "bearer" => SupportedAuthScheme::Http(HttpAuthScheme::Bearer),
+                "basic" => SupportedAuthScheme::Http(HttpAuthScheme::Basic),
+                _ => return Err(unsupported_security_scheme_error(scheme)),
+            },
+            _ => return Err(unsupported_security_scheme_error(scheme)),
+        };
+        if schemes.insert(scheme.id.clone(), auth).is_some() {
+            return Err(CoreError::SdkGen {
+                message: format!("duplicate security scheme id '{}'", scheme.id),
+            });
+        }
+    }
+    Ok(schemes)
+}
+
+fn operation_security_ids(graph: &ApiGraph, op: &Operation) -> Vec<String> {
     let mut scheme_ids: Vec<String> = if op.security_overrides_global {
         op.security.clone()
     } else {
@@ -181,78 +316,25 @@ pub(crate) fn operation_api_key_schemes(
     };
     scheme_ids.sort();
     scheme_ids.dedup();
-
-    let mut out = Vec::new();
-    for scheme_id in scheme_ids {
-        let Some(scheme) = schemes.get(&scheme_id) else {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "operation '{}' references unknown security scheme '{}'",
-                    op.id, scheme_id
-                ),
-            });
-        };
-        out.push(OperationApiKeyScheme {
-            id: scheme_id,
-            name: scheme.name.clone(),
-            location: scheme.location,
-        });
-    }
-    out.sort_by(|a, b| {
-        location_sort_key(a.location)
-            .cmp(&location_sort_key(b.location))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    out.dedup();
-    Ok(out)
+    scheme_ids
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ApiKeyScheme {
-    name: String,
-    location: ApiKeyLocation,
+fn unsupported_security_scheme_error(scheme: &crate::graph::SecurityScheme) -> CoreError {
+    CoreError::SdkGen {
+        message: format!(
+            "SDK targets support apiKey/header, apiKey/query, http/bearer, and http/basic security only, got scheme '{}' as kind='{}' location='{}' name='{}'",
+            scheme.id, scheme.kind, scheme.location, scheme.name
+        ),
+    }
 }
 
-fn api_key_security_schemes(graph: &ApiGraph) -> Result<BTreeMap<String, ApiKeyScheme>, CoreError> {
-    let mut schemes = BTreeMap::new();
-    for scheme in &graph.security {
-        if scheme.kind != "apiKey" {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "SDK targets support apiKey/header and apiKey/query security only, got scheme '{}' as {}/{}",
-                    scheme.id, scheme.kind, scheme.location
-                ),
-            });
-        }
-        let location = match scheme.location.as_str() {
-            "header" => ApiKeyLocation::Header,
-            "query" => ApiKeyLocation::Query,
-            _ => {
-                return Err(CoreError::SdkGen {
-                    message: format!(
-                        "SDK targets support apiKey/header and apiKey/query security only, got scheme '{}' as {}/{}",
-                        scheme.id, scheme.kind, scheme.location
-                    ),
-                });
-            }
-        };
-        if let Some(existing) = schemes.insert(
-            scheme.id.clone(),
-            ApiKeyScheme {
-                name: scheme.name.clone(),
-                location,
-            },
-        ) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "duplicate security scheme id '{}' uses credentials '{}' and '{}'",
-                    scheme.id, existing.name, scheme.name
-                ),
-            });
-        }
+fn unknown_security_scheme_error(op: &Operation, scheme_id: &str) -> CoreError {
+    CoreError::SdkGen {
+        message: format!(
+            "operation '{}' references unknown security scheme '{}'",
+            op.id, scheme_id
+        ),
     }
-    Ok(schemes)
 }
 
 fn location_sort_key(location: ApiKeyLocation) -> u8 {
@@ -648,7 +730,8 @@ pub(crate) fn request_body_model_of(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_stem, operation_api_key_headers, operation_api_key_queries, success_responses_of,
+        file_stem, http_auth_features, operation_api_key_headers, operation_api_key_queries,
+        operation_http_auth_schemes, success_responses_of, HttpAuthScheme,
     };
     use crate::graph::{ApiGraph, Operation, Response, SecurityScheme, SourceSpan};
 
@@ -797,6 +880,74 @@ mod tests {
         assert_eq!(operation_api_key_queries(&graph, &op)?, vec!["api_key"]);
         op.security_overrides_global = true;
         assert!(operation_api_key_queries(&graph, &op)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_http_auth_schemes_honor_global_and_override() -> Result<(), crate::CoreError> {
+        let graph = ApiGraph {
+            security: vec![
+                SecurityScheme {
+                    id: "BearerAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "bearer".to_string(),
+                    global: true,
+                },
+                SecurityScheme {
+                    id: "BasicAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "basic".to_string(),
+                    global: false,
+                },
+                SecurityScheme {
+                    id: "HeaderAuth".to_string(),
+                    kind: "apiKey".to_string(),
+                    location: "header".to_string(),
+                    name: "X-API-Key".to_string(),
+                    global: true,
+                },
+            ],
+            ..ApiGraph::default()
+        };
+        let features = http_auth_features(&graph)?;
+        assert!(features.bearer);
+        assert!(features.basic);
+
+        let mut op = Operation {
+            id: "write".to_string(),
+            method: "POST".to_string(),
+            path: "/write".to_string(),
+            handler: "write".to_string(),
+            group: None,
+            middleware: Vec::new(),
+            params: vec![],
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![],
+            security: vec![],
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        assert_eq!(
+            operation_http_auth_schemes(&graph, &op)?,
+            vec![HttpAuthScheme::Bearer]
+        );
+        assert_eq!(operation_api_key_headers(&graph, &op)?, vec!["X-API-Key"]);
+
+        op.security = vec!["BasicAuth".to_string()];
+        op.security_overrides_global = true;
+        assert_eq!(
+            operation_http_auth_schemes(&graph, &op)?,
+            vec![HttpAuthScheme::Basic]
+        );
+        assert!(operation_api_key_headers(&graph, &op)?.is_empty());
         Ok(())
     }
 }

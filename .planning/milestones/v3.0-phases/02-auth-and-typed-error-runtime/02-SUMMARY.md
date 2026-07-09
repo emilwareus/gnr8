@@ -8,6 +8,9 @@ In progress.
 
 - 02-01 Query API-Key Auth: added `ApplySecurity::api_key_query`, OpenAPI `apiKey` query lowering,
   Go/Python/TypeScript query credential emission, shared auth resolver coverage, and Go runtime smoke.
+- 02-02 Bearer And Basic Auth: added `ApplySecurity::bearer` / `ApplySecurity::basic`, OpenAPI
+  `http` security lowering/import, shared operation-scoped HTTP auth resolution, Go/Python/TypeScript
+  client auth options, Authorization header emission, and Go bearer/basic runtime smoke.
 
 ## Verification
 
@@ -20,8 +23,14 @@ In progress.
 
 All passed for Plan 1 on 2026-07-09.
 
+Plan 2 verification passed on 2026-07-09:
+
+- `cargo test -p gnr8 auth -- --nocapture`
+- `cargo test -p gnr8 security_is_emitted -- --nocapture`
+- `cargo test -p gnr8 imports_openapi31_security_schemes_and_operation_security -- --nocapture`
+- `cargo test -p gnr8 generated_sdk -- --nocapture`
+- `cargo clippy -p gnr8 --all-targets -- -D warnings`
+
 ## Remaining
 
-- Bearer token auth.
-- Basic auth.
 - Richer typed error runtime payloads across Go/Python/TypeScript.

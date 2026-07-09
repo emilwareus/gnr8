@@ -26,8 +26,9 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
 use crate::sdk::emit_common::{
     check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_queries,
-    operation_api_key_schemes, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, SuccessResponses,
+    operation_api_key_schemes, operation_http_auth_schemes, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    ApiKeyLocation, HttpAuthScheme, SuccessResponses,
 };
 use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -984,18 +985,43 @@ fn compat_constructor_requires_field(_owner_name: &str, field: &Field) -> bool {
 /// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
 /// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
 /// hard-coded fixture name.
-pub(crate) fn emit_client(package: &str, has_auth: bool) -> String {
-    let api_key_field = if has_auth {
+pub(crate) fn emit_client(
+    package: &str,
+    has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
+) -> String {
+    let api_key_field = if has_api_key_auth {
         "apiKey string\napiKeys map[string]string\n"
     } else {
         ""
     };
-    let api_key_option = if has_auth {
+    let bearer_field = if has_bearer_auth {
+        "bearerToken string\n"
+    } else {
+        ""
+    };
+    let basic_field = if has_basic_auth {
+        "basicUsername string\nbasicPassword string\n"
+    } else {
+        ""
+    };
+    let api_key_option = if has_api_key_auth {
         "\n// WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.\nfunc WithAPIKey(key string) Option {\nreturn func(c *Client) { c.apiKey = key }\n}\n\n// WithAPIKeyHeader sets the API key sent in one specific auth header.\nfunc WithAPIKeyHeader(header, key string) Option {\nreturn func(c *Client) {\nif c.apiKeys == nil {\nc.apiKeys = map[string]string{}\n}\nc.apiKeys[header] = key\n}\n}\n".to_string()
     } else {
         String::new()
     };
-    let api_key_init = if has_auth {
+    let bearer_option = if has_bearer_auth {
+        "\n// WithBearerToken sets the bearer token sent to operations secured by HTTP bearer auth.\nfunc WithBearerToken(token string) Option {\nreturn func(c *Client) { c.bearerToken = token }\n}\n".to_string()
+    } else {
+        String::new()
+    };
+    let basic_option = if has_basic_auth {
+        "\n// WithBasicAuth sets the credentials sent to operations secured by HTTP basic auth.\nfunc WithBasicAuth(username, password string) Option {\nreturn func(c *Client) {\nc.basicUsername = username\nc.basicPassword = password\n}\n}\n".to_string()
+    } else {
+        String::new()
+    };
+    let api_key_init = if has_api_key_auth {
         "apiKeys: map[string]string{},\n"
     } else {
         ""
@@ -1007,7 +1033,7 @@ pub(crate) fn emit_client(package: &str, has_auth: bool) -> String {
 type Client struct {{
 baseURL string
 httpClient *http.Client
-{api_key_field}}}
+{api_key_field}{bearer_field}{basic_field}}}
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
@@ -1017,6 +1043,8 @@ func WithHTTPClient(hc *http.Client) Option {{
 return func(c *Client) {{ c.httpClient = hc }}
 }}
 {api_key_option}
+{bearer_option}
+{basic_option}
 
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
@@ -3483,6 +3511,7 @@ fn emit_operation(
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
     let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     // The return type is the success model when one exists, else an empty struct.
     let return_model = if success.has_binary_body() {
         "[]byte".to_string()
@@ -3538,6 +3567,7 @@ fn emit_operation(
         &success,
         &auth_headers,
         &auth_queries,
+        &auth_http,
     )?;
     if !dispatch_returns {
         writeln!(body, "return out, nil").map_err(sink)?;
@@ -3561,6 +3591,7 @@ fn emit_request_dispatch(
     success: &SuccessResponses,
     auth_headers: &[String],
     auth_queries: &[String],
+    auth_http: &[HttpAuthScheme],
 ) -> Result<(), CoreError> {
     let body_model = request_body_model_of(op, graph)?;
     let has_body = body_model.is_some();
@@ -3673,6 +3704,29 @@ fn emit_request_dispatch(
         )
         .map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
+    }
+    for scheme in auth_http {
+        match scheme {
+            HttpAuthScheme::Bearer => {
+                writeln!(body, "if c.bearerToken != \"\" {{").map_err(sink)?;
+                writeln!(
+                    body,
+                    "req.Header.Set(\"Authorization\", \"Bearer \"+c.bearerToken)"
+                )
+                .map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+            }
+            HttpAuthScheme::Basic => {
+                writeln!(
+                    body,
+                    "if c.basicUsername != \"\" || c.basicPassword != \"\" {{"
+                )
+                .map_err(sink)?;
+                writeln!(body, "req.SetBasicAuth(c.basicUsername, c.basicPassword)")
+                    .map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+            }
+        }
     }
 
     // Execute.
@@ -4912,7 +4966,7 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client("goalservice", false);
+            let out = emit_client("goalservice", false, false, false);
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -4922,9 +4976,17 @@ mod tests {
                 "{out}"
             );
             assert!(!out.contains("func WithAPIKey(key string) Option"), "{out}");
-            let secured = emit_client("goalservice", true);
+            let secured = emit_client("goalservice", true, true, true);
             assert!(
                 secured.contains("func WithAPIKey(key string) Option"),
+                "{secured}"
+            );
+            assert!(
+                secured.contains("func WithBearerToken(token string) Option"),
+                "{secured}"
+            );
+            assert!(
+                secured.contains("func WithBasicAuth(username, password string) Option"),
                 "{secured}"
             );
             // computed imports.

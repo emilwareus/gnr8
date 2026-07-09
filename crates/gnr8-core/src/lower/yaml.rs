@@ -244,16 +244,24 @@ fn write_components(out: &mut String, components: &Components) {
     }
 }
 
-/// Emit one named `apiKey`/`header`/`<name>` security scheme.
+/// Emit one named security scheme.
 fn write_security_scheme(out: &mut String, name: &str, scheme: &SecurityScheme) {
     let _ = writeln!(out, "{INDENT}{INDENT}{}:", map_key(name));
     let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}type: {}", scheme.kind);
-    let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}in: {}", scheme.location);
-    let _ = writeln!(
-        out,
-        "{INDENT}{INDENT}{INDENT}name: {}",
-        scalar(&scheme.name)
-    );
+    if scheme.kind == "http" {
+        let _ = writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}scheme: {}",
+            scalar(&scheme.name)
+        );
+    } else {
+        let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}in: {}", scheme.location);
+        let _ = writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}name: {}",
+            scalar(&scheme.name)
+        );
+    }
 }
 
 /// Emit a [`SchemaObject`] body with keys in fixed order: `type`, `format`, `description`, `enum`,

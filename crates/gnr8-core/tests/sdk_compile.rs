@@ -194,6 +194,63 @@ fn query_api_key_graph() -> gnr8::graph::ApiGraph {
     .expect("query api-key graph json")
 }
 
+fn http_auth_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "getBearer",
+              "method": "GET",
+              "path": "/bearer",
+              "handler": "getBearer",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BearerAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "getBasic",
+              "method": "GET",
+              "path": "/basic",
+              "handler": "getBasic",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BasicAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": [
+            {
+              "id": "BearerAuth",
+              "kind": "http",
+              "location": "",
+              "name": "bearer",
+              "global": false
+            },
+            {
+              "id": "BasicAuth",
+              "kind": "http",
+              "location": "",
+              "name": "basic",
+              "global": false
+            }
+          ]
+        }"#,
+    )
+    .expect("http auth graph json")
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]
@@ -431,6 +488,65 @@ func TestQueryAPIKeyIsSent(t *testing.T) {{
     assert!(
         test.is_ok(),
         "go test ./... (query auth smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_sends_bearer_and_basic_auth() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile http auth smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = http_auth_graph();
+    let dir = materialize_sdk_from_graph("http-auth", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestBearerAndBasicAuthAreSent(t *testing.T) {{
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		switch r.URL.Path {{
+		case "/api/bearer":
+			if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {{
+				t.Errorf("bearer Authorization = %q, want Bearer secret-token", got)
+			}}
+		case "/api/basic":
+			username, password, ok := r.BasicAuth()
+			if !ok || username != "user" || password != "pass" {{
+				t.Errorf("basic auth = (%q, %q, %v), want (user, pass, true)", username, password, ok)
+			}}
+		default:
+			t.Errorf("path = %s, want /api/bearer or /api/basic", r.URL.Path)
+		}}
+		w.WriteHeader(http.StatusNoContent)
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, WithBearerToken("secret-token"), WithBasicAuth("user", "pass"))
+	if _, err := c.GetBearer(context.Background()); err != nil {{
+		t.Fatalf("GetBearer returned error: %v", err)
+	}}
+	if _, err := c.GetBasic(context.Background()); err != nil {{
+		t.Fatalf("GetBasic returned error: %v", err)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("http_auth_test.go"), smoke).expect("write http_auth_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (http auth smoke) must pass: {test:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

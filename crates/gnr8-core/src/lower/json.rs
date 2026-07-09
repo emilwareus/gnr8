@@ -236,8 +236,12 @@ fn write_components(components: &Components) -> Value {
 fn write_security_scheme(scheme: &SecurityScheme) -> Value {
     let mut out = Map::new();
     out.insert("type".to_string(), Value::String(scheme.kind.clone()));
-    out.insert("in".to_string(), Value::String(scheme.location.clone()));
-    out.insert("name".to_string(), Value::String(scheme.name.clone()));
+    if scheme.kind == "http" {
+        out.insert("scheme".to_string(), Value::String(scheme.name.clone()));
+    } else {
+        out.insert("in".to_string(), Value::String(scheme.location.clone()));
+        out.insert("name".to_string(), Value::String(scheme.name.clone()));
+    }
     Value::Object(out)
 }
 

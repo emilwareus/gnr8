@@ -294,15 +294,21 @@ impl Importer {
         };
         let kind = scheme.get("type").and_then(Value::as_str).unwrap_or("");
         let location = scheme.get("in").and_then(Value::as_str).unwrap_or("");
-        let has_name = scheme.get("name").and_then(Value::as_str).is_some();
-        if kind != "apiKey" || location != "header" || !has_name {
-            return Err(CoreError::Config {
-                message: format!(
-                    "{context} references unsupported security scheme '{id}'; gnr8 imports only apiKey/header schemes with a name"
-                ),
-            });
+        let name = scheme.get("name").and_then(Value::as_str);
+        let http_scheme = scheme.get("scheme").and_then(Value::as_str);
+        let supported = match kind {
+            "apiKey" => matches!(location, "header" | "query") && name.is_some(),
+            "http" => matches!(http_scheme, Some("bearer" | "basic")),
+            _ => false,
+        };
+        if supported {
+            return Ok(());
         }
-        Ok(())
+        Err(CoreError::Config {
+            message: format!(
+                "{context} references unsupported security scheme '{id}'; gnr8 imports apiKey/header, apiKey/query, http/bearer, and http/basic schemes only"
+            ),
+        })
     }
 
     fn validate_representable_responses(&self) -> Result<(), CoreError> {
@@ -352,25 +358,50 @@ impl Importer {
         for (id, scheme) in raw_schemes {
             let kind = scheme.get("type").and_then(Value::as_str).unwrap_or("");
             let location = scheme.get("in").and_then(Value::as_str).unwrap_or("");
-            let Some(name) = scheme.get("name").and_then(Value::as_str) else {
-                self.warn(format!(
-                    "security scheme '{id}' has no header name and was not imported"
-                ));
-                continue;
-            };
-            if kind != "apiKey" || location != "header" {
-                self.warn(format!(
-                    "security scheme '{id}' uses unsupported {kind}/{location}; only apiKey/header is imported"
-                ));
-                continue;
+            match kind {
+                "apiKey" => {
+                    let Some(name) = scheme.get("name").and_then(Value::as_str) else {
+                        self.warn(format!(
+                            "security scheme '{id}' has no apiKey name and was not imported"
+                        ));
+                        continue;
+                    };
+                    if !matches!(location, "header" | "query") {
+                        self.warn(format!(
+                            "security scheme '{id}' uses unsupported apiKey/{location}; only apiKey/header and apiKey/query are imported"
+                        ));
+                        continue;
+                    }
+                    schemes.push(SecurityScheme {
+                        id: id.clone(),
+                        kind: "apiKey".to_string(),
+                        location: location.to_string(),
+                        name: name.to_string(),
+                        global: global_ids.contains(&id),
+                    });
+                }
+                "http" => {
+                    let http_scheme = scheme.get("scheme").and_then(Value::as_str).unwrap_or("");
+                    if !matches!(http_scheme, "bearer" | "basic") {
+                        self.warn(format!(
+                            "security scheme '{id}' uses unsupported http/{http_scheme}; only http/bearer and http/basic are imported"
+                        ));
+                        continue;
+                    }
+                    schemes.push(SecurityScheme {
+                        id: id.clone(),
+                        kind: "http".to_string(),
+                        location: String::new(),
+                        name: http_scheme.to_string(),
+                        global: global_ids.contains(&id),
+                    });
+                }
+                _ => {
+                    self.warn(format!(
+                        "security scheme '{id}' uses unsupported type {kind}; only apiKey and http are imported"
+                    ));
+                }
             }
-            schemes.push(SecurityScheme {
-                id: id.clone(),
-                kind: "apiKey".to_string(),
-                location: "header".to_string(),
-                name: name.to_string(),
-                global: global_ids.contains(&id),
-            });
         }
         schemes.sort_by(|a, b| a.id.cmp(&b.id));
         schemes
@@ -1972,12 +2003,15 @@ openapi: 3.1.0
 info: { title: Secure API, version: 1.0.0 }
 security:
   - ApiKeyAuth: []
+    QueryAuth: []
+    BearerAuth: []
 paths:
   /write:
     post:
       operationId: writeEndpoint
       security:
         - CSRFAuth: []
+          BasicAuth: []
       responses: { '204': { description: ok } }
 components:
   securitySchemes:
@@ -1985,6 +2019,16 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+    QueryAuth:
+      type: apiKey
+      in: query
+      name: api_key
+    BearerAuth:
+      type: http
+      scheme: bearer
+    BasicAuth:
+      type: http
+      scheme: basic
     CSRFAuth:
       type: apiKey
       in: header
@@ -1996,17 +2040,34 @@ components:
             text,
         )
         .unwrap();
-        assert_eq!(graph.security.len(), 2);
+        assert_eq!(graph.security.len(), 5);
         assert!(graph
             .security
             .iter()
             .any(|scheme| scheme.id == "ApiKeyAuth" && scheme.global));
+        assert!(graph.security.iter().any(|scheme| {
+            scheme.id == "QueryAuth" && scheme.location == "query" && scheme.name == "api_key"
+        }));
+        assert!(graph.security.iter().any(|scheme| {
+            scheme.id == "BearerAuth"
+                && scheme.kind == "http"
+                && scheme.location.is_empty()
+                && scheme.name == "bearer"
+                && scheme.global
+        }));
+        assert!(graph.security.iter().any(|scheme| {
+            scheme.id == "BasicAuth"
+                && scheme.kind == "http"
+                && scheme.location.is_empty()
+                && scheme.name == "basic"
+                && !scheme.global
+        }));
         let write = graph
             .operations
             .iter()
             .find(|operation| operation.id == "writeEndpoint")
             .unwrap();
-        assert_eq!(write.security, vec!["CSRFAuth"]);
+        assert_eq!(write.security, vec!["BasicAuth", "CSRFAuth"]);
         assert!(write.security_overrides_global);
 
         let yaml = to_openapi(&graph, "Secure API", "/", &graph.security).unwrap();
@@ -2019,8 +2080,13 @@ components:
             .next()
             .unwrap_or(write_block);
         assert!(
-            write_block.contains("security:\n        - CSRFAuth: []"),
+            write_block.contains("security:\n        - BasicAuth: []")
+                && write_block.contains("CSRFAuth: []"),
             "imported operation security must keep OpenAPI override semantics:\n{write_block}"
+        );
+        assert!(
+            write_block.contains("BasicAuth: []"),
+            "imported operation security must keep HTTP basic override:\n{write_block}"
         );
         assert!(
             !write_block.contains("ApiKeyAuth: []"),

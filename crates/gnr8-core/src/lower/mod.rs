@@ -41,11 +41,11 @@ use model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
+/// Supported `apiKey` locations.
 const SUPPORTED_API_KEY_LOCATIONS: &[&str] = &["header", "query"];
 
-/// The only security scheme kind the `PoC` supports.
-const SUPPORTED_SCHEME_KIND: &str = "apiKey";
+/// Supported HTTP auth schemes.
+const SUPPORTED_HTTP_SCHEMES: &[&str] = &["bearer", "basic"];
 
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document (serialized YAML).
 ///
@@ -190,14 +190,12 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
     let mut requirements = Vec::with_capacity(schemes.len());
     let mut components = Vec::with_capacity(schemes.len());
     for scheme in schemes {
-        if scheme.kind != SUPPORTED_SCHEME_KIND
-            || !SUPPORTED_API_KEY_LOCATIONS.contains(&scheme.location.as_str())
-        {
+        if !is_supported_security_scheme(scheme) {
             return Err(crate::CoreError::Lowering {
                 message: format!(
-                    "unsupported security scheme '{}': supported SDK/OpenAPI auth is kind=\"{SUPPORTED_SCHEME_KIND}\" \
-                     in=\"header\" or in=\"query\" (got kind=\"{}\" location=\"{}\")",
-                    scheme.id, scheme.kind, scheme.location
+                    "unsupported security scheme '{}': supported SDK/OpenAPI auth is apiKey/header, \
+                     apiKey/query, http/bearer, or http/basic (got kind=\"{}\" location=\"{}\" name=\"{}\")",
+                    scheme.id, scheme.kind, scheme.location, scheme.name
                 ),
             });
         }
@@ -228,6 +226,16 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
         requirements,
         schemes: components,
     })
+}
+
+fn is_supported_security_scheme(scheme: &GraphSecurityScheme) -> bool {
+    match scheme.kind.as_str() {
+        "apiKey" => SUPPORTED_API_KEY_LOCATIONS.contains(&scheme.location.as_str()),
+        "http" => {
+            scheme.location.is_empty() && SUPPORTED_HTTP_SCHEMES.contains(&scheme.name.as_str())
+        }
+        _ => false,
+    }
 }
 
 /// Group operations sharing an absolute path into one [`PathItem`] (so PUT + DELETE on
@@ -1473,6 +1481,38 @@ mod tests {
         assert!(yaml.contains("type: apiKey"), "{yaml}");
         assert!(yaml.contains("in: query"), "{yaml}");
         assert!(yaml.contains("name: api_key"), "{yaml}");
+    }
+
+    #[test]
+    fn http_security_is_emitted_in_components() {
+        let config = vec![
+            SecurityScheme {
+                id: "BearerAuth".to_string(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "bearer".to_string(),
+                global: true,
+            },
+            SecurityScheme {
+                id: "BasicAuth".to_string(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "basic".to_string(),
+                global: true,
+            },
+        ];
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap();
+        assert!(yaml.contains("- BasicAuth: []"), "{yaml}");
+        assert!(yaml.contains("BearerAuth: []"), "{yaml}");
+        assert!(
+            yaml.contains("BearerAuth:\n      type: http\n      scheme: bearer"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("BasicAuth:\n      type: http\n      scheme: basic"),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("in: \n"), "{yaml}");
     }
 
     #[test]

@@ -29,8 +29,9 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    operation_api_key_queries, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of,
+    operation_api_key_queries, operation_http_auth_schemes, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    HttpAuthScheme,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -946,7 +947,15 @@ class ApiError(Exception):
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", PyModelStyle::default(), false, &[])
+    emit_client_with_models(
+        package,
+        "models",
+        PyModelStyle::default(),
+        false,
+        false,
+        false,
+        &[],
+    )
 }
 
 /// The set of model class names `client.py` references (each operation's request-body model and typed
@@ -983,7 +992,9 @@ pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     model_style: PyModelStyle,
-    has_auth: bool,
+    has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
     model_refs: &[String],
 ) -> String {
     let (body_encode, body_comment) = match model_style {
@@ -999,6 +1010,9 @@ pub(crate) fn emit_client_with_models(
 
     // --- Import header, assembled per file in canonical isort order (no unused imports, F401-clean). ---
     let mut stdlib: Vec<String> = Vec::new();
+    if has_basic_auth {
+        stdlib.push("import base64".to_string());
+    }
     if let PyModelStyle::Dataclass = model_style {
         stdlib.push("import dataclasses".to_string());
     }
@@ -1032,21 +1046,61 @@ pub(crate) fn emit_client_with_models(
         first_party,
     ]);
 
-    let auth_init = if has_auth {
+    let auth_init = if has_api_key_auth {
         "        api_keys: Optional[dict[str, str]] = None,\n"
     } else {
         ""
     };
-    let auth_field = if has_auth {
+    let bearer_init = if has_bearer_auth {
+        "        bearer_token: Optional[str] = None,\n"
+    } else {
+        ""
+    };
+    let basic_init = if has_basic_auth {
+        "        basic_auth: Optional[tuple[str, str]] = None,\n"
+    } else {
+        ""
+    };
+    let auth_field = if has_api_key_auth {
         "        self._api_keys = api_keys or {}\n"
     } else {
         ""
     };
-    let auth_loop = if has_auth {
-        "        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                req.add_header(header, key)\n"
+    let bearer_field = if has_bearer_auth {
+        "        self._bearer_token = bearer_token\n"
     } else {
         ""
     };
+    let basic_field = if has_basic_auth {
+        "        self._basic_auth = basic_auth\n"
+    } else {
+        ""
+    };
+    let auth_headers_arg = if has_api_key_auth {
+        "        auth_headers: Optional[tuple[str, ...]] = None,\n"
+    } else {
+        ""
+    };
+    let auth_bearer_arg = if has_bearer_auth {
+        "        auth_bearer: bool = False,\n"
+    } else {
+        ""
+    };
+    let auth_basic_arg = if has_basic_auth {
+        "        auth_basic: bool = False,\n"
+    } else {
+        ""
+    };
+    let mut auth_loop = String::new();
+    if has_api_key_auth {
+        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                req.add_header(header, key)\n");
+    }
+    if has_bearer_auth {
+        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            req.add_header(\"Authorization\", f\"Bearer {self._bearer_token}\")\n");
+    }
+    if has_basic_auth {
+        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            req.add_header(\"Authorization\", \"Basic \" + base64.b64encode(raw).decode(\"ascii\"))\n");
+    }
     // The `_do` signature is pre-exploded (one parameter per line, trailing comma) because the single-
     // line form exceeds the 88-column limit — matching `ruff format` so the output is format-stable.
     format!(
@@ -1061,11 +1115,11 @@ class Client:
         base_url: str,
         *,
         api_key: Optional[str] = None,
-{auth_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+{auth_init}{bearer_init}{basic_init}        opener: Optional[urllib.request.OpenerDirector] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}        self._opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}        self._opener = opener or urllib.request.build_opener()
 
     def _do(
         self,
@@ -1073,7 +1127,7 @@ class Client:
         path: str,
         *,
         body: Optional[Any] = None,
-        auth_headers: Optional[tuple[str, ...]] = None,
+{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}
     ) -> tuple:
 {body_comment}{body_encode}
         data = json.dumps(body).encode(\"utf-8\") if body is not None else None
@@ -1274,6 +1328,7 @@ fn emit_operation(
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
     let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1392,10 +1447,20 @@ fn emit_operation(
     } else {
         ""
     };
-    let auth_arg = if auth_headers.is_empty() {
+    let mut auth_args = Vec::new();
+    if !auth_headers.is_empty() {
+        auth_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
+    }
+    if auth_http.contains(&HttpAuthScheme::Bearer) {
+        auth_args.push("auth_bearer=True".to_string());
+    }
+    if auth_http.contains(&HttpAuthScheme::Basic) {
+        auth_args.push("auth_basic=True".to_string());
+    }
+    let auth_arg = if auth_args.is_empty() {
         String::new()
     } else {
-        format!(", auth_headers={}", py_string_tuple(&auth_headers))
+        format!(", {}", auth_args.join(", "))
     };
     writeln!(
         out,
@@ -1525,8 +1590,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        emit_client, emit_errors, emit_init, emit_models, emit_models_with_style, emit_operations,
-        py_type, screaming_snake, snake,
+        emit_client, emit_client_with_models, emit_errors, emit_init, emit_models,
+        emit_models_with_style, emit_operations, py_type, screaming_snake, snake,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
     use crate::sdk::model_style::PyModelStyle;
@@ -2150,6 +2215,32 @@ mod tests {
         }
 
         #[test]
+        fn http_auth_marks_operation_dispatch() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "BearerAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "bearer".to_string(),
+                    global: true,
+                },
+                crate::graph::SecurityScheme {
+                    id: "BasicAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "basic".to_string(),
+                    global: true,
+                },
+            ];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("self._do(\"GET\", path, auth_bearer=True, auth_basic=True)"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn binary_success_returns_bytes_without_json_decode() {
             let mut g = ops_graph();
             let op = g
@@ -2233,7 +2324,7 @@ mod tests {
     }
 
     mod client_errors_init {
-        use super::{emit_client, emit_errors, emit_init, ops_graph};
+        use super::{emit_client, emit_client_with_models, emit_errors, emit_init, ops_graph};
 
         #[test]
         fn client_has_injectable_opener_and_no_third_party_http_imports() {
@@ -2247,6 +2338,33 @@ mod tests {
             // no third-party HTTP libs (PYSDK-01).
             assert!(!out.contains("import requests"), "{out}");
             assert!(!out.contains("import httpx"), "{out}");
+        }
+
+        #[test]
+        fn client_emits_http_auth_options_when_needed() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                true,
+                true,
+                &[],
+            );
+            assert!(out.contains("import base64"), "{out}");
+            assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
+            assert!(
+                out.contains("basic_auth: Optional[tuple[str, str]] = None"),
+                "{out}"
+            );
+            assert!(
+                out.contains("req.add_header(\"Authorization\", f\"Bearer {self._bearer_token}\")"),
+                "{out}"
+            );
+            assert!(
+                out.contains("base64.b64encode(raw).decode(\"ascii\")"),
+                "{out}"
+            );
         }
 
         #[test]

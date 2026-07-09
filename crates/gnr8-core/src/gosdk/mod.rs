@@ -19,8 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_names, file_stem, model_file_name,
-    operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
+    api_key_credential_names, check_unique_schema_names, file_stem, http_auth_features,
+    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
+    validate_sdk_base_path,
 };
 use crate::sdk::go::GoSdkOptions;
 use crate::sdk::go::{GoQuerySetterArgumentPolicy, GoRequestBuilderAliases};
@@ -137,9 +138,11 @@ pub(crate) fn generate_files_with_profile_options(
     };
 
     // Fixed leading files (sorted: client.go before errors.go).
+    let http_auth = http_auth_features(graph)?;
+    let has_api_key_auth = !auth_credentials.is_empty();
     files.push(raw_go_file(
         "client.go",
-        emit::emit_client(package, !auth_credentials.is_empty()),
+        emit::emit_client(package, has_api_key_auth, http_auth.bearer, http_auth.basic),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
     if emit_compat_surface {

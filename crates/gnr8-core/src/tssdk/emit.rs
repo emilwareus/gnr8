@@ -32,8 +32,9 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::emit_common::{
     check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    operation_api_key_queries, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, SuccessResponses,
+    operation_api_key_queries, operation_http_auth_schemes, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    HttpAuthScheme, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -573,15 +574,57 @@ export class ApiError extends Error {
 /// `--lib es2022,dom`).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", false)
+    emit_client_with_models(package, "models", false, false, false)
 }
 
 /// Emit `client.ts` with a configurable model-barrel import path.
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
-    _has_auth: bool,
+    _has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
 ) -> String {
+    let bearer_option = if has_bearer_auth {
+        "  bearerToken?: string;\n"
+    } else {
+        ""
+    };
+    let basic_option = if has_basic_auth {
+        "  basicAuth?: { username: string; password: string };\n"
+    } else {
+        ""
+    };
+    let bearer_field = if has_bearer_auth {
+        "  private readonly bearerToken?: string;\n"
+    } else {
+        ""
+    };
+    let basic_field = if has_basic_auth {
+        "  private readonly basicAuth?: { username: string; password: string };\n"
+    } else {
+        ""
+    };
+    let bearer_init = if has_bearer_auth {
+        "    this.bearerToken = opts.bearerToken;\n"
+    } else {
+        ""
+    };
+    let basic_init = if has_basic_auth {
+        "    this.basicAuth = opts.basicAuth;\n"
+    } else {
+        ""
+    };
+    let bearer_helper = if has_bearer_auth {
+        "\n  _bearerAuth(): string | undefined {\n    if (this.bearerToken === undefined) {\n      return undefined;\n    }\n    return `Bearer ${this.bearerToken}`;\n  }\n"
+    } else {
+        ""
+    };
+    let basic_helper = if has_basic_auth {
+        "\n  _basicAuth(): string | undefined {\n    if (this.basicAuth === undefined) {\n      return undefined;\n    }\n    const raw = `${this.basicAuth.username}:${this.basicAuth.password}`;\n    return `Basic ${btoa(raw)}`;\n  }\n"
+    } else {
+        ""
+    };
     format!(
         "\
 import {{ ApiError }} from \"./errors\";
@@ -592,6 +635,7 @@ export interface ClientOptions {{
   fetch?: typeof fetch;
   apiKey?: string;
   apiKeys?: Record<string, string>;
+{bearer_option}{basic_option}
 }}
 
 export class Client {{
@@ -599,12 +643,14 @@ export class Client {{
   private readonly fetchFn: typeof fetch;
   private readonly apiKey?: string;
   private readonly apiKeys: Record<string, string>;
+{bearer_field}{basic_field}
 
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {{}};
+{bearer_init}{basic_init}
   }}
 
   _apiKey(...names: string[]): string | undefined {{
@@ -616,6 +662,7 @@ export class Client {{
     }}
     return this.apiKey;
   }}
+{bearer_helper}{basic_helper}
 
   async _request(
     method: string,
@@ -964,6 +1011,7 @@ fn emit_operation(
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
     let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
@@ -1060,6 +1108,7 @@ fn emit_operation(
         &success,
         TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
         &auth_headers,
+        &auth_http,
     )?;
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
@@ -1199,6 +1248,7 @@ fn emit_op_dispatch(
     success: &SuccessResponses,
     request_body: TsRequestBody,
     auth_headers: &[String],
+    auth_http: &[HttpAuthScheme],
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -1216,6 +1266,18 @@ fn emit_op_dispatch(
             quoted_string_literal(header)
         )
         .map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    if auth_http.contains(&HttpAuthScheme::Bearer) {
+        writeln!(out, "    const bearerAuth = this._bearerAuth();").map_err(sink)?;
+        writeln!(out, "    if (bearerAuth !== undefined) {{").map_err(sink)?;
+        writeln!(out, "      headers[\"Authorization\"] = bearerAuth;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    if auth_http.contains(&HttpAuthScheme::Basic) {
+        writeln!(out, "    const basicAuth = this._basicAuth();").map_err(sink)?;
+        writeln!(out, "    if (basicAuth !== undefined) {{").map_err(sink)?;
+        writeln!(out, "      headers[\"Authorization\"] = basicAuth;").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     if request_body.is_required() {
@@ -1345,7 +1407,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        camel, emit_client, emit_errors, emit_index, emit_models, emit_operations, ts_type,
+        camel, emit_client, emit_client_with_models, emit_errors, emit_index, emit_models,
+        emit_operations, ts_type,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
 
@@ -2034,6 +2097,44 @@ mod tests {
         }
 
         #[test]
+        fn http_auth_sets_authorization_header() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "BearerAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "bearer".to_string(),
+                    global: true,
+                },
+                crate::graph::SecurityScheme {
+                    id: "BasicAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "basic".to_string(),
+                    global: true,
+                },
+            ];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("const bearerAuth = this._bearerAuth();"),
+                "{out}"
+            );
+            assert!(
+                out.contains("headers[\"Authorization\"] = bearerAuth;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("const basicAuth = this._basicAuth();"),
+                "{out}"
+            );
+            assert!(
+                out.contains("headers[\"Authorization\"] = basicAuth;"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn auth_headers_use_collision_free_temp_names() {
             let mut g = ops_graph();
             g.security = vec![
@@ -2280,7 +2381,7 @@ mod tests {
     }
 
     mod client_errors_index {
-        use super::{emit_client, emit_errors, emit_index, ops_graph};
+        use super::{emit_client, emit_client_with_models, emit_errors, emit_index, ops_graph};
 
         #[test]
         fn client_uses_fetch_with_an_injectable_transport_and_no_third_party_imports() {
@@ -2295,6 +2396,27 @@ mod tests {
             assert!(!out.contains("axios"), "{out}");
             assert!(!out.contains("node-fetch"), "{out}");
             assert!(!out.contains("@types"), "{out}");
+        }
+
+        #[test]
+        fn client_emits_http_auth_options_when_needed() {
+            let out = emit_client_with_models("bookstore", "models", false, true, true);
+            assert!(out.contains("bearerToken?: string;"), "{out}");
+            assert!(
+                out.contains("basicAuth?: { username: string; password: string };"),
+                "{out}"
+            );
+            assert!(
+                out.contains("return `Bearer ${this.bearerToken}`;"),
+                "{out}"
+            );
+            assert!(
+                out.contains(
+                    "const raw = `${this.basicAuth.username}:${this.basicAuth.password}`;"
+                ),
+                "{out}"
+            );
+            assert!(out.contains("return `Basic ${btoa(raw)}`;"), "{out}");
         }
 
         #[test]

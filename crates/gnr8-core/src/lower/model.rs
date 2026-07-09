@@ -131,21 +131,22 @@ pub(crate) struct ResponseObj {
 /// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub(crate) struct Components {
-    /// Named security schemes (e.g. `ApiKeyAuth` → apiKey/header/X-API-Key), sorted by name.
+    /// Named security schemes (e.g. `ApiKeyAuth` → apiKey/header/X-API-Key,
+    /// `BearerAuth` → http/bearer), sorted by name.
     pub security_schemes: Vec<(String, SecurityScheme)>,
     /// Component schemas, keyed by their bare component name, sorted by name.
     pub schemas: Vec<(String, SchemaObject)>,
 }
 
 /// A security scheme, built from the user's `gnr8` config (the single source of truth for security —
-/// `CLAUDE.md` rule 4). The `PoC` emits the `apiKey`/`header` shape the fixture config declares.
+/// `CLAUDE.md` rule 4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SecurityScheme {
-    /// The scheme kind (e.g. `"apiKey"`), from config.
+    /// The scheme kind (e.g. `"apiKey"` or `"http"`), from config.
     pub kind: String,
-    /// Where the key is read from (e.g. `"header"`), from config.
+    /// Where the key is read from (e.g. `"header"`); empty for HTTP auth schemes.
     pub location: String,
-    /// The header name carrying the key (e.g. `X-API-Key`), from config.
+    /// The credential name (e.g. `X-API-Key`) or HTTP scheme (`bearer`, `basic`), from config.
     pub name: String,
 }
 

@@ -22,11 +22,11 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
-    model_file_name, operation_api_key_schemes, operation_file_name, operation_group_file_name,
-    operation_group_name, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, validate_sdk_base_path,
-    ApiKeyLocation,
+    api_key_credential_names, check_unique_schema_names, file_in_dir, file_stem,
+    http_auth_features, join_path, model_file_name, operation_api_key_schemes, operation_file_name,
+    operation_group_file_name, operation_group_name, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    validate_sdk_base_path, ApiKeyLocation,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
@@ -113,10 +113,13 @@ fn generate_files_with_layout_options(
     let model_dir = layout.model_dir_ref().unwrap_or("models");
     let split_operations =
         layout.is_split() && !matches!(layout.operation_split(), OperationFileSplit::Compact);
+    let http_auth = http_auth_features(graph)?;
     let mut client = emit::emit_client_with_models(
         package,
         model_dir.trim_matches('/'),
         !auth_credentials.is_empty(),
+        http_auth.bearer,
+        http_auth.basic,
     );
     if split_operations {
         client.push_str(&emit::emit_split_operation_surface(&ops)?);

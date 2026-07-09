@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: "Production-ready SDK adoption"
 status: in_progress
-stopped_at: Phase 2 Plan 1 complete; bearer/basic auth and richer typed errors remain
-last_updated: "2026-07-09T12:00:00.000Z"
-last_activity: 2026-07-09 — Completed Phase 2 Plan 1 query API-key auth
+stopped_at: Phase 2 Plan 2 complete; richer typed errors remain
+last_updated: "2026-07-09T09:03:09.000Z"
+last_activity: 2026-07-09 — Completed Phase 2 Plan 2 bearer/basic auth
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
+  total_plans: 3
+  completed_plans: 3
   percent: 20
 ---
 
@@ -26,9 +26,9 @@ See: .planning/PROJECT.md (updated 2026-07-09)
 ## Current Position
 
 Phase: Phase 2 — Auth And Typed Error Runtime
-Plan: Plan 2 pending
+Plan: Plan 3 pending
 Status: Phase 2 in progress
-Last activity: 2026-07-09 — Query API-key auth implemented across OpenAPI and SDK targets
+Last activity: 2026-07-09 — Bearer/basic auth implemented across OpenAPI and SDK targets
 
 ## Performance Metrics
 

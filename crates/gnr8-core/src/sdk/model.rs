@@ -271,6 +271,10 @@ impl SdkModel {
     /// # Errors
     ///
     /// Returns [`CoreError::Config`] for invalid alias configuration.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "builder intentionally assembles the full SDK planning model in one deterministic pass"
+    )]
     pub fn build(
         graph: &ApiGraph,
         package: impl Into<String>,
