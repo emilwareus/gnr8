@@ -4767,9 +4767,31 @@ fieldValue := reflected.Field(i)
 if omitempty && fieldValue.IsZero() {{
 continue
 }}
-values.Set(name, formValue(fieldValue.Interface()))
-}}
-return nil
+	addFormField(values, name, fieldValue.Interface())
+	}}
+	return nil
+	}}
+
+	func addFormField(values url.Values, name string, value any) {{
+	v := reflect.ValueOf(value)
+	if !v.IsValid() {{
+	values.Set(name, "")
+	return
+	}}
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+	if v.IsNil() {{
+	return
+	}}
+	v = v.Elem()
+	}}
+	if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {{
+	values.Del(name)
+	for i := 0; i < v.Len(); i++ {{
+	values.Add(name, formValue(v.Index(i).Interface()))
+	}}
+	return
+	}}
+values.Set(name, formValue(value))
 }}
 
 func formFieldName(field reflect.StructField) (string, bool) {{
@@ -4868,16 +4890,24 @@ return nil
 }}
 return writeMultipartField(writer, name, v.Elem().Interface())
 }}
-if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {{
-part, err := writer.CreateFormFile(name, name)
-if err != nil {{
-return err
-}}
-_, err = part.Write(v.Bytes())
-return err
-}}
-return writer.WriteField(name, formValue(value))
-}}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {{
+	part, err := writer.CreateFormFile(name, name)
+	if err != nil {{
+	return err
+	}}
+	_, err = part.Write(v.Bytes())
+	return err
+	}}
+	if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {{
+	for i := 0; i < v.Len(); i++ {{
+	if err := writeMultipartField(writer, name, v.Index(i).Interface()); err != nil {{
+	return err
+	}}
+	}}
+	return nil
+	}}
+	return writer.WriteField(name, formValue(value))
+	}}
 "#
         )
         .map_err(sink)?;

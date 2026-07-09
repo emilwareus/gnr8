@@ -336,6 +336,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
+                },
+                {
+                  "json_name": "tags",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
+                  "description": null,
+                  "example": null
                 }
               ] },
               "enum_source_order": [],
@@ -360,6 +369,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "optional": false,
                   "nullable": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "files",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
                 }
@@ -841,13 +859,16 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/form":
             assert self.headers.get("Content-Type") == "application/x-www-form-urlencoded", self.headers
             values = urllib.parse.parse_qs(body.decode("utf-8"))
-            assert values == {"count": ["3"], "name": ["Ada"]}, values
+            assert values == {"count": ["3"], "name": ["Ada"], "tags": ["sdk", "media"]}, values
         elif self.path == "/multipart":
             assert self.headers.get("Content-Type", "").startswith("multipart/form-data; boundary="), self.headers
             assert b'name="title"' in body, body
             assert b"Report" in body, body
             assert b'name="file"; filename="file"' in body, body
             assert b"abc123" in body, body
+            assert body.count(b'name="files"; filename="files"') == 2, body
+            assert b"part-one" in body, body
+            assert b"part-two" in body, body
         elif self.path == "/binary":
             assert self.headers.get("Content-Type") == "application/octet-stream", self.headers
             assert body == b"raw-bytes", body
@@ -867,8 +888,14 @@ def main():
             opener=urllib.request.build_opener(),
         )
         assert client.post_text("hello") is None
-        assert client.post_form(bookstore.FormBody(name="Ada", count=3)) is None
-        assert client.post_multipart(bookstore.MultipartBody(title="Report", file=b"abc123")) is None
+        assert client.post_form(bookstore.FormBody(name="Ada", count=3, tags=["sdk", "media"])) is None
+        assert client.post_multipart(
+            bookstore.MultipartBody(
+                title="Report",
+                file=b"abc123",
+                files=[b"part-one", b"part-two"],
+            )
+        ) is None
         assert client.post_binary(b"raw-bytes") is None
         assert _Handler.seen == ["/text", "/form", "/multipart", "/binary"], _Handler.seen
     finally:

@@ -812,15 +812,32 @@ export class Client {{
       if (value === undefined || value === null) {{
         continue;
       }}
-      if (value instanceof Blob) {{
-        form.append(key, value);
-      }} else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {{
-        form.append(key, new Blob([value as BlobPart]), key);
+      if (Array.isArray(value)) {{
+        for (const item of value) {{
+          this._appendMultipartValue(form, key, item);
+        }}
       }} else {{
-        form.append(key, String(value));
+        this._appendMultipartValue(form, key, value);
       }}
     }}
     return form;
+  }}
+
+  private _appendMultipartValue(
+    form: FormData,
+    key: string,
+    value: unknown,
+  ): void {{
+    if (value === undefined || value === null) {{
+      return;
+    }}
+    if (value instanceof Blob) {{
+      form.append(key, value);
+    }} else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {{
+      form.append(key, new Blob([value as BlobPart]), key);
+    }} else {{
+      form.append(key, String(value));
+    }}
   }}
 
   async _request(
@@ -875,31 +892,21 @@ export class Client {{
         for (const hook of this.hooks.request) {{
           await hook(hookContext, init);
         }}
-        const response = await this.fetchFn(url, init);
+      }} catch (error) {{
         if (timeoutId !== undefined) {{
           clearTimeout(timeoutId);
         }}
-        hookContext.status = response.status;
-        hookContext.responseHeaders = response.headers;
-        for (const hook of this.hooks.response) {{
-          await hook(hookContext, response);
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
         }}
-        if (
-          this._shouldRetryStatus(response.status) &&
-          attempt < retryAttempts
-        ) {{
-          await this._sleep(this._retryDelayMs(response));
-          continue;
+        throw error;
+      }}
+      let response: Response | undefined = undefined;
+      try {{
+        response = await this.fetchFn(url, init);
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
         }}
-        if (response.status < 200 || response.status >= 300) {{
-          const error = new ApiError(response.status, {{
-            headers: response.headers,
-          }});
-          for (const hook of this.hooks.error) {{
-            await hook(hookContext, error);
-          }}
-        }}
-        return response;
       }} catch (error) {{
         if (timeoutId !== undefined) {{
           clearTimeout(timeoutId);
@@ -913,6 +920,34 @@ export class Client {{
         }}
         throw error;
       }}
+      if (response === undefined) {{
+        throw new Error(\"request failed without response\");
+      }}
+      hookContext.status = response.status;
+      hookContext.responseHeaders = response.headers;
+      try {{
+        for (const hook of this.hooks.response) {{
+          await hook(hookContext, response);
+        }}
+      }} catch (error) {{
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+        throw error;
+      }}
+      if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {{
+        await this._sleep(this._retryDelayMs(response));
+        continue;
+      }}
+      if (response.status < 200 || response.status >= 300) {{
+        const error = new ApiError(response.status, {{
+          headers: response.headers,
+        }});
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+      }}
+      return response;
     }}
     throw lastError ?? new Error(\"request failed without response\");
   }}
@@ -3607,6 +3642,21 @@ mod tests {
             assert!(
                 out.contains("for (const hook of this.hooks.error)"),
                 "{out}"
+            );
+            let request_hook_pos = out
+                .find("for (const hook of this.hooks.request)")
+                .expect("request hook loop");
+            let fetch_pos = out
+                .find("response = await this.fetchFn(url, init);")
+                .expect("fetch assignment");
+            let retry_catch_pos = out.find("lastError = error;").expect("retry catch");
+            assert!(
+                request_hook_pos < fetch_pos && fetch_pos < retry_catch_pos,
+                "hook failures must be handled before the transport retry catch:\n{out}"
+            );
+            assert!(
+                out.contains("throw error;\n      }\n      let response: Response | undefined"),
+                "request hook failures must be rethrown before fetch retry handling:\n{out}"
             );
         }
 

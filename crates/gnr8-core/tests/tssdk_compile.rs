@@ -235,6 +235,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
+                },
+                {
+                  "json_name": "tags",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
+                  "description": null,
+                  "example": null
                 }
               ] },
               "enum_source_order": [],
@@ -259,6 +268,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "optional": false,
                   "nullable": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "files",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
                 }
@@ -482,8 +500,12 @@ import { Client } from "./index";
 
 async function smoke(client: Client): Promise<void> {
   await client.postText("hello");
-  await client.postForm({ name: "Ada", count: 3 });
-  await client.postMultipart({ title: "Report", file: new Uint8Array([1, 2, 3]) });
+	  await client.postForm({ name: "Ada", count: 3, tags: ["sdk", "media"] });
+	  await client.postMultipart({
+	    title: "Report",
+	    file: new Uint8Array([1, 2, 3]),
+	    files: [new Uint8Array([4, 5, 6]), new Uint8Array([7, 8, 9])],
+	  });
   await client.postBinary(new Uint8Array([1, 2, 3]));
 }
 
@@ -498,6 +520,12 @@ void smoke;
     assert!(
         result.is_ok(),
         "media SDK and consumer must type-check (text + form + multipart + binary): {result:?}"
+    );
+    let client_src = std::fs::read_to_string(dir.join("client.ts")).expect("read media client.ts");
+    assert!(
+        client_src.contains("if (Array.isArray(value))")
+            && client_src.contains("this._appendMultipartValue(form, key, item);"),
+        "multipart helper must append array values as repeated parts:\n{client_src}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

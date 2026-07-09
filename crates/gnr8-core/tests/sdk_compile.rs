@@ -332,6 +332,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
+                },
+                {
+                  "json_name": "tags",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
+                  "description": null,
+                  "example": null
                 }
               ] },
               "enum_source_order": [],
@@ -356,6 +365,15 @@ fn media_graph() -> gnr8::graph::ApiGraph {
                   "optional": false,
                   "nullable": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "files",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
                 }
@@ -708,19 +726,25 @@ func TestMediaRequestBodies(t *testing.T) {
 			if err != nil {
 				t.Fatalf("form body did not parse: %v", err)
 			}
-			if values.Get("name") != "Ada" || values.Get("count") != "3" {
-				t.Errorf("form body = %q, want name=Ada and count=3", string(body))
-			}
-		case "/multipart":
-			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data; boundary=") {
-				t.Errorf("multipart Content-Type = %q, want multipart/form-data boundary", got)
-			}
-			text := string(body)
-			for _, want := range []string{`name="title"`, "Report", `name="file"; filename="file"`, "abc123"} {
-				if !strings.Contains(text, want) {
-					t.Errorf("multipart body missing %q:\n%s", want, text)
+				if values.Get("name") != "Ada" || values.Get("count") != "3" {
+					t.Errorf("form body = %q, want name=Ada and count=3", string(body))
 				}
-			}
+				if got := values["tags"]; len(got) != 2 || got[0] != "sdk" || got[1] != "media" {
+					t.Errorf("form tags = %#v, want repeated tags sdk/media; body=%q", got, string(body))
+				}
+			case "/multipart":
+				if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data; boundary=") {
+					t.Errorf("multipart Content-Type = %q, want multipart/form-data boundary", got)
+				}
+				text := string(body)
+				for _, want := range []string{`name="title"`, "Report", `name="file"; filename="file"`, "abc123", `name="files"; filename="files"`, "part-one", "part-two"} {
+					if !strings.Contains(text, want) {
+						t.Errorf("multipart body missing %q:\n%s", want, text)
+					}
+				}
+				if strings.Count(text, `name="files"; filename="files"`) != 2 {
+					t.Errorf("multipart repeated files field count mismatch:\n%s", text)
+				}
 		case "/binary":
 			if got := r.Header.Get("Content-Type"); got != "application/octet-stream" {
 				t.Errorf("binary Content-Type = %q, want application/octet-stream", got)
@@ -740,10 +764,10 @@ func TestMediaRequestBodies(t *testing.T) {
 	if _, err := c.PostText(ctx, "hello"); err != nil {
 		t.Fatalf("PostText returned error: %v", err)
 	}
-	if _, err := c.PostForm(ctx, FormBody{Name: "Ada", Count: 3}); err != nil {
+	if _, err := c.PostForm(ctx, FormBody{Name: "Ada", Count: 3, Tags: []string{"sdk", "media"}}); err != nil {
 		t.Fatalf("PostForm returned error: %v", err)
 	}
-	if _, err := c.PostMultipart(ctx, MultipartBody{Title: "Report", File: []byte("abc123")}); err != nil {
+	if _, err := c.PostMultipart(ctx, MultipartBody{Title: "Report", File: []byte("abc123"), Files: [][]byte{[]byte("part-one"), []byte("part-two")}}); err != nil {
 		t.Fatalf("PostMultipart returned error: %v", err)
 	}
 	if _, err := c.PostBinary(ctx, []byte("raw-bytes")); err != nil {

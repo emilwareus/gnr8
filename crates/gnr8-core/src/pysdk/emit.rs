@@ -1357,23 +1357,27 @@ class Client:
         for key, item in value.items():
             if item is None:
                 continue
-            out.extend(f\"--{{boundary}}\\r\\n\".encode())
-            if isinstance(item, (bytes, bytearray)):
-                out.extend(
-                    (
-                        f'Content-Disposition: form-data; name=\"{{key}}\"; '
-                        f'filename=\"{{key}}\"\\r\\n'
-                        \"Content-Type: application/octet-stream\\r\\n\\r\\n\"
-                    ).encode()
-                )
-                out.extend(bytes(item))
-                out.extend(b\"\\r\\n\")
-            else:
-                out.extend(
-                    f'Content-Disposition: form-data; name=\"{{key}}\"\\r\\n\\r\\n'.encode()
-                )
-                out.extend(str(item).encode())
-                out.extend(b\"\\r\\n\")
+            items = item if isinstance(item, (list, tuple)) else (item,)
+            for part in items:
+                if part is None:
+                    continue
+                out.extend(f\"--{{boundary}}\\r\\n\".encode())
+                if isinstance(part, (bytes, bytearray)):
+                    out.extend(
+                        (
+                            f'Content-Disposition: form-data; name=\"{{key}}\"; '
+                            f'filename=\"{{key}}\"\\r\\n'
+                            \"Content-Type: application/octet-stream\\r\\n\\r\\n\"
+                        ).encode()
+                    )
+                    out.extend(bytes(part))
+                    out.extend(b\"\\r\\n\")
+                else:
+                    out.extend(
+                        f'Content-Disposition: form-data; name=\"{{key}}\"\\r\\n\\r\\n'.encode()
+                    )
+                    out.extend(str(part).encode())
+                    out.extend(b\"\\r\\n\")
         out.extend(f\"--{{boundary}}--\\r\\n\".encode())
         return bytes(out)
 
