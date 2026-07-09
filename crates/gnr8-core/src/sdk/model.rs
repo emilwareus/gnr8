@@ -29,6 +29,12 @@ pub struct SdkModel {
     pub schemas: Vec<SdkSchema>,
     /// Additional compatibility aliases.
     pub aliases: Vec<SdkAlias>,
+    /// Error response plan shared by SDK targets.
+    pub errors: SdkErrorPlan,
+    /// Runtime behavior policy shared by SDK targets.
+    pub runtime: SdkRuntimePolicy,
+    /// Documentation metadata shared by SDK targets.
+    pub docs_metadata: SdkDocsMetadata,
     /// File layout plan.
     pub file_plan: SdkFilePlan,
     /// Compatibility metadata.
@@ -64,10 +70,38 @@ pub struct SdkOperation {
     pub path: String,
     /// Service/group name.
     pub service: String,
+    /// Operation auth requirements.
+    pub auth: SdkOperationAuth,
     /// Request schema name, when present.
     pub request_schema: Option<String>,
     /// Response body schema names keyed by status.
     pub response_schemas: Vec<(u16, String)>,
+    /// Success responses keyed by status.
+    pub success_responses: Vec<SdkResponse>,
+    /// Error responses keyed by status.
+    pub error_responses: Vec<SdkResponse>,
+}
+
+/// Operation auth requirements after global/per-operation graph metadata is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkOperationAuth {
+    /// Referenced security scheme ids.
+    pub schemes: Vec<String>,
+    /// Whether operation-level auth replaced inherited global auth.
+    pub overrides_global: bool,
+}
+
+/// Planned SDK response surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkResponse {
+    /// HTTP response status.
+    pub status: u16,
+    /// Body schema name, when present.
+    pub body_schema: Option<String>,
+    /// Stable body kind (`json`, `binary`, `empty`, ...).
+    pub body_kind: String,
+    /// Media types emitted for this response.
+    pub content_types: Vec<String>,
 }
 
 /// A generated schema/model.
@@ -111,6 +145,98 @@ pub struct SdkAlias {
     pub canonical: String,
     /// Additional public symbol.
     pub alias: String,
+}
+
+/// Shared error response plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkErrorPlan {
+    /// Neutral base error concept all SDK targets map to their idiomatic exported error type.
+    pub base_error_type: String,
+    /// Error responses discovered on operations.
+    pub responses: Vec<SdkErrorResponse>,
+}
+
+/// One operation error response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkErrorResponse {
+    /// Operation id that can produce the error.
+    pub operation_id: String,
+    /// HTTP error status.
+    pub status: u16,
+    /// Error body schema name, when present.
+    pub body_schema: Option<String>,
+    /// Media types emitted for this error response.
+    pub content_types: Vec<String>,
+}
+
+/// Shared runtime behavior policy.
+///
+/// Phase 1 records the policy boundary with conservative no-op defaults. Later phases can populate
+/// these fields from transforms before each target renders timeout, retry, idempotency, and hook code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkRuntimePolicy {
+    /// Default request timeout in milliseconds.
+    pub default_timeout_ms: Option<u64>,
+    /// Default maximum retry count.
+    pub max_retries: u8,
+    /// Status codes eligible for default retry.
+    pub retry_statuses: Vec<u16>,
+    /// Whether unsafe methods may be retried without an explicit idempotency marker.
+    pub retry_unsafe_methods: bool,
+    /// Runtime hook kinds requested by the plan.
+    pub hooks: Vec<SdkHookKind>,
+}
+
+/// Runtime hook phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdkHookKind {
+    /// Request hook before transport execution.
+    Request,
+    /// Response hook after a successful HTTP response.
+    Response,
+    /// Error hook for transport or non-2xx errors.
+    Error,
+}
+
+/// Shared docs metadata plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkDocsMetadata {
+    /// API title.
+    pub title: String,
+    /// API base path.
+    pub base_path: String,
+    /// Operation docs metadata.
+    pub operations: Vec<SdkOperationDocs>,
+    /// Schema docs metadata.
+    pub schemas: Vec<SdkSchemaDocs>,
+}
+
+/// Documentation metadata for one operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkOperationDocs {
+    /// Operation id.
+    pub operation_id: String,
+    /// Service/group name.
+    pub service: String,
+    /// Optional summary.
+    pub summary: Option<String>,
+    /// Optional long description.
+    pub description: Option<String>,
+    /// Whether the operation is deprecated.
+    pub deprecated: bool,
+    /// Tags to show in docs.
+    pub tags: Vec<String>,
+}
+
+/// Documentation metadata for one schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkSchemaDocs {
+    /// Schema id.
+    pub schema_id: String,
+    /// Generated schema name.
+    pub name: String,
+    /// Optional schema description.
+    pub description: Option<String>,
 }
 
 /// File layout plan.
@@ -166,6 +292,8 @@ impl SdkModel {
 
         let mut operations = Vec::with_capacity(graph.operations.len());
         let mut services: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut error_responses = Vec::new();
+        let mut operation_docs = Vec::with_capacity(graph.operations.len());
         for op in &graph.operations {
             let service = op.group.clone().unwrap_or_else(|| "default".to_string());
             services
@@ -186,20 +314,64 @@ impl SdkModel {
                     })
                 })
                 .collect::<Result<Vec<_>, CoreError>>()?;
+            let responses = op
+                .responses
+                .iter()
+                .map(|response| response_model(graph, response))
+                .collect::<Result<Vec<_>, CoreError>>()?;
+            let (success_responses, op_error_responses): (Vec<_>, Vec<_>) = responses
+                .into_iter()
+                .partition(|response| (200..=299).contains(&response.status));
+            for response in &op_error_responses {
+                error_responses.push(SdkErrorResponse {
+                    operation_id: op.id.clone(),
+                    status: response.status,
+                    body_schema: response.body_schema.clone(),
+                    content_types: response.content_types.clone(),
+                });
+            }
+            let tags = if service == "default" {
+                Vec::new()
+            } else {
+                vec![service.clone()]
+            };
+            operation_docs.push(SdkOperationDocs {
+                operation_id: op.id.clone(),
+                service: service.clone(),
+                summary: None,
+                description: None,
+                deprecated: false,
+                tags,
+            });
             operations.push(SdkOperation {
                 id: op.id.clone(),
                 handler: op.handler.clone(),
                 method: op.method.clone(),
                 path: op.path.clone(),
                 service,
+                auth: SdkOperationAuth {
+                    schemes: op.security.clone(),
+                    overrides_global: op.security_overrides_global,
+                },
                 request_schema,
                 response_schemas,
+                success_responses,
+                error_responses: op_error_responses,
             });
         }
+        let schema_docs = graph
+            .schemas
+            .iter()
+            .map(|schema| SdkSchemaDocs {
+                schema_id: schema.id.clone(),
+                name: schema.name.clone(),
+                description: None,
+            })
+            .collect();
 
         Ok(Self {
             package,
-            base_path,
+            base_path: base_path.clone(),
             auth,
             services: services
                 .into_iter()
@@ -216,6 +388,23 @@ impl SdkModel {
                 })
                 .collect(),
             aliases: resolved_aliases,
+            errors: SdkErrorPlan {
+                base_error_type: "ApiError".to_string(),
+                responses: error_responses,
+            },
+            runtime: SdkRuntimePolicy {
+                default_timeout_ms: None,
+                max_retries: 0,
+                retry_statuses: Vec::new(),
+                retry_unsafe_methods: false,
+                hooks: Vec::new(),
+            },
+            docs_metadata: SdkDocsMetadata {
+                title: graph.title.clone(),
+                base_path: base_path.clone(),
+                operations: operation_docs,
+                schemas: schema_docs,
+            },
             file_plan: SdkFilePlan {
                 split: layout.is_split(),
                 operation_dir: layout.operation_dir_ref().map(ToString::to_string),
@@ -231,6 +420,28 @@ impl SdkModel {
             },
         })
     }
+}
+
+fn response_model(
+    graph: &ApiGraph,
+    response: &crate::graph::Response,
+) -> Result<SdkResponse, CoreError> {
+    let body_schema = response
+        .body
+        .as_ref()
+        .map(|body| schema_name_by_ref(graph, &body.ref_id))
+        .transpose()?;
+    let content_types = if response.content_types.is_empty() {
+        response.content_type.clone().into_iter().collect()
+    } else {
+        response.content_types.clone()
+    };
+    Ok(SdkResponse {
+        status: response.status,
+        body_schema,
+        body_kind: response.body_kind.clone(),
+        content_types,
+    })
 }
 
 fn schema_name_by_ref(graph: &ApiGraph, ref_id: &str) -> Result<String, CoreError> {
@@ -295,35 +506,65 @@ mod tests {
                 }),
                 request_body_required: true,
                 request_body_content_type: None,
-                responses: vec![Response {
-                    status: 201,
-                    body: Some(SchemaRef {
-                        ref_id: "app.Book".to_string(),
-                    }),
-                    body_kind: "json".to_string(),
-                    content_type: None,
-                    content_types: vec!["application/json".to_string()],
-                }],
+                responses: vec![
+                    Response {
+                        status: 201,
+                        body: Some(SchemaRef {
+                            ref_id: "app.Book".to_string(),
+                        }),
+                        body_kind: "json".to_string(),
+                        content_type: None,
+                        content_types: vec!["application/json".to_string()],
+                    },
+                    Response {
+                        status: 404,
+                        body: Some(SchemaRef {
+                            ref_id: "app.ErrorResponse".to_string(),
+                        }),
+                        body_kind: "json".to_string(),
+                        content_type: None,
+                        content_types: vec!["application/json".to_string()],
+                    },
+                ],
                 security: Vec::new(),
                 security_overrides_global: false,
                 provenance: span(),
             }],
-            schemas: vec![Schema {
-                id: "app.Book".to_string(),
-                name: "Book".to_string(),
-                body: Type::Object(vec![Field {
-                    json_name: "title".to_string(),
-                    required: true,
-                    optional: false,
-                    nullable: false,
-                    schema: Type::Primitive(Prim::String),
-                    description: None,
-                    example: None,
-                    meta: FieldMeta::default(),
-                }]),
-                enum_source_order: Vec::new(),
-                provenance: span(),
-            }],
+            schemas: vec![
+                Schema {
+                    id: "app.Book".to_string(),
+                    name: "Book".to_string(),
+                    body: Type::Object(vec![Field {
+                        json_name: "title".to_string(),
+                        required: true,
+                        optional: false,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    }]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.ErrorResponse".to_string(),
+                    name: "ErrorResponse".to_string(),
+                    body: Type::Object(vec![Field {
+                        json_name: "message".to_string(),
+                        required: true,
+                        optional: false,
+                        nullable: false,
+                        schema: Type::Primitive(Prim::String),
+                        description: None,
+                        example: None,
+                        meta: FieldMeta::default(),
+                    }]),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            title: "Book API".to_string(),
             ..ApiGraph::default()
         }
     }
@@ -401,5 +642,34 @@ mod tests {
             model.auth.unwrap().api_key_headers,
             vec!["X-CSRF-Token", "X-School-Id"]
         );
+    }
+
+    #[test]
+    fn sdk_model_carries_error_runtime_and_docs_boundaries() {
+        let model = SdkModel::build(
+            &graph(),
+            "books",
+            "/api",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+
+        assert_eq!(model.errors.base_error_type, "ApiError");
+        assert_eq!(model.errors.responses.len(), 1);
+        assert_eq!(model.errors.responses[0].operation_id, "createBook");
+        assert_eq!(model.errors.responses[0].status, 404);
+        assert_eq!(
+            model.errors.responses[0].body_schema.as_deref(),
+            Some("ErrorResponse")
+        );
+        assert_eq!(model.operations[0].success_responses[0].status, 201);
+        assert_eq!(model.operations[0].error_responses[0].status, 404);
+        assert_eq!(model.runtime.default_timeout_ms, None);
+        assert_eq!(model.runtime.max_retries, 0);
+        assert_eq!(model.docs_metadata.title, "Book API");
+        assert_eq!(model.docs_metadata.operations[0].tags, vec!["Books"]);
+        assert_eq!(model.docs_metadata.schemas[0].name, "Book");
     }
 }

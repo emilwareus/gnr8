@@ -16,11 +16,11 @@ installable, operationally credible SDKs.
 
 ### SDK Model Foundation
 
-- [ ] **SDKM-01**: A gnr8 maintainer can lower `ApiGraph` into a shared SDK planning model that carries
+- [x] **SDKM-01**: A gnr8 maintainer can lower `ApiGraph` into a shared SDK planning model that carries
   package, service/group, operation, schema, auth, error, runtime policy, docs metadata, and file-plan facts.
-- [ ] **SDKM-02**: A gnr8 maintainer can render Go, Python, and TypeScript SDKs from the shared SDK planning
+- [x] **SDKM-02**: A gnr8 maintainer can render Go, Python, and TypeScript SDKs from the shared SDK planning
   facts without duplicating semantic decisions in each emitter.
-- [ ] **SDKM-03**: A gnr8 maintainer can add tests proving the SDK planning model is deterministic and does
+- [x] **SDKM-03**: A gnr8 maintainer can add tests proving the SDK planning model is deterministic and does
   not change existing minimal SDK outputs except where the v3.0 requirements intentionally change them.
 
 ### Auth

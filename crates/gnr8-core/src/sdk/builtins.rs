@@ -2949,15 +2949,15 @@ impl Target for GoSdk {
         )?;
         let files = crate::gosdk::generate_files_with_profile_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
             self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Go", &package, ir, &model, &self.docs)?;
+        write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
         if self.package_metadata {
             out.write(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
@@ -3137,14 +3137,22 @@ impl Target for PySdk {
         )?;
         let files = crate::pysdk::generate_files_with_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             self.model_style,
             &self.aliases,
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Python", &package, ir, &model, &self.docs)?;
+        write_sdk_docs(
+            out,
+            &self.dir,
+            "Python",
+            &model.package,
+            ir,
+            &model,
+            &self.docs,
+        )?;
         Ok(())
     }
 
@@ -3405,8 +3413,8 @@ impl Target for TsSdk {
         let options = self.effective_options();
         let mut files = crate::tssdk::generate_files_with_profile_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
@@ -3428,7 +3436,7 @@ impl Target for TsSdk {
             out,
             &self.dir,
             "TypeScript",
-            &package,
+            &model.package,
             ir,
             &model,
             &self.docs,
