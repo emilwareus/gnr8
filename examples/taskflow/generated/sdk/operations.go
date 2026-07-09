@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 )
@@ -16,7 +17,7 @@ type ListTasksParams struct {
 }
 
 // ListTasks -> GET /tasks
-func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskList, error) {
+func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...RequestOption) (TaskList, error) {
 	var out TaskList
 	reqURL := c.baseURL + "/tasks"
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -33,23 +34,37 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "listTasks",
+		PathTemplate:         "/tasks",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var apiErr struct {
-			Message string   `json:"message"`
-			Slug    string   `json:"slug"`
-			Hints   []string `json:"hints"`
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		var typedBody any
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
 		}
 	}
 	if resp.StatusCode == 200 {
@@ -62,7 +77,7 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskLis
 }
 
 // CreateTask -> POST /tasks
-func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, error) {
+func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...RequestOption) (Task, error) {
 	var out Task
 	payload, err := json.Marshal(in)
 	if err != nil {
@@ -80,17 +95,45 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "createTask",
+		PathTemplate:         "/tasks",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var apiErr ErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
+		}
+		var typedBody any
+		switch resp.StatusCode {
+		case 400:
+			var decoded ErrorResponse
+			if len(rawBody) > 0 {
+				_ = json.Unmarshal(rawBody, &decoded)
+			}
+			typedBody = decoded
+		}
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErrorStringValue(apiErr.Message),
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
 		}
 	}
 	if resp.StatusCode == 201 {
@@ -103,7 +146,7 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, er
 }
 
 // DeleteTask -> DELETE /tasks/{id}
-func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, error) {
+func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOption) (ErrorResponse, error) {
 	var out ErrorResponse
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
@@ -115,23 +158,37 @@ func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, erro
 	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "deleteTask",
+		PathTemplate:         "/tasks/{id}",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var apiErr struct {
-			Message string   `json:"message"`
-			Slug    string   `json:"slug"`
-			Hints   []string `json:"hints"`
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		var typedBody any
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Message,
-			Slug:       apiErr.Slug,
-			Hints:      apiErr.Hints,
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
 		}
 	}
 	if resp.StatusCode == 200 {
@@ -144,7 +201,7 @@ func (c *Client) DeleteTask(ctx context.Context, id string) (ErrorResponse, erro
 }
 
 // GetTask -> GET /tasks/{id}
-func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
+func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) (Task, error) {
 	var out Task
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -156,17 +213,45 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "getTask",
+		PathTemplate:         "/tasks/{id}",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var apiErr ErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
+		}
+		var typedBody any
+		switch resp.StatusCode {
+		case 404:
+			var decoded ErrorResponse
+			if len(rawBody) > 0 {
+				_ = json.Unmarshal(rawBody, &decoded)
+			}
+			typedBody = decoded
+		}
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErrorStringValue(apiErr.Message),
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
 		}
 	}
 	if resp.StatusCode == 200 {
@@ -179,7 +264,7 @@ func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
 }
 
 // UpdateTask -> PUT /tasks/{id}
-func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest) (Task, error) {
+func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest, opts ...RequestOption) (Task, error) {
 	var out Task
 	payload, err := json.Marshal(in)
 	if err != nil {
@@ -197,17 +282,45 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 	} else if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "updateTask",
+		PathTemplate:         "/tasks/{id}",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
 	if err != nil {
 		return out, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var apiErr ErrorResponse
-		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
+		}
+		var typedBody any
+		switch resp.StatusCode {
+		case 404:
+			var decoded ErrorResponse
+			if len(rawBody) > 0 {
+				_ = json.Unmarshal(rawBody, &decoded)
+			}
+			typedBody = decoded
+		}
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
 		return out, &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErrorStringValue(apiErr.Message),
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
 		}
 	}
 	if resp.StatusCode == 200 {

@@ -7958,7 +7958,7 @@ func (s Server) create(c *gin.Context) {
     fn format_command_rewrites_artifacts_before_host_ownership() {
         let mut out = Artifacts::new();
         out.write("generated/openapi.json", "{\"openapi\":\"3.1.0\"}\n");
-        FormatCommand::new("sh")
+        FormatCommand::new("/bin/sh")
             .args([
                 "-c",
                 "printf '{\"openapi\":\"3.1.0\",\"formatted\":true}\\n' > generated/openapi.json",
@@ -7981,7 +7981,7 @@ func (s Server) create(c *gin.Context) {
     fn format_command_rejects_undeclared_artifacts() {
         let mut out = Artifacts::new();
         out.write("generated/openapi.json", "{}\n");
-        let err = FormatCommand::new("sh")
+        let err = FormatCommand::new("/bin/sh")
             .args([
                 "-c",
                 "mkdir -p generated && printf x > generated/extra.json",

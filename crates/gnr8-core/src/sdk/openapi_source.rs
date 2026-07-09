@@ -1539,10 +1539,9 @@ fn string_enum_values(schema: &Value) -> Option<EnumValues> {
     for value in values {
         if value.is_null() {
             nullable = true;
-        } else if let Some(member) = value.as_str() {
-            enum_values.push(member.to_string());
         } else {
-            return None;
+            let member = value.as_str()?;
+            enum_values.push(member.to_string());
         }
     }
     enum_values.sort();

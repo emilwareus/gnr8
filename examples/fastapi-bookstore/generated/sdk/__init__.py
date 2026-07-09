@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .client import Client
+from .client import Client, ClientHooks, HookContext, RequestOptions
 from .errors import ApiError
 from .models import (
     Author,
@@ -15,6 +15,9 @@ from .models import (
 
 __all__ = [
     "Client",
+    "ClientHooks",
+    "HookContext",
+    "RequestOptions",
     "ApiError",
     "Author",
     "Book",

@@ -2,17 +2,28 @@
 package sdk
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
 // Client is the sdk SDK entrypoint. Tag-grouped operation methods hang
 // off this type; it is constructed with functional options.
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	apiKey     string
-	apiKeys    map[string]string
+	baseURL            string
+	httpClient         *http.Client
+	timeout            time.Duration
+	maxRetries         int
+	retryStatuses      map[int]bool
+	retryUnsafeMethods bool
+	requestHooks       []RequestHook
+	responseHooks      []ResponseHook
+	errorHooks         []ErrorHook
+	apiKey             string
+	apiKeys            map[string]string
 }
 
 // Option mutates a Client during construction (functional-options pattern).
@@ -21,6 +32,86 @@ type Option func(*Client)
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithTimeout sets the client-level default request timeout.
+func WithTimeout(timeout time.Duration) Option {
+	return func(c *Client) { c.timeout = timeout }
+}
+
+// WithMaxRetries sets the client-level default retry count.
+func WithMaxRetries(maxRetries int) Option {
+	return func(c *Client) { c.maxRetries = maxRetries }
+}
+
+// WithRequestHook installs a hook that runs before each HTTP attempt.
+func WithRequestHook(hook RequestHook) Option {
+	return func(c *Client) { c.requestHooks = append(c.requestHooks, hook) }
+}
+
+// WithResponseHook installs a hook that runs after each HTTP response.
+func WithResponseHook(hook ResponseHook) Option {
+	return func(c *Client) { c.responseHooks = append(c.responseHooks, hook) }
+}
+
+// WithErrorHook installs a hook that runs for transport failures and final non-2xx responses.
+func WithErrorHook(hook ErrorHook) Option {
+	return func(c *Client) { c.errorHooks = append(c.errorHooks, hook) }
+}
+
+// RequestOptions overrides runtime behavior for one operation call.
+type RequestOptions struct {
+	Timeout        time.Duration
+	MaxRetries     *int
+	IdempotencyKey string
+	Metadata       map[string]string
+}
+
+// RequestOption mutates per-request runtime options.
+type RequestOption func(*RequestOptions)
+
+// WithRequestTimeout overrides the timeout for one operation call.
+func WithRequestTimeout(timeout time.Duration) RequestOption {
+	return func(o *RequestOptions) { o.Timeout = timeout }
+}
+
+// WithRequestMaxRetries overrides max retries for one operation call.
+func WithRequestMaxRetries(maxRetries int) RequestOption {
+	return func(o *RequestOptions) { o.MaxRetries = &maxRetries }
+}
+
+// WithIdempotencyKey sets the idempotency key sent by explicitly idempotent operations.
+func WithIdempotencyKey(key string) RequestOption {
+	return func(o *RequestOptions) { o.IdempotencyKey = key }
+}
+
+// WithRequestMetadata attaches hook-visible metadata to one operation call.
+func WithRequestMetadata(metadata map[string]string) RequestOption {
+	return func(o *RequestOptions) { o.Metadata = metadata }
+}
+
+// RequestContext describes one generated SDK transport attempt.
+type RequestContext struct {
+	OperationID     string
+	Method          string
+	PathTemplate    string
+	URL             string
+	Headers         http.Header
+	RequestMetadata map[string]string
+	StatusCode      int
+	ResponseHeaders http.Header
+}
+
+type RequestHook func(context.Context, RequestContext, *http.Request) error
+type ResponseHook func(context.Context, RequestContext, *http.Response) error
+type ErrorHook func(context.Context, RequestContext, error)
+
+type runtimeRequestOptions struct {
+	OperationID          string
+	PathTemplate         string
+	Idempotent           bool
+	IdempotencyKeyHeader string
+	Options              RequestOptions
 }
 
 // WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.
@@ -42,12 +133,160 @@ func WithAPIKeyHeader(header, key string) Option {
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
 func NewClient(baseURL string, opts ...Option) *Client {
 	c := &Client{
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		apiKeys:    map[string]string{},
+		baseURL:            baseURL,
+		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		timeout:            30 * time.Second,
+		maxRetries:         0,
+		retryStatuses:      map[int]bool{},
+		retryUnsafeMethods: false,
+		apiKeys:            map[string]string{},
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
+}
+
+func newRequestOptions(opts ...RequestOption) RequestOptions {
+	var options RequestOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	return options
+}
+
+func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {
+	timeout := c.timeout
+	if runtime.Options.Timeout > 0 {
+		timeout = runtime.Options.Timeout
+	}
+	ctx := req.Context()
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+		req = req.Clone(ctx)
+	}
+	if runtime.Idempotent && runtime.Options.IdempotencyKey != "" {
+		header := runtime.IdempotencyKeyHeader
+		if header == "" {
+			header = "Idempotency-Key"
+		}
+		req.Header.Set(header, runtime.Options.IdempotencyKey)
+	}
+	maxRetries := c.maxRetries
+	if runtime.Options.MaxRetries != nil {
+		maxRetries = *runtime.Options.MaxRetries
+	}
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	allowRetries := c.retryUnsafeMethods || runtime.Idempotent || retryableMethod(req.Method)
+	if !allowRetries {
+		maxRetries = 0
+	}
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		attemptReq, err := cloneRequestForAttempt(req, attempt)
+		if err != nil {
+			return nil, err
+		}
+		ctx := requestContext(runtime, attemptReq)
+		for _, hook := range c.requestHooks {
+			if err := hook(attemptReq.Context(), ctx, attemptReq); err != nil {
+				c.callErrorHooks(attemptReq.Context(), ctx, err)
+				return nil, err
+			}
+		}
+		resp, err := c.httpClient.Do(attemptReq)
+		if err != nil {
+			lastErr = err
+			if attempt < maxRetries {
+				continue
+			}
+			c.callErrorHooks(attemptReq.Context(), ctx, err)
+			return nil, err
+		}
+		ctx.StatusCode = resp.StatusCode
+		ctx.ResponseHeaders = resp.Header.Clone()
+		for _, hook := range c.responseHooks {
+			if err := hook(attemptReq.Context(), ctx, resp); err != nil {
+				_ = resp.Body.Close()
+				c.callErrorHooks(attemptReq.Context(), ctx, err)
+				return nil, err
+			}
+		}
+		if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {
+			sleepRetryAfter(resp)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			c.callErrorHooks(attemptReq.Context(), ctx, &APIError{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get("X-Request-ID")})
+		}
+		return resp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("request failed without response")
+}
+
+func cloneRequestForAttempt(req *http.Request, attempt int) (*http.Request, error) {
+	cloned := req.Clone(req.Context())
+	if attempt == 0 || req.Body == nil {
+		return cloned, nil
+	}
+	if req.GetBody == nil {
+		return nil, errors.New("request body cannot be replayed for retry")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	cloned.Body = body
+	return cloned, nil
+}
+
+func requestContext(runtime runtimeRequestOptions, req *http.Request) RequestContext {
+	return RequestContext{
+		OperationID:     runtime.OperationID,
+		Method:          req.Method,
+		PathTemplate:    runtime.PathTemplate,
+		URL:             req.URL.String(),
+		Headers:         req.Header.Clone(),
+		RequestMetadata: runtime.Options.Metadata,
+	}
+}
+
+func (c *Client) callErrorHooks(ctx context.Context, requestContext RequestContext, err error) {
+	for _, hook := range c.errorHooks {
+		hook(ctx, requestContext, err)
+	}
+}
+
+func retryableMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRetryStatus(status int, retryStatuses map[int]bool) bool {
+	return retryStatuses[status] || status >= 500
+}
+
+func sleepRetryAfter(resp *http.Response) {
+	retryAfter := resp.Header.Get("Retry-After")
+	if retryAfter == "" {
+		return
+	}
+	seconds, err := strconv.Atoi(retryAfter)
+	if err != nil || seconds <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(seconds) * time.Second)
 }
