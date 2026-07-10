@@ -29,11 +29,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
+    Prim, RuntimePolicy, Type,
+};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, SuccessResponses,
+    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
+    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, ErrorResponseBody, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
@@ -70,6 +74,14 @@ pub(crate) fn camel(name: &str) -> String {
 
 pub(crate) fn operation_method_name(op: &Operation) -> String {
     camel(&op.handler)
+}
+
+fn upper_camel_first(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 /// Escape an arbitrary wire string into a TypeScript double-quoted string literal (the quotes
@@ -543,17 +555,35 @@ fn emit_interface_with_policies(
     Ok(())
 }
 
-/// Emit `errors.ts`: the typed `ApiError extends Error` carrying the HTTP status + decoded body, with an
-/// `isNotFound()` helper. `package` is unused in the body but kept for call-site symmetry with the twin.
+/// Emit `errors.ts`: the typed `ApiError extends Error` carrying status, response metadata, and body.
 pub(crate) fn emit_errors(_package: &str) -> String {
     "\
+export interface ApiErrorInit {
+  headers?: Headers;
+  requestId?: string;
+  rawBody?: string;
+  jsonBody?: unknown;
+  body?: unknown;
+}
+
 export class ApiError extends Error {
+  public readonly headers: Headers;
+  public readonly requestId?: string;
+  public readonly rawBody: string;
+  public readonly jsonBody: unknown;
+  public readonly body: unknown;
+
   constructor(
     public readonly status: number,
-    public readonly body: unknown,
+    init: ApiErrorInit = {},
   ) {
     super(`HTTP ${status}`);
     this.name = \"ApiError\";
+    this.headers = init.headers ?? new Headers();
+    this.requestId = init.requestId;
+    this.rawBody = init.rawBody ?? \"\";
+    this.jsonBody = init.jsonBody ?? null;
+    this.body = init.body ?? this.jsonBody;
   }
 
   isNotFound(): boolean {
@@ -573,25 +603,130 @@ export class ApiError extends Error {
 /// `--lib es2022,dom`).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", false)
+    emit_client_with_models(
+        package,
+        "models",
+        false,
+        false,
+        false,
+        &RuntimePolicy::default(),
+    )
 }
 
 /// Emit `client.ts` with a configurable model-barrel import path.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated runtime client is one fixed source block with options, hooks, retry helpers, and transport helpers"
+)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
-    _has_auth: bool,
+    _has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
+    runtime: &RuntimePolicy,
 ) -> String {
+    let bearer_option = if has_bearer_auth {
+        "  bearerToken?: string;\n"
+    } else {
+        ""
+    };
+    let basic_option = if has_basic_auth {
+        "  basicAuth?: { username: string; password: string };\n"
+    } else {
+        ""
+    };
+    let bearer_field = if has_bearer_auth {
+        "  private readonly bearerToken?: string;\n"
+    } else {
+        ""
+    };
+    let basic_field = if has_basic_auth {
+        "  private readonly basicAuth?: { username: string; password: string };\n"
+    } else {
+        ""
+    };
+    let bearer_init = if has_bearer_auth {
+        "    this.bearerToken = opts.bearerToken;\n"
+    } else {
+        ""
+    };
+    let basic_init = if has_basic_auth {
+        "    this.basicAuth = opts.basicAuth;\n"
+    } else {
+        ""
+    };
+    let bearer_helper = if has_bearer_auth {
+        "\n  _bearerAuth(): string | undefined {\n    if (this.bearerToken === undefined) {\n      return undefined;\n    }\n    return `Bearer ${this.bearerToken}`;\n  }\n"
+    } else {
+        ""
+    };
+    let basic_helper = if has_basic_auth {
+        "\n  _basicAuth(): string | undefined {\n    if (this.basicAuth === undefined) {\n      return undefined;\n    }\n    const raw = `${this.basicAuth.username}:${this.basicAuth.password}`;\n    return `Basic ${btoa(raw)}`;\n  }\n"
+    } else {
+        ""
+    };
+    let default_timeout = ts_timeout_value(runtime.default_timeout_ms);
+    let max_retries = runtime.max_retries;
+    let retry_statuses = ts_retry_status_array(runtime);
+    let retry_unsafe_methods = runtime.retry_unsafe_methods;
     format!(
         "\
 import {{ ApiError }} from \"./errors\";
 import * as models from \"./{model_module}\";
+
+export interface RequestOptions {{
+  timeoutMs?: number;
+  maxRetries?: number;
+  idempotencyKey?: string;
+  metadata?: Record<string, string>;
+}}
+
+export interface HookContext {{
+  operationId: string;
+  method: string;
+  pathTemplate: string;
+  url: string;
+  headers: Record<string, string>;
+  requestMetadata: Record<string, string>;
+  status?: number;
+  responseHeaders?: Headers;
+}}
+
+export type RequestHook = (
+  context: HookContext,
+  init: RequestInit,
+) => void | Promise<void>;
+export type ResponseHook = (
+  context: HookContext,
+  response: Response,
+) => void | Promise<void>;
+export type ErrorHook = (
+  context: HookContext,
+  error: unknown,
+) => void | Promise<void>;
+
+export interface ClientHooks {{
+  request?: RequestHook[];
+  response?: ResponseHook[];
+  error?: ErrorHook[];
+}}
 
 export interface ClientOptions {{
   baseUrl: string;
   fetch?: typeof fetch;
   apiKey?: string;
   apiKeys?: Record<string, string>;
+  timeoutMs?: number;
+  maxRetries?: number;
+  hooks?: ClientHooks;
+{bearer_option}{basic_option}}}
+
+interface RuntimeRequestContext {{
+  operationId: string;
+  pathTemplate: string;
+  idempotent?: boolean;
+  idempotencyKeyHeader?: string;
 }}
 
 export class Client {{
@@ -599,13 +734,27 @@ export class Client {{
   private readonly fetchFn: typeof fetch;
   private readonly apiKey?: string;
   private readonly apiKeys: Record<string, string>;
-
+  private readonly timeoutMs?: number;
+  private readonly maxRetries: number;
+  private readonly retryStatuses: Set<number>;
+  private readonly retryUnsafeMethods: boolean;
+  private readonly hooks: Required<ClientHooks>;
+{bearer_field}{basic_field}
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {{}};
-  }}
+    this.timeoutMs = opts.timeoutMs ?? {default_timeout};
+    this.maxRetries = opts.maxRetries ?? {max_retries};
+    this.retryStatuses = new Set<number>({retry_statuses});
+    this.retryUnsafeMethods = {retry_unsafe_methods};
+    this.hooks = {{
+      request: opts.hooks?.request ?? [],
+      response: opts.hooks?.response ?? [],
+      error: opts.hooks?.error ?? [],
+    }};
+{bearer_init}{basic_init}  }}
 
   _apiKey(...names: string[]): string | undefined {{
     for (const name of names) {{
@@ -616,21 +765,259 @@ export class Client {{
     }}
     return this.apiKey;
   }}
+{bearer_helper}{basic_helper}
+  private _encodeBody(body: unknown): BodyInit | undefined {{
+    if (body === undefined) {{
+      return undefined;
+    }}
+    if (
+      body instanceof URLSearchParams ||
+      body instanceof FormData ||
+      body instanceof Blob ||
+      body instanceof ArrayBuffer ||
+      typeof body === \"string\"
+    ) {{
+      return body;
+    }}
+    if (ArrayBuffer.isView(body)) {{
+      return new Blob([body as unknown as BlobPart]);
+    }}
+    return JSON.stringify(body);
+  }}
+
+  private _formBody(body: unknown): URLSearchParams {{
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(
+      body as Record<string, unknown>,
+    )) {{
+      if (value === undefined || value === null) {{
+        continue;
+      }}
+      if (Array.isArray(value)) {{
+        for (const item of value) {{
+          params.append(key, String(item));
+        }}
+      }} else {{
+        params.set(key, String(value));
+      }}
+    }}
+    return params;
+  }}
+
+  private _multipartBody(body: unknown): FormData {{
+    const form = new FormData();
+    for (const [key, value] of Object.entries(
+      body as Record<string, unknown>,
+    )) {{
+      if (value === undefined || value === null) {{
+        continue;
+      }}
+      if (Array.isArray(value)) {{
+        for (const item of value) {{
+          this._appendMultipartValue(form, key, item);
+        }}
+      }} else {{
+        this._appendMultipartValue(form, key, value);
+      }}
+    }}
+    return form;
+  }}
+
+  private _appendMultipartValue(
+    form: FormData,
+    key: string,
+    value: unknown,
+  ): void {{
+    if (value === undefined || value === null) {{
+      return;
+    }}
+    if (value instanceof Blob) {{
+      form.append(key, value);
+    }} else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {{
+      form.append(key, new Blob([value as BlobPart]), key);
+    }} else {{
+      form.append(key, String(value));
+    }}
+  }}
 
   async _request(
     method: string,
     path: string,
     headers: Record<string, string>,
     body?: unknown,
+    requestContext?: RuntimeRequestContext,
+    options: RequestOptions = {{}},
   ): Promise<Response> {{
-    return await this.fetchFn(`${{this.baseUrl}}${{path}}`, {{
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    }});
+    const context = requestContext ?? {{ operationId: \"\", pathTemplate: path }};
+    const url = `${{this.baseUrl}}${{path}}`;
+    const requestMetadata = options.metadata ?? {{}};
+    if (context.idempotent === true && options.idempotencyKey !== undefined) {{
+      headers[context.idempotencyKeyHeader ?? \"Idempotency-Key\"] =
+        options.idempotencyKey;
+    }}
+    const maxRetries = Math.max(0, options.maxRetries ?? this.maxRetries);
+    const retryAttempts =
+      this.retryUnsafeMethods ||
+      context.idempotent === true ||
+      this._retryableMethod(method)
+        ? maxRetries
+        : 0;
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    const bodyPayload = this._encodeBody(body);
+    let lastError: unknown = undefined;
+    for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {{
+      const controller =
+        timeoutMs !== undefined && timeoutMs > 0
+          ? new AbortController()
+          : undefined;
+      const timeoutId =
+        controller === undefined
+          ? undefined
+          : setTimeout(() => controller.abort(), timeoutMs);
+      const init: RequestInit = {{
+        method,
+        headers,
+        body: bodyPayload,
+        signal: controller?.signal,
+      }};
+      const hookContext: HookContext = {{
+        operationId: context.operationId,
+        method,
+        pathTemplate: context.pathTemplate,
+        url,
+        headers: {{ ...headers }},
+        requestMetadata,
+      }};
+      try {{
+        for (const hook of this.hooks.request) {{
+          await hook(hookContext, init);
+        }}
+      }} catch (error) {{
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
+        }}
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+        throw error;
+      }}
+      let response: Response | undefined = undefined;
+      try {{
+        response = await this.fetchFn(url, init);
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
+        }}
+      }} catch (error) {{
+        if (timeoutId !== undefined) {{
+          clearTimeout(timeoutId);
+        }}
+        lastError = error;
+        if (attempt < retryAttempts) {{
+          continue;
+        }}
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+        throw error;
+      }}
+      if (response === undefined) {{
+        throw new Error(\"request failed without response\");
+      }}
+      hookContext.status = response.status;
+      hookContext.responseHeaders = response.headers;
+      try {{
+        for (const hook of this.hooks.response) {{
+          await hook(hookContext, response);
+        }}
+      }} catch (error) {{
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+        throw error;
+      }}
+      if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {{
+        await this._sleep(this._retryDelayMs(response));
+        continue;
+      }}
+      if (response.status < 200 || response.status >= 300) {{
+        const error = new ApiError(response.status, {{
+          headers: response.headers,
+        }});
+        for (const hook of this.hooks.error) {{
+          await hook(hookContext, error);
+        }}
+      }}
+      return response;
+    }}
+    throw lastError ?? new Error(\"request failed without response\");
+  }}
+
+  private _retryableMethod(method: string): boolean {{
+    return (
+      method === \"GET\" ||
+      method === \"HEAD\" ||
+      method === \"OPTIONS\" ||
+      method === \"PUT\" ||
+      method === \"DELETE\"
+    );
+  }}
+
+  private _shouldRetryStatus(status: number): boolean {{
+    return this.retryStatuses.has(status) || status >= 500;
+  }}
+
+  private _retryDelayMs(response: Response): number {{
+    const retryAfter = response.headers.get(\"Retry-After\");
+    if (retryAfter === null) {{
+      return 0;
+    }}
+    const seconds = Number.parseInt(retryAfter, 10);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+  }}
+
+  private async _sleep(ms: number): Promise<void> {{
+    if (ms <= 0) {{
+      return;
+    }}
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }}
 "
     )
+}
+
+fn ts_timeout_value(timeout_ms: Option<u64>) -> String {
+    timeout_ms.map_or_else(|| "30000".to_string(), |ms| ms.to_string())
+}
+
+fn ts_retry_status_array(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    let joined = statuses
+        .into_iter()
+        .map(|status| status.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
+}
+
+struct TsOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn ts_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> TsOperationRuntime<'a> {
+    let policy = graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id);
+    TsOperationRuntime {
+        idempotent: policy.is_some_and(|policy| policy.idempotent),
+        idempotency_key_header: policy.and_then(|policy| policy.idempotency_key_header.as_deref()),
+    }
 }
 
 /// Emit `client.ts`'s operation methods (appended to the client file by [`generate`]).
@@ -664,6 +1051,7 @@ pub(crate) fn emit_operations(
             base_path,
             OperationEmitStyle::ClassMethod,
         )?;
+        emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::ClassMethod)?;
     }
     emit_group_getters(&mut out, ops)?;
     // Close the `class Client {` opened by emit_client.
@@ -689,7 +1077,7 @@ pub(crate) fn emit_operation_module(
     models_module: &str,
 ) -> Result<String, CoreError> {
     let mut out = format!(
-        "import type {{ Client }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
+        "import type {{ Client, RequestOptions }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
     );
     for op in ops {
         emit_operation(
@@ -699,8 +1087,20 @@ pub(crate) fn emit_operation_module(
             base_path,
             OperationEmitStyle::PrototypeFunction,
         )?;
+        emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::PrototypeFunction)?;
     }
     Ok(out)
+}
+
+pub(crate) fn pagination_method_names(graph: &ApiGraph, op: &Operation) -> Vec<String> {
+    if pagination_policy_for(graph, op).is_none() {
+        return Vec::new();
+    }
+    let method = operation_method_name(op);
+    vec![
+        format!("{method}Pages"),
+        format!("iterate{}", upper_camel_first(&method)),
+    ]
 }
 
 fn grouped_ops<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Operation>> {
@@ -904,6 +1304,19 @@ fn ts_method_signature(name: &str, args: &[String], ret_promise: &str) -> String
     out
 }
 
+fn ts_async_generator_method_signature(name: &str, args: &[String], ret: &str) -> String {
+    let one_line = format!("  async *{name}({}): {ret} {{", args.join(", "));
+    if args.is_empty() || one_line.chars().count() <= 80 {
+        return one_line;
+    }
+    let mut out = format!("  async *{name}(\n");
+    for arg in args {
+        let _ = writeln!(out, "    {arg},");
+    }
+    let _ = write!(out, "  ): {ret} {{");
+    out
+}
+
 /// Emit a group facade's delegator signature (`{method}(...args: Parameters<...>): ReturnType<...> {`),
 /// wrapping to multi-line when the single-line form exceeds Prettier's 80-col `printWidth` — the parallel
 /// of [`ts_method_signature`] for the facade path. A rest parameter (`...args`) takes NO trailing comma
@@ -962,7 +1375,10 @@ fn emit_operation(
 
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
@@ -1005,19 +1421,20 @@ fn emit_operation(
         args.push(format!("{ident}: {ty}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: models.{}", body.model));
+        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
     }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}: {ty}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body?: models.{}", body.model));
+        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         let ty = ts_type(&p.schema, false, graph, "models.")?;
         args.push(format!("{ident}?: {ty}"));
     }
+    args.push("options?: RequestOptions".to_string());
 
     let ret_promise = if return_model.is_some() || success.has_binary_body() {
         format!("Promise<{return_ty}>")
@@ -1051,17 +1468,405 @@ fn emit_operation(
         &required_query_idents,
         &optional_query,
         &optional_query_idents,
+        &auth_queries,
     )?;
     emit_op_dispatch(
         out,
         &op.method,
         &success,
-        TsRequestBody::from_required(body_model.as_ref().map(|body| body.required)),
+        TsRequestBody::from_body(body_model.as_ref()),
         &auth_headers,
+        &auth_http,
+        &error_bodies,
+        op,
+        graph,
     )?;
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
+    Ok(())
+}
+
+struct TsPaginationInfo {
+    page_type: String,
+    item_type: String,
+    items_expr: String,
+    next_cursor_expr: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "TypeScript pagination helper emission writes page and item async generators in one deterministic source block"
+)]
+fn emit_pagination_helpers(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    style: OperationEmitStyle,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = operation_method_name(op);
+    let pages_name = format!("{method_name}Pages");
+    let items_name = format!("iterate{}", upper_camel_first(&method_name));
+    let info = ts_pagination_info(graph, op, policy)?;
+    let TsPaginationArgs { args, call_args } = ts_pagination_args(op, graph)?;
+
+    match style {
+        OperationEmitStyle::ClassMethod => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_method_signature(
+                    &pages_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.page_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+        OperationEmitStyle::PrototypeFunction => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_prototype_signature(
+                    &pages_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.page_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+    }
+    emit_ts_pagination_initialization(out, op, policy)?;
+    writeln!(out, "    while (true) {{").map_err(sink)?;
+    writeln!(
+        out,
+        "      const page = await this.{method_name}({});",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(out, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(out, "      if (items.length === 0) {{").map_err(sink)?;
+        writeln!(out, "        break;").map_err(sink)?;
+        writeln!(out, "      }}").map_err(sink)?;
+    }
+    writeln!(out, "      yield page;").map_err(sink)?;
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_expr = info
+                .next_cursor_expr
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                    "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                    op.id
+                ),
+                })?;
+            let cursor_ident = ts_query_ident(op, cursor_param)?;
+            writeln!(out, "      const nextCursor = {next_expr};").map_err(sink)?;
+            writeln!(
+                out,
+                "      if (nextCursor === undefined || nextCursor === null || nextCursor === \"\") {{"
+            )
+            .map_err(sink)?;
+            writeln!(out, "        break;").map_err(sink)?;
+            writeln!(out, "      }}").map_err(sink)?;
+            writeln!(out, "      {cursor_ident} = nextCursor;").map_err(sink)?;
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let page_ident = ts_query_ident(op, page_param)?;
+            writeln!(out, "      {page_ident} += 1;").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let offset_ident = ts_query_ident(op, offset_param)?;
+            writeln!(out, "      {offset_ident} += items.length;").map_err(sink)?;
+        }
+    }
+    writeln!(out, "    }}").map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
+        OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
+
+    match style {
+        OperationEmitStyle::ClassMethod => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_method_signature(
+                    &items_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.item_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+        OperationEmitStyle::PrototypeFunction => {
+            writeln!(
+                out,
+                "{}",
+                ts_async_generator_prototype_signature(
+                    &items_name,
+                    &args,
+                    &format!("AsyncIterable<{}>", info.item_type),
+                )
+            )
+            .map_err(sink)?;
+        }
+    }
+    writeln!(
+        out,
+        "    for await (const page of this.{pages_name}({})) {{",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "      for (const item of {} ?? []) {{",
+        info.items_expr
+    )
+    .map_err(sink)?;
+    writeln!(out, "        yield item;").map_err(sink)?;
+    writeln!(out, "      }}").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    match style {
+        OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
+        OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
+    }
+    Ok(())
+}
+
+fn emit_ts_pagination_initialization(
+    out: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            if ts_query_param(op, page_param)?.required {
+                return Ok(());
+            }
+            let ident = ts_query_ident(op, page_param)?;
+            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
+            writeln!(out, "      {ident} = 1;").map_err(sink)?;
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            if ts_query_param(op, offset_param)?.required {
+                return Ok(());
+            }
+            let ident = ts_query_ident(op, offset_param)?;
+            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
+            writeln!(out, "      {ident} = 0;").map_err(sink)?;
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+struct TsPaginationArgs {
+    args: Vec<String>,
+    call_args: Vec<String>,
+}
+
+fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationArgs, CoreError> {
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    let mut args: Vec<String> = Vec::new();
+    let mut call_args: Vec<String> = Vec::new();
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}: {ty}"));
+        call_args.push(ident.clone());
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
+        call_args.push("body".to_string());
+    }
+    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}: {ty}"));
+        call_args.push(ident.clone());
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
+        call_args.push("body".to_string());
+    }
+    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        let ty = ts_type(&param.schema, false, graph, "models.")?;
+        args.push(format!("{ident}?: {ty}"));
+        call_args.push(ident.clone());
+    }
+    args.push("options?: RequestOptions".to_string());
+    call_args.push("options".to_string());
+    Ok(TsPaginationArgs { args, call_args })
+}
+
+fn ts_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<TsPaginationInfo, CoreError> {
+    validate_ts_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_model = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_model
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_model
+            ),
+        });
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_expr = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(ts_property_access("page", &field.json_name))
+    } else {
+        None
+    };
+    Ok(TsPaginationInfo {
+        page_type: format!("models.{page_model}"),
+        item_type: ts_type(item_schema, false, graph, "models.")?,
+        items_expr: ts_property_access("page", &items.json_name),
+        next_cursor_expr,
+    })
+}
+
+fn ts_property_access(base: &str, property: &str) -> String {
+    if is_ident(property) {
+        format!("{base}.{property}")
+    } else {
+        format!("{base}[{}]", ts_string_literal(property))
+    }
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn ts_query_param<'a>(op: &'a Operation, param_name: &str) -> Result<&'a Param, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn ts_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError> {
+    ts_query_param(op, param_name).map(|param| camel(&param.name))
+}
+
+fn validate_ts_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = ts_query_param(op, param_name)?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1073,6 +1878,16 @@ fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> Str
         let _ = writeln!(out, "  {arg},");
     }
     let _ = write!(out, "): {ret_promise} {{");
+    out
+}
+
+fn ts_async_generator_prototype_signature(name: &str, args: &[String], ret: &str) -> String {
+    let mut out = format!("export const {name} = async function* (\n");
+    out.push_str("  this: Client,\n");
+    for arg in args {
+        let _ = writeln!(out, "  {arg},");
+    }
+    let _ = write!(out, "): {ret} {{");
     out
 }
 
@@ -1115,8 +1930,9 @@ fn emit_op_query(
     required_query_idents: &[String],
     optional_query: &[&Param],
     optional_query_idents: &[String],
+    auth_queries: &[String],
 ) -> Result<(), CoreError> {
-    if query_params.is_empty() {
+    if query_params.is_empty() && auth_queries.is_empty() {
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
@@ -1138,6 +1954,23 @@ fn emit_op_query(
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
+    for (idx, query) in auth_queries.iter().enumerate() {
+        let local = format!("apiKeyQuery{idx}");
+        writeln!(
+            out,
+            "    const {local} = this._apiKey({});",
+            quoted_string_literal(query)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      searchParams.set({}, {local});",
+            quoted_string_literal(query)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
     writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
     writeln!(out, "    if (qs) {{").map_err(sink)?;
     writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
@@ -1150,15 +1983,27 @@ fn emit_op_query(
 #[derive(Clone, Copy)]
 enum TsRequestBody {
     None,
-    Optional,
-    Required,
+    Optional {
+        encoding: RequestBodyEncoding,
+        content_type: &'static str,
+    },
+    Required {
+        encoding: RequestBodyEncoding,
+        content_type: &'static str,
+    },
 }
 
 impl TsRequestBody {
-    fn from_required(required: Option<bool>) -> Self {
-        match required {
-            Some(true) => Self::Required,
-            Some(false) => Self::Optional,
+    fn from_body(body: Option<&crate::sdk::emit_common::RequestBodyModel>) -> Self {
+        match body {
+            Some(body) if body.required => Self::Required {
+                encoding: body.encoding,
+                content_type: ts_static_content_type(&body.content_type),
+            },
+            Some(body) => Self::Optional {
+                encoding: body.encoding,
+                content_type: ts_static_content_type(&body.content_type),
+            },
             None => Self::None,
         }
     }
@@ -1168,17 +2013,214 @@ impl TsRequestBody {
     }
 
     fn is_required(self) -> bool {
-        matches!(self, Self::Required)
+        matches!(self, Self::Required { .. })
+    }
+
+    fn encoding(self) -> Option<RequestBodyEncoding> {
+        match self {
+            Self::None => None,
+            Self::Optional { encoding, .. } | Self::Required { encoding, .. } => Some(encoding),
+        }
+    }
+
+    fn content_type(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Optional { content_type, .. } | Self::Required { content_type, .. } => {
+                Some(content_type)
+            }
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn ts_static_content_type(content_type: &str) -> &'static str {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "text/plain" => "text/plain",
+        "application/x-www-form-urlencoded" => "application/x-www-form-urlencoded",
+        "multipart/form-data" => "multipart/form-data",
+        "application/octet-stream" => "application/octet-stream",
+        _ => "application/json",
+    }
+}
+
+fn ts_request_body_arg_type(
+    body: &crate::sdk::emit_common::RequestBodyModel,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    match body.encoding {
+        RequestBodyEncoding::Text => Ok("string".to_string()),
+        RequestBodyEncoding::Binary => Ok("Blob | ArrayBuffer | Uint8Array".to_string()),
+        RequestBodyEncoding::Multipart => ts_multipart_request_body_arg_type(body, graph),
+        RequestBodyEncoding::Json | RequestBodyEncoding::FormUrlEncoded => {
+            Ok(format!("models.{}", body.model))
+        }
+    }
+}
+
+fn ts_multipart_request_body_arg_type(
+    body: &crate::sdk::emit_common::RequestBodyModel,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.id == body.schema_id)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "multipart request body model '{}' references missing schema '{}'",
+                body.model, body.schema_id
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "multipart request body model '{}' must be an object schema",
+                body.model
+            ),
+        });
+    };
+    let mut parts = Vec::with_capacity(fields.len());
+    for field in fields {
+        let key = if is_ident(&field.json_name) {
+            field.json_name.clone()
+        } else {
+            ts_string_literal(&field.json_name)
+        };
+        let optional = if field.required && !field.optional {
+            ""
+        } else {
+            "?"
+        };
+        let ty = ts_multipart_field_type(&field.schema, field.nullable, graph)?;
+        parts.push(format!("{key}{optional}: {ty}"));
+    }
+    Ok(format!("{{ {} }}", parts.join("; ")))
+}
+
+fn ts_multipart_field_type(
+    schema: &Type,
+    nullable: bool,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    let mut ty = match schema {
+        Type::Primitive(Prim::Bytes) => "Blob | ArrayBuffer | Uint8Array".to_string(),
+        Type::Array(items) if matches!(items.as_ref(), Type::Primitive(Prim::Bytes)) => {
+            "Array<Blob | ArrayBuffer | Uint8Array>".to_string()
+        }
+        _ => ts_type(schema, false, graph, "models.")?,
+    };
+    if nullable {
+        ty.push_str(" | null");
+    }
+    Ok(ty)
+}
+
+fn emit_error_throw_branch(
+    out: &mut String,
+    error_bodies: &[ErrorResponseBody],
+) -> Result<(), CoreError> {
+    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
+    writeln!(out, "      const rawBody = await res.text();").map_err(sink)?;
+    writeln!(out, "      let jsonBody: unknown = null;").map_err(sink)?;
+    writeln!(out, "      try {{").map_err(sink)?;
+    writeln!(
+        out,
+        "        jsonBody = rawBody ? JSON.parse(rawBody) : null;"
+    )
+    .map_err(sink)?;
+    writeln!(out, "      }} catch {{").map_err(sink)?;
+    writeln!(out, "        jsonBody = null;").map_err(sink)?;
+    writeln!(out, "      }}").map_err(sink)?;
+    writeln!(out, "      let errorBody: unknown = jsonBody;").map_err(sink)?;
+    for error_body in error_bodies {
+        writeln!(out, "      if (res.status === {}) {{", error_body.status).map_err(sink)?;
+        writeln!(
+            out,
+            "        errorBody = jsonBody as models.{};",
+            error_body.model
+        )
+        .map_err(sink)?;
+        writeln!(out, "      }}").map_err(sink)?;
+    }
+    writeln!(out, "      throw new ApiError(res.status, {{").map_err(sink)?;
+    writeln!(out, "        headers: res.headers,").map_err(sink)?;
+    writeln!(
+        out,
+        "        requestId: res.headers.get(\"x-request-id\") ?? undefined,"
+    )
+    .map_err(sink)?;
+    writeln!(out, "        rawBody,").map_err(sink)?;
+    writeln!(out, "        jsonBody,").map_err(sink)?;
+    writeln!(out, "        body: errorBody,").map_err(sink)?;
+    writeln!(out, "      }});").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_ts_request_body_arg(
+    out: &mut String,
+    request_body: TsRequestBody,
+) -> Result<&'static str, CoreError> {
+    let Some(encoding) = request_body.encoding() else {
+        return Ok("undefined");
+    };
+    match encoding {
+        RequestBodyEncoding::FormUrlEncoded => {
+            if request_body.is_required() {
+                writeln!(out, "    const requestBody = this._formBody(body);").map_err(sink)?;
+            } else {
+                writeln!(
+                    out,
+                    "    const requestBody = body === undefined ? undefined : this._formBody(body);"
+                )
+                .map_err(sink)?;
+            }
+            Ok("requestBody")
+        }
+        RequestBodyEncoding::Multipart => {
+            if request_body.is_required() {
+                writeln!(out, "    const requestBody = this._multipartBody(body);")
+                    .map_err(sink)?;
+            } else {
+                writeln!(
+                    out,
+                    "    const requestBody = body === undefined ? undefined : this._multipartBody(body);"
+                )
+                .map_err(sink)?;
+            }
+            Ok("requestBody")
+        }
+        RequestBodyEncoding::Json | RequestBodyEncoding::Text | RequestBodyEncoding::Binary => {
+            Ok("body")
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "operation dispatch emission needs the operation, graph, auth, response, and body facts at one write site"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "operation dispatch emission writes the complete fetch request path in one deterministic block"
+)]
 fn emit_op_dispatch(
     out: &mut String,
     method: &str,
     success: &SuccessResponses,
     request_body: TsRequestBody,
     auth_headers: &[String],
+    auth_http: &[HttpAuthScheme],
+    error_bodies: &[ErrorResponseBody],
+    op: &Operation,
+    graph: &ApiGraph,
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -1198,37 +2240,78 @@ fn emit_op_dispatch(
         .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    if request_body.is_required() {
-        writeln!(out, "    headers[\"Content-Type\"] = \"application/json\";").map_err(sink)?;
-    } else if request_body.is_present() {
-        writeln!(out, "    if (body !== undefined) {{").map_err(sink)?;
-        writeln!(
-            out,
-            "      headers[\"Content-Type\"] = \"application/json\";"
-        )
-        .map_err(sink)?;
+    if auth_http.contains(&HttpAuthScheme::Bearer) {
+        writeln!(out, "    const bearerAuth = this._bearerAuth();").map_err(sink)?;
+        writeln!(out, "    if (bearerAuth !== undefined) {{").map_err(sink)?;
+        writeln!(out, "      headers[\"Authorization\"] = bearerAuth;").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    if request_body.is_present() {
-        writeln!(
-            out,
-            "    const res = await this._request(\"{method}\", path, headers, body);"
-        )
-        .map_err(sink)?;
-    } else {
-        writeln!(
-            out,
-            "    const res = await this._request(\"{method}\", path, headers);"
-        )
-        .map_err(sink)?;
+    if auth_http.contains(&HttpAuthScheme::Basic) {
+        writeln!(out, "    const basicAuth = this._basicAuth();").map_err(sink)?;
+        writeln!(out, "    if (basicAuth !== undefined) {{").map_err(sink)?;
+        writeln!(out, "      headers[\"Authorization\"] = basicAuth;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
     }
-    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
+    if request_body.is_required() {
+        if request_body.encoding() != Some(RequestBodyEncoding::Multipart) {
+            let content_type = request_body.content_type().unwrap_or("application/json");
+            writeln!(
+                out,
+                "    headers[\"Content-Type\"] = {};",
+                quoted_string_literal(content_type)
+            )
+            .map_err(sink)?;
+        }
+    } else if request_body.is_present() {
+        writeln!(out, "    if (body !== undefined) {{").map_err(sink)?;
+        if request_body.encoding() != Some(RequestBodyEncoding::Multipart) {
+            let content_type = request_body.content_type().unwrap_or("application/json");
+            writeln!(
+                out,
+                "      headers[\"Content-Type\"] = {};",
+                quoted_string_literal(content_type)
+            )
+            .map_err(sink)?;
+        }
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    let runtime = ts_operation_runtime(graph, op);
+    let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
+    let request_body_arg = emit_ts_request_body_arg(out, request_body)?;
+    let body_arg = if request_body.is_present() {
+        request_body_arg
+    } else {
+        "undefined"
+    };
+    writeln!(out, "    const res = await this._request(").map_err(sink)?;
+    writeln!(out, "      \"{method}\",").map_err(sink)?;
+    writeln!(out, "      path,").map_err(sink)?;
+    writeln!(out, "      headers,").map_err(sink)?;
+    writeln!(out, "      {body_arg},").map_err(sink)?;
+    writeln!(out, "      {{").map_err(sink)?;
     writeln!(
         out,
-        "      throw new ApiError(res.status, await res.json().catch(() => null));"
+        "        operationId: {},",
+        quoted_string_literal(&op.id)
     )
     .map_err(sink)?;
-    writeln!(out, "    }}").map_err(sink)?;
+    writeln!(
+        out,
+        "        pathTemplate: {},",
+        quoted_string_literal(&op.path)
+    )
+    .map_err(sink)?;
+    writeln!(out, "        idempotent: {},", runtime.idempotent).map_err(sink)?;
+    writeln!(
+        out,
+        "        idempotencyKeyHeader: {},",
+        quoted_string_literal(idempotency_header)
+    )
+    .map_err(sink)?;
+    writeln!(out, "      }},").map_err(sink)?;
+    writeln!(out, "      options,").map_err(sink)?;
+    writeln!(out, "    );").map_err(sink)?;
+    emit_error_throw_branch(out, error_bodies)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -1239,11 +2322,7 @@ fn emit_op_dispatch(
         writeln!(out, "      return await res.blob();").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
         if !success.has_bodyless_alternative() {
-            writeln!(
-                out,
-                "    throw new ApiError(res.status, await res.json().catch(() => null));"
-            )
-            .map_err(sink)?;
+            writeln!(out, "    throw new ApiError(res.status);").map_err(sink)?;
         }
     } else if let Some(model) = success.body_model.as_deref() {
         writeln!(
@@ -1255,11 +2334,7 @@ fn emit_op_dispatch(
         writeln!(out, "      return (await res.json()) as models.{model};").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
         if !success.has_bodyless_alternative() {
-            writeln!(
-                out,
-                "    throw new ApiError(res.status, await res.json().catch(() => null));"
-            )
-            .map_err(sink)?;
+            writeln!(out, "    throw new ApiError(res.status);").map_err(sink)?;
         }
     }
     Ok(())
@@ -1301,8 +2376,17 @@ pub(crate) fn emit_index_with_models(
 
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
-    out.push_str("export type { ClientOptions } from \"./client\";\n");
+    out.push_str("export type {\n");
+    out.push_str("  ClientHooks,\n");
+    out.push_str("  ClientOptions,\n");
+    out.push_str("  ErrorHook,\n");
+    out.push_str("  HookContext,\n");
+    out.push_str("  RequestHook,\n");
+    out.push_str("  RequestOptions,\n");
+    out.push_str("  ResponseHook,\n");
+    out.push_str("} from \"./client\";\n");
     out.push_str("export { ApiError } from \"./errors\";\n");
+    out.push_str("export type { ApiErrorInit } from \"./errors\";\n");
 
     // Every named schema becomes a top-level symbol in models.ts (interface or type) — re-export them
     // all as types (interfaces and `type` aliases are type-only re-exports).
@@ -1325,7 +2409,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        camel, emit_client, emit_errors, emit_index, emit_models, emit_operations, ts_type,
+        camel, emit_client, emit_client_with_models, emit_errors, emit_index, emit_models,
+        emit_operations, ts_type,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
 
@@ -1824,7 +2909,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
                 out.contains(
-                    "async createBook(body: models.Book): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "camel method, typed body, typed return:\n{out}"
             );
@@ -1833,7 +2918,13 @@ mod tests {
                 "rejects only non-2xx statuses:\n{out}"
             );
             assert!(
-                out.contains("throw new ApiError(res.status, await res.json().catch(() => null));"),
+                out.contains("const rawBody = await res.text();")
+                    && out.contains("throw new ApiError(res.status, {"),
+                "{out}"
+            );
+            assert!(out.contains("if (res.status === 409) {"), "{out}");
+            assert!(
+                out.contains("errorBody = jsonBody as models.OutOfStock;"),
                 "{out}"
             );
             // typed return casts the decoded JSON to the response interface.
@@ -1842,8 +2933,162 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("const res = await this._request(\"POST\", path, headers, body);"),
+                out.contains("const res = await this._request(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body,")
+                    && out.contains("operationId: \"createBook\",")
+                    && out.contains("options,"),
                 "body op dispatches through the shared request helper:\n{out}"
+            );
+        }
+
+        #[test]
+        fn operation_dispatch_includes_idempotency_runtime_context() {
+            let mut g = ops_graph();
+            g.operation_runtime = vec![crate::graph::OperationRuntimePolicy {
+                operation_id: "createBook".to_string(),
+                idempotent: true,
+                idempotency_key_header: Some("X-Idempotency-Key".to_string()),
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("operationId: \"createBook\",")
+                    && out.contains("pathTemplate: \"/books\",")
+                    && out.contains("idempotent: true,")
+                    && out.contains("idempotencyKeyHeader: \"X-Idempotency-Key\","),
+                "{out}"
+            );
+            assert!(
+                out.contains("const res = await this._request(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body,")
+                    && out.contains("options,"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        #[expect(
+            clippy::too_many_lines,
+            reason = "the synthetic pagination graph is embedded inline so the helper regression is self-contained"
+        )]
+        fn pagination_policy_emits_async_page_and_item_helpers() {
+            let mut g: ApiGraph = serde_json::from_str(
+                r#"{
+                  "module": "app",
+                  "operations": [
+                    {
+                      "id": "listBooks",
+                      "method": "GET",
+                      "path": "/books",
+                      "handler": "listBooks",
+                      "params": [
+                        {
+                          "name": "cursor",
+                          "location": "query",
+                          "required": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+                        }
+                      ],
+                      "request_body": null,
+                      "responses": [
+                        { "status": 200, "body": { "ref_id": "dto.BookPage" } }
+                      ],
+                      "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+                    }
+                  ],
+                  "schemas": [
+                    {
+                      "id": "dto.Book",
+                      "name": "Book",
+                      "body": { "type": "object", "of": [
+                        {
+                          "json_name": "id",
+                          "required": true,
+                          "optional": false,
+                          "nullable": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "description": null,
+                          "example": null
+                        }
+                      ] },
+                      "provenance": { "file": "models.ts", "start_line": 1, "end_line": 1 }
+                    },
+                    {
+                      "id": "dto.BookPage",
+                      "name": "BookPage",
+                      "body": { "type": "object", "of": [
+                        {
+                          "json_name": "items",
+                          "required": true,
+                          "optional": false,
+                          "nullable": false,
+                          "schema": { "type": "array", "of": { "type": "named", "of": "dto.Book" } },
+                          "description": null,
+                          "example": null
+                        },
+                        {
+                          "json_name": "nextCursor",
+                          "required": false,
+                          "optional": true,
+                          "nullable": false,
+                          "schema": { "type": "primitive", "of": { "prim": "string" } },
+                          "description": null,
+                          "example": null
+                        }
+                      ] },
+                      "provenance": { "file": "models.ts", "start_line": 2, "end_line": 2 }
+                    }
+                  ],
+                  "diagnostics": [],
+                  "base_path": "/",
+                  "title": "API",
+                  "security": []
+                }"#,
+            )
+            .unwrap();
+            g.pagination = vec![crate::graph::PaginationPolicy {
+                operation_id: "listBooks".to_string(),
+                mode: crate::graph::PaginationMode::Cursor,
+                items_field: "items".to_string(),
+                cursor_param: Some("cursor".to_string()),
+                next_cursor_field: Some("nextCursor".to_string()),
+                page_param: None,
+                page_size_param: None,
+                offset_param: None,
+                limit_param: None,
+                termination: crate::graph::PaginationTermination::NoNextCursor,
+            }];
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let out = emit_operations(&g, "bookstore", "/", &ops).unwrap();
+            assert!(
+                out.contains(
+                    "  async listBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): Promise<models.BookPage> {"
+                ),
+                "raw method must remain available:\n{out}"
+            );
+            assert!(
+                out.contains(
+                    "  async *listBooksPages(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.BookPage> {"
+                ),
+                "{out}"
+            );
+            assert!(out.contains("const nextCursor = page.nextCursor;"), "{out}");
+            assert!(out.contains("cursor = nextCursor;"), "{out}");
+            assert!(
+                out.contains(
+                    "  async *iterateListBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.Book> {"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("for await (const page of this.listBooksPages(cursor, options)) {"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const item of page.items ?? []) {"),
+                "{out}"
             );
         }
 
@@ -1893,7 +3138,7 @@ mod tests {
             // parameter per line (still body-before-query).
             assert!(
                 out.contains(
-                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n  ): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
                 ),
                 "required body must stay before required query params:\n{out}"
             );
@@ -1921,7 +3166,7 @@ mod tests {
             // Wrapped to satisfy Prettier's 80-col printWidth.
             assert!(
                 out.contains(
-                    "  async createBook(\n    body: models.Book,\n  ): Promise<models.CreatedMessage | undefined> {"
+                    "  async createBook(\n    body: models.Book,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage | undefined> {"
                 ),
                 "bodyless alternate success should make the return type optional:\n{out}"
             );
@@ -1940,7 +3185,9 @@ mod tests {
                 "path param must be percent-escaped (V5) via a backslash-free template literal:\n{out}"
             );
             assert!(
-                out.contains("async getBook(bookId: number): Promise<models.Book> {"),
+                out.contains(
+                    "  async getBook(\n    bookId: number,\n    options?: RequestOptions,\n  ): Promise<models.Book> {"
+                ),
                 "{out}"
             );
         }
@@ -1960,7 +3207,9 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "getBook")).unwrap();
             assert!(
-                out.contains("async getBook(bookId: number): Promise<Blob> {"),
+                out.contains(
+                    "async getBook(bookId: number, options?: RequestOptions): Promise<Blob> {"
+                ),
                 "binary success should return Blob:\n{out}"
             );
             assert!(out.contains("return await res.blob();"), "{out}");
@@ -1975,7 +3224,9 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("async listBooks(cursor?: string): Promise<void> {"),
+                out.contains(
+                    "async listBooks(cursor?: string, options?: RequestOptions): Promise<void> {"
+                ),
                 "{out}"
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
@@ -1988,6 +3239,74 @@ mod tests {
             assert!(
                 !out.contains("JSON.stringify(body)"),
                 "query op has no body:\n{out}"
+            );
+        }
+
+        #[test]
+        fn query_api_key_auth_is_appended_to_query_string() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "QueryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: "api_key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("const apiKeyQuery0 = this._apiKey(\"api_key\");"),
+                "{out}"
+            );
+            assert!(
+                out.contains("searchParams.set(\"api_key\", apiKeyQuery0);"),
+                "{out}"
+            );
+            assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
+        }
+
+        #[test]
+        fn http_auth_sets_authorization_header() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "BearerAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "bearer".to_string(),
+                    global: true,
+                },
+                crate::graph::SecurityScheme {
+                    id: "BasicAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "basic".to_string(),
+                    global: false,
+                },
+            ];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("const bearerAuth = this._bearerAuth();"),
+                "{out}"
+            );
+            assert!(
+                out.contains("headers[\"Authorization\"] = bearerAuth;"),
+                "{out}"
+            );
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.id == "listBooks")
+                .unwrap();
+            op.security = vec!["BasicAuth".to_string()];
+            op.security_overrides_global = true;
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("const basicAuth = this._basicAuth();"),
+                "{out}"
+            );
+            assert!(
+                out.contains("headers[\"Authorization\"] = basicAuth;"),
+                "{out}"
             );
         }
 
@@ -2169,7 +3488,9 @@ mod tests {
             let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
             // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
             assert!(
-                out.contains("async search(q: string, page?: string): Promise<void> {"),
+                out.contains(
+                    "  async search(\n    q: string,\n    page?: string,\n    options?: RequestOptions,\n  ): Promise<void> {"
+                ),
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
@@ -2238,7 +3559,8 @@ mod tests {
     }
 
     mod client_errors_index {
-        use super::{emit_client, emit_errors, emit_index, ops_graph};
+        use super::{emit_client, emit_client_with_models, emit_errors, emit_index, ops_graph};
+        use crate::graph::RuntimePolicy;
 
         #[test]
         fn client_uses_fetch_with_an_injectable_transport_and_no_third_party_imports() {
@@ -2256,6 +3578,117 @@ mod tests {
         }
 
         #[test]
+        fn client_emits_http_auth_options_when_needed() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                false,
+                true,
+                true,
+                &crate::graph::RuntimePolicy::default(),
+            );
+            assert!(out.contains("bearerToken?: string;"), "{out}");
+            assert!(
+                out.contains("basicAuth?: { username: string; password: string };"),
+                "{out}"
+            );
+            assert!(
+                out.contains("return `Bearer ${this.bearerToken}`;"),
+                "{out}"
+            );
+            assert!(
+                out.contains(
+                    "const raw = `${this.basicAuth.username}:${this.basicAuth.password}`;"
+                ),
+                "{out}"
+            );
+            assert!(out.contains("return `Basic ${btoa(raw)}`;"), "{out}");
+        }
+
+        #[test]
+        fn client_emits_runtime_options_retries_and_hooks() {
+            let runtime = RuntimePolicy {
+                default_timeout_ms: Some(1_234),
+                max_retries: 2,
+                retry_statuses: vec![429, 408],
+                retry_unsafe_methods: true,
+                hooks: Vec::new(),
+            };
+            let out = emit_client_with_models("bookstore", "models", false, false, false, &runtime);
+            assert!(out.contains("export interface RequestOptions {"), "{out}");
+            assert!(out.contains("timeoutMs?: number;"), "{out}");
+            assert!(out.contains("maxRetries?: number;"), "{out}");
+            assert!(out.contains("idempotencyKey?: string;"), "{out}");
+            assert!(out.contains("export interface HookContext {"), "{out}");
+            assert!(out.contains("operationId: string;"), "{out}");
+            assert!(out.contains("pathTemplate: string;"), "{out}");
+            assert!(
+                out.contains("requestMetadata: Record<string, string>;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.timeoutMs = opts.timeoutMs ?? 1234;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.maxRetries = opts.maxRetries ?? 2;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.retryStatuses = new Set<number>([408, 429]);"),
+                "{out}"
+            );
+            assert!(out.contains("this.retryUnsafeMethods = true;"), "{out}");
+            assert!(
+                out.contains("for (const hook of this.hooks.request)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const hook of this.hooks.response)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("for (const hook of this.hooks.error)"),
+                "{out}"
+            );
+            let request_hook_pos = out
+                .find("for (const hook of this.hooks.request)")
+                .expect("request hook loop");
+            let fetch_pos = out
+                .find("response = await this.fetchFn(url, init);")
+                .expect("fetch assignment");
+            let retry_catch_pos = out.find("lastError = error;").expect("retry catch");
+            assert!(
+                request_hook_pos < fetch_pos && fetch_pos < retry_catch_pos,
+                "hook failures must be handled before the transport retry catch:\n{out}"
+            );
+            assert!(
+                out.contains("throw error;\n      }\n      let response: Response | undefined"),
+                "request hook failures must be rethrown before fetch retry handling:\n{out}"
+            );
+        }
+
+        #[test]
+        fn runtime_retry_overrides_keep_default_transient_statuses() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                false,
+                false,
+                false,
+                &RuntimePolicy::default(),
+            );
+            assert!(
+                out.contains("this.maxRetries = opts.maxRetries ?? 0;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.retryStatuses = new Set<number>([408, 429]);"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn errors_define_typed_apierror_extends_error_with_is_not_found() {
             let out = emit_errors("bookstore");
             assert!(
@@ -2263,7 +3696,10 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("public readonly status: number,"), "{out}");
-            assert!(out.contains("public readonly body: unknown,"), "{out}");
+            assert!(out.contains("public readonly headers: Headers;"), "{out}");
+            assert!(out.contains("public readonly rawBody: string;"), "{out}");
+            assert!(out.contains("public readonly jsonBody: unknown;"), "{out}");
+            assert!(out.contains("public readonly body: unknown;"), "{out}");
             assert!(out.contains("isNotFound(): boolean {"), "{out}");
             assert!(out.contains("return this.status === 404;"), "{out}");
         }
@@ -2277,6 +3713,10 @@ mod tests {
             );
             assert!(
                 out.contains("export { ApiError } from \"./errors\";"),
+                "{out}"
+            );
+            assert!(
+                out.contains("export type { ApiErrorInit } from \"./errors\";"),
                 "{out}"
             );
             assert!(out.contains("  Book,"), "{out}");

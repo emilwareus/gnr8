@@ -32,20 +32,20 @@ mod yaml;
 
 use crate::analyze::facts::LiteralValue;
 use crate::graph::{
-    ApiGraph, Field, Operation as GraphOp, Prim, Schema, SecurityScheme as GraphSecurityScheme,
-    Type, WellKnown,
+    ApiGraph, Field, Operation as GraphOp, OperationDocsPolicy, Prim, Schema,
+    SecurityScheme as GraphSecurityScheme, Type, WellKnown,
 };
 use model::{
-    Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
-    SchemaObject, SecurityRequirement, SecurityScheme,
+    Components, Info, MediaExample, OpenApiDoc, Operation, Parameter, PathItem, RequestBody,
+    ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The only `apiKey` location the `PoC` supports (the fixture's `X-API-Key` header).
-const SUPPORTED_API_KEY_LOCATION: &str = "header";
+/// Supported `apiKey` locations.
+const SUPPORTED_API_KEY_LOCATIONS: &[&str] = &["header", "query"];
 
-/// The only security scheme kind the `PoC` supports.
-const SUPPORTED_SCHEME_KIND: &str = "apiKey";
+/// Supported HTTP auth schemes.
+const SUPPORTED_HTTP_SCHEMES: &[&str] = &["bearer", "basic"];
 
 /// Lower the [`crate::graph::ApiGraph`] to an `OpenAPI` 3.1.0 document (serialized YAML).
 ///
@@ -190,12 +190,12 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
     let mut requirements = Vec::with_capacity(schemes.len());
     let mut components = Vec::with_capacity(schemes.len());
     for scheme in schemes {
-        if scheme.kind != SUPPORTED_SCHEME_KIND || scheme.location != SUPPORTED_API_KEY_LOCATION {
+        if !is_supported_security_scheme(scheme) {
             return Err(crate::CoreError::Lowering {
                 message: format!(
-                    "unsupported security scheme '{}': the PoC supports kind=\"{SUPPORTED_SCHEME_KIND}\" \
-                     in=\"{SUPPORTED_API_KEY_LOCATION}\" only (got kind=\"{}\" location=\"{}\")",
-                    scheme.id, scheme.kind, scheme.location
+                    "unsupported security scheme '{}': supported SDK/OpenAPI auth is apiKey/header, \
+                     apiKey/query, http/bearer, or http/basic (got kind=\"{}\" location=\"{}\" name=\"{}\")",
+                    scheme.id, scheme.kind, scheme.location, scheme.name
                 ),
             });
         }
@@ -228,6 +228,16 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
     })
 }
 
+fn is_supported_security_scheme(scheme: &GraphSecurityScheme) -> bool {
+    match scheme.kind.as_str() {
+        "apiKey" => SUPPORTED_API_KEY_LOCATIONS.contains(&scheme.location.as_str()),
+        "http" => {
+            scheme.location.is_empty() && SUPPORTED_HTTP_SCHEMES.contains(&scheme.name.as_str())
+        }
+        _ => false,
+    }
+}
+
 /// Group operations sharing an absolute path into one [`PathItem`] (so PUT + DELETE on
 /// `/goal/{uuid}` coexist), preserving graph order and keying paths in first-seen (sorted) order.
 fn build_paths(
@@ -241,7 +251,12 @@ fn build_paths(
     let mut paths: Vec<(String, PathItem)> = Vec::new();
     for op in &graph.operations {
         let abs_path = join_base(base_path, &op.path)?;
-        let operation = lower_operation(op, ref_to_name, global_security)?;
+        let operation = lower_operation(
+            op,
+            operation_docs_policy(graph, &op.id),
+            ref_to_name,
+            global_security,
+        )?;
         // Find the existing path-item index (the graph's (path, method) sort keeps same-path
         // operations adjacent, so this stays deterministic), else append a fresh one.
         let index = if let Some(index) = paths.iter().position(|(p, _)| *p == abs_path) {
@@ -295,6 +310,7 @@ fn place_operation(
 /// stable default since the graph carries none.
 fn lower_operation(
     op: &GraphOp,
+    docs: Option<&OperationDocsPolicy>,
     ref_to_name: &BTreeMap<&str, &str>,
     global_security: &[String],
 ) -> Result<Operation, crate::CoreError> {
@@ -314,18 +330,24 @@ fn lower_operation(
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
     let request_body = match &op.request_body {
-        Some(body) => Some(RequestBody {
-            required: op.request_body_required,
-            content_type: op
+        Some(body) => {
+            let content_type = op
                 .request_body_content_type
                 .clone()
-                .unwrap_or_else(|| "application/json".to_string()),
-            schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
-        }),
+                .unwrap_or_else(|| "application/json".to_string());
+            Some(RequestBody {
+                required: op.request_body_required,
+                examples: docs
+                    .map(|policy| media_examples_for(&policy.request_examples, &content_type))
+                    .unwrap_or_default(),
+                content_type,
+                schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
+            })
+        }
         None => None,
     };
 
-    let responses = lower_responses(op, ref_to_name)?;
+    let responses = lower_responses(op, docs, ref_to_name)?;
     let mut operation_security = Vec::new();
     if !op.security.is_empty() {
         if !op.security_overrides_global {
@@ -338,7 +360,10 @@ fn lower_operation(
 
     Ok(Operation {
         operation_id: op.id.clone(),
-        tags: op.group.clone().into_iter().collect(),
+        summary: docs.and_then(|policy| policy.summary.clone()),
+        description: docs.and_then(|policy| policy.description.clone()),
+        deprecated: docs.is_some_and(|policy| policy.deprecated),
+        tags: operation_tags(op, docs),
         security: operation_security
             .into_iter()
             .map(|scheme| SecurityRequirement {
@@ -346,6 +371,7 @@ fn lower_operation(
                 scopes: Vec::new(),
             })
             .collect(),
+        security_explicit: op.security_overrides_global || !op.security.is_empty(),
         parameters,
         request_body,
         responses,
@@ -354,12 +380,13 @@ fn lower_operation(
 
 fn lower_responses(
     op: &GraphOp,
+    docs: Option<&OperationDocsPolicy>,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<Vec<(String, ResponseObj)>, crate::CoreError> {
     let mut responses = op
         .responses
         .iter()
-        .map(|resp| lower_response(op, resp, ref_to_name))
+        .map(|resp| lower_response(op, resp, docs, ref_to_name))
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
     if responses.is_empty() {
         responses.push(default_response());
@@ -370,8 +397,15 @@ fn lower_responses(
 fn lower_response(
     op: &GraphOp,
     resp: &crate::graph::Response,
+    docs: Option<&OperationDocsPolicy>,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<(String, ResponseObj), crate::CoreError> {
+    let response_docs = docs.and_then(|policy| {
+        policy
+            .responses
+            .iter()
+            .find(|response| response.status == resp.status)
+    });
     let (schema_ref, content_type, binary, event_stream) = match resp.body_kind.as_str() {
         "json" => {
             let schema_ref = match &resp.body {
@@ -422,7 +456,16 @@ fn lower_response(
     Ok((
         resp.status.to_string(),
         ResponseObj {
-            description: default_response_description(resp.status),
+            description: response_docs
+                .and_then(|response| response.description.clone())
+                .unwrap_or_else(|| default_response_description(resp.status)),
+            examples: content_type
+                .as_deref()
+                .and_then(|content_type| {
+                    response_docs
+                        .map(|response| media_examples_for(&response.examples, content_type))
+                })
+                .unwrap_or_default(),
             schema_ref,
             content_type,
             binary,
@@ -463,8 +506,44 @@ fn default_response() -> (String, ResponseObj) {
             content_type: None,
             binary: false,
             event_stream: false,
+            examples: Vec::new(),
         },
     )
+}
+
+fn operation_docs_policy<'a>(
+    graph: &'a ApiGraph,
+    operation_id: &str,
+) -> Option<&'a OperationDocsPolicy> {
+    graph
+        .operation_docs
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
+}
+
+fn operation_tags(op: &GraphOp, docs: Option<&OperationDocsPolicy>) -> Vec<String> {
+    docs.filter(|policy| !policy.tags.is_empty()).map_or_else(
+        || op.group.clone().into_iter().collect(),
+        |policy| policy.tags.clone(),
+    )
+}
+
+fn media_examples_for(
+    examples: &[crate::graph::MediaExample],
+    content_type: &str,
+) -> Vec<MediaExample> {
+    let mut out = examples
+        .iter()
+        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+        .map(|example| MediaExample {
+            name: example.name.clone(),
+            summary: example.summary.clone(),
+            description: example.description.clone(),
+            value: example.value.clone(),
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Map each graph [`Schema`] to a component [`SchemaObject`], keyed by its bare local name.
@@ -1457,6 +1536,55 @@ mod tests {
     }
 
     #[test]
+    fn api_key_query_security_is_emitted_in_components() {
+        let config = vec![SecurityScheme {
+            id: "QueryAuth".to_string(),
+            kind: "apiKey".to_string(),
+            location: "query".to_string(),
+            name: "api_key".to_string(),
+            global: true,
+        }];
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap();
+        assert!(yaml.contains("- QueryAuth: []"), "{yaml}");
+        assert!(yaml.contains("QueryAuth:"), "{yaml}");
+        assert!(yaml.contains("type: apiKey"), "{yaml}");
+        assert!(yaml.contains("in: query"), "{yaml}");
+        assert!(yaml.contains("name: api_key"), "{yaml}");
+    }
+
+    #[test]
+    fn http_security_is_emitted_in_components() {
+        let config = vec![
+            SecurityScheme {
+                id: "BearerAuth".to_string(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "bearer".to_string(),
+                global: true,
+            },
+            SecurityScheme {
+                id: "BasicAuth".to_string(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "basic".to_string(),
+                global: true,
+            },
+        ];
+        let yaml = to_openapi(&sample_graph(), "goalservice", "/goal", &config).unwrap();
+        assert!(yaml.contains("- BasicAuth: []"), "{yaml}");
+        assert!(yaml.contains("BearerAuth: []"), "{yaml}");
+        assert!(
+            yaml.contains("BearerAuth:\n      type: http\n      scheme: bearer"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("BasicAuth:\n      type: http\n      scheme: basic"),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("in: \n"), "{yaml}");
+    }
+
+    #[test]
     fn operation_scoped_security_lowers_with_global_security() {
         let mut graph = sample_graph();
         graph
@@ -1486,6 +1614,37 @@ mod tests {
         assert!(
             update_block.contains("security:\n        - ApiKeyAuth: []\n          CSRFAuth: []"),
             "operation-level security must include inherited global auth plus scoped auth:\n{update_block}"
+        );
+    }
+
+    #[test]
+    fn public_operation_emits_explicit_empty_security_override() {
+        let mut graph = sample_graph();
+        let public = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "updateGoal")
+            .unwrap();
+        public.security.clear();
+        public.security_overrides_global = true;
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let update_block = yaml
+            .split("operationId: updateGoal")
+            .nth(1)
+            .expect("updateGoal operation");
+        let update_block = update_block
+            .split("responses:")
+            .next()
+            .unwrap_or(update_block);
+        assert!(update_block.contains("security: []"), "{update_block}");
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            json["paths"]["/goal/{uuid}"]["put"]["security"],
+            serde_json::json!([])
         );
     }
 

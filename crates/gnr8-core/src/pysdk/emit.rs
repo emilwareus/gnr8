@@ -26,11 +26,15 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
+    Prim, RuntimePolicy, Type,
+};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, is_json_object_key, join_path, operation_api_key_headers,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of,
+    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
+    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, HttpAuthScheme, RequestBodyEncoding,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -900,7 +904,7 @@ fn emit_dataclass(
     Ok(())
 }
 
-/// Emit `errors.py`: the typed `ApiError(Exception)` with status/message/slug/hints + `is_not_found()`.
+/// Emit `errors.py`: the typed `ApiError(Exception)` with status, response metadata, and decoded body.
 ///
 /// `package` is unused in the body (no package clause in Python) but kept for call-site symmetry with
 /// the Go twin's `emit_errors`. The `from __future__ import annotations` header keeps annotations lazy.
@@ -914,7 +918,7 @@ from typing import Any, Optional
 class ApiError(Exception):
     \"\"\"Raised by operation methods on a non-success response.
 
-    Carries the HTTP status and the decoded error body (message/slug/hints).
+    Carries status, response metadata, raw body, parsed JSON, and decoded error body.
     \"\"\"
 
     def __init__(
@@ -923,9 +927,20 @@ class ApiError(Exception):
         message: str = \"\",
         slug: str = \"\",
         hints: Optional[list[Any]] = None,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        request_id: str = \"\",
+        raw_body: bytes = b\"\",
+        json_body: Any = None,
+        body: Any = None,
     ) -> None:
         super().__init__(f\"{status_code} {message} ({slug})\")
         self.status_code = status_code
+        self.headers = headers or {}
+        self.request_id = request_id
+        self.raw_body = raw_body
+        self.json_body = json_body
+        self.body = body
         self.message = message
         self.slug = slug
         self.hints = hints if hints is not None else []
@@ -946,7 +961,85 @@ class ApiError(Exception):
 /// `urllib.error.HTTPError` so 4xx/5xx return a `(code, body)` pair instead of raising (Pitfall 6).
 #[cfg(test)]
 pub(crate) fn emit_client(package: &str) -> String {
-    emit_client_with_models(package, "models", PyModelStyle::default(), false, &[])
+    emit_client_with_models(
+        package,
+        "models",
+        PyModelStyle::default(),
+        false,
+        false,
+        false,
+        &[],
+        &RuntimePolicy::default(),
+        false,
+    )
+}
+
+fn py_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+fn py_timeout_value(timeout_ms: Option<u64>) -> String {
+    timeout_ms.map_or_else(
+        || "30.0".to_string(),
+        |ms| format!("{}.{:03}", ms / 1000, ms % 1000),
+    )
+}
+
+fn py_retry_status_tuple(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    match statuses.as_slice() {
+        [] => "()".to_string(),
+        [single] => format!("({single},)"),
+        many => {
+            let joined = many
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({joined})")
+        }
+    }
+}
+
+fn py_body_encoding(encoding: RequestBodyEncoding) -> &'static str {
+    match encoding {
+        RequestBodyEncoding::Json => "json",
+        RequestBodyEncoding::Text => "text",
+        RequestBodyEncoding::FormUrlEncoded => "form",
+        RequestBodyEncoding::Multipart => "multipart",
+        RequestBodyEncoding::Binary => "binary",
+    }
+}
+
+struct PyOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn py_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> PyOperationRuntime<'a> {
+    graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+        .map_or(
+            PyOperationRuntime {
+                idempotent: false,
+                idempotency_key_header: None,
+            },
+            |policy| PyOperationRuntime {
+                idempotent: policy.idempotent,
+                idempotency_key_header: policy.idempotency_key_header.as_deref(),
+            },
+        )
 }
 
 /// The set of model class names `client.py` references (each operation's request-body model and typed
@@ -970,42 +1063,93 @@ pub(crate) fn client_referenced_models(
         if let Some(model) = success_responses_of(op, graph)?.body_model {
             names.push(model);
         }
+        if let Some(item_model) = pagination_item_model_name(graph, op) {
+            names.push(item_model.to_string());
+        }
+        for error_body in error_response_bodies_of(op, graph)? {
+            names.push(error_body.model);
+        }
     }
     names.sort();
     names.dedup();
     Ok(names)
 }
 
+fn pagination_item_model_name<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a str> {
+    let policy = pagination_policy_for(graph, op)?;
+    let success = success_responses_of(op, graph).ok()?;
+    let page_model = success.body_model?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)?;
+    let Type::Object(fields) = &schema.body else {
+        return None;
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)?;
+    let Type::Array(item_schema) = &items.schema else {
+        return None;
+    };
+    let Type::Named(ref_id) = item_schema.as_ref() else {
+        return None;
+    };
+    graph
+        .schemas
+        .iter()
+        .find(|schema| &schema.id == ref_id)
+        .map(|schema| schema.name.as_str())
+}
+
 /// Emit `client.py` with a configurable model package import path and the explicit set of model names to
 /// import (from [`client_referenced_models`]).
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Python client emitter is parameterized by layout/auth/model/runtime facts without a builder object"
+)]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "the Python client emitter receives independent auth and pagination feature switches"
+)]
 pub(crate) fn emit_client_with_models(
     _package: &str,
     model_module: &str,
     model_style: PyModelStyle,
-    has_auth: bool,
+    has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
     model_refs: &[String],
+    runtime: &RuntimePolicy,
+    has_pagination: bool,
 ) -> String {
-    let (body_encode, body_comment) = match model_style {
-        PyModelStyle::Pydantic => (
-            "        if isinstance(body, BaseModel):\n            body = body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n",
-            "        # Dump Pydantic v2 request models (alias-aware, JSON mode) before json.dumps.\n",
-        ),
-        PyModelStyle::Dataclass => (
-            "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n",
-            "        # Dataclass request models need conversion before json.dumps.\n",
-        ),
+    let body_value = match model_style {
+        PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            mode = \"python\" if body_encoding == \"multipart\" else \"json\"\n            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)\n        return self._wire_value(body)\n",
+        PyModelStyle::Dataclass => "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n        return self._wire_value(body)\n",
     };
 
     // --- Import header, assembled per file in canonical isort order (no unused imports, F401-clean). ---
     let mut stdlib: Vec<String> = Vec::new();
+    if has_basic_auth {
+        stdlib.push("import base64".to_string());
+    }
     if let PyModelStyle::Dataclass = model_style {
         stdlib.push("import dataclasses".to_string());
     }
+    stdlib.push("import enum".to_string());
     stdlib.push("import json".to_string());
+    stdlib.push("import secrets".to_string());
+    stdlib.push("import time".to_string());
     stdlib.push("import urllib.error".to_string());
     stdlib.push("import urllib.parse".to_string());
     stdlib.push("import urllib.request".to_string());
+    let collections = if has_pagination {
+        "from collections.abc import Callable, Iterator"
+    } else {
+        "from collections.abc import Callable"
+    };
+    stdlib.push(collections.to_string());
     stdlib.push("from typing import Any, Optional".to_string());
 
     let mut third_party: Vec<String> = Vec::new();
@@ -1032,26 +1176,127 @@ pub(crate) fn emit_client_with_models(
         first_party,
     ]);
 
-    let auth_init = if has_auth {
+    let auth_init = if has_api_key_auth {
         "        api_keys: Optional[dict[str, str]] = None,\n"
     } else {
         ""
     };
-    let auth_field = if has_auth {
+    let bearer_init = if has_bearer_auth {
+        "        bearer_token: Optional[str] = None,\n"
+    } else {
+        ""
+    };
+    let basic_init = if has_basic_auth {
+        "        basic_auth: Optional[tuple[str, str]] = None,\n"
+    } else {
+        ""
+    };
+    let auth_field = if has_api_key_auth {
         "        self._api_keys = api_keys or {}\n"
     } else {
         ""
     };
-    let auth_loop = if has_auth {
-        "        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                req.add_header(header, key)\n"
+    let bearer_field = if has_bearer_auth {
+        "        self._bearer_token = bearer_token\n"
     } else {
         ""
     };
+    let basic_field = if has_basic_auth {
+        "        self._basic_auth = basic_auth\n"
+    } else {
+        ""
+    };
+    let auth_headers_arg = if has_api_key_auth {
+        "        auth_headers: Optional[tuple[str, ...]] = None,\n"
+    } else {
+        ""
+    };
+    let auth_bearer_arg = if has_bearer_auth {
+        "        auth_bearer: bool = False,\n"
+    } else {
+        ""
+    };
+    let auth_basic_arg = if has_basic_auth {
+        "        auth_basic: bool = False,\n"
+    } else {
+        ""
+    };
+    let mut auth_loop = String::new();
+    if has_api_key_auth {
+        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                headers[header] = key\n");
+    }
+    if has_bearer_auth {
+        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\"\n");
+    }
+    if has_basic_auth {
+        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            headers[\"Authorization\"] = \"Basic \" + base64.b64encode(raw).decode(\"ascii\")\n");
+    }
+    let default_timeout = py_timeout_value(runtime.default_timeout_ms);
+    let max_retries = runtime.max_retries;
+    let retry_statuses = py_retry_status_tuple(runtime);
+    let retry_unsafe_methods = py_bool(runtime.retry_unsafe_methods);
     // The `_do` signature is pre-exploded (one parameter per line, trailing comma) because the single-
     // line form exceeds the 88-column limit — matching `ruff format` so the output is format-stable.
     format!(
         "\
 {header}
+
+class RequestOptions:
+    \"\"\"Per-request SDK runtime overrides.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> None:
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.idempotency_key = idempotency_key
+        self.metadata = metadata or {{}}
+
+
+class HookContext:
+    \"\"\"Context passed to generated SDK runtime hooks.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        method: str,
+        path_template: str,
+        url: str,
+        headers: dict[str, str],
+        request_metadata: dict[str, str],
+    ) -> None:
+        self.operation_id = operation_id
+        self.method = method
+        self.path_template = path_template
+        self.url = url
+        self.headers = headers
+        self.request_metadata = request_metadata
+        self.status: Optional[int] = None
+        self.response_headers: dict[str, str] = {{}}
+
+
+class ClientHooks:
+    \"\"\"Generated SDK runtime hooks.\"\"\"
+
+    def __init__(
+        self,
+        *,
+        request: Optional[
+            list[Callable[[HookContext, urllib.request.Request], None]]
+        ] = None,
+        response: Optional[list[Callable[[HookContext], None]]] = None,
+        error: Optional[list[Callable[[HookContext, BaseException], None]]] = None,
+    ) -> None:
+        self.request = request or []
+        self.response = response or []
+        self.error = error or []
+
 
 class Client:
     \"\"\"SDK client over urllib (no requests/httpx).\"\"\"
@@ -1061,11 +1306,93 @@ class Client:
         base_url: str,
         *,
         api_key: Optional[str] = None,
-{auth_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+{auth_init}{bearer_init}{basic_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+        timeout: Optional[float] = {default_timeout},
+        max_retries: int = {max_retries},
+        hooks: Optional[ClientHooks] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}        self._opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}        self._opener = opener or urllib.request.build_opener()
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._retry_statuses = {retry_statuses}
+        self._retry_unsafe_methods = {retry_unsafe_methods}
+        self._hooks = hooks or ClientHooks()
+
+    def _body_value(self, body: Any, body_encoding: str) -> Any:
+{body_value}
+    def _wire_value(self, value: Any) -> Any:
+        if isinstance(value, enum.Enum):
+            return self._wire_value(value.value)
+        if isinstance(value, list):
+            return [self._wire_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._wire_value(item) for item in value)
+        if isinstance(value, dict):
+            return {{key: self._wire_value(item) for key, item in value.items()}}
+        return value
+
+    def _encode_body(
+        self,
+        body: Optional[Any],
+        body_encoding: str,
+        content_type: str,
+    ) -> tuple[Optional[bytes], str]:
+        if body is None:
+            return None, content_type
+        if body_encoding == \"binary\":
+            if isinstance(body, bytes):
+                return body, content_type
+            if isinstance(body, bytearray):
+                return bytes(body), content_type
+            raise TypeError(\"binary request bodies must be bytes or bytearray\")
+        if body_encoding == \"text\":
+            return str(body).encode(), content_type
+        value = self._body_value(body, body_encoding)
+        if body_encoding == \"json\":
+            return json.dumps(value).encode(), content_type
+        if body_encoding == \"form\":
+            encoded = urllib.parse.urlencode(value, doseq=True).encode()
+            return encoded, content_type
+        if body_encoding == \"multipart\":
+            boundary = f\"gnr8-{{secrets.token_hex(16)}}\"
+            return (
+                self._encode_multipart(value, boundary),
+                f\"multipart/form-data; boundary={{boundary}}\",
+            )
+        raise ValueError(f\"unsupported request body encoding: {{body_encoding}}\")
+
+    def _encode_multipart(self, value: Any, boundary: str) -> bytes:
+        if not isinstance(value, dict):
+            raise TypeError(\"multipart request bodies must encode to a dict\")
+        out = bytearray()
+        for key, item in value.items():
+            if item is None:
+                continue
+            items = item if isinstance(item, (list, tuple)) else (item,)
+            for part in items:
+                if part is None:
+                    continue
+                out.extend(f\"--{{boundary}}\\r\\n\".encode())
+                if isinstance(part, (bytes, bytearray)):
+                    out.extend(
+                        (
+                            f'Content-Disposition: form-data; name=\"{{key}}\"; '
+                            f'filename=\"{{key}}\"\\r\\n'
+                            \"Content-Type: application/octet-stream\\r\\n\\r\\n\"
+                        ).encode()
+                    )
+                    out.extend(bytes(part))
+                    out.extend(b\"\\r\\n\")
+                else:
+                    out.extend(
+                        f'Content-Disposition: form-data; name=\"{{key}}\"\\r\\n\\r\\n'.encode()
+                    )
+                    out.extend(str(part).encode())
+                    out.extend(b\"\\r\\n\")
+        out.extend(f\"--{{boundary}}--\\r\\n\".encode())
+        return bytes(out)
 
     def _do(
         self,
@@ -1073,32 +1400,137 @@ class Client:
         path: str,
         *,
         body: Optional[Any] = None,
-        auth_headers: Optional[tuple[str, ...]] = None,
+{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}        operation_id: str,
+        path_template: str,
+        content_type: str = \"application/json\",
+        body_encoding: str = \"json\",
+        request_options: Optional[RequestOptions] = None,
+        idempotent: bool = False,
+        idempotency_key_header: str = \"Idempotency-Key\",
     ) -> tuple:
-{body_comment}{body_encode}
-        data = json.dumps(body).encode(\"utf-8\") if body is not None else None
-        req = urllib.request.Request(self._base_url + path, data=data, method=method)
+        data, content_type = self._encode_body(body, body_encoding, content_type)
+        options = request_options or RequestOptions()
+        timeout = options.timeout if options.timeout is not None else self._timeout
+        if options.max_retries is not None:
+            max_retries = options.max_retries
+        else:
+            max_retries = self._max_retries
+        if max_retries < 0:
+            max_retries = 0
+        if not (
+            self._retry_unsafe_methods
+            or idempotent
+            or method in (\"GET\", \"HEAD\", \"OPTIONS\", \"PUT\", \"DELETE\")
+        ):
+            max_retries = 0
+        headers: dict[str, str] = {{}}
         if data is not None:
-            req.add_header(\"Content-Type\", \"application/json\")
-{auth_loop}        try:
-            with self._opener.open(req) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            headers[\"Content-Type\"] = content_type
+{auth_loop}        if idempotent and options.idempotency_key:
+            headers[idempotency_key_header] = options.idempotency_key
+        url = self._base_url + path
+        last_error: Optional[BaseException] = None
+        for attempt in range(max_retries + 1):
+            req = urllib.request.Request(url, data=data, method=method)
+            for key, value in headers.items():
+                req.add_header(key, value)
+            context = HookContext(
+                operation_id=operation_id,
+                method=method,
+                path_template=path_template,
+                url=url,
+                headers=dict(headers),
+                request_metadata=dict(options.metadata),
+            )
+            try:
+                for hook in self._hooks.request:
+                    hook(context, req)
+                try:
+                    with self._opener.open(req, timeout=timeout) as resp:
+                        status = resp.status
+                        response_headers = dict(resp.headers.items())
+                        raw = resp.read()
+                except urllib.error.HTTPError as e:
+                    status = e.code
+                    response_headers = dict(e.headers.items())
+                    raw = e.read()
+                context.status = status
+                context.response_headers = response_headers
+                for hook in self._hooks.response:
+                    hook(context)
+                if self._should_retry_status(status) and attempt < max_retries:
+                    self._sleep_retry_after(response_headers)
+                    continue
+                if status < 200 or status >= 300:
+                    self._call_error_hooks(
+                        context,
+                        ApiError(
+                            status,
+                            \"\",
+                            \"\",
+                            headers=response_headers,
+                            raw_body=raw,
+                        ),
+                    )
+                return status, response_headers, raw
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt < max_retries:
+                    continue
+                self._call_error_hooks(context, e)
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(\"request failed without response\")
+
+    def _should_retry_status(self, status: int) -> bool:
+        return status in self._retry_statuses or status >= 500
 
     @staticmethod
-    def _raise(status: int, raw: bytes) -> None:
+    def _sleep_retry_after(headers: dict[str, str]) -> None:
+        retry_after = headers.get(\"Retry-After\") or headers.get(\"retry-after\")
+        if not retry_after:
+            return
         try:
-            decoded = json.loads(raw) if raw else {{}}
+            seconds = int(retry_after)
         except ValueError:
-            decoded = {{}}
-        if not isinstance(decoded, dict):
-            decoded = {{}}
+            return
+        if seconds > 0:
+            time.sleep(seconds)
+
+    def _call_error_hooks(self, context: HookContext, error: BaseException) -> None:
+        for hook in self._hooks.error:
+            hook(context, error)
+
+    @staticmethod
+    def _raise(
+        status: int,
+        headers: dict[str, str],
+        raw: bytes,
+        error_model: Optional[type] = None,
+    ) -> None:
+        try:
+            json_body = json.loads(raw) if raw else None
+        except ValueError:
+            json_body = None
+        body = json_body
+        if error_model is not None and isinstance(json_body, dict):
+            try:
+                body = error_model.from_dict(json_body)
+            except Exception:
+                body = json_body
+        decoded = json_body if isinstance(json_body, dict) else {{}}
+        request_id = headers.get(\"X-Request-ID\") or headers.get(\"x-request-id\", \"\")
         raise ApiError(
             status,
             decoded.get(\"message\", \"\"),
             decoded.get(\"slug\", \"\"),
             decoded.get(\"hints\"),
+            headers=headers,
+            request_id=request_id,
+            raw_body=raw,
+            json_body=json_body,
+            body=body,
         )
 "
     )
@@ -1140,8 +1572,17 @@ pub(crate) fn emit_operations_with_style(
     for op in ops {
         out.push('\n');
         emit_operation(&mut out, op, graph, base_path, model_style)?;
+        emit_pagination_helpers(&mut out, op, graph, model_style)?;
     }
     Ok(out)
+}
+
+pub(crate) fn pagination_method_names(graph: &ApiGraph, op: &Operation) -> Vec<String> {
+    if pagination_policy_for(graph, op).is_none() {
+        return Vec::new();
+    }
+    let method = operation_method_name(op);
+    vec![format!("{method}_pages"), format!("iter_{method}")]
 }
 
 /// The keyword/digit-safe, collision-checked Python identifiers for one operation's arguments.
@@ -1272,7 +1713,10 @@ fn emit_operation(
 
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1318,6 +1762,7 @@ fn emit_operation(
     for ident in &optional_query_idents {
         args.push(format!("{ident}=None"));
     }
+    args.push("request_options: Optional[RequestOptions] = None".to_string());
 
     writeln!(out, "{}", method_def(&method_name, &args, &return_hint)).map_err(sink)?;
 
@@ -1351,7 +1796,7 @@ fn emit_operation(
     // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
     // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
     // the wire key stays the ORIGINAL `p.name`.
-    if !query_params.is_empty() {
+    if !query_params.is_empty() || !auth_queries.is_empty() {
         writeln!(out, "        _query = {{}}").map_err(sink)?;
         for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
             writeln!(out, "        _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
@@ -1359,6 +1804,23 @@ fn emit_operation(
         for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
             writeln!(out, "        if {ident} is not None:").map_err(sink)?;
             writeln!(out, "            _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
+        }
+        for query in &auth_queries {
+            writeln!(
+                out,
+                "        _auth_query_{} = self._api_keys.get({}) or self._api_key",
+                safe_ident(&snake(query)),
+                quoted_string_literal(query)
+            )
+            .map_err(sink)?;
+            writeln!(out, "        if _auth_query_{}:", safe_ident(&snake(query))).map_err(sink)?;
+            writeln!(
+                out,
+                "            _query[{}] = _auth_query_{}",
+                quoted_string_literal(query),
+                safe_ident(&snake(query))
+            )
+            .map_err(sink)?;
         }
         writeln!(out, "        if _query:").map_err(sink)?;
         writeln!(
@@ -1369,24 +1831,52 @@ fn emit_operation(
     }
 
     // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
-    let body_arg = if body_model.is_some() {
-        ", body=body"
-    } else {
-        ""
-    };
-    let auth_arg = if auth_headers.is_empty() {
-        String::new()
-    } else {
-        format!(", auth_headers={}", py_string_tuple(&auth_headers))
-    };
-    writeln!(
-        out,
-        "        _status, _raw = self._do(\"{}\", path{body_arg}{auth_arg})",
-        op.method
-    )
-    .map_err(sink)?;
+    let mut do_args = vec![quoted_string_literal(&op.method), "path".to_string()];
+    if let Some(body) = body_model.as_ref() {
+        do_args.push("body=body".to_string());
+        do_args.push(format!(
+            "content_type={}",
+            quoted_string_literal(&body.content_type)
+        ));
+        do_args.push(format!(
+            "body_encoding={}",
+            quoted_string_literal(py_body_encoding(body.encoding))
+        ));
+    }
+    if !auth_headers.is_empty() {
+        do_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
+    }
+    if auth_http.contains(&HttpAuthScheme::Bearer) {
+        do_args.push("auth_bearer=True".to_string());
+    }
+    if auth_http.contains(&HttpAuthScheme::Basic) {
+        do_args.push("auth_basic=True".to_string());
+    }
+    let runtime = py_operation_runtime(graph, op);
+    do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
+    do_args.push(format!("path_template={}", quoted_string_literal(&op.path)));
+    do_args.push("request_options=request_options".to_string());
+    do_args.push(format!("idempotent={}", py_bool(runtime.idempotent)));
+    do_args.push(format!(
+        "idempotency_key_header={}",
+        quoted_string_literal(runtime.idempotency_key_header.unwrap_or("Idempotency-Key")),
+    ));
+    writeln!(out, "        _status, _headers, _raw = self._do(").map_err(sink)?;
+    for arg in do_args {
+        writeln!(out, "            {arg},").map_err(sink)?;
+    }
+    writeln!(out, "        )").map_err(sink)?;
     writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
-    writeln!(out, "            self._raise(_status, _raw)").map_err(sink)?;
+    for error_body in &error_bodies {
+        writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
+        writeln!(
+            out,
+            "                self._raise(_status, _headers, _raw, {})",
+            error_body.model
+        )
+        .map_err(sink)?;
+    }
+    writeln!(out, "            self._raise(_status, _headers, _raw)").map_err(sink)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -1398,7 +1888,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
+            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
         }
     } else if let Some(model) = &return_model {
         writeln!(
@@ -1423,10 +1913,335 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _raw)").map_err(sink)?;
+            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
+    }
+    Ok(())
+}
+
+struct PyPaginationInfo {
+    page_model: String,
+    item_type: String,
+    items_ident: String,
+    next_cursor_ident: Option<String>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Python pagination helper emission writes page and item helpers in one deterministic source block"
+)]
+fn emit_pagination_helpers(
+    out: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+    model_style: PyModelStyle,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = operation_method_name(op);
+    let pages_name = format!("{method_name}_pages");
+    let items_name = format!("iter_{method_name}");
+    let info = py_pagination_info(graph, op, policy, model_style)?;
+    let (args, call_args) = py_pagination_args(op, graph)?;
+
+    writeln!(out).map_err(sink)?;
+    writeln!(
+        out,
+        "{}",
+        method_def(
+            &pages_name,
+            &args,
+            &format!("Iterator[{}]", info.page_model)
+        )
+    )
+    .map_err(sink)?;
+    emit_pagination_initialization(out, policy)?;
+    writeln!(out, "        while True:").map_err(sink)?;
+    writeln!(
+        out,
+        "            _page = self.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(out, "            _items = _page.{} or []", info.items_ident).map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(out, "            if not _items:").map_err(sink)?;
+        writeln!(out, "                break").map_err(sink)?;
+    }
+    writeln!(out, "            yield _page").map_err(sink)?;
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_ident = info.next_cursor_ident.as_deref().ok_or_else(|| {
+                CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                        op.id
+                    ),
+                }
+            })?;
+            let cursor_ident = py_query_ident(op, cursor_param)?;
+            writeln!(out, "            _next_cursor = _page.{next_ident}").map_err(sink)?;
+            writeln!(out, "            if not _next_cursor:").map_err(sink)?;
+            writeln!(out, "                break").map_err(sink)?;
+            writeln!(out, "            {cursor_ident} = _next_cursor").map_err(sink)?;
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let page_ident = py_query_ident(op, page_param)?;
+            writeln!(out, "            {page_ident} += 1").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let offset_ident = py_query_ident(op, offset_param)?;
+            writeln!(out, "            {offset_ident} += len(_items)").map_err(sink)?;
+        }
+    }
+
+    writeln!(out).map_err(sink)?;
+    writeln!(
+        out,
+        "{}",
+        method_def(&items_name, &args, &format!("Iterator[{}]", info.item_type))
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "        for _page in self.{pages_name}({}):",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(
+        out,
+        "            for _item in _page.{} or []:",
+        info.items_ident
+    )
+    .map_err(sink)?;
+    writeln!(out, "                yield _item").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_pagination_initialization(
+    out: &mut String,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            let ident = safe_ident(&snake(page_param));
+            writeln!(out, "        if {ident} is None:").map_err(sink)?;
+            writeln!(out, "            {ident} = 1").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            let ident = safe_ident(&snake(offset_param));
+            writeln!(out, "        if {ident} is None:").map_err(sink)?;
+            writeln!(out, "            {ident} = 0").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn py_pagination_args(
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<(Vec<String>, Vec<String>), CoreError> {
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+    let ResolvedArgs {
+        path_idents,
+        required_query,
+        required_query_idents,
+        optional_query,
+        optional_query_idents,
+    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+
+    let mut args: Vec<String> = vec!["self".to_string()];
+    let mut call_args: Vec<String> = Vec::new();
+    for ident in &path_idents {
+        args.push(ident.clone());
+        call_args.push(format!("{ident}={ident}"));
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
+        args.push(format!("body: {}", body.model));
+        call_args.push("body=body".to_string());
+    }
+    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        let hint = py_type(&param.schema, false, graph)?;
+        args.push(format!("{ident}: {hint}"));
+        call_args.push(format!("{ident}={ident}"));
+    }
+    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
+        args.push(format!("body: Optional[{}] = None", body.model));
+        call_args.push("body=body".to_string());
+    }
+    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        let hint = py_type(&param.schema, false, graph)?;
+        args.push(format!("{ident}: Optional[{hint}] = None"));
+        call_args.push(format!("{ident}={ident}"));
+    }
+    args.push("request_options: Optional[RequestOptions] = None".to_string());
+    call_args.push("request_options=request_options".to_string());
+    Ok((args, call_args))
+}
+
+fn py_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+    model_style: PyModelStyle,
+) -> Result<PyPaginationInfo, CoreError> {
+    validate_numeric_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_model = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_model)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_model
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_model
+            ),
+        });
+    };
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_ident = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(py_field_ident(field, model_style))
+    } else {
+        None
+    };
+    Ok(PyPaginationInfo {
+        page_model,
+        item_type: py_type(item_schema, false, graph)?,
+        items_ident: py_field_ident(items, model_style),
+        next_cursor_ident,
+    })
+}
+
+fn py_field_ident(field: &Field, model_style: PyModelStyle) -> String {
+    match model_style {
+        PyModelStyle::Pydantic => pydantic_field_ident(field),
+        PyModelStyle::Dataclass => safe_ident(&field.json_name),
+    }
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn py_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .map(|param| safe_ident(&snake(&param.name)))
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn validate_numeric_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = op
+            .params
+            .iter()
+            .find(|param| param.location == "query" && param.name == param_name)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing query parameter '{}'",
+                    op.id, param_name
+                ),
+            })?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1477,7 +2292,7 @@ pub(crate) fn emit_init_with_models(
 ) -> String {
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
-    out.push_str("from .client import Client\n");
+    out.push_str("from .client import Client, ClientHooks, HookContext, RequestOptions\n");
     out.push_str("from .errors import ApiError\n");
 
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
@@ -1492,6 +2307,9 @@ pub(crate) fn emit_init_with_models(
 
     out.push_str("\n__all__ = [\n");
     out.push_str("    \"Client\",\n");
+    out.push_str("    \"ClientHooks\",\n");
+    out.push_str("    \"HookContext\",\n");
+    out.push_str("    \"RequestOptions\",\n");
     out.push_str("    \"ApiError\",\n");
     for name in &names {
         let _ = writeln!(out, "    \"{name}\",");
@@ -1507,8 +2325,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        emit_client, emit_errors, emit_init, emit_models, emit_models_with_style, emit_operations,
-        py_type, screaming_snake, snake,
+        emit_client, emit_client_with_models, emit_errors, emit_init, emit_models,
+        emit_models_with_style, emit_operations, py_type, screaming_snake, snake,
     };
     use crate::graph::{ApiGraph, Operation, Prim, Type};
     use crate::sdk::model_style::PyModelStyle;
@@ -1997,20 +2815,36 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book) -> CreatedMessage:"),
+                out.contains("def create_book(")
+                    && out.contains("body: Book")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> CreatedMessage:"),
                 "snake method, typed body, typed return:\n{out}"
             );
             assert!(
                 out.contains("if _status < 200 or _status >= 300:"),
                 "rejects only non-2xx statuses:\n{out}"
             );
-            assert!(out.contains("self._raise(_status, _raw)"), "{out}");
+            assert!(out.contains("if _status == 409:"), "{out}");
+            assert!(
+                out.contains("self._raise(_status, _headers, _raw, OutOfStock)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("self._raise(_status, _headers, _raw)"),
+                "{out}"
+            );
             assert!(
                 out.contains("return CreatedMessage.model_validate(_data)"),
                 "{out}"
             );
             assert!(
-                out.contains("self._do(\"POST\", path, body=body)"),
+                out.contains("_status, _headers, _raw = self._do(")
+                    && out.contains("\"POST\",")
+                    && out.contains("body=body,")
+                    && out.contains("content_type=\"application/json\",")
+                    && out.contains("body_encoding=\"json\",")
+                    && out.contains("operation_id=\"createBook\","),
                 "body op passes body to _do:\n{out}"
             );
         }
@@ -2032,7 +2866,10 @@ mod tests {
             });
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book, tenant) -> CreatedMessage:"),
+                out.contains("body: Book")
+                    && out.contains("tenant")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> CreatedMessage:"),
                 "required body must stay before required query params:\n{out}"
             );
             assert!(out.contains("_query[\"tenant\"] = tenant"), "{out}");
@@ -2053,7 +2890,10 @@ mod tests {
                 .sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("def create_book(self, body: Book) -> Optional[CreatedMessage]:"),
+                out.contains("def create_book(")
+                    && out.contains("body: Book")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Optional[CreatedMessage]:"),
                 "bodyless alternate success should make the return hint optional:\n{out}"
             );
             assert!(
@@ -2074,7 +2914,10 @@ mod tests {
                 "path param must be percent-escaped (V5) with a backslash-free f-string (PYSDK-02):\n{out}"
             );
             assert!(
-                out.contains("def get_book(self, book_id) -> Book:"),
+                out.contains("def get_book(")
+                    && out.contains("book_id")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Book:"),
                 "{out}"
             );
         }
@@ -2084,7 +2927,10 @@ mod tests {
             let g = ops_graph();
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> Any:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Any:"),
                 "{out}"
             );
             assert!(out.contains("if cursor is not None:"), "{out}");
@@ -2105,6 +2951,71 @@ mod tests {
         }
 
         #[test]
+        fn query_api_key_auth_is_appended_to_query_string() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "QueryAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: "api_key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains(
+                    "_auth_query_api_key = self._api_keys.get(\"api_key\") or self._api_key"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("_query[\"api_key\"] = _auth_query_api_key"),
+                "{out}"
+            );
+            assert!(
+                out.contains("path = path + \"?\" + urllib.parse.urlencode(_query)"),
+                "{out}"
+            );
+        }
+
+        #[test]
+        fn http_auth_marks_operation_dispatch() {
+            let mut g = ops_graph();
+            g.security = vec![
+                crate::graph::SecurityScheme {
+                    id: "BearerAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "bearer".to_string(),
+                    global: true,
+                },
+                crate::graph::SecurityScheme {
+                    id: "BasicAuth".to_string(),
+                    kind: "http".to_string(),
+                    location: String::new(),
+                    name: "basic".to_string(),
+                    global: false,
+                },
+            ];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("_status, _headers, _raw = self._do(")
+                    && out.contains("\"GET\",")
+                    && out.contains("auth_bearer=True,")
+                    && out.contains("operation_id=\"listBooks\","),
+                "{out}"
+            );
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.id == "listBooks")
+                .unwrap();
+            op.security = vec!["BasicAuth".to_string()];
+            op.security_overrides_global = true;
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(out.contains("auth_basic=True,"), "{out}");
+        }
+
+        #[test]
         fn binary_success_returns_bytes_without_json_decode() {
             let mut g = ops_graph();
             let op = g
@@ -2117,7 +3028,10 @@ mod tests {
             op.responses[0].content_types = vec!["application/pdf".to_string()];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> bytes:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> bytes:"),
                 "{out}"
             );
             assert!(out.contains("if _status in (200,):"), "{out}");
@@ -2149,7 +3063,10 @@ mod tests {
             op.responses.sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("def list_books(self, cursor=None) -> Optional[bytes]:"),
+                out.contains("def list_books(")
+                    && out.contains("cursor=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Optional[bytes]:"),
                 "{out}"
             );
             assert!(out.contains("return _raw"), "{out}");
@@ -2188,7 +3105,7 @@ mod tests {
     }
 
     mod client_errors_init {
-        use super::{emit_client, emit_errors, emit_init, ops_graph};
+        use super::{emit_client, emit_client_with_models, emit_errors, emit_init, ops_graph};
 
         #[test]
         fn client_has_injectable_opener_and_no_third_party_http_imports() {
@@ -2202,6 +3119,35 @@ mod tests {
             // no third-party HTTP libs (PYSDK-01).
             assert!(!out.contains("import requests"), "{out}");
             assert!(!out.contains("import httpx"), "{out}");
+        }
+
+        #[test]
+        fn client_emits_http_auth_options_when_needed() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                true,
+                true,
+                &[],
+                &crate::graph::RuntimePolicy::default(),
+                false,
+            );
+            assert!(out.contains("import base64"), "{out}");
+            assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
+            assert!(
+                out.contains("basic_auth: Optional[tuple[str, str]] = None"),
+                "{out}"
+            );
+            assert!(
+                out.contains("headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""),
+                "{out}"
+            );
+            assert!(
+                out.contains("base64.b64encode(raw).decode(\"ascii\")"),
+                "{out}"
+            );
         }
 
         #[test]
@@ -2399,7 +3345,11 @@ mod tests {
             let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
             // required `q` is positional (no `=None`), optional `page` keeps the default.
             assert!(
-                out.contains("def search(self, q, page=None) -> Any:"),
+                out.contains("def search(")
+                    && out.contains("q,")
+                    && out.contains("page=None")
+                    && out.contains("request_options: Optional[RequestOptions] = None")
+                    && out.contains(") -> Any:"),
                 "{out}"
             );
             // required `q` is unconditionally written; optional `page` is guarded.

@@ -11,8 +11,9 @@
 //!
 //! The smoke test constructs the `Client` via `NewClient(srv.URL)`, calls `CreateGoal` (POST `/goal/`)
 //! and asserts method/path/body + the decoded `CommandMessageWithUUID.UUID` (SDK-05 exercised), and
-//! exercises a 4xx path — a `DeleteGoal` against a stub returning 404 must surface a `*APIError` with
-//! `StatusCode == 404` (SDK-04 typed error). A `go build`/`go test` non-zero exit maps to a captured
+//! exercises a 4xx path — a `DeleteGoal` against a stub returning the declared 400 `HttpError` must
+//! surface a `*APIError` with a typed `Body` (SDK-04 typed error). A `go build`/`go test` non-zero exit
+//! maps to a captured
 //! stderr failure (or `CoreError::GoBuild` in the harness helper), never a panic (threat T-03-03-04).
 //!
 //! Requires the Go toolchain (present on dev + CI, go 1.26); skips gracefully (early return) if it is
@@ -160,6 +161,404 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
     .expect("optional body graph json")
 }
 
+fn query_api_key_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": [
+            {
+              "id": "QueryAuth",
+              "kind": "apiKey",
+              "location": "query",
+              "name": "api_key"
+            }
+          ]
+        }"#,
+    )
+    .expect("query api-key graph json")
+}
+
+fn http_auth_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "getBearer",
+              "method": "GET",
+              "path": "/bearer",
+              "handler": "getBearer",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BearerAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "getBasic",
+              "method": "GET",
+              "path": "/basic",
+              "handler": "getBasic",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "security": ["BasicAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": [
+            {
+              "id": "BearerAuth",
+              "kind": "http",
+              "location": "",
+              "name": "bearer",
+              "global": false
+            },
+            {
+              "id": "BasicAuth",
+              "kind": "http",
+              "location": "",
+              "name": "basic",
+              "global": false
+            }
+          ]
+        }"#,
+    )
+    .expect("http auth graph json")
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the media graph is an explicit JSON fixture covering four content types"
+)]
+fn media_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/media",
+          "operations": [
+            {
+              "id": "postText",
+              "method": "POST",
+              "path": "/text",
+              "handler": "postText",
+              "params": [],
+              "request_body": { "ref_id": "dto.TextBody" },
+              "request_body_required": true,
+              "request_body_content_type": "text/plain",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "postForm",
+              "method": "POST",
+              "path": "/form",
+              "handler": "postForm",
+              "params": [],
+              "request_body": { "ref_id": "dto.FormBody" },
+              "request_body_required": true,
+              "request_body_content_type": "application/x-www-form-urlencoded",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "postMultipart",
+              "method": "POST",
+              "path": "/multipart",
+              "handler": "postMultipart",
+              "params": [],
+              "request_body": { "ref_id": "dto.MultipartBody" },
+              "request_body_required": true,
+              "request_body_content_type": "multipart/form-data",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "postBinary",
+              "method": "POST",
+              "path": "/binary",
+              "handler": "postBinary",
+              "params": [],
+              "request_body": { "ref_id": "dto.UploadBytes" },
+              "request_body_required": true,
+              "request_body_content_type": "application/octet-stream",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.FormBody",
+              "name": "FormBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "count",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "name",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "tags",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.MultipartBody",
+              "name": "MultipartBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "file",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bytes" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "title",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "files",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.TextBody",
+              "name": "TextBody",
+              "body": { "type": "primitive", "of": { "prim": "string" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "dto.UploadBytes",
+              "name": "UploadBytes",
+              "body": { "type": "primitive", "of": { "prim": "bytes" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("media graph json")
+}
+
+fn runtime_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "createUnsafe",
+              "method": "POST",
+              "path": "/unsafe",
+              "handler": "createUnsafe",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "createIdempotent",
+              "method": "POST",
+              "path": "/idempotent",
+              "handler": "createIdempotent",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "http.go", "start_line": 3, "end_line": 3 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("runtime graph json");
+    graph.runtime = gnr8::graph::RuntimePolicy {
+        default_timeout_ms: Some(5_000),
+        max_retries: 0,
+        retry_statuses: Vec::new(),
+        retry_unsafe_methods: false,
+        hooks: Vec::new(),
+    };
+    graph.operation_runtime = vec![gnr8::graph::OperationRuntimePolicy {
+        operation_id: "createIdempotent".to_string(),
+        idempotent: true,
+        idempotency_key_header: Some("Idempotency-Key".to_string()),
+    }];
+    graph
+}
+
+fn pagination_graph() -> gnr8::graph::ApiGraph {
+    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "listItems",
+              "params": [
+                {
+                  "name": "cursor",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 200, "body": { "ref_id": "dto.ItemPage" } } ],
+              "provenance": { "file": "http.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.Item",
+              "name": "Item",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "id",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.ItemPage",
+              "name": "ItemPage",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "items",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "nextCursor",
+                  "required": false,
+                  "optional": true,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("pagination graph json");
+    graph.pagination = vec![gnr8::graph::PaginationPolicy {
+        operation_id: "listItems".to_string(),
+        mode: gnr8::graph::PaginationMode::Cursor,
+        items_field: "items".to_string(),
+        cursor_param: Some("cursor".to_string()),
+        next_cursor_field: Some("nextCursor".to_string()),
+        page_param: None,
+        page_size_param: None,
+        offset_param: None,
+        limit_param: None,
+        termination: gnr8::graph::PaginationTermination::NoNextCursor,
+    }];
+    graph
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]
@@ -193,23 +592,7 @@ fn generated_sdk_go_builds_clean() {
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }
 
-/// SDK-05 + SDK-04: a fixed httptest smoke test constructs the Client, calls `CreateGoal` (POST /goal/)
-/// asserting method/path/body + the decoded response, and exercises a 4xx `DeleteGoal` path that must
-/// surface a `*APIError` with `StatusCode` == 404. `go test ./...` must pass.
-#[test]
-fn generated_sdk_passes_httptest_smoke() {
-    if !go_available() {
-        eprintln!("skipping sdk_compile smoke: go toolchain unavailable");
-        return;
-    }
-    let dir = materialize_sdk();
-    let pkg = package_clause(&dir);
-
-    // A FIXED smoke *_test.go written by the harness (NOT part of the snapshot-ed SDK bundle — the
-    // bundle stays production-SDK-only, RESEARCH Open Q2 recommendation b). It shares the SDK's package
-    // (read from the written files) so it can call unexported helpers and the package types directly.
-    let smoke = format!(
-        r#"package {pkg}
+const HTTPTEST_SMOKE_TEMPLATE: &str = r#"package __PKG__
 
 import (
 	"context"
@@ -222,76 +605,220 @@ import (
 )
 
 // SDK-05: CreateGoal sends POST /goal/ with the marshaled body and decodes the 201 response.
-func TestCreateGoalSmoke(t *testing.T) {{
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
-		if r.Method != http.MethodPost {{
+func TestCreateGoalSmoke(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
 			t.Errorf("method = %s, want POST", r.Method)
-		}}
-		if r.URL.Path != "/goal/" {{
+		}
+		if r.URL.Path != "/goal/" {
 			t.Errorf("path = %s, want /goal/", r.URL.Path)
-		}}
+		}
 		body, _ := io.ReadAll(r.Body)
-		if !strings.Contains(string(body), "\"name\":\"my-goal\"") {{
+		if !strings.Contains(string(body), "\"name\":\"my-goal\"") {
 			t.Errorf("request body = %s, want it to contain name=my-goal", string(body))
-		}}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(CommandMessageWithUUID{{Message: "ok", UUID: "goal-123"}})
-	}}))
+		_ = json.NewEncoder(w).Encode(CommandMessageWithUUID{Message: "ok", UUID: "goal-123"})
+	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL)
-	out, err := c.CreateGoal(context.Background(), CreateGoalInput{{Name: "my-goal"}})
-	if err != nil {{
+	out, err := c.CreateGoal(context.Background(), CreateGoalInput{Name: "my-goal"})
+	if err != nil {
 		t.Fatalf("CreateGoal returned error: %v", err)
-	}}
-	if out.UUID != "goal-123" {{
+	}
+	if out.UUID != "goal-123" {
 		t.Fatalf("out.UUID = %q, want goal-123", out.UUID)
-	}}
-	if out.Message != "ok" {{
+	}
+	if out.Message != "ok" {
 		t.Fatalf("out.Message = %q, want ok", out.Message)
-	}}
-}}
+	}
+}
 
-// SDK-04: a 404 with an HttpError body must surface a *APIError carrying StatusCode == 404.
-func TestDeleteGoalNotFoundAPIError(t *testing.T) {{
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
-		if r.Method != http.MethodDelete {{
+// SDK-04: a declared 400 with an HttpError body must surface a *APIError with a typed Body.
+func TestDeleteGoalBadRequestAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
 			t.Errorf("method = %s, want DELETE", r.Method)
-		}}
-		if r.URL.Path != "/goal/missing-uuid" {{
+		}
+		if r.URL.Path != "/goal/missing-uuid" {
 			t.Errorf("path = %s, want /goal/missing-uuid", r.URL.Path)
-		}}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(HttpError{{Message: "not found", Slug: "goal_not_found"}})
-	}}))
+		w.Header().Set("X-Request-ID", "req-400")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: "bad_request"})
+	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL)
 	_, err := c.DeleteGoal(context.Background(), "missing-uuid")
-	if err == nil {{
-		t.Fatalf("DeleteGoal on a 404 must return an error")
-	}}
+	if err == nil {
+		t.Fatalf("DeleteGoal on a 400 must return an error")
+	}
 	apiErr, ok := err.(*APIError)
-	if !ok {{
+	if !ok {
 		t.Fatalf("error type = %T, want *APIError", err)
-	}}
-	if apiErr.StatusCode != 404 {{
-		t.Fatalf("StatusCode = %d, want 404", apiErr.StatusCode)
-	}}
-	if !apiErr.IsNotFound() {{
-		t.Fatalf("IsNotFound() = false, want true for a 404")
-	}}
-}}
-"#
-    );
+	}
+	if apiErr.StatusCode != 400 {
+		t.Fatalf("StatusCode = %d, want 400", apiErr.StatusCode)
+	}
+	if apiErr.IsNotFound() {
+		t.Fatalf("IsNotFound() = true, want false for a 400")
+	}
+	if apiErr.RequestID != "req-400" {
+		t.Fatalf("RequestID = %q, want req-400", apiErr.RequestID)
+	}
+	if got := apiErr.Headers.Get("X-Request-ID"); got != "req-400" {
+		t.Fatalf("Headers.Get(X-Request-ID) = %q, want req-400", got)
+	}
+	if !strings.Contains(string(apiErr.RawBody), "bad_request") {
+		t.Fatalf("RawBody = %s, want bad_request", string(apiErr.RawBody))
+	}
+	if apiErr.JSONBody == nil {
+		t.Fatalf("JSONBody = nil, want parsed JSON")
+	}
+	typed, ok := apiErr.Body.(HttpError)
+	if !ok {
+		t.Fatalf("Body type = %T, want HttpError", apiErr.Body)
+	}
+	if typed.Slug != "bad_request" {
+		t.Fatalf("Body.Slug = %q, want bad_request", typed.Slug)
+	}
+	if apiErr.Message != "bad request" {
+		t.Fatalf("Message = %q, want bad request", apiErr.Message)
+	}
+	if apiErr.Slug != "bad_request" {
+		t.Fatalf("Slug = %q, want bad_request", apiErr.Slug)
+	}
+}
+"#;
+
+const MEDIA_SMOKE_TEMPLATE: &str = r#"package __PKG__
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestMediaRequestBodies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/text":
+			if got := r.Header.Get("Content-Type"); got != "text/plain" {
+				t.Errorf("text Content-Type = %q, want text/plain", got)
+			}
+			if string(body) != "hello" {
+				t.Errorf("text body = %q, want hello", string(body))
+			}
+		case "/form":
+			if got := r.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+				t.Errorf("form Content-Type = %q, want application/x-www-form-urlencoded", got)
+			}
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Fatalf("form body did not parse: %v", err)
+			}
+				if values.Get("name") != "Ada" || values.Get("count") != "3" {
+					t.Errorf("form body = %q, want name=Ada and count=3", string(body))
+				}
+				if got := values["tags"]; len(got) != 2 || got[0] != "sdk" || got[1] != "media" {
+					t.Errorf("form tags = %#v, want repeated tags sdk/media; body=%q", got, string(body))
+				}
+			case "/multipart":
+				if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "multipart/form-data; boundary=") {
+					t.Errorf("multipart Content-Type = %q, want multipart/form-data boundary", got)
+				}
+				text := string(body)
+				for _, want := range []string{`name="title"`, "Report", `name="file"; filename="file"`, "abc123", `name="files"; filename="files"`, "part-one", "part-two"} {
+					if !strings.Contains(text, want) {
+						t.Errorf("multipart body missing %q:\n%s", want, text)
+					}
+				}
+				if strings.Count(text, `name="files"; filename="files"`) != 2 {
+					t.Errorf("multipart repeated files field count mismatch:\n%s", text)
+				}
+		case "/binary":
+			if got := r.Header.Get("Content-Type"); got != "application/octet-stream" {
+				t.Errorf("binary Content-Type = %q, want application/octet-stream", got)
+			}
+			if string(body) != "raw-bytes" {
+				t.Errorf("binary body = %q, want raw-bytes", string(body))
+			}
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+	if _, err := c.PostText(ctx, "hello"); err != nil {
+		t.Fatalf("PostText returned error: %v", err)
+	}
+	if _, err := c.PostForm(ctx, FormBody{Name: "Ada", Count: 3, Tags: []string{"sdk", "media"}}); err != nil {
+		t.Fatalf("PostForm returned error: %v", err)
+	}
+	if _, err := c.PostMultipart(ctx, MultipartBody{Title: "Report", File: []byte("abc123"), Files: [][]byte{[]byte("part-one"), []byte("part-two")}}); err != nil {
+		t.Fatalf("PostMultipart returned error: %v", err)
+	}
+	if _, err := c.PostBinary(ctx, []byte("raw-bytes")); err != nil {
+		t.Fatalf("PostBinary returned error: %v", err)
+	}
+}
+"#;
+
+/// SDK-05 + SDK-04: a fixed httptest smoke test constructs the Client, calls `CreateGoal` (POST /goal/)
+/// asserting method/path/body + the decoded response, and exercises a declared 4xx `DeleteGoal` path
+/// that must surface a `*APIError` with a typed error body. `go test ./...` must pass.
+#[test]
+fn generated_sdk_passes_httptest_smoke() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile smoke: go toolchain unavailable");
+        return;
+    }
+    let dir = materialize_sdk();
+    let pkg = package_clause(&dir);
+
+    // A FIXED smoke *_test.go written by the harness (NOT part of the snapshot-ed SDK bundle — the
+    // bundle stays production-SDK-only, RESEARCH Open Q2 recommendation b). It shares the SDK's package
+    // (read from the written files) so it can call unexported helpers and the package types directly.
+    let smoke = HTTPTEST_SMOKE_TEMPLATE.replace("__PKG__", &pkg);
     std::fs::write(dir.join("smoke_test.go"), smoke).expect("write smoke_test.go");
 
     let test = run_go(&["test", "./..."], &dir);
     assert!(
         test.is_ok(),
         "go test ./... (httptest smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_media_request_bodies_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile media smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = media_graph();
+    let dir = materialize_sdk_from_graph("media", &graph, "/");
+    let pkg = package_clause(&dir);
+    let smoke = MEDIA_SMOKE_TEMPLATE.replace("__PKG__", &pkg);
+    std::fs::write(dir.join("media_smoke_test.go"), smoke).expect("write media_smoke_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (media request body smoke) must pass: {test:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
@@ -346,6 +873,403 @@ func TestOptionalBodyNilDoesNotSendJSON(t *testing.T) {{
     std::fs::write(dir.join("optional_body_test.go"), smoke).expect("write optional smoke");
     let test = run_go(&["test", "./..."], &dir);
     assert!(test.is_ok(), "go test ./... must succeed: {test:?}");
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_sends_query_api_key() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile query auth smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = query_api_key_graph();
+    let dir = materialize_sdk_from_graph("query-api-key", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestQueryAPIKeyIsSent(t *testing.T) {{
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		if r.Method != http.MethodGet {{
+			t.Errorf("method = %s, want GET", r.Method)
+		}}
+		if r.URL.Path != "/api/items" {{
+			t.Errorf("path = %s, want /api/items", r.URL.Path)
+		}}
+		if got := r.URL.Query().Get("api_key"); got != "secret" {{
+			t.Errorf("api_key query = %q, want secret", got)
+		}}
+		w.WriteHeader(http.StatusNoContent)
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, WithAPIKey("secret"))
+	if _, err := c.ListItems(context.Background()); err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("query_auth_test.go"), smoke).expect("write query_auth_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (query auth smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_sends_bearer_and_basic_auth() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile http auth smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = http_auth_graph();
+    let dir = materialize_sdk_from_graph("http-auth", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestBearerAndBasicAuthAreSent(t *testing.T) {{
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		switch r.URL.Path {{
+		case "/api/bearer":
+			if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {{
+				t.Errorf("bearer Authorization = %q, want Bearer secret-token", got)
+			}}
+		case "/api/basic":
+			username, password, ok := r.BasicAuth()
+			if !ok || username != "user" || password != "pass" {{
+				t.Errorf("basic auth = (%q, %q, %v), want (user, pass, true)", username, password, ok)
+			}}
+		default:
+			t.Errorf("path = %s, want /api/bearer or /api/basic", r.URL.Path)
+		}}
+		w.WriteHeader(http.StatusNoContent)
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, WithBearerToken("secret-token"), WithBasicAuth("user", "pass"))
+	if _, err := c.GetBearer(context.Background()); err != nil {{
+		t.Fatalf("GetBearer returned error: %v", err)
+	}}
+	if _, err := c.GetBasic(context.Background()); err != nil {{
+		t.Fatalf("GetBasic returned error: %v", err)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("http_auth_test.go"), smoke).expect("write http_auth_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (http auth smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test writes one fixed generated-SDK Go program so failures show the exact smoke source"
+)]
+fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile runtime smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = runtime_graph();
+    let dir = materialize_sdk_from_graph("runtime", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+type runtimeEvent struct {{
+	Kind string
+	OperationID string
+	Method string
+	PathTemplate string
+	Trace string
+	StatusCode int
+}}
+
+func hasRuntimeEvent(events []runtimeEvent, want runtimeEvent) bool {{
+	for _, event := range events {{
+		if event == want {{
+			return true
+		}}
+	}}
+	return false
+}}
+
+func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
+	counts := map[string]int{{}}
+	idempotencyKeys := []string{{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		key := r.Method + " " + r.URL.Path
+		counts[key]++
+		switch r.URL.Path {{
+		case "/api/items":
+			if counts[key] == 1 {{
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}}
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/unsafe":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/api/idempotent":
+			idempotencyKeys = append(idempotencyKeys, r.Header.Get("Idempotency-Key"))
+			if counts[key] == 1 {{
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}}
+	}}))
+	defer srv.Close()
+
+	events := []runtimeEvent{{}}
+	c := NewClient(
+		srv.URL,
+		WithTimeout(5*time.Second),
+		WithMaxRetries(0),
+		WithRequestHook(func(_ context.Context, ctx RequestContext, _ *http.Request) error {{
+			events = append(events, runtimeEvent{{
+				Kind: "request",
+				OperationID: ctx.OperationID,
+				Method: ctx.Method,
+				PathTemplate: ctx.PathTemplate,
+				Trace: ctx.RequestMetadata["trace"],
+			}})
+			return nil
+		}}),
+		WithResponseHook(func(_ context.Context, ctx RequestContext, _ *http.Response) error {{
+			events = append(events, runtimeEvent{{
+				Kind: "response",
+				OperationID: ctx.OperationID,
+				StatusCode: ctx.StatusCode,
+			}})
+			return nil
+		}}),
+		WithErrorHook(func(_ context.Context, ctx RequestContext, _ error) {{
+			events = append(events, runtimeEvent{{
+				Kind: "error",
+				OperationID: ctx.OperationID,
+				StatusCode: ctx.StatusCode,
+			}})
+		}}),
+	)
+
+	_, err := c.ListItems(
+		context.Background(),
+		WithRequestMaxRetries(1),
+		WithRequestTimeout(5*time.Second),
+		WithRequestMetadata(map[string]string{{"trace": "runtime"}}),
+	)
+	if err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+	if counts["GET /api/items"] != 2 {{
+		t.Fatalf("GET /api/items count = %d, want 2", counts["GET /api/items"])
+	}}
+
+	_, err = c.CreateUnsafe(context.Background(), WithRequestMaxRetries(1))
+	if err == nil {{
+		t.Fatalf("CreateUnsafe must return an APIError")
+	}}
+	apiErr, ok := err.(*APIError)
+	if !ok || apiErr.StatusCode != http.StatusInternalServerError {{
+		t.Fatalf("CreateUnsafe error = %#v, want *APIError status 500", err)
+	}}
+	if counts["POST /api/unsafe"] != 1 {{
+		t.Fatalf("POST /api/unsafe count = %d, want 1", counts["POST /api/unsafe"])
+	}}
+
+	_, err = c.CreateIdempotent(
+		context.Background(),
+		WithRequestMaxRetries(1),
+		WithIdempotencyKey("idem-1"),
+	)
+	if err != nil {{
+		t.Fatalf("CreateIdempotent returned error: %v", err)
+	}}
+	if counts["POST /api/idempotent"] != 2 {{
+		t.Fatalf("POST /api/idempotent count = %d, want 2", counts["POST /api/idempotent"])
+	}}
+	if len(idempotencyKeys) != 2 || idempotencyKeys[0] != "idem-1" || idempotencyKeys[1] != "idem-1" {{
+		t.Fatalf("idempotency keys = %#v, want two idem-1 values", idempotencyKeys)
+	}}
+
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "request", OperationID: "listItems", Method: "GET", PathTemplate: "/items", Trace: "runtime"}}) {{
+		t.Fatalf("missing listItems request event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 429}}) {{
+		t.Fatalf("missing listItems 429 response event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 204}}) {{
+		t.Fatalf("missing listItems 204 response event in %#v", events)
+	}}
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "error", OperationID: "createUnsafe", StatusCode: 500}}) {{
+		t.Fatalf("missing createUnsafe error event in %#v", events)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("runtime_test.go"), smoke).expect("write runtime_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (runtime smoke) must pass: {test:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pagination smoke covers raw, page, full iteration, and early-stop behavior together"
+)]
+fn generated_sdk_pagination_helpers_work_against_httptest() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile pagination smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = pagination_graph();
+    let dir = materialize_sdk_from_graph("pagination", &graph, "/api");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestPaginationHelpers(t *testing.T) {{
+	seen := []string{{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
+		if r.URL.Path != "/api/items" {{
+			t.Errorf("path = %s, want /api/items", r.URL.Path)
+		}}
+		cursor := r.URL.Query().Get("cursor")
+		seen = append(seen, cursor)
+		w.Header().Set("Content-Type", "application/json")
+		switch cursor {{
+		case "":
+			_ = json.NewEncoder(w).Encode(ItemPage{{
+				Items: []Item{{{{ID: "a"}}}},
+				NextCursor: "n2",
+			}})
+		case "n2":
+			_ = json.NewEncoder(w).Encode(ItemPage{{
+				Items: []Item{{{{ID: "b"}}}},
+				NextCursor: "",
+			}})
+		default:
+			t.Errorf("cursor = %q, want empty or n2", cursor)
+			w.WriteHeader(http.StatusBadRequest)
+		}}
+	}}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	raw, err := c.ListItems(context.Background(), ListItemsParams{{}})
+	if err != nil {{
+		t.Fatalf("ListItems returned error: %v", err)
+	}}
+	if len(raw.Items) != 1 || raw.Items[0].ID != "a" {{
+		t.Fatalf("raw.Items = %#v, want first item a", raw.Items)
+	}}
+
+	seen = nil
+	pages, err := c.ListItemsPages(context.Background(), ListItemsParams{{}})
+	if err != nil {{
+		t.Fatalf("ListItemsPages returned error: %v", err)
+	}}
+	if len(pages) != 2 || pages[0].Items[0].ID != "a" || pages[1].Items[0].ID != "b" {{
+		t.Fatalf("pages = %#v, want a then b", pages)
+	}}
+	if len(seen) != 2 || seen[0] != "" || seen[1] != "n2" {{
+		t.Fatalf("seen cursors = %#v, want empty then n2", seen)
+	}}
+
+	seen = nil
+	items := []string{{}}
+	err = c.IterateListItems(context.Background(), ListItemsParams{{}}, func(item Item) bool {{
+		items = append(items, item.ID)
+		return true
+	}})
+	if err != nil {{
+		t.Fatalf("IterateListItems returned error: %v", err)
+	}}
+	if len(items) != 2 || items[0] != "a" || items[1] != "b" {{
+		t.Fatalf("items = %#v, want a then b", items)
+	}}
+	if len(seen) != 2 || seen[0] != "" || seen[1] != "n2" {{
+		t.Fatalf("seen cursors = %#v, want empty then n2", seen)
+	}}
+
+	seen = nil
+	items = nil
+	err = c.IterateListItems(context.Background(), ListItemsParams{{}}, func(item Item) bool {{
+		items = append(items, item.ID)
+		return false
+	}})
+	if err != nil {{
+		t.Fatalf("IterateListItems early stop returned error: %v", err)
+	}}
+	if len(items) != 1 || items[0] != "a" {{
+		t.Fatalf("early-stop items = %#v, want only a", items)
+	}}
+	if len(seen) != 1 || seen[0] != "" {{
+		t.Fatalf("early-stop cursors = %#v, want only the first request", seen)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("pagination_test.go"), smoke).expect("write pagination_test.go");
+
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(
+        test.is_ok(),
+        "go test ./... (pagination smoke) must pass: {test:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }

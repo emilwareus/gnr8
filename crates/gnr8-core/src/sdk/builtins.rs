@@ -15,7 +15,11 @@ use super::{
     collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
-use crate::graph::{ApiGraph, Response, Schema, SchemaRef, SecurityScheme, Type};
+use crate::graph::{
+    ApiGraph, MediaExample, OperationDocsPolicy, OperationRuntimePolicy, PaginationMode,
+    PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy, RuntimeHookKind,
+    RuntimePolicy, Schema, SchemaRef, SecurityScheme, Type,
+};
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
 use crate::sdk::emit_common::quoted_string_literal;
@@ -1620,6 +1624,8 @@ pub struct ApplySecurity {
 /// or boolean composition.
 #[derive(Debug, Clone)]
 pub enum OperationSelector {
+    /// Match one operation id exactly.
+    OperationId(String),
     /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
     PathPrefix(String),
     /// Match operations whose HTTP method is one of these uppercase method names.
@@ -1633,6 +1639,12 @@ pub enum OperationSelector {
 }
 
 impl OperationSelector {
+    /// Match one operation id exactly.
+    #[must_use]
+    pub fn operation(id: impl Into<String>) -> Self {
+        Self::OperationId(id.into())
+    }
+
     /// Match operations whose graph path, or base-path-joined path, starts with `prefix`.
     #[must_use]
     pub fn path_prefix(prefix: impl Into<String>) -> Self {
@@ -1692,6 +1704,52 @@ impl ApplySecurity {
                 kind: "apiKey".to_string(),
                 location: "header".to_string(),
                 name: header_name.into(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
+    /// An `apiKey`-in-`query` scheme: `id` is the OpenAPI scheme id (e.g. `"ApiKeyQueryAuth"`),
+    /// `param_name` is the credential query parameter (e.g. `"api_key"`).
+    #[must_use]
+    pub fn api_key_query(id: impl Into<String>, param_name: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "apiKey".to_string(),
+                location: "query".to_string(),
+                name: param_name.into(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
+    /// An HTTP bearer scheme: `id` is the OpenAPI scheme id (e.g. `"BearerAuth"`).
+    #[must_use]
+    pub fn bearer(id: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "bearer".to_string(),
+                global: true,
+            },
+            selectors: Vec::new(),
+        }
+    }
+
+    /// An HTTP basic scheme: `id` is the OpenAPI scheme id (e.g. `"BasicAuth"`).
+    #[must_use]
+    pub fn basic(id: impl Into<String>) -> Self {
+        Self {
+            scheme: SecurityScheme {
+                id: id.into(),
+                kind: "http".to_string(),
+                location: String::new(),
+                name: "basic".to_string(),
                 global: true,
             },
             selectors: Vec::new(),
@@ -1768,6 +1826,7 @@ fn operation_selector_matches(
     base_path: &str,
 ) -> bool {
     match selector {
+        OperationSelector::OperationId(id) => op.id == *id,
         OperationSelector::PathPrefix(prefix) => {
             op.path.starts_with(prefix)
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
@@ -1784,6 +1843,831 @@ fn operation_selector_matches(
             .iter()
             .all(|selector| operation_selector_matches(selector, op, base_path)),
     }
+}
+
+/// Configure generated SDK runtime defaults.
+#[derive(Debug, Clone)]
+pub struct ConfigureSdkRuntime {
+    policy: RuntimePolicy,
+}
+
+impl ConfigureSdkRuntime {
+    /// Create a no-op SDK runtime policy builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            policy: RuntimePolicy::default(),
+        }
+    }
+
+    /// Set the client-level default timeout in milliseconds.
+    #[must_use]
+    pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.policy.default_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Set the client-level default max retry count.
+    #[must_use]
+    pub fn max_retries(mut self, max_retries: u8) -> Self {
+        self.policy.max_retries = max_retries;
+        if max_retries > 0 && self.policy.retry_statuses.is_empty() {
+            self.policy.retry_statuses = vec![408, 429];
+        }
+        self
+    }
+
+    /// Override exact retryable status codes. Generated runtimes also treat every `5xx` status as
+    /// retryable when retries are enabled.
+    #[must_use]
+    pub fn retry_statuses<I>(mut self, statuses: I) -> Self
+    where
+        I: IntoIterator<Item = u16>,
+    {
+        self.policy.retry_statuses = statuses.into_iter().collect();
+        self
+    }
+
+    /// Allow generated runtimes to retry unsafe methods without per-operation idempotency metadata.
+    #[must_use]
+    pub const fn retry_unsafe_methods(mut self, enabled: bool) -> Self {
+        self.policy.retry_unsafe_methods = enabled;
+        self
+    }
+
+    /// Enable generated request hooks.
+    #[must_use]
+    pub fn request_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Request);
+        self
+    }
+
+    /// Enable generated response hooks.
+    #[must_use]
+    pub fn response_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Response);
+        self
+    }
+
+    /// Enable generated error hooks.
+    #[must_use]
+    pub fn error_hooks(mut self) -> Self {
+        self.policy.hooks.push(RuntimeHookKind::Error);
+        self
+    }
+}
+
+impl Default for ConfigureSdkRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transform for ConfigureSdkRuntime {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        let mut policy = self.policy.clone();
+        policy.retry_statuses.sort_unstable();
+        policy.retry_statuses.dedup();
+        for status in &policy.retry_statuses {
+            if *status < 400 || *status > 599 {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "SDK runtime retry status {status} is invalid; expected an HTTP 4xx/5xx status"
+                    ),
+                });
+            }
+        }
+        policy.hooks.sort_by_key(|hook| match hook {
+            RuntimeHookKind::Request => 0_u8,
+            RuntimeHookKind::Response => 1,
+            RuntimeHookKind::Error => 2,
+        });
+        policy.hooks.dedup();
+        ir.runtime = policy;
+        Ok(())
+    }
+}
+
+/// Mark matched operations as explicitly idempotent for generated SDK retry policy.
+#[derive(Debug, Clone)]
+pub struct MarkIdempotent {
+    selector: OperationSelector,
+    idempotency_key_header: Option<String>,
+}
+
+impl MarkIdempotent {
+    /// Mark one operation id as idempotent.
+    #[must_use]
+    pub fn operation(id: impl Into<String>) -> Self {
+        Self {
+            selector: OperationSelector::operation(id),
+            idempotency_key_header: Some("Idempotency-Key".to_string()),
+        }
+    }
+
+    /// Mark operations matched by `selector` as idempotent.
+    #[must_use]
+    pub fn when(selector: OperationSelector) -> Self {
+        Self {
+            selector,
+            idempotency_key_header: Some("Idempotency-Key".to_string()),
+        }
+    }
+
+    /// Set the header generated clients use for consumer-supplied idempotency keys.
+    #[must_use]
+    pub fn idempotency_key_header(mut self, header: impl Into<String>) -> Self {
+        self.idempotency_key_header = Some(header.into());
+        self
+    }
+}
+
+impl Transform for MarkIdempotent {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if self
+            .idempotency_key_header
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(CoreError::Config {
+                message: "idempotency key header must not be empty".to_string(),
+            });
+        }
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.operation_runtime.clone();
+        for op in &ir.operations {
+            if operation_selector_matches(&self.selector, op, &base_path) {
+                matched += 1;
+                upsert_operation_runtime(
+                    &mut policies,
+                    OperationRuntimePolicy {
+                        operation_id: op.id.clone(),
+                        idempotent: true,
+                        idempotency_key_header: self.idempotency_key_header.clone(),
+                    },
+                );
+            }
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "idempotency policy did not match any operations".to_string(),
+            });
+        }
+        ir.operation_runtime = policies;
+        Ok(())
+    }
+}
+
+/// Configure generated SDK pagination helpers for matched operations.
+#[derive(Debug, Clone)]
+pub struct ConfigurePagination {
+    selector: OperationSelector,
+    mode: PaginationMode,
+    items_field: String,
+    cursor_param: Option<String>,
+    next_cursor_field: Option<String>,
+    page_param: Option<String>,
+    page_size_param: Option<String>,
+    offset_param: Option<String>,
+    limit_param: Option<String>,
+    termination: PaginationTermination,
+}
+
+impl ConfigurePagination {
+    /// Configure cursor pagination.
+    #[must_use]
+    pub fn cursor(
+        selector: OperationSelector,
+        cursor_param: impl Into<String>,
+        next_cursor_field: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Cursor,
+            items_field: items_field.into(),
+            cursor_param: Some(cursor_param.into()),
+            next_cursor_field: Some(next_cursor_field.into()),
+            page_param: None,
+            page_size_param: None,
+            offset_param: None,
+            limit_param: None,
+            termination: PaginationTermination::NoNextCursor,
+        }
+    }
+
+    /// Configure page-number pagination.
+    #[must_use]
+    pub fn page(
+        selector: OperationSelector,
+        page_param: impl Into<String>,
+        page_size_param: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Page,
+            items_field: items_field.into(),
+            cursor_param: None,
+            next_cursor_field: None,
+            page_param: Some(page_param.into()),
+            page_size_param: Some(page_size_param.into()),
+            offset_param: None,
+            limit_param: None,
+            termination: PaginationTermination::EmptyItems,
+        }
+    }
+
+    /// Configure offset/limit pagination.
+    #[must_use]
+    pub fn offset(
+        selector: OperationSelector,
+        offset_param: impl Into<String>,
+        limit_param: impl Into<String>,
+        items_field: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector,
+            mode: PaginationMode::Offset,
+            items_field: items_field.into(),
+            cursor_param: None,
+            next_cursor_field: None,
+            page_param: None,
+            page_size_param: None,
+            offset_param: Some(offset_param.into()),
+            limit_param: Some(limit_param.into()),
+            termination: PaginationTermination::EmptyItems,
+        }
+    }
+
+    /// Set the optional page-size parameter for cursor pagination.
+    #[must_use]
+    pub fn page_size_param(mut self, page_size_param: impl Into<String>) -> Self {
+        self.page_size_param = Some(page_size_param.into());
+        self
+    }
+
+    /// Terminate generated helpers when the returned items field is empty.
+    #[must_use]
+    pub const fn stop_when_empty_items(mut self) -> Self {
+        self.termination = PaginationTermination::EmptyItems;
+        self
+    }
+}
+
+impl Transform for ConfigurePagination {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        self.validate()?;
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.pagination.clone();
+        for op in &ir.operations {
+            if !operation_selector_matches(&self.selector, op, &base_path) {
+                continue;
+            }
+            self.validate_operation_params(op)?;
+            matched += 1;
+            upsert_pagination(
+                &mut policies,
+                PaginationPolicy {
+                    operation_id: op.id.clone(),
+                    mode: self.mode,
+                    items_field: self.items_field.clone(),
+                    cursor_param: self.cursor_param.clone(),
+                    next_cursor_field: self.next_cursor_field.clone(),
+                    page_param: self.page_param.clone(),
+                    page_size_param: self.page_size_param.clone(),
+                    offset_param: self.offset_param.clone(),
+                    limit_param: self.limit_param.clone(),
+                    termination: self.termination,
+                },
+            );
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "pagination policy did not match any operations".to_string(),
+            });
+        }
+        ir.pagination = policies;
+        Ok(())
+    }
+}
+
+impl ConfigurePagination {
+    fn validate(&self) -> Result<(), CoreError> {
+        let required = match self.mode {
+            PaginationMode::Cursor => [
+                self.cursor_param.as_deref(),
+                self.next_cursor_field.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+            PaginationMode::Page => [
+                self.page_param.as_deref(),
+                self.page_size_param.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+            PaginationMode::Offset => [
+                self.offset_param.as_deref(),
+                self.limit_param.as_deref(),
+                Some(self.items_field.as_str()),
+            ]
+            .into_iter()
+            .collect::<Vec<_>>(),
+        };
+        if required.iter().any(|value| value.is_none_or(str::is_empty)) {
+            return Err(CoreError::Config {
+                message: "pagination policy fields must not be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_operation_params(&self, op: &crate::graph::Operation) -> Result<(), CoreError> {
+        for param in self.required_request_params() {
+            if !op
+                .params
+                .iter()
+                .any(|candidate| candidate.location == "query" && candidate.name == param)
+            {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "pagination policy for operation '{}' references missing query parameter '{}'",
+                        op.id, param
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn required_request_params(&self) -> Vec<&str> {
+        match self.mode {
+            PaginationMode::Cursor => self
+                .cursor_param
+                .iter()
+                .chain(self.page_size_param.iter())
+                .map(String::as_str)
+                .collect(),
+            PaginationMode::Page => self
+                .page_param
+                .iter()
+                .chain(self.page_size_param.iter())
+                .map(String::as_str)
+                .collect(),
+            PaginationMode::Offset => self
+                .offset_param
+                .iter()
+                .chain(self.limit_param.iter())
+                .map(String::as_str)
+                .collect(),
+        }
+    }
+}
+
+/// Configure public operation documentation and documented JSON error responses.
+#[derive(Debug, Clone)]
+pub struct DocumentOperation {
+    selector: OperationSelector,
+    summary: Option<String>,
+    description: Option<String>,
+    deprecated: Option<bool>,
+    tags: Vec<String>,
+    request_examples: Vec<MediaExample>,
+    response_docs: Vec<ResponseDocsPolicy>,
+    error_responses: Vec<DocumentedJsonErrorResponse>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentedJsonErrorResponse {
+    status: u16,
+    schema: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDocumentedJsonErrorResponse {
+    status: u16,
+    schema_ref: String,
+    description: Option<String>,
+}
+
+impl DocumentOperation {
+    /// Document operations matched by `selector`.
+    #[must_use]
+    pub fn when(selector: OperationSelector) -> Self {
+        Self {
+            selector,
+            summary: None,
+            description: None,
+            deprecated: None,
+            tags: Vec::new(),
+            request_examples: Vec::new(),
+            response_docs: Vec::new(),
+            error_responses: Vec::new(),
+        }
+    }
+
+    /// Set a short operation summary.
+    #[must_use]
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Set a longer operation description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Mark the operation deprecated.
+    #[must_use]
+    pub const fn deprecated(mut self) -> Self {
+        self.deprecated = Some(true);
+        self
+    }
+
+    /// Add a public operation tag.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Add public operation tags.
+    #[must_use]
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags.extend(tags.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set a response description for a status.
+    #[must_use]
+    pub fn response_description(mut self, status: u16, description: impl Into<String>) -> Self {
+        self.response_docs.push(ResponseDocsPolicy {
+            status,
+            description: Some(description.into()),
+            examples: Vec::new(),
+        });
+        self
+    }
+
+    /// Add a JSON request example for `application/json`.
+    #[must_use]
+    pub fn request_example_json(
+        self,
+        name: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.request_example(name, "application/json", value)
+    }
+
+    /// Add a text request example for `text/plain`.
+    #[must_use]
+    pub fn request_example_text(self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.request_example(name, "text/plain", serde_json::Value::String(value.into()))
+    }
+
+    /// Add a request example for a specific media type.
+    #[must_use]
+    pub fn request_example(
+        mut self,
+        name: impl Into<String>,
+        content_type: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.request_examples
+            .push(media_example(name, content_type, value));
+        self
+    }
+
+    /// Add a JSON response example for `application/json`.
+    #[must_use]
+    pub fn response_example_json(
+        self,
+        status: u16,
+        name: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.response_example(status, name, "application/json", value)
+    }
+
+    /// Add a text response example for `text/plain`.
+    #[must_use]
+    pub fn response_example_text(
+        self,
+        status: u16,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.response_example(
+            status,
+            name,
+            "text/plain",
+            serde_json::Value::String(value.into()),
+        )
+    }
+
+    /// Add a response example for a specific media type.
+    #[must_use]
+    pub fn response_example(
+        mut self,
+        status: u16,
+        name: impl Into<String>,
+        content_type: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.response_docs.push(ResponseDocsPolicy {
+            status,
+            description: None,
+            examples: vec![media_example(name, content_type, value)],
+        });
+        self
+    }
+
+    /// Add or replace a documented JSON error response on matched operations.
+    #[must_use]
+    pub fn json_error_response(
+        mut self,
+        status: u16,
+        schema: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.error_responses.push(DocumentedJsonErrorResponse {
+            status,
+            schema: schema.into(),
+            description: Some(description.into()),
+        });
+        self
+    }
+}
+
+impl Transform for DocumentOperation {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        self.validate()?;
+        let resolved_errors = self
+            .error_responses
+            .iter()
+            .map(|error| {
+                Ok(ResolvedDocumentedJsonErrorResponse {
+                    status: error.status,
+                    schema_ref: resolve_schema_ref(
+                        ir,
+                        &error.schema,
+                        "documented JSON error response schema",
+                    )?,
+                    description: error.description.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoreError>>()?;
+
+        let base_path = ir.base_path.clone();
+        let mut matched = 0_usize;
+        let mut policies = ir.operation_docs.clone();
+        for index in 0..ir.operations.len() {
+            if !operation_selector_matches(&self.selector, &ir.operations[index], &base_path) {
+                continue;
+            }
+            matched += 1;
+            let operation_id = ir.operations[index].id.clone();
+            apply_documented_error_responses(&mut ir.operations[index], &resolved_errors);
+            let mut policy = policies
+                .iter()
+                .find(|existing| existing.operation_id == operation_id)
+                .cloned()
+                .unwrap_or_else(|| OperationDocsPolicy {
+                    operation_id,
+                    summary: None,
+                    description: None,
+                    deprecated: false,
+                    tags: Vec::new(),
+                    request_examples: Vec::new(),
+                    responses: Vec::new(),
+                });
+            apply_documentation_policy_updates(&mut policy, self, &resolved_errors);
+            upsert_operation_docs(&mut policies, policy);
+        }
+        if matched == 0 {
+            return Err(CoreError::Config {
+                message: "operation documentation policy did not match any operations".to_string(),
+            });
+        }
+        ir.operation_docs = policies;
+        Ok(())
+    }
+}
+
+impl DocumentOperation {
+    fn validate(&self) -> Result<(), CoreError> {
+        validate_optional_metadata_value("operation summary", self.summary.as_deref())?;
+        validate_optional_metadata_value("operation description", self.description.as_deref())?;
+        validate_metadata_values("operation tag", &self.tags)?;
+        for example in &self.request_examples {
+            validate_media_example(example)?;
+        }
+        for response in &self.response_docs {
+            validate_http_status(response.status, "response documentation status")?;
+            validate_optional_metadata_value(
+                "response description",
+                response.description.as_deref(),
+            )?;
+            for example in &response.examples {
+                validate_media_example(example)?;
+            }
+        }
+        for response in &self.error_responses {
+            validate_http_status(response.status, "documented error response status")?;
+            if response.status < 400 {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "documented JSON error response status {} is not a 4xx/5xx status",
+                        response.status
+                    ),
+                });
+            }
+            validate_optional_metadata_value(
+                "documented error response description",
+                response.description.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn media_example(
+    name: impl Into<String>,
+    content_type: impl Into<String>,
+    value: impl Into<serde_json::Value>,
+) -> MediaExample {
+    MediaExample {
+        name: name.into(),
+        content_type: content_type.into(),
+        summary: None,
+        description: None,
+        value: value.into(),
+    }
+}
+
+fn apply_documented_error_responses(
+    op: &mut crate::graph::Operation,
+    responses: &[ResolvedDocumentedJsonErrorResponse],
+) {
+    for response in responses {
+        op.responses
+            .retain(|existing| existing.status != response.status);
+        op.responses.push(Response {
+            status: response.status,
+            body: Some(SchemaRef {
+                ref_id: response.schema_ref.clone(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        });
+        op.responses.sort_by_key(|existing| existing.status);
+    }
+}
+
+fn apply_documentation_policy_updates(
+    policy: &mut OperationDocsPolicy,
+    update: &DocumentOperation,
+    errors: &[ResolvedDocumentedJsonErrorResponse],
+) {
+    if update.summary.is_some() {
+        policy.summary.clone_from(&update.summary);
+    }
+    if update.description.is_some() {
+        policy.description.clone_from(&update.description);
+    }
+    if let Some(deprecated) = update.deprecated {
+        policy.deprecated = deprecated;
+    }
+    policy.tags.extend(update.tags.iter().cloned());
+    policy.tags.sort();
+    policy.tags.dedup();
+    for example in &update.request_examples {
+        upsert_media_example(&mut policy.request_examples, example.clone());
+    }
+    for error in errors {
+        upsert_response_docs(
+            &mut policy.responses,
+            ResponseDocsPolicy {
+                status: error.status,
+                description: error.description.clone(),
+                examples: Vec::new(),
+            },
+        );
+    }
+    for response in &update.response_docs {
+        upsert_response_docs(&mut policy.responses, response.clone());
+    }
+}
+
+fn upsert_operation_docs(policies: &mut Vec<OperationDocsPolicy>, policy: OperationDocsPolicy) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+}
+
+fn upsert_response_docs(responses: &mut Vec<ResponseDocsPolicy>, update: ResponseDocsPolicy) {
+    if let Some(existing) = responses
+        .iter_mut()
+        .find(|existing| existing.status == update.status)
+    {
+        if update.description.is_some() {
+            existing.description = update.description;
+        }
+        for example in update.examples {
+            upsert_media_example(&mut existing.examples, example);
+        }
+    } else {
+        responses.push(update);
+    }
+    responses.sort_by_key(|response| response.status);
+}
+
+fn upsert_media_example(examples: &mut Vec<MediaExample>, example: MediaExample) {
+    if let Some(existing) = examples.iter_mut().find(|existing| {
+        existing.name == example.name
+            && existing
+                .content_type
+                .eq_ignore_ascii_case(&example.content_type)
+    }) {
+        *existing = example;
+    } else {
+        examples.push(example);
+    }
+    examples.sort_by(|a, b| {
+        a.content_type
+            .cmp(&b.content_type)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn validate_media_example(example: &MediaExample) -> Result<(), CoreError> {
+    validate_metadata_value("media example name", &example.name)?;
+    validate_metadata_value("media example content type", &example.content_type)?;
+    validate_optional_metadata_value("media example summary", example.summary.as_deref())?;
+    validate_optional_metadata_value("media example description", example.description.as_deref())
+}
+
+fn validate_optional_metadata_value(field: &str, value: Option<&str>) -> Result<(), CoreError> {
+    if let Some(value) = value {
+        validate_metadata_value(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_http_status(status: u16, field: &str) -> Result<(), CoreError> {
+    if (100..=599).contains(&status) {
+        return Ok(());
+    }
+    Err(CoreError::Config {
+        message: format!("{field} {status} is invalid; expected an HTTP status 100..599"),
+    })
+}
+
+fn upsert_operation_runtime(
+    policies: &mut Vec<OperationRuntimePolicy>,
+    policy: OperationRuntimePolicy,
+) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+}
+
+fn upsert_pagination(policies: &mut Vec<PaginationPolicy>, policy: PaginationPolicy) {
+    if let Some(existing) = policies
+        .iter_mut()
+        .find(|existing| existing.operation_id == policy.operation_id)
+    {
+        *existing = policy;
+    } else {
+        policies.push(policy);
+    }
+    policies.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
 }
 
 fn middleware_symbol_matches(actual: &str, expected: &str) -> bool {
@@ -1872,6 +2756,8 @@ pub struct GroupOperations {
 #[derive(Debug, Clone)]
 enum GroupRule {
     PathPrefix { prefix: String, group: String },
+    SourcePrefix { prefix: String, group: String },
+    ExistingGroup { existing: String, group: String },
     Operation { id: String, group: String },
 }
 
@@ -1887,6 +2773,26 @@ impl GroupOperations {
     pub fn by_path_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
         self.rules.push(GroupRule::PathPrefix {
             prefix: prefix.into(),
+            group: group.into(),
+        });
+        self
+    }
+
+    /// Group operations whose source provenance file starts with `prefix`.
+    #[must_use]
+    pub fn by_source_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::SourcePrefix {
+            prefix: prefix.into(),
+            group: group.into(),
+        });
+        self
+    }
+
+    /// Group operations by a source/imported tag already present on the graph.
+    #[must_use]
+    pub fn by_tag(mut self, tag: impl Into<String>, group: impl Into<String>) -> Self {
+        self.rules.push(GroupRule::ExistingGroup {
+            existing: tag.into(),
             group: group.into(),
         });
         self
@@ -1910,6 +2816,22 @@ impl Transform for GroupOperations {
                 let matched = match rule {
                     GroupRule::PathPrefix { prefix, group } => {
                         if op.path.starts_with(prefix) {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    GroupRule::SourcePrefix { prefix, group } => {
+                        if op.provenance.file.starts_with(prefix) {
+                            op.group = Some(group.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    GroupRule::ExistingGroup { existing, group } => {
+                        if op.group.as_deref() == Some(existing.as_str()) {
                             op.group = Some(group.clone());
                             true
                         } else {
@@ -2704,6 +3626,7 @@ pub struct GoSdk {
     profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: bool,
+    package_info: SdkPackageMetadata,
     error_model: Option<String>,
     required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
     query_time_format: Option<QueryTimeFormat>,
@@ -2726,6 +3649,7 @@ impl GoSdk {
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
             package_metadata: true,
+            package_info: SdkPackageMetadata::default(),
             error_model: None,
             required_pointer_constructor_policy: None,
             query_time_format: None,
@@ -2871,6 +3795,13 @@ impl GoSdk {
         self
     }
 
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        self.package_info = metadata;
+        self
+    }
+
     /// Emit source files only, without docs or package metadata.
     #[must_use]
     pub fn source_only(self) -> Self {
@@ -2949,19 +3880,23 @@ impl Target for GoSdk {
         )?;
         let files = crate::gosdk::generate_files_with_profile_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
             self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Go", &package, ir, &model, &self.docs)?;
+        write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
         if self.package_metadata {
             out.write(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
                 format!("module {}\n\ngo {}\n", self.module, self.go_version),
+            );
+            out.write(
+                format!("{}/PUBLISHING.md", self.dir.trim_end_matches('/')),
+                publishing_recipe("Go", &self.module, &self.package_info)?,
             );
         }
         Ok(())
@@ -2998,6 +3933,8 @@ pub struct PySdk {
     aliases: SdkTypeAliases,
     profile: SdkProfile,
     docs: SdkDocs,
+    package_metadata: bool,
+    package_info: SdkPackageMetadata,
 }
 
 impl PySdk {
@@ -3012,6 +3949,8 @@ impl PySdk {
             aliases: SdkTypeAliases::default(),
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
+            package_metadata: true,
+            package_info: SdkPackageMetadata::default(),
         }
     }
 
@@ -3089,10 +4028,31 @@ impl PySdk {
         self.docs(false)
     }
 
+    /// Enable or disable package metadata files such as `pyproject.toml`.
+    #[must_use]
+    pub const fn package_metadata(mut self, enabled: bool) -> Self {
+        self.package_metadata = enabled;
+        self
+    }
+
+    /// Set the generated Python package version.
+    #[must_use]
+    pub fn package_version(mut self, version: impl Into<String>) -> Self {
+        self.package_info = self.package_info.clone().version(version);
+        self
+    }
+
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        self.package_info = metadata;
+        self
+    }
+
     /// Emit source files only, without generated docs.
     #[must_use]
     pub fn source_only(self) -> Self {
-        self.docs(false)
+        self.docs(false).package_metadata(false)
     }
 
     /// Expose `alias` as an additional type name for a schema id or generated schema name.
@@ -3135,16 +4095,42 @@ impl Target for PySdk {
             &self.aliases,
             &self.profile,
         )?;
-        let files = crate::pysdk::generate_files_with_options(
+        let mut files = crate::pysdk::generate_files_with_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             self.model_style,
             &self.aliases,
         )?;
+        if self.package_metadata {
+            let dist_name = self.package_info.resolved_name(&model.package)?;
+            files.push(super::bundle::SdkFile {
+                name: "pyproject.toml".to_string(),
+                contents: pyproject_toml(
+                    &model.package,
+                    &dist_name,
+                    &self.package_info,
+                    self.model_style,
+                    &files,
+                )?,
+            });
+            files.push(super::bundle::SdkFile {
+                name: "PUBLISHING.md".to_string(),
+                contents: publishing_recipe("Python", &dist_name, &self.package_info)?,
+            });
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Python", &package, ir, &model, &self.docs)?;
+        write_sdk_docs(
+            out,
+            &self.dir,
+            "Python",
+            &model.package,
+            ir,
+            &model,
+            &self.docs,
+        )?;
         Ok(())
     }
 
@@ -3179,6 +4165,7 @@ pub struct TsSdk {
     profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: Option<bool>,
+    package_info: SdkPackageMetadata,
     model_property_policy: Option<TsModelPropertyPolicy>,
     nullable_policy: Option<TsNullablePolicy>,
     response_policy: Option<TsResponsePolicy>,
@@ -3199,6 +4186,7 @@ impl TsSdk {
             profile: SdkProfile::default(),
             docs: SdkDocs::default(),
             package_metadata: None,
+            package_info: SdkPackageMetadata::default(),
             model_property_policy: None,
             nullable_policy: None,
             response_policy: None,
@@ -3272,6 +4260,16 @@ impl TsSdk {
     #[must_use]
     pub const fn package_metadata(mut self, enabled: bool) -> Self {
         self.package_metadata = Some(enabled);
+        self
+    }
+
+    /// Configure generated package metadata and publishing recipe content.
+    #[must_use]
+    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        if self.package_metadata.is_none() {
+            self.package_metadata = Some(true);
+        }
+        self.package_info = metadata;
         self
     }
 
@@ -3405,30 +4403,50 @@ impl Target for TsSdk {
         let options = self.effective_options();
         let mut files = crate::tssdk::generate_files_with_profile_options(
             ir,
-            &package,
-            &ir.base_path,
+            &model.package,
+            &model.base_path,
             &self.layout,
             &self.aliases,
             &self.profile,
             &options,
         )?;
         if self.effective_package_metadata() {
-            if !files.iter().any(|file| file.name == "package.json") {
-                files.push(super::bundle::SdkFile {
-                    name: "package.json".to_string(),
-                    contents: ts_package_json(&package, self.profile.is_typescript_axios_compat()),
-                });
-                files.sort_by(|a, b| a.name.cmp(&b.name));
-            }
+            files.retain(|file| {
+                file.name != "package.json"
+                    && file.name != "PUBLISHING.md"
+                    && file.name != "tsconfig.json"
+            });
+            let package_name = self.package_info.resolved_name(&package)?;
+            files.push(super::bundle::SdkFile {
+                name: "package.json".to_string(),
+                contents: ts_package_json(
+                    &package_name,
+                    &self.package_info,
+                    self.profile.is_typescript_axios_compat(),
+                )?,
+            });
+            files.push(super::bundle::SdkFile {
+                name: "PUBLISHING.md".to_string(),
+                contents: publishing_recipe("TypeScript", &package_name, &self.package_info)?,
+            });
+            files.push(super::bundle::SdkFile {
+                name: "tsconfig.json".to_string(),
+                contents: crate::tssdk::emit_package_tsconfig(),
+            });
+            files.sort_by(|a, b| a.name.cmp(&b.name));
         } else {
-            files.retain(|file| file.name != "package.json");
+            files.retain(|file| {
+                file.name != "package.json"
+                    && file.name != "PUBLISHING.md"
+                    && file.name != "tsconfig.json"
+            });
         }
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(
             out,
             &self.dir,
             "TypeScript",
-            &package,
+            &model.package,
             ir,
             &model,
             &self.docs,
@@ -3446,6 +4464,118 @@ impl Target for TsSdk {
         } else {
             vec![self.dir.trim_end_matches('/').to_string()]
         }
+    }
+}
+
+/// Package-manager metadata shared by generated SDK targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SdkPackageMetadata {
+    registry_name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    repository_url: Option<String>,
+    homepage_url: Option<String>,
+    documentation_url: Option<String>,
+    keywords: Vec<String>,
+}
+
+impl SdkPackageMetadata {
+    /// Empty metadata: targets derive package name from their module/import path and use version
+    /// `0.1.0`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the registry/distribution package name.
+    #[must_use]
+    pub fn registry_name(mut self, name: impl Into<String>) -> Self {
+        self.registry_name = Some(name.into());
+        self
+    }
+
+    /// Alias for [`Self::registry_name`].
+    #[must_use]
+    pub fn name(self, name: impl Into<String>) -> Self {
+        self.registry_name(name)
+    }
+
+    /// Set the package version.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Set a human-readable package description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the SPDX license expression or license label.
+    #[must_use]
+    pub fn license(mut self, license: impl Into<String>) -> Self {
+        self.license = Some(license.into());
+        self
+    }
+
+    /// Set the repository URL.
+    #[must_use]
+    pub fn repository(mut self, url: impl Into<String>) -> Self {
+        self.repository_url = Some(url.into());
+        self
+    }
+
+    /// Set the homepage URL.
+    #[must_use]
+    pub fn homepage(mut self, url: impl Into<String>) -> Self {
+        self.homepage_url = Some(url.into());
+        self
+    }
+
+    /// Set the documentation URL.
+    #[must_use]
+    pub fn documentation(mut self, url: impl Into<String>) -> Self {
+        self.documentation_url = Some(url.into());
+        self
+    }
+
+    /// Add one package keyword.
+    #[must_use]
+    pub fn keyword(mut self, keyword: impl Into<String>) -> Self {
+        self.keywords.push(keyword.into());
+        self
+    }
+
+    /// Replace package keywords.
+    #[must_use]
+    pub fn keywords<I, S>(mut self, keywords: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.keywords = keywords.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn resolved_name(&self, default: &str) -> Result<String, CoreError> {
+        let name = self.registry_name.as_deref().unwrap_or(default);
+        validate_metadata_value("package name", name)?;
+        Ok(name.to_string())
+    }
+
+    fn resolved_version(&self) -> Result<String, CoreError> {
+        let version = self.version.as_deref().unwrap_or("0.1.0");
+        validate_metadata_value("package version", version)?;
+        if version.chars().any(char::is_whitespace) {
+            return Err(CoreError::Config {
+                message: "package version must contain no whitespace".to_string(),
+            });
+        }
+        Ok(version.to_string())
     }
 }
 
@@ -3773,31 +4903,269 @@ fn write_sdk_files(
     Ok(())
 }
 
-fn ts_package_json(package: &str, axios: bool) -> String {
+fn pyproject_toml(
+    import_package: &str,
+    distribution_name: &str,
+    metadata: &SdkPackageMetadata,
+    model_style: PyModelStyle,
+    files: &[super::bundle::SdkFile],
+) -> Result<String, CoreError> {
+    let version = metadata.resolved_version()?;
+    let dependencies = if model_style.is_pydantic() {
+        "\ndependencies = [\"pydantic>=2\"]"
+    } else {
+        "\ndependencies = []"
+    };
+    let packages = pyproject_packages(import_package, files);
+    let package_list = packages
+        .iter()
+        .map(|(name, _dir)| quoted_string_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut package_dirs = String::new();
+    for (name, dir) in &packages {
+        let _ = std::fmt::Write::write_fmt(
+            &mut package_dirs,
+            format_args!(
+                "{} = {}\n",
+                quoted_string_literal(name),
+                quoted_string_literal(dir)
+            ),
+        );
+    }
+    let project_optional = pyproject_optional_metadata(metadata)?;
+    Ok(format!(
+        "[build-system]\n\
+requires = [\"setuptools>=68\", \"wheel\"]\n\
+build-backend = \"setuptools.build_meta\"\n\n\
+[project]\n\
+name = {}\n\
+version = {}\n\
+requires-python = \">=3.9\"{}{}\n\n\
+[tool.setuptools]\n\
+packages = [{}]\n\n\
+[tool.setuptools.package-dir]\n\
+{}",
+        quoted_string_literal(distribution_name),
+        quoted_string_literal(&version),
+        dependencies,
+        project_optional,
+        package_list,
+        package_dirs
+    ))
+}
+
+fn pyproject_packages(package: &str, files: &[super::bundle::SdkFile]) -> Vec<(String, String)> {
+    let mut packages = vec![(package.to_string(), ".".to_string())];
+    for file in files {
+        let Some(dir) = file.name.strip_suffix("/__init__.py") else {
+            continue;
+        };
+        if dir.is_empty() {
+            continue;
+        }
+        let dotted = dir.replace('/', ".");
+        packages.push((format!("{package}.{dotted}"), dir.to_string()));
+    }
+    packages.sort();
+    packages.dedup();
+    packages
+}
+
+fn pyproject_optional_metadata(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    if let Some(description) = &metadata.description {
+        validate_metadata_value("package description", description)?;
+        out.push_str("\ndescription = ");
+        out.push_str(&quoted_string_literal(description));
+    }
+    if let Some(license) = &metadata.license {
+        validate_metadata_value("package license", license)?;
+        out.push_str("\nlicense = { text = ");
+        out.push_str(&quoted_string_literal(license));
+        out.push_str(" }");
+    }
+    if !metadata.keywords.is_empty() {
+        validate_metadata_values("package keyword", &metadata.keywords)?;
+        out.push_str("\nkeywords = [");
+        out.push_str(&quoted_array(&metadata.keywords));
+        out.push(']');
+    }
+    let urls = pyproject_urls(metadata)?;
+    if !urls.is_empty() {
+        out.push_str("\n\n[project.urls]\n");
+        out.push_str(&urls);
+    }
+    Ok(out)
+}
+
+fn pyproject_urls(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    for (label, value) in [
+        ("Repository", &metadata.repository_url),
+        ("Homepage", &metadata.homepage_url),
+        ("Documentation", &metadata.documentation_url),
+    ] {
+        let Some(url) = value else {
+            continue;
+        };
+        validate_metadata_value("package URL", url)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("{label} = {}\n", quoted_string_literal(url)),
+        );
+    }
+    Ok(out)
+}
+
+fn ts_package_json(
+    package: &str,
+    metadata: &SdkPackageMetadata,
+    axios: bool,
+) -> Result<String, CoreError> {
+    let version = metadata.resolved_version()?;
     let dependencies = if axios {
         "\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  },"
     } else {
         ""
     };
-    format!(
+    Ok(format!(
         "{{
   \"name\": {},
-  \"version\": \"0.1.0\",
-  \"type\": \"module\",{}
-  \"main\": \"./index.js\",
-  \"module\": \"./index.js\",
-  \"types\": \"./index.d.ts\",
+  \"version\": {},
+  \"type\": \"commonjs\",{}{}
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
   \"exports\": {{
     \".\": {{
-      \"types\": \"./index.d.ts\",
-      \"import\": \"./index.js\"
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
     }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
   }}
 }}
 ",
         quoted_string_literal(package),
-        dependencies
-    )
+        quoted_string_literal(&version),
+        dependencies,
+        ts_optional_package_fields(metadata)?
+    ))
+}
+
+fn ts_optional_package_fields(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
+    let mut out = String::new();
+    if let Some(description) = &metadata.description {
+        validate_metadata_value("package description", description)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n  \"description\": {},",
+                quoted_string_literal(description)
+            ),
+        );
+    }
+    if let Some(license) = &metadata.license {
+        validate_metadata_value("package license", license)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"license\": {},", quoted_string_literal(license)),
+        );
+    }
+    if let Some(repository) = &metadata.repository_url {
+        validate_metadata_value("package repository", repository)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n  \"repository\": {{ \"type\": \"git\", \"url\": {} }},",
+                quoted_string_literal(repository)
+            ),
+        );
+    }
+    if let Some(homepage) = &metadata.homepage_url {
+        validate_metadata_value("package homepage", homepage)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"homepage\": {},", quoted_string_literal(homepage)),
+        );
+    }
+    if !metadata.keywords.is_empty() {
+        validate_metadata_values("package keyword", &metadata.keywords)?;
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!("\n  \"keywords\": [{}],", quoted_array(&metadata.keywords)),
+        );
+    }
+    Ok(out)
+}
+
+fn publishing_recipe(
+    language: &str,
+    package: &str,
+    metadata: &SdkPackageMetadata,
+) -> Result<String, CoreError> {
+    let version = metadata.resolved_version()?;
+    let mut out = format!(
+        "# Publishing {language} SDK\n\n\
+Package: `{package}`\n\
+Version: `{version}`\n\n\
+`gnr8` never stores registry credentials and never uploads packages. Run these commands in this \
+generated SDK directory after reviewing the generated files.\n\n"
+    );
+    match language {
+        "Go" => out.push_str(
+            "1. `go test ./...`\n\
+2. `go vet ./...`\n\
+3. Tag and publish from your repository using your normal Go module release process.\n",
+        ),
+        "Python" => out.push_str(
+            "1. `python3 -m py_compile *.py`\n\
+2. `python3 -m build`\n\
+3. Upload with your own credentials, for example `python3 -m twine upload dist/*`.\n",
+        ),
+        "TypeScript" => out.push_str(
+            "1. `npm install`\n\
+2. `npm run build`\n\
+3. `npm pack --dry-run`\n\
+4. `npm publish --dry-run`\n\
+5. Publish with your own npm credentials when the dry run matches expectations.\n",
+        ),
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn quoted_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| quoted_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_metadata_values(field: &str, values: &[String]) -> Result<(), CoreError> {
+    for value in values {
+        validate_metadata_value(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_metadata_value(field: &str, value: &str) -> Result<(), CoreError> {
+    if value.trim().is_empty() || value.contains('\n') || value.contains('\r') {
+        return Err(CoreError::Config {
+            message: format!("{field} must be non-empty and stay on one line"),
+        });
+    }
+    Ok(())
 }
 
 fn collect_static_include(
@@ -3905,18 +5273,24 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, Cx, EnumOrder, FastApi, Flask, FormatCommand,
-        GoGin, GoSdk, GroupOperations, Header, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
+        DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
+        Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
-        QueryParam, SdkOperationAliases, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
+        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
-        ApiGraph, Diagnostic, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+        ApiGraph, Diagnostic, Field, Operation, PaginationMode, PaginationTermination, Param, Prim,
+        Response, RuntimeHookKind, Schema, SchemaRef, SourceSpan, Type,
     };
-    use crate::sdk::docs::SdkDocs;
+    use crate::sdk::docs::{write_sdk_docs, SdkDocs};
+    use crate::sdk::layout::SdkFileLayout;
+    use crate::sdk::model::SdkModel;
     use crate::sdk::profile::SdkProfile;
+    use crate::sdk::surface::SdkTypeAliases;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
 
@@ -3929,6 +5303,46 @@ mod tests {
             file: "handlers.go".to_string(),
             start_line: 10,
             end_line: 20,
+        }
+    }
+
+    fn grouped_test_operation(
+        id: &str,
+        method: &str,
+        path: &str,
+        group: Option<&str>,
+        file: &str,
+    ) -> Operation {
+        Operation {
+            id: id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler: id.to_string(),
+            group: group.map(str::to_string),
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: Vec::new(),
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: file.to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }
+    }
+
+    fn query_param(name: &str, required: bool) -> Param {
+        Param {
+            name: name.to_string(),
+            location: "query".to_string(),
+            required,
+            schema: Type::Primitive(Prim::String),
+            default: None,
+            provenance: span(),
         }
     }
 
@@ -4827,7 +6241,7 @@ mod tests {
             .text
             .as_str();
         assert!(
-            operations.contains("var apiErr ErrorResponse"),
+            operations.contains("var decoded ErrorResponse"),
             "Go SDK should decode non-2xx graph responses into ErrorResponse:\n{operations}"
         );
     }
@@ -4912,50 +6326,303 @@ mod tests {
     fn group_operations_overrides_matches_and_preserves_source_groups() {
         let mut ir = ApiGraph {
             operations: vec![
-                Operation {
-                    id: "login".to_string(),
-                    method: "POST".to_string(),
-                    path: "/auth/login".to_string(),
-                    handler: "login".to_string(),
-                    group: Some("auth".to_string()),
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "download".to_string(),
-                    method: "GET".to_string(),
-                    path: "/files/{fileId}".to_string(),
-                    handler: "download".to_string(),
-                    group: Some("files".to_string()),
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
+                grouped_test_operation(
+                    "login",
+                    "POST",
+                    "/auth/login",
+                    Some("auth"),
+                    "app/auth/routes.py",
+                ),
+                grouped_test_operation(
+                    "download",
+                    "GET",
+                    "/files/{fileId}",
+                    Some("files"),
+                    "app/files/routes.py",
+                ),
+                grouped_test_operation(
+                    "createAdmin",
+                    "POST",
+                    "/admin/users",
+                    Some("Admin"),
+                    "app/admin/routes.py",
+                ),
             ],
             ..ApiGraph::default()
         };
 
         GroupOperations::new()
             .by_operation("login", "session")
+            .by_source_prefix("app/files", "downloads")
+            .by_tag("Admin", "backoffice")
             .by_path_prefix("/missing", "unused")
             .apply(&mut ir, &cx())
             .unwrap();
 
         assert_eq!(ir.operations[0].group.as_deref(), Some("session"));
-        assert_eq!(ir.operations[1].group.as_deref(), Some("files"));
+        assert_eq!(ir.operations[1].group.as_deref(), Some("downloads"));
+        assert_eq!(ir.operations[2].group.as_deref(), Some("backoffice"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_runtime_and_pagination_transforms_populate_model_facts() {
+        let mut list =
+            grouped_test_operation("listBooks", "GET", "/books", Some("Books"), "books.py");
+        list.params = vec![query_param("cursor", false), query_param("limit", false)];
+        list.responses = vec![Response {
+            status: 200,
+            body: None,
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        }];
+        let mut create =
+            grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
+        create.responses = vec![Response {
+            status: 201,
+            body: None,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+        }];
+        let mut ir = ApiGraph {
+            operations: vec![create, list],
+            ..ApiGraph::default()
+        };
+
+        ConfigureSdkRuntime::new()
+            .timeout_ms(2_000)
+            .max_retries(3)
+            .request_hooks()
+            .response_hooks()
+            .error_hooks()
+            .apply(&mut ir, &cx())
+            .unwrap();
+        MarkIdempotent::operation("createBook")
+            .idempotency_key_header("X-Idempotency-Key")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ConfigurePagination::cursor(
+            OperationSelector::operation("listBooks"),
+            "cursor",
+            "nextCursor",
+            "items",
+        )
+        .page_size_param("limit")
+        .apply(&mut ir, &cx())
+        .unwrap();
+
+        assert_eq!(ir.runtime.default_timeout_ms, Some(2_000));
+        assert_eq!(ir.runtime.max_retries, 3);
+        assert_eq!(ir.runtime.retry_statuses, vec![408, 429]);
+        assert_eq!(
+            ir.runtime.hooks,
+            vec![
+                RuntimeHookKind::Request,
+                RuntimeHookKind::Response,
+                RuntimeHookKind::Error
+            ]
+        );
+        assert_eq!(ir.operation_runtime[0].operation_id, "createBook");
+        assert!(ir.operation_runtime[0].idempotent);
+        assert_eq!(
+            ir.operation_runtime[0].idempotency_key_header.as_deref(),
+            Some("X-Idempotency-Key")
+        );
+        assert_eq!(ir.pagination[0].operation_id, "listBooks");
+        assert_eq!(ir.pagination[0].mode, PaginationMode::Cursor);
+        assert_eq!(
+            ir.pagination[0].termination,
+            PaginationTermination::NoNextCursor
+        );
+
+        let model = SdkModel::build(
+            &ir,
+            "books",
+            "/",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+        assert_eq!(model.runtime.default_timeout_ms, Some(2_000));
+        assert_eq!(model.runtime.max_retries, 3);
+        assert_eq!(model.runtime.retry_statuses, vec![408, 429]);
+        let create = model
+            .operations
+            .iter()
+            .find(|op| op.id == "createBook")
+            .unwrap();
+        assert!(create.runtime.idempotent);
+        assert_eq!(
+            create.runtime.idempotency_key_header.as_deref(),
+            Some("X-Idempotency-Key")
+        );
+        let list = model
+            .operations
+            .iter()
+            .find(|op| op.id == "listBooks")
+            .unwrap();
+        assert_eq!(
+            list.pagination.as_ref().unwrap().cursor_param.as_deref(),
+            Some("cursor")
+        );
+        assert_eq!(
+            list.pagination.as_ref().unwrap().page_size_param.as_deref(),
+            Some("limit")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn operation_documentation_transform_populates_openapi_and_sdk_docs() {
+        let mut create =
+            grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
+        create.request_body = Some(SchemaRef {
+            ref_id: "app.BookInput".to_string(),
+        });
+        create.responses = vec![Response {
+            status: 201,
+            body: Some(SchemaRef {
+                ref_id: "app.Book".to_string(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: None,
+            content_types: vec!["application/json".to_string()],
+        }];
+        let mut ir = ApiGraph {
+            operations: vec![create],
+            schemas: vec![
+                Schema {
+                    id: "app.ApiError".to_string(),
+                    name: "ApiError".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.Book".to_string(),
+                    name: "Book".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+                Schema {
+                    id: "app.BookInput".to_string(),
+                    name: "BookInput".to_string(),
+                    body: Type::Object(Vec::new()),
+                    enum_source_order: Vec::new(),
+                    provenance: span(),
+                },
+            ],
+            ..ApiGraph::default()
+        };
+
+        DocumentOperation::when(OperationSelector::operation("createBook"))
+            .summary("Create a book")
+            .description("Creates a book from catalog input.")
+            .deprecated()
+            .tags(["Catalog", "Books"])
+            .request_example_json("minimal", serde_json::json!({ "title": "Dune" }))
+            .response_description(201, "Book created")
+            .response_example_json(201, "created", serde_json::json!({ "id": "book_1" }))
+            .json_error_response(422, "ApiError", "Validation failed")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let yaml = crate::lower::to_openapi(&ir, "books", "/", &[]).unwrap();
+        assert!(yaml.contains("summary: Create a book"), "{yaml}");
+        assert!(yaml.contains("deprecated: true"), "{yaml}");
+        assert!(yaml.contains("tags: [Books, Catalog]"), "{yaml}");
+        assert!(yaml.contains("'422':"), "{yaml}");
+        assert!(yaml.contains("description: Validation failed"), "{yaml}");
+        assert!(yaml.contains("examples:"), "{yaml}");
+        assert!(yaml.contains("minimal:"), "{yaml}");
+        assert!(yaml.contains(r#"value: {"title":"Dune"}"#), "{yaml}");
+
+        let model = SdkModel::build(
+            &ir,
+            "books",
+            "/",
+            &SdkFileLayout::compact(),
+            &SdkTypeAliases::default(),
+            &SdkProfile::minimal(),
+        )
+        .unwrap();
+        let docs = model
+            .docs_metadata
+            .operations
+            .iter()
+            .find(|docs| docs.operation_id == "createBook")
+            .unwrap();
+        assert_eq!(docs.summary.as_deref(), Some("Create a book"));
+        assert!(docs.deprecated);
+        assert_eq!(docs.tags, vec!["Books", "Catalog"]);
+
+        let mut out = Artifacts::new();
+        write_sdk_docs(
+            &mut out,
+            "sdk",
+            "Go",
+            "books",
+            &ir,
+            &model,
+            &SdkDocs::both(),
+        )
+        .unwrap();
+        let reference = out
+            .files()
+            .iter()
+            .find(|file| file.path == "sdk/reference.md")
+            .unwrap();
+        assert!(
+            reference.text.contains("Create a book")
+                && reference.text.contains("Validation failed")
+                && reference.text.contains("`minimal` (`application/json`)"),
+            "{}",
+            reference.text
+        );
+        let api_docs = out
+            .files()
+            .iter()
+            .find(|file| file.path == "sdk/docs/BooksApi.md")
+            .unwrap();
+        assert!(
+            api_docs.text.contains("Deprecated: yes")
+                && api_docs.text.contains("Book created")
+                && api_docs.text.contains("ApiError.md"),
+            "{}",
+            api_docs.text
+        );
+    }
+
+    #[test]
+    fn pagination_transform_rejects_missing_query_parameter() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "listBooks",
+                "GET",
+                "/books",
+                Some("Books"),
+                "books.py",
+            )],
+            ..ApiGraph::default()
+        };
+
+        let err = ConfigurePagination::cursor(
+            OperationSelector::operation("listBooks"),
+            "cursor",
+            "nextCursor",
+            "items",
+        )
+        .apply(&mut ir, &cx())
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references missing query parameter 'cursor'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -5684,6 +7351,7 @@ mod tests {
         let target = GoSdk::new()
             .module_path("example.com/bookstore/sdk")
             .go_version("1.26.4")
+            .package(SdkPackageMetadata::new().version("1.2.3"))
             .to("generated/sdk-go");
 
         let mut out = Artifacts::new();
@@ -5698,6 +7366,16 @@ mod tests {
             go_mod.text,
             "module example.com/bookstore/sdk\n\ngo 1.26.4\n"
         );
+        let publishing = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-go/PUBLISHING.md")
+            .expect("GoSdk must emit a publishing recipe with package metadata");
+        assert!(publishing.text.contains("Version: `1.2.3`"));
+        assert!(publishing.text.contains("go test ./..."));
+        assert!(publishing
+            .text
+            .contains("never stores registry credentials"));
     }
 
     #[test]
@@ -5713,6 +7391,7 @@ mod tests {
 
         for path in [
             "generated/sdk-go/go.mod",
+            "generated/sdk-go/PUBLISHING.md",
             "generated/sdk-go/README.md",
             "generated/sdk-go/reference.md",
         ] {
@@ -5865,7 +7544,84 @@ mod tests {
     }
 
     #[test]
-    fn pysdk_source_only_omits_docs() {
+    fn pysdk_target_emits_pyproject_metadata() {
+        let ir = ApiGraph::default();
+        let target = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .package(
+                SdkPackageMetadata::new()
+                    .name("bookstore-sdk")
+                    .version("1.2.3")
+                    .description("Bookstore SDK")
+                    .license("MIT")
+                    .repository("https://example.com/repo.git")
+                    .homepage("https://example.com")
+                    .documentation("https://example.com/docs")
+                    .keywords(["bookstore", "sdk"]),
+            )
+            .to("generated/sdk-py");
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+
+        let pyproject = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-py/pyproject.toml")
+            .expect("PySdk must emit pyproject.toml package metadata");
+        assert!(
+            pyproject.text.contains("[build-system]"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("name = \"bookstore-sdk\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("version = \"1.2.3\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("dependencies = [\"pydantic>=2\"]"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("description = \"Bookstore SDK\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("license = { text = \"MIT\" }"),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject
+                .text
+                .contains("Repository = \"https://example.com/repo.git\""),
+            "{}",
+            pyproject.text
+        );
+        assert!(
+            pyproject.text.contains("\"sdk\" = \".\""),
+            "{}",
+            pyproject.text
+        );
+        let publishing = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-py/PUBLISHING.md")
+            .expect("PySdk must emit a publishing recipe with package metadata");
+        assert!(publishing.text.contains("Package: `bookstore-sdk`"));
+        assert!(publishing.text.contains("python3 -m build"));
+    }
+
+    #[test]
+    fn pysdk_source_only_omits_docs_and_package_metadata() {
         let ir = ApiGraph::default();
         let target = PySdk::new()
             .module("example.com/bookstore/sdk")
@@ -5878,6 +7634,8 @@ mod tests {
         for path in [
             "generated/sdk-py/README.md",
             "generated/sdk-py/reference.md",
+            "generated/sdk-py/pyproject.toml",
+            "generated/sdk-py/PUBLISHING.md",
         ] {
             assert!(
                 !out.files().iter().any(|file| file.path == path),
@@ -5958,6 +7716,29 @@ mod tests {
     }
 
     #[test]
+    fn tssdk_package_configuration_enables_metadata_for_minimal_profile() {
+        let ir = ApiGraph::default();
+        let mut out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .package(SdkPackageMetadata::new().version("2.0.0"))
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+
+        for path in [
+            "generated/sdk-ts/package.json",
+            "generated/sdk-ts/tsconfig.json",
+            "generated/sdk-ts/PUBLISHING.md",
+        ] {
+            assert!(
+                out.files().iter().any(|file| file.path == path),
+                "package configuration should emit {path}"
+            );
+        }
+    }
+
+    #[test]
     fn tssdk_fetch_compat_emits_package_metadata_and_source_only_can_disable_it() {
         let ir = ApiGraph::default();
 
@@ -5966,6 +7747,16 @@ mod tests {
             .module("@example/bookstore-sdk")
             .to("generated/sdk-ts")
             .profile(SdkProfile::typescript_fetch_compat())
+            .package(
+                SdkPackageMetadata::new()
+                    .name("@example/bookstore-sdk")
+                    .version("2.0.0")
+                    .description("Bookstore SDK")
+                    .license("MIT")
+                    .repository("https://example.com/repo.git")
+                    .homepage("https://example.com")
+                    .keywords(["bookstore", "sdk"]),
+            )
             .generate(&ir, &mut compat_out, &cx())
             .unwrap();
         let package_json = compat_out
@@ -5973,7 +7764,36 @@ mod tests {
             .iter()
             .find(|file| file.path == "generated/sdk-ts/package.json")
             .expect("typescript-fetch compat should emit package metadata by default");
-        assert!(package_json.text.contains("\"types\": \"./index.d.ts\""));
+        let parsed_package: serde_json::Value =
+            serde_json::from_str(&package_json.text).expect("package.json must parse as JSON");
+        assert_eq!(parsed_package["name"], "@example/bookstore-sdk");
+        assert!(package_json
+            .text
+            .contains("\"types\": \"./dist/index.d.ts\""));
+        assert!(package_json.text.contains("\"main\": \"./dist/index.js\""));
+        assert!(package_json.text.contains("\"prebuild\":"));
+        assert!(package_json.text.contains("\"prepack\": \"npm run build\""));
+        assert!(package_json.text.contains("\"version\": \"2.0.0\""));
+        assert!(package_json
+            .text
+            .contains("\"description\": \"Bookstore SDK\""));
+        assert!(package_json.text.contains("\"license\": \"MIT\""));
+        assert!(package_json
+            .text
+            .contains("\"keywords\": [\"bookstore\", \"sdk\"]"));
+        let ts_publishing = compat_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/PUBLISHING.md")
+            .expect("TsSdk must emit a publishing recipe with package metadata");
+        assert!(ts_publishing.text.contains("npm pack --dry-run"));
+        assert!(ts_publishing.text.contains("npm run build"));
+        let tsconfig = compat_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/tsconfig.json")
+            .expect("TsSdk package metadata must include a build configuration");
+        assert!(tsconfig.text.contains("\"declaration\": true"));
 
         let mut axios_out = Artifacts::new();
         TsSdk::new()
@@ -6000,6 +7820,8 @@ mod tests {
 
         for path in [
             "generated/sdk-ts/package.json",
+            "generated/sdk-ts/PUBLISHING.md",
+            "generated/sdk-ts/tsconfig.json",
             "generated/sdk-ts/README.md",
             "generated/sdk-ts/reference.md",
         ] {
@@ -6199,7 +8021,7 @@ func (s Server) create(c *gin.Context) {
     fn format_command_rewrites_artifacts_before_host_ownership() {
         let mut out = Artifacts::new();
         out.write("generated/openapi.json", "{\"openapi\":\"3.1.0\"}\n");
-        FormatCommand::new("sh")
+        FormatCommand::new("/bin/sh")
             .args([
                 "-c",
                 "printf '{\"openapi\":\"3.1.0\",\"formatted\":true}\\n' > generated/openapi.json",
@@ -6222,7 +8044,7 @@ func (s Server) create(c *gin.Context) {
     fn format_command_rejects_undeclared_artifacts() {
         let mut out = Artifacts::new();
         out.write("generated/openapi.json", "{}\n");
-        let err = FormatCommand::new("sh")
+        let err = FormatCommand::new("/bin/sh")
             .args([
                 "-c",
                 "mkdir -p generated && printf x > generated/extra.json",

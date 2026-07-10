@@ -19,8 +19,9 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_stem, model_file_name,
-    operation_file_name, operation_group_file_name, operation_group_name, validate_sdk_base_path,
+    api_key_credential_names, check_unique_schema_names, file_stem, http_auth_features,
+    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
+    validate_sdk_base_path,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
@@ -116,7 +117,7 @@ pub(crate) fn generate_files_with_options(
     check_unique_schema_names(graph, "Python SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_headers = api_key_header_names(graph)?;
+    let auth_credentials = api_key_credential_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
@@ -137,12 +138,17 @@ pub(crate) fn generate_files_with_options(
     } else {
         emit::client_referenced_models(graph, &ops)?
     };
+    let http_auth = http_auth_features(graph)?;
     let mut client = emit::emit_client_with_models(
         package,
         &model_module,
         model_style,
-        !auth_headers.is_empty(),
+        !auth_credentials.is_empty(),
+        http_auth.bearer,
+        http_auth.basic,
         &model_refs,
+        &graph.runtime,
+        !split_operations && !graph.pagination.is_empty(),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);
@@ -374,6 +380,14 @@ fn emit_operation_file(
     let mut out = String::from("from __future__ import annotations\n\n");
     out.push_str("import json\n");
     out.push_str("import urllib.parse\n");
+    if ops.iter().any(|op| {
+        graph
+            .pagination
+            .iter()
+            .any(|policy| policy.operation_id == op.id)
+    }) {
+        out.push_str("from collections.abc import Iterator\n");
+    }
     out.push_str("from typing import Any, Optional\n\n");
     let prefix = py_relative_prefix(file_name);
     let _ = writeln!(out, "from {prefix}client import Client");
@@ -393,8 +407,11 @@ fn emit_operation_file(
     out.push_str(&unindent_python_methods(&methods));
     out.push('\n');
     for op in ops {
-        let method = emit::operation_method_name(op);
-        let _ = writeln!(out, "Client.{method} = {method}");
+        let mut methods = vec![emit::operation_method_name(op)];
+        methods.extend(emit::pagination_method_names(graph, op));
+        for method in methods {
+            let _ = writeln!(out, "Client.{method} = {method}");
+        }
     }
     Ok(out)
 }
@@ -653,8 +670,10 @@ mod tests {
     #[test]
     fn generated_client_contains_the_operation_methods_and_models_the_enum() {
         let out = generate(&sample_graph(), "bookstore", "/").unwrap();
-        assert!(out.contains("def create_book(self, body: Book)"), "{out}");
-        assert!(out.contains("def list_books(self, cursor=None)"), "{out}");
+        assert!(out.contains("def create_book("), "{out}");
+        assert!(out.contains("body: Book"), "{out}");
+        assert!(out.contains("def list_books("), "{out}");
+        assert!(out.contains("cursor=None"), "{out}");
         assert!(out.contains("class BookFormat(str, enum.Enum):"), "{out}");
         assert!(out.contains("class Book(BaseModel):"), "{out}");
         assert!(out.contains("from pydantic import BaseModel"), "{out}");

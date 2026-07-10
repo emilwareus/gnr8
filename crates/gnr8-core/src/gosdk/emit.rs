@@ -23,11 +23,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Prim, Schema, Type, WellKnown};
+use crate::graph::{
+    ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Prim,
+    RuntimePolicy, Schema, Type, WellKnown,
+};
 use crate::sdk::emit_common::{
-    check_unique_schema_names, join_path, operation_api_key_headers, operation_api_key_schemes,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, SuccessResponses,
+    check_unique_schema_names, error_response_bodies_of, join_path, operation_api_key_headers,
+    operation_api_key_queries, operation_api_key_schemes, operation_http_auth_schemes, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, ApiKeyLocation, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
 use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
@@ -984,22 +988,58 @@ fn compat_constructor_requires_field(_owner_name: &str, field: &Field) -> bool {
 /// `net/http` + `time` are always needed (the default client carries a `30 * time.Second` timeout). The
 /// doc comment names the SDK by its `package` (derived from config, the single source) rather than a
 /// hard-coded fixture name.
-pub(crate) fn emit_client(package: &str, has_auth: bool) -> String {
-    let api_key_field = if has_auth {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated runtime client is one fixed source block with options, hooks, retry helpers, and transport helpers"
+)]
+pub(crate) fn emit_client(
+    package: &str,
+    has_api_key_auth: bool,
+    has_bearer_auth: bool,
+    has_basic_auth: bool,
+    runtime: &RuntimePolicy,
+) -> String {
+    let api_key_field = if has_api_key_auth {
         "apiKey string\napiKeys map[string]string\n"
     } else {
         ""
     };
-    let api_key_option = if has_auth {
+    let bearer_field = if has_bearer_auth {
+        "bearerToken string\n"
+    } else {
+        ""
+    };
+    let basic_field = if has_basic_auth {
+        "basicUsername string\nbasicPassword string\n"
+    } else {
+        ""
+    };
+    let api_key_option = if has_api_key_auth {
         "\n// WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.\nfunc WithAPIKey(key string) Option {\nreturn func(c *Client) { c.apiKey = key }\n}\n\n// WithAPIKeyHeader sets the API key sent in one specific auth header.\nfunc WithAPIKeyHeader(header, key string) Option {\nreturn func(c *Client) {\nif c.apiKeys == nil {\nc.apiKeys = map[string]string{}\n}\nc.apiKeys[header] = key\n}\n}\n".to_string()
     } else {
         String::new()
     };
-    let api_key_init = if has_auth {
+    let bearer_option = if has_bearer_auth {
+        "\n// WithBearerToken sets the bearer token sent to operations secured by HTTP bearer auth.\nfunc WithBearerToken(token string) Option {\nreturn func(c *Client) { c.bearerToken = token }\n}\n".to_string()
+    } else {
+        String::new()
+    };
+    let basic_option = if has_basic_auth {
+        "\n// WithBasicAuth sets the credentials sent to operations secured by HTTP basic auth.\nfunc WithBasicAuth(username, password string) Option {\nreturn func(c *Client) {\nc.basicUsername = username\nc.basicPassword = password\n}\n}\n".to_string()
+    } else {
+        String::new()
+    };
+    let api_key_init = if has_api_key_auth {
         "apiKeys: map[string]string{},\n"
     } else {
         ""
     };
+    let default_timeout = runtime
+        .default_timeout_ms
+        .map_or_else(|| "30 * time.Second".to_string(), go_duration_ms);
+    let retry_statuses = go_retry_status_map(runtime);
+    let retry_unsafe_methods = runtime.retry_unsafe_methods;
+    let max_retries = runtime.max_retries;
     let body = format!(
         "\
 // Client is the {package} SDK entrypoint. Tag-grouped operation methods hang
@@ -1007,7 +1047,14 @@ pub(crate) fn emit_client(package: &str, has_auth: bool) -> String {
 type Client struct {{
 baseURL string
 httpClient *http.Client
-{api_key_field}}}
+timeout time.Duration
+maxRetries int
+retryStatuses map[int]bool
+retryUnsafeMethods bool
+requestHooks []RequestHook
+responseHooks []ResponseHook
+errorHooks []ErrorHook
+{api_key_field}{bearer_field}{basic_field}}}
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
@@ -1016,14 +1063,100 @@ type Option func(*Client)
 func WithHTTPClient(hc *http.Client) Option {{
 return func(c *Client) {{ c.httpClient = hc }}
 }}
+
+// WithTimeout sets the client-level default request timeout.
+func WithTimeout(timeout time.Duration) Option {{
+return func(c *Client) {{ c.timeout = timeout }}
+}}
+
+// WithMaxRetries sets the client-level default retry count.
+func WithMaxRetries(maxRetries int) Option {{
+return func(c *Client) {{ c.maxRetries = maxRetries }}
+}}
+
+// WithRequestHook installs a hook that runs before each HTTP attempt.
+func WithRequestHook(hook RequestHook) Option {{
+return func(c *Client) {{ c.requestHooks = append(c.requestHooks, hook) }}
+}}
+
+// WithResponseHook installs a hook that runs after each HTTP response.
+func WithResponseHook(hook ResponseHook) Option {{
+return func(c *Client) {{ c.responseHooks = append(c.responseHooks, hook) }}
+}}
+
+// WithErrorHook installs a hook that runs for transport failures and final non-2xx responses.
+func WithErrorHook(hook ErrorHook) Option {{
+return func(c *Client) {{ c.errorHooks = append(c.errorHooks, hook) }}
+}}
+
+// RequestOptions overrides runtime behavior for one operation call.
+type RequestOptions struct {{
+Timeout time.Duration
+MaxRetries *int
+IdempotencyKey string
+Metadata map[string]string
+}}
+
+// RequestOption mutates per-request runtime options.
+type RequestOption func(*RequestOptions)
+
+// WithRequestTimeout overrides the timeout for one operation call.
+func WithRequestTimeout(timeout time.Duration) RequestOption {{
+return func(o *RequestOptions) {{ o.Timeout = timeout }}
+}}
+
+// WithRequestMaxRetries overrides max retries for one operation call.
+func WithRequestMaxRetries(maxRetries int) RequestOption {{
+return func(o *RequestOptions) {{ o.MaxRetries = &maxRetries }}
+}}
+
+// WithIdempotencyKey sets the idempotency key sent by explicitly idempotent operations.
+func WithIdempotencyKey(key string) RequestOption {{
+return func(o *RequestOptions) {{ o.IdempotencyKey = key }}
+}}
+
+// WithRequestMetadata attaches hook-visible metadata to one operation call.
+func WithRequestMetadata(metadata map[string]string) RequestOption {{
+return func(o *RequestOptions) {{ o.Metadata = metadata }}
+}}
+
+// RequestContext describes one generated SDK transport attempt.
+type RequestContext struct {{
+OperationID string
+Method string
+PathTemplate string
+URL string
+Headers http.Header
+RequestMetadata map[string]string
+StatusCode int
+ResponseHeaders http.Header
+}}
+
+type RequestHook func(context.Context, RequestContext, *http.Request) error
+type ResponseHook func(context.Context, RequestContext, *http.Response) error
+type ErrorHook func(context.Context, RequestContext, error)
+
+type runtimeRequestOptions struct {{
+OperationID string
+PathTemplate string
+Idempotent bool
+IdempotencyKeyHeader string
+Options RequestOptions
+}}
 {api_key_option}
+{bearer_option}
+{basic_option}
 
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
 func NewClient(baseURL string, opts ...Option) *Client {{
 c := &Client{{
 baseURL: baseURL,
-httpClient: &http.Client{{Timeout: 30 * time.Second}},
+httpClient: &http.Client{{Timeout: {default_timeout}}},
+timeout: {default_timeout},
+maxRetries: {max_retries},
+retryStatuses: {retry_statuses},
+retryUnsafeMethods: {retry_unsafe_methods},
 {api_key_init}
 }}
 for _, opt := range opts {{
@@ -1031,9 +1164,179 @@ opt(c)
 }}
 return c
 }}
+
+func newRequestOptions(opts ...RequestOption) RequestOptions {{
+var options RequestOptions
+for _, opt := range opts {{
+opt(&options)
+}}
+return options
+}}
+
+func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {{
+timeout := c.timeout
+if runtime.Options.Timeout > 0 {{
+timeout = runtime.Options.Timeout
+}}
+ctx := req.Context()
+var cancel context.CancelFunc
+if timeout > 0 {{
+ctx, cancel = context.WithTimeout(ctx, timeout)
+defer cancel()
+req = req.Clone(ctx)
+}}
+if runtime.Idempotent && runtime.Options.IdempotencyKey != \"\" {{
+header := runtime.IdempotencyKeyHeader
+if header == \"\" {{
+header = \"Idempotency-Key\"
+}}
+req.Header.Set(header, runtime.Options.IdempotencyKey)
+}}
+maxRetries := c.maxRetries
+if runtime.Options.MaxRetries != nil {{
+maxRetries = *runtime.Options.MaxRetries
+}}
+if maxRetries < 0 {{
+maxRetries = 0
+}}
+allowRetries := c.retryUnsafeMethods || runtime.Idempotent || retryableMethod(req.Method)
+if !allowRetries {{
+maxRetries = 0
+}}
+var lastErr error
+for attempt := 0; attempt <= maxRetries; attempt++ {{
+attemptReq, err := cloneRequestForAttempt(req, attempt)
+if err != nil {{
+return nil, err
+}}
+ctx := requestContext(runtime, attemptReq)
+for _, hook := range c.requestHooks {{
+if err := hook(attemptReq.Context(), ctx, attemptReq); err != nil {{
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+}}
+resp, err := c.httpClient.Do(attemptReq)
+if err != nil {{
+lastErr = err
+if attempt < maxRetries {{
+continue
+}}
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+ctx.StatusCode = resp.StatusCode
+ctx.ResponseHeaders = resp.Header.Clone()
+for _, hook := range c.responseHooks {{
+if err := hook(attemptReq.Context(), ctx, resp); err != nil {{
+_ = resp.Body.Close()
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
+}}
+if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {{
+sleepRetryAfter(resp)
+_, _ = io.Copy(io.Discard, resp.Body)
+_ = resp.Body.Close()
+continue
+}}
+if resp.StatusCode < 200 || resp.StatusCode >= 300 {{
+c.callErrorHooks(attemptReq.Context(), ctx, &APIError{{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get(\"X-Request-ID\")}})
+}}
+return resp, nil
+}}
+if lastErr != nil {{
+return nil, lastErr
+}}
+return nil, errors.New(\"request failed without response\")
+}}
+
+func cloneRequestForAttempt(req *http.Request, attempt int) (*http.Request, error) {{
+cloned := req.Clone(req.Context())
+if attempt == 0 || req.Body == nil {{
+return cloned, nil
+}}
+if req.GetBody == nil {{
+return nil, errors.New(\"request body cannot be replayed for retry\")
+}}
+body, err := req.GetBody()
+if err != nil {{
+return nil, err
+}}
+cloned.Body = body
+return cloned, nil
+}}
+
+func requestContext(runtime runtimeRequestOptions, req *http.Request) RequestContext {{
+return RequestContext{{
+OperationID: runtime.OperationID,
+Method: req.Method,
+PathTemplate: runtime.PathTemplate,
+URL: req.URL.String(),
+Headers: req.Header.Clone(),
+RequestMetadata: runtime.Options.Metadata,
+}}
+}}
+
+func (c *Client) callErrorHooks(ctx context.Context, requestContext RequestContext, err error) {{
+for _, hook := range c.errorHooks {{
+hook(ctx, requestContext, err)
+}}
+}}
+
+func retryableMethod(method string) bool {{
+switch method {{
+case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+return true
+default:
+return false
+}}
+}}
+
+func shouldRetryStatus(status int, retryStatuses map[int]bool) bool {{
+return retryStatuses[status] || status >= 500
+}}
+
+func sleepRetryAfter(resp *http.Response) {{
+retryAfter := resp.Header.Get(\"Retry-After\")
+if retryAfter == \"\" {{
+return
+}}
+seconds, err := strconv.Atoi(retryAfter)
+if err != nil || seconds <= 0 {{
+return
+}}
+time.Sleep(time.Duration(seconds) * time.Second)
+}}
 "
     );
-    file(package, &["net/http", "time"], &body)
+    file(
+        package,
+        &["context", "errors", "io", "net/http", "strconv", "time"],
+        &body,
+    )
+}
+
+fn go_duration_ms(timeout_ms: u64) -> String {
+    format!("{timeout_ms} * time.Millisecond")
+}
+
+fn go_retry_status_map(runtime: &RuntimePolicy) -> String {
+    let mut statuses = runtime.retry_statuses.clone();
+    if statuses.is_empty() {
+        statuses.extend([408, 429]);
+    }
+    statuses.sort_unstable();
+    statuses.dedup();
+    if statuses.is_empty() {
+        return "map[int]bool{}".to_string();
+    }
+    let entries = statuses
+        .into_iter()
+        .map(|status| format!("{status}: true"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("map[int]bool{{{entries}}}")
 }
 
 /// Emit language-native compatibility aliases.
@@ -2649,11 +2952,14 @@ fn emit_compat_execute_body(
         writeln!(body, "}}").map_err(sink)?;
     }
     for scheme in operation_api_key_schemes(graph, op)? {
+        if scheme.location != ApiKeyLocation::Header {
+            continue;
+        }
         writeln!(
             body,
             "compatApplyAPIKey(req, r.ctx, {}, {})",
             quoted_string_literal(&scheme.id),
-            quoted_string_literal(&scheme.header)
+            quoted_string_literal(&scheme.name)
         )
         .map_err(sink)?;
     }
@@ -3188,7 +3494,7 @@ fn emit_compat_alias_constructors(
     Ok(())
 }
 
-/// Emit `errors.go`: the typed `APIError` (status + decoded body) + `Error()` + `IsNotFound()`.
+/// Emit `errors.go`: the typed `APIError` (status + headers + raw/decoded body) + helpers.
 ///
 /// The `Error()` string is prefixed with the SDK `package` (derived from config, the single source) so
 /// the message names the actual SDK rather than a hard-coded fixture name.
@@ -3196,9 +3502,14 @@ pub(crate) fn emit_errors(package: &str) -> String {
     let body = format!(
         "\
 // APIError is returned by operation methods on non-2xx responses. It exposes the
-// HTTP status and the decoded error body (message/slug/hints).
+// HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
 type APIError struct {{
 StatusCode int
+Headers http.Header
+RequestID string
+RawBody []byte
+JSONBody any
+Body any
 Message string
 Slug string
 Hints []string
@@ -3214,78 +3525,54 @@ func (e *APIError) IsNotFound() bool {{
 return e.StatusCode == 404
 }}
 
-func apiErrorStringValue(v any) string {{
+func apiErrorObject(body any) map[string]any {{
+object, ok := body.(map[string]any)
+if !ok {{
+return nil
+}}
+return object
+}}
+
+func apiErrorStringField(body any, key string) string {{
+object := apiErrorObject(body)
+if object == nil {{
+return \"\"
+}}
+v := object[key]
 switch value := v.(type) {{
 case string:
 return value
-case *string:
-if value == nil {{
-return \"\"
-}}
-return *value
 default:
 return \"\"
 }}
 }}
 
-func apiErrorStringSliceValue(v any) []string {{
+func apiErrorStringSliceField(body any, key string) []string {{
+object := apiErrorObject(body)
+if object == nil {{
+return nil
+}}
+v := object[key]
 switch value := v.(type) {{
 case []string:
 return value
-case *[]string:
-if value == nil {{
-return nil
+case []any:
+out := make([]string, 0, len(value))
+for _, item := range value {{
+text, ok := item.(string)
+if !ok {{
+continue
 }}
-return *value
+out = append(out, text)
+}}
+return out
 default:
 return nil
 }}
 }}
 "
     );
-    file(package, &["fmt"], &body)
-}
-
-/// The fields of the typed `APIError` envelope the non-2xx branch can populate from a decoded
-/// error body. Each maps a Go field on `APIError` to the json field name the error model must carry
-/// for that assignment to be emitted (so the SDK only ever reads a field the resolved struct has).
-const API_ERROR_FIELDS: &[(&str, &str)] =
-    &[("Message", "message"), ("Slug", "slug"), ("Hints", "hints")];
-
-/// Resolve the per-operation error model (the lowest-status non-2xx response body) from the graph.
-///
-/// Mirrors the success-response resolver for the error side (CR-01): rather than hard-coding a Go type literally
-/// named `HttpError`, the non-2xx branch decodes into whatever type the graph's error response
-/// actually references. An operation with no typed non-2xx body yields `None`, and the caller
-/// decodes into a generator-owned anonymous struct instead so the SDK never references a type the
-/// graph does not define.
-///
-/// # Errors
-///
-/// Returns [`CoreError::SdkGen`] if the error response body `$ref` is dangling.
-fn error_model_of<'g>(
-    op: &Operation,
-    graph: &'g ApiGraph,
-) -> Result<Option<&'g Schema>, CoreError> {
-    for resp in &op.responses {
-        if !(200..300).contains(&resp.status) {
-            let Some(body) = &resp.body else {
-                continue;
-            };
-            let model = graph
-                .schemas
-                .iter()
-                .find(|s| s.id == body.ref_id)
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "operation '{}' error response references dangling $ref '{}'",
-                        op.id, body.ref_id
-                    ),
-                })?;
-            return Ok(Some(model));
-        }
-    }
-    Ok(None)
+    file(package, &["fmt", "net/http"], &body)
 }
 
 /// Emit the single `operations.go` resource surface: ctx-first typed methods on `*Client`.
@@ -3328,6 +3615,7 @@ fn emit_operations_inner(
     include_facades: bool,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
+    let body_encodings = request_body_encodings(ops, graph)?;
     let mut first = true;
     for op in ops {
         if !first {
@@ -3335,13 +3623,50 @@ fn emit_operations_inner(
         }
         first = false;
         emit_operation(&mut body, op, graph, base_path)?;
+        emit_pagination_helpers(&mut body, op, graph)?;
     }
+    emit_request_body_helpers(&mut body, &body_encodings)?;
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
     // need strconv/time. This stays correct when split layout emits one operation per file.
-    let mut imports: Vec<&str> = vec!["context", "encoding/json", "net/http"];
-    if ops.iter().any(|op| op.request_body.is_some()) {
+    let mut imports: Vec<&str> = vec!["context", "encoding/json", "io", "net/http"];
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::Json
+                | RequestBodyEncoding::Multipart
+                | RequestBodyEncoding::Binary
+        )
+    }) {
         imports.push("bytes");
+    }
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::Text | RequestBodyEncoding::FormUrlEncoded
+        )
+    }) {
+        imports.push("strings");
+    }
+    if body_encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Text))
+    {
+        imports.push("fmt");
+    }
+    if body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart
+        )
+    }) {
+        imports.extend(["fmt", "net/url", "reflect", "strings"]);
+    }
+    if body_encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart))
+    {
+        imports.push("mime/multipart");
     }
     let mut needs_io = ops
         .iter()
@@ -3479,6 +3804,8 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let auth_headers = operation_api_key_headers(graph, op)?;
+    let auth_queries = operation_api_key_queries(graph, op)?;
+    let auth_http = operation_http_auth_schemes(graph, op)?;
     // The return type is the success model when one exists, else an empty struct.
     let return_model = if success.has_binary_body() {
         "[]byte".to_string()
@@ -3505,6 +3832,7 @@ fn emit_operation(
             args.push(format!("in *{}", body_model.model));
         }
     }
+    args.push("opts ...RequestOption".to_string());
 
     writeln!(
         body,
@@ -3533,9 +3861,473 @@ fn emit_operation(
         &query_params,
         &success,
         &auth_headers,
+        &auth_queries,
+        &auth_http,
     )?;
     if !dispatch_returns {
         writeln!(body, "return out, nil").map_err(sink)?;
+    }
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+struct GoPaginationInfo {
+    page_type: String,
+    item_type: String,
+    items_field: String,
+    next_cursor_field: Option<String>,
+}
+
+fn emit_pagination_helpers(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    let Some(policy) = pagination_policy_for(graph, op) else {
+        return Ok(());
+    };
+    let method_name = exported(&op.handler);
+    let pages_name = format!("{method_name}Pages");
+    let items_name = format!("Iterate{method_name}");
+    let info = go_pagination_info(graph, op, policy)?;
+    let PaginationArgs { args, call_args } = go_pagination_args(op, graph)?;
+
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "// {pages_name} follows the configured pagination policy for {method_name}."
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "func (c *Client) {pages_name}({}) ([]{}, error) {{",
+        args.join(", "),
+        info.page_type
+    )
+    .map_err(sink)?;
+    writeln!(body, "var pages []{}", info.page_type).map_err(sink)?;
+    emit_go_pagination_initialization(body, op, policy)?;
+    writeln!(body, "for {{").map_err(sink)?;
+    writeln!(
+        body,
+        "page, err := c.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    writeln!(body, "return nil, err").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "break").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "pages = append(pages, page)").map_err(sink)?;
+    emit_go_pagination_advance(body, op, policy, &info, "break")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "return pages, nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let mut iter_args = args.clone();
+    let opts = iter_args.pop().ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination helper for operation '{}' has no opts argument",
+            op.id
+        ),
+    })?;
+    iter_args.push(format!("yield func({}) bool", info.item_type));
+    iter_args.push(opts);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "// {items_name} visits every item from {pages_name} until yield returns false."
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "func (c *Client) {items_name}({}) error {{",
+        iter_args.join(", ")
+    )
+    .map_err(sink)?;
+    emit_go_pagination_initialization(body, op, policy)?;
+    writeln!(body, "for {{").map_err(sink)?;
+    writeln!(
+        body,
+        "page, err := c.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    writeln!(body, "return err").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "return nil").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
+    writeln!(body, "if !yield(item) {{").map_err(sink)?;
+    writeln!(body, "return nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    emit_go_pagination_advance(body, op, policy, &info, "return nil")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_go_pagination_advance(
+    body: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+    info: &GoPaginationInfo,
+    terminate: &str,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {
+            let cursor_param = policy
+                .cursor_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without cursor_param",
+                        op.id
+                    ),
+                })?;
+            let next_field = info.next_cursor_field.as_deref().ok_or_else(|| {
+                CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is cursor mode without next_cursor_field",
+                        op.id
+                    ),
+                }
+            })?;
+            let param = go_query_param(op, cursor_param)?;
+            let param_field = exported(&param.name);
+            writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
+            writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
+            writeln!(body, "{terminate}").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            if param.required {
+                writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
+            } else {
+                writeln!(body, "params.{param_field} = &nextCursor").map_err(sink)?;
+            }
+        }
+        PaginationMode::Page => {
+            let page_param = policy
+                .page_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is page mode without page_param",
+                        op.id
+                    ),
+                })?;
+            let param = go_query_param(op, page_param)?;
+            let field = exported(&param.name);
+            if param.required {
+                writeln!(body, "params.{field} += 1").map_err(sink)?;
+            } else {
+                writeln!(body, "*params.{field} += 1").map_err(sink)?;
+            }
+        }
+        PaginationMode::Offset => {
+            let offset_param = policy
+                .offset_param
+                .as_deref()
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "pagination policy for operation '{}' is offset mode without offset_param",
+                        op.id
+                    ),
+                })?;
+            let param = go_query_param(op, offset_param)?;
+            let field = exported(&param.name);
+            writeln!(body, "itemCount := int64(len(page.{}))", info.items_field).map_err(sink)?;
+            if param.required {
+                writeln!(body, "params.{field} += itemCount").map_err(sink)?;
+            } else {
+                writeln!(body, "*params.{field} += itemCount").map_err(sink)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_go_pagination_initialization(
+    body: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    match policy.mode {
+        PaginationMode::Cursor => {}
+        PaginationMode::Page => {
+            let Some(page_param) = policy.page_param.as_deref() else {
+                return Ok(());
+            };
+            if go_query_param(op, page_param)?.required {
+                return Ok(());
+            }
+            let field = exported(page_param);
+            writeln!(body, "if params.{field} == nil {{").map_err(sink)?;
+            writeln!(body, "initialPage := int64(1)").map_err(sink)?;
+            writeln!(body, "params.{field} = &initialPage").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        PaginationMode::Offset => {
+            let Some(offset_param) = policy.offset_param.as_deref() else {
+                return Ok(());
+            };
+            if go_query_param(op, offset_param)?.required {
+                return Ok(());
+            }
+            let field = exported(offset_param);
+            writeln!(body, "if params.{field} == nil {{").map_err(sink)?;
+            writeln!(body, "initialOffset := int64(0)").map_err(sink)?;
+            writeln!(body, "params.{field} = &initialOffset").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+struct PaginationArgs {
+    args: Vec<String>,
+    call_args: Vec<String>,
+}
+
+fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs, CoreError> {
+    let method_name = exported(&op.handler);
+    let path_params: Vec<&str> = op
+        .params
+        .iter()
+        .filter(|p| p.location == "path")
+        .map(|p| p.name.as_str())
+        .collect();
+    let query_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location == "query").collect();
+    let body_model = request_body_model_of(op, graph)?;
+
+    let mut args = vec!["ctx context.Context".to_string()];
+    let mut call_args = vec!["ctx".to_string()];
+    for p in &path_params {
+        let ident = lower_camel(p);
+        args.push(format!("{ident} string"));
+        call_args.push(ident);
+    }
+    if !query_params.is_empty() {
+        args.push(format!("params {method_name}Params"));
+        call_args.push("params".to_string());
+    }
+    if let Some(body_model) = &body_model {
+        if body_model.required {
+            args.push(format!("in {}", body_model.model));
+        } else {
+            args.push(format!("in *{}", body_model.model));
+        }
+        call_args.push("in".to_string());
+    }
+    args.push("opts ...RequestOption".to_string());
+    call_args.push("opts...".to_string());
+    Ok(PaginationArgs { args, call_args })
+}
+
+fn go_pagination_info(
+    graph: &ApiGraph,
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<GoPaginationInfo, CoreError> {
+    validate_go_pagination_params(op, policy)?;
+    let success = success_responses_of(op, graph)?;
+    let page_type = success.body_model.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' requires a JSON success response model",
+            op.id
+        ),
+    })?;
+    let schema = graph
+        .schemas
+        .iter()
+        .find(|schema| schema.name == page_type)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response model '{}'",
+                op.id, page_type
+            ),
+        })?;
+    let Type::Object(fields) = &schema.body else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' requires object response model '{}'",
+                op.id, page_type
+            ),
+        });
+    };
+    let options = GoEmitOptions::default();
+    let items = fields
+        .iter()
+        .find(|field| field.json_name == policy.items_field)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing response items field '{}'",
+                op.id, policy.items_field
+            ),
+        })?;
+    let Type::Array(item_schema) = &items.schema else {
+        return Err(CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' response items field '{}' is not an array",
+                op.id, policy.items_field
+            ),
+        });
+    };
+    let next_cursor_field = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+        let field = fields
+            .iter()
+            .find(|field| field.json_name == next_cursor)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing next cursor field '{}'",
+                    op.id, next_cursor
+                ),
+            })?;
+        Some(go_field_name(&field.json_name, &options))
+    } else {
+        None
+    };
+    Ok(GoPaginationInfo {
+        page_type,
+        item_type: go_type(item_schema, false, graph)?,
+        items_field: go_field_name(&items.json_name, &options),
+        next_cursor_field,
+    })
+}
+
+fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
+    graph
+        .pagination
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+}
+
+fn go_query_param<'a>(
+    op: &'a Operation,
+    param_name: &str,
+) -> Result<&'a crate::graph::Param, CoreError> {
+    op.params
+        .iter()
+        .find(|param| param.location == "query" && param.name == param_name)
+        .ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "pagination policy for operation '{}' references missing query parameter '{}'",
+                op.id, param_name
+            ),
+        })
+}
+
+fn validate_go_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = go_query_param(op, param_name)?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn emit_required_request_body(
+    body: &mut String,
+    encoding: RequestBodyEncoding,
+) -> Result<(), CoreError> {
+    match encoding {
+        RequestBodyEncoding::Json => {
+            writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody := bytes.NewReader(payload)").map_err(sink)?;
+        }
+        RequestBodyEncoding::Text => {
+            writeln!(body, "reqBody := strings.NewReader(fmt.Sprint(in))").map_err(sink)?;
+        }
+        RequestBodyEncoding::FormUrlEncoded => {
+            writeln!(body, "reqBody, err := encodeFormBody(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Multipart => {
+            writeln!(
+                body,
+                "reqBody, reqContentType, err := encodeMultipartBody(in)"
+            )
+            .map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Binary => {
+            writeln!(body, "reqBody := bytes.NewReader([]byte(in))").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_optional_request_body(
+    body: &mut String,
+    encoding: RequestBodyEncoding,
+) -> Result<(), CoreError> {
+    writeln!(body, "var reqBody io.Reader").map_err(sink)?;
+    if encoding == RequestBodyEncoding::Multipart {
+        writeln!(body, "var reqContentType string").map_err(sink)?;
+    }
+    writeln!(body, "if in != nil {{").map_err(sink)?;
+    match encoding {
+        RequestBodyEncoding::Json => {
+            writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
+        }
+        RequestBodyEncoding::Text => {
+            writeln!(body, "reqBody = strings.NewReader(fmt.Sprint(*in))").map_err(sink)?;
+        }
+        RequestBodyEncoding::FormUrlEncoded => {
+            writeln!(body, "var err error").map_err(sink)?;
+            writeln!(body, "reqBody, err = encodeFormBody(in)").map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+        }
+        RequestBodyEncoding::Multipart => {
+            writeln!(body, "var err error").map_err(sink)?;
+            writeln!(body, "var reader *bytes.Reader").map_err(sink)?;
+            writeln!(
+                body,
+                "reader, reqContentType, err = encodeMultipartBody(in)"
+            )
+            .map_err(sink)?;
+            writeln!(body, "if err != nil {{").map_err(sink)?;
+            writeln!(body, "return out, err").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "reqBody = reader").map_err(sink)?;
+        }
+        RequestBodyEncoding::Binary => {
+            writeln!(body, "reqBody = bytes.NewReader([]byte(*in))").map_err(sink)?;
+        }
     }
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -3555,29 +4347,21 @@ fn emit_request_dispatch(
     query_params: &[&crate::graph::Param],
     success: &SuccessResponses,
     auth_headers: &[String],
+    auth_queries: &[String],
+    auth_http: &[HttpAuthScheme],
 ) -> Result<(), CoreError> {
     let body_model = request_body_model_of(op, graph)?;
     let has_body = body_model.is_some();
-    let has_required_body = body_model.as_ref().is_some_and(|body| body.required);
     let has_decode = success.body_model.is_some();
     let has_binary = success.has_binary_body();
 
     // Body marshalling.
-    if has_required_body {
-        writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
-        writeln!(body, "if err != nil {{").map_err(sink)?;
-        writeln!(body, "return out, err").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
-        writeln!(body, "reqBody := bytes.NewReader(payload)").map_err(sink)?;
-    } else if has_body {
-        writeln!(body, "var reqBody io.Reader").map_err(sink)?;
-        writeln!(body, "if in != nil {{").map_err(sink)?;
-        writeln!(body, "payload, err := json.Marshal(in)").map_err(sink)?;
-        writeln!(body, "if err != nil {{").map_err(sink)?;
-        writeln!(body, "return out, err").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
-        writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
+    if let Some(body_info) = &body_model {
+        if body_info.required {
+            emit_required_request_body(body, body_info.encoding)?;
+        } else {
+            emit_optional_request_body(body, body_info.encoding)?;
+        }
     }
 
     // URL construction: baseURL + absolute path with path params interpolated.
@@ -3594,24 +4378,27 @@ fn emit_request_dispatch(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    if has_required_body {
-        writeln!(
-            body,
-            "req.Header.Set(\"Content-Type\", \"application/json\")"
-        )
-        .map_err(sink)?;
-    } else if has_body {
-        writeln!(body, "if in != nil {{").map_err(sink)?;
-        writeln!(
-            body,
-            "req.Header.Set(\"Content-Type\", \"application/json\")"
-        )
-        .map_err(sink)?;
-        writeln!(body, "}}").map_err(sink)?;
+    if let Some(body_info) = &body_model {
+        let content_type = quoted_string_literal(&body_info.content_type);
+        if body_info.required {
+            if body_info.encoding == RequestBodyEncoding::Multipart {
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+            } else {
+                writeln!(body, "req.Header.Set(\"Content-Type\", {content_type})").map_err(sink)?;
+            }
+        } else {
+            writeln!(body, "if in != nil {{").map_err(sink)?;
+            if body_info.encoding == RequestBodyEncoding::Multipart {
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+            } else {
+                writeln!(body, "req.Header.Set(\"Content-Type\", {content_type})").map_err(sink)?;
+            }
+            writeln!(body, "}}").map_err(sink)?;
+        }
     }
 
     // Query parameter encoding.
-    if !query_params.is_empty() {
+    if !query_params.is_empty() || !auth_queries.is_empty() {
         writeln!(body, "q := req.URL.Query()").map_err(sink)?;
         for p in query_params {
             let field = exported(&p.name);
@@ -3629,6 +4416,18 @@ fn emit_request_dispatch(
                 writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
                 writeln!(body, "}}").map_err(sink)?;
             }
+        }
+        for query in auth_queries {
+            writeln!(
+                body,
+                "if key := c.apiKeys[{}]; key != \"\" {{",
+                quoted_string_literal(query)
+            )
+            .map_err(sink)?;
+            writeln!(body, "q.Set({}, key)", quoted_string_literal(query)).map_err(sink)?;
+            writeln!(body, "}} else if c.apiKey != \"\" {{").map_err(sink)?;
+            writeln!(body, "q.Set({}, c.apiKey)", quoted_string_literal(query)).map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
         }
         writeln!(body, "req.URL.RawQuery = q.Encode()").map_err(sink)?;
     }
@@ -3656,9 +4455,45 @@ fn emit_request_dispatch(
         .map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
+    for scheme in auth_http {
+        match scheme {
+            HttpAuthScheme::Bearer => {
+                writeln!(body, "if c.bearerToken != \"\" {{").map_err(sink)?;
+                writeln!(
+                    body,
+                    "req.Header.Set(\"Authorization\", \"Bearer \"+c.bearerToken)"
+                )
+                .map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+            }
+            HttpAuthScheme::Basic => {
+                writeln!(
+                    body,
+                    "if c.basicUsername != \"\" || c.basicPassword != \"\" {{"
+                )
+                .map_err(sink)?;
+                writeln!(body, "req.SetBasicAuth(c.basicUsername, c.basicPassword)")
+                    .map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+            }
+        }
+    }
 
+    let runtime = go_operation_runtime(graph, op);
+    let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
     // Execute.
-    writeln!(body, "resp, err := c.httpClient.Do(req)").map_err(sink)?;
+    writeln!(body, "resp, err := c.do(req, runtimeRequestOptions{{").map_err(sink)?;
+    writeln!(body, "OperationID: {},", quoted_string_literal(&op.id)).map_err(sink)?;
+    writeln!(body, "PathTemplate: {},", quoted_string_literal(&op.path)).map_err(sink)?;
+    writeln!(body, "Idempotent: {},", runtime.idempotent).map_err(sink)?;
+    writeln!(
+        body,
+        "IdempotencyKeyHeader: {},",
+        quoted_string_literal(idempotency_header)
+    )
+    .map_err(sink)?;
+    writeln!(body, "Options: newRequestOptions(opts...),").map_err(sink)?;
+    writeln!(body, "}})").map_err(sink)?;
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
@@ -3713,6 +4548,28 @@ fn emit_request_dispatch(
     Ok(())
 }
 
+struct GoOperationRuntime<'a> {
+    idempotent: bool,
+    idempotency_key_header: Option<&'a str>,
+}
+
+fn go_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> GoOperationRuntime<'a> {
+    graph
+        .operation_runtime
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+        .map_or(
+            GoOperationRuntime {
+                idempotent: false,
+                idempotency_key_header: None,
+            },
+            |policy| GoOperationRuntime {
+                idempotent: policy.idempotent,
+                idempotency_key_header: policy.idempotency_key_header.as_deref(),
+            },
+        )
+}
+
 fn go_status_match(expr: &str, statuses: &[u16]) -> String {
     statuses
         .iter()
@@ -3721,71 +4578,45 @@ fn go_status_match(expr: &str, statuses: &[u16]) -> String {
         .join(" || ")
 }
 
-/// Emit the non-2xx error-decode block: decode the response body into the operation's error model
-/// (or a generator-owned anonymous struct when none is typed) and return a populated `*APIError`.
-///
-/// CR-01: the error type and the fields copied into `APIError` are derived from the graph's actual
-/// error response schema — never a hard-coded `HttpError`. Only the [`API_ERROR_FIELDS`] entries
-/// whose json field the resolved error struct actually declares are copied, so the SDK never reads a
-/// field the user's type does not provide. When the resolved struct carries none of those fields (or
-/// there is no typed error body), the SDK decodes into a small anonymous struct exposing exactly the
-/// fields `APIError` consumes, so a graph whose error model is shaped differently still compiles.
+/// Emit the non-2xx error-decode block: read raw bytes once, parse generic JSON once, decode any
+/// explicit status error schema, then return a populated `*APIError`.
 fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Result<(), CoreError> {
-    // Which APIError fields the resolved error struct can supply (by its declared json fields). A
-    // named error model's body is a neutral Type::Object; a non-object body declares no usable fields.
-    let error_model = error_model_of(op, graph)?;
-    let usable: Vec<(&str, &str)> = error_model.map_or_else(Vec::new, |model| {
-        let model_fields: &[Field] = match &model.body {
-            Type::Object(fields) => fields,
-            // A non-object error body declares no named fields to copy into APIError.
-            Type::Primitive(_)
-            | Type::WellKnown(_)
-            | Type::Array(_)
-            | Type::Map { .. }
-            | Type::Named(_)
-            | Type::Enum(_)
-            | Type::Union(_)
-            | Type::Any {} => &[],
-        };
-        API_ERROR_FIELDS
-            .iter()
-            .copied()
-            .filter(|(_, json_name)| model_fields.iter().any(|f| f.json_name == *json_name))
-            .collect()
-    });
-
-    if let (Some(model), false) = (error_model, usable.is_empty()) {
-        // The graph's error model is named + carries at least one APIError field: decode into it.
-        writeln!(body, "var apiErr {}", model.name).map_err(sink)?;
-    } else {
-        // No typed error body, or its shape shares no APIError field: decode into a generator-owned
-        // anonymous struct so the SDK never references a user type it cannot rely on (CR-01 fallback).
-        writeln!(body, "var apiErr struct {{").map_err(sink)?;
-        writeln!(body, "Message string `json:\"message\"`").map_err(sink)?;
-        writeln!(body, "Slug string `json:\"slug\"`").map_err(sink)?;
-        writeln!(body, "Hints []string `json:\"hints\"`").map_err(sink)?;
+    let error_bodies = error_response_bodies_of(op, graph)?;
+    writeln!(body, "rawBody, _ := io.ReadAll(resp.Body)").map_err(sink)?;
+    writeln!(body, "var jsonBody any").map_err(sink)?;
+    writeln!(body, "if len(rawBody) > 0 {{").map_err(sink)?;
+    writeln!(body, "_ = json.Unmarshal(rawBody, &jsonBody)").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "var typedBody any").map_err(sink)?;
+    if !error_bodies.is_empty() {
+        writeln!(body, "switch resp.StatusCode {{").map_err(sink)?;
+        for error_body in &error_bodies {
+            writeln!(body, "case {}:", error_body.status).map_err(sink)?;
+            writeln!(body, "var decoded {}", error_body.model).map_err(sink)?;
+            writeln!(body, "if len(rawBody) > 0 {{").map_err(sink)?;
+            writeln!(body, "_ = json.Unmarshal(rawBody, &decoded)").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(body, "typedBody = decoded").map_err(sink)?;
+        }
         writeln!(body, "}}").map_err(sink)?;
     }
-    writeln!(body, "_ = json.NewDecoder(resp.Body).Decode(&apiErr)").map_err(sink)?;
+    writeln!(body, "if typedBody == nil {{").map_err(sink)?;
+    writeln!(body, "typedBody = jsonBody").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "return out, &APIError{{").map_err(sink)?;
     writeln!(body, "StatusCode: resp.StatusCode,").map_err(sink)?;
-    if error_model.is_none() || usable.is_empty() {
-        // Anonymous fallback struct: all three fields are present, copy them all.
-        for (go_field, _) in API_ERROR_FIELDS {
-            writeln!(body, "{go_field}: apiErr.{go_field},").map_err(sink)?;
-        }
-    } else {
-        // Typed error model: copy only the fields it declares (others stay APIError's zero value).
-        for (go_field, json_name) in &usable {
-            let src = exported(json_name);
-            let expr = match *go_field {
-                "Hints" => format!("apiErrorStringSliceValue(apiErr.{src})"),
-                "Message" | "Slug" => format!("apiErrorStringValue(apiErr.{src})"),
-                _ => format!("apiErr.{src}"),
-            };
-            writeln!(body, "{go_field}: {expr},").map_err(sink)?;
-        }
-    }
+    writeln!(body, "Headers: resp.Header.Clone(),").map_err(sink)?;
+    writeln!(body, "RequestID: resp.Header.Get(\"X-Request-ID\"),").map_err(sink)?;
+    writeln!(body, "RawBody: rawBody,").map_err(sink)?;
+    writeln!(body, "JSONBody: jsonBody,").map_err(sink)?;
+    writeln!(body, "Body: typedBody,").map_err(sink)?;
+    writeln!(body, "Message: apiErrorStringField(jsonBody, \"message\"),").map_err(sink)?;
+    writeln!(body, "Slug: apiErrorStringField(jsonBody, \"slug\"),").map_err(sink)?;
+    writeln!(
+        body,
+        "Hints: apiErrorStringSliceField(jsonBody, \"hints\"),"
+    )
+    .map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
@@ -3844,6 +4675,257 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
         }
     }
     Ok(extra.into_iter().collect())
+}
+
+fn request_body_encodings(
+    ops: &[&Operation],
+    graph: &ApiGraph,
+) -> Result<Vec<RequestBodyEncoding>, CoreError> {
+    let mut encodings = Vec::new();
+    for op in ops {
+        if let Some(body) = request_body_model_of(op, graph)? {
+            encodings.push(body.encoding);
+        }
+    }
+    encodings.sort_by_key(|encoding| match encoding {
+        RequestBodyEncoding::Json => 0_u8,
+        RequestBodyEncoding::Text => 1,
+        RequestBodyEncoding::FormUrlEncoded => 2,
+        RequestBodyEncoding::Multipart => 3,
+        RequestBodyEncoding::Binary => 4,
+    });
+    encodings.dedup();
+    Ok(encodings)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "request media helper emission writes fixed Go helper source blocks in one deterministic section"
+)]
+fn emit_request_body_helpers(
+    body: &mut String,
+    encodings: &[RequestBodyEncoding],
+) -> Result<(), CoreError> {
+    let needs_form = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::FormUrlEncoded));
+    let needs_multipart = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart));
+    if !needs_form && !needs_multipart {
+        return Ok(());
+    }
+    if needs_form {
+        writeln!(
+            body,
+            r"
+func encodeFormBody(v any) (*strings.Reader, error) {{
+values := url.Values{{}}
+if err := addFormValues(values, v); err != nil {{
+return nil, err
+}}
+return strings.NewReader(values.Encode()), nil
+}}
+"
+        )
+        .map_err(sink)?;
+    }
+    if needs_multipart {
+        writeln!(
+            body,
+            r#"
+func encodeMultipartBody(v any) (*bytes.Reader, string, error) {{
+var buf bytes.Buffer
+writer := multipart.NewWriter(&buf)
+if err := addMultipartValues(writer, v); err != nil {{
+return nil, "", err
+}}
+if err := writer.Close(); err != nil {{
+return nil, "", err
+}}
+return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
+}}
+"#
+        )
+        .map_err(sink)?;
+    }
+    writeln!(
+        body,
+        r#"
+func addFormValues(values url.Values, value any) error {{
+if value == nil {{
+return nil
+}}
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {{
+if reflected.IsNil() {{
+return nil
+}}
+reflected = reflected.Elem()
+}}
+if reflected.Kind() != reflect.Struct {{
+return fmt.Errorf("form body must be a struct")
+}}
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {{
+field := typ.Field(i)
+if field.PkgPath != "" {{
+continue
+}}
+name, omitempty := formFieldName(field)
+if name == "" || name == "-" {{
+continue
+}}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {{
+continue
+}}
+	addFormField(values, name, fieldValue.Interface())
+	}}
+	return nil
+	}}
+
+	func addFormField(values url.Values, name string, value any) {{
+	v := reflect.ValueOf(value)
+	if !v.IsValid() {{
+	values.Set(name, "")
+	return
+	}}
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+	if v.IsNil() {{
+	return
+	}}
+	v = v.Elem()
+	}}
+	if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {{
+	values.Del(name)
+	for i := 0; i < v.Len(); i++ {{
+	values.Add(name, formValue(v.Index(i).Interface()))
+	}}
+	return
+	}}
+values.Set(name, formValue(value))
+}}
+
+func formFieldName(field reflect.StructField) (string, bool) {{
+tag := field.Tag.Get("form")
+if tag == "" {{
+tag = field.Tag.Get("json")
+}}
+if tag == "-" {{
+return "-", false
+}}
+omitempty := false
+if tag != "" {{
+parts := strings.Split(tag, ",")
+for _, option := range parts[1:] {{
+if option == "omitempty" {{
+omitempty = true
+}}
+}}
+if parts[0] != "" {{
+return parts[0], omitempty
+}}
+}}
+return field.Name, omitempty
+}}
+
+func formValue(value any) string {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return ""
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return ""
+}}
+return formValue(v.Elem().Interface())
+}}
+if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {{
+return fmt.Sprint(value)
+}}
+parts := make([]string, 0, v.Len())
+for i := 0; i < v.Len(); i++ {{
+parts = append(parts, formValue(v.Index(i).Interface()))
+}}
+return strings.Join(parts, ",")
+}}
+"#
+    )
+    .map_err(sink)?;
+    if needs_multipart {
+        writeln!(
+            body,
+            r#"
+func addMultipartValues(writer *multipart.Writer, value any) error {{
+if value == nil {{
+return nil
+}}
+reflected := reflect.ValueOf(value)
+for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {{
+if reflected.IsNil() {{
+return nil
+}}
+reflected = reflected.Elem()
+}}
+if reflected.Kind() != reflect.Struct {{
+return fmt.Errorf("multipart body must be a struct")
+}}
+typ := reflected.Type()
+for i := 0; i < reflected.NumField(); i++ {{
+field := typ.Field(i)
+if field.PkgPath != "" {{
+continue
+}}
+name, omitempty := formFieldName(field)
+if name == "" || name == "-" {{
+continue
+}}
+fieldValue := reflected.Field(i)
+if omitempty && fieldValue.IsZero() {{
+continue
+}}
+if err := writeMultipartField(writer, name, fieldValue.Interface()); err != nil {{
+return err
+}}
+}}
+return nil
+}}
+
+func writeMultipartField(writer *multipart.Writer, name string, value any) error {{
+v := reflect.ValueOf(value)
+if !v.IsValid() {{
+return writer.WriteField(name, "")
+}}
+if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {{
+if v.IsNil() {{
+return nil
+}}
+return writeMultipartField(writer, name, v.Elem().Interface())
+}}
+	if v.Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {{
+	part, err := writer.CreateFormFile(name, name)
+	if err != nil {{
+	return err
+	}}
+	_, err = part.Write(v.Bytes())
+	return err
+	}}
+	if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {{
+	for i := 0; i < v.Len(); i++ {{
+	if err := writeMultipartField(writer, name, v.Index(i).Interface()); err != nil {{
+	return err
+	}}
+	}}
+	return nil
+	}}
+	return writer.WriteField(name, formValue(value))
+	}}
+"#
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
 }
 
 /// Emit the `url :=` line, interpolating path params via `fmt.Sprintf` when the path is templated.
@@ -4532,7 +5614,7 @@ mod tests {
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
                 out.contains(
-                    "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput) (CommandMessage, error)"
+                    "func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput, opts ...RequestOption) (CommandMessage, error)"
                 ),
                 "ctx must be first, body typed, return the 201 model:\n{out}"
             );
@@ -4558,7 +5640,7 @@ mod tests {
             );
             assert!(
                 out.contains(
-                    "func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) (GoalResponse, error)"
+                    "func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...RequestOption) (GoalResponse, error)"
                 ),
                 "{out}"
             );
@@ -4584,7 +5666,7 @@ mod tests {
                 .collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams) ([]byte, error)"),
+                out.contains("func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...RequestOption) ([]byte, error)"),
                 "binary success should return raw bytes:\n{out}"
             );
             assert!(out.contains("data, err := io.ReadAll(resp.Body)"), "{out}");
@@ -4613,7 +5695,7 @@ mod tests {
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("func (c *Client) MarkRead(ctx context.Context, in *MarkReadRequest) (struct{}, error)"),
+                out.contains("func (c *Client) MarkRead(ctx context.Context, in *MarkReadRequest, opts ...RequestOption) (struct{}, error)"),
                 "optional bodies must take a pointer input:\n{out}"
             );
             assert!(
@@ -4633,47 +5715,40 @@ mod tests {
         #[test]
         fn error_decode_uses_the_graphs_error_model_name_not_a_hardcoded_httperror() {
             // CR-01 generality: a graph whose error response model is named `ApiError` (NOT
-            // `HttpError`) must emit `var apiErr ApiError`, referencing the type the graph actually
+            // `HttpError`) must decode into `ApiError`, referencing the type the graph actually
             // carries. A hard-coded `HttpError` here would be `undefined` and fail `go build`.
             let graph = super::error_model_graph("ApiError");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("var apiErr ApiError"),
+                out.contains("var decoded ApiError"),
                 "error decode must use the graph's error model name `ApiError`:\n{out}"
             );
             assert!(
-                !out.contains("var apiErr HttpError"),
+                !out.contains("var decoded HttpError"),
                 "error decode must NOT reference a hard-coded `HttpError`:\n{out}"
             );
-            // It still populates the APIError from the resolved struct's fields.
-            assert!(
-                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
-                "{out}"
-            );
-            assert!(
-                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
-                "{out}"
-            );
+            assert!(out.contains("typedBody = decoded"), "{out}");
+            assert!(out.contains("Body: typedBody,"), "{out}");
         }
 
         #[test]
-        fn error_decode_falls_back_to_an_anonymous_struct_when_no_error_response_exists() {
+        fn error_decode_falls_back_to_parsed_json_when_no_error_response_exists() {
             // An operation with no typed non-2xx response has no graph error model; the SDK must NOT
-            // fabricate a dependency on a named type — it decodes into a generator-owned anonymous
-            // struct exposing exactly the fields APIError consumes, so it always compiles.
+            // fabricate a dependency on a named type. It exposes the parsed JSON body as the generic
+            // Body fallback.
             let graph = super::no_error_response_graph();
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
             assert!(
-                out.contains("var apiErr struct {"),
-                "absent error model must decode into an anonymous struct:\n{out}"
+                out.contains("typedBody = jsonBody"),
+                "absent error model must fall back to parsed JSON:\n{out}"
             );
             assert!(
-                !out.contains("var apiErr HttpError"),
+                !out.contains("var decoded HttpError"),
                 "absent error model must not reference any named error type:\n{out}"
             );
-            assert!(out.contains("Message string `json:\"message\"`"), "{out}");
+            assert!(!out.contains("switch resp.StatusCode {"), "{out}");
         }
 
         #[test]
@@ -4867,23 +5942,26 @@ mod tests {
         }
 
         #[test]
-        fn error_decode_only_copies_fields_the_error_model_declares() {
-            // A graph whose error model carries only `message` (no `slug`/`hints`) must copy ONLY
-            // Message — referencing `apiErr.Slug`/`apiErr.Hints` on that struct would not compile.
+        fn error_decode_reads_standard_fields_from_generic_json_body() {
+            // Standard message/slug/hints fields are read from the parsed JSON object, not from the
+            // declared model type, so a narrower error model still compiles.
             let graph = super::error_model_graph("ProblemDetails");
             let ops: Vec<&crate::graph::Operation> = graph.operations.iter().collect();
             let out = emit_operations(&graph, "goalservice", "/goal", &ops).unwrap();
-            // The synthetic error model in error_model_graph declares message + slug only.
             assert!(
-                out.contains("Message: apiErrorStringValue(apiErr.Message),"),
+                out.contains("Message: apiErrorStringField(jsonBody, \"message\"),"),
                 "{out}"
             );
             assert!(
-                out.contains("Slug: apiErrorStringValue(apiErr.Slug),"),
+                out.contains("Slug: apiErrorStringField(jsonBody, \"slug\"),"),
                 "{out}"
             );
             assert!(
-                !out.contains("Hints: apiErr.Hints,"),
+                out.contains("Hints: apiErrorStringSliceField(jsonBody, \"hints\"),"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("apiErr.Hints"),
                 "must not read a `Hints` field the error model does not declare:\n{out}"
             );
         }
@@ -4894,7 +5972,13 @@ mod tests {
 
         #[test]
         fn client_emits_functional_options_constructor() {
-            let out = emit_client("goalservice", false);
+            let out = emit_client(
+                "goalservice",
+                false,
+                false,
+                false,
+                &crate::graph::RuntimePolicy::default(),
+            );
             assert!(
                 out.contains("func NewClient(baseURL string, opts ...Option) *Client"),
                 "{out}"
@@ -4904,9 +5988,23 @@ mod tests {
                 "{out}"
             );
             assert!(!out.contains("func WithAPIKey(key string) Option"), "{out}");
-            let secured = emit_client("goalservice", true);
+            let secured = emit_client(
+                "goalservice",
+                true,
+                true,
+                true,
+                &crate::graph::RuntimePolicy::default(),
+            );
             assert!(
                 secured.contains("func WithAPIKey(key string) Option"),
+                "{secured}"
+            );
+            assert!(
+                secured.contains("func WithBearerToken(token string) Option"),
+                "{secured}"
+            );
+            assert!(
+                secured.contains("func WithBasicAuth(username, password string) Option"),
                 "{secured}"
             );
             // computed imports.
@@ -4919,8 +6017,13 @@ mod tests {
             let out = emit_errors("goalservice");
             assert!(out.contains("type APIError struct"), "{out}");
             assert!(out.contains("StatusCode int"), "{out}");
+            assert!(out.contains("Headers http.Header"), "{out}");
+            assert!(out.contains("RawBody []byte"), "{out}");
+            assert!(out.contains("JSONBody any"), "{out}");
+            assert!(out.contains("Body any"), "{out}");
             assert!(out.contains("func (e *APIError) Error() string"), "{out}");
-            assert!(out.contains("import \"fmt\""), "{out}");
+            assert!(out.contains("\"fmt\""), "{out}");
+            assert!(out.contains("\"net/http\""), "{out}");
         }
     }
 

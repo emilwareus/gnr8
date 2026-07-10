@@ -31,12 +31,13 @@ pub use crate::analyze::facts::{FieldFact as Field, Prim, Type, WellKnown};
 ///
 /// ## Generation metadata (set by transforms, read by targets)
 ///
-/// `base_path`, `title`, and `security` are **not** extracted from the source — they are facts the
-/// typed source cannot express (the mount prefix is often a runtime value; the title is author
-/// metadata; auth lives in middleware, not handler signatures, CLAUDE.md rule 4). They live on the
-/// graph as plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads,
-/// then passes to the existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`] functions.
-/// They default to a root-mounted, untitled, unsecured API so a bare `build_graph` graph still lowers.
+/// `base_path`, `title`, `security`, runtime policy, pagination policy, and documentation policy are
+/// **not** extracted from the source — they are facts the typed source cannot express (the mount prefix
+/// is often a runtime value; the title is author metadata; auth lives in middleware; retry,
+/// pagination, and public docs are product decisions, CLAUDE.md rule 4). They live on the graph as
+/// plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads, then passes
+/// to the existing lowering and SDK emitters. They default to a root-mounted, untitled, unsecured API
+/// with no runtime helpers, so a bare `build_graph` graph still lowers.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiGraph {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
@@ -57,6 +58,18 @@ pub struct ApiGraph {
     /// source of truth for the generated `security` requirement + `components.securitySchemes`
     /// (CLAUDE.md rule 4). Defaults to empty (no security).
     pub security: Vec<SecurityScheme>,
+    /// Generated SDK runtime behavior policy — set by runtime transforms, read by SDK targets.
+    #[serde(default, skip_serializing_if = "RuntimePolicy::is_default")]
+    pub runtime: RuntimePolicy,
+    /// Per-operation generated SDK runtime metadata, keyed by operation id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_runtime: Vec<OperationRuntimePolicy>,
+    /// Explicit generated SDK pagination metadata, keyed by operation id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pagination: Vec<PaginationPolicy>,
+    /// Operation documentation metadata, keyed by operation id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_docs: Vec<OperationDocsPolicy>,
 }
 
 /// The default API base path (`"/"`, a root-mounted service) used when no transform sets one.
@@ -80,8 +93,179 @@ impl Default for ApiGraph {
             base_path: default_base_path(),
             title: default_title(),
             security: Vec::new(),
+            runtime: RuntimePolicy::default(),
+            operation_runtime: Vec::new(),
+            pagination: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
+}
+
+/// Generated SDK runtime behavior configured by code-as-config transforms.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePolicy {
+    /// Default per-request timeout in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_timeout_ms: Option<u64>,
+    /// Default maximum retry count.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_retries: u8,
+    /// Exact retryable status codes. Generated runtimes also treat all `5xx` statuses as retryable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_statuses: Vec<u16>,
+    /// Whether unsafe methods may be retried without per-operation idempotency metadata.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retry_unsafe_methods: bool,
+    /// Runtime hook phases emitted by generated clients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<RuntimeHookKind>,
+}
+
+impl RuntimePolicy {
+    fn is_default(value: &Self) -> bool {
+        value == &Self::default()
+    }
+}
+
+/// Runtime hook phase requested by generated SDK configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHookKind {
+    /// Request hook before transport execution.
+    Request,
+    /// Response hook after an HTTP response is received.
+    Response,
+    /// Error hook for transport failures and non-2xx responses.
+    Error,
+}
+
+/// Per-operation generated SDK runtime metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperationRuntimePolicy {
+    /// Operation id this metadata applies to.
+    pub operation_id: String,
+    /// Whether generated runtimes may retry this operation even if its method is normally unsafe.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub idempotent: bool,
+    /// Header used for a consumer-supplied idempotency key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key_header: Option<String>,
+}
+
+/// Explicit generated SDK pagination metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PaginationPolicy {
+    /// Operation id this pagination policy applies to.
+    pub operation_id: String,
+    /// Pagination shape.
+    pub mode: PaginationMode,
+    /// Response field containing page items.
+    pub items_field: String,
+    /// Request cursor parameter for cursor pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_param: Option<String>,
+    /// Response next-cursor field for cursor pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor_field: Option<String>,
+    /// Request page-number parameter for page pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_param: Option<String>,
+    /// Request page-size parameter for cursor/page pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size_param: Option<String>,
+    /// Request offset parameter for offset pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_param: Option<String>,
+    /// Request limit parameter for offset pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_param: Option<String>,
+    /// Termination rule used by generated helpers.
+    pub termination: PaginationTermination,
+}
+
+/// Pagination shape configured for a generated operation helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaginationMode {
+    /// Cursor token pagination.
+    Cursor,
+    /// Page number pagination.
+    Page,
+    /// Offset/limit pagination.
+    Offset,
+}
+
+/// Pagination helper termination rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaginationTermination {
+    /// Stop when the response next-cursor field is absent, empty, or null.
+    NoNextCursor,
+    /// Stop when the configured items field is empty.
+    EmptyItems,
+}
+
+/// Operation documentation metadata configured by code-as-config transforms.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OperationDocsPolicy {
+    /// Operation id this documentation policy applies to.
+    pub operation_id: String,
+    /// Optional short operation summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional longer operation description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether the operation is deprecated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deprecated: bool,
+    /// Public operation tags. Empty means use the source-derived group tag, if any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Named request examples keyed by media type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_examples: Vec<MediaExample>,
+    /// Response documentation keyed by status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses: Vec<ResponseDocsPolicy>,
+}
+
+/// Response documentation metadata for one status code.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResponseDocsPolicy {
+    /// HTTP status this documentation applies to.
+    pub status: u16,
+    /// Optional response description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Named response examples keyed by media type.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<MediaExample>,
+}
+
+/// One named media example.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaExample {
+    /// Example key under the `OpenAPI` `examples` map.
+    pub name: String,
+    /// Media type this example belongs to.
+    pub content_type: String,
+    /// Optional short example summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional longer example description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON-compatible example value.
+    pub value: serde_json::Value,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a reference to the field value"
+)]
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 /// One declared security scheme — graph-owned generation metadata (CLAUDE.md rule 4).
@@ -340,6 +524,10 @@ impl ApiGraph {
             base_path: default_base_path(),
             title: default_title(),
             security: Vec::new(),
+            runtime: RuntimePolicy::default(),
+            operation_runtime: Vec::new(),
+            pagination: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
 }
@@ -549,7 +737,7 @@ mod tests {
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{ApiGraph, Type};
+    use super::{ApiGraph, RuntimePolicy, Type};
     use crate::analyze::facts::GoFacts;
 
     /// A facts document mirroring real sidecar output: two routes whose operation ids are derived from
@@ -839,10 +1027,16 @@ mod tests {
         assert_eq!(graph.base_path, "/");
         assert_eq!(graph.title, "API");
         assert!(graph.security.is_empty());
+        assert_eq!(graph.runtime, RuntimePolicy::default());
+        assert!(graph.operation_runtime.is_empty());
+        assert!(graph.pagination.is_empty());
         let empty = ApiGraph::default();
         assert_eq!(empty.base_path, "/");
         assert_eq!(empty.title, "API");
         assert!(empty.security.is_empty());
+        assert_eq!(empty.runtime, RuntimePolicy::default());
+        assert!(empty.operation_runtime.is_empty());
+        assert!(empty.pagination.is_empty());
     }
 
     #[test]

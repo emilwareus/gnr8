@@ -1,5 +1,31 @@
 # Milestones
 
+## v3.0 Production-ready SDK adoption (Shipped: 2026-07-09)
+
+**Phases completed:** 5 phases, 13 plans
+
+Full detail: `.planning/milestones/v3.0-ROADMAP.md` · Requirements:
+`.planning/milestones/v3.0-REQUIREMENTS.md` · Audit:
+`.planning/milestones/v3.0-MILESTONE-AUDIT.md`
+
+**Key accomplishments:**
+
+- Introduced a shared SDK semantic planning layer so Go, Python, and TypeScript SDK emitters derive
+  package, service/group, operation, schema, auth, error, runtime policy, docs metadata, and file-plan
+  decisions from the same facts.
+- Added graph-driven auth and typed API errors across OpenAPI and generated SDKs, with runtime smoke
+  coverage for outgoing credentials and decoded declared error responses.
+- Stabilized operation IDs, SDK method names, grouping selectors, `gnr8 compat` facts, `doctor --json`
+  SDK readiness, generated package metadata, local package validation, and publishing recipes.
+- Added production SDK runtime ergonomics: pagination helpers, client/per-request timeouts and retries,
+  safe retry gating, idempotency-key preservation, and request/response/error hooks.
+- Added operation documentation transforms for summaries, descriptions, tags, deprecation, named examples,
+  response descriptions, and documented JSON error responses, propagated into OpenAPI and SDK docs.
+- Added common request media support across generated SDKs for JSON, text, form-urlencoded, multipart, and
+  binary uploads while keeping server stubs and older spec profiles out of scope.
+
+---
+
 ## v2.0 Multi-language: TypeScript & Python (Shipped: 2026-06-26)
 
 **Phases completed:** 6 phases, 19 plans, 43 tasks

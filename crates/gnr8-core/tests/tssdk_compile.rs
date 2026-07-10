@@ -140,6 +140,23 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn run_tsc_project(dir: &Path) -> Result<String, gnr8::CoreError> {
+    let output = Command::new("node")
+        .args([TSC, "--project", "tsconfig.json"])
+        .current_dir(dir)
+        .output()
+        .map_err(|source| gnr8::CoreError::TypeScriptToolchainMissing { source })?;
+    if !output.status.success() {
+        let mut captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        captured.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Err(gnr8::CoreError::GoBuild {
+            code: output.status.code(),
+            stderr: captured,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Materialize the generated SDK into a fresh temp dir as flat `<dir>/client.ts` etc., returning the
 /// dir. Unlike the Python twin (which nests a `bookstore/` package), `tssdk::write_to_dir` writes the
 /// four files FLAT (the bundle's fixed frame names), so there is no package subdir.
@@ -152,6 +169,169 @@ fn materialize_sdk() -> PathBuf {
         .expect("tssdk::generate must succeed");
     let dir = unique_temp_dir("ok");
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("write_to_dir must materialize the SDK");
+    dir
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the media graph is an explicit JSON fixture covering four content types"
+)]
+fn media_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "postText",
+              "method": "POST",
+              "path": "/text",
+              "handler": "postText",
+              "params": [],
+              "request_body": { "ref_id": "dto.TextBody" },
+              "request_body_required": true,
+              "request_body_content_type": "text/plain",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "postForm",
+              "method": "POST",
+              "path": "/form",
+              "handler": "postForm",
+              "params": [],
+              "request_body": { "ref_id": "dto.FormBody" },
+              "request_body_required": true,
+              "request_body_content_type": "application/x-www-form-urlencoded",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "postMultipart",
+              "method": "POST",
+              "path": "/multipart",
+              "handler": "postMultipart",
+              "params": [],
+              "request_body": { "ref_id": "dto.MultipartBody" },
+              "request_body_required": true,
+              "request_body_content_type": "multipart/form-data",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "postBinary",
+              "method": "POST",
+              "path": "/binary",
+              "handler": "postBinary",
+              "params": [],
+              "request_body": { "ref_id": "dto.UploadBytes" },
+              "request_body_required": true,
+              "request_body_content_type": "application/octet-stream",
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "main.ts", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.FormBody",
+              "name": "FormBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "count",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "name",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "tags",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "dto.MultipartBody",
+              "name": "MultipartBody",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "file",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bytes" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "title",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "files",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.TextBody",
+              "name": "TextBody",
+              "body": { "type": "primitive", "of": { "prim": "string" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 3, "end_line": 3 }
+            },
+            {
+              "id": "dto.UploadBytes",
+              "name": "UploadBytes",
+              "body": { "type": "primitive", "of": { "prim": "bytes" } },
+              "enum_source_order": [],
+              "provenance": { "file": "models.ts", "start_line": 4, "end_line": 4 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("media graph json")
+}
+
+fn materialize_media_sdk() -> PathBuf {
+    let graph = media_graph();
+    let bundle = gnr8::tssdk::generate(&graph, PACKAGE, &graph.base_path)
+        .expect("media tssdk::generate must succeed");
+    let dir = unique_temp_dir("media");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
+        .expect("write_to_dir must materialize the media SDK");
     dir
 }
 
@@ -318,6 +498,114 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     assert!(
         result.is_ok(),
         "tsc --noEmit --strict --lib es2022,dom must type-check the generated SDK (exit 0): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_typescript_package_builds_declared_entrypoints() {
+    if !toolchain_available() {
+        eprintln!("skipping TypeScript package build: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_fetch_compat_sdk();
+    let result = run_tsc_project(&dir);
+    assert!(
+        result.is_ok(),
+        "generated npm package must build: {result:?}"
+    );
+
+    let package_text =
+        std::fs::read_to_string(dir.join("package.json")).expect("read package.json");
+    let package: serde_json::Value =
+        serde_json::from_str(&package_text).expect("package.json must parse");
+    for field in ["main", "types"] {
+        let relative = package[field]
+            .as_str()
+            .expect("package entrypoint must be a string")
+            .trim_start_matches("./");
+        assert!(
+            dir.join(relative).is_file(),
+            "package {field} entrypoint must exist after build: {relative}"
+        );
+    }
+
+    let commonjs = Command::new("node")
+        .args([
+            "--eval",
+            "const sdk = require('.'); if (typeof sdk.Configuration !== 'function') process.exit(1);",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run CommonJS package consumer");
+    assert!(
+        commonjs.status.success(),
+        "CommonJS package consumer failed: {}",
+        String::from_utf8_lossy(&commonjs.stderr)
+    );
+
+    let esm = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            "import { Configuration } from 'sdk'; if (typeof Configuration !== 'function') process.exit(1);",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run ESM package consumer");
+    assert!(
+        esm.status.success(),
+        "ESM package consumer failed: {}",
+        String::from_utf8_lossy(&esm.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(
+        dir.parent()
+            .expect("generated fetch SDK should have a temp parent"),
+    );
+}
+
+#[test]
+fn generated_sdk_media_request_bodies_typecheck_with_consumer() {
+    if !toolchain_available() {
+        eprintln!("skipping tssdk_compile media typecheck: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_media_sdk();
+    std::fs::write(
+        dir.join("media_consumer.ts"),
+        r#"
+import { Client } from "./index";
+
+async function smoke(client: Client): Promise<void> {
+  await client.postText("hello");
+	  await client.postForm({ name: "Ada", count: 3, tags: ["sdk", "media"] });
+	  await client.postMultipart({
+	    title: "Report",
+	    file: new Uint8Array([1, 2, 3]),
+	    files: [new Uint8Array([4, 5, 6]), new Uint8Array([7, 8, 9])],
+	  });
+  await client.postBinary(new Uint8Array([1, 2, 3]));
+}
+
+void smoke;
+"#,
+    )
+    .expect("write media consumer");
+
+    let ts_files = collect_ts_files(&dir);
+    let ts_file_refs: Vec<&str> = ts_files.iter().map(String::as_str).collect();
+    let result = run_tsc(&ts_file_refs, &dir);
+    assert!(
+        result.is_ok(),
+        "media SDK and consumer must type-check (text + form + multipart + binary): {result:?}"
+    );
+    let client_src = std::fs::read_to_string(dir.join("client.ts")).expect("read media client.ts");
+    assert!(
+        client_src.contains("if (Array.isArray(value))")
+            && client_src.contains("this._appendMultipartValue(form, key, item);"),
+        "multipart helper must append array values as repeated parts:\n{client_src}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

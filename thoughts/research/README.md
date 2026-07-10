@@ -18,6 +18,7 @@ The current research question:
 - [Go static analysis](go-static-analysis.md)
 - [Speed and incrementality](speed-and-incrementality.md)
 - [Validation plan](validation-plan.md)
+- [Adoption support for code-first SDK publishing](adoption-support.md)
 
 ## Current Position
 

@@ -22,10 +22,11 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_header_names, check_unique_schema_names, file_in_dir, file_stem, join_path,
-    model_file_name, operation_api_key_schemes, operation_file_name, operation_group_file_name,
-    operation_group_name, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, validate_sdk_base_path,
+    api_key_credential_names, check_unique_schema_names, file_in_dir, file_stem,
+    http_auth_features, join_path, model_file_name, operation_api_key_schemes, operation_file_name,
+    operation_group_file_name, operation_group_name, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    validate_sdk_base_path, ApiKeyLocation,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::profile::SdkProfile;
@@ -103,7 +104,7 @@ fn generate_files_with_layout_options(
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
-    let auth_headers = api_key_header_names(graph)?;
+    let auth_credentials = api_key_credential_names(graph)?;
     let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
@@ -112,10 +113,14 @@ fn generate_files_with_layout_options(
     let model_dir = layout.model_dir_ref().unwrap_or("models");
     let split_operations =
         layout.is_split() && !matches!(layout.operation_split(), OperationFileSplit::Compact);
+    let http_auth = http_auth_features(graph)?;
     let mut client = emit::emit_client_with_models(
         package,
         model_dir.trim_matches('/'),
-        !auth_headers.is_empty(),
+        !auth_credentials.is_empty(),
+        http_auth.bearer,
+        http_auth.basic,
+        &graph.runtime,
     );
     if split_operations {
         client.push_str(&emit::emit_split_operation_surface(&ops)?);
@@ -455,21 +460,28 @@ fn operation_file_methods(
         OperationFileSplit::Compact => {}
         OperationFileSplit::PerEndpoint => {
             for op in ops {
+                let mut methods = vec![emit::operation_method_name(op)];
+                methods.extend(emit::pagination_method_names(graph, op));
                 files.push((
                     ts_operation_file_name(layout, op, &format!("api_{}.ts", file_stem(&op.id)))?,
-                    vec![emit::operation_method_name(op)],
+                    methods,
                 ));
             }
         }
         OperationFileSplit::PerTag => {
             for (group, ops) in operation_groups(&ops) {
+                let mut methods = Vec::new();
+                for op in ops {
+                    methods.push(emit::operation_method_name(op));
+                    methods.extend(emit::pagination_method_names(graph, op));
+                }
                 files.push((
                     ts_operation_group_file_name(
                         layout,
                         &group,
                         &format!("api_{}.ts", file_stem(&group)),
                     )?,
-                    ops.into_iter().map(emit::operation_method_name).collect(),
+                    methods,
                 ));
             }
         }
@@ -583,6 +595,10 @@ fn generate_openapi_generator_compat_files(
             name: "package.json".to_string(),
             contents: emit_axios_package_json(package),
         },
+        SdkFile {
+            name: "tsconfig.json".to_string(),
+            contents: emit_package_tsconfig(),
+        },
     ];
     check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -627,6 +643,10 @@ fn generate_typescript_fetch_compat_files(
             name: "package.json".to_string(),
             contents: emit_fetch_package_json(package),
         },
+        SdkFile {
+            name: "tsconfig.json".to_string(),
+            contents: emit_package_tsconfig(),
+        },
     ];
     check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -667,13 +687,52 @@ fn emit_fetch_package_json(package: &str) -> String {
         "{{
   \"name\": {},
   \"version\": \"0.1.0\",
-  \"type\": \"module\",
-  \"main\": \"./index.js\",
-  \"types\": \"./index.d.ts\"
+  \"type\": \"commonjs\",
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
+  \"exports\": {{
+    \".\": {{
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
+    }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
+  }}
 }}
 ",
         quoted_string_literal(package)
     )
+}
+
+pub(crate) fn emit_package_tsconfig() -> String {
+    "\
+{
+  \"compilerOptions\": {
+    \"target\": \"ES2022\",
+    \"module\": \"CommonJS\",
+    \"moduleResolution\": \"Node\",
+    \"lib\": [\"ES2022\", \"DOM\"],
+    \"strict\": true,
+    \"declaration\": true,
+    \"outDir\": \"dist\",
+    \"rootDir\": \".\",
+    \"esModuleInterop\": true,
+    \"skipLibCheck\": true
+  },
+  \"include\": [\"**/*.ts\"],
+  \"exclude\": [\"dist\", \"node_modules\"]
+}
+"
+    .to_string()
 }
 
 #[expect(
@@ -1252,9 +1311,12 @@ fn operation_auth_header_names(
 ) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for scheme in operation_api_key_schemes(graph, op)? {
-        let names = grouped.entry(scheme.header.clone()).or_default();
+        if scheme.location != ApiKeyLocation::Header {
+            continue;
+        }
+        let names = grouped.entry(scheme.name.clone()).or_default();
         names.push(scheme.id);
-        names.push(scheme.header);
+        names.push(scheme.name);
     }
     for names in grouped.values_mut() {
         names.sort();
@@ -1351,11 +1413,28 @@ fn emit_axios_package_json(package: &str) -> String {
         "{{
   \"name\": {},
   \"version\": \"0.1.0\",
-  \"type\": \"module\",
-  \"main\": \"./index.js\",
-  \"types\": \"./index.d.ts\",
+  \"type\": \"commonjs\",
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
+  \"exports\": {{
+    \".\": {{
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
+    }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
   \"dependencies\": {{
     \"axios\": \"^1.0.0\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
   }}
 }}
 ",
@@ -1581,11 +1660,10 @@ fn emit_axios_operation_method(
         "    if (response.status < 200 || response.status >= 300) {{"
     )
     .map_err(ts_mod_sink)?;
-    writeln!(
-        out,
-        "      throw new ApiError(response.status, response.data);"
-    )
-    .map_err(ts_mod_sink)?;
+    writeln!(out, "      throw new ApiError(response.status, {{").map_err(ts_mod_sink)?;
+    writeln!(out, "        body: response.data,").map_err(ts_mod_sink)?;
+    writeln!(out, "        jsonBody: response.data,").map_err(ts_mod_sink)?;
+    writeln!(out, "      }});").map_err(ts_mod_sink)?;
     writeln!(out, "    }}").map_err(ts_mod_sink)?;
     if success.has_binary_body() {
         if response_policy == TsResponsePolicy::DataOnly && success.has_bodyless_alternative() {
@@ -2111,8 +2189,10 @@ mod tests {
     #[test]
     fn generated_client_contains_the_operation_methods_and_models_the_enum() {
         let out = generate(&sample_graph(), "bookstore", "/").unwrap();
-        assert!(out.contains("async createBook(body: models.Book)"), "{out}");
-        assert!(out.contains("async listBooks(cursor?: string)"), "{out}");
+        assert!(out.contains("async createBook("), "{out}");
+        assert!(out.contains("body: models.Book"), "{out}");
+        assert!(out.contains("async listBooks("), "{out}");
+        assert!(out.contains("cursor?: string"), "{out}");
         assert!(
             out.contains("export type BookFormat = \"hardcover\" | \"paperback\";"),
             "{out}"
@@ -2142,6 +2222,7 @@ mod tests {
                 "index.ts",
                 "models.ts",
                 "package.json",
+                "tsconfig.json",
             ]
         );
         let api = files
@@ -2284,6 +2365,7 @@ mod tests {
                 "models/index.ts",
                 "package.json",
                 "runtime.ts",
+                "tsconfig.json",
             ]
         );
 

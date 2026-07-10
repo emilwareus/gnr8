@@ -168,6 +168,10 @@ pub trait Target {
 - A target emits **its own diagnostics** for facts it can't represent (in addition to the automatic
   capability check in §6).
 
+Built-in SDK targets use a shared SDK planning boundary before language rendering. See
+[`sdk-model.md`](sdk-model.md) for the current `ApiGraph -> SdkModel -> emitter` contract and the rule
+that cross-target SDK semantics should be added to `SdkModel` before Go/Python/TypeScript rendering.
+
 How a user adds a target (sketch):
 ```rust
 struct PostmanCollection { out: String }

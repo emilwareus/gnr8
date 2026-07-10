@@ -6,8 +6,8 @@
 //! `operationId`, `$ref`, `type`, `enum`, and object-valued maps.
 
 use super::model::{
-    Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
-    SchemaObject, SecurityRequirement, SecurityScheme,
+    Components, Info, MediaExample, OpenApiDoc, Operation, Parameter, PathItem, RequestBody,
+    ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
 };
 use crate::analyze::facts::LiteralValue;
 use serde_json::{Map, Value};
@@ -87,6 +87,18 @@ fn write_operation(op: &Operation) -> Value {
         "operationId".to_string(),
         Value::String(op.operation_id.clone()),
     );
+    if let Some(summary) = &op.summary {
+        out.insert("summary".to_string(), Value::String(summary.clone()));
+    }
+    if let Some(description) = &op.description {
+        out.insert(
+            "description".to_string(),
+            Value::String(description.clone()),
+        );
+    }
+    if op.deprecated {
+        out.insert("deprecated".to_string(), Value::Bool(true));
+    }
     if !op.tags.is_empty() {
         out.insert(
             "tags".to_string(),
@@ -98,8 +110,13 @@ fn write_operation(op: &Operation) -> Value {
             ),
         );
     }
-    if !op.security.is_empty() {
-        out.insert("security".to_string(), write_security(&op.security));
+    if op.security_explicit {
+        let security = if op.security.is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            write_security(&op.security)
+        };
+        out.insert("security".to_string(), security);
     }
     if !op.parameters.is_empty() {
         out.insert(
@@ -126,6 +143,7 @@ fn write_parameter(param: &Parameter) -> Value {
 fn write_request_body(body: &RequestBody) -> Value {
     let mut media = Map::new();
     media.insert("schema".to_string(), ref_schema(&body.schema_ref));
+    write_examples_into(&mut media, &body.examples);
 
     let mut content = Map::new();
     content.insert(body.content_type.clone(), Value::Object(media));
@@ -167,6 +185,7 @@ fn write_response(response: &ResponseObj) -> Value {
 
         let mut media = Map::new();
         media.insert("schema".to_string(), Value::Object(schema));
+        write_examples_into(&mut media, &response.examples);
 
         let mut content = Map::new();
         content.insert(
@@ -188,6 +207,7 @@ fn write_response(response: &ResponseObj) -> Value {
             |schema_ref| ref_schema(schema_ref),
         );
         media.insert("schema".to_string(), schema);
+        write_examples_into(&mut media, &response.examples);
 
         let mut content = Map::new();
         content.insert(
@@ -201,6 +221,7 @@ fn write_response(response: &ResponseObj) -> Value {
     } else if let Some(schema_ref) = &response.schema_ref {
         let mut media = Map::new();
         media.insert("schema".to_string(), ref_schema(schema_ref));
+        write_examples_into(&mut media, &response.examples);
 
         let mut content = Map::new();
         content.insert(
@@ -213,6 +234,28 @@ fn write_response(response: &ResponseObj) -> Value {
         out.insert("content".to_string(), Value::Object(content));
     }
     Value::Object(out)
+}
+
+fn write_examples_into(media: &mut Map<String, Value>, examples: &[MediaExample]) {
+    if examples.is_empty() {
+        return;
+    }
+    let mut examples_out = Map::new();
+    for example in examples {
+        let mut body = Map::new();
+        if let Some(summary) = &example.summary {
+            body.insert("summary".to_string(), Value::String(summary.clone()));
+        }
+        if let Some(description) = &example.description {
+            body.insert(
+                "description".to_string(),
+                Value::String(description.clone()),
+            );
+        }
+        body.insert("value".to_string(), example.value.clone());
+        examples_out.insert(example.name.clone(), Value::Object(body));
+    }
+    media.insert("examples".to_string(), Value::Object(examples_out));
 }
 
 fn write_components(components: &Components) -> Value {
@@ -236,8 +279,12 @@ fn write_components(components: &Components) -> Value {
 fn write_security_scheme(scheme: &SecurityScheme) -> Value {
     let mut out = Map::new();
     out.insert("type".to_string(), Value::String(scheme.kind.clone()));
-    out.insert("in".to_string(), Value::String(scheme.location.clone()));
-    out.insert("name".to_string(), Value::String(scheme.name.clone()));
+    if scheme.kind == "http" {
+        out.insert("scheme".to_string(), Value::String(scheme.name.clone()));
+    } else {
+        out.insert("in".to_string(), Value::String(scheme.location.clone()));
+        out.insert("name".to_string(), Value::String(scheme.name.clone()));
+    }
     Value::Object(out)
 }
 
@@ -415,13 +462,18 @@ mod tests {
                 PathItem {
                     post: Some(Operation {
                         operation_id: "createGoal".to_string(),
+                        summary: None,
+                        description: None,
+                        deprecated: false,
                         tags: vec!["goals".to_string()],
                         security: Vec::new(),
+                        security_explicit: false,
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,
                             content_type: "application/json".to_string(),
                             schema_ref: "CreateGoalInput".to_string(),
+                            examples: Vec::new(),
                         }),
                         responses: vec![(
                             "201".to_string(),
@@ -431,6 +483,7 @@ mod tests {
                                 content_type: None,
                                 binary: false,
                                 event_stream: false,
+                                examples: Vec::new(),
                             },
                         )],
                     }),

@@ -49,6 +49,19 @@ use crate::graph::{ApiGraph, Diagnostic};
 use crate::manifest::blake3_hex;
 use crate::CoreError;
 
+/// Validate a generated OpenAPI artifact enough for `gnr8 doctor` readiness.
+///
+/// This reuses the OpenAPI source parser's JSON/YAML parsing and version detection, then checks local
+/// `$ref`s plus operation/schema naming facts that make an emitted document consumable.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] when the artifact is not parseable OpenAPI 3.x or has broken local
+/// references / unstable names.
+pub fn validate_openapi_artifact(text: &str, path: &Path) -> Result<(), CoreError> {
+    openapi_source::validate_openapi_artifact(text, path)
+}
+
 /// The execution context handed to every stage.
 ///
 /// Carries the project root every relative path (a source's input dir, a target's output path) is
@@ -885,11 +898,13 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApiOverrides, ApplySecurity, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk,
-        GroupOperations, Header, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, DocumentOperation,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
         OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
-        RenameOperation, RenameType, SdkOperationAliases, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
+        RenameOperation, RenameType, SdkOperationAliases, SdkPackageMetadata, SetBasePath,
+        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
+        TsSdk,
     };
     pub use super::docs::SdkDocs;
     pub use super::go::{
@@ -909,7 +924,9 @@ pub mod prelude {
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,
     };
-    pub use crate::graph::SecurityScheme;
+    pub use crate::graph::{
+        PaginationMode, PaginationTermination, RuntimeHookKind, SecurityScheme,
+    };
 }
 
 #[cfg(test)]

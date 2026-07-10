@@ -16,8 +16,9 @@ mod watch;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 fn main() -> Result<()> {
@@ -1748,6 +1749,589 @@ fn reconcile_doctor_source_probe(
     initial
 }
 
+fn collect_sdk_readiness(
+    root: &Path,
+    bundle: &mut gnr8::runner::ArtifactBundle,
+) -> Vec<doctor::SdkReadiness> {
+    if let Err(err) = ensure_bundle_artifacts(root, bundle) {
+        return vec![doctor::SdkReadiness::not_ready(
+            "artifacts",
+            "generated",
+            "artifact cache",
+            err.to_string(),
+        )];
+    }
+
+    let groups = artifact_groups_by_anchor(bundle);
+    groups
+        .into_iter()
+        .filter_map(|(anchor, artifacts)| readiness_for_artifact_group(&anchor, &artifacts))
+        .collect()
+}
+
+fn artifact_groups_by_anchor(
+    bundle: &gnr8::runner::ArtifactBundle,
+) -> BTreeMap<String, Vec<gnr8::sdk::Artifact>> {
+    let mut groups: BTreeMap<String, Vec<gnr8::sdk::Artifact>> = BTreeMap::new();
+    for anchor in &bundle.output_anchors {
+        let normalized = anchor.trim_end_matches('/').to_string();
+        if normalized.is_empty() {
+            continue;
+        }
+        let prefix = format!("{normalized}/");
+        let artifacts = bundle
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.path == normalized || artifact.path.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !artifacts.is_empty() {
+            groups.insert(normalized, artifacts);
+        }
+    }
+    groups
+}
+
+fn readiness_for_artifact_group(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+) -> Option<doctor::SdkReadiness> {
+    if let Some(openapi) = artifacts
+        .iter()
+        .find(|artifact| is_openapi_artifact(&artifact.path, &artifact.text))
+    {
+        return Some(validate_openapi_target(&openapi.path, &openapi.text));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "go"))
+    {
+        return Some(validate_go_target(anchor, artifacts));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "py"))
+    {
+        return Some(validate_python_target(anchor, artifacts));
+    }
+    if artifacts
+        .iter()
+        .any(|artifact| path_extension_is(&artifact.path, "ts"))
+    {
+        return Some(validate_typescript_target(anchor, artifacts));
+    }
+    None
+}
+
+fn is_openapi_artifact(path: &str, text: &str) -> bool {
+    let openapi_like = text.contains("openapi:")
+        || text.contains("\"openapi\"")
+        || text.contains("swagger:")
+        || text.contains("\"swagger\"");
+    (path_extension_is(path, "yaml")
+        || path_extension_is(path, "yml")
+        || path_extension_is(path, "json"))
+        && openapi_like
+}
+
+fn path_extension_is(path: &str, ext: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(ext))
+}
+
+fn validate_openapi_target(path: &str, text: &str) -> doctor::SdkReadiness {
+    match gnr8::sdk::validate_openapi_artifact(text, Path::new(path)) {
+        Ok(()) => doctor::SdkReadiness::ready("openapi", path, "built-in OpenAPI parser"),
+        Err(err) => doctor::SdkReadiness::not_ready(
+            "openapi",
+            path,
+            "built-in OpenAPI parser",
+            err.to_string(),
+        ),
+    }
+}
+
+fn validate_go_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "go test ./...; go vet ./...";
+    if let Err(reason) = command_available("go", &["version"]) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "go") else {
+        return doctor::SdkReadiness::not_ready(
+            "go",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated Go SDK for readiness",
+        );
+    };
+    if !materialized.target_dir.join("go.mod").is_file() {
+        return doctor::SdkReadiness::not_ready(
+            "go",
+            anchor,
+            TOOLCHAIN,
+            "generated Go SDK is missing go.mod package metadata",
+        );
+    }
+    if let Err(reason) = command_success_in(
+        "go",
+        &["test", "./..."],
+        &materialized.target_dir,
+        &[("GOPROXY", "off")],
+    ) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    if let Err(reason) = command_success_in(
+        "go",
+        &["vet", "./..."],
+        &materialized.target_dir,
+        &[("GOPROXY", "off")],
+    ) {
+        return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
+    }
+    doctor::SdkReadiness::ready("go", anchor, TOOLCHAIN)
+}
+
+fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "python3 -m py_compile; import package";
+    if let Err(reason) = command_available("python3", &["--version"]) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "python") else {
+        return doctor::SdkReadiness::not_ready(
+            "python",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated Python SDK for readiness",
+        );
+    };
+    let py_files = artifacts
+        .iter()
+        .filter(|artifact| path_extension_is(&artifact.path, "py"))
+        .map(|artifact| materialized.root.join(&artifact.path))
+        .collect::<Vec<_>>();
+    if py_files.is_empty() {
+        return doctor::SdkReadiness::not_ready(
+            "python",
+            anchor,
+            TOOLCHAIN,
+            "generated Python SDK contains no .py files",
+        );
+    }
+    if let Err(reason) = python_compile(&py_files) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    if let Err(reason) = python_import_package(&materialized.target_dir) {
+        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    }
+    doctor::SdkReadiness::ready("python", anchor, TOOLCHAIN)
+}
+
+fn validate_typescript_target(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+) -> doctor::SdkReadiness {
+    const TOOLCHAIN: &str = "node + typescript --noEmit --strict";
+    if let Err(reason) = command_available("node", &["--version"]) {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+    }
+    let Ok(project_root) = std::env::current_dir() else {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "failed to resolve the project directory",
+        );
+    };
+    let Some(tsc) = typescript_compiler(&project_root, anchor) else {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "typescript compiler not found; install it in the project with `npm install --save-dev typescript` or provide `tsc` on PATH",
+        );
+    };
+    let Ok(materialized) = materialize_artifact_group(anchor, artifacts, "typescript") else {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "failed to materialize generated TypeScript SDK for readiness",
+        );
+    };
+    if let Err(reason) =
+        link_typescript_node_modules(&project_root, anchor, &materialized.target_dir)
+    {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+    }
+    let ts_files = artifacts
+        .iter()
+        .filter(|artifact| path_extension_is(&artifact.path, "ts"))
+        .map(|artifact| materialized.root.join(&artifact.path))
+        .collect::<Vec<_>>();
+    if ts_files.is_empty() {
+        return doctor::SdkReadiness::not_ready(
+            "typescript",
+            anchor,
+            TOOLCHAIN,
+            "generated TypeScript SDK contains no .ts files",
+        );
+    }
+    if let Err(reason) = typescript_typecheck(&tsc, &ts_files, &materialized.target_dir) {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+    }
+    if materialized.target_dir.join("package.json").is_file() {
+        if !materialized.target_dir.join("tsconfig.json").is_file() {
+            return doctor::SdkReadiness::not_ready(
+                "typescript",
+                anchor,
+                TOOLCHAIN,
+                "generated TypeScript package is missing tsconfig.json",
+            );
+        }
+        if let Err(reason) = typescript_build(&tsc, &materialized.target_dir) {
+            return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+        }
+        if let Err(reason) = validate_typescript_package_entrypoints(&materialized.target_dir) {
+            return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+        }
+        if command_available("npm", &["--version"]).is_ok() {
+            if let Err(reason) = command_success_in(
+                "npm",
+                &["pack", "--dry-run", "--ignore-scripts"],
+                &materialized.target_dir,
+                &[],
+            ) {
+                return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+            }
+        }
+    }
+    doctor::SdkReadiness::ready("typescript", anchor, TOOLCHAIN)
+}
+
+struct MaterializedTarget {
+    root: PathBuf,
+    target_dir: PathBuf,
+}
+
+impl Drop for MaterializedTarget {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn materialize_artifact_group(
+    anchor: &str,
+    artifacts: &[gnr8::sdk::Artifact],
+    label: &str,
+) -> Result<MaterializedTarget, String> {
+    let root = unique_doctor_temp_dir(label)?;
+    let result = (|| {
+        for artifact in artifacts {
+            let path = safe_temp_artifact_path(&root, &artifact.path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create readiness temp dir '{}': {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::write(&path, &artifact.text).map_err(|err| {
+                format!(
+                    "failed to write readiness temp file '{}': {err}",
+                    path.display()
+                )
+            })?;
+        }
+        let target_dir = safe_temp_artifact_path(&root, anchor)?;
+        Ok(MaterializedTarget {
+            root: root.clone(),
+            target_dir,
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    result
+}
+
+fn unique_doctor_temp_dir(label: &str) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system clock before Unix epoch: {err}"))?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "gnr8-doctor-readiness-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "failed to create readiness temp dir '{}': {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn safe_temp_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return Err(format!("artifact path {rel:?} must be project-relative"));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "artifact path {rel:?} must not escape the project root"
+        ));
+    }
+    Ok(root.join(path))
+}
+
+fn command_available(program: &str, args: &[&str]) -> Result<(), String> {
+    command_success_in(program, args, Path::new("."), &[])
+}
+
+fn command_success_in(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    envs: &[(&str, &str)],
+) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to run `{}`: {err}", command_label(program, args)))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "`{}` failed: {}",
+        command_label(program, args),
+        command_output_excerpt(&output)
+    ))
+}
+
+fn command_label(program: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn command_output_excerpt(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("command exited non-zero without output")
+        .to_string()
+}
+
+fn python_compile(files: &[PathBuf]) -> Result<(), String> {
+    let args = std::iter::once("-m".to_string())
+        .chain(std::iter::once("py_compile".to_string()))
+        .chain(files.iter().map(|path| path.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    command_success_in("python3", &arg_refs, Path::new("."), &[])
+}
+
+fn python_import_package(package_dir: &Path) -> Result<(), String> {
+    let init = package_dir.join("__init__.py");
+    if !init.is_file() {
+        return Err("generated Python SDK is missing __init__.py".to_string());
+    }
+    let code = "\
+import importlib.util
+import sys
+init_path = sys.argv[1]
+package_dir = sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    'gnr8_sdk_check',
+    init_path,
+    submodule_search_locations=[package_dir],
+)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+";
+    let init_arg = init.to_string_lossy().into_owned();
+    let dir_arg = package_dir.to_string_lossy().into_owned();
+    command_success_in(
+        "python3",
+        &["-c", code, &init_arg, &dir_arg],
+        package_dir.parent().unwrap_or_else(|| Path::new(".")),
+        &[],
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeScriptCompiler {
+    NodeScript(PathBuf),
+    Executable(String),
+}
+
+fn typescript_compiler(project_root: &Path, anchor: &str) -> Option<TypeScriptCompiler> {
+    let output_dir = safe_temp_artifact_path(project_root, anchor).ok()?;
+    if let Some(path) = local_typescript_compiler(&output_dir) {
+        return Some(TypeScriptCompiler::NodeScript(path));
+    }
+    if command_available("tsc", &["--version"]).is_ok() {
+        return Some(TypeScriptCompiler::Executable("tsc".to_string()));
+    }
+    let development_sidecar = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tsextract")
+        .join("node_modules")
+        .join("typescript")
+        .join("lib")
+        .join("tsc.js");
+    development_sidecar
+        .is_file()
+        .then_some(TypeScriptCompiler::NodeScript(development_sidecar))
+}
+
+fn link_typescript_node_modules(
+    project_root: &Path,
+    anchor: &str,
+    materialized_target: &Path,
+) -> Result<(), String> {
+    let output_dir = safe_temp_artifact_path(project_root, anchor)?;
+    let Some(source) = local_node_modules(&output_dir) else {
+        return Ok(());
+    };
+    let destination = materialized_target.join("node_modules");
+    if destination.exists() {
+        return Ok(());
+    }
+    symlink_directory(&source, &destination).map_err(|err| {
+        format!(
+            "failed to make installed TypeScript dependencies available to readiness checks: {err}"
+        )
+    })
+}
+
+fn local_node_modules(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|root| root.join("node_modules"))
+        .find(|path| path.is_dir())
+}
+
+#[cfg(unix)]
+fn symlink_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, destination)
+}
+
+#[cfg(windows)]
+fn symlink_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(source, destination)
+}
+
+fn local_typescript_compiler(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|root| {
+            root.join("node_modules")
+                .join("typescript")
+                .join("lib")
+                .join("tsc.js")
+        })
+        .find(|path| path.is_file())
+}
+
+fn run_typescript_compiler(
+    compiler: &TypeScriptCompiler,
+    args: &[String],
+    cwd: &Path,
+) -> Result<(), String> {
+    match compiler {
+        TypeScriptCompiler::NodeScript(path) => {
+            let mut node_args = vec![path.to_string_lossy().into_owned()];
+            node_args.extend_from_slice(args);
+            let arg_refs = node_args.iter().map(String::as_str).collect::<Vec<_>>();
+            command_success_in("node", &arg_refs, cwd, &[])
+        }
+        TypeScriptCompiler::Executable(program) => {
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            command_success_in(program, &arg_refs, cwd, &[])
+        }
+    }
+}
+
+fn typescript_typecheck(
+    compiler: &TypeScriptCompiler,
+    files: &[PathBuf],
+    cwd: &Path,
+) -> Result<(), String> {
+    let mut args = vec![
+        "--noEmit".to_string(),
+        "--strict".to_string(),
+        "--lib".to_string(),
+        "es2022,dom".to_string(),
+    ];
+    args.extend(files.iter().map(|path| path.to_string_lossy().into_owned()));
+    run_typescript_compiler(compiler, &args, cwd)
+}
+
+fn typescript_build(compiler: &TypeScriptCompiler, cwd: &Path) -> Result<(), String> {
+    run_typescript_compiler(
+        compiler,
+        &["--project".to_string(), "tsconfig.json".to_string()],
+        cwd,
+    )
+}
+
+fn validate_typescript_package_entrypoints(package_dir: &Path) -> Result<(), String> {
+    let package_path = package_dir.join("package.json");
+    let text = std::fs::read_to_string(&package_path)
+        .map_err(|err| format!("failed to read '{}': {err}", package_path.display()))?;
+    let package: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("invalid generated package.json: {err}"))?;
+    for (label, value) in [
+        ("main", package.get("main")),
+        ("types", package.get("types")),
+        ("exports[.].types", package.pointer("/exports/./types")),
+        ("exports[.].import", package.pointer("/exports/./import")),
+        ("exports[.].require", package.pointer("/exports/./require")),
+        ("exports[.].default", package.pointer("/exports/./default")),
+    ] {
+        let relative = value.and_then(serde_json::Value::as_str).ok_or_else(|| {
+            format!("generated package.json is missing string entrypoint {label}")
+        })?;
+        let relative = Path::new(relative.strip_prefix("./").unwrap_or(relative));
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(format!(
+                "generated package.json entrypoint {label} is not a safe relative path: {}",
+                relative.display()
+            ));
+        }
+        if !package_dir.join(relative).is_file() {
+            return Err(format!(
+                "generated package.json entrypoint {label} does not exist after build: {}",
+                relative.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run `gnr8 doctor`: a health aggregator that runs the user's `.gnr8/` pipeline once and reports its
 /// diagnostics + drift (HARD-01 / D-01, D-02). Mirrors `run_check`'s shell-vs-decision split (this is
 /// the impure shell; the pure grouping + exit policy lives in [`doctor::DoctorReport`]).
@@ -1788,6 +2372,10 @@ fn run_doctor(output: Output) -> Result<()> {
         .as_ref()
         .map(|bundle| bundle.output_anchors.clone())
         .unwrap_or_default();
+    let sdk_readiness = bundle
+        .as_mut()
+        .map(|bundle| collect_sdk_readiness(&root, bundle))
+        .unwrap_or_default();
     let drift = bundle.as_mut().and_then(|b| plan_bundle(&root, b).ok());
 
     let report = doctor::DoctorReport::assemble(
@@ -1798,6 +2386,7 @@ fn run_doctor(output: Output) -> Result<()> {
         diagnostics,
         drift.as_ref(),
     )
+    .with_sdk_readiness(sdk_readiness)
     .with_runtime(
         doctor::DoctorRuntime {
             binary_path: std::env::current_exe()
@@ -1955,7 +2544,12 @@ fn fmt_duration(duration: Duration) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{allowed_missing_docs, reconcile_doctor_source_probe, unallowed_missing_docs};
+    use super::{
+        allowed_missing_docs, link_typescript_node_modules, local_node_modules,
+        local_typescript_compiler, reconcile_doctor_source_probe, typescript_compiler,
+        unallowed_missing_docs, validate_typescript_package_entrypoints, MaterializedTarget,
+        TypeScriptCompiler,
+    };
     use gnr8::sdk::compat::CompatibilityAllow;
     use std::path::PathBuf;
 
@@ -1996,6 +2590,98 @@ mod tests {
 
         assert_eq!(language, "configured");
         assert!(present);
+    }
+
+    #[test]
+    fn typescript_compiler_resolves_from_project_node_modules() {
+        let root = temp_root("project-tsc");
+        let compiler = root.join("node_modules/typescript/lib/tsc.js");
+        std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        std::fs::write(&compiler, "// test compiler").unwrap();
+        let nested = root.join("packages/sdk");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(local_typescript_compiler(&nested), Some(compiler));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_compiler_prefers_the_generated_package_install() {
+        let root = temp_root("output-tsc");
+        let compiler = root.join("generated/sdk/node_modules/typescript/lib/tsc.js");
+        std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        std::fs::write(&compiler, "// test compiler").unwrap();
+
+        assert_eq!(
+            typescript_compiler(&root, "generated/sdk"),
+            Some(TypeScriptCompiler::NodeScript(compiler))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_readiness_reuses_installed_package_dependencies() {
+        let root = temp_root("output-dependencies");
+        let dependency = root.join("node_modules/axios/index.d.ts");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "export {};\n").unwrap();
+        let materialized = root.join("materialized");
+        std::fs::create_dir_all(&materialized).unwrap();
+
+        assert_eq!(
+            local_node_modules(&root.join("generated/sdk")),
+            Some(root.join("node_modules"))
+        );
+        link_typescript_node_modules(&root, "generated/sdk", &materialized).unwrap();
+        assert!(materialized.join("node_modules/axios/index.d.ts").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_package_entrypoints_must_exist_after_build() {
+        let root = temp_root("package-entrypoints");
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/index.js"), "exports.answer = 42;\n").unwrap();
+        std::fs::write(
+            root.join("dist/index.d.ts"),
+            "export declare const answer: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        assert!(validate_typescript_package_entrypoints(&root).is_ok());
+        std::fs::remove_file(root.join("dist/index.js")).unwrap();
+        let err = validate_typescript_package_entrypoints(&root).unwrap_err();
+        assert!(err.contains("does not exist after build"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn materialized_readiness_target_cleans_its_temp_tree() {
+        let root = temp_root("materialized-cleanup");
+        let target_dir = root.join("sdk");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        drop(MaterializedTarget {
+            root: root.clone(),
+            target_dir,
+        });
+
+        assert!(!root.exists());
     }
 
     #[test]

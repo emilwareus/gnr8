@@ -67,8 +67,7 @@ pub(crate) struct PathItem {
 
 /// One HTTP operation (an `operationId` + its params/body/responses).
 ///
-/// There is no `summary` here: those were doc-comment-annotation facts and have been removed
-/// (CLAUDE.md rules 1 & 3). `tags` are static source route-group names, not annotations.
+/// Summary/description/deprecation/tags are graph-owned documentation policy, not source annotations.
 // `operation_id` mirrors the spec's `operationId` key; the field name intentionally echoes the
 // struct, so the field-name lint is silenced here rather than renamed away from the spec term.
 #[allow(clippy::struct_field_names)]
@@ -76,10 +75,19 @@ pub(crate) struct PathItem {
 pub(crate) struct Operation {
     /// Stable, unique operation id (the graph operation id).
     pub operation_id: String,
-    /// Static source route-group tags.
+    /// Optional short operation summary.
+    pub summary: Option<String>,
+    /// Optional longer operation description.
+    pub description: Option<String>,
+    /// Whether the operation is deprecated.
+    pub deprecated: bool,
+    /// Public operation tags.
     pub tags: Vec<String>,
     /// Operation-level security requirements.
     pub security: Vec<SecurityRequirement>,
+    /// Whether the operation must emit a `security` key even when the requirement list is empty.
+    #[serde(skip)]
+    pub security_explicit: bool,
     /// Path + query parameters, in graph (name-sorted) order.
     pub parameters: Vec<Parameter>,
     /// The JSON request body, if the operation takes one.
@@ -111,6 +119,8 @@ pub(crate) struct RequestBody {
     pub content_type: String,
     /// The JSON-pointer name of the referenced schema (bare component name).
     pub schema_ref: String,
+    /// Named examples for this media type.
+    pub examples: Vec<MediaExample>,
 }
 
 /// One response keyed by status code.
@@ -126,26 +136,42 @@ pub(crate) struct ResponseObj {
     pub binary: bool,
     /// Whether this response is a server-sent event stream (`text/event-stream`).
     pub event_stream: bool,
+    /// Named examples for this response media type.
+    pub examples: Vec<MediaExample>,
+}
+
+/// One named media example.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct MediaExample {
+    /// Example key under the `OpenAPI` `examples` map.
+    pub name: String,
+    /// Optional short example summary.
+    pub summary: Option<String>,
+    /// Optional longer example description.
+    pub description: Option<String>,
+    /// JSON-compatible example value.
+    pub value: serde_json::Value,
 }
 
 /// Reusable `components`: security schemes + schemas, both as sorted `Vec`s.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub(crate) struct Components {
-    /// Named security schemes (e.g. `ApiKeyAuth` → apiKey/header/X-API-Key), sorted by name.
+    /// Named security schemes (e.g. `ApiKeyAuth` → apiKey/header/X-API-Key,
+    /// `BearerAuth` → http/bearer), sorted by name.
     pub security_schemes: Vec<(String, SecurityScheme)>,
     /// Component schemas, keyed by their bare component name, sorted by name.
     pub schemas: Vec<(String, SchemaObject)>,
 }
 
 /// A security scheme, built from the user's `gnr8` config (the single source of truth for security —
-/// `CLAUDE.md` rule 4). The `PoC` emits the `apiKey`/`header` shape the fixture config declares.
+/// `CLAUDE.md` rule 4).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SecurityScheme {
-    /// The scheme kind (e.g. `"apiKey"`), from config.
+    /// The scheme kind (e.g. `"apiKey"` or `"http"`), from config.
     pub kind: String,
-    /// Where the key is read from (e.g. `"header"`), from config.
+    /// Where the key is read from (e.g. `"header"`); empty for HTTP auth schemes.
     pub location: String,
-    /// The header name carrying the key (e.g. `X-API-Key`), from config.
+    /// The credential name (e.g. `X-API-Key`) or HTTP scheme (`bearer`, `basic`), from config.
     pub name: String,
 }
 

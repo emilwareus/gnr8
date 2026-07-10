@@ -16,8 +16,8 @@
 //! surfaced as a typed [`crate::CoreError`] by [`super::to_openapi`], not here).
 
 use super::model::{
-    Components, Info, OpenApiDoc, Operation, Parameter, PathItem, RequestBody, ResponseObj,
-    SchemaObject, SecurityRequirement, SecurityScheme,
+    Components, Info, MediaExample, OpenApiDoc, Operation, Parameter, PathItem, RequestBody,
+    ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
 };
 use crate::analyze::facts::LiteralValue;
 use std::fmt::Write as _;
@@ -104,12 +104,25 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
 fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     let pad = INDENT.repeat(depth);
     let _ = writeln!(out, "{pad}operationId: {}", scalar(&op.operation_id));
+    if let Some(summary) = &op.summary {
+        let _ = writeln!(out, "{pad}summary: {}", scalar(summary));
+    }
+    if let Some(description) = &op.description {
+        let _ = writeln!(out, "{pad}description: {}", scalar(description));
+    }
+    if op.deprecated {
+        let _ = writeln!(out, "{pad}deprecated: true");
+    }
     if !op.tags.is_empty() {
         let _ = writeln!(out, "{pad}tags: {}", flow_seq(&op.tags));
     }
-    if !op.security.is_empty() {
-        let _ = writeln!(out, "{pad}security:");
-        write_security_requirement(out, &op.security, depth + 1);
+    if op.security_explicit {
+        if op.security.is_empty() {
+            let _ = writeln!(out, "{pad}security: []");
+        } else {
+            let _ = writeln!(out, "{pad}security:");
+            write_security_requirement(out, &op.security, depth + 1);
+        }
     }
     if !op.parameters.is_empty() {
         let _ = writeln!(out, "{pad}parameters:");
@@ -147,6 +160,7 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
         "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
         ref_pointer(&body.schema_ref)
     );
+    write_examples(out, &body.examples, depth + 3);
 }
 
 /// Emit the `responses` map keyed by quoted status code.
@@ -189,6 +203,7 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                 out,
                 "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
             );
+            write_examples(out, &resp.examples, depth + 4);
         } else if resp.event_stream {
             let content_type = resp.content_type.as_deref().unwrap_or("text/event-stream");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
@@ -210,6 +225,7 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                     "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
                 );
             }
+            write_examples(out, &resp.examples, depth + 4);
         } else if let Some(schema_ref) = &resp.schema_ref {
             let content_type = resp.content_type.as_deref().unwrap_or("application/json");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
@@ -224,7 +240,31 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                 "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
                 ref_pointer(schema_ref)
             );
+            write_examples(out, &resp.examples, depth + 4);
         }
+    }
+}
+
+fn write_examples(out: &mut String, examples: &[MediaExample], depth: usize) {
+    if examples.is_empty() {
+        return;
+    }
+    let pad = INDENT.repeat(depth);
+    let _ = writeln!(out, "{pad}examples:");
+    for example in examples {
+        let _ = writeln!(out, "{pad}{INDENT}{}:", map_key(&example.name));
+        if let Some(summary) = &example.summary {
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}summary: {}", scalar(summary));
+        }
+        if let Some(description) = &example.description {
+            let _ = writeln!(
+                out,
+                "{pad}{INDENT}{INDENT}description: {}",
+                scalar(description)
+            );
+        }
+        let value = serde_json::to_string(&example.value).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}value: {value}");
     }
 }
 
@@ -244,16 +284,24 @@ fn write_components(out: &mut String, components: &Components) {
     }
 }
 
-/// Emit one named `apiKey`/`header`/`<name>` security scheme.
+/// Emit one named security scheme.
 fn write_security_scheme(out: &mut String, name: &str, scheme: &SecurityScheme) {
     let _ = writeln!(out, "{INDENT}{INDENT}{}:", map_key(name));
     let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}type: {}", scheme.kind);
-    let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}in: {}", scheme.location);
-    let _ = writeln!(
-        out,
-        "{INDENT}{INDENT}{INDENT}name: {}",
-        scalar(&scheme.name)
-    );
+    if scheme.kind == "http" {
+        let _ = writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}scheme: {}",
+            scalar(&scheme.name)
+        );
+    } else {
+        let _ = writeln!(out, "{INDENT}{INDENT}{INDENT}in: {}", scheme.location);
+        let _ = writeln!(
+            out,
+            "{INDENT}{INDENT}{INDENT}name: {}",
+            scalar(&scheme.name)
+        );
+    }
 }
 
 /// Emit a [`SchemaObject`] body with keys in fixed order: `type`, `format`, `description`, `enum`,
@@ -497,13 +545,18 @@ mod tests {
     fn sample_doc() -> OpenApiDoc {
         let post = Operation {
             operation_id: "createGoal".to_string(),
+            summary: None,
+            description: None,
+            deprecated: false,
             tags: vec!["goals".to_string()],
             security: Vec::new(),
+            security_explicit: false,
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
                 content_type: "application/json".to_string(),
                 schema_ref: "CreateGoalInput".to_string(),
+                examples: Vec::new(),
             }),
             responses: vec![(
                 "201".to_string(),
@@ -513,6 +566,7 @@ mod tests {
                     content_type: None,
                     binary: false,
                     event_stream: false,
+                    examples: Vec::new(),
                 },
             )],
         };
