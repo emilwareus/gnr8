@@ -455,7 +455,7 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
     graph.runtime = gnr8::graph::RuntimePolicy {
         default_timeout_ms: Some(5_000),
         max_retries: 0,
-        retry_statuses: vec![408, 429],
+        retry_statuses: Vec::new(),
         retry_unsafe_methods: false,
         hooks: Vec::new(),
     };
@@ -1039,7 +1039,7 @@ func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
 		switch r.URL.Path {{
 		case "/api/items":
 			if counts[key] == 1 {{
-				w.WriteHeader(http.StatusInternalServerError)
+				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			}}
 			w.WriteHeader(http.StatusNoContent)
@@ -1134,8 +1134,8 @@ func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
 	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "request", OperationID: "listItems", Method: "GET", PathTemplate: "/items", Trace: "runtime"}}) {{
 		t.Fatalf("missing listItems request event in %#v", events)
 	}}
-	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 500}}) {{
-		t.Fatalf("missing listItems 500 response event in %#v", events)
+	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 429}}) {{
+		t.Fatalf("missing listItems 429 response event in %#v", events)
 	}}
 	if !hasRuntimeEvent(events, runtimeEvent{{Kind: "response", OperationID: "listItems", StatusCode: 204}}) {{
 		t.Fatalf("missing listItems 204 response event in %#v", events)
@@ -1158,6 +1158,10 @@ func TestRuntimeRetriesIdempotencyAndHooks(t *testing.T) {{
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pagination smoke covers raw, page, full iteration, and early-stop behavior together"
+)]
 fn generated_sdk_pagination_helpers_work_against_httptest() {
     if !go_available() {
         eprintln!("skipping sdk_compile pagination smoke: go toolchain unavailable");
@@ -1239,6 +1243,22 @@ func TestPaginationHelpers(t *testing.T) {{
 	}}
 	if len(seen) != 2 || seen[0] != "" || seen[1] != "n2" {{
 		t.Fatalf("seen cursors = %#v, want empty then n2", seen)
+	}}
+
+	seen = nil
+	items = nil
+	err = c.IterateListItems(context.Background(), ListItemsParams{{}}, func(item Item) bool {{
+		items = append(items, item.ID)
+		return false
+	}})
+	if err != nil {{
+		t.Fatalf("IterateListItems early stop returned error: %v", err)
+	}}
+	if len(items) != 1 || items[0] != "a" {{
+		t.Fatalf("early-stop items = %#v, want only a", items)
+	}}
+	if len(seen) != 1 || seen[0] != "" {{
+		t.Fatalf("early-stop cursors = %#v, want only the first request", seen)
 	}}
 }}
 "#

@@ -110,8 +110,13 @@ fn write_operation(op: &Operation) -> Value {
             ),
         );
     }
-    if !op.security.is_empty() {
-        out.insert("security".to_string(), write_security(&op.security));
+    if op.security_explicit {
+        let security = if op.security.is_empty() {
+            Value::Array(Vec::new())
+        } else {
+            write_security(&op.security)
+        };
+        out.insert("security".to_string(), security);
     }
     if !op.parameters.is_empty() {
         out.insert(
@@ -462,6 +467,7 @@ mod tests {
                         deprecated: false,
                         tags: vec!["goals".to_string()],
                         security: Vec::new(),
+                        security_explicit: false,
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,

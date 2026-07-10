@@ -4266,6 +4266,9 @@ impl TsSdk {
     /// Configure generated package metadata and publishing recipe content.
     #[must_use]
     pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
+        if self.package_metadata.is_none() {
+            self.package_metadata = Some(true);
+        }
         self.package_info = metadata;
         self
     }
@@ -4408,7 +4411,11 @@ impl Target for TsSdk {
             &options,
         )?;
         if self.effective_package_metadata() {
-            files.retain(|file| file.name != "package.json" && file.name != "PUBLISHING.md");
+            files.retain(|file| {
+                file.name != "package.json"
+                    && file.name != "PUBLISHING.md"
+                    && file.name != "tsconfig.json"
+            });
             let package_name = self.package_info.resolved_name(&package)?;
             files.push(super::bundle::SdkFile {
                 name: "package.json".to_string(),
@@ -4422,9 +4429,17 @@ impl Target for TsSdk {
                 name: "PUBLISHING.md".to_string(),
                 contents: publishing_recipe("TypeScript", &package_name, &self.package_info)?,
             });
+            files.push(super::bundle::SdkFile {
+                name: "tsconfig.json".to_string(),
+                contents: crate::tssdk::emit_package_tsconfig(),
+            });
             files.sort_by(|a, b| a.name.cmp(&b.name));
         } else {
-            files.retain(|file| file.name != "package.json" && file.name != "PUBLISHING.md");
+            files.retain(|file| {
+                file.name != "package.json"
+                    && file.name != "PUBLISHING.md"
+                    && file.name != "tsconfig.json"
+            });
         }
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(
@@ -5018,15 +5033,25 @@ fn ts_package_json(
         "{{
   \"name\": {},
   \"version\": {},
-  \"type\": \"module\",{}{}
-  \"main\": \"./index.js\",
-  \"module\": \"./index.js\",
-  \"types\": \"./index.d.ts\",
+  \"type\": \"commonjs\",{}{}
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
   \"exports\": {{
     \".\": {{
-      \"types\": \"./index.d.ts\",
-      \"import\": \"./index.js\"
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
     }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
   }}
 }}
 ",
@@ -5108,9 +5133,11 @@ generated SDK directory after reviewing the generated files.\n\n"
 3. Upload with your own credentials, for example `python3 -m twine upload dist/*`.\n",
         ),
         "TypeScript" => out.push_str(
-            "1. `npm pack --dry-run`\n\
-2. `npm publish --dry-run`\n\
-3. Publish with your own npm credentials when the dry run matches expectations.\n",
+            "1. `npm install`\n\
+2. `npm run build`\n\
+3. `npm pack --dry-run`\n\
+4. `npm publish --dry-run`\n\
+5. Publish with your own npm credentials when the dry run matches expectations.\n",
         ),
         _ => {}
     }
@@ -7689,6 +7716,29 @@ mod tests {
     }
 
     #[test]
+    fn tssdk_package_configuration_enables_metadata_for_minimal_profile() {
+        let ir = ApiGraph::default();
+        let mut out = Artifacts::new();
+        TsSdk::new()
+            .module("@example/bookstore-sdk")
+            .to("generated/sdk-ts")
+            .package(SdkPackageMetadata::new().version("2.0.0"))
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+
+        for path in [
+            "generated/sdk-ts/package.json",
+            "generated/sdk-ts/tsconfig.json",
+            "generated/sdk-ts/PUBLISHING.md",
+        ] {
+            assert!(
+                out.files().iter().any(|file| file.path == path),
+                "package configuration should emit {path}"
+            );
+        }
+    }
+
+    #[test]
     fn tssdk_fetch_compat_emits_package_metadata_and_source_only_can_disable_it() {
         let ir = ApiGraph::default();
 
@@ -7717,7 +7767,12 @@ mod tests {
         let parsed_package: serde_json::Value =
             serde_json::from_str(&package_json.text).expect("package.json must parse as JSON");
         assert_eq!(parsed_package["name"], "@example/bookstore-sdk");
-        assert!(package_json.text.contains("\"types\": \"./index.d.ts\""));
+        assert!(package_json
+            .text
+            .contains("\"types\": \"./dist/index.d.ts\""));
+        assert!(package_json.text.contains("\"main\": \"./dist/index.js\""));
+        assert!(package_json.text.contains("\"prebuild\":"));
+        assert!(package_json.text.contains("\"prepack\": \"npm run build\""));
         assert!(package_json.text.contains("\"version\": \"2.0.0\""));
         assert!(package_json
             .text
@@ -7732,6 +7787,13 @@ mod tests {
             .find(|file| file.path == "generated/sdk-ts/PUBLISHING.md")
             .expect("TsSdk must emit a publishing recipe with package metadata");
         assert!(ts_publishing.text.contains("npm pack --dry-run"));
+        assert!(ts_publishing.text.contains("npm run build"));
+        let tsconfig = compat_out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-ts/tsconfig.json")
+            .expect("TsSdk package metadata must include a build configuration");
+        assert!(tsconfig.text.contains("\"declaration\": true"));
 
         let mut axios_out = Artifacts::new();
         TsSdk::new()
@@ -7759,6 +7821,7 @@ mod tests {
         for path in [
             "generated/sdk-ts/package.json",
             "generated/sdk-ts/PUBLISHING.md",
+            "generated/sdk-ts/tsconfig.json",
             "generated/sdk-ts/README.md",
             "generated/sdk-ts/reference.md",
         ] {

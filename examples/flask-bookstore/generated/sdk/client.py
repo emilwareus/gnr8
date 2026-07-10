@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import enum
 import json
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -92,14 +94,26 @@ class Client:
         self._opener = opener or urllib.request.build_opener()
         self._timeout = timeout
         self._max_retries = max_retries
-        self._retry_statuses = ()
+        self._retry_statuses = (408, 429)
         self._retry_unsafe_methods = False
         self._hooks = hooks or ClientHooks()
 
-    def _body_value(self, body: Any) -> Any:
+    def _body_value(self, body: Any, body_encoding: str) -> Any:
         if isinstance(body, BaseModel):
-            return body.model_dump(mode="json", by_alias=True, exclude_unset=True)
-        return body
+            mode = "python" if body_encoding == "multipart" else "json"
+            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)
+        return self._wire_value(body)
+
+    def _wire_value(self, value: Any) -> Any:
+        if isinstance(value, enum.Enum):
+            return self._wire_value(value.value)
+        if isinstance(value, list):
+            return [self._wire_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._wire_value(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._wire_value(item) for key, item in value.items()}
+        return value
 
     def _encode_body(
         self,
@@ -117,14 +131,14 @@ class Client:
             raise TypeError("binary request bodies must be bytes or bytearray")
         if body_encoding == "text":
             return str(body).encode(), content_type
-        value = self._body_value(body)
+        value = self._body_value(body, body_encoding)
         if body_encoding == "json":
             return json.dumps(value).encode(), content_type
         if body_encoding == "form":
             encoded = urllib.parse.urlencode(value, doseq=True).encode()
             return encoded, content_type
         if body_encoding == "multipart":
-            boundary = "gnr8-boundary"
+            boundary = f"gnr8-{secrets.token_hex(16)}"
             return (
                 self._encode_multipart(value, boundary),
                 f"multipart/form-data; boundary={boundary}",

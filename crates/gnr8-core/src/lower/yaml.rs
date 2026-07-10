@@ -116,9 +116,13 @@ fn write_operation(out: &mut String, op: &Operation, depth: usize) {
     if !op.tags.is_empty() {
         let _ = writeln!(out, "{pad}tags: {}", flow_seq(&op.tags));
     }
-    if !op.security.is_empty() {
-        let _ = writeln!(out, "{pad}security:");
-        write_security_requirement(out, &op.security, depth + 1);
+    if op.security_explicit {
+        if op.security.is_empty() {
+            let _ = writeln!(out, "{pad}security: []");
+        } else {
+            let _ = writeln!(out, "{pad}security:");
+            write_security_requirement(out, &op.security, depth + 1);
+        }
     }
     if !op.parameters.is_empty() {
         let _ = writeln!(out, "{pad}parameters:");
@@ -546,6 +550,7 @@ mod tests {
             deprecated: false,
             tags: vec!["goals".to_string()],
             security: Vec::new(),
+            security_explicit: false,
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,

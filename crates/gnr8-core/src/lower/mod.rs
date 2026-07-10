@@ -371,6 +371,7 @@ fn lower_operation(
                 scopes: Vec::new(),
             })
             .collect(),
+        security_explicit: op.security_overrides_global || !op.security.is_empty(),
         parameters,
         request_body,
         responses,
@@ -1613,6 +1614,37 @@ mod tests {
         assert!(
             update_block.contains("security:\n        - ApiKeyAuth: []\n          CSRFAuth: []"),
             "operation-level security must include inherited global auth plus scoped auth:\n{update_block}"
+        );
+    }
+
+    #[test]
+    fn public_operation_emits_explicit_empty_security_override() {
+        let mut graph = sample_graph();
+        let public = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "updateGoal")
+            .unwrap();
+        public.security.clear();
+        public.security_overrides_global = true;
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let update_block = yaml
+            .split("operationId: updateGoal")
+            .nth(1)
+            .expect("updateGoal operation");
+        let update_block = update_block
+            .split("responses:")
+            .next()
+            .unwrap_or(update_block);
+        assert!(update_block.contains("security: []"), "{update_block}");
+
+        let json_text =
+            to_openapi_json(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            json["paths"]["/goal/{uuid}"]["put"]["security"],
+            serde_json::json!([])
         );
     }
 

@@ -595,6 +595,10 @@ fn generate_openapi_generator_compat_files(
             name: "package.json".to_string(),
             contents: emit_axios_package_json(package),
         },
+        SdkFile {
+            name: "tsconfig.json".to_string(),
+            contents: emit_package_tsconfig(),
+        },
     ];
     check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -639,6 +643,10 @@ fn generate_typescript_fetch_compat_files(
             name: "package.json".to_string(),
             contents: emit_fetch_package_json(package),
         },
+        SdkFile {
+            name: "tsconfig.json".to_string(),
+            contents: emit_package_tsconfig(),
+        },
     ];
     check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
@@ -679,13 +687,52 @@ fn emit_fetch_package_json(package: &str) -> String {
         "{{
   \"name\": {},
   \"version\": \"0.1.0\",
-  \"type\": \"module\",
-  \"main\": \"./index.js\",
-  \"types\": \"./index.d.ts\"
+  \"type\": \"commonjs\",
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
+  \"exports\": {{
+    \".\": {{
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
+    }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
+  }}
 }}
 ",
         quoted_string_literal(package)
     )
+}
+
+pub(crate) fn emit_package_tsconfig() -> String {
+    "\
+{
+  \"compilerOptions\": {
+    \"target\": \"ES2022\",
+    \"module\": \"CommonJS\",
+    \"moduleResolution\": \"Node\",
+    \"lib\": [\"ES2022\", \"DOM\"],
+    \"strict\": true,
+    \"declaration\": true,
+    \"outDir\": \"dist\",
+    \"rootDir\": \".\",
+    \"esModuleInterop\": true,
+    \"skipLibCheck\": true
+  },
+  \"include\": [\"**/*.ts\"],
+  \"exclude\": [\"dist\", \"node_modules\"]
+}
+"
+    .to_string()
 }
 
 #[expect(
@@ -1366,11 +1413,28 @@ fn emit_axios_package_json(package: &str) -> String {
         "{{
   \"name\": {},
   \"version\": \"0.1.0\",
-  \"type\": \"module\",
-  \"main\": \"./index.js\",
-  \"types\": \"./index.d.ts\",
+  \"type\": \"commonjs\",
+  \"main\": \"./dist/index.js\",
+  \"types\": \"./dist/index.d.ts\",
+  \"exports\": {{
+    \".\": {{
+      \"types\": \"./dist/index.d.ts\",
+      \"import\": \"./dist/index.js\",
+      \"require\": \"./dist/index.js\",
+      \"default\": \"./dist/index.js\"
+    }}
+  }},
+  \"files\": [\"dist\"],
+  \"scripts\": {{
+    \"prebuild\": \"node -e \\\"require('fs').rmSync('dist', {{ recursive: true, force: true }})\\\"\",
+    \"build\": \"tsc -p tsconfig.json\",
+    \"prepack\": \"npm run build\"
+  }},
   \"dependencies\": {{
     \"axios\": \"^1.0.0\"
+  }},
+  \"devDependencies\": {{
+    \"typescript\": \"^5.0.0\"
   }}
 }}
 ",
@@ -2158,6 +2222,7 @@ mod tests {
                 "index.ts",
                 "models.ts",
                 "package.json",
+                "tsconfig.json",
             ]
         );
         let api = files
@@ -2300,6 +2365,7 @@ mod tests {
                 "models/index.ts",
                 "package.json",
                 "runtime.ts",
+                "tsconfig.json",
             ]
         );
 

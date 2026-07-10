@@ -137,7 +137,7 @@ func NewClient(baseURL string, opts ...Option) *Client {
 		httpClient:         &http.Client{Timeout: 30 * time.Second},
 		timeout:            30 * time.Second,
 		maxRetries:         0,
-		retryStatuses:      map[int]bool{},
+		retryStatuses:      map[int]bool{408: true, 429: true},
 		retryUnsafeMethods: false,
 		apiKeys:            map[string]string{},
 	}

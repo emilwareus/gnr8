@@ -214,6 +214,9 @@ pub(crate) struct HttpAuthFeatures {
 /// Resolve which HTTP auth helpers the generated SDK client must expose.
 pub(crate) fn http_auth_features(graph: &ApiGraph) -> Result<HttpAuthFeatures, CoreError> {
     let schemes = supported_security_schemes(graph)?;
+    for op in &graph.operations {
+        validate_operation_auth_slots(graph, op, &schemes)?;
+    }
     let mut features = HttpAuthFeatures::default();
     for scheme in schemes.values() {
         match scheme {
@@ -231,6 +234,7 @@ pub(crate) fn operation_http_auth_schemes(
     op: &Operation,
 ) -> Result<Vec<HttpAuthScheme>, CoreError> {
     let schemes = supported_security_schemes(graph)?;
+    validate_operation_auth_slots(graph, op, &schemes)?;
     let scheme_ids = operation_security_ids(graph, op);
     let mut out = Vec::new();
     for scheme_id in scheme_ids {
@@ -244,6 +248,39 @@ pub(crate) fn operation_http_auth_schemes(
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+fn validate_operation_auth_slots(
+    graph: &ApiGraph,
+    op: &Operation,
+    schemes: &BTreeMap<String, SupportedAuthScheme>,
+) -> Result<(), CoreError> {
+    let mut slots = BTreeMap::new();
+    for scheme_id in operation_security_ids(graph, op) {
+        let Some(scheme) = schemes.get(&scheme_id) else {
+            return Err(unknown_security_scheme_error(op, &scheme_id));
+        };
+        let slot = match scheme {
+            SupportedAuthScheme::ApiKey(ApiKeyScheme {
+                name,
+                location: ApiKeyLocation::Header,
+            }) => format!("header:{}", name.to_ascii_lowercase()),
+            SupportedAuthScheme::ApiKey(ApiKeyScheme {
+                name,
+                location: ApiKeyLocation::Query,
+            }) => format!("query:{name}"),
+            SupportedAuthScheme::Http(_) => "header:authorization".to_string(),
+        };
+        if let Some(existing) = slots.insert(slot.clone(), scheme_id.clone()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' requires security schemes '{}' and '{}' that both write {slot}",
+                    op.id, existing, scheme_id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1074,6 +1111,18 @@ mod tests {
             vec![HttpAuthScheme::Basic]
         );
         assert!(operation_api_key_headers(&graph, &op)?.is_empty());
+
+        op.security = vec!["BearerAuth".to_string(), "BasicAuth".to_string()];
+        let result = operation_http_auth_schemes(&graph, &op);
+        assert!(
+            result.is_err(),
+            "conflicting Authorization schemes must fail"
+        );
+        let message = result.err().map_or_else(String::new, |err| err.to_string());
+        assert!(
+            message.contains("both write header:authorization"),
+            "{message}"
+        );
         Ok(())
     }
 }

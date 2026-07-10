@@ -140,6 +140,23 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn run_tsc_project(dir: &Path) -> Result<String, gnr8::CoreError> {
+    let output = Command::new("node")
+        .args([TSC, "--project", "tsconfig.json"])
+        .current_dir(dir)
+        .output()
+        .map_err(|source| gnr8::CoreError::TypeScriptToolchainMissing { source })?;
+    if !output.status.success() {
+        let mut captured = String::from_utf8_lossy(&output.stdout).into_owned();
+        captured.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Err(gnr8::CoreError::GoBuild {
+            code: output.status.code(),
+            stderr: captured,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Materialize the generated SDK into a fresh temp dir as flat `<dir>/client.ts` etc., returning the
 /// dir. Unlike the Python twin (which nests a `bookstore/` package), `tssdk::write_to_dir` writes the
 /// four files FLAT (the bundle's fixed frame names), so there is no package subdir.
@@ -484,6 +501,69 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_typescript_package_builds_declared_entrypoints() {
+    if !toolchain_available() {
+        eprintln!("skipping TypeScript package build: node/tsc toolchain unavailable");
+        return;
+    }
+    let dir = materialize_fetch_compat_sdk();
+    let result = run_tsc_project(&dir);
+    assert!(
+        result.is_ok(),
+        "generated npm package must build: {result:?}"
+    );
+
+    let package_text =
+        std::fs::read_to_string(dir.join("package.json")).expect("read package.json");
+    let package: serde_json::Value =
+        serde_json::from_str(&package_text).expect("package.json must parse");
+    for field in ["main", "types"] {
+        let relative = package[field]
+            .as_str()
+            .expect("package entrypoint must be a string")
+            .trim_start_matches("./");
+        assert!(
+            dir.join(relative).is_file(),
+            "package {field} entrypoint must exist after build: {relative}"
+        );
+    }
+
+    let commonjs = Command::new("node")
+        .args([
+            "--eval",
+            "const sdk = require('.'); if (typeof sdk.Configuration !== 'function') process.exit(1);",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run CommonJS package consumer");
+    assert!(
+        commonjs.status.success(),
+        "CommonJS package consumer failed: {}",
+        String::from_utf8_lossy(&commonjs.stderr)
+    );
+
+    let esm = Command::new("node")
+        .args([
+            "--input-type=module",
+            "--eval",
+            "import { Configuration } from 'sdk'; if (typeof Configuration !== 'function') process.exit(1);",
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run ESM package consumer");
+    assert!(
+        esm.status.success(),
+        "ESM package consumer failed: {}",
+        String::from_utf8_lossy(&esm.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(
+        dir.parent()
+            .expect("generated fetch SDK should have a temp parent"),
+    );
 }
 
 #[test]

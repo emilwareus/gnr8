@@ -101,7 +101,10 @@ fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
 fn write_pydantic_stub(dir: &Path) {
     std::fs::write(
         dir.join("pydantic.py"),
-        r#"class ConfigDict(dict):
+        r#"import enum
+
+
+class ConfigDict(dict):
     pass
 
 
@@ -136,6 +139,14 @@ class BaseModel:
         def dump(value):
             if isinstance(value, BaseModel):
                 return value.model_dump(**_kwargs)
+            if isinstance(value, (bytes, bytearray)):
+                if _kwargs.get("mode") == "json":
+                    return bytes(value).decode("utf-8")
+                return value
+            if isinstance(value, enum.Enum):
+                if _kwargs.get("mode") == "json":
+                    return value.value
+                return value
             if isinstance(value, list):
                 return [dump(item) for item in value]
             if isinstance(value, dict):
@@ -459,7 +470,7 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
     graph.runtime = gnr8::graph::RuntimePolicy {
         default_timeout_ms: Some(5_000),
         max_retries: 0,
-        retry_statuses: vec![408, 429],
+        retry_statuses: Vec::new(),
         retry_unsafe_methods: false,
         hooks: Vec::new(),
     };
@@ -833,9 +844,15 @@ if __name__ == "__main__":
 const MEDIA_DRIVER: &str = r#"import threading
 import urllib.parse
 import urllib.request
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import bookstore
+
+
+class WireValue(str, Enum):
+    ADA = "Ada"
+    REPORT = "Report"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -865,7 +882,7 @@ class _Handler(BaseHTTPRequestHandler):
             assert b'name="title"' in body, body
             assert b"Report" in body, body
             assert b'name="file"; filename="file"' in body, body
-            assert b"abc123" in body, body
+            assert b"\xff\x00binary" in body, body
             assert body.count(b'name="files"; filename="files"') == 2, body
             assert b"part-one" in body, body
             assert b"part-two" in body, body
@@ -888,11 +905,11 @@ def main():
             opener=urllib.request.build_opener(),
         )
         assert client.post_text("hello") is None
-        assert client.post_form(bookstore.FormBody(name="Ada", count=3, tags=["sdk", "media"])) is None
+        assert client.post_form(bookstore.FormBody(name=WireValue.ADA, count=3, tags=["sdk", "media"])) is None
         assert client.post_multipart(
             bookstore.MultipartBody(
-                title="Report",
-                file=b"abc123",
+                title=WireValue.REPORT,
+                file=b"\xff\x00binary",
                 files=[b"part-one", b"part-two"],
             )
         ) is None
@@ -932,7 +949,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         key = f"{self.command} {self.path}"
         _Handler.counts[key] += 1
-        self._send_empty(500 if _Handler.counts[key] == 1 else 204)
+        self._send_empty(429 if _Handler.counts[key] == 1 else 204)
 
     def do_POST(self):
         key = f"{self.command} {self.path}"
@@ -989,7 +1006,7 @@ def main():
         assert _Handler.idempotency_keys == ["idem-1", "idem-1"], _Handler.idempotency_keys
 
         assert ("request", "listItems", "GET", "/items", "runtime") in events, events
-        assert ("response", "listItems", 500) in events, events
+        assert ("response", "listItems", 429) in events, events
         assert ("response", "listItems", 204) in events, events
         assert any(event[:3] == ("error", "createUnsafe", 500) for event in events), events
     finally:

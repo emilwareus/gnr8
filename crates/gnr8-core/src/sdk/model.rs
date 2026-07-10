@@ -492,7 +492,7 @@ impl SdkModel {
 
 fn effective_retry_statuses(graph: &ApiGraph) -> Vec<u16> {
     let mut statuses = graph.runtime.retry_statuses.clone();
-    if graph.runtime.max_retries > 0 && statuses.is_empty() {
+    if statuses.is_empty() {
         statuses.extend([408, 429]);
     }
     statuses.sort_unstable();
@@ -794,6 +794,7 @@ mod tests {
         assert_eq!(model.operations[0].error_responses[0].status, 404);
         assert_eq!(model.runtime.default_timeout_ms, None);
         assert_eq!(model.runtime.max_retries, 0);
+        assert_eq!(model.runtime.retry_statuses, vec![408, 429]);
         assert_eq!(model.docs_metadata.title, "Book API");
         assert_eq!(model.docs_metadata.operations[0].tags, vec!["Books"]);
         assert_eq!(model.docs_metadata.schemas[0].name, "Book");

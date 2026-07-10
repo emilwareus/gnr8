@@ -991,7 +991,7 @@ fn ts_timeout_value(timeout_ms: Option<u64>) -> String {
 
 fn ts_retry_status_array(runtime: &RuntimePolicy) -> String {
     let mut statuses = runtime.retry_statuses.clone();
-    if runtime.max_retries > 0 && statuses.is_empty() {
+    if statuses.is_empty() {
         statuses.extend([408, 429]);
     }
     statuses.sort_unstable();
@@ -3280,7 +3280,7 @@ mod tests {
                     kind: "http".to_string(),
                     location: String::new(),
                     name: "basic".to_string(),
-                    global: true,
+                    global: false,
                 },
             ];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
@@ -3292,6 +3292,14 @@ mod tests {
                 out.contains("headers[\"Authorization\"] = bearerAuth;"),
                 "{out}"
             );
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.id == "listBooks")
+                .unwrap();
+            op.security = vec!["BasicAuth".to_string()];
+            op.security_overrides_global = true;
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("const basicAuth = this._basicAuth();"),
                 "{out}"
@@ -3657,6 +3665,26 @@ mod tests {
             assert!(
                 out.contains("throw error;\n      }\n      let response: Response | undefined"),
                 "request hook failures must be rethrown before fetch retry handling:\n{out}"
+            );
+        }
+
+        #[test]
+        fn runtime_retry_overrides_keep_default_transient_statuses() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                false,
+                false,
+                false,
+                &RuntimePolicy::default(),
+            );
+            assert!(
+                out.contains("this.maxRetries = opts.maxRetries ?? 0;"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.retryStatuses = new Set<number>([408, 429]);"),
+                "{out}"
             );
         }
 

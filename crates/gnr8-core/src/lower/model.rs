@@ -85,6 +85,9 @@ pub(crate) struct Operation {
     pub tags: Vec<String>,
     /// Operation-level security requirements.
     pub security: Vec<SecurityRequirement>,
+    /// Whether the operation must emit a `security` key even when the requirement list is empty.
+    #[serde(skip)]
+    pub security_explicit: bool,
     /// Path + query parameters, in graph (name-sorted) order.
     pub parameters: Vec<Parameter>,
     /// The JSON request body, if the operation takes one.

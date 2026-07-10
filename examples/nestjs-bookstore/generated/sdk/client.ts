@@ -73,7 +73,7 @@ export class Client {
     this.apiKeys = opts.apiKeys ?? {};
     this.timeoutMs = opts.timeoutMs ?? 30000;
     this.maxRetries = opts.maxRetries ?? 0;
-    this.retryStatuses = new Set<number>([]);
+    this.retryStatuses = new Set<number>([408, 429]);
     this.retryUnsafeMethods = false;
     this.hooks = {
       request: opts.hooks?.request ?? [],

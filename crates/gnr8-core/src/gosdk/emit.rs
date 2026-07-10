@@ -1323,7 +1323,7 @@ fn go_duration_ms(timeout_ms: u64) -> String {
 
 fn go_retry_status_map(runtime: &RuntimePolicy) -> String {
     let mut statuses = runtime.retry_statuses.clone();
-    if runtime.max_retries > 0 && statuses.is_empty() {
+    if statuses.is_empty() {
         statuses.extend([408, 429]);
     }
     statuses.sort_unstable();
@@ -3878,10 +3878,6 @@ struct GoPaginationInfo {
     next_cursor_field: Option<String>,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Go pagination helper emission writes page and item helpers in one deterministic source block"
-)]
 fn emit_pagination_helpers(
     body: &mut String,
     op: &Operation,
@@ -3927,6 +3923,66 @@ fn emit_pagination_helpers(
         writeln!(body, "}}").map_err(sink)?;
     }
     writeln!(body, "pages = append(pages, page)").map_err(sink)?;
+    emit_go_pagination_advance(body, op, policy, &info, "break")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "return pages, nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+
+    let mut iter_args = args.clone();
+    let opts = iter_args.pop().ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination helper for operation '{}' has no opts argument",
+            op.id
+        ),
+    })?;
+    iter_args.push(format!("yield func({}) bool", info.item_type));
+    iter_args.push(opts);
+    writeln!(body).map_err(sink)?;
+    writeln!(
+        body,
+        "// {items_name} visits every item from {pages_name} until yield returns false."
+    )
+    .map_err(sink)?;
+    writeln!(
+        body,
+        "func (c *Client) {items_name}({}) error {{",
+        iter_args.join(", ")
+    )
+    .map_err(sink)?;
+    emit_go_pagination_initialization(body, op, policy)?;
+    writeln!(body, "for {{").map_err(sink)?;
+    writeln!(
+        body,
+        "page, err := c.{method_name}({})",
+        call_args.join(", ")
+    )
+    .map_err(sink)?;
+    writeln!(body, "if err != nil {{").map_err(sink)?;
+    writeln!(body, "return err").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if policy.termination == PaginationTermination::EmptyItems {
+        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "return nil").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
+    writeln!(body, "if !yield(item) {{").map_err(sink)?;
+    writeln!(body, "return nil").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    emit_go_pagination_advance(body, op, policy, &info, "return nil")?;
+    writeln!(body, "}}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(())
+}
+
+fn emit_go_pagination_advance(
+    body: &mut String,
+    op: &Operation,
+    policy: &PaginationPolicy,
+    info: &GoPaginationInfo,
+    terminate: &str,
+) -> Result<(), CoreError> {
     match policy.mode {
         PaginationMode::Cursor => {
             let cursor_param = policy
@@ -3950,7 +4006,7 @@ fn emit_pagination_helpers(
             let param_field = exported(&param.name);
             writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
             writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
-            writeln!(body, "break").map_err(sink)?;
+            writeln!(body, "{terminate}").map_err(sink)?;
             writeln!(body, "}}").map_err(sink)?;
             if param.required {
                 writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
@@ -3996,49 +4052,6 @@ fn emit_pagination_helpers(
             }
         }
     }
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "return pages, nil").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-
-    let mut iter_args = args.clone();
-    let opts = iter_args.pop().ok_or_else(|| CoreError::SdkGen {
-        message: format!(
-            "pagination helper for operation '{}' has no opts argument",
-            op.id
-        ),
-    })?;
-    iter_args.push(format!("yield func({}) bool", info.item_type));
-    iter_args.push(opts);
-    writeln!(body).map_err(sink)?;
-    writeln!(
-        body,
-        "// {items_name} visits every item from {pages_name} until yield returns false."
-    )
-    .map_err(sink)?;
-    writeln!(
-        body,
-        "func (c *Client) {items_name}({}) error {{",
-        iter_args.join(", ")
-    )
-    .map_err(sink)?;
-    writeln!(
-        body,
-        "pages, err := c.{pages_name}({})",
-        call_args.join(", ")
-    )
-    .map_err(sink)?;
-    writeln!(body, "if err != nil {{").map_err(sink)?;
-    writeln!(body, "return err").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "for _, page := range pages {{").map_err(sink)?;
-    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
-    writeln!(body, "if !yield(item) {{").map_err(sink)?;
-    writeln!(body, "return nil").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
-    writeln!(body, "return nil").map_err(sink)?;
-    writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
 

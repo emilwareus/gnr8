@@ -991,7 +991,7 @@ fn py_timeout_value(timeout_ms: Option<u64>) -> String {
 
 fn py_retry_status_tuple(runtime: &RuntimePolicy) -> String {
     let mut statuses = runtime.retry_statuses.clone();
-    if runtime.max_retries > 0 && statuses.is_empty() {
+    if statuses.is_empty() {
         statuses.extend([408, 429]);
     }
     statuses.sort_unstable();
@@ -1125,8 +1125,8 @@ pub(crate) fn emit_client_with_models(
     has_pagination: bool,
 ) -> String {
     let body_value = match model_style {
-        PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            return body.model_dump(mode=\"json\", by_alias=True, exclude_unset=True)\n        return body\n",
-        PyModelStyle::Dataclass => "        if body is not None and dataclasses.is_dataclass(body):\n            return dataclasses.asdict(body)\n        return body\n",
+        PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            mode = \"python\" if body_encoding == \"multipart\" else \"json\"\n            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)\n        return self._wire_value(body)\n",
+        PyModelStyle::Dataclass => "        if body is not None and dataclasses.is_dataclass(body):\n            body = dataclasses.asdict(body)\n        return self._wire_value(body)\n",
     };
 
     // --- Import header, assembled per file in canonical isort order (no unused imports, F401-clean). ---
@@ -1137,7 +1137,9 @@ pub(crate) fn emit_client_with_models(
     if let PyModelStyle::Dataclass = model_style {
         stdlib.push("import dataclasses".to_string());
     }
+    stdlib.push("import enum".to_string());
     stdlib.push("import json".to_string());
+    stdlib.push("import secrets".to_string());
     stdlib.push("import time".to_string());
     stdlib.push("import urllib.error".to_string());
     stdlib.push("import urllib.parse".to_string());
@@ -1318,8 +1320,19 @@ class Client:
         self._retry_unsafe_methods = {retry_unsafe_methods}
         self._hooks = hooks or ClientHooks()
 
-    def _body_value(self, body: Any) -> Any:
+    def _body_value(self, body: Any, body_encoding: str) -> Any:
 {body_value}
+    def _wire_value(self, value: Any) -> Any:
+        if isinstance(value, enum.Enum):
+            return self._wire_value(value.value)
+        if isinstance(value, list):
+            return [self._wire_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._wire_value(item) for item in value)
+        if isinstance(value, dict):
+            return {{key: self._wire_value(item) for key, item in value.items()}}
+        return value
+
     def _encode_body(
         self,
         body: Optional[Any],
@@ -1336,14 +1349,14 @@ class Client:
             raise TypeError(\"binary request bodies must be bytes or bytearray\")
         if body_encoding == \"text\":
             return str(body).encode(), content_type
-        value = self._body_value(body)
+        value = self._body_value(body, body_encoding)
         if body_encoding == \"json\":
             return json.dumps(value).encode(), content_type
         if body_encoding == \"form\":
             encoded = urllib.parse.urlencode(value, doseq=True).encode()
             return encoded, content_type
         if body_encoding == \"multipart\":
-            boundary = \"gnr8-boundary\"
+            boundary = f\"gnr8-{{secrets.token_hex(16)}}\"
             return (
                 self._encode_multipart(value, boundary),
                 f\"multipart/form-data; boundary={{boundary}}\",
@@ -2980,7 +2993,7 @@ mod tests {
                     kind: "http".to_string(),
                     location: String::new(),
                     name: "basic".to_string(),
-                    global: true,
+                    global: false,
                 },
             ];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
@@ -2988,10 +3001,18 @@ mod tests {
                 out.contains("_status, _headers, _raw = self._do(")
                     && out.contains("\"GET\",")
                     && out.contains("auth_bearer=True,")
-                    && out.contains("auth_basic=True,")
                     && out.contains("operation_id=\"listBooks\","),
                 "{out}"
             );
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|op| op.id == "listBooks")
+                .unwrap();
+            op.security = vec!["BasicAuth".to_string()];
+            op.security_overrides_global = true;
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(out.contains("auth_basic=True,"), "{out}");
         }
 
         #[test]

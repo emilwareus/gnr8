@@ -317,8 +317,6 @@ impl Importer {
                 Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
             }
         }
-        let has_inherited_security =
-            !security_requirement_scheme_ids(self.root.get("security")).is_empty();
         let Some(paths) = self.root.get("paths").and_then(Value::as_object) else {
             return Ok(());
         };
@@ -346,29 +344,10 @@ impl Importer {
                         || format!("{} {}", method.to_ascii_uppercase(), path),
                         str::to_string,
                     );
-                if requirements.is_empty() && has_inherited_security {
-                    return Err(CoreError::Config {
-                        message: format!(
-                            "operation '{op_label}' disables inherited security with security: []; gnr8 graph cannot represent per-operation security removal"
-                        ),
-                    });
-                }
                 if requirements.len() > 1 {
                     return Err(CoreError::Config {
                         message: format!(
                             "operation '{op_label}' uses alternative security requirements; gnr8 currently supports one AND requirement object, not OR alternatives"
-                        ),
-                    });
-                }
-                if has_inherited_security
-                    && requirements
-                        .first()
-                        .and_then(Value::as_object)
-                        .is_some_and(serde_json::Map::is_empty)
-                {
-                    return Err(CoreError::Config {
-                        message: format!(
-                            "operation '{op_label}' disables inherited security with an empty security requirement; gnr8 graph cannot represent per-operation security removal"
                         ),
                     });
                 }
@@ -776,16 +755,6 @@ impl Importer {
             return Vec::new();
         };
         if requirements.is_empty() {
-            if self
-                .root
-                .get("security")
-                .and_then(Value::as_array)
-                .is_some_and(|items| !items.is_empty())
-            {
-                self.warn(format!(
-                    "operation '{operation_id}' disables inherited security; gnr8 graph cannot represent per-operation security removal"
-                ));
-            }
             return Vec::new();
         }
         if requirements.len() > 1 {
@@ -2302,13 +2271,16 @@ components:
       in: header
       name: X-API-Key
 ";
-        let err = import_openapi_document(
+        let graph = import_openapi_document(
             std::path::Path::new("."),
             std::path::PathBuf::from("openapi.yaml"),
             security_removal,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("disables inherited security"));
+        .unwrap();
+        assert_eq!(graph.operations[0].id, "publicEndpoint");
+        assert!(graph.operations[0].security.is_empty());
+        assert!(graph.operations[0].security_overrides_global);
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
 
         let missing_scheme = r"
 openapi: 3.1.0
