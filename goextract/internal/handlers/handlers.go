@@ -146,10 +146,18 @@ type parameterHint struct {
 	defaultValue  *facts.LiteralValue
 }
 
+type untypedQueryRead struct {
+	name string
+	file string
+	line uint32
+}
+
 type contextTraversal struct {
 	route                  routes.Route
 	cf                     *CodeFacts
 	seenParam              map[string]bool
+	resolvedParam          map[string]bool
+	untypedQueryReads      *[]untypedQueryRead
 	formFields             map[string]facts.FieldFact
 	formHasFile            *bool
 	hasBodyBind            *bool
@@ -383,7 +391,6 @@ func (a *Analyzer) analyzeContextHelperCall(
 		bindings: helperCallBindings(caller, call, fn),
 	}
 	hint := helperCallHint(caller, call, inherited)
-	suppressBodyBinds := callUsesTypeArgs(call)
 	traversal.stack[key] = true
 	defer delete(traversal.stack, key)
 
@@ -395,18 +402,22 @@ func (a *Analyzer) analyzeContextHelperCall(
 		}
 		name, recvPkg, ginCall := routes.GinMethod(callee.info, nested)
 		if ginCall && recvPkg == routes.GinPkgPath {
-			a.analyzeTraversedGinCall(next, nested, name, hint, optionalBindPositions, suppressBodyBinds, traversal)
+			a.analyzeTraversedGinCall(next, nested, name, hint, optionalBindPositions, traversal)
 			return true
 		}
-		if pname, ok := requestHeaderGetNameInFrame(next, nested); ok {
-			a.addTraversedParameter(traversal, requestParameter(
-				pname,
-				"header",
-				true,
-				facts.PrimitiveType(facts.StringPrim()),
-				callee.fset,
-				nested.Pos(),
-			))
+		if pname, matched, resolved := requestHeaderGetInFrame(next, nested); matched {
+			if resolved {
+				a.addTraversedParameter(traversal, requestParameter(
+					pname,
+					"header",
+					true,
+					facts.PrimitiveType(facts.StringPrim()),
+					callee.fset,
+					nested.Pos(),
+				), true)
+			} else {
+				a.reportDynamicParameterName(next, nested, traversal, "Request.Header.Get")
+			}
 		}
 		if frameCallPassesGinContext(next, nested) {
 			a.analyzeContextHelperCall(next, nested, hint, depth+1, traversal)
@@ -567,7 +578,6 @@ func (a *Analyzer) analyzeTraversedGinCall(
 	method string,
 	hint parameterHint,
 	optionalBindPositions map[token.Pos]bool,
-	suppressBodyBinds bool,
 	traversal *contextTraversal,
 ) {
 	switch method {
@@ -577,7 +587,9 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			if hint.schemaKnown && hint.schema != nil {
 				schema = *hint.schema
 			}
-			a.addTraversedParameter(traversal, requestParameter(name, "path", true, schema, frame.decl.fset, call.Pos()))
+			a.addTraversedParameter(traversal, requestParameter(name, "path", true, schema, frame.decl.fset, call.Pos()), true)
+		} else {
+			a.reportDynamicParameterName(frame, call, traversal, method)
 		}
 	case "Query", "DefaultQuery", "GetQuery", "QueryArray", "GetQueryArray", "QueryMap":
 		name, ok := frameCallStringArg(frame, call, 0)
@@ -586,10 +598,11 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			return
 		}
 		param := parameterFromGinAccess(frame.decl.info, method, name, frame.decl.fset, call, hint)
-		a.addTraversedParameter(traversal, param)
+		resolved := method != "Query" || hint.schemaKnown || hint.requiredKnown || hint.defaultValue != nil
+		a.addTraversedParameter(traversal, param, resolved)
 		if method == "Query" && !hint.requiredKnown && traversal.diagnostics != nil {
 			file, line := positionOf(frame.decl.fset, call.Pos())
-			traversal.diagnostics.UntypedQueryParam(name, traversal.route.Method, untypedRouteLabel(traversal.route), file, line)
+			*traversal.untypedQueryReads = append(*traversal.untypedQueryReads, untypedQueryRead{name: name, file: file, line: line})
 		}
 	case "GetHeader":
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
@@ -601,7 +614,7 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			if hint.requiredKnown {
 				required = hint.required
 			}
-			a.addTraversedParameter(traversal, requestParameter(name, "header", required, schema, frame.decl.fset, call.Pos()))
+			a.addTraversedParameter(traversal, requestParameter(name, "header", required, schema, frame.decl.fset, call.Pos()), true)
 		} else {
 			a.reportDynamicParameterName(frame, call, traversal, method)
 		}
@@ -615,30 +628,26 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			if hint.requiredKnown {
 				required = hint.required
 			}
-			a.addTraversedParameter(traversal, requestParameter(name, "cookie", required, schema, frame.decl.fset, call.Pos()))
+			a.addTraversedParameter(traversal, requestParameter(name, "cookie", required, schema, frame.decl.fset, call.Pos()), true)
 		} else {
 			a.reportDynamicParameterName(frame, call, traversal, method)
 		}
 	case "ShouldBindQuery":
-		a.addBoundParameters(frame, call, "query", traversal.cf, traversal.seenParam, traversal.diagnostics)
+		a.addBoundParameters(frame, call, "query", traversal.cf, traversal.seenParam, traversal.resolvedParam, traversal.route, traversal.diagnostics)
 	case "ShouldBindHeader":
-		a.addBoundParameters(frame, call, "header", traversal.cf, traversal.seenParam, traversal.diagnostics)
+		a.addBoundParameters(frame, call, "header", traversal.cf, traversal.seenParam, traversal.resolvedParam, traversal.route, traversal.diagnostics)
 	case "ShouldBindJSON", "BindJSON":
-		if !suppressBodyBinds {
-			a.setTraversedRequestBody(frame, call, "application/json", optionalBindPositions, traversal)
-		}
+		a.setTraversedRequestBody(frame, call, "application/json", optionalBindPositions, traversal)
 	case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
-		if !suppressBodyBinds {
-			bound := boundTypeFromCall(frame, call)
-			contentType := bindContentType(method, frame.decl.info, call, bound)
-			a.setTraversedRequestBody(frame, call, contentType, optionalBindPositions, traversal)
-		}
+		bound := boundTypeFromCall(frame, call)
+		contentType := bindContentType(method, frame.decl.info, call, bound)
+		a.setTraversedRequestBody(frame, call, contentType, optionalBindPositions, traversal)
 	case "FormFile":
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
 			traversal.formFields[name] = formField(name, facts.PrimitiveType(facts.BytesPrim()), true)
 			*traversal.formHasFile = true
 		} else {
-			a.reportDynamicParameterName(frame, call, traversal, method)
+			a.reportDynamicBodyFieldName(frame, call, traversal, method)
 		}
 	case "PostForm", "DefaultPostForm", "GetPostForm":
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
@@ -650,7 +659,7 @@ func (a *Analyzer) analyzeTraversedGinCall(
 				traversal.formFields[name] = field
 			}
 		} else {
-			a.reportDynamicParameterName(frame, call, traversal, method)
+			a.reportDynamicBodyFieldName(frame, call, traversal, method)
 		}
 	}
 }
@@ -665,14 +674,55 @@ func (a *Analyzer) setTraversedRequestBody(
 	bound := boundTypeFromCall(frame, call)
 	id, ok := a.namedTypeID(bound)
 	if !ok {
+		if !isTypeParameter(bound) && traversal.diagnostics != nil {
+			file, line := positionOf(frame.decl.fset, call.Pos())
+			traversal.diagnostics.RequestBodyUnresolved(
+				selectorName(call.Fun),
+				traversal.route.Method,
+				untypedRouteLabel(traversal.route),
+				"binding target does not resolve to a named schema",
+				file,
+				line,
+			)
+		}
 		return
 	}
-	traversal.cf.RequestBody = &facts.TypeRef{RefID: id}
-	traversal.cf.RequestBodyContentType = contentType
+	if contentType == "" && traversal.diagnostics != nil {
+		file, line := positionOf(frame.decl.fset, call.Pos())
+		traversal.diagnostics.RequestBodyUnresolved(
+			selectorName(call.Fun),
+			traversal.route.Method,
+			untypedRouteLabel(traversal.route),
+			"binding media type is selected dynamically or is unsupported",
+			file,
+			line,
+		)
+	}
+	a.setRequestBodyFact(
+		traversal.cf,
+		&facts.TypeRef{RefID: id},
+		contentType,
+		traversal.route,
+		traversal.diagnostics,
+		frame.decl.fset,
+		call.Pos(),
+		selectorName(call.Fun),
+	)
 	*traversal.hasBodyBind = true
 	if !optionalBindPositions[call.Pos()] {
 		*traversal.allBodyBindsOptional = false
 	}
+}
+
+func isTypeParameter(t gotypes.Type) bool {
+	if t == nil {
+		return false
+	}
+	if pointer, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = pointer.Elem()
+	}
+	_, ok := gotypes.Unalias(t).(*gotypes.TypeParam)
+	return ok
 }
 
 func boundTypeFromCall(frame helperFrame, call *ast.CallExpr) gotypes.Type {
@@ -700,13 +750,16 @@ func frameCallStringArg(frame helperFrame, call *ast.CallExpr, index int) (strin
 	return frameStringValue(frame, call.Args[index])
 }
 
-func (a *Analyzer) addTraversedParameter(traversal *contextTraversal, param facts.ParamFact) {
-	key := param.Location + "/" + param.Name
-	if traversal.seenParam[key] {
-		return
-	}
-	traversal.seenParam[key] = true
-	traversal.cf.Params = append(traversal.cf.Params, param)
+func (a *Analyzer) addTraversedParameter(traversal *contextTraversal, param facts.ParamFact, resolved bool) {
+	a.addExtractedParameter(
+		traversal.cf,
+		traversal.seenParam,
+		traversal.resolvedParam,
+		param,
+		resolved,
+		traversal.route,
+		traversal.diagnostics,
+	)
 }
 
 func (a *Analyzer) reportDynamicParameterName(
@@ -729,27 +782,48 @@ func (a *Analyzer) reportDynamicParameterName(
 	)
 }
 
-func requestHeaderGetName(info *gotypes.Info, call *ast.CallExpr) (string, bool) {
-	return requestHeaderGetNameInFrame(helperFrame{decl: handlerDecl{info: info}}, call)
+func (a *Analyzer) reportDynamicBodyFieldName(
+	frame helperFrame,
+	call *ast.CallExpr,
+	traversal *contextTraversal,
+	method string,
+) {
+	if traversal.diagnostics == nil {
+		return
+	}
+	file, line := positionOf(frame.decl.fset, call.Pos())
+	traversal.diagnostics.RequestBodyUnresolved(
+		method,
+		traversal.route.Method,
+		untypedRouteLabel(traversal.route),
+		"form field name is dynamic",
+		file,
+		line,
+	)
 }
 
-func requestHeaderGetNameInFrame(frame helperFrame, call *ast.CallExpr) (string, bool) {
+func requestHeaderGet(info *gotypes.Info, call *ast.CallExpr) (string, bool, bool) {
+	return requestHeaderGetInFrame(helperFrame{decl: handlerDecl{info: info}}, call)
+}
+
+func requestHeaderGetInFrame(frame helperFrame, call *ast.CallExpr) (string, bool, bool) {
 	if call == nil || frame.decl.info == nil || len(call.Args) == 0 {
-		return "", false
+		return "", false, false
 	}
 	method, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || method.Sel == nil || method.Sel.Name != "Get" || !isNamedType(frame.decl.info.TypeOf(method.X), "net/http", "Header") {
-		return "", false
+		return "", false, false
 	}
 	header, ok := method.X.(*ast.SelectorExpr)
 	if !ok || header.Sel == nil || header.Sel.Name != "Header" {
-		return "", false
+		return "", false, false
 	}
 	request, ok := header.X.(*ast.SelectorExpr)
 	if !ok || request.Sel == nil || request.Sel.Name != "Request" || !isGinContextType(frameTypeOf(frame, request.X)) {
-		return "", false
+		return "", false, false
 	}
-	return frameCallStringArg(frame, call, 0)
+	name, resolved := frameCallStringArg(frame, call, 0)
+	return name, true, resolved
 }
 
 // Analyze infers the request/response/param facts for one route's handler. The
@@ -765,6 +839,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 
 	cf := CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	seenParam := map[string]bool{}
+	resolvedParam := map[string]bool{}
+	untypedQueryReads := []untypedQueryRead{}
 	seenStatus := map[uint16]bool{}
 	provisionalStatus := map[uint16]bool{}
 	formFields := map[string]facts.FieldFact{}
@@ -782,20 +858,23 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
-			if pname, ok := requestHeaderGetName(h.info, call); ok && !seenParam["header/"+pname] {
-				seenParam["header/"+pname] = true
-				cf.Params = append(cf.Params, requestParameter(
-					pname,
-					"header",
-					true,
-					facts.PrimitiveType(facts.StringPrim()),
-					h.fset,
-					call.Pos(),
-				))
+			if pname, matched, resolved := requestHeaderGet(h.info, call); matched {
+				if resolved {
+					a.addExtractedParameter(
+						&cf,
+						seenParam,
+						resolvedParam,
+						requestParameter(pname, "header", true, facts.PrimitiveType(facts.StringPrim()), h.fset, call.Pos()),
+						true,
+						route,
+						diags,
+					)
+				} else {
+					reportDirectDynamicParameter(diags, h, route, call, "Request.Header.Get")
+				}
 			}
 			if ref, schema, ok := a.bodyFromGenericJSONHelper(h, call); ok {
-				cf.RequestBody = ref
-				cf.RequestBodyContentType = "application/json"
+				a.setRequestBodyFact(&cf, ref, "application/json", route, diags, h.fset, call.Pos(), selectorName(call.Fun))
 				cf.Schemas = append(cf.Schemas, schema...)
 				hasBodyBind = true
 				allBodyBindsOptional = false
@@ -809,6 +888,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 					route:                  route,
 					cf:                     &cf,
 					seenParam:              seenParam,
+					resolvedParam:          resolvedParam,
+					untypedQueryReads:      &untypedQueryReads,
 					formFields:             formFields,
 					formHasFile:            &formHasFile,
 					hasBodyBind:            &hasBodyBind,
@@ -820,31 +901,37 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			)
 			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedResponseSeen, contentTypeHint)
 			a.analyzePathHelperCall(h, call, &cf, seenParam)
-			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
+			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam, resolvedParam, diags)
 			return true
 		}
 		switch name {
 		case "ShouldBindJSON", "BindJSON":
 			if ref, _, ok := a.bindRequestType(h.info, call); ok {
-				cf.RequestBody = ref
-				cf.RequestBodyContentType = "application/json"
+				a.setRequestBodyFact(&cf, ref, "application/json", route, diags, h.fset, call.Pos(), name)
 				hasBodyBind = true
 				if !optionalBindPositions[call.Pos()] {
 					allBodyBindsOptional = false
 				}
+			} else {
+				reportDirectUnresolvedBody(diags, h, route, call, name, "binding target does not resolve to a named schema")
 			}
 		case "ShouldBindQuery":
-			a.addBoundParameters(helperFrame{decl: h}, call, "query", &cf, seenParam, diags)
+			a.addBoundParameters(helperFrame{decl: h}, call, "query", &cf, seenParam, resolvedParam, route, diags)
 		case "ShouldBindHeader":
-			a.addBoundParameters(helperFrame{decl: h}, call, "header", &cf, seenParam, diags)
+			a.addBoundParameters(helperFrame{decl: h}, call, "header", &cf, seenParam, resolvedParam, route, diags)
 		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
 			if ref, bound, ok := a.bindRequestType(h.info, call); ok {
-				cf.RequestBody = ref
+				contentType := bindContentType(name, h.info, call, bound)
+				if contentType == "" {
+					reportDirectUnresolvedBody(diags, h, route, call, name, "binding media type is selected dynamically or is unsupported")
+				}
+				a.setRequestBodyFact(&cf, ref, contentType, route, diags, h.fset, call.Pos(), name)
 				hasBodyBind = true
 				if !optionalBindPositions[call.Pos()] {
 					allBodyBindsOptional = false
 				}
-				cf.RequestBodyContentType = bindContentType(name, h.info, call, bound)
+			} else {
+				reportDirectUnresolvedBody(diags, h, route, call, name, "binding target does not resolve to a named schema")
 			}
 		case "JSON":
 			a.analyzeJSON(h, call, route, &cf, seenStatus, provisionalStatus, diags)
@@ -853,7 +940,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		case "AbortWithStatus":
 			a.analyzeStatus(h, call, route, &cf, seenStatus, provisionalStatus, false, diags)
 		case "Header":
-			if key, ok := stringArg(call, 0); ok && strings.EqualFold(key, "Content-Type") {
+			if key, ok := a.callStringArg(h, call, 0); ok && strings.EqualFold(key, "Content-Type") {
 				if value, ok := a.stringValueOf(h, call.Args[1]); ok {
 					contentTypeHint = value
 				}
@@ -871,53 +958,65 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				a.addSSEResponse(&cf, seenStatus, provisionalStatus)
 			}
 		case "Param":
-			if pname, ok := stringArg(call, 0); ok && !seenParam["path/"+pname] {
-				seenParam["path/"+pname] = true
-				cf.Params = append(cf.Params, pathParam(pname, h.fset, call.Pos()))
+			if pname, ok := a.callStringArg(h, call, 0); ok {
+				a.addExtractedParameter(&cf, seenParam, resolvedParam, pathParam(pname, h.fset, call.Pos()), true, route, diags)
+			} else {
+				reportDirectDynamicParameter(diags, h, route, call, name)
 			}
 		case "Query", "DefaultQuery", "GetQuery", "QueryArray", "GetQueryArray", "QueryMap":
-			if pname, ok := stringArg(call, 0); ok && !seenParam["query/"+pname] {
-				seenParam["query/"+pname] = true
+			if pname, ok := a.callStringArg(h, call, 0); ok {
 				file, line := positionOf(h.fset, call.Pos())
-				cf.Params = append(cf.Params, parameterFromGinAccess(h.info, name, pname, h.fset, call, parameterHint{}))
+				resolved := name != "Query"
+				a.addExtractedParameter(
+					&cf,
+					seenParam,
+					resolvedParam,
+					parameterFromGinAccess(h.info, name, pname, h.fset, call, parameterHint{}),
+					resolved,
+					route,
+					diags,
+				)
 				if name == "Query" {
-					diags.UntypedQueryParam(pname, route.Method, untypedRouteLabel(route), file, line)
+					untypedQueryReads = append(untypedQueryReads, untypedQueryRead{name: pname, file: file, line: line})
 				}
+			} else {
+				reportDirectDynamicParameter(diags, h, route, call, name)
 			}
 		case "GetHeader":
-			if pname, ok := stringArg(call, 0); ok && !seenParam["header/"+pname] {
-				seenParam["header/"+pname] = true
-				cf.Params = append(cf.Params, requestParameter(
+			if pname, ok := a.callStringArg(h, call, 0); ok {
+				a.addExtractedParameter(&cf, seenParam, resolvedParam, requestParameter(
 					pname,
 					"header",
 					true,
 					facts.PrimitiveType(facts.StringPrim()),
 					h.fset,
 					call.Pos(),
-				))
+				), true, route, diags)
+			} else {
+				reportDirectDynamicParameter(diags, h, route, call, name)
 			}
 		case "Cookie":
-			if pname, ok := stringArg(call, 0); ok && !seenParam["cookie/"+pname] {
-				seenParam["cookie/"+pname] = true
-				cf.Params = append(cf.Params, requestParameter(
+			if pname, ok := a.callStringArg(h, call, 0); ok {
+				a.addExtractedParameter(&cf, seenParam, resolvedParam, requestParameter(
 					pname,
 					"cookie",
 					true,
 					facts.PrimitiveType(facts.StringPrim()),
 					h.fset,
 					call.Pos(),
-				))
+				), true, route, diags)
+			} else {
+				reportDirectDynamicParameter(diags, h, route, call, name)
 			}
 		case "FormFile":
-			if fname, ok := stringArg(call, 0); ok {
+			if fname, ok := a.callStringArg(h, call, 0); ok {
 				formFields[fname] = formField(fname, facts.PrimitiveType(facts.BytesPrim()), true)
 				formHasFile = true
 			} else {
-				file, line := positionOf(h.fset, call.Pos())
-				diags.Warn("unsupported multipart source pattern: FormFile field name is dynamic (GO-05)", file, line)
+				reportDirectUnresolvedBody(diags, h, route, call, name, "multipart field name is dynamic")
 			}
 		case "PostForm", "DefaultPostForm", "GetPostForm":
-			if fname, ok := stringArg(call, 0); ok {
+			if fname, ok := a.callStringArg(h, call, 0); ok {
 				if _, seen := formFields[fname]; !seen {
 					field := formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
 					if name == "DefaultPostForm" && len(call.Args) > 1 {
@@ -926,12 +1025,10 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 					formFields[fname] = field
 				}
 			} else {
-				file, line := positionOf(h.fset, call.Pos())
-				diags.Warn("unsupported form source pattern: form field name is dynamic (GO-05)", file, line)
+				reportDirectUnresolvedBody(diags, h, route, call, name, "form field name is dynamic")
 			}
 		case "MultipartForm":
-			file, line := positionOf(h.fset, call.Pos())
-			diags.Warn("unsupported multipart source pattern: MultipartForm map access cannot be fully extracted; use typed ShouldBind or direct FormFile/PostForm calls (GO-05)", file, line)
+			reportDirectUnresolvedBody(diags, h, route, call, name, "MultipartForm map access cannot be fully extracted")
 		}
 		return true
 	})
@@ -963,7 +1060,91 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	if hasBodyBind {
 		cf.RequestBodyRequired = !allBodyBindsOptional
 	}
+	if diags != nil {
+		reported := map[string]bool{}
+		for _, read := range untypedQueryReads {
+			key := "query/" + read.name
+			if resolvedParam[key] || reported[key] {
+				continue
+			}
+			reported[key] = true
+			diags.UntypedQueryParam(read.name, route.Method, untypedRouteLabel(route), read.file, read.line)
+		}
+	}
 	return cf
+}
+
+func reportDirectDynamicParameter(
+	diags *diag.Accumulator,
+	h handlerDecl,
+	route routes.Route,
+	call *ast.CallExpr,
+	subject string,
+) {
+	if diags == nil {
+		return
+	}
+	file, line := positionOf(h.fset, call.Pos())
+	diags.RequestParameterUnresolved(
+		subject,
+		route.Method,
+		untypedRouteLabel(route),
+		"parameter name is dynamic",
+		file,
+		line,
+	)
+}
+
+func reportDirectUnresolvedBody(
+	diags *diag.Accumulator,
+	h handlerDecl,
+	route routes.Route,
+	call *ast.CallExpr,
+	subject string,
+	reason string,
+) {
+	if diags == nil {
+		return
+	}
+	file, line := positionOf(h.fset, call.Pos())
+	diags.RequestBodyUnresolved(subject, route.Method, untypedRouteLabel(route), reason, file, line)
+}
+
+func (a *Analyzer) setRequestBodyFact(
+	cf *CodeFacts,
+	ref *facts.TypeRef,
+	contentType string,
+	route routes.Route,
+	diags *diag.Accumulator,
+	fset *token.FileSet,
+	pos token.Pos,
+	subject string,
+) {
+	if cf == nil || ref == nil {
+		return
+	}
+	if cf.RequestBody == nil {
+		cf.RequestBody = ref
+		cf.RequestBodyContentType = contentType
+		return
+	}
+	if cf.RequestBody.RefID != ref.RefID || (cf.RequestBodyContentType != "" && contentType != "" && cf.RequestBodyContentType != contentType) {
+		if diags != nil {
+			file, line := positionOf(fset, pos)
+			diags.RequestBodyUnresolved(
+				subject,
+				route.Method,
+				untypedRouteLabel(route),
+				"conflicting body evidence ("+cf.RequestBody.RefID+" as "+cf.RequestBodyContentType+" versus "+ref.RefID+" as "+contentType+")",
+				file,
+				line,
+			)
+		}
+		return
+	}
+	if cf.RequestBodyContentType == "" {
+		cf.RequestBodyContentType = contentType
+	}
 }
 
 func (a *Analyzer) handlerForRoute(route routes.Route) (handlerDecl, bool) {
@@ -1149,20 +1330,22 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	route routes.Route,
 	cf *CodeFacts,
 	seenParam map[string]bool,
+	resolvedParam map[string]bool,
+	diags *diag.Accumulator,
 ) {
 	if param, ok := a.queryParamFromModuleHelper(h, call); ok {
-		if !seenParam["query/"+param.Name] {
-			seenParam["query/"+param.Name] = true
-			cf.Params = append(cf.Params, param)
+		if resolvedParam["query/"+param.Name] {
+			return
 		}
+		a.addExtractedParameter(cf, seenParam, resolvedParam, param, true, route, diags)
 		return
 	}
 	query, ok := firstQueryCall(h.info, call)
 	if !ok || query == call {
 		return
 	}
-	pname, ok := stringArg(query, 0)
-	if !ok || seenParam["query/"+pname] {
+	pname, ok := a.callStringArg(h, query, 0)
+	if !ok {
 		return
 	}
 	if nestedQueryHelperOutranks(h.info, call, query) {
@@ -1172,9 +1355,10 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	if !ok {
 		return
 	}
-	seenParam["query/"+pname] = true
-	cf.Params = append(cf.Params, param)
-	_ = route
+	if resolvedParam["query/"+param.Name] {
+		return
+	}
+	a.addExtractedParameter(cf, seenParam, resolvedParam, param, true, route, diags)
 }
 
 func (a *Analyzer) queryParamFromHelper(
@@ -1221,7 +1405,7 @@ func (a *Analyzer) queryParamFromModuleHelper(h handlerDecl, call *ast.CallExpr)
 		return facts.ParamFact{}, false
 	}
 	for i := 0; i < len(call.Args) && i < sig.Params().Len(); i++ {
-		pname, ok := stringArg(call, i)
+		pname, ok := a.stringValueOf(h, call.Args[i])
 		if !ok {
 			continue
 		}
@@ -2105,19 +2289,21 @@ func selectorName(expr ast.Expr) string {
 	}
 }
 
-// bindRequestType resolves ShouldBindJSON(&x) / ShouldBind(&x) -> a TypeRef to the bound named type.
-// arg[0] must be &ident (an *ast.UnaryExpr with Op AND). When the type cannot be
-// resolved to a named type, returns ok=false and the route simply has no request
-// body — there is no secondary source (CLAUDE.md rule 3).
+// bindRequestType resolves ShouldBindJSON(&x), ShouldBindJSON(ptr), and
+// ShouldBindJSON(new(T)) to the bound named type. Gin accepts all of these
+// pointer-bearing shapes; restricting extraction to the address-of syntax would
+// silently lose an otherwise statically known body.
 func (a *Analyzer) bindRequestType(info *gotypes.Info, call *ast.CallExpr) (*facts.TypeRef, gotypes.Type, bool) {
-	if len(call.Args) < 1 {
+	if info == nil || len(call.Args) < 1 {
 		return nil, nil, false
 	}
-	unary, ok := call.Args[0].(*ast.UnaryExpr)
-	if !ok || unary.Op != token.AND {
+	bound := info.TypeOf(call.Args[0])
+	if bound == nil {
 		return nil, nil, false
 	}
-	bound := info.TypeOf(unary.X)
+	if pointer, ok := gotypes.Unalias(bound).(*gotypes.Pointer); ok {
+		bound = pointer.Elem()
+	}
 	id, ok := a.namedTypeID(bound)
 	if !ok {
 		return nil, nil, false
@@ -2132,7 +2318,7 @@ func bindContentType(method string, info *gotypes.Info, call *ast.CallExpr, boun
 	case "Form", "FormPost":
 		return "application/x-www-form-urlencoded"
 	case "JSON":
-		return ""
+		return "application/json"
 	}
 	if typeContainsMultipartFile(bound) {
 		return "multipart/form-data"
@@ -2565,6 +2751,13 @@ func responseContentTypes(contentType string) []string {
 
 func (a *Analyzer) stringValueOf(h handlerDecl, expr ast.Expr) (string, bool) {
 	return a.stringValueOfSeen(h, expr, map[string]bool{})
+}
+
+func (a *Analyzer) callStringArg(h handlerDecl, call *ast.CallExpr, index int) (string, bool) {
+	if call == nil || index < 0 || index >= len(call.Args) {
+		return "", false
+	}
+	return a.stringValueOf(h, call.Args[index])
 }
 
 func (a *Analyzer) stringValueOfSeen(h handlerDecl, expr ast.Expr, seen map[string]bool) (string, bool) {
@@ -3130,6 +3323,116 @@ func requestParameter(
 	}
 }
 
+func (a *Analyzer) addExtractedParameter(
+	cf *CodeFacts,
+	seen map[string]bool,
+	resolved map[string]bool,
+	param facts.ParamFact,
+	isResolved bool,
+	route routes.Route,
+	diags *diag.Accumulator,
+) {
+	key := param.Location + "/" + param.Name
+	wasResolved := resolved[key]
+	if isResolved {
+		resolved[key] = true
+	}
+	if !seen[key] {
+		seen[key] = true
+		cf.Params = append(cf.Params, param)
+		return
+	}
+	index := -1
+	for i := range cf.Params {
+		if cf.Params[i].Location == param.Location && cf.Params[i].Name == param.Name {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		cf.Params = append(cf.Params, param)
+		return
+	}
+	existing := &cf.Params[index]
+	if !wasResolved && isResolved {
+		*existing = param
+		return
+	}
+	if wasResolved && !isResolved {
+		return
+	}
+	if !reflect.DeepEqual(existing.Schema, param.Schema) {
+		existingSpecificity := parameterSchemaSpecificity(existing.Schema)
+		incomingSpecificity := parameterSchemaSpecificity(param.Schema)
+		switch {
+		case incomingSpecificity > existingSpecificity:
+			existing.Schema = param.Schema
+			existing.Span = param.Span
+		case incomingSpecificity < existingSpecificity:
+			// A raw string access is compatible evidence for a value that a
+			// surrounding parser or typed binder refines more precisely.
+			return
+		default:
+			if diags != nil {
+				diags.RequestParameterUnresolved(
+					param.Name,
+					route.Method,
+					untypedRouteLabel(route),
+					"conflicting extracted schemas for "+key,
+					param.Span.File,
+					param.Span.StartLine,
+				)
+			}
+			return
+		}
+	}
+	existing.Required = existing.Required || param.Required
+	if existing.Default == nil {
+		existing.Default = param.Default
+	} else if param.Default != nil && !reflect.DeepEqual(existing.Default, param.Default) && diags != nil {
+		diags.RequestParameterUnresolved(
+			param.Name,
+			route.Method,
+			untypedRouteLabel(route),
+			"conflicting extracted defaults for "+key,
+			param.Span.File,
+			param.Span.StartLine,
+		)
+	}
+	if existing.Style == "" {
+		existing.Style = param.Style
+	} else if param.Style != "" && existing.Style != param.Style && diags != nil {
+		diags.RequestParameterUnresolved(
+			param.Name,
+			route.Method,
+			untypedRouteLabel(route),
+			"conflicting extracted serialization styles for "+key,
+			param.Span.File,
+			param.Span.StartLine,
+		)
+	}
+	if existing.Explode == nil {
+		existing.Explode = param.Explode
+	} else if param.Explode != nil && *existing.Explode != *param.Explode && diags != nil {
+		diags.RequestParameterUnresolved(
+			param.Name,
+			route.Method,
+			untypedRouteLabel(route),
+			"conflicting extracted explode values for "+key,
+			param.Span.File,
+			param.Span.StartLine,
+		)
+	}
+	existing.AllowReserved = existing.AllowReserved || param.AllowReserved
+}
+
+func parameterSchemaSpecificity(schema facts.Type) int {
+	if isPrimitiveStringType(schema) || schema.Type == facts.TypeAny {
+		return 0
+	}
+	return 1
+}
+
 func parameterFromGinAccess(
 	info *gotypes.Info,
 	method string,
@@ -3182,17 +3485,20 @@ func (a *Analyzer) addBoundParameters(
 	location string,
 	cf *CodeFacts,
 	seen map[string]bool,
+	resolved map[string]bool,
+	route routes.Route,
 	diags *diag.Accumulator,
 ) {
 	bound := boundTypeFromCall(frame, call)
-	params, ok := a.parametersFromBoundType(bound, location, frame.decl.fset, diags, map[string]bool{})
+	params, ok := a.parametersFromBoundType(bound, location, frame.decl.fset, route, diags, map[string]bool{})
 	if !ok {
 		if diags != nil {
 			file, line := positionOf(frame.decl.fset, call.Pos())
-			diags.WarnCode(
-				"request.parameter.unresolved",
-				"request_parameter",
-				"unable to resolve "+location+" binding DTO passed to "+selectorName(call.Fun),
+			diags.RequestParameterUnresolved(
+				selectorName(call.Fun),
+				route.Method,
+				untypedRouteLabel(route),
+				"unable to resolve "+location+" binding DTO",
 				file,
 				line,
 			)
@@ -3200,12 +3506,7 @@ func (a *Analyzer) addBoundParameters(
 		return
 	}
 	for _, param := range params {
-		key := param.Location + "/" + param.Name
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		cf.Params = append(cf.Params, param)
+		a.addExtractedParameter(cf, seen, resolved, param, true, route, diags)
 	}
 }
 
@@ -3213,6 +3514,7 @@ func (a *Analyzer) parametersFromBoundType(
 	t gotypes.Type,
 	location string,
 	fset *token.FileSet,
+	route routes.Route,
 	diags *diag.Accumulator,
 	seen map[string]bool,
 ) ([]facts.ParamFact, bool) {
@@ -3238,7 +3540,7 @@ func (a *Analyzer) parametersFromBoundType(
 	for index := 0; index < structure.NumFields(); index++ {
 		field := structure.Field(index)
 		if field.Embedded() {
-			nested, nestedOK := a.parametersFromBoundType(field.Type(), location, fset, diags, seen)
+			nested, nestedOK := a.parametersFromBoundType(field.Type(), location, fset, route, diags, seen)
 			if nestedOK {
 				out = append(out, nested...)
 			}
@@ -3253,10 +3555,11 @@ func (a *Analyzer) parametersFromBoundType(
 		schema, schemaOK := a.parameterType(field.Type(), tag)
 		if !schemaOK {
 			if diags != nil {
-				diags.WarnCode(
-					"request.parameter.unresolved",
-					"request_parameter",
-					"unsupported "+location+" binding field type for "+field.Name()+": "+field.Type().String(),
+				diags.RequestParameterUnresolved(
+					field.Name(),
+					route.Method,
+					untypedRouteLabel(route),
+					"unsupported "+location+" binding field type: "+field.Type().String(),
 					file,
 					line,
 				)
@@ -3275,7 +3578,20 @@ func (a *Analyzer) parametersFromBoundType(
 			field.Pos(),
 		)
 		if defaultText, exists := parameterDefault(tag, options); exists {
-			param.Default = literalForParameter(defaultText, schema)
+			if schema.Type == facts.TypeArray || schema.Type == facts.TypeMap || schema.Type == facts.TypeObject {
+				if diags != nil {
+					diags.RequestParameterUnresolved(
+						name,
+						route.Method,
+						untypedRouteLabel(route),
+						"structured parameter default cannot be represented losslessly",
+						file,
+						line,
+					)
+				}
+			} else {
+				param.Default = literalForParameter(defaultText, schema)
+			}
 		}
 		applyParameterSerialization(&param, tag, options)
 		out = append(out, param)

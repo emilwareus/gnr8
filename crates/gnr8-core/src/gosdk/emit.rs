@@ -1832,7 +1832,7 @@ return []compatParameterPair{{Name: name, Value: compatScalarQueryValue(input)}}
 }
 }
 
-func compatEncodeQuery(values url.Values, allowReserved map[string]bool) string {
+func compatEncodeQuery(values url.Values, allowReserved map[string]map[int]bool) string {
 keys := make([]string, 0, len(values))
 for key := range values {
 keys = append(keys, key)
@@ -1840,9 +1840,9 @@ keys = append(keys, key)
 sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {
-for _, value := range values[key] {
+for index, value := range values[key] {
 encoded := url.QueryEscape(value)
-if allowReserved[key] {
+if allowReserved[key][index] {
 encoded = strings.NewReplacer(
 \"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
 \"%40\", \"@\", \"%21\", \"!\", \"%24\", \"$\", \"%26\", \"&\", \"%27\", \"'\", \"%28\", \"(\",
@@ -1853,6 +1853,10 @@ parts = append(parts, url.QueryEscape(key)+\"=\"+encoded)
 }
 }
 return strings.Join(parts, \"&\")
+}
+
+func compatCookieEscape(value string) string {
+return strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
 }
 
 func compatDefaultAuthHeader() string {
@@ -2330,7 +2334,7 @@ return []compatParameterPair{{{{Name: name, Value: compatQueryValue(input)}}}}
 }}
 }}
 
-func compatEncodeQuery(values url.Values, allowReserved map[string]bool) string {{
+func compatEncodeQuery(values url.Values, allowReserved map[string]map[int]bool) string {{
 keys := make([]string, 0, len(values))
 for key := range values {{
 keys = append(keys, key)
@@ -2338,9 +2342,9 @@ keys = append(keys, key)
 sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {{
-for _, value := range values[key] {{
+for index, value := range values[key] {{
 encoded := url.QueryEscape(value)
-if allowReserved[key] {{
+if allowReserved[key][index] {{
 encoded = strings.NewReplacer(
 \"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
 \"%40\", \"@\", \"%21\", \"!\", \"%24\", \"$\", \"%26\", \"&\", \"%27\", \"'\", \"%28\", \"(\",
@@ -2351,6 +2355,10 @@ parts = append(parts, url.QueryEscape(key)+\"=\"+encoded)
 }}
 }}
 return strings.Join(parts, \"&\")
+}}
+
+func compatCookieEscape(value string) string {{
+return strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
 }}
 
 func compatDefaultAuthHeader() string {{
@@ -3334,7 +3342,7 @@ fn emit_compat_query(
     writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
     let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
     if has_allow_reserved {
-        writeln!(body, "compatAllowReserved := map[string]bool{{}}").map_err(sink)?;
+        writeln!(body, "compatAllowReserved := map[string]map[int]bool{{}}").map_err(sink)?;
     }
     for param in query_params {
         let field = lower_camel(&param.name);
@@ -3349,7 +3357,14 @@ fn emit_compat_query(
         .map_err(sink)?;
         writeln!(body, "q.Add(pair.Name, pair.Value)").map_err(sink)?;
         if param.allow_reserved {
-            writeln!(body, "compatAllowReserved[pair.Name] = true").map_err(sink)?;
+            writeln!(body, "if compatAllowReserved[pair.Name] == nil {{").map_err(sink)?;
+            writeln!(body, "compatAllowReserved[pair.Name] = map[int]bool{{}}").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
+            writeln!(
+                body,
+                "compatAllowReserved[pair.Name][len(q[pair.Name])-1] = true"
+            )
+            .map_err(sink)?;
         }
         writeln!(body, "}}").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
@@ -3415,7 +3430,7 @@ fn emit_compat_header_cookie_params(
         .map_err(sink)?;
         writeln!(
             body,
-            "req.AddCookie(&http.Cookie{{Name: pair.Name, Value: pair.Value}})"
+            "req.AddCookie(&http.Cookie{{Name: compatCookieEscape(pair.Name), Value: compatCookieEscape(pair.Value)}})"
         )
         .map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
@@ -4714,7 +4729,7 @@ fn emit_request_dispatch(
         writeln!(body, "q := req.URL.Query()").map_err(sink)?;
         let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
         if has_allow_reserved {
-            writeln!(body, "wireAllowReserved := map[string]bool{{}}").map_err(sink)?;
+            writeln!(body, "wireAllowReserved := map[string]map[int]bool{{}}").map_err(sink)?;
         }
         for p in query_params {
             let field = exported(&p.name);
@@ -4740,7 +4755,15 @@ fn emit_request_dispatch(
                 .map_err(sink)?;
                 writeln!(body, "q.Add(pair.Name, pair.Value)").map_err(sink)?;
                 if p.allow_reserved {
-                    writeln!(body, "wireAllowReserved[pair.Name] = true").map_err(sink)?;
+                    writeln!(body, "if wireAllowReserved[pair.Name] == nil {{").map_err(sink)?;
+                    writeln!(body, "wireAllowReserved[pair.Name] = map[int]bool{{}}")
+                        .map_err(sink)?;
+                    writeln!(body, "}}").map_err(sink)?;
+                    writeln!(
+                        body,
+                        "wireAllowReserved[pair.Name][len(q[pair.Name])-1] = true"
+                    )
+                    .map_err(sink)?;
                 }
                 writeln!(body, "}}").map_err(sink)?;
             } else {
@@ -4749,7 +4772,7 @@ fn emit_request_dispatch(
                 if p.allow_reserved {
                     writeln!(
                         body,
-                        "wireAllowReserved[{}] = true",
+                        "wireAllowReserved[{}] = map[int]bool{{0: true}}",
                         quoted_string_literal(&p.name)
                     )
                     .map_err(sink)?;
@@ -5053,9 +5076,9 @@ fn parameter_needs_pair_helper(param: &crate::graph::Param) -> bool {
 }
 
 fn operation_needs_wire_helpers(op: &Operation) -> bool {
-    op.params
-        .iter()
-        .any(|param| param.allow_reserved || parameter_needs_pair_helper(param))
+    op.params.iter().any(|param| {
+        param.allow_reserved || parameter_needs_pair_helper(param) || param.location == "cookie"
+    })
 }
 
 fn emit_header_and_cookie_params(
@@ -5100,7 +5123,7 @@ fn emit_non_query_parameter(
         } else {
             writeln!(
                 body,
-                "req.AddCookie(&http.Cookie{{Name: pair.Name, Value: pair.Value}})"
+                "req.AddCookie(&http.Cookie{{Name: wireCookieEscape(pair.Name), Value: wireCookieEscape(pair.Value)}})"
             )
             .map_err(sink)?;
         }
@@ -5118,7 +5141,7 @@ fn emit_non_query_parameter(
         } else {
             writeln!(
                 body,
-                "req.AddCookie(&http.Cookie{{Name: {}, Value: {value}}})",
+                "req.AddCookie(&http.Cookie{{Name: wireCookieEscape({}), Value: wireCookieEscape({value})}})",
                 quoted_string_literal(&param.name)
             )
             .map_err(sink)?;
@@ -5206,7 +5229,7 @@ return instant.Format(time.RFC3339)
 return fmt.Sprint(value)
 }
 
-func encodeWireQuery(values url.Values, allowReserved map[string]bool) string {
+func encodeWireQuery(values url.Values, allowReserved map[string]map[int]bool) string {
 keys := make([]string, 0, len(values))
 for key := range values {
 keys = append(keys, key)
@@ -5214,9 +5237,9 @@ keys = append(keys, key)
 sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {
-for _, value := range values[key] {
+for index, value := range values[key] {
 encoded := url.QueryEscape(value)
-if allowReserved[key] {
+if allowReserved[key][index] {
 encoded = strings.NewReplacer(
 "%3A", ":", "%2F", "/", "%3F", "?", "%23", "#", "%5B", "[", "%5D", "]",
 "%40", "@", "%21", "!", "%24", "$", "%26", "&", "%27", "'", "%28", "(",
@@ -5227,6 +5250,10 @@ parts = append(parts, url.QueryEscape(key)+"="+encoded)
 }
 }
 return strings.Join(parts, "&")
+}
+
+func wireCookieEscape(value string) string {
+return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
 }
 "##,
     );

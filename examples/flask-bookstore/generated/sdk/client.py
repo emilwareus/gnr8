@@ -115,6 +115,12 @@ class Client:
             return {key: self._wire_value(item) for key, item in value.items()}
         return value
 
+    @staticmethod
+    def _parameter_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
     def _parameter_pairs(
         self,
         name: str,
@@ -130,24 +136,29 @@ class Client:
         else:
             delimiter = ","
         if isinstance(value, (list, tuple)):
-            parts = [str(item) for item in value]
+            parts = [self._parameter_scalar(item) for item in value]
             if explode and style == "form":
                 return [(name, item) for item in parts]
             return [(name, delimiter.join(parts))]
         if isinstance(value, dict):
             entries = sorted(value.items())
             if style == "deepObject":
-                return [(f"{name}[{key}]", str(item)) for key, item in entries]
+                return [
+                    (f"{name}[{key}]", self._parameter_scalar(item))
+                    for key, item in entries
+                ]
             if explode and style == "form":
-                return [(str(key), str(item)) for key, item in entries]
+                return [
+                    (str(key), self._parameter_scalar(item)) for key, item in entries
+                ]
             parts = []
             for key, item in entries:
                 if explode:
-                    parts.append(f"{key}={item}")
+                    parts.append(f"{key}={self._parameter_scalar(item)}")
                 else:
-                    parts.extend((str(key), str(item)))
+                    parts.extend((str(key), self._parameter_scalar(item)))
             return [(name, delimiter.join(parts))]
-        return [(name, str(value))]
+        return [(name, self._parameter_scalar(value))]
 
     @staticmethod
     def _encode_query(

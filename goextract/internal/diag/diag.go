@@ -16,6 +16,7 @@ const severityWarn = "WARN"
 const (
 	categorySource           = "source"
 	categoryRequestParameter = "request_parameter"
+	categoryRequestBody      = "request_body"
 	categoryResponse         = "response"
 	categorySchema           = "schema"
 )
@@ -99,6 +100,25 @@ func (a *Accumulator) RequestParameterUnresolved(subject, method, route, reason,
 		Category: categoryRequestParameter,
 		Message: "request parameter analysis stopped at " + subject + " on " + method + " " + route +
 			": " + reason + "; add an explicit parameter override or keep the helper within the loaded module",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
+	})
+}
+
+// RequestBodyUnresolved records a request-body shape or media type that Gin
+// accepts at runtime but the extractor cannot represent faithfully. The stable
+// code is intentionally distinct from request-parameter failures so callers can
+// deny incomplete body extraction independently.
+func (a *Accumulator) RequestBodyUnresolved(subject, method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.body.unresolved",
+		Severity: severityWarn,
+		Category: categoryRequestBody,
+		Message: "request body analysis is incomplete for " + subject + " on " + method + " " + route +
+			": " + reason + "; add an explicit body override or use a statically typed binding",
 		File:      file,
 		Line:      line,
 		EndLine:   line,

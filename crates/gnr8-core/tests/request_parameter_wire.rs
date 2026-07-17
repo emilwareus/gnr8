@@ -15,9 +15,7 @@ const TSC: &str = concat!(
     "/../../tsextract/node_modules/typescript/bin/tsc"
 );
 
-fn parameter_graph() -> gnr8::graph::ApiGraph {
-    serde_json::from_str(
-        r#"{
+const PARAMETER_GRAPH_JSON: &str = r#"{
           "module": "wire.test",
           "operations": [
             {
@@ -86,11 +84,41 @@ fn parameter_graph() -> gnr8::graph::ApiGraph {
                   "required": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "provenance": { "file": "wire.go", "start_line": 6, "end_line": 6 }
+                },
+                {
+                  "name": "force",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "primitive", "of": { "prim": "bool" } },
+                  "provenance": { "file": "wire.go", "start_line": 7, "end_line": 7 }
+                },
+                {
+                  "name": "strict",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "provenance": { "file": "wire.go", "start_line": 8, "end_line": 8 }
+                },
+                {
+                  "name": "free",
+                  "location": "query",
+                  "required": false,
+                  "schema": {
+                    "type": "map",
+                    "of": {
+                      "key": { "type": "primitive", "of": { "prim": "string" } },
+                      "value": { "type": "primitive", "of": { "prim": "string" } }
+                    }
+                  },
+                  "style": "form",
+                  "explode": true,
+                  "allow_reserved": true,
+                  "provenance": { "file": "wire.go", "start_line": 9, "end_line": 9 }
                 }
               ],
               "request_body": null,
               "responses": [ { "status": 204, "body": null } ],
-              "provenance": { "file": "wire.go", "start_line": 1, "end_line": 6 }
+              "provenance": { "file": "wire.go", "start_line": 1, "end_line": 9 }
             }
           ],
           "schemas": [],
@@ -113,9 +141,10 @@ fn parameter_graph() -> gnr8::graph::ApiGraph {
               "global": true
             }
           ]
-        }"#,
-    )
-    .expect("request parameter graph must deserialize")
+        }"#;
+
+fn parameter_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(PARAMETER_GRAPH_JSON).expect("request parameter graph must deserialize")
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -309,6 +338,13 @@ func TestRequestParameterWireContract(t *testing.T) {
 		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a?x=1") {
 			t.Errorf("redirect was not allowReserved: %s", r.URL.RawQuery)
 		}
+		if got := r.URL.Query().Get("force"); got != "true" {
+			t.Errorf("force = %q", got)
+		}
+		if !strings.Contains(r.URL.RawQuery, "strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1") ||
+			!strings.Contains(r.URL.RawQuery, "strict=https://free.test/a?x=1") {
+			t.Errorf("per-value allowReserved policy was lost: %s", r.URL.RawQuery)
+		}
 		if got := r.Header.Get("X-Signature"); got != "sig" {
 			t.Errorf("X-Signature = %q", got)
 		}
@@ -318,17 +354,19 @@ func TestRequestParameterWireContract(t *testing.T) {
 		if got := r.Header.Get("X-API-Key"); got != "secret" {
 			t.Errorf("X-API-Key = %q", got)
 		}
-		cookie, err := r.Cookie("session")
-		if err != nil || cookie.Value != "session-1" {
-			t.Errorf("session cookie = %#v, %v", cookie, err)
+		if got := r.Header.Get("Cookie"); got != "session=session%2Fwith%20space%2Bplus" {
+			t.Errorf("session cookie = %q", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
 	filters := map[string]string{"z": "two", "a": "one"}
+	free := map[string]string{"strict": "https://free.test/a?x=1"}
 	tags := []string{"red", "blue"}
-	session := "session-1"
+	session := "session/with space+plus"
+	force := true
+	strict := "https://strict.test/a?x=1"
 	client := NewClient(srv.URL, WithAPIKey("secret"))
 	_, err := client.SendWire(context.Background(), SendWireParams{
 		Statuses:   []string{"active", "pending"},
@@ -337,6 +375,9 @@ func TestRequestParameterWireContract(t *testing.T) {
 		Filters:    &filters,
 		XTags:      &tags,
 		Session:    &session,
+		Force:      &force,
+		Strict:     &strict,
+		Free:       &free,
 	})
 	if err != nil {
 		t.Fatalf("SendWire returned error: %v", err)
@@ -396,6 +437,13 @@ func TestCompatibilityRequestParameterWireContract(t *testing.T) {
 		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a?x=1") {
 			t.Errorf("redirect was not allowReserved: %s", r.URL.RawQuery)
 		}
+		if got := r.URL.Query().Get("force"); got != "true" {
+			t.Errorf("force = %q", got)
+		}
+		if !strings.Contains(r.URL.RawQuery, "strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1") ||
+			!strings.Contains(r.URL.RawQuery, "strict=https://free.test/a?x=1") {
+			t.Errorf("per-value allowReserved policy was lost: %s", r.URL.RawQuery)
+		}
 		if got := r.Header.Get("X-Signature"); got != "sig" {
 			t.Errorf("X-Signature = %q", got)
 		}
@@ -405,9 +453,8 @@ func TestCompatibilityRequestParameterWireContract(t *testing.T) {
 		if got := r.Header.Get("X-API-Key"); got != "secret" {
 			t.Errorf("X-API-Key = %q", got)
 		}
-		cookie, err := r.Cookie("session")
-		if err != nil || cookie.Value != "session-1" {
-			t.Errorf("session cookie = %#v, %v", cookie, err)
+		if got := r.Header.Get("Cookie"); got != "session=session%2Fwith%20space%2Bplus" {
+			t.Errorf("session cookie = %q", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -425,7 +472,10 @@ func TestCompatibilityRequestParameterWireContract(t *testing.T) {
 		XSignature("sig").
 		Filters(map[string]string{"z": "two", "a": "one"}).
 		XTags([]string{"red", "blue"}).
-		Session("session-1").
+		Session("session/with space+plus").
+		Force(true).
+		Strict("https://strict.test/a?x=1").
+		Free(map[string]string{"strict": "https://free.test/a?x=1"}).
 		Execute()
 	if err != nil {
 		t.Fatalf("SendWire returned error: %v", err)
@@ -494,10 +544,13 @@ const transport: typeof fetch = async (input, init) => {
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
   if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (url.searchParams.get("force") !== "true") throw new Error(url.search);
+  if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
+  if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
   if (headers.get("X-Signature") !== "sig") throw new Error("missing signature");
   if (headers.get("X-Tags") !== "red,blue") throw new Error("wrong tags");
   if (headers.get("X-API-Key") !== "secret") throw new Error("missing API key");
-  if (headers.get("Cookie") !== "session=session-1") throw new Error("wrong cookie");
+  if (headers.get("Cookie") !== "session=session%2Fwith%20space%2Bplus") throw new Error("wrong cookie");
   return new Response(null, { status: 204 });
 };
 
@@ -509,7 +562,10 @@ async function main(): Promise<void> {
     "sig",
     { z: "two", a: "one" },
     ["red", "blue"],
-    "session-1",
+    "session/with space+plus",
+    true,
+    "https://strict.test/a?x=1",
+    { strict: "https://free.test/a?x=1" },
   );
 }
 
@@ -555,10 +611,13 @@ function verify(config: AxiosRequestConfig): void {
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
   if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (url.searchParams.get("force") !== "true") throw new Error(url.search);
+  if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
+  if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
   if (headers.get("X-Signature") !== "sig") throw new Error("missing signature");
   if (headers.get("X-Tags") !== "red,blue") throw new Error("wrong tags");
   if (headers.get("X-API-Key") !== "secret") throw new Error("missing API key");
-  if (headers.get("Cookie") !== "session=session-1") throw new Error("wrong cookie");
+  if (headers.get("Cookie") !== "session=session%2Fwith%20space%2Bplus") throw new Error("wrong cookie");
 }
 
 const transport: AxiosInstance = {
@@ -580,7 +639,10 @@ async function main(): Promise<void> {
     xSignature: "sig",
     filters: { z: "two", a: "one" },
     xTags: ["red", "blue"],
-    session: "session-1",
+    session: "session/with space+plus",
+    force: true,
+    strict: "https://strict.test/a?x=1",
+    free: { strict: "https://free.test/a?x=1" },
   });
 }
 
@@ -624,10 +686,13 @@ const transport: typeof fetch = async (input, init) => {
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
   if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (url.searchParams.get("force") !== "true") throw new Error(url.search);
+  if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
+  if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
   if (headers.get("X-Signature") !== "sig") throw new Error("missing signature");
   if (headers.get("X-Tags") !== "red,blue") throw new Error("wrong tags");
   if (headers.get("X-API-Key") !== "secret") throw new Error("missing API key");
-  if (headers.get("Cookie") !== "session=session-1") throw new Error("wrong cookie");
+  if (headers.get("Cookie") !== "session=session%2Fwith%20space%2Bplus") throw new Error("wrong cookie");
   return new Response(null, { status: 204 });
 };
 
@@ -644,7 +709,10 @@ async function main(): Promise<void> {
     xSignature: "sig",
     filters: { z: "two", a: "one" },
     xTags: ["red", "blue"],
-    session: "session-1",
+    session: "session/with space+plus",
+    force: true,
+    strict: "https://strict.test/a?x=1",
+    free: { strict: "https://free.test/a?x=1" },
   });
 }
 
@@ -718,11 +786,14 @@ class Opener:
         assert query["filters[z]"] == ["two"], query
         assert query["api_key"] == ["secret"], query
         assert "redirect=https://example.test/a?x=1" in parsed.query, parsed.query
+        assert query["force"] == ["true"], query
+        assert "strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1" in parsed.query, parsed.query
+        assert "strict=https://free.test/a?x=1" in parsed.query, parsed.query
         headers = {key.lower(): value for key, value in request.header_items()}
         assert headers["x-signature"] == "sig", headers
         assert headers["x-tags"] == "red,blue", headers
         assert headers["x-api-key"] == "secret", headers
-        assert headers["cookie"] == "session=session-1", headers
+        assert headers["cookie"] == "session=session%2Fwith%20space%2Bplus", headers
         return Response()
 
 
@@ -733,6 +804,9 @@ client.send_wire(
     "sig",
     filters={"z": "two", "a": "one"},
     x_tags=["red", "blue"],
-    session="session-1",
+    session="session/with space+plus",
+    force=True,
+    strict="https://strict.test/a?x=1",
+    free={"strict": "https://free.test/a?x=1"},
 )
 "#;

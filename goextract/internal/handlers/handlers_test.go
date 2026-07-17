@@ -871,7 +871,7 @@ func parseRequest[T any](c *gin.Context) (T, error) {
 	}
 }
 
-func TestGenericJSONBodyHelperRequiresTypeParamBind(t *testing.T) {
+func TestGenericJSONBodyHelperPreservesConcreteEnvelopeBind(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/genericbodyguard
 
@@ -934,8 +934,9 @@ func parseEnvelope[T any](c *gin.Context) (T, error) {
 	for _, r := range routes.Recognize(res) {
 		cf = analyzer.Analyze(r, diags)
 	}
-	if cf.RequestBody != nil || cf.RequestBodyContentType != "" {
-		t.Fatalf("generic helper binding a concrete envelope should not infer CreateRequest body, got body=%+v content_type=%q", cf.RequestBody, cf.RequestBodyContentType)
+	assertBodySuffix(t, cf.RequestBody, "Envelope")
+	if cf.RequestBodyContentType != "application/json" {
+		t.Fatalf("generic helper's concrete envelope bind should remain the request body, got body=%+v content_type=%q", cf.RequestBody, cf.RequestBodyContentType)
 	}
 }
 
@@ -1676,6 +1677,128 @@ func cycleB(c *gin.Context) { cycleA(c) }
 	}
 }
 
+func TestDirectRequestFactsPreferTypedEvidenceAndDiagnoseEveryIncompleteShape(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/requestdiagnostics
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import (
+	"mime/multipart"
+	"net/http"
+)
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct { Request *http.Request }
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) Query(string) string { return "" }
+func (c *Context) Param(string) string { return "" }
+func (c *Context) GetHeader(string) string { return "" }
+func (c *Context) Cookie(string) (string, error) { return "", nil }
+func (c *Context) FormFile(string) (*multipart.FileHeader, error) { return nil, nil }
+func (c *Context) PostForm(string) string { return "" }
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) ShouldBindQuery(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package requestdiagnostics
+
+import "github.com/gin-gonic/gin"
+
+const limitName = "limit"
+
+type Server struct{ R *gin.Engine }
+type SearchQuery struct { Limit int `+"`"+`form:"limit"`+"`"+` }
+type GoodBody struct { Name string `+"`"+`json:"name"`+"`"+` }
+type OtherBody struct { ID string `+"`"+`json:"id"`+"`"+` }
+type Response struct { OK bool `+"`"+`json:"ok"`+"`"+` }
+
+func (s Server) Register() { s.R.POST("/broken", s.broken) }
+
+func (s Server) broken(c *gin.Context) {
+	var query SearchQuery
+	_ = c.Query(limitName)
+	_ = c.ShouldBindQuery(&query)
+
+	dynamic := limitName
+	_ = c.Param(dynamic)
+	_ = c.GetHeader(dynamic)
+	_, _ = c.Cookie(dynamic)
+	_ = c.Request.Header.Get(dynamic)
+	_, _ = c.FormFile(dynamic)
+	_ = c.PostForm(dynamic)
+
+	loose := map[string]any{}
+	_ = c.ShouldBindJSON(&loose)
+	good := new(GoodBody)
+	_ = c.ShouldBindJSON(good)
+	var other OtherBody
+	_ = c.ShouldBindJSON(&other)
+	c.JSON(200, Response{OK: true})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load request diagnostic fixture: %v", err)
+	}
+	diagnostics := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/requestdiagnostics", diagnostics)
+	var code handlers.CodeFacts
+	for _, route := range routes.Recognize(res) {
+		code = analyzer.Analyze(route, diagnostics)
+	}
+
+	limit, ok := paramByName(code.Params, "limit")
+	if !ok || primName(limit.Schema) != facts.PrimInt {
+		t.Fatalf("typed binding must replace earlier untyped query evidence, got %+v", limit)
+	}
+	assertBodySuffix(t, code.RequestBody, "GoodBody")
+
+	parameterSubjects := map[string]bool{}
+	bodyReasons := []string{}
+	for _, item := range diagnostics.Items() {
+		if item.Operation != "POST /broken" {
+			t.Fatalf("request completeness diagnostic lost operation identity: %+v", item)
+		}
+		switch item.Code {
+		case "request.parameter.unresolved":
+			parameterSubjects[item.Subject] = true
+			if item.Subject == "limit" || strings.Contains(item.Message, "untyped query param 'limit'") {
+				t.Fatalf("resolved constant-name typed query emitted a false incompleteness diagnostic: %+v", item)
+			}
+		case "request.body.unresolved":
+			bodyReasons = append(bodyReasons, item.Message)
+		}
+	}
+	for _, subject := range []string{"Param", "GetHeader", "Cookie", "Request.Header.Get"} {
+		if !parameterSubjects[subject] {
+			t.Fatalf("missing dynamic-name parameter diagnostic for %s: %+v", subject, diagnostics.Items())
+		}
+	}
+	for _, reason := range []string{
+		"multipart field name is dynamic",
+		"form field name is dynamic",
+		"binding target does not resolve to a named schema",
+		"conflicting body evidence",
+	} {
+		if !sliceContainsText(bodyReasons, reason) {
+			t.Fatalf("missing request.body.unresolved reason %q: %+v", reason, diagnostics.Items())
+		}
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {
@@ -1688,6 +1811,15 @@ func mustWrite(t *testing.T, path string, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+func sliceContainsText(values []string, needle string) bool {
+	for _, value := range values {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertBinaryOctetStreamResponse(t *testing.T, responses []facts.ResponseFact) {
