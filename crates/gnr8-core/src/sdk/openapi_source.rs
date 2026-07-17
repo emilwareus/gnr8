@@ -13,12 +13,13 @@ use crate::analyze::facts::{
     Constraints, FieldFact, FieldMeta, LiteralValue, Prim, Type, WellKnown,
 };
 use crate::graph::{
-    ApiGraph, Diagnostic, Operation, Param, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
+    ApiGraph, Diagnostic, DiagnosticCategory, Operation, Param, Response, Schema, SchemaRef,
+    SecurityScheme, SourceSpan,
 };
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecVersion {
+pub(crate) enum SpecVersion {
     Swagger2,
     OpenApi30,
     OpenApi31,
@@ -56,6 +57,7 @@ struct Importer {
     diagnostics: Vec<Diagnostic>,
     external_docs: BTreeMap<PathBuf, Value>,
     used_operation_ids: BTreeSet<String>,
+    operation_security: Vec<crate::graph::OperationSecurityPolicy>,
 }
 
 /// Load an OpenAPI/Swagger document from `input`, resolved against `project_root`.
@@ -94,7 +96,7 @@ fn read_text(path: &Path) -> Result<String, CoreError> {
     })
 }
 
-fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
+pub(crate) fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Ok(value),
         Err(json_err) => noyalib::from_str::<Value>(text).map_err(|yaml_err| CoreError::Config {
@@ -106,7 +108,7 @@ fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
     }
 }
 
-fn detect_version(root: &Value, path: &Path) -> Result<SpecVersion, CoreError> {
+pub(crate) fn detect_version(root: &Value, path: &Path) -> Result<SpecVersion, CoreError> {
     if root.get("swagger").and_then(Value::as_str) == Some("2.0") {
         return Ok(SpecVersion::Swagger2);
     }
@@ -259,6 +261,7 @@ impl Importer {
             diagnostics: Vec::new(),
             external_docs: BTreeMap::new(),
             used_operation_ids: BTreeSet::new(),
+            operation_security: Vec::new(),
         }
     }
 
@@ -267,11 +270,15 @@ impl Importer {
         self.validate_representable_responses()?;
         self.collect_root_schemas();
         let security = self.import_security_schemes();
+        let security_requirements = import_security_requirements(self.root.get("security"));
+        let openapi_metadata = self.import_metadata();
         let mut operations = self.import_operations();
         let mut schemas = self.import_schemas();
 
         operations.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
         schemas.sort_by(|a, b| a.id.cmp(&b.id));
+        self.operation_security
+            .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
         self.diagnostics
             .sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
@@ -293,7 +300,10 @@ impl Importer {
                 .and_then(Value::as_str)
                 .unwrap_or("API")
                 .to_string(),
+            openapi_metadata,
             security,
+            security_requirements,
+            operation_security: std::mem::take(&mut self.operation_security),
             runtime: crate::graph::RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
@@ -304,17 +314,16 @@ impl Importer {
     fn validate_representable_security(&self) -> Result<(), CoreError> {
         let root_security = self.root.get("security").and_then(Value::as_array);
         let raw_schemes = self.raw_security_schemes();
-        if root_security.is_some_and(|requirements| requirements.len() > 1) {
-            return Err(CoreError::Config {
-                message: "OpenAPI source uses alternative top-level security requirements; gnr8 currently supports one AND requirement object, not OR alternatives".to_string(),
-            });
-        }
-        if let Some(requirement) = root_security
-            .and_then(|requirements| requirements.first())
-            .and_then(Value::as_object)
-        {
-            for id in requirement.keys() {
-                Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
+        if let Some(requirements) = root_security {
+            for requirement in requirements {
+                let Some(requirement) = requirement.as_object() else {
+                    return Err(CoreError::Config {
+                        message: "top-level security requirement is not an object".to_string(),
+                    });
+                };
+                for id in requirement.keys() {
+                    Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
+                }
             }
         }
         let Some(paths) = self.root.get("paths").and_then(Value::as_object) else {
@@ -344,14 +353,14 @@ impl Importer {
                         || format!("{} {}", method.to_ascii_uppercase(), path),
                         str::to_string,
                     );
-                if requirements.len() > 1 {
-                    return Err(CoreError::Config {
-                        message: format!(
-                            "operation '{op_label}' uses alternative security requirements; gnr8 currently supports one AND requirement object, not OR alternatives"
-                        ),
-                    });
-                }
-                if let Some(requirement) = requirements.first().and_then(Value::as_object) {
+                for requirement in requirements {
+                    let Some(requirement) = requirement.as_object() else {
+                        return Err(CoreError::Config {
+                            message: format!(
+                                "operation '{op_label}' has a security requirement that is not an object"
+                            ),
+                        });
+                    };
                     for id in requirement.keys() {
                         Self::validate_security_scheme_ref(
                             &raw_schemes,
@@ -510,6 +519,97 @@ impl Importer {
         }
         schemes.sort_by(|a, b| a.id.cmp(&b.id));
         schemes
+    }
+
+    fn import_metadata(&self) -> crate::graph::OpenApiMetadataPolicy {
+        let info = self.root.get("info").and_then(Value::as_object);
+        let contact = info
+            .and_then(|info| info.get("contact"))
+            .and_then(Value::as_object)
+            .map(|contact| crate::graph::OpenApiContact {
+                name: contact
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                url: contact
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                email: contact
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            });
+        let license = info
+            .and_then(|info| info.get("license"))
+            .and_then(Value::as_object)
+            .and_then(|license| {
+                Some(crate::graph::OpenApiLicense {
+                    name: license.get("name")?.as_str()?.to_string(),
+                    url: license
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                })
+            });
+        crate::graph::OpenApiMetadataPolicy {
+            version: info
+                .and_then(|info| info.get("version"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            description: info
+                .and_then(|info| info.get("description"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            terms_of_service: info
+                .and_then(|info| info.get("termsOfService"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            contact,
+            license,
+            servers: self.import_servers(),
+        }
+    }
+
+    fn import_servers(&self) -> Vec<crate::graph::OpenApiServer> {
+        if self.version != SpecVersion::Swagger2 {
+            return self
+                .root
+                .get("servers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|server| {
+                    let server = server.as_object()?;
+                    Some(crate::graph::OpenApiServer {
+                        url: server.get("url")?.as_str()?.to_string(),
+                        description: server
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    })
+                })
+                .collect();
+        }
+        let Some(host) = self.root.get("host").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let base_path = self
+            .root
+            .get("basePath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.root
+            .get("schemes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|scheme| crate::graph::OpenApiServer {
+                url: format!("{scheme}://{host}{base_path}"),
+                description: None,
+            })
+            .collect()
     }
 
     fn collect_root_schemas(&mut self) {
@@ -716,8 +816,16 @@ impl Importer {
                 });
                 let mut responses = self.import_responses(operation, &operation_id);
                 responses.sort_by_key(|response| response.status);
-                let security = self.operation_security(operation_object, &operation_id);
+                let (security, security_alternatives) =
+                    self.import_operation_security(operation_object, &operation_id);
                 let security_overrides_global = operation_object.contains_key("security");
+                if security_overrides_global {
+                    self.operation_security
+                        .push(crate::graph::OperationSecurityPolicy {
+                            operation_id: operation_id.clone(),
+                            alternatives: security_alternatives,
+                        });
+                }
 
                 operations.push(Operation {
                     id: operation_id.clone(),
@@ -740,29 +848,25 @@ impl Importer {
         operations
     }
 
-    fn operation_security(
+    fn import_operation_security(
         &mut self,
         operation_object: &serde_json::Map<String, Value>,
         operation_id: &str,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<crate::graph::SecurityRequirementGroup>) {
         let Some(security) = operation_object.get("security") else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Some(requirements) = security.as_array() else {
             self.warn(format!(
                 "security on operation '{operation_id}' is not an array and was not imported"
             ));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if requirements.is_empty() {
-            return Vec::new();
-        }
-        if requirements.len() > 1 {
-            self.warn(format!(
-                "operation '{operation_id}' has alternative security requirements; importing merged scheme ids"
-            ));
+            return (Vec::new(), Vec::new());
         }
         let mut ids = Vec::new();
+        let mut alternatives = Vec::new();
         for requirement in requirements {
             let Some(object) = requirement.as_object() else {
                 self.warn(format!(
@@ -770,11 +874,14 @@ impl Importer {
                 ));
                 continue;
             };
-            ids.extend(object.keys().cloned());
+            let mut schemes: Vec<String> = object.keys().cloned().collect();
+            schemes.sort();
+            ids.extend(schemes.iter().cloned());
+            alternatives.push(crate::graph::SecurityRequirementGroup { schemes });
         }
         ids.sort();
         ids.dedup();
-        ids
+        (ids, alternatives)
     }
 
     fn operation_id(&mut self, method: &str, path: &str, operation: &Value) -> String {
@@ -814,6 +921,15 @@ impl Importer {
             required,
             schema: imported.ty,
             default,
+            style: parameter
+                .get("style")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            explode: parameter.get("explode").and_then(Value::as_bool),
+            allow_reserved: parameter
+                .get("allowReserved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             provenance: self.span(),
         })
     }
@@ -1416,12 +1532,17 @@ impl Importer {
     }
 
     fn warn(&mut self, message: String) {
-        self.diagnostics.push(Diagnostic {
-            severity: "WARN".to_string(),
+        self.diagnostics.push(Diagnostic::new(
+            "source.openapi.unrepresentable",
+            DiagnosticCategory::Source,
+            "WARN",
             message,
-            file: self.display_file(),
-            line: 1,
-        });
+            SourceSpan {
+                file: self.display_file(),
+                start_line: 1,
+                end_line: 1,
+            },
+        ));
     }
 
     fn display_file(&self) -> String {
@@ -1626,6 +1747,22 @@ fn security_requirement_scheme_ids(security: Option<&Value>) -> BTreeSet<String>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn import_security_requirements(
+    security: Option<&Value>,
+) -> Vec<crate::graph::SecurityRequirementGroup> {
+    security
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .map(|requirement| {
+            let mut schemes: Vec<String> = requirement.keys().cloned().collect();
+            schemes.sort();
+            crate::graph::SecurityRequirementGroup { schemes }
+        })
+        .collect()
 }
 
 fn choose_content(content: &serde_json::Map<String, Value>) -> Option<(&str, &Value)> {
@@ -2236,7 +2373,11 @@ components:
     }
 
     #[test]
-    fn rejects_openapi_security_shapes_that_graph_cannot_represent() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture covers top-level OR, operation-level AND, public, and unknown security cases"
+    )]
+    fn imports_security_alternatives_and_rejects_unknown_schemes() {
         let top_level_or = r"
 openapi: 3.1.0
 info: { title: Secure API, version: 1.0.0 }
@@ -2244,14 +2385,23 @@ security:
   - ApiKeyAuth: []
   - PartnerAuth: []
 paths: {}
+components:
+  securitySchemes:
+    ApiKeyAuth: { type: apiKey, in: header, name: X-API-Key }
+    PartnerAuth: { type: apiKey, in: header, name: X-Partner-Key }
 ";
-        let err = import_openapi_document(
+        let graph = import_openapi_document(
             std::path::Path::new("."),
             std::path::PathBuf::from("openapi.yaml"),
             top_level_or,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("alternative top-level security"));
+        .unwrap();
+        assert_eq!(graph.security_requirements.len(), 2);
+        let yaml = to_openapi(&graph, "Secure API", "/", &graph.security).unwrap();
+        assert!(
+            yaml.contains("- ApiKeyAuth: []\n  - PartnerAuth: []"),
+            "{yaml}"
+        );
 
         let security_removal = r"
 openapi: 3.1.0

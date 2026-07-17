@@ -115,6 +115,56 @@ class Client:
             return {key: self._wire_value(item) for key, item in value.items()}
         return value
 
+    def _parameter_pairs(
+        self,
+        name: str,
+        value: Any,
+        style: str,
+        explode: bool,
+    ) -> list[tuple[str, str]]:
+        value = self._wire_value(value)
+        if style == "spaceDelimited":
+            delimiter = " "
+        elif style == "pipeDelimited":
+            delimiter = "|"
+        else:
+            delimiter = ","
+        if isinstance(value, (list, tuple)):
+            parts = [str(item) for item in value]
+            if explode and style == "form":
+                return [(name, item) for item in parts]
+            return [(name, delimiter.join(parts))]
+        if isinstance(value, dict):
+            entries = sorted(value.items())
+            if style == "deepObject":
+                return [(f"{name}[{key}]", str(item)) for key, item in entries]
+            if explode and style == "form":
+                return [(str(key), str(item)) for key, item in entries]
+            parts = []
+            for key, item in entries:
+                if explode:
+                    parts.append(f"{key}={item}")
+                else:
+                    parts.extend((str(key), str(item)))
+            return [(name, delimiter.join(parts))]
+        return [(name, str(value))]
+
+    @staticmethod
+    def _encode_query(
+        pairs: list[tuple[str, str]],
+        allow_reserved: set[int],
+    ) -> str:
+        reserved = ":/?#[]@!$&'()*+,;="
+        encoded = []
+        for index, (key, value) in enumerate(pairs):
+            safe = reserved if index in allow_reserved else ""
+            encoded.append(
+                urllib.parse.quote_plus(str(key), safe="")
+                + "="
+                + urllib.parse.quote_plus(str(value), safe=safe)
+            )
+        return "&".join(encoded)
+
     def _encode_body(
         self,
         body: Optional[Any],
@@ -182,6 +232,7 @@ class Client:
         path: str,
         *,
         body: Optional[Any] = None,
+        request_headers: Optional[dict[str, str]] = None,
         operation_id: str,
         path_template: str,
         content_type: str = "application/json",
@@ -205,7 +256,7 @@ class Client:
             or method in ("GET", "HEAD", "OPTIONS", "PUT", "DELETE")
         ):
             max_retries = 0
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(request_headers or {})
         if data is not None:
             headers["Content-Type"] = content_type
         if idempotent and options.idempotency_key:
@@ -317,15 +368,16 @@ class Client:
 
     def list_orders(
         self,
-        status=None,
+        status: Optional[str] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
         path = "/orders/"
-        _query = {}
+        _query: list[tuple[str, str]] = []
+        _allow_reserved: set[int] = set()
         if status is not None:
-            _query["status"] = status
+            _query.extend(self._parameter_pairs("status", status, "form", True))
         if _query:
-            path = path + "?" + urllib.parse.urlencode(_query)
+            path = path + "?" + self._encode_query(_query, _allow_reserved)
         _status, _headers, _raw = self._do(
             "GET",
             path,

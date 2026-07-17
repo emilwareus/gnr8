@@ -149,6 +149,7 @@ pub(crate) fn generate_files_with_options(
         &model_refs,
         &graph.runtime,
         !split_operations && !graph.pagination.is_empty(),
+        !split_operations && emit::operations_need_parameter_literals(&ops),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);
@@ -388,7 +389,11 @@ fn emit_operation_file(
     }) {
         out.push_str("from collections.abc import Iterator\n");
     }
-    out.push_str("from typing import Any, Optional\n\n");
+    if emit::operations_need_parameter_literals(ops) {
+        out.push_str("from typing import Any, Literal, Optional\n\n");
+    } else {
+        out.push_str("from typing import Any, Optional\n\n");
+    }
     let prefix = py_relative_prefix(file_name);
     let _ = writeln!(out, "from {prefix}client import Client");
     let model_refs = emit::client_referenced_models(graph, ops)?;
@@ -673,7 +678,7 @@ mod tests {
         assert!(out.contains("def create_book("), "{out}");
         assert!(out.contains("body: Book"), "{out}");
         assert!(out.contains("def list_books("), "{out}");
-        assert!(out.contains("cursor=None"), "{out}");
+        assert!(out.contains("cursor: Optional[str] = None"), "{out}");
         assert!(out.contains("class BookFormat(str, enum.Enum):"), "{out}");
         assert!(out.contains("class Book(BaseModel):"), "{out}");
         assert!(out.contains("from pydantic import BaseModel"), "{out}");

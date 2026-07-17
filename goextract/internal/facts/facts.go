@@ -59,12 +59,15 @@ type RouteFact struct {
 // params are required; query params default to a string type and not required. There
 // is no enum or description — those were annotation-only and are gone.
 type ParamFact struct {
-	Name     string        `json:"name"`
-	Location string        `json:"location"`
-	Required bool          `json:"required"`
-	Schema   Type          `json:"schema"`
-	Default  *LiteralValue `json:"default,omitempty"`
-	Span     SourceSpan    `json:"span"`
+	Name          string        `json:"name"`
+	Location      string        `json:"location"`
+	Required      bool          `json:"required"`
+	Schema        Type          `json:"schema"`
+	Default       *LiteralValue `json:"default,omitempty"`
+	Style         string        `json:"style,omitempty"`
+	Explode       *bool         `json:"explode,omitempty"`
+	AllowReserved bool          `json:"allow_reserved,omitempty"`
+	Span          SourceSpan    `json:"span"`
 }
 
 // ResponseFact describes one response keyed by HTTP status.
@@ -267,10 +270,16 @@ type TypeRef struct {
 
 // DiagnosticFact is one warning/error with a source location (D-10 / GO-06).
 type DiagnosticFact struct {
-	Severity string `json:"severity"`
-	Message  string `json:"message"`
-	File     string `json:"file"`
-	Line     uint32 `json:"line"`
+	Code      string `json:"code,omitempty"`
+	Severity  string `json:"severity"`
+	Category  string `json:"category,omitempty"`
+	Message   string `json:"message"`
+	File      string `json:"file"`
+	Line      uint32 `json:"line"`
+	EndLine   uint32 `json:"end_line,omitempty"`
+	Operation string `json:"operation,omitempty"`
+	Schema    string `json:"schema,omitempty"`
+	Subject   string `json:"subject,omitempty"`
 }
 
 // SourceSpan is the file + line range provenance attached to every node (D-07).

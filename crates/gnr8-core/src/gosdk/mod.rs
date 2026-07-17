@@ -1182,6 +1182,9 @@ mod tests {
                 required: true,
                 schema: Type::Primitive(Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
                 provenance: SourceSpan {
                     file: "/root/http.go".to_string(),
                     start_line: 1,
@@ -1194,6 +1197,9 @@ mod tests {
                 required: true,
                 schema: Type::Primitive(Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
                 provenance: SourceSpan {
                     file: "/root/http.go".to_string(),
                     start_line: 1,
@@ -1349,6 +1355,9 @@ mod tests {
             required: true,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
             provenance: SourceSpan {
                 file: "/root/http.go".to_string(),
                 start_line: 1,
@@ -1467,6 +1476,9 @@ mod tests {
             required: true,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
             provenance: SourceSpan {
                 file: "/root/http.go".to_string(),
                 start_line: 1,
@@ -1983,6 +1995,9 @@ mod tests {
                 required: false,
                 schema: Type::Primitive(Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
                 provenance: SourceSpan {
                     file: "/root/h.go".to_string(),
                     start_line: 1,

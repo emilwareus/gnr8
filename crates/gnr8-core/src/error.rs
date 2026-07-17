@@ -154,6 +154,33 @@ pub enum CoreError {
         message: String,
     },
 
+    /// A configured diagnostic policy denied one or more structured diagnostics.
+    #[error("diagnostic policy denied: {codes:?}")]
+    DiagnosticsDenied {
+        /// Sorted, de-duplicated diagnostic codes that caused the failure.
+        codes: Vec<String>,
+    },
+
+    /// An artifact producer attempted an invalid ownership transition.
+    #[error("artifact ownership error [{code}] for '{path}' from {producer}: {message}")]
+    ArtifactOwnership {
+        /// Stable machine-enforceable identity such as `artifact.path_collision`.
+        code: String,
+        /// Project-relative artifact path involved in the transition.
+        path: String,
+        /// Pipeline stage that requested the transition.
+        producer: String,
+        /// Human-readable details, including the current owner when relevant.
+        message: String,
+    },
+
+    /// The host CLI and generation child do not implement the same exact protocol/capabilities.
+    #[error("host/child compatibility error: {message}")]
+    Protocol {
+        /// Actionable version or capability mismatch details.
+        message: String,
+    },
+
     /// The ownership manifest (`.gnr8/cache/manifest.json`) could not be loaded, parsed, or saved
     /// (Phase 4 / WS-04, D-04).
     ///

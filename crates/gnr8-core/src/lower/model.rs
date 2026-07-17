@@ -20,6 +20,8 @@ pub(crate) struct OpenApiDoc {
     pub openapi: &'static str,
     /// Document metadata (`title`, `version`, optional `description`).
     pub info: Info,
+    /// Public server URLs.
+    pub servers: Vec<Server>,
     /// Top-level security requirements (e.g. `[{ApiKeyAuth: []}]`), built from the user's `gnr8` config;
     /// empty when the config declares no schemes (`CLAUDE.md` rule 4 — security is config, not scraped).
     pub security: Vec<SecurityRequirement>,
@@ -38,6 +40,31 @@ pub(crate) struct Info {
     pub version: String,
     /// Optional longer description; omitted from the document when `None`.
     pub description: Option<String>,
+    /// Terms-of-service URL.
+    pub terms_of_service: Option<String>,
+    /// Contact metadata.
+    pub contact: Option<Contact>,
+    /// License metadata.
+    pub license: Option<License>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Contact {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct License {
+    pub name: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Server {
+    pub url: String,
+    pub description: Option<String>,
 }
 
 /// One top-level (or per-operation) security requirement: a scheme name → required scopes (always
@@ -48,6 +75,8 @@ pub(crate) struct SecurityRequirement {
     pub scheme: String,
     /// Required scopes — always empty for an API-key scheme.
     pub scopes: Vec<String>,
+    /// Zero-based OR-alternative index; schemes sharing an index are combined with AND in one object.
+    pub alternative: usize,
 }
 
 /// All HTTP operations registered under one path template, keyed by method in fixed HTTP order.
@@ -106,6 +135,12 @@ pub(crate) struct Parameter {
     pub location: String,
     /// Whether the parameter is required (path params are always required).
     pub required: bool,
+    /// Explicit parameter serialization style.
+    pub style: Option<String>,
+    /// Explicit parameter explode behavior.
+    pub explode: Option<bool>,
+    /// Whether reserved characters may remain unescaped.
+    pub allow_reserved: bool,
     /// The parameter's schema (primitive, with optional `format`).
     pub schema: SchemaObject,
 }
@@ -132,6 +167,8 @@ pub(crate) struct ResponseObj {
     pub schema_ref: Option<String>,
     /// Response media type when content is emitted.
     pub content_type: Option<String>,
+    /// Every declared response media type, in deterministic order.
+    pub content_types: Vec<String>,
     /// Whether this response is binary/file content (`type: string`, `format: binary`).
     pub binary: bool,
     /// Whether this response is a server-sent event stream (`text/event-stream`).

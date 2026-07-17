@@ -13,6 +13,13 @@ import "github.com/gnr8/goextract/internal/facts"
 
 const severityWarn = "WARN"
 
+const (
+	categorySource           = "source"
+	categoryRequestParameter = "request_parameter"
+	categoryResponse         = "response"
+	categorySchema           = "schema"
+)
+
 // Accumulator collects DiagnosticFact values during extraction.
 type Accumulator struct {
 	items []facts.DiagnosticFact
@@ -27,12 +34,17 @@ func New() *Accumulator {
 // (TARGET-API.md §5.2). goType is the rendered Go type (e.g. "*float64").
 func (a *Accumulator) Floatf(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.numeric.narrowing",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message: "float64 -> float32 narrowing: field " + structName + "." + fieldName +
 			" (" + goType + ") loses precision in the generated Go SDK; map to float64 or " +
 			"surface a compatibility diagnostic (TARGET-API.md §5.2)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
 	})
 }
 
@@ -40,12 +52,17 @@ func (a *Accumulator) Floatf(structName, fieldName, goType, file string, line ui
 // (TARGET-API.md §5.1): map[string]any lowers to additionalProperties: true.
 func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.free_form_map",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message: "free-form map field: " + structName + "." + fieldName +
 			" (" + goType + ") lowers to additionalProperties: true; downstream generators " +
 			"may mishandle untyped maps (TARGET-API.md §5.1)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
 	})
 }
 
@@ -57,12 +74,36 @@ func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, li
 // on the Rust side in 02-03).
 func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.parameter.unresolved",
 		Severity: severityWarn,
+		Category: categoryRequestParameter,
 		Message: "untyped query param '" + name + "' on " + method + " " + route +
 			": read via c.Query with no binding struct; param type/required-ness " +
 			"under-specified, type inferred as string only (TARGET-API.md §5.4)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   name,
+	})
+}
+
+// RequestParameterUnresolved records a helper boundary where a Gin context was
+// passed but the module-owned implementation could not be traversed. Keeping
+// this distinct from an untyped direct Query read lets CI deny incomplete call
+// graph analysis with the same stable request.parameter.unresolved identity.
+func (a *Accumulator) RequestParameterUnresolved(subject, method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.parameter.unresolved",
+		Severity: severityWarn,
+		Category: categoryRequestParameter,
+		Message: "request parameter analysis stopped at " + subject + " on " + method + " " + route +
+			": " + reason + "; add an explicit parameter override or keep the helper within the loaded module",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
 	})
 }
 
@@ -72,11 +113,15 @@ func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line u
 // is no secondary source to recover it from (CLAUDE.md rule 3).
 func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "response.schema.unresolved",
 		Severity: severityWarn,
+		Category: categoryResponse,
 		Message: "dynamic response in handler " + handler + ": " + reason +
 			"; cannot infer a typed response from code (TARGET-API.md §5; D-05)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: handler,
 	})
 }
 
@@ -85,11 +130,14 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 // review can fix the source pattern or add an explicit custom Source/Transform.
 func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.route.unresolved",
 		Severity: severityWarn,
+		Category: categorySource,
 		Message: "unsupported Gin route pattern: " + reason +
 			"; route skipped rather than guessed (GO-04)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
 	})
 }
 
@@ -101,23 +149,36 @@ func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) 
 // type, mirroring Floatf/FreeFormMap.
 func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.type.unresolved",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message: "unsupported field type: " + structName + "." + fieldName +
 			" (" + goType + ") has no neutral primitive; lowered to free-form any " +
 			"rather than guessing a concrete type (GO-06)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
 	})
 }
 
 // Warn records a generic warning. Used for go/packages load errors (GO-06) and
 // any rule that does not have a dedicated helper.
 func (a *Accumulator) Warn(message, file string, line uint32) {
+	a.WarnCode("source.unresolved", categorySource, message, file, line)
+}
+
+// WarnCode records a warning with an explicit stable code and category.
+func (a *Accumulator) WarnCode(code, category, message, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     code,
 		Severity: severityWarn,
+		Category: category,
 		Message:  message,
 		File:     file,
 		Line:     line,
+		EndLine:  line,
 	})
 }
 

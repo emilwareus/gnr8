@@ -333,6 +333,9 @@ pub(crate) fn emit_models_with_aliases_and_policies(
         }
         writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
     }
+    if out.is_empty() {
+        out.push_str("export {};\n");
+    }
     Ok(out)
 }
 
@@ -381,6 +384,9 @@ pub(crate) fn emit_models_openapi_generator_compat(
             out.push('\n');
         }
         writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
+    }
+    if out.is_empty() {
+        out.push_str("export {};\n");
     }
     Ok(out)
 }
@@ -1057,6 +1063,9 @@ pub(crate) fn emit_operations(
     // Close the `class Client {` opened by emit_client.
     out.push_str("}\n");
     emit_group_facades(&mut out, ops)?;
+    if ts_operations_need_wire_helpers(ops) {
+        emit_ts_wire_helpers(&mut out);
+    }
     Ok(out)
 }
 
@@ -1088,6 +1097,9 @@ pub(crate) fn emit_operation_module(
             OperationEmitStyle::PrototypeFunction,
         )?;
         emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::PrototypeFunction)?;
+    }
+    if ts_operations_need_wire_helpers(ops) {
+        emit_ts_wire_helpers(&mut out);
     }
     Ok(out)
 }
@@ -1358,6 +1370,7 @@ fn emit_operation(
 
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
     let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
 
     // The templated path tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token nor an unused arg can slip through (twin of WR-03).
@@ -1407,7 +1420,7 @@ fn emit_operation(
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
 
     // Signature: path params (positional), required body when present, required query
     // (positional), optional body when present, then optional query params (`?: T`). This preserves
@@ -1480,6 +1493,10 @@ fn emit_operation(
         &error_bodies,
         op,
         graph,
+        &required_query,
+        &required_query_idents,
+        &optional_query,
+        &optional_query_idents,
     )?;
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
@@ -1709,7 +1726,7 @@ struct TsPaginationArgs {
 
 fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationArgs, CoreError> {
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
     let body_model = request_body_model_of(op, graph)?;
     let ResolvedArgs {
         path_idents,
@@ -1717,7 +1734,7 @@ fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationAr
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
 
     let mut args: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
@@ -1936,22 +1953,23 @@ fn emit_op_query(
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
+    let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
+    if has_allow_reserved {
+        writeln!(out, "    const allowReserved = new Set<number>();").map_err(sink)?;
+        writeln!(out, "    let queryPairIndex = 0;").map_err(sink)?;
+    }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        writeln!(
-            out,
-            "    searchParams.set(\"{}\", String({ident}));",
-            p.name
-        )
-        .map_err(sink)?;
+        if p.location != "query" {
+            continue;
+        }
+        emit_ts_query_parameter(out, p, ident, "    ", has_allow_reserved)?;
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        if p.location != "query" {
+            continue;
+        }
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        writeln!(
-            out,
-            "      searchParams.set(\"{}\", String({ident}));",
-            p.name
-        )
-        .map_err(sink)?;
+        emit_ts_query_parameter(out, p, ident, "      ", has_allow_reserved)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     for (idx, query) in auth_queries.iter().enumerate() {
@@ -1965,17 +1983,240 @@ fn emit_op_query(
         writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
         writeln!(
             out,
-            "      searchParams.set({}, {local});",
+            "      searchParams.append({}, {local});",
             quoted_string_literal(query)
         )
         .map_err(sink)?;
+        if has_allow_reserved {
+            writeln!(out, "      queryPairIndex += 1;").map_err(sink)?;
+        }
         writeln!(out, "    }}").map_err(sink)?;
     }
-    writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
+    if has_allow_reserved {
+        writeln!(
+            out,
+            "    const qs = wireQueryString(searchParams, allowReserved);"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
+    }
     writeln!(out, "    if (qs) {{").map_err(sink)?;
     writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
     Ok(())
+}
+
+fn emit_ts_query_parameter(
+    out: &mut String,
+    param: &Param,
+    ident: &str,
+    padding: &str,
+    track_pair_index: bool,
+) -> Result<(), CoreError> {
+    if ts_parameter_needs_pairs(param) {
+        writeln!(
+            out,
+            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, {ident}, {}, {})) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(ts_parameter_style(param)),
+            ts_parameter_explode(param)
+        )
+        .map_err(sink)?;
+        writeln!(out, "{padding}  searchParams.append(wireName, wireValue);").map_err(sink)?;
+        if param.allow_reserved {
+            writeln!(out, "{padding}  allowReserved.add(queryPairIndex);").map_err(sink)?;
+        }
+        if track_pair_index {
+            writeln!(out, "{padding}  queryPairIndex += 1;").map_err(sink)?;
+        }
+        writeln!(out, "{padding}}}").map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "{padding}searchParams.append({}, String({ident}));",
+            quoted_string_literal(&param.name)
+        )
+        .map_err(sink)?;
+        if param.allow_reserved {
+            writeln!(out, "{padding}allowReserved.add(queryPairIndex);").map_err(sink)?;
+        }
+        if track_pair_index {
+            writeln!(out, "{padding}queryPairIndex += 1;").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn ts_parameter_style(param: &Param) -> &str {
+    param
+        .style
+        .as_deref()
+        .unwrap_or(match param.location.as_str() {
+            "header" => "simple",
+            _ => "form",
+        })
+}
+
+pub(super) fn ts_parameter_explode(param: &Param) -> bool {
+    param
+        .explode
+        .unwrap_or_else(|| ts_parameter_style(param) == "form")
+}
+
+pub(super) fn ts_parameter_needs_pairs(param: &Param) -> bool {
+    matches!(
+        param.schema,
+        Type::Array(_) | Type::Map { .. } | Type::Any {}
+    )
+}
+
+fn ts_operations_need_wire_helpers(ops: &[&Operation]) -> bool {
+    ops.iter().any(|op| {
+        op.params
+            .iter()
+            .any(|param| param.allow_reserved || ts_parameter_needs_pairs(param))
+    })
+}
+
+fn emit_ts_header_cookie_parameters(
+    out: &mut String,
+    required_params: &[&Param],
+    required_idents: &[String],
+    optional_params: &[&Param],
+    optional_idents: &[String],
+) -> Result<(), CoreError> {
+    let has_cookie = required_params
+        .iter()
+        .chain(optional_params.iter())
+        .any(|param| param.location == "cookie");
+    if has_cookie {
+        writeln!(out, "    const cookieParts: string[] = [];").map_err(sink)?;
+    }
+    for (param, ident) in required_params.iter().zip(required_idents.iter()) {
+        if param.location == "header" || param.location == "cookie" {
+            emit_ts_header_cookie_parameter(out, param, ident, "    ")?;
+        }
+    }
+    for (param, ident) in optional_params.iter().zip(optional_idents.iter()) {
+        if param.location != "header" && param.location != "cookie" {
+            continue;
+        }
+        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
+        emit_ts_header_cookie_parameter(out, param, ident, "      ")?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    if has_cookie {
+        writeln!(out, "    if (cookieParts.length > 0) {{").map_err(sink)?;
+        writeln!(out, "      headers[\"Cookie\"] = cookieParts.join(\"; \");").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_ts_header_cookie_parameter(
+    out: &mut String,
+    param: &Param,
+    ident: &str,
+    padding: &str,
+) -> Result<(), CoreError> {
+    if ts_parameter_needs_pairs(param) {
+        writeln!(
+            out,
+            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, {ident}, {}, {})) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(ts_parameter_style(param)),
+            ts_parameter_explode(param)
+        )
+        .map_err(sink)?;
+        if param.location == "header" {
+            writeln!(
+                out,
+                "{padding}  headers[wireName] = headers[wireName] === undefined ? wireValue : headers[wireName] + \",\" + wireValue;"
+            )
+            .map_err(sink)?;
+        } else {
+            writeln!(
+                out,
+                "{padding}  cookieParts.push(encodeURIComponent(wireName) + \"=\" + encodeURIComponent(wireValue));"
+            )
+            .map_err(sink)?;
+        }
+        writeln!(out, "{padding}}}").map_err(sink)?;
+    } else if param.location == "header" {
+        writeln!(
+            out,
+            "{padding}headers[{}] = String({ident});",
+            quoted_string_literal(&param.name)
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "{padding}cookieParts.push(encodeURIComponent({}) + \"=\" + encodeURIComponent(String({ident})));",
+            quoted_string_literal(&param.name)
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
+}
+
+pub(super) fn emit_ts_wire_helpers(out: &mut String) {
+    out.push_str(
+        r#"
+
+function wireParameterPairs(
+  name: string,
+  value: unknown,
+  style: string,
+  explode: boolean,
+): Array<[string, string]> {
+  const delimiter = style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => String(item));
+    return explode && style === "form"
+      ? parts.map((item) => [name, item])
+      : [[name, parts.join(delimiter)]];
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a.localeCompare(b),
+    );
+    if (style === "deepObject") {
+      return entries.map(([key, item]) => [name + "[" + key + "]", String(item)]);
+    }
+    if (explode && style === "form") {
+      return entries.map(([key, item]) => [key, String(item)]);
+    }
+    const parts = entries.flatMap(([key, item]) =>
+      explode ? [key + "=" + String(item)] : [key, String(item)],
+    );
+    return [[name, parts.join(delimiter)]];
+  }
+  return [[name, String(value)]];
+}
+
+function wireQueryString(values: URLSearchParams, allowReserved: Set<number>): string {
+  const restoreReserved = (value: string): string =>
+    value.replace(
+      /%3A|%2F|%3F|%23|%5B|%5D|%40|%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D/gi,
+      (token) => decodeURIComponent(token),
+    );
+  const parts: string[] = [];
+  let index = 0;
+  values.forEach((value, key) => {
+    const encoded = encodeURIComponent(value);
+    parts.push(
+      encodeURIComponent(key) +
+        "=" +
+        (allowReserved.has(index) ? restoreReserved(encoded) : encoded),
+    );
+    index += 1;
+  });
+  return parts.join("&");
+}
+"#,
+    );
 }
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
@@ -2221,8 +2462,19 @@ fn emit_op_dispatch(
     error_bodies: &[ErrorResponseBody],
     op: &Operation,
     graph: &ApiGraph,
+    required_params: &[&Param],
+    required_param_idents: &[String],
+    optional_params: &[&Param],
+    optional_param_idents: &[String],
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
+    emit_ts_header_cookie_parameters(
+        out,
+        required_params,
+        required_param_idents,
+        optional_params,
+        optional_param_idents,
+    )?;
     for (idx, header) in auth_headers.iter().enumerate() {
         let local = format!("apiKey{idx}");
         writeln!(
@@ -3127,6 +3379,9 @@ mod tests {
                 required: true,
                 schema: crate::graph::Type::Primitive(crate::graph::Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
                 provenance: crate::graph::SourceSpan {
                     file: "main.ts".to_string(),
                     start_line: 4,
@@ -3143,7 +3398,7 @@ mod tests {
                 "required body must stay before required query params:\n{out}"
             );
             assert!(
-                out.contains("searchParams.set(\"tenant\", String(tenant));"),
+                out.contains("searchParams.append(\"tenant\", String(tenant));"),
                 "{out}"
             );
         }
@@ -3231,7 +3486,7 @@ mod tests {
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("searchParams.set(\"cursor\", String(cursor));"),
+                out.contains("searchParams.append(\"cursor\", String(cursor));"),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -3258,7 +3513,7 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("searchParams.set(\"api_key\", apiKeyQuery0);"),
+                out.contains("searchParams.append(\"api_key\", apiKeyQuery0);"),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -3494,7 +3749,10 @@ mod tests {
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
+            assert!(
+                out.contains("searchParams.append(\"q\", String(q));"),
+                "{out}"
+            );
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 

@@ -1,0 +1,1677 @@
+//! Exact semantic compatibility checking for Swagger 2 and OpenAPI 3 documents.
+//!
+//! Compatibility uses a dedicated canonical contract rather than [`crate::graph::ApiGraph`]. The
+//! graph intentionally models only facts that gnr8 can currently generate, while a compatibility
+//! oracle must retain every compared fact or it could report a false match.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+
+use super::openapi_source::{detect_version, parse_json_or_yaml, SpecVersion};
+use crate::CoreError;
+
+/// The exact-comparison policy supported by OpenAPI compatibility checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenApiCompatibilityPolicy {
+    /// Require consumer-visible semantic equality after Swagger/OpenAPI normalization.
+    Exact,
+}
+
+/// One deterministic, machine-readable contract difference.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OpenApiDifference {
+    /// Stable dotted identity for this kind of difference.
+    pub code: String,
+    /// Precise canonical contract location expressed as a JSON pointer.
+    pub location: String,
+    /// HTTP operation (`METHOD /path`) when the difference belongs to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Parameter, schema, media-type, or security-scheme name when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Response status when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Baseline value; absent when the value was added.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<Value>,
+    /// Candidate value; absent when the value was removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<Value>,
+}
+
+/// Result of comparing two Swagger/OpenAPI documents.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OpenApiCompatibilityReport {
+    /// Whether no semantic differences were found.
+    pub compatible: bool,
+    /// Detected version of the baseline document.
+    pub old_version: String,
+    /// Detected version of the candidate document.
+    pub new_version: String,
+    /// Differences sorted by location, code, operation, name, and status.
+    pub differences: Vec<OpenApiDifference>,
+}
+
+/// Compare two Swagger 2/OpenAPI 3 files under the requested policy.
+///
+/// # Errors
+///
+/// Returns a typed error when either file cannot be read, parsed, or normalized without ambiguity.
+pub fn compare_openapi_files(
+    old: impl AsRef<Path>,
+    new: impl AsRef<Path>,
+    policy: OpenApiCompatibilityPolicy,
+) -> Result<OpenApiCompatibilityReport, CoreError> {
+    let old = ParsedDocument::load(old.as_ref())?;
+    let new = ParsedDocument::load(new.as_ref())?;
+    compare_documents(old, new, policy)
+}
+
+fn compare_documents(
+    old: ParsedDocument,
+    new: ParsedDocument,
+    policy: OpenApiCompatibilityPolicy,
+) -> Result<OpenApiCompatibilityReport, CoreError> {
+    match policy {
+        OpenApiCompatibilityPolicy::Exact => {
+            let old_version = spec_version_label(old.version).to_string();
+            let new_version = spec_version_label(new.version).to_string();
+            let old = Canonicalizer::new(old).canonicalize()?;
+            let new = Canonicalizer::new(new).canonicalize()?;
+            let mut differences = diff_documents(&old, &new);
+            differences.sort_by(|a, b| {
+                a.location
+                    .cmp(&b.location)
+                    .then_with(|| a.code.cmp(&b.code))
+                    .then_with(|| a.operation.cmp(&b.operation))
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.status.cmp(&b.status))
+            });
+            Ok(OpenApiCompatibilityReport {
+                compatible: differences.is_empty(),
+                old_version,
+                new_version,
+                differences,
+            })
+        }
+    }
+}
+
+fn spec_version_label(version: SpecVersion) -> &'static str {
+    match version {
+        SpecVersion::Swagger2 => "swagger-2.0",
+        SpecVersion::OpenApi30 => "openapi-3.0",
+        SpecVersion::OpenApi31 => "openapi-3.1",
+    }
+}
+
+struct ParsedDocument {
+    path: PathBuf,
+    root: Value,
+    version: SpecVersion,
+}
+
+impl ParsedDocument {
+    fn load(path: &Path) -> Result<Self, CoreError> {
+        let text = std::fs::read_to_string(path).map_err(|source| CoreError::Io {
+            message: format!(
+                "failed to read OpenAPI compatibility input '{}': {source}",
+                path.display()
+            ),
+        })?;
+        let root = parse_json_or_yaml(&text, path)?;
+        let version = detect_version(&root, path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            root,
+            version,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CanonicalDocument {
+    metadata: BTreeMap<String, Value>,
+    servers: Vec<String>,
+    security: SecurityRequirements,
+    security_schemes: BTreeMap<String, Value>,
+    operations: BTreeMap<String, CanonicalOperation>,
+    schemas: BTreeMap<String, Value>,
+}
+
+type SecurityRequirements = Vec<BTreeMap<String, Vec<String>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CanonicalOperation {
+    operation_id: Option<String>,
+    summary: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+    deprecated: bool,
+    external_docs: Option<Value>,
+    parameters: BTreeMap<String, CanonicalParameter>,
+    request_body: Option<CanonicalRequestBody>,
+    responses: BTreeMap<String, CanonicalResponse>,
+    security: SecurityRequirements,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "OpenAPI parameters expose independent required, deprecated, explode, and allowReserved flags"
+)]
+struct CanonicalParameter {
+    name: String,
+    location: String,
+    description: Option<String>,
+    required: bool,
+    deprecated: bool,
+    style: String,
+    explode: bool,
+    allow_reserved: bool,
+    schema: Value,
+    examples: Option<Value>,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CanonicalRequestBody {
+    description: Option<String>,
+    required: bool,
+    content: BTreeMap<String, CanonicalMedia>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CanonicalResponse {
+    description: Option<String>,
+    headers: BTreeMap<String, Value>,
+    content: BTreeMap<String, CanonicalMedia>,
+    extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CanonicalMedia {
+    schema: Option<Value>,
+    example: Option<Value>,
+    examples: Option<Value>,
+    encoding: Option<Value>,
+}
+
+struct Canonicalizer {
+    document: ParsedDocument,
+    external_documents: BTreeMap<PathBuf, Value>,
+}
+
+impl Canonicalizer {
+    fn new(document: ParsedDocument) -> Self {
+        Self {
+            document,
+            external_documents: BTreeMap::new(),
+        }
+    }
+
+    fn canonicalize(mut self) -> Result<CanonicalDocument, CoreError> {
+        let metadata = self.metadata();
+        let servers = self.servers();
+        let security = canonical_security(self.document.root.get("security"));
+        let security_schemes = self.security_schemes();
+        let schemas = self.schemas();
+        let operations = self.operations()?;
+        Ok(CanonicalDocument {
+            metadata,
+            servers,
+            security,
+            security_schemes,
+            operations,
+            schemas,
+        })
+    }
+
+    fn metadata(&self) -> BTreeMap<String, Value> {
+        let mut metadata = BTreeMap::new();
+        if let Some(info) = self.document.root.get("info").and_then(Value::as_object) {
+            for key in [
+                "title",
+                "version",
+                "description",
+                "termsOfService",
+                "contact",
+                "license",
+            ] {
+                if let Some(value) = info.get(key) {
+                    metadata.insert(key.to_string(), normalize_generic(value));
+                }
+            }
+        }
+        for key in ["externalDocs", "tags"] {
+            if let Some(value) = self.document.root.get(key) {
+                metadata.insert(key.to_string(), normalize_generic(value));
+            }
+        }
+        metadata
+    }
+
+    fn servers(&self) -> Vec<String> {
+        let mut servers: Vec<String> = match self.document.version {
+            SpecVersion::Swagger2 => {
+                let Some(host) = self.document.root.get("host").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let schemes = self
+                    .document
+                    .root
+                    .get("schemes")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|items| !items.is_empty())
+                    .unwrap_or_else(|| vec!["https".to_string()]);
+                schemes
+                    .into_iter()
+                    .map(|scheme| normalize_server_url(&format!("{scheme}://{host}")))
+                    .collect()
+            }
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
+                .document
+                .root
+                .get("servers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|server| server.get("url").and_then(Value::as_str))
+                .map(normalize_server_url)
+                .collect(),
+        };
+        servers.sort();
+        servers.dedup();
+        servers
+    }
+
+    fn security_schemes(&self) -> BTreeMap<String, Value> {
+        let raw = match self.document.version {
+            SpecVersion::Swagger2 => self
+                .document
+                .root
+                .get("securityDefinitions")
+                .and_then(Value::as_object),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
+                .document
+                .root
+                .pointer("/components/securitySchemes")
+                .and_then(Value::as_object),
+        };
+        raw.into_iter()
+            .flatten()
+            .map(|(name, scheme)| {
+                let normalized = if self.document.version == SpecVersion::Swagger2 {
+                    normalize_swagger_security_scheme(scheme)
+                } else {
+                    normalize_generic(scheme)
+                };
+                (name.clone(), normalized)
+            })
+            .collect()
+    }
+
+    fn schemas(&self) -> BTreeMap<String, Value> {
+        let raw = match self.document.version {
+            SpecVersion::Swagger2 => self
+                .document
+                .root
+                .get("definitions")
+                .and_then(Value::as_object),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
+                .document
+                .root
+                .pointer("/components/schemas")
+                .and_then(Value::as_object),
+        };
+        raw.into_iter()
+            .flatten()
+            .map(|(name, schema)| (name.clone(), normalize_schema(schema)))
+            .collect()
+    }
+
+    fn operations(&mut self) -> Result<BTreeMap<String, CanonicalOperation>, CoreError> {
+        let Some(paths) = self
+            .document
+            .root
+            .get("paths")
+            .and_then(Value::as_object)
+            .cloned()
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let root_consumes = string_array(self.document.root.get("consumes"));
+        let root_produces = string_array(self.document.root.get("produces"));
+        let root_security = canonical_security(self.document.root.get("security"));
+        let base_path = if self.document.version == SpecVersion::Swagger2 {
+            self.document
+                .root
+                .get("basePath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let mut operations = BTreeMap::new();
+        for (path, item) in paths {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            let path_parameters = item
+                .get("parameters")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (method, operation) in item {
+                if !is_http_method(method) {
+                    continue;
+                }
+                let Some(operation) = operation.as_object() else {
+                    continue;
+                };
+                let normalized_path = join_contract_path(&base_path, &path);
+                let operation_label = format!("{} {normalized_path}", method.to_ascii_uppercase());
+                let consumes = string_array(operation.get("consumes"));
+                let consumes = if consumes.is_empty() {
+                    &root_consumes
+                } else {
+                    &consumes
+                };
+                let produces = string_array(operation.get("produces"));
+                let produces = if produces.is_empty() {
+                    &root_produces
+                } else {
+                    &produces
+                };
+                let parameters = self.parameters(&path_parameters, operation)?;
+                let request_body = self.request_body(operation, consumes)?;
+                let responses = self.responses(operation, produces)?;
+                let security = if operation.contains_key("security") {
+                    canonical_security(operation.get("security"))
+                } else {
+                    root_security.clone()
+                };
+                let mut tags = string_array(operation.get("tags"));
+                tags.sort();
+                tags.dedup();
+                operations.insert(
+                    operation_label,
+                    CanonicalOperation {
+                        operation_id: optional_string(operation.get("operationId")),
+                        summary: optional_string(operation.get("summary")),
+                        description: optional_string(operation.get("description")),
+                        tags,
+                        deprecated: operation
+                            .get("deprecated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        external_docs: operation.get("externalDocs").map(normalize_generic),
+                        parameters,
+                        request_body,
+                        responses,
+                        security,
+                        extensions: extensions(operation),
+                    },
+                );
+            }
+        }
+        Ok(operations)
+    }
+
+    fn parameters(
+        &mut self,
+        path_parameters: &[Value],
+        operation: &Map<String, Value>,
+    ) -> Result<BTreeMap<String, CanonicalParameter>, CoreError> {
+        let mut parameters = BTreeMap::new();
+        let operation_parameters = operation
+            .get("parameters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for raw in path_parameters.iter().chain(&operation_parameters) {
+            let resolved = self.resolve_object(raw, 0)?;
+            let Some(parameter) = resolved.as_object() else {
+                continue;
+            };
+            let Some(location) = parameter.get("in").and_then(Value::as_str) else {
+                continue;
+            };
+            if matches!(location, "body" | "formData") {
+                continue;
+            }
+            let Some(name) = parameter.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let schema = parameter_schema(self.document.version, parameter);
+            let (style, mut explode) =
+                parameter_serialization(self.document.version, parameter, location);
+            if !schema_is_collection(&schema) {
+                explode = false;
+            }
+            let key = format!("{location}/{name}");
+            parameters.insert(
+                key,
+                CanonicalParameter {
+                    name: name.to_string(),
+                    location: location.to_string(),
+                    description: optional_string(parameter.get("description")),
+                    required: location == "path"
+                        || parameter
+                            .get("required")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    deprecated: parameter
+                        .get("deprecated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    style,
+                    explode,
+                    allow_reserved: parameter
+                        .get("allowReserved")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    schema,
+                    examples: parameter
+                        .get("examples")
+                        .or_else(|| parameter.get("example"))
+                        .map(normalize_generic),
+                    extensions: extensions(parameter),
+                },
+            );
+        }
+        Ok(parameters)
+    }
+
+    fn request_body(
+        &mut self,
+        operation: &Map<String, Value>,
+        consumes: &[String],
+    ) -> Result<Option<CanonicalRequestBody>, CoreError> {
+        if self.document.version != SpecVersion::Swagger2 {
+            let Some(raw) = operation.get("requestBody") else {
+                return Ok(None);
+            };
+            let body = self.resolve_object(raw, 0)?;
+            let Some(body) = body.as_object() else {
+                return Ok(None);
+            };
+            return Ok(Some(CanonicalRequestBody {
+                description: optional_string(body.get("description")),
+                required: body
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                content: canonical_content(body.get("content")),
+            }));
+        }
+
+        let parameters = operation
+            .get("parameters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut body_schema = None;
+        let mut body_description = None;
+        let mut required = false;
+        let mut form_properties = Map::new();
+        let mut form_required = Vec::new();
+        for raw in parameters {
+            let resolved = self.resolve_object(&raw, 0)?;
+            let Some(parameter) = resolved.as_object() else {
+                continue;
+            };
+            match parameter.get("in").and_then(Value::as_str) {
+                Some("body") => {
+                    body_schema = parameter.get("schema").map(normalize_schema);
+                    body_description = optional_string(parameter.get("description"));
+                    required |= parameter
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                }
+                Some("formData") => {
+                    let Some(name) = parameter.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    form_properties.insert(
+                        name.to_string(),
+                        parameter_schema(SpecVersion::Swagger2, parameter),
+                    );
+                    if parameter
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        form_required.push(Value::String(name.to_string()));
+                        required = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if body_schema.is_none() && !form_properties.is_empty() {
+            form_required.sort_by_key(value_sort_key);
+            let mut schema = Map::new();
+            schema.insert("type".to_string(), Value::String("object".to_string()));
+            schema.insert("properties".to_string(), Value::Object(form_properties));
+            if !form_required.is_empty() {
+                schema.insert("required".to_string(), Value::Array(form_required));
+            }
+            body_schema = Some(Value::Object(schema));
+        }
+        let Some(schema) = body_schema else {
+            return Ok(None);
+        };
+        let media_types = if consumes.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            consumes.to_vec()
+        };
+        let content = media_types
+            .into_iter()
+            .map(|media_type| {
+                (
+                    media_type,
+                    CanonicalMedia {
+                        schema: Some(schema.clone()),
+                        example: None,
+                        examples: None,
+                        encoding: None,
+                    },
+                )
+            })
+            .collect();
+        Ok(Some(CanonicalRequestBody {
+            description: body_description,
+            required,
+            content,
+        }))
+    }
+
+    fn responses(
+        &mut self,
+        operation: &Map<String, Value>,
+        produces: &[String],
+    ) -> Result<BTreeMap<String, CanonicalResponse>, CoreError> {
+        let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+            return Ok(BTreeMap::new());
+        };
+        let mut out = BTreeMap::new();
+        for (status, raw) in responses {
+            let resolved = self.resolve_object(raw, 0)?;
+            let Some(response) = resolved.as_object() else {
+                continue;
+            };
+            let content = if self.document.version == SpecVersion::Swagger2 {
+                if let Some(schema) = response.get("schema").map(normalize_schema) {
+                    let media_types = if produces.is_empty() {
+                        vec!["application/json".to_string()]
+                    } else {
+                        produces.to_vec()
+                    };
+                    media_types
+                        .into_iter()
+                        .map(|media_type| {
+                            let example = response
+                                .get("examples")
+                                .and_then(Value::as_object)
+                                .and_then(|examples| examples.get(&media_type))
+                                .map(normalize_generic);
+                            (
+                                media_type,
+                                CanonicalMedia {
+                                    schema: Some(schema.clone()),
+                                    example,
+                                    examples: None,
+                                    encoding: None,
+                                },
+                            )
+                        })
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                }
+            } else {
+                canonical_content(response.get("content"))
+            };
+            let headers = response
+                .get("headers")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .map(|(name, value)| (name.to_ascii_lowercase(), normalize_generic(value)))
+                .collect();
+            out.insert(
+                status.to_ascii_uppercase(),
+                CanonicalResponse {
+                    description: optional_string(response.get("description")),
+                    headers,
+                    content,
+                    extensions: extensions(response),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    fn resolve_object(&mut self, value: &Value, depth: usize) -> Result<Value, CoreError> {
+        if depth > 32 {
+            return Err(CoreError::Config {
+                message: format!(
+                    "OpenAPI compatibility reference traversal exceeded 32 levels in '{}'",
+                    self.document.path.display()
+                ),
+            });
+        }
+        let Some(reference) = value.get("$ref").and_then(Value::as_str) else {
+            return Ok(value.clone());
+        };
+        let (path, fragment) = split_reference(reference);
+        let referenced = if path.is_empty() {
+            self.document.root.pointer(fragment).cloned()
+        } else {
+            let parent = self
+                .document
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let external_path = parent.join(path);
+            if !self.external_documents.contains_key(&external_path) {
+                let text =
+                    std::fs::read_to_string(&external_path).map_err(|source| CoreError::Io {
+                        message: format!(
+                            "failed to read OpenAPI compatibility reference '{}': {source}",
+                            external_path.display()
+                        ),
+                    })?;
+                let parsed = parse_json_or_yaml(&text, &external_path)?;
+                self.external_documents
+                    .insert(external_path.clone(), parsed);
+            }
+            self.external_documents
+                .get(&external_path)
+                .and_then(|document| document.pointer(fragment))
+                .cloned()
+        }
+        .ok_or_else(|| CoreError::Config {
+            message: format!(
+                "OpenAPI compatibility input '{}' contains unresolved reference {reference:?}",
+                self.document.path.display()
+            ),
+        })?;
+        let mut resolved = self.resolve_object(&referenced, depth + 1)?;
+        if let (Some(resolved), Some(original)) = (resolved.as_object_mut(), value.as_object()) {
+            for (key, sibling) in original {
+                if key != "$ref" {
+                    resolved.insert(key.clone(), sibling.clone());
+                }
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+fn split_reference(reference: &str) -> (&str, &str) {
+    let (path, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+    let fragment = if fragment.is_empty() { "" } else { fragment };
+    (path, fragment)
+}
+
+fn is_http_method(method: &str) -> bool {
+    matches!(
+        method.to_ascii_lowercase().as_str(),
+        "get" | "put" | "post" | "delete" | "options" | "head" | "patch" | "trace"
+    )
+}
+
+fn join_contract_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    match (base.is_empty(), path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{path}"),
+        (false, true) => format!("{base}/"),
+        (false, false) => format!("{base}/{path}"),
+    }
+}
+
+fn normalize_server_url(url: &str) -> String {
+    if url == "/" {
+        "/".to_string()
+    } else {
+        url.trim_end_matches('/').to_string()
+    }
+}
+
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(Value::as_str).map(str::to_string)
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn canonical_security(value: Option<&Value>) -> SecurityRequirements {
+    let mut requirements = value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .map(|requirement| {
+            requirement
+                .iter()
+                .map(|(scheme, scopes)| {
+                    let mut scopes = scopes
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    scopes.sort();
+                    scopes.dedup();
+                    (scheme.clone(), scopes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    requirements.sort_by_key(|requirement| {
+        value_sort_key(&serde_json::to_value(requirement).unwrap_or(Value::Null))
+    });
+    requirements
+}
+
+fn parameter_serialization(
+    version: SpecVersion,
+    parameter: &Map<String, Value>,
+    location: &str,
+) -> (String, bool) {
+    if version != SpecVersion::Swagger2 {
+        let style = parameter
+            .get("style")
+            .and_then(Value::as_str)
+            .unwrap_or(match location {
+                "path" | "header" => "simple",
+                _ => "form",
+            })
+            .to_string();
+        let explode = parameter
+            .get("explode")
+            .and_then(Value::as_bool)
+            .unwrap_or(style == "form");
+        return (style, explode);
+    }
+    let collection = parameter
+        .get("collectionFormat")
+        .and_then(Value::as_str)
+        .unwrap_or("csv");
+    match (location, collection) {
+        ("query" | "formData", "multi") => ("form".to_string(), true),
+        ("query", "ssv") => ("spaceDelimited".to_string(), false),
+        ("query", "pipes") => ("pipeDelimited".to_string(), false),
+        ("path" | "header", _) => ("simple".to_string(), false),
+        _ => ("form".to_string(), false),
+    }
+}
+
+fn parameter_schema(version: SpecVersion, parameter: &Map<String, Value>) -> Value {
+    if let Some(schema) = parameter.get("schema") {
+        return normalize_schema(schema);
+    }
+    if version != SpecVersion::Swagger2 {
+        if let Some(content) = parameter.get("content") {
+            let mut object = Map::new();
+            object.insert("content".to_string(), normalize_generic(content));
+            return Value::Object(object);
+        }
+    }
+    let keys = [
+        "type",
+        "format",
+        "items",
+        "enum",
+        "default",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+    ];
+    let mut schema = Map::new();
+    for key in keys {
+        if let Some(value) = parameter.get(key) {
+            schema.insert(key.to_string(), value.clone());
+        }
+    }
+    normalize_schema(&Value::Object(schema))
+}
+
+fn schema_is_collection(schema: &Value) -> bool {
+    matches!(
+        schema.get("type").and_then(Value::as_str),
+        Some("array" | "object")
+    ) || schema.get("properties").is_some()
+        || schema.get("additionalProperties").is_some()
+}
+
+fn canonical_content(value: Option<&Value>) -> BTreeMap<String, CanonicalMedia> {
+    value
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(media_type, media)| {
+            let media = media.as_object();
+            (
+                media_type.to_ascii_lowercase(),
+                CanonicalMedia {
+                    schema: media
+                        .and_then(|item| item.get("schema"))
+                        .map(normalize_schema),
+                    example: media
+                        .and_then(|item| item.get("example"))
+                        .map(normalize_generic),
+                    examples: media
+                        .and_then(|item| item.get("examples"))
+                        .map(normalize_generic),
+                    encoding: media
+                        .and_then(|item| item.get("encoding"))
+                        .map(normalize_generic),
+                },
+            )
+        })
+        .collect()
+}
+
+fn normalize_swagger_security_scheme(value: &Value) -> Value {
+    let Some(scheme) = value.as_object() else {
+        return normalize_generic(value);
+    };
+    match scheme.get("type").and_then(Value::as_str) {
+        Some("basic") => serde_json::json!({"type": "http", "scheme": "basic"}),
+        Some("oauth2") => {
+            let flow = scheme.get("flow").and_then(Value::as_str).unwrap_or("");
+            let (flow_name, authorization_key, token_key) = match flow {
+                "implicit" => ("implicit", Some("authorizationUrl"), None),
+                "password" => ("password", None, Some("tokenUrl")),
+                "application" => ("clientCredentials", None, Some("tokenUrl")),
+                "accessCode" => (
+                    "authorizationCode",
+                    Some("authorizationUrl"),
+                    Some("tokenUrl"),
+                ),
+                _ => (flow, None, None),
+            };
+            let mut details = Map::new();
+            if let Some(key) = authorization_key {
+                if let Some(url) = scheme.get("authorizationUrl") {
+                    details.insert(key.to_string(), url.clone());
+                }
+            }
+            if let Some(key) = token_key {
+                if let Some(url) = scheme.get("tokenUrl") {
+                    details.insert(key.to_string(), url.clone());
+                }
+            }
+            details.insert(
+                "scopes".to_string(),
+                normalize_generic(scheme.get("scopes").unwrap_or(&Value::Object(Map::new()))),
+            );
+            let mut flows = Map::new();
+            flows.insert(flow_name.to_string(), Value::Object(details));
+            let mut out = Map::new();
+            out.insert("type".to_string(), Value::String("oauth2".to_string()));
+            out.insert("flows".to_string(), Value::Object(flows));
+            Value::Object(out)
+        }
+        _ => normalize_generic(value),
+    }
+}
+
+fn normalize_schema(value: &Value) -> Value {
+    let Value::Object(object) = value else {
+        return normalize_generic(value);
+    };
+    let mut nullable = object
+        .get("nullable")
+        .or_else(|| object.get("x-nullable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = Map::new();
+    for (key, value) in object {
+        if matches!(key.as_str(), "nullable" | "x-nullable") {
+            continue;
+        }
+        if key == "$ref" {
+            if let Some(reference) = value.as_str() {
+                out.insert(key.clone(), Value::String(normalize_reference(reference)));
+            }
+            continue;
+        }
+        if key == "type" {
+            if let Some(types) = value.as_array() {
+                let mut retained = Vec::new();
+                for item in types {
+                    if item.as_str() == Some("null") {
+                        nullable = true;
+                    } else {
+                        retained.push(item.clone());
+                    }
+                }
+                retained.sort_by_key(value_sort_key);
+                if retained.len() == 1 {
+                    if let Some(item) = retained.into_iter().next() {
+                        out.insert(key.clone(), item);
+                    }
+                } else if !retained.is_empty() {
+                    out.insert(key.clone(), Value::Array(retained));
+                }
+                continue;
+            }
+            if value.as_str() == Some("file") {
+                out.insert(key.clone(), Value::String("string".to_string()));
+                out.insert("format".to_string(), Value::String("binary".to_string()));
+                continue;
+            }
+        }
+        let normalized = match key.as_str() {
+            "properties" => Value::Object(
+                value
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, schema)| (name.clone(), normalize_schema(schema)))
+                    .collect(),
+            ),
+            "items" | "additionalProperties" | "not" => normalize_schema(value),
+            "allOf" | "anyOf" | "oneOf" => {
+                let mut items = value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(normalize_schema)
+                    .collect::<Vec<_>>();
+                items.sort_by_key(value_sort_key);
+                Value::Array(items)
+            }
+            "required" | "enum" => {
+                let mut items = value.as_array().cloned().unwrap_or_default();
+                items.sort_by_key(value_sort_key);
+                items.dedup();
+                Value::Array(items)
+            }
+            _ => normalize_generic(value),
+        };
+        out.insert(key.clone(), normalized);
+    }
+    if nullable {
+        out.insert("x-gnr8-nullable".to_string(), Value::Bool(true));
+    }
+    Value::Object(out)
+}
+
+fn normalize_reference(reference: &str) -> String {
+    let (_, fragment) = split_reference(reference);
+    let fragment = fragment
+        .replace("/definitions/", "/components/schemas/")
+        .replace("/securityDefinitions/", "/components/securitySchemes/")
+        .replace("/parameters/", "/components/parameters/")
+        .replace("/responses/", "/components/responses/");
+    format!("#{fragment}")
+}
+
+fn normalize_generic(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let value = if key == "$ref" {
+                        value.as_str().map_or_else(
+                            || normalize_generic(value),
+                            |reference| Value::String(normalize_reference(reference)),
+                        )
+                    } else {
+                        normalize_generic(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(normalize_generic).collect()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+    }
+}
+
+fn extensions(object: &Map<String, Value>) -> BTreeMap<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| key.starts_with("x-") && key.as_str() != "x-nullable")
+        .map(|(key, value)| (key.clone(), normalize_generic(value)))
+        .collect()
+}
+
+fn value_sort_key(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn diff_documents(old: &CanonicalDocument, new: &CanonicalDocument) -> Vec<OpenApiDifference> {
+    let mut differences = Vec::new();
+    diff_map_values(
+        &old.metadata,
+        &new.metadata,
+        "/metadata",
+        "metadata",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_json_value(
+        &serde_json::to_value(&old.servers).unwrap_or(Value::Null),
+        &serde_json::to_value(&new.servers).unwrap_or(Value::Null),
+        "/servers",
+        "server.changed",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_json_value(
+        &serde_json::to_value(&old.security).unwrap_or(Value::Null),
+        &serde_json::to_value(&new.security).unwrap_or(Value::Null),
+        "/security",
+        "security.requirement.changed",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_map_values(
+        &old.security_schemes,
+        &new.security_schemes,
+        "/components/securitySchemes",
+        "security.scheme",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_map_values(
+        &old.schemas,
+        &new.schemas,
+        "/components/schemas",
+        "schema",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_operations(&old.operations, &new.operations, &mut differences);
+    differences
+}
+
+fn diff_operations(
+    old: &BTreeMap<String, CanonicalOperation>,
+    new: &BTreeMap<String, CanonicalOperation>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for operation in union_keys(old, new) {
+        let location = operation_pointer(operation);
+        match (old.get(operation), new.get(operation)) {
+            (Some(old), Some(new)) => diff_operation(operation, &location, old, new, differences),
+            (Some(old), None) => differences.push(difference(
+                "operation.missing",
+                &location,
+                Some(operation),
+                None,
+                None,
+                Some(to_value(old)),
+                None,
+            )),
+            (None, Some(new)) => differences.push(difference(
+                "operation.added",
+                &location,
+                Some(operation),
+                None,
+                None,
+                None,
+                Some(to_value(new)),
+            )),
+            (None, None) => {}
+        }
+    }
+}
+
+fn diff_operation(
+    operation: &str,
+    location: &str,
+    old: &CanonicalOperation,
+    new: &CanonicalOperation,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for (field, old, new) in [
+        (
+            "operationId",
+            to_value(&old.operation_id),
+            to_value(&new.operation_id),
+        ),
+        ("summary", to_value(&old.summary), to_value(&new.summary)),
+        (
+            "description",
+            to_value(&old.description),
+            to_value(&new.description),
+        ),
+        ("tags", to_value(&old.tags), to_value(&new.tags)),
+        (
+            "deprecated",
+            to_value(&old.deprecated),
+            to_value(&new.deprecated),
+        ),
+        (
+            "externalDocs",
+            to_value(&old.external_docs),
+            to_value(&new.external_docs),
+        ),
+        ("security", to_value(&old.security), to_value(&new.security)),
+        (
+            "extensions",
+            to_value(&old.extensions),
+            to_value(&new.extensions),
+        ),
+    ] {
+        diff_json_value(
+            &old,
+            &new,
+            &format!("{location}/{}", escape_pointer(field)),
+            &format!("operation.{}.changed", dotted(field)),
+            Some(operation),
+            None,
+            None,
+            differences,
+        );
+    }
+    diff_parameters(
+        operation,
+        location,
+        &old.parameters,
+        &new.parameters,
+        differences,
+    );
+    diff_request_body(
+        operation,
+        location,
+        old.request_body.as_ref(),
+        new.request_body.as_ref(),
+        differences,
+    );
+    diff_responses(
+        operation,
+        location,
+        &old.responses,
+        &new.responses,
+        differences,
+    );
+}
+
+fn diff_parameters(
+    operation: &str,
+    operation_location: &str,
+    old: &BTreeMap<String, CanonicalParameter>,
+    new: &BTreeMap<String, CanonicalParameter>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for key in union_keys(old, new) {
+        let location = format!("{operation_location}/parameters/{}", escape_pointer(key));
+        let name = key.split_once('/').map_or(key, |(_, name)| name);
+        match (old.get(key), new.get(key)) {
+            (Some(old), Some(new)) => diff_json_value(
+                &to_value(old),
+                &to_value(new),
+                &location,
+                "parameter.changed",
+                Some(operation),
+                Some(name),
+                None,
+                differences,
+            ),
+            (Some(old), None) => differences.push(difference(
+                "parameter.missing",
+                &location,
+                Some(operation),
+                Some(name),
+                None,
+                Some(to_value(old)),
+                None,
+            )),
+            (None, Some(new)) => differences.push(difference(
+                "parameter.added",
+                &location,
+                Some(operation),
+                Some(name),
+                None,
+                None,
+                Some(to_value(new)),
+            )),
+            (None, None) => {}
+        }
+    }
+}
+
+fn diff_request_body(
+    operation: &str,
+    operation_location: &str,
+    old: Option<&CanonicalRequestBody>,
+    new: Option<&CanonicalRequestBody>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    let location = format!("{operation_location}/requestBody");
+    match (old, new) {
+        (Some(old), Some(new)) => diff_json_value(
+            &to_value(old),
+            &to_value(new),
+            &location,
+            "request.body.changed",
+            Some(operation),
+            None,
+            None,
+            differences,
+        ),
+        (Some(old), None) => differences.push(difference(
+            "request.body.missing",
+            &location,
+            Some(operation),
+            None,
+            None,
+            Some(to_value(old)),
+            None,
+        )),
+        (None, Some(new)) => differences.push(difference(
+            "request.body.added",
+            &location,
+            Some(operation),
+            None,
+            None,
+            None,
+            Some(to_value(new)),
+        )),
+        (None, None) => {}
+    }
+}
+
+fn diff_responses(
+    operation: &str,
+    operation_location: &str,
+    old: &BTreeMap<String, CanonicalResponse>,
+    new: &BTreeMap<String, CanonicalResponse>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for status in union_keys(old, new) {
+        let location = format!("{operation_location}/responses/{}", escape_pointer(status));
+        match (old.get(status), new.get(status)) {
+            (Some(old), Some(new)) => diff_json_value(
+                &to_value(old),
+                &to_value(new),
+                &location,
+                "response.changed",
+                Some(operation),
+                None,
+                Some(status),
+                differences,
+            ),
+            (Some(old), None) => differences.push(difference(
+                "response.missing",
+                &location,
+                Some(operation),
+                None,
+                Some(status),
+                Some(to_value(old)),
+                None,
+            )),
+            (None, Some(new)) => differences.push(difference(
+                "response.added",
+                &location,
+                Some(operation),
+                None,
+                Some(status),
+                None,
+                Some(to_value(new)),
+            )),
+            (None, None) => {}
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "difference context is explicit so every recursive report retains its stable subject fields"
+)]
+fn diff_map_values(
+    old: &BTreeMap<String, Value>,
+    new: &BTreeMap<String, Value>,
+    base: &str,
+    code_prefix: &str,
+    operation: Option<&str>,
+    name: Option<&str>,
+    status: Option<&str>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for key in union_keys(old, new) {
+        let location = format!("{base}/{}", escape_pointer(key));
+        let subject_name = name.or(Some(key));
+        match (old.get(key), new.get(key)) {
+            (Some(old), Some(new)) => diff_json_value(
+                old,
+                new,
+                &location,
+                &format!("{code_prefix}.changed"),
+                operation,
+                subject_name,
+                status,
+                differences,
+            ),
+            (Some(old), None) => differences.push(difference(
+                &format!("{code_prefix}.missing"),
+                &location,
+                operation,
+                subject_name,
+                status,
+                Some(old.clone()),
+                None,
+            )),
+            (None, Some(new)) => differences.push(difference(
+                &format!("{code_prefix}.added"),
+                &location,
+                operation,
+                subject_name,
+                status,
+                None,
+                Some(new.clone()),
+            )),
+            (None, None) => {}
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recursive JSON differences carry explicit operation/name/status context"
+)]
+fn diff_json_value(
+    old: &Value,
+    new: &Value,
+    location: &str,
+    code: &str,
+    operation: Option<&str>,
+    name: Option<&str>,
+    status: Option<&str>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    if old == new {
+        return;
+    }
+    match (old.as_object(), new.as_object()) {
+        (Some(old), Some(new)) => {
+            let old: BTreeMap<String, Value> = old
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let new: BTreeMap<String, Value> = new
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let prefix = code.trim_end_matches(".changed");
+            for key in union_keys(&old, &new) {
+                let child_location = format!("{location}/{}", escape_pointer(key));
+                let child_code = format!("{prefix}.{}", dotted(key));
+                match (old.get(key), new.get(key)) {
+                    (Some(old), Some(new)) => diff_json_value(
+                        old,
+                        new,
+                        &child_location,
+                        &format!("{child_code}.changed"),
+                        operation,
+                        name,
+                        status,
+                        differences,
+                    ),
+                    (Some(old), None) => differences.push(difference(
+                        &format!("{child_code}.missing"),
+                        &child_location,
+                        operation,
+                        name,
+                        status,
+                        Some(old.clone()),
+                        None,
+                    )),
+                    (None, Some(new)) => differences.push(difference(
+                        &format!("{child_code}.added"),
+                        &child_location,
+                        operation,
+                        name,
+                        status,
+                        None,
+                        Some(new.clone()),
+                    )),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => differences.push(difference(
+            code,
+            location,
+            operation,
+            name,
+            status,
+            Some(old.clone()),
+            Some(new.clone()),
+        )),
+    }
+}
+
+fn difference(
+    code: &str,
+    location: &str,
+    operation: Option<&str>,
+    name: Option<&str>,
+    status: Option<&str>,
+    old: Option<Value>,
+    new: Option<Value>,
+) -> OpenApiDifference {
+    OpenApiDifference {
+        code: code.to_string(),
+        location: location.to_string(),
+        operation: operation.map(str::to_string),
+        name: name.map(str::to_string),
+        status: status.map(str::to_string),
+        old,
+        new,
+    }
+}
+
+fn union_keys<'a, T>(
+    old: &'a BTreeMap<String, T>,
+    new: &'a BTreeMap<String, T>,
+) -> impl Iterator<Item = &'a str> {
+    let keys: BTreeSet<&str> = old.keys().chain(new.keys()).map(String::as_str).collect();
+    keys.into_iter()
+}
+
+fn operation_pointer(operation: &str) -> String {
+    let (method, path) = operation.split_once(' ').unwrap_or((operation, ""));
+    format!(
+        "/paths/{}/{method}",
+        escape_pointer(path),
+        method = method.to_ascii_lowercase()
+    )
+}
+
+fn escape_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn dotted(value: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('.');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn to_value(value: &impl serde::Serialize) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::path::Path;
+
+    use super::{compare_documents, OpenApiCompatibilityPolicy, ParsedDocument};
+    use crate::sdk::openapi_source::{detect_version, parse_json_or_yaml};
+
+    fn parsed(name: &str, text: &str) -> ParsedDocument {
+        let path = Path::new(name);
+        let root = parse_json_or_yaml(text, path).expect("parse fixture");
+        let version = detect_version(&root, path).expect("detect fixture version");
+        ParsedDocument {
+            path: path.to_path_buf(),
+            root,
+            version,
+        }
+    }
+
+    #[test]
+    fn swagger_and_openapi_equivalents_compare_equal() {
+        let swagger = parsed(
+            "old.json",
+            r##"{
+  "swagger": "2.0",
+  "basePath": "/api",
+  "info": {"title": "Books", "version": "1.0", "description": "API"},
+  "produces": ["application/json"],
+  "paths": {
+    "/books": {
+      "get": {
+        "operationId": "listBooks",
+        "parameters": [{"name":"status","in":"query","type":"array","items":{"type":"string"},"collectionFormat":"multi"}],
+        "responses": {"200":{"description":"ok","schema":{"type":"array","items":{"$ref":"#/definitions/Book"}}}}
+      }
+    }
+  },
+  "definitions": {"Book":{"type":"object","required":["id"],"properties":{"id":{"type":"string","format":"uuid"}}}}
+}"##,
+        );
+        let openapi = parsed(
+            "new.yaml",
+            r"openapi: 3.1.0
+info:
+  title: Books
+  version: '1.0'
+  description: API
+paths:
+  /api/books:
+    get:
+      operationId: listBooks
+      parameters:
+        - name: status
+          in: query
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Book'
+components:
+  schemas:
+    Book:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+",
+        );
+        let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+        assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn changed_parameter_type_has_stable_precise_difference() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.0.3","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"parameters":[{"name":"limit","in":"query","schema":{"type":"integer"}}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"parameters":[{"name":"limit","in":"query","schema":{"type":"string"}}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+        let difference = report.differences.first().expect("one difference");
+        assert_eq!(difference.code, "parameter.schema.type.changed");
+        assert_eq!(
+            difference.location,
+            "/paths/~1x/get/parameters/query~1limit/schema/type"
+        );
+    }
+
+    #[test]
+    fn security_alternatives_and_and_groups_are_not_conflated() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"security":[{"ApiKey":[],"Bearer":[]}],"paths":{}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"security":[{"ApiKey":[]},{"Bearer":[]}],"paths":{}}"#,
+        );
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+        assert_eq!(report.differences[0].code, "security.requirement.changed");
+    }
+}

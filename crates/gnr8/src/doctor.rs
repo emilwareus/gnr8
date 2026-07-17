@@ -69,8 +69,12 @@ pub(crate) struct OutputHealth {
 /// [`Diagnostic`] fields verbatim plus the derived `why`/`fix` strings.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct DoctorDiagnostic {
+    /// Stable diagnostic identity.
+    pub(crate) code: String,
     /// Severity copied from the source diagnostic (`"WARN"` / `"ERROR"`).
     pub(crate) severity: String,
+    /// Stable diagnostic category.
+    pub(crate) category: gnr8::graph::DiagnosticCategory,
     /// The original analyzer message (rule + identity).
     pub(crate) message: String,
     /// The source file the diagnostic applies to (module-relative).
@@ -276,7 +280,9 @@ impl DoctorReport {
             .map(|d| {
                 let (why, fix) = explain(&d.message);
                 DoctorDiagnostic {
+                    code: d.code,
                     severity: d.severity,
+                    category: d.category,
                     message: d.message,
                     file: d.file,
                     line: d.line,
@@ -448,8 +454,8 @@ impl DoctorReport {
         for d in &self.diagnostics {
             let _ = writeln!(
                 out,
-                "  {}  {} ({}:{})",
-                d.severity, d.message, d.file, d.line
+                "  {}  [{}] {} ({}:{})",
+                d.severity, d.code, d.message, d.file, d.line
             );
             let _ = writeln!(out, "        why: {}", d.why);
             let _ = writeln!(out, "        fix: {}", d.fix);
@@ -513,18 +519,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::DoctorReport;
-    use gnr8::graph::Diagnostic;
+    use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
     use gnr8::lifecycle::{PlannedFile, WriteAction, WritePlan};
     use std::collections::HashSet;
 
     /// One informational analysis WARN (the kind the fixture emits several of).
     fn warn_diag(message: &str) -> Diagnostic {
-        Diagnostic {
-            severity: "WARN".to_string(),
-            message: message.to_string(),
-            file: "internal/common/dto/goal.go".to_string(),
-            line: 32,
-        }
+        Diagnostic::new(
+            "source.test",
+            DiagnosticCategory::Source,
+            "WARN",
+            message,
+            SourceSpan {
+                file: "internal/common/dto/goal.go".to_string(),
+                start_line: 32,
+                end_line: 32,
+            },
+        )
     }
 
     /// A WritePlan whose every file has the given action (a one-file plan is enough to exercise the

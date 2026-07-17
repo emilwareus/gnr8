@@ -87,6 +87,18 @@ pub(crate) enum Commands {
 /// SDK compatibility subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum CompatAction {
+    /// Compare Swagger 2/OpenAPI 3 documents semantically.
+    Openapi {
+        /// Old/baseline Swagger or `OpenAPI` document.
+        #[arg(long)]
+        old: String,
+        /// New/candidate Swagger or `OpenAPI` document.
+        #[arg(long)]
+        new: String,
+        /// Compatibility policy to enforce.
+        #[arg(long, value_enum, default_value_t = OpenApiCompatPolicy::Exact)]
+        policy: OpenApiCompatPolicy,
+    },
     /// Compare two generated TypeScript SDK directories.
     Typescript {
         /// Old/baseline SDK directory.
@@ -117,6 +129,22 @@ pub(crate) enum CompatAction {
         #[arg(long)]
         suggest: bool,
     },
+    /// Compare two generated Python SDK directories.
+    Python {
+        /// Old/baseline SDK directory.
+        #[arg(long)]
+        old: String,
+        /// New/candidate SDK directory.
+        #[arg(long)]
+        new: String,
+    },
+}
+
+/// `OpenAPI` compatibility policies exposed by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OpenApiCompatPolicy {
+    /// Require semantic equality after Swagger/OpenAPI representation normalization.
+    Exact,
 }
 
 /// Source frontend presets for `gnr8 init`.
@@ -195,6 +223,10 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one parser smoke test enumerates every top-level command and compatibility subcommand"
+    )]
     fn cli_parses_all_top_level_commands() {
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "init"]).unwrap().command,
@@ -281,6 +313,16 @@ mod tests {
                 .command,
             Commands::Compat {
                 action: CompatAction::Go { .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "gnr8", "compat", "python", "--old", "old-sdk", "--new", "new-sdk"
+            ])
+            .unwrap()
+            .command,
+            Commands::Compat {
+                action: CompatAction::Python { .. }
             }
         ));
         assert!(matches!(

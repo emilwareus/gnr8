@@ -1030,10 +1030,7 @@ mod tests {
         // The dry-run seam must reject an escaping path with the SAME typed error as the write path, so
         // `gnr8 check` never mis-classifies it as drift (and the planner never hashes a file outside the
         // root). Parity with `apply_writes_rejects_a_traversal_output_path`.
-        let artifacts = vec![crate::sdk::Artifact {
-            path: "../escape.go".to_string(),
-            text: "x".to_string(),
-        }];
+        let artifacts = vec![crate::sdk::Artifact::new("../escape.go", "x")];
         let result = super::plan_only(std::path::Path::new("/tmp/proj-does-not-exist"), &artifacts);
         assert!(
             matches!(result, Err(crate::CoreError::Io { .. })),

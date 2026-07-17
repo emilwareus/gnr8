@@ -15,7 +15,10 @@ mod watch;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+use cli::{
+    Cli, Commands, CompatAction, GuideTopic, InspectAction, OpenApiCompatPolicy, SdkPreset,
+    SourcePreset,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -237,6 +240,7 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
 )]
 fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
     match action {
+        CompatAction::Openapi { old, new, policy } => run_openapi_compat(old, new, *policy, output),
         CompatAction::Typescript {
             old,
             new,
@@ -396,7 +400,100 @@ fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
             }
             Ok(())
         }
+        CompatAction::Python { old, new } => {
+            let old_surface = gnr8::sdk::compat::extract_python_surface(old)?;
+            let new_surface = gnr8::sdk::compat::extract_python_surface(new)?;
+            let diff = gnr8::sdk::compat::diff_python_surfaces(&old_surface, &new_surface);
+            let breaking = diff.is_breaking();
+            if output.json {
+                #[derive(serde::Serialize)]
+                struct CompatReport<'a> {
+                    language: &'static str,
+                    old: &'a str,
+                    new: &'a str,
+                    compatible: bool,
+                    breaking: bool,
+                    diff: &'a gnr8::sdk::compat::PythonSurfaceDiff,
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&CompatReport {
+                        language: "python",
+                        old,
+                        new,
+                        compatible: !breaking,
+                        breaking,
+                        diff: &diff,
+                    })?
+                );
+            } else if breaking {
+                output.progress("compat python: breaking changes detected");
+                print_python_compat_diff(&diff);
+            } else {
+                output.progress("compat python: compatible");
+            }
+            if breaking {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
+}
+
+fn run_openapi_compat(
+    old: &str,
+    new: &str,
+    policy: OpenApiCompatPolicy,
+    output: Output,
+) -> Result<()> {
+    let core_policy = match policy {
+        OpenApiCompatPolicy::Exact => gnr8::sdk::openapi_compat::OpenApiCompatibilityPolicy::Exact,
+    };
+    let report = gnr8::sdk::openapi_compat::compare_openapi_files(old, new, core_policy)?;
+    if output.json {
+        #[derive(serde::Serialize)]
+        struct CliReport<'a> {
+            language: &'static str,
+            policy: &'static str,
+            old: &'a str,
+            new: &'a str,
+            compatible: bool,
+            old_version: &'a str,
+            new_version: &'a str,
+            differences: &'a [gnr8::sdk::openapi_compat::OpenApiDifference],
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CliReport {
+                language: "openapi",
+                policy: "exact",
+                old,
+                new,
+                compatible: report.compatible,
+                old_version: &report.old_version,
+                new_version: &report.new_version,
+                differences: &report.differences,
+            })?
+        );
+    } else if report.compatible {
+        output.progress("compat openapi: compatible");
+    } else {
+        output.progress("compat openapi: semantic differences detected");
+        for difference in &report.differences {
+            let operation = difference
+                .operation
+                .as_deref()
+                .map_or_else(String::new, |operation| format!(" [{operation}]"));
+            println!(
+                "- {} at {}{}",
+                difference.code, difference.location, operation
+            );
+        }
+    }
+    if !report.compatible {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn load_compat_contract(
@@ -572,6 +669,35 @@ fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
         println!(
             "  exported method signature changed: {} ({} -> {})",
             change.symbol, change.old, change.new
+        );
+    }
+}
+
+fn print_python_compat_diff(diff: &gnr8::sdk::compat::PythonSurfaceDiff) {
+    print_compat_list("missing modules", &diff.missing_modules);
+    print_compat_list("missing public exports", &diff.missing_public_exports);
+    print_compat_list("missing models", &diff.missing_models);
+    print_compat_list("missing from_dict helpers", &diff.missing_from_dict);
+    print_compat_list("missing to_dict helpers", &diff.missing_to_dict);
+    print_compat_list("missing exception classes", &diff.missing_exception_classes);
+    print_compat_list("alias changes", &diff.alias_changes);
+    print_compat_list(
+        "package entry point changes",
+        &diff.package_entry_point_changes,
+    );
+    for missing in &diff.missing_model_fields {
+        println!("  missing model field: {}.{}", missing.model, missing.field);
+    }
+    for change in &diff.model_field_changes {
+        println!(
+            "  changed model field: {}.{}: {:?} -> {:?}",
+            change.model, change.field, change.old, change.new
+        );
+    }
+    for change in &diff.constructor_changes {
+        println!(
+            "  changed constructor: {}: {} -> {}",
+            change.model, change.old, change.new
         );
     }
 }
@@ -2505,8 +2631,8 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
     }
     for diag in diagnostics {
         eprintln!(
-            "{}: {} ({}:{})",
-            diag.severity, diag.message, diag.file, diag.line
+            "{} [{}]: {} ({}:{})",
+            diag.severity, diag.code, diag.message, diag.file, diag.line
         );
     }
 }

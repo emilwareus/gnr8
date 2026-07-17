@@ -36,11 +36,188 @@ fn parse_json(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout).unwrap_or_else(|err| panic!("invalid JSON: {err}\n{stdout}"))
 }
 
+fn write_openapi_compat_pair(root: &Path, candidate_type: &str) -> (PathBuf, PathBuf) {
+    let old = root.join("swagger.json");
+    let new = root.join("openapi.yaml");
+    std::fs::write(
+        &old,
+        r#"{
+  "swagger":"2.0",
+  "basePath":"/api",
+  "info":{"title":"Books","version":"1"},
+  "paths":{"/books":{"get":{"operationId":"listBooks","parameters":[{"name":"limit","in":"query","type":"integer","format":"int64"}],"responses":{"204":{"description":"ok"}}}}}
+}"#,
+    )
+    .expect("write Swagger baseline");
+    std::fs::write(
+        &new,
+        format!(
+            "openapi: 3.1.0\ninfo:\n  title: Books\n  version: '1'\npaths:\n  /api/books:\n    get:\n      operationId: listBooks\n      parameters:\n        - name: limit\n          in: query\n          required: false\n          schema:\n            type: {candidate_type}\n            format: int64\n      responses:\n        '204':\n          description: ok\n"
+        ),
+    )
+    .expect("write OpenAPI candidate");
+    (old, new)
+}
+
+#[test]
+fn compat_openapi_exact_accepts_equivalent_swagger_and_openapi() {
+    let root = unique_temp_dir("openapi-equivalent");
+    let (old, new) = write_openapi_compat_pair(&root, "integer");
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "openapi".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+            "--policy".to_string(),
+            "exact".to_string(),
+        ],
+    );
+    assert!(
+        ok,
+        "equivalent contracts should pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(parse_json(&stdout)["compatible"], true);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn compat_openapi_exact_reports_stable_parameter_difference() {
+    let root = unique_temp_dir("openapi-difference");
+    let (old, new) = write_openapi_compat_pair(&root, "string");
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "openapi".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+        ],
+    );
+    assert!(
+        !ok,
+        "changed contracts should fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(
+        report["differences"][0]["code"],
+        "parameter.schema.type.changed"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn write_go_sdk(dir: &Path, body: &str) {
     std::fs::create_dir_all(dir).expect("create Go SDK dir");
     std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n")
         .expect("write go.mod");
     std::fs::write(dir.join("sdk.go"), body).expect("write sdk.go");
+}
+
+fn write_python_sdk(dir: &Path, title_field: &str, include_from_dict: bool) {
+    let package = dir.join("sdk");
+    std::fs::create_dir_all(&package).expect("create Python SDK package");
+    std::fs::write(
+        package.join("__init__.py"),
+        "from .errors import ApiError\nfrom .models import Book\n\n__all__ = [\"ApiError\", \"Book\"]\n",
+    )
+    .expect("write Python package init");
+    let from_dict = if include_from_dict {
+        "\n    @classmethod\n    def from_dict(cls, data):\n        return cls(**data)\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        package.join("models.py"),
+        format!(
+            "class Book(BaseModel):\n    {title_field}\n{from_dict}\n    def to_dict(self):\n        return {{}}\n"
+        ),
+    )
+    .expect("write Python models");
+    std::fs::write(
+        package.join("errors.py"),
+        "class ApiError(Exception):\n    pass\n",
+    )
+    .expect("write Python errors");
+    std::fs::write(
+        dir.join("pyproject.toml"),
+        "[project.scripts]\nsdk = \"sdk.cli:main\"\n",
+    )
+    .expect("write Python package metadata");
+}
+
+#[test]
+fn compat_python_accepts_equivalent_packages() {
+    let root = unique_temp_dir("python-equivalent");
+    let old = root.join("old-python");
+    let new = root.join("new-python");
+    write_python_sdk(&old, "title: str = Field(alias=\"bookTitle\")", true);
+    write_python_sdk(&new, "title: str = Field(alias=\"bookTitle\")", true);
+
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "python".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+        ],
+    );
+    assert!(
+        ok,
+        "equivalent Python packages should pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(report["language"], "python");
+    assert_eq!(report["compatible"], true);
+    assert_eq!(report["breaking"], false);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn compat_python_reports_model_and_helper_breaks() {
+    let root = unique_temp_dir("python-breaking");
+    let old = root.join("old-python");
+    let new = root.join("new-python");
+    write_python_sdk(&old, "title: str = Field(alias=\"bookTitle\")", true);
+    write_python_sdk(
+        &new,
+        "title: str = Field(default=None, alias=\"title\")",
+        false,
+    );
+
+    let (ok, stdout, stderr) = run_gnr8(
+        &root,
+        &[
+            "--json".to_string(),
+            "compat".to_string(),
+            "python".to_string(),
+            "--old".to_string(),
+            old.display().to_string(),
+            "--new".to_string(),
+            new.display().to_string(),
+        ],
+    );
+    assert!(
+        !ok,
+        "breaking Python package drift must fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(report["compatible"], false);
+    assert_eq!(report["breaking"], true);
+    assert_eq!(report["diff"]["model_field_changes"][0]["model"], "Book");
+    assert_eq!(report["diff"]["model_field_changes"][0]["field"], "title");
+    assert_eq!(report["diff"]["missing_from_dict"][0], "Book");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn write_go_compat_pair(root: &Path) -> (PathBuf, PathBuf) {

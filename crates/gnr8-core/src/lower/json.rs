@@ -20,6 +20,27 @@ pub(crate) fn write(doc: &OpenApiDoc) -> Value {
         Value::String(doc.openapi.to_string()),
     );
     out.insert("info".to_string(), write_info(&doc.info));
+    if !doc.servers.is_empty() {
+        out.insert(
+            "servers".to_string(),
+            Value::Array(
+                doc.servers
+                    .iter()
+                    .map(|server| {
+                        let mut value = Map::new();
+                        value.insert("url".to_string(), Value::String(server.url.clone()));
+                        if let Some(description) = &server.description {
+                            value.insert(
+                                "description".to_string(),
+                                Value::String(description.clone()),
+                            );
+                        }
+                        Value::Object(value)
+                    })
+                    .collect(),
+            ),
+        );
+    }
     if !doc.security.is_empty() {
         out.insert("security".to_string(), write_security(&doc.security));
     }
@@ -38,13 +59,44 @@ fn write_info(info: &Info) -> Value {
             Value::String(description.clone()),
         );
     }
+    if let Some(terms) = &info.terms_of_service {
+        out.insert("termsOfService".to_string(), Value::String(terms.clone()));
+    }
+    if let Some(contact) = &info.contact {
+        let mut value = Map::new();
+        if let Some(name) = &contact.name {
+            value.insert("name".to_string(), Value::String(name.clone()));
+        }
+        if let Some(url) = &contact.url {
+            value.insert("url".to_string(), Value::String(url.clone()));
+        }
+        if let Some(email) = &contact.email {
+            value.insert("email".to_string(), Value::String(email.clone()));
+        }
+        out.insert("contact".to_string(), Value::Object(value));
+    }
+    if let Some(license) = &info.license {
+        let mut value = Map::new();
+        value.insert("name".to_string(), Value::String(license.name.clone()));
+        if let Some(url) = &license.url {
+            value.insert("url".to_string(), Value::String(url.clone()));
+        }
+        out.insert("license".to_string(), Value::Object(value));
+    }
     Value::Object(out)
 }
 
 fn write_security(security: &[SecurityRequirement]) -> Value {
-    let mut entry = Map::new();
+    let mut alternatives: Vec<(usize, Map<String, Value>)> = Vec::new();
     for req in security {
-        entry.insert(
+        let index = alternatives
+            .iter()
+            .position(|(alternative, _)| *alternative == req.alternative)
+            .unwrap_or_else(|| {
+                alternatives.push((req.alternative, Map::new()));
+                alternatives.len() - 1
+            });
+        alternatives[index].1.insert(
             req.scheme.clone(),
             Value::Array(
                 req.scopes
@@ -54,7 +106,12 @@ fn write_security(security: &[SecurityRequirement]) -> Value {
             ),
         );
     }
-    Value::Array(vec![Value::Object(entry)])
+    Value::Array(
+        alternatives
+            .into_iter()
+            .map(|(_, entry)| Value::Object(entry))
+            .collect(),
+    )
 }
 
 fn write_paths(paths: &[(String, PathItem)]) -> Value {
@@ -136,6 +193,15 @@ fn write_parameter(param: &Parameter) -> Value {
     out.insert("name".to_string(), Value::String(param.name.clone()));
     out.insert("in".to_string(), Value::String(param.location.clone()));
     out.insert("required".to_string(), Value::Bool(param.required));
+    if let Some(style) = &param.style {
+        out.insert("style".to_string(), Value::String(style.clone()));
+    }
+    if let Some(explode) = param.explode {
+        out.insert("explode".to_string(), Value::Bool(explode));
+    }
+    if param.allow_reserved {
+        out.insert("allowReserved".to_string(), Value::Bool(true));
+    }
     out.insert("schema".to_string(), write_schema(&param.schema));
     Value::Object(out)
 }
@@ -182,22 +248,15 @@ fn write_response(response: &ResponseObj) -> Value {
         let mut schema = Map::new();
         schema.insert("type".to_string(), Value::String("string".to_string()));
         schema.insert("format".to_string(), Value::String("binary".to_string()));
-
-        let mut media = Map::new();
-        media.insert("schema".to_string(), Value::Object(schema));
-        write_examples_into(&mut media, &response.examples);
-
         let mut content = Map::new();
-        content.insert(
-            response
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            Value::Object(media),
-        );
+        for content_type in response_media_types(response, "application/octet-stream") {
+            let mut media = Map::new();
+            media.insert("schema".to_string(), Value::Object(schema.clone()));
+            write_examples_into(&mut media, &response.examples);
+            content.insert(content_type.to_string(), Value::Object(media));
+        }
         out.insert("content".to_string(), Value::Object(content));
     } else if response.event_stream {
-        let mut media = Map::new();
         let schema = response.schema_ref.as_ref().map_or_else(
             || {
                 let mut schema = Map::new();
@@ -206,34 +265,33 @@ fn write_response(response: &ResponseObj) -> Value {
             },
             |schema_ref| ref_schema(schema_ref),
         );
-        media.insert("schema".to_string(), schema);
-        write_examples_into(&mut media, &response.examples);
-
         let mut content = Map::new();
-        content.insert(
-            response
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "text/event-stream".to_string()),
-            Value::Object(media),
-        );
+        for content_type in response_media_types(response, "text/event-stream") {
+            let mut media = Map::new();
+            media.insert("schema".to_string(), schema.clone());
+            write_examples_into(&mut media, &response.examples);
+            content.insert(content_type.to_string(), Value::Object(media));
+        }
         out.insert("content".to_string(), Value::Object(content));
     } else if let Some(schema_ref) = &response.schema_ref {
-        let mut media = Map::new();
-        media.insert("schema".to_string(), ref_schema(schema_ref));
-        write_examples_into(&mut media, &response.examples);
-
+        let schema = ref_schema(schema_ref);
         let mut content = Map::new();
-        content.insert(
-            response
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "application/json".to_string()),
-            Value::Object(media),
-        );
+        for content_type in response_media_types(response, "application/json") {
+            let mut media = Map::new();
+            media.insert("schema".to_string(), schema.clone());
+            write_examples_into(&mut media, &response.examples);
+            content.insert(content_type.to_string(), Value::Object(media));
+        }
         out.insert("content".to_string(), Value::Object(content));
     }
     Value::Object(out)
+}
+
+fn response_media_types<'a>(response: &'a ResponseObj, fallback: &'static str) -> Vec<&'a str> {
+    if !response.content_types.is_empty() {
+        return response.content_types.iter().map(String::as_str).collect();
+    }
+    vec![response.content_type.as_deref().unwrap_or(fallback)]
 }
 
 fn write_examples_into(media: &mut Map<String, Value>, examples: &[MediaExample]) {
@@ -452,10 +510,15 @@ mod tests {
                 title: "goalservice".to_string(),
                 version: "0.1.0".to_string(),
                 description: None,
+                terms_of_service: None,
+                contact: None,
+                license: None,
             },
+            servers: Vec::new(),
             security: vec![SecurityRequirement {
                 scheme: "ApiKeyAuth".to_string(),
                 scopes: vec![],
+                alternative: 0,
             }],
             paths: vec![(
                 "/goal/".to_string(),
@@ -481,6 +544,7 @@ mod tests {
                                 description: "Goal created".to_string(),
                                 schema_ref: Some("CommandMessage".to_string()),
                                 content_type: None,
+                                content_types: Vec::new(),
                                 binary: false,
                                 event_stream: false,
                                 examples: Vec::new(),
@@ -576,6 +640,7 @@ mod tests {
         doc.security.push(SecurityRequirement {
             scheme: "CSRFAuth".to_string(),
             scopes: vec![],
+            alternative: 0,
         });
 
         let json = write(&doc);

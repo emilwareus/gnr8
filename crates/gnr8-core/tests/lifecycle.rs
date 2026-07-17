@@ -42,10 +42,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 
 /// One synthetic artifact (a `(path, text)` pair) — what the child's pipeline would emit.
 fn artifact(path: &str, text: &str) -> Artifact {
-    Artifact {
-        path: path.to_string(),
-        text: text.to_string(),
-    }
+    Artifact::new(path, text)
 }
 
 fn artifact_metadata(path: &str, text: &str) -> ArtifactMetadata {

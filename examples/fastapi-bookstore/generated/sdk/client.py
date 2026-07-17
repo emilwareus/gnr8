@@ -16,6 +16,7 @@ from .errors import ApiError
 from .models import (
     Book,
     BookFilters,
+    BookFormat,
     BookOrError,
     CreatedMessage,
     ListBooksResponse,
@@ -118,6 +119,56 @@ class Client:
             return {key: self._wire_value(item) for key, item in value.items()}
         return value
 
+    def _parameter_pairs(
+        self,
+        name: str,
+        value: Any,
+        style: str,
+        explode: bool,
+    ) -> list[tuple[str, str]]:
+        value = self._wire_value(value)
+        if style == "spaceDelimited":
+            delimiter = " "
+        elif style == "pipeDelimited":
+            delimiter = "|"
+        else:
+            delimiter = ","
+        if isinstance(value, (list, tuple)):
+            parts = [str(item) for item in value]
+            if explode and style == "form":
+                return [(name, item) for item in parts]
+            return [(name, delimiter.join(parts))]
+        if isinstance(value, dict):
+            entries = sorted(value.items())
+            if style == "deepObject":
+                return [(f"{name}[{key}]", str(item)) for key, item in entries]
+            if explode and style == "form":
+                return [(str(key), str(item)) for key, item in entries]
+            parts = []
+            for key, item in entries:
+                if explode:
+                    parts.append(f"{key}={item}")
+                else:
+                    parts.extend((str(key), str(item)))
+            return [(name, delimiter.join(parts))]
+        return [(name, str(value))]
+
+    @staticmethod
+    def _encode_query(
+        pairs: list[tuple[str, str]],
+        allow_reserved: set[int],
+    ) -> str:
+        reserved = ":/?#[]@!$&'()*+,;="
+        encoded = []
+        for index, (key, value) in enumerate(pairs):
+            safe = reserved if index in allow_reserved else ""
+            encoded.append(
+                urllib.parse.quote_plus(str(key), safe="")
+                + "="
+                + urllib.parse.quote_plus(str(value), safe=safe)
+            )
+        return "&".join(encoded)
+
     def _encode_body(
         self,
         body: Optional[Any],
@@ -185,6 +236,7 @@ class Client:
         path: str,
         *,
         body: Optional[Any] = None,
+        request_headers: Optional[dict[str, str]] = None,
         operation_id: str,
         path_template: str,
         content_type: str = "application/json",
@@ -208,7 +260,7 @@ class Client:
             or method in ("GET", "HEAD", "OPTIONS", "PUT", "DELETE")
         ):
             max_retries = 0
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(request_headers or {})
         if data is not None:
             headers["Content-Type"] = content_type
         if idempotent and options.idempotency_key:
@@ -320,20 +372,21 @@ class Client:
 
     def list_books(
         self,
-        genre,
-        cursor=None,
-        sort=None,
+        genre: str,
+        cursor: Optional[str] = None,
+        sort: Optional[str] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> ListBooksResponse:
         path = "/books/"
-        _query = {}
-        _query["genre"] = genre
+        _query: list[tuple[str, str]] = []
+        _allow_reserved: set[int] = set()
+        _query.extend(self._parameter_pairs("genre", genre, "form", True))
         if cursor is not None:
-            _query["cursor"] = cursor
+            _query.extend(self._parameter_pairs("cursor", cursor, "form", True))
         if sort is not None:
-            _query["sort"] = sort
+            _query.extend(self._parameter_pairs("sort", sort, "form", True))
         if _query:
-            path = path + "?" + urllib.parse.urlencode(_query)
+            path = path + "?" + self._encode_query(_query, _allow_reserved)
         _status, _headers, _raw = self._do(
             "GET",
             path,
@@ -378,15 +431,16 @@ class Client:
     def get_book(
         self,
         book_id,
-        fmt=None,
+        fmt: Optional[BookFormat] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> BookOrError:
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
-        _query = {}
+        _query: list[tuple[str, str]] = []
+        _allow_reserved: set[int] = set()
         if fmt is not None:
-            _query["fmt"] = fmt
+            _query.extend(self._parameter_pairs("fmt", fmt, "form", True))
         if _query:
-            path = path + "?" + urllib.parse.urlencode(_query)
+            path = path + "?" + self._encode_query(_query, _allow_reserved)
         _status, _headers, _raw = self._do(
             "GET",
             path,

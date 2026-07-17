@@ -35,6 +35,13 @@ jobs:
           cache: npm
           cache-dependency-path: tsextract/package-lock.json
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install independent YAML parser
+        run: python -m pip install PyYAML==6.0.2
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Full release gate

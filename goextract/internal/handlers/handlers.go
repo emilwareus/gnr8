@@ -35,7 +35,10 @@ import (
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
 	"github.com/gnr8/goextract/internal/routes"
+	"golang.org/x/tools/go/packages"
 )
+
+const maxContextHelperDepth = 32
 
 // CodeFacts is the code-inferred contract for one handler: the request body, the
 // responses keyed by status, and the params. This is the ONLY source of these
@@ -123,6 +126,39 @@ type handlerCollision struct {
 	line    uint32
 }
 
+type helperBinding struct {
+	stringValue *string
+	literal     *facts.LiteralValue
+	typeValue   gotypes.Type
+	ginContext  bool
+}
+
+type helperFrame struct {
+	decl     handlerDecl
+	bindings map[gotypes.Object]helperBinding
+}
+
+type parameterHint struct {
+	schema        *facts.Type
+	schemaKnown   bool
+	required      bool
+	requiredKnown bool
+	defaultValue  *facts.LiteralValue
+}
+
+type contextTraversal struct {
+	route                  routes.Route
+	cf                     *CodeFacts
+	seenParam              map[string]bool
+	formFields             map[string]facts.FieldFact
+	formHasFile            *bool
+	hasBodyBind            *bool
+	allBodyBindsOptional   *bool
+	diagnostics            *diag.Accumulator
+	stack                  map[string]bool
+	reportedUnresolvedCall map[token.Pos]bool
+}
+
 // NewAnalyzer builds an Analyzer from the loaded packages and the target module
 // path. The module prefix qualifies handler-inferred schema refs into the 02-01
 // module-relative format. Duplicate-name collisions are retained so callers can
@@ -131,7 +167,7 @@ func NewAnalyzer(res *load.Result, module string, diags *diag.Accumulator) *Anal
 	idx, collisions := buildIndex(res)
 	return &Analyzer{
 		idx:           idx,
-		declsByObject: buildDeclObjectIndex(res),
+		declsByObject: buildDeclObjectIndex(res, module),
 		modulePrefix:  module,
 		collisions:    collisions,
 	}
@@ -223,12 +259,12 @@ func buildIndex(res *load.Result) (Index, []handlerCollision) {
 	return idx, collisions
 }
 
-func buildDeclObjectIndex(res *load.Result) map[string]handlerDecl {
+func buildDeclObjectIndex(res *load.Result, module string) map[string]handlerDecl {
 	out := make(map[string]handlerDecl)
 	if res == nil {
 		return out
 	}
-	for _, pkg := range res.Packages {
+	for _, pkg := range modulePackages(res, module) {
 		if pkg.TypesInfo == nil {
 			continue
 		}
@@ -253,6 +289,43 @@ func buildDeclObjectIndex(res *load.Result) map[string]handlerDecl {
 	return out
 }
 
+// modulePackages includes imported packages that belong to the target module,
+// even when route loading was scoped to a narrower package pattern. Third-party
+// dependencies are deliberately excluded: traversing their source would make
+// extraction depend on dependency internals rather than the application's
+// contract source.
+func modulePackages(res *load.Result, module string) []*packages.Package {
+	if res == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := []*packages.Package{}
+	var visit func(*packages.Package)
+	visit = func(pkg *packages.Package) {
+		if pkg == nil || seen[pkg.ID] {
+			return
+		}
+		seen[pkg.ID] = true
+		if moduleOwnsPackage(module, pkg.PkgPath) {
+			out = append(out, pkg)
+		}
+		for _, imported := range pkg.Imports {
+			visit(imported)
+		}
+	}
+	for _, pkg := range res.Packages {
+		visit(pkg)
+	}
+	return out
+}
+
+func moduleOwnsPackage(module, pkgPath string) bool {
+	if module == "" || pkgPath == "" {
+		return false
+	}
+	return pkgPath == module || strings.HasPrefix(pkgPath, module+"/")
+}
+
 func funcDeclObjectKey(pkgPath string, pos token.Pos) string {
 	if pkgPath == "" || !pos.IsValid() {
 		return ""
@@ -264,15 +337,419 @@ func funcObjectKey(fn *gotypes.Func) string {
 	return routes.FuncObjectKey(fn)
 }
 
-func (a *Analyzer) samePackageCallee(h handlerDecl, fn *gotypes.Func) (handlerDecl, bool) {
-	if fn == nil || fn.Pkg() == nil || fn.Pkg().Path() != h.pkgPath {
+func (a *Analyzer) moduleOwnedCallee(fn *gotypes.Func) (handlerDecl, bool) {
+	if fn == nil || fn.Pkg() == nil || !moduleOwnsPackage(a.modulePrefix, fn.Pkg().Path()) {
 		return handlerDecl{}, false
 	}
 	callee, ok := a.declsByObject[funcObjectKey(fn)]
-	if !ok || callee.pkgPath != h.pkgPath || callee.decl == nil || callee.decl.Body == nil {
+	if !ok || callee.decl == nil || callee.decl.Body == nil {
 		return handlerDecl{}, false
 	}
 	return callee, true
+}
+
+func (a *Analyzer) analyzeContextHelperCall(
+	caller helperFrame,
+	call *ast.CallExpr,
+	inherited parameterHint,
+	depth int,
+	traversal *contextTraversal,
+) {
+	if traversal == nil || !frameCallPassesGinContext(caller, call) {
+		return
+	}
+	fn := calledFuncObject(caller.decl.info, call.Fun)
+	callee, ok := a.moduleOwnedCallee(fn)
+	if !ok {
+		reason := "callee source is not available in the loaded module"
+		if fn != nil && fn.Pkg() != nil && !moduleOwnsPackage(a.modulePrefix, fn.Pkg().Path()) {
+			reason = "callee belongs to external package " + fn.Pkg().Path()
+		}
+		a.reportContextTraversalStop(caller, call, traversal, reason)
+		return
+	}
+	if depth >= maxContextHelperDepth {
+		a.reportContextTraversalStop(caller, call, traversal, "helper traversal exceeded the deterministic depth limit of 32")
+		return
+	}
+	key := callee.identityKey()
+	if traversal.stack[key] {
+		a.reportContextTraversalStop(caller, call, traversal, "cycle detected while traversing module-owned helpers")
+		return
+	}
+
+	next := helperFrame{
+		decl:     callee,
+		bindings: helperCallBindings(caller, call, fn),
+	}
+	hint := helperCallHint(caller, call, inherited)
+	suppressBodyBinds := callUsesTypeArgs(call)
+	traversal.stack[key] = true
+	defer delete(traversal.stack, key)
+
+	optionalBindPositions := collectOptionalBindPositions(callee)
+	ast.Inspect(callee.decl.Body, func(node ast.Node) bool {
+		nested, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ginCall := routes.GinMethod(callee.info, nested)
+		if ginCall && recvPkg == routes.GinPkgPath {
+			a.analyzeTraversedGinCall(next, nested, name, hint, optionalBindPositions, suppressBodyBinds, traversal)
+			return true
+		}
+		if pname, ok := requestHeaderGetNameInFrame(next, nested); ok {
+			a.addTraversedParameter(traversal, requestParameter(
+				pname,
+				"header",
+				true,
+				facts.PrimitiveType(facts.StringPrim()),
+				callee.fset,
+				nested.Pos(),
+			))
+		}
+		if frameCallPassesGinContext(next, nested) {
+			a.analyzeContextHelperCall(next, nested, hint, depth+1, traversal)
+		}
+		return true
+	})
+}
+
+func (a *Analyzer) reportContextTraversalStop(
+	caller helperFrame,
+	call *ast.CallExpr,
+	traversal *contextTraversal,
+	reason string,
+) {
+	if traversal.diagnostics == nil || traversal.reportedUnresolvedCall[call.Pos()] {
+		return
+	}
+	traversal.reportedUnresolvedCall[call.Pos()] = true
+	subject := selectorName(call.Fun)
+	if subject == "" {
+		subject = "dynamic helper"
+	}
+	file, line := positionOf(caller.decl.fset, call.Pos())
+	traversal.diagnostics.RequestParameterUnresolved(
+		subject,
+		traversal.route.Method,
+		untypedRouteLabel(traversal.route),
+		reason,
+		file,
+		line,
+	)
+}
+
+func helperCallBindings(caller helperFrame, call *ast.CallExpr, fn *gotypes.Func) map[gotypes.Object]helperBinding {
+	out := map[gotypes.Object]helperBinding{}
+	if fn == nil {
+		return out
+	}
+	sig, ok := gotypes.Unalias(fn.Type()).(*gotypes.Signature)
+	if !ok || sig.Params() == nil {
+		return out
+	}
+	for index, arg := range call.Args {
+		if index >= sig.Params().Len() {
+			break
+		}
+		out[sig.Params().At(index)] = helperBindingFromExpr(caller, arg)
+	}
+	return out
+}
+
+func helperBindingFromExpr(frame helperFrame, expr ast.Expr) helperBinding {
+	binding := helperBinding{typeValue: frameTypeOf(frame, expr)}
+	if id, ok := expr.(*ast.Ident); ok {
+		if inherited, exists := frame.bindings[frame.decl.info.ObjectOf(id)]; exists {
+			binding = inherited
+			if binding.typeValue == nil {
+				binding.typeValue = frame.decl.info.TypeOf(expr)
+			}
+		}
+	}
+	if value := frameLiteralValue(frame, expr); value != nil {
+		binding.literal = value
+		if stringValue, ok := literalStringValue(value); ok {
+			binding.stringValue = &stringValue
+		}
+	}
+	binding.ginContext = binding.ginContext || isGinContextType(binding.typeValue)
+	return binding
+}
+
+func frameCallPassesGinContext(frame helperFrame, call *ast.CallExpr) bool {
+	if call == nil || frame.decl.info == nil {
+		return false
+	}
+	for _, arg := range call.Args {
+		if isGinContextType(frameTypeOf(frame, arg)) {
+			return true
+		}
+		if id, ok := arg.(*ast.Ident); ok {
+			if binding, exists := frame.bindings[frame.decl.info.ObjectOf(id)]; exists && binding.ginContext {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func frameTypeOf(frame helperFrame, expr ast.Expr) gotypes.Type {
+	if expr == nil || frame.decl.info == nil {
+		return nil
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		if binding, exists := frame.bindings[frame.decl.info.ObjectOf(id)]; exists && binding.typeValue != nil {
+			return binding.typeValue
+		}
+	}
+	return frame.decl.info.TypeOf(expr)
+}
+
+func frameLiteralValue(frame helperFrame, expr ast.Expr) *facts.LiteralValue {
+	if expr == nil || frame.decl.info == nil {
+		return nil
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		if binding, exists := frame.bindings[frame.decl.info.ObjectOf(id)]; exists && binding.literal != nil {
+			return binding.literal
+		}
+	}
+	return literalValue(frame.decl.info, expr)
+}
+
+func frameStringValue(frame helperFrame, expr ast.Expr) (string, bool) {
+	if id, ok := expr.(*ast.Ident); ok && frame.decl.info != nil {
+		if binding, exists := frame.bindings[frame.decl.info.ObjectOf(id)]; exists && binding.stringValue != nil {
+			return *binding.stringValue, true
+		}
+	}
+	return literalStringValue(frameLiteralValue(frame, expr))
+}
+
+func literalStringValue(value *facts.LiteralValue) (string, bool) {
+	if value == nil || value.Type != "string" {
+		return "", false
+	}
+	text, ok := value.Value.(string)
+	return text, ok
+}
+
+func helperCallHint(frame helperFrame, call *ast.CallExpr, inherited parameterHint) parameterHint {
+	hint := inherited
+	if !hint.schemaKnown {
+		if schema, ok := queryHelperSchema(frame.decl.info.TypeOf(call), call); ok {
+			hint.schema = &schema
+			hint.schemaKnown = true
+		}
+	}
+	if hint.defaultValue == nil {
+		hint.defaultValue = queryHelperDefaultFromArgs(frame.decl.info, call, signatureOf(frame.decl.info, call.Fun))
+	}
+	if !hint.requiredKnown {
+		name := strings.ToLower(selectorName(call.Fun))
+		switch {
+		case strings.Contains(name, "optional") || hint.defaultValue != nil:
+			hint.requiredKnown = true
+			hint.required = false
+		case strings.Contains(name, "required") || helperReturnsError(frame.decl.info, call):
+			hint.requiredKnown = true
+			hint.required = true
+		}
+	}
+	return hint
+}
+
+func (a *Analyzer) analyzeTraversedGinCall(
+	frame helperFrame,
+	call *ast.CallExpr,
+	method string,
+	hint parameterHint,
+	optionalBindPositions map[token.Pos]bool,
+	suppressBodyBinds bool,
+	traversal *contextTraversal,
+) {
+	switch method {
+	case "Param":
+		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			schema := facts.PrimitiveType(facts.StringPrim())
+			if hint.schemaKnown && hint.schema != nil {
+				schema = *hint.schema
+			}
+			a.addTraversedParameter(traversal, requestParameter(name, "path", true, schema, frame.decl.fset, call.Pos()))
+		}
+	case "Query", "DefaultQuery", "GetQuery", "QueryArray", "GetQueryArray", "QueryMap":
+		name, ok := frameCallStringArg(frame, call, 0)
+		if !ok {
+			a.reportDynamicParameterName(frame, call, traversal, method)
+			return
+		}
+		param := parameterFromGinAccess(frame.decl.info, method, name, frame.decl.fset, call, hint)
+		a.addTraversedParameter(traversal, param)
+		if method == "Query" && !hint.requiredKnown && traversal.diagnostics != nil {
+			file, line := positionOf(frame.decl.fset, call.Pos())
+			traversal.diagnostics.UntypedQueryParam(name, traversal.route.Method, untypedRouteLabel(traversal.route), file, line)
+		}
+	case "GetHeader":
+		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			schema := facts.PrimitiveType(facts.StringPrim())
+			if hint.schemaKnown && hint.schema != nil {
+				schema = *hint.schema
+			}
+			required := true
+			if hint.requiredKnown {
+				required = hint.required
+			}
+			a.addTraversedParameter(traversal, requestParameter(name, "header", required, schema, frame.decl.fset, call.Pos()))
+		} else {
+			a.reportDynamicParameterName(frame, call, traversal, method)
+		}
+	case "Cookie":
+		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			schema := facts.PrimitiveType(facts.StringPrim())
+			if hint.schemaKnown && hint.schema != nil {
+				schema = *hint.schema
+			}
+			required := true
+			if hint.requiredKnown {
+				required = hint.required
+			}
+			a.addTraversedParameter(traversal, requestParameter(name, "cookie", required, schema, frame.decl.fset, call.Pos()))
+		} else {
+			a.reportDynamicParameterName(frame, call, traversal, method)
+		}
+	case "ShouldBindQuery":
+		a.addBoundParameters(frame, call, "query", traversal.cf, traversal.seenParam, traversal.diagnostics)
+	case "ShouldBindHeader":
+		a.addBoundParameters(frame, call, "header", traversal.cf, traversal.seenParam, traversal.diagnostics)
+	case "ShouldBindJSON", "BindJSON":
+		if !suppressBodyBinds {
+			a.setTraversedRequestBody(frame, call, "application/json", optionalBindPositions, traversal)
+		}
+	case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
+		if !suppressBodyBinds {
+			bound := boundTypeFromCall(frame, call)
+			contentType := bindContentType(method, frame.decl.info, call, bound)
+			a.setTraversedRequestBody(frame, call, contentType, optionalBindPositions, traversal)
+		}
+	case "FormFile":
+		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			traversal.formFields[name] = formField(name, facts.PrimitiveType(facts.BytesPrim()), true)
+			*traversal.formHasFile = true
+		} else {
+			a.reportDynamicParameterName(frame, call, traversal, method)
+		}
+	case "PostForm", "DefaultPostForm", "GetPostForm":
+		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			if _, exists := traversal.formFields[name]; !exists {
+				field := formField(name, facts.PrimitiveType(facts.StringPrim()), false)
+				if method == "DefaultPostForm" && len(call.Args) > 1 {
+					field.Meta = &facts.FieldMeta{Default: frameLiteralValue(frame, call.Args[1])}
+				}
+				traversal.formFields[name] = field
+			}
+		} else {
+			a.reportDynamicParameterName(frame, call, traversal, method)
+		}
+	}
+}
+
+func (a *Analyzer) setTraversedRequestBody(
+	frame helperFrame,
+	call *ast.CallExpr,
+	contentType string,
+	optionalBindPositions map[token.Pos]bool,
+	traversal *contextTraversal,
+) {
+	bound := boundTypeFromCall(frame, call)
+	id, ok := a.namedTypeID(bound)
+	if !ok {
+		return
+	}
+	traversal.cf.RequestBody = &facts.TypeRef{RefID: id}
+	traversal.cf.RequestBodyContentType = contentType
+	*traversal.hasBodyBind = true
+	if !optionalBindPositions[call.Pos()] {
+		*traversal.allBodyBindsOptional = false
+	}
+}
+
+func boundTypeFromCall(frame helperFrame, call *ast.CallExpr) gotypes.Type {
+	if call == nil || len(call.Args) == 0 {
+		return nil
+	}
+	expr := call.Args[0]
+	if unary, ok := expr.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+		expr = unary.X
+	}
+	t := frameTypeOf(frame, expr)
+	if t == nil {
+		return nil
+	}
+	if pointer, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		return pointer.Elem()
+	}
+	return t
+}
+
+func frameCallStringArg(frame helperFrame, call *ast.CallExpr, index int) (string, bool) {
+	if call == nil || index >= len(call.Args) {
+		return "", false
+	}
+	return frameStringValue(frame, call.Args[index])
+}
+
+func (a *Analyzer) addTraversedParameter(traversal *contextTraversal, param facts.ParamFact) {
+	key := param.Location + "/" + param.Name
+	if traversal.seenParam[key] {
+		return
+	}
+	traversal.seenParam[key] = true
+	traversal.cf.Params = append(traversal.cf.Params, param)
+}
+
+func (a *Analyzer) reportDynamicParameterName(
+	frame helperFrame,
+	call *ast.CallExpr,
+	traversal *contextTraversal,
+	method string,
+) {
+	if traversal.diagnostics == nil {
+		return
+	}
+	file, line := positionOf(frame.decl.fset, call.Pos())
+	traversal.diagnostics.RequestParameterUnresolved(
+		method,
+		traversal.route.Method,
+		untypedRouteLabel(traversal.route),
+		"parameter name is dynamic",
+		file,
+		line,
+	)
+}
+
+func requestHeaderGetName(info *gotypes.Info, call *ast.CallExpr) (string, bool) {
+	return requestHeaderGetNameInFrame(helperFrame{decl: handlerDecl{info: info}}, call)
+}
+
+func requestHeaderGetNameInFrame(frame helperFrame, call *ast.CallExpr) (string, bool) {
+	if call == nil || frame.decl.info == nil || len(call.Args) == 0 {
+		return "", false
+	}
+	method, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || method.Sel == nil || method.Sel.Name != "Get" || !isNamedType(frame.decl.info.TypeOf(method.X), "net/http", "Header") {
+		return "", false
+	}
+	header, ok := method.X.(*ast.SelectorExpr)
+	if !ok || header.Sel == nil || header.Sel.Name != "Header" {
+		return "", false
+	}
+	request, ok := header.X.(*ast.SelectorExpr)
+	if !ok || request.Sel == nil || request.Sel.Name != "Request" || !isGinContextType(frameTypeOf(frame, request.X)) {
+		return "", false
+	}
+	return frameCallStringArg(frame, call, 0)
 }
 
 // Analyze infers the request/response/param facts for one route's handler. The
@@ -297,7 +774,6 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	hasBodyBind := false
 	allBodyBindsOptional := true
 	delegatedResponseSeen := map[string]bool{}
-	delegatedBodySeen := map[string]bool{}
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -306,6 +782,17 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
+			if pname, ok := requestHeaderGetName(h.info, call); ok && !seenParam["header/"+pname] {
+				seenParam["header/"+pname] = true
+				cf.Params = append(cf.Params, requestParameter(
+					pname,
+					"header",
+					true,
+					facts.PrimitiveType(facts.StringPrim()),
+					h.fset,
+					call.Pos(),
+				))
+			}
 			if ref, schema, ok := a.bodyFromGenericJSONHelper(h, call); ok {
 				cf.RequestBody = ref
 				cf.RequestBodyContentType = "application/json"
@@ -313,7 +800,24 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				hasBodyBind = true
 				allBodyBindsOptional = false
 			}
-			a.analyzeDelegatedRequestBodies(h, call, &cf, delegatedBodySeen, &hasBodyBind, &allBodyBindsOptional)
+			a.analyzeContextHelperCall(
+				helperFrame{decl: h, bindings: map[gotypes.Object]helperBinding{}},
+				call,
+				parameterHint{},
+				0,
+				&contextTraversal{
+					route:                  route,
+					cf:                     &cf,
+					seenParam:              seenParam,
+					formFields:             formFields,
+					formHasFile:            &formHasFile,
+					hasBodyBind:            &hasBodyBind,
+					allBodyBindsOptional:   &allBodyBindsOptional,
+					diagnostics:            diags,
+					stack:                  map[string]bool{},
+					reportedUnresolvedCall: map[token.Pos]bool{},
+				},
+			)
 			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedResponseSeen, contentTypeHint)
 			a.analyzePathHelperCall(h, call, &cf, seenParam)
 			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam)
@@ -329,6 +833,10 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 					allBodyBindsOptional = false
 				}
 			}
+		case "ShouldBindQuery":
+			a.addBoundParameters(helperFrame{decl: h}, call, "query", &cf, seenParam, diags)
+		case "ShouldBindHeader":
+			a.addBoundParameters(helperFrame{decl: h}, call, "header", &cf, seenParam, diags)
 		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
 			if ref, bound, ok := a.bindRequestType(h.info, call); ok {
 				cf.RequestBody = ref
@@ -367,14 +875,38 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				seenParam["path/"+pname] = true
 				cf.Params = append(cf.Params, pathParam(pname, h.fset, call.Pos()))
 			}
-		case "Query", "DefaultQuery", "GetQuery":
+		case "Query", "DefaultQuery", "GetQuery", "QueryArray", "GetQueryArray", "QueryMap":
 			if pname, ok := stringArg(call, 0); ok && !seenParam["query/"+pname] {
 				seenParam["query/"+pname] = true
 				file, line := positionOf(h.fset, call.Pos())
-				cf.Params = append(cf.Params, queryParamFromGinCall(h.info, name, pname, h.fset, call))
+				cf.Params = append(cf.Params, parameterFromGinAccess(h.info, name, pname, h.fset, call, parameterHint{}))
 				if name == "Query" {
 					diags.UntypedQueryParam(pname, route.Method, untypedRouteLabel(route), file, line)
 				}
+			}
+		case "GetHeader":
+			if pname, ok := stringArg(call, 0); ok && !seenParam["header/"+pname] {
+				seenParam["header/"+pname] = true
+				cf.Params = append(cf.Params, requestParameter(
+					pname,
+					"header",
+					true,
+					facts.PrimitiveType(facts.StringPrim()),
+					h.fset,
+					call.Pos(),
+				))
+			}
+		case "Cookie":
+			if pname, ok := stringArg(call, 0); ok && !seenParam["cookie/"+pname] {
+				seenParam["cookie/"+pname] = true
+				cf.Params = append(cf.Params, requestParameter(
+					pname,
+					"cookie",
+					true,
+					facts.PrimitiveType(facts.StringPrim()),
+					h.fset,
+					call.Pos(),
+				))
 			}
 		case "FormFile":
 			if fname, ok := stringArg(call, 0); ok {
@@ -384,10 +916,14 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				file, line := positionOf(h.fset, call.Pos())
 				diags.Warn("unsupported multipart source pattern: FormFile field name is dynamic (GO-05)", file, line)
 			}
-		case "PostForm", "DefaultPostForm":
+		case "PostForm", "DefaultPostForm", "GetPostForm":
 			if fname, ok := stringArg(call, 0); ok {
 				if _, seen := formFields[fname]; !seen {
-					formFields[fname] = formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
+					field := formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
+					if name == "DefaultPostForm" && len(call.Args) > 1 {
+						field.Meta = &facts.FieldMeta{Default: literalValue(h.info, call.Args[1])}
+					}
+					formFields[fname] = field
 				}
 			} else {
 				file, line := positionOf(h.fset, call.Pos())
@@ -614,7 +1150,7 @@ func (a *Analyzer) analyzeQueryHelperCall(
 	cf *CodeFacts,
 	seenParam map[string]bool,
 ) {
-	if param, ok := a.queryParamFromSamePackageHelper(h, call); ok {
+	if param, ok := a.queryParamFromModuleHelper(h, call); ok {
 		if !seenParam["query/"+param.Name] {
 			seenParam["query/"+param.Name] = true
 			cf.Params = append(cf.Params, param)
@@ -653,7 +1189,7 @@ func (a *Analyzer) queryParamFromHelper(
 	}
 	required := queryHelperRequired(h.info, helper, query)
 	if fn := calledFuncObject(h.info, helper.Fun); fn != nil {
-		if callee, ok := a.samePackageCallee(h, fn); ok {
+		if callee, ok := a.moduleOwnedCallee(fn); ok {
 			required = queryHelperRequiredFromDirectCallee(h.info, helper, callee, query)
 		}
 	}
@@ -667,12 +1203,12 @@ func (a *Analyzer) queryParamFromHelper(
 	}, true
 }
 
-func (a *Analyzer) queryParamFromSamePackageHelper(h handlerDecl, call *ast.CallExpr) (facts.ParamFact, bool) {
+func (a *Analyzer) queryParamFromModuleHelper(h handlerDecl, call *ast.CallExpr) (facts.ParamFact, bool) {
 	if !callPassesGinContext(h.info, call) {
 		return facts.ParamFact{}, false
 	}
 	fn := calledFuncObject(h.info, call.Fun)
-	callee, ok := a.samePackageCallee(h, fn)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok {
 		return facts.ParamFact{}, false
 	}
@@ -757,7 +1293,7 @@ func (a *Analyzer) pathParamFromHelper(
 	call *ast.CallExpr,
 ) (string, facts.Type, bool) {
 	fn := calledFuncObject(h.info, call.Fun)
-	callee, ok := a.samePackageCallee(h, fn)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok {
 		return "", facts.Type{}, false
 	}
@@ -943,7 +1479,7 @@ func (a *Analyzer) delegatedGinContextHelper(h handlerDecl, call *ast.CallExpr) 
 		return handlerDecl{}, false
 	}
 	fn := calledFuncObject(h.info, call.Fun)
-	callee, ok := a.samePackageCallee(h, fn)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok {
 		return handlerDecl{}, false
 	}
@@ -958,7 +1494,7 @@ func (a *Analyzer) bodyFromGenericJSONHelper(
 		return nil, nil, false
 	}
 	fn := calledFuncObject(h.info, call.Fun)
-	callee, ok := a.samePackageCallee(h, fn)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok || !helperBindsJSONTypeParam(callee) {
 		return nil, nil, false
 	}
@@ -1129,7 +1665,7 @@ func firstQueryCall(info *gotypes.Info, root ast.Expr) (*ast.CallExpr, bool) {
 
 func isGinQueryMethod(name string) bool {
 	switch name {
-	case "Query", "DefaultQuery", "GetQuery":
+	case "Query", "DefaultQuery", "GetQuery", "QueryArray", "GetQueryArray", "QueryMap":
 		return true
 	default:
 		return false
@@ -1155,6 +1691,28 @@ func queryHelperSchema(t gotypes.Type, helper *ast.CallExpr) (facts.Type, bool) 
 	}
 	if ptr, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
 		t = ptr.Elem()
+	}
+	if slice, ok := gotypes.Unalias(t).(*gotypes.Slice); ok {
+		elem, ok := queryHelperSchema(slice.Elem(), helper)
+		if !ok {
+			return facts.Type{}, false
+		}
+		return facts.ArrayType(elem), true
+	}
+	if array, ok := gotypes.Unalias(t).(*gotypes.Array); ok {
+		elem, ok := queryHelperSchema(array.Elem(), helper)
+		if !ok {
+			return facts.Type{}, false
+		}
+		return facts.ArrayType(elem), true
+	}
+	if mapped, ok := gotypes.Unalias(t).(*gotypes.Map); ok {
+		key, keyOK := queryHelperSchema(mapped.Key(), helper)
+		value, valueOK := queryHelperSchema(mapped.Elem(), helper)
+		if !keyOK || !valueOK {
+			return facts.Type{}, false
+		}
+		return facts.MapTypeOf(key, value), true
 	}
 	if named, ok := gotypes.Unalias(t).(*gotypes.Named); ok {
 		if obj := named.Obj(); obj != nil && obj.Pkg() != nil {
@@ -1857,7 +2415,7 @@ func (a *Analyzer) analyzeData(
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.Warn("unsupported binary response pattern: Gin Data content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
+		diags.WarnCode("response.media_type.unresolved", "response", "unsupported binary response pattern: Gin Data content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,
@@ -1890,7 +2448,7 @@ func (a *Analyzer) analyzeDataFromReader(
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.Warn("unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
+		diags.WarnCode("response.media_type.unresolved", "response", "unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,
@@ -2033,7 +2591,7 @@ func (a *Analyzer) stringValueOfSeen(h handlerDecl, expr ast.Expr, seen map[stri
 		return "", false
 	}
 	fn := calledFuncObject(h.info, call.Fun)
-	callee, ok := a.samePackageCallee(h, fn)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok {
 		return "", false
 	}
@@ -2553,6 +3111,403 @@ func queryParamFromGinCall(info *gotypes.Info, method, name string, fset *token.
 		param.Default = queryDefaultValue(info, call)
 	}
 	return param
+}
+
+func requestParameter(
+	name string,
+	location string,
+	required bool,
+	schema facts.Type,
+	fset *token.FileSet,
+	pos token.Pos,
+) facts.ParamFact {
+	return facts.ParamFact{
+		Name:     name,
+		Location: location,
+		Required: required,
+		Schema:   schema,
+		Span:     spanOf(fset, pos),
+	}
+}
+
+func parameterFromGinAccess(
+	info *gotypes.Info,
+	method string,
+	name string,
+	fset *token.FileSet,
+	call *ast.CallExpr,
+	hint parameterHint,
+) facts.ParamFact {
+	schema := facts.PrimitiveType(facts.StringPrim())
+	required := false
+	param := requestParameter(name, "query", required, schema, fset, call.Pos())
+	switch method {
+	case "DefaultQuery":
+		param.Default = queryDefaultValue(info, call)
+	case "QueryArray", "GetQueryArray":
+		param.Schema = facts.ArrayType(facts.PrimitiveType(facts.StringPrim()))
+		param.Style = "form"
+		param.Explode = boolPointer(true)
+	case "QueryMap":
+		param.Schema = facts.MapTypeOf(
+			facts.PrimitiveType(facts.StringPrim()),
+			facts.PrimitiveType(facts.StringPrim()),
+		)
+		param.Style = "deepObject"
+		param.Explode = boolPointer(true)
+	}
+	if hint.schemaKnown && hint.schema != nil {
+		param.Schema = *hint.schema
+	}
+	if hint.requiredKnown {
+		param.Required = hint.required
+	}
+	if hint.defaultValue != nil {
+		param.Default = hint.defaultValue
+	}
+	if param.Schema.Type == facts.TypeArray && param.Style == "" {
+		param.Style = "form"
+		param.Explode = boolPointer(true)
+	}
+	return param
+}
+
+func boolPointer(value bool) *bool {
+	return &value
+}
+
+func (a *Analyzer) addBoundParameters(
+	frame helperFrame,
+	call *ast.CallExpr,
+	location string,
+	cf *CodeFacts,
+	seen map[string]bool,
+	diags *diag.Accumulator,
+) {
+	bound := boundTypeFromCall(frame, call)
+	params, ok := a.parametersFromBoundType(bound, location, frame.decl.fset, diags, map[string]bool{})
+	if !ok {
+		if diags != nil {
+			file, line := positionOf(frame.decl.fset, call.Pos())
+			diags.WarnCode(
+				"request.parameter.unresolved",
+				"request_parameter",
+				"unable to resolve "+location+" binding DTO passed to "+selectorName(call.Fun),
+				file,
+				line,
+			)
+		}
+		return
+	}
+	for _, param := range params {
+		key := param.Location + "/" + param.Name
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		cf.Params = append(cf.Params, param)
+	}
+}
+
+func (a *Analyzer) parametersFromBoundType(
+	t gotypes.Type,
+	location string,
+	fset *token.FileSet,
+	diags *diag.Accumulator,
+	seen map[string]bool,
+) ([]facts.ParamFact, bool) {
+	if t == nil {
+		return nil, false
+	}
+	if pointer, ok := gotypes.Unalias(t).(*gotypes.Pointer); ok {
+		t = pointer.Elem()
+	}
+	if named, ok := gotypes.Unalias(t).(*gotypes.Named); ok {
+		key := named.String()
+		if seen[key] {
+			return nil, true
+		}
+		seen[key] = true
+		t = named.Underlying()
+	}
+	structure, ok := gotypes.Unalias(t).(*gotypes.Struct)
+	if !ok {
+		return nil, false
+	}
+	out := []facts.ParamFact{}
+	for index := 0; index < structure.NumFields(); index++ {
+		field := structure.Field(index)
+		if field.Embedded() {
+			nested, nestedOK := a.parametersFromBoundType(field.Type(), location, fset, diags, seen)
+			if nestedOK {
+				out = append(out, nested...)
+			}
+			continue
+		}
+		tag := reflect.StructTag(structure.Tag(index))
+		name, options, skip := parameterWireName(tag, field.Name(), location)
+		if skip {
+			continue
+		}
+		file, line := positionOf(fset, field.Pos())
+		schema, schemaOK := a.parameterType(field.Type(), tag)
+		if !schemaOK {
+			if diags != nil {
+				diags.WarnCode(
+					"request.parameter.unresolved",
+					"request_parameter",
+					"unsupported "+location+" binding field type for "+field.Name()+": "+field.Type().String(),
+					file,
+					line,
+				)
+			}
+			continue
+		}
+		if enumValues := parameterEnumValues(tag); len(enumValues) > 0 {
+			schema = schemaWithEnum(schema, enumValues)
+		}
+		param := requestParameter(
+			name,
+			location,
+			tagContainsToken(tag.Get("binding"), "required") || tagContainsToken(tag.Get("validate"), "required"),
+			schema,
+			fset,
+			field.Pos(),
+		)
+		if defaultText, exists := parameterDefault(tag, options); exists {
+			param.Default = literalForParameter(defaultText, schema)
+		}
+		applyParameterSerialization(&param, tag, options)
+		out = append(out, param)
+	}
+	return out, true
+}
+
+func parameterWireName(tag reflect.StructTag, fallback, location string) (string, []string, bool) {
+	key := "form"
+	if location == "header" {
+		key = "header"
+	}
+	raw, ok := tag.Lookup(key)
+	if !ok || raw == "" {
+		return fallback, nil, false
+	}
+	parts := strings.Split(raw, ",")
+	name := strings.TrimSpace(parts[0])
+	if name == "-" {
+		return "", nil, true
+	}
+	if name == "" {
+		name = fallback
+	}
+	return name, parts[1:], false
+}
+
+func (a *Analyzer) parameterType(t gotypes.Type, tag reflect.StructTag) (facts.Type, bool) {
+	if t == nil {
+		return facts.Type{}, false
+	}
+	switch value := gotypes.Unalias(t).(type) {
+	case *gotypes.Pointer:
+		return a.parameterType(value.Elem(), tag)
+	case *gotypes.Slice:
+		element, ok := a.parameterType(value.Elem(), reflect.StructTag(""))
+		if !ok {
+			return facts.Type{}, false
+		}
+		return facts.ArrayType(element), true
+	case *gotypes.Array:
+		element, ok := a.parameterType(value.Elem(), reflect.StructTag(""))
+		if !ok {
+			return facts.Type{}, false
+		}
+		return facts.ArrayType(element), true
+	case *gotypes.Map:
+		key, keyOK := a.parameterType(value.Key(), reflect.StructTag(""))
+		item, itemOK := a.parameterType(value.Elem(), reflect.StructTag(""))
+		if !keyOK || !itemOK {
+			return facts.Type{}, false
+		}
+		return facts.MapTypeOf(key, item), true
+	case *gotypes.Named:
+		object := value.Obj()
+		if object != nil && object.Pkg() != nil {
+			switch {
+			case object.Pkg().Path() == "github.com/google/uuid" && object.Name() == "UUID":
+				return facts.WellKnownType(facts.WellKnownUUID), true
+			case object.Pkg().Path() == "time" && object.Name() == "Time":
+				if tag.Get("time_format") == "2006-01-02" {
+					return facts.WellKnownType(facts.WellKnownDate), true
+				}
+				return facts.WellKnownType(facts.WellKnownDateTime), true
+			case object.Pkg().Path() == "mime/multipart" && object.Name() == "FileHeader":
+				return facts.PrimitiveType(facts.BytesPrim()), true
+			}
+			if _, basic := gotypes.Unalias(value.Underlying()).(*gotypes.Basic); basic {
+				if members := namedStringEnumMembers(value); len(members) > 0 {
+					return facts.EnumType(members), true
+				}
+				return a.parameterType(value.Underlying(), tag)
+			}
+			if _, structure := gotypes.Unalias(value.Underlying()).(*gotypes.Struct); structure {
+				return facts.NamedType(a.qualifiedSchemaID(object.Pkg().Path(), object.Name())), true
+			}
+		}
+		return a.parameterType(value.Underlying(), tag)
+	case *gotypes.Basic:
+		switch value.Kind() {
+		case gotypes.String:
+			return facts.PrimitiveType(facts.StringPrim()), true
+		case gotypes.Bool:
+			return facts.PrimitiveType(facts.BoolPrim()), true
+		case gotypes.Int8:
+			return facts.PrimitiveType(facts.IntPrim(8, true)), true
+		case gotypes.Int16:
+			return facts.PrimitiveType(facts.IntPrim(16, true)), true
+		case gotypes.Int32:
+			return facts.PrimitiveType(facts.IntPrim(32, true)), true
+		case gotypes.Int, gotypes.Int64:
+			return facts.PrimitiveType(facts.IntPrim(64, true)), true
+		case gotypes.Uint8:
+			return facts.PrimitiveType(facts.IntPrim(8, false)), true
+		case gotypes.Uint16:
+			return facts.PrimitiveType(facts.IntPrim(16, false)), true
+		case gotypes.Uint32:
+			return facts.PrimitiveType(facts.IntPrim(32, false)), true
+		case gotypes.Uint, gotypes.Uint64:
+			return facts.PrimitiveType(facts.IntPrim(64, false)), true
+		case gotypes.Float32:
+			return facts.PrimitiveType(facts.FloatPrim(32)), true
+		case gotypes.Float64:
+			return facts.PrimitiveType(facts.FloatPrim(64)), true
+		}
+	}
+	return facts.Type{}, false
+}
+
+func namedStringEnumMembers(named *gotypes.Named) []string {
+	if named == nil || named.Obj() == nil || named.Obj().Pkg() == nil {
+		return nil
+	}
+	basic, ok := gotypes.Unalias(named.Underlying()).(*gotypes.Basic)
+	if !ok || basic.Kind() != gotypes.String {
+		return nil
+	}
+	out := []string{}
+	for _, name := range named.Obj().Pkg().Scope().Names() {
+		constantObject, ok := named.Obj().Pkg().Scope().Lookup(name).(*gotypes.Const)
+		if !ok || !gotypes.Identical(constantObject.Type(), named) || constantObject.Val() == nil || constantObject.Val().Kind() != constant.String {
+			continue
+		}
+		out = append(out, constant.StringVal(constantObject.Val()))
+	}
+	return out
+}
+
+func schemaWithEnum(schema facts.Type, values []string) facts.Type {
+	if schema.Type == facts.TypeArray {
+		if element, ok := schema.Of.(*facts.Type); ok && element != nil {
+			return facts.ArrayType(facts.EnumType(values))
+		}
+	}
+	return facts.EnumType(values)
+}
+
+func parameterEnumValues(tag reflect.StructTag) []string {
+	for _, source := range []string{tag.Get("binding"), tag.Get("validate")} {
+		for _, token := range strings.Split(source, ",") {
+			token = strings.TrimSpace(token)
+			if value, ok := strings.CutPrefix(token, "oneof="); ok {
+				return strings.Fields(strings.ReplaceAll(value, "|", " "))
+			}
+		}
+	}
+	for _, key := range []string{"enums", "enum"} {
+		if value := tag.Get(key); value != "" {
+			return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '|' || r == ' ' })
+		}
+	}
+	return nil
+}
+
+func tagContainsToken(value, expected string) bool {
+	for _, token := range strings.Split(value, ",") {
+		if strings.TrimSpace(token) == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func parameterDefault(tag reflect.StructTag, options []string) (string, bool) {
+	if value, ok := tag.Lookup("default"); ok {
+		return value, true
+	}
+	for _, option := range options {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(option), "default="); ok {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func literalForParameter(value string, schema facts.Type) *facts.LiteralValue {
+	if value == "null" {
+		return &facts.LiteralValue{Type: "null"}
+	}
+	if schema.Type == facts.TypePrimitive {
+		if primitive, ok := schema.Of.(*facts.Prim); ok && primitive != nil {
+			switch primitive.Prim {
+			case facts.PrimBool:
+				if parsed, err := strconv.ParseBool(value); err == nil {
+					return &facts.LiteralValue{Type: "bool", Value: parsed}
+				}
+			case facts.PrimInt, facts.PrimFloat:
+				if _, err := strconv.ParseFloat(value, 64); err == nil {
+					return &facts.LiteralValue{Type: "number", Value: value}
+				}
+			}
+		}
+	}
+	return &facts.LiteralValue{Type: "string", Value: value}
+}
+
+func applyParameterSerialization(param *facts.ParamFact, tag reflect.StructTag, options []string) {
+	if param == nil {
+		return
+	}
+	param.Style = tag.Get("style")
+	if value := tag.Get("explode"); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			param.Explode = boolPointer(parsed)
+		}
+	}
+	if value := tag.Get("allowReserved"); value != "" {
+		param.AllowReserved, _ = strconv.ParseBool(value)
+	}
+	collectionFormat := tag.Get("collection_format")
+	for _, option := range options {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(option), "collection_format="); ok {
+			collectionFormat = value
+		}
+	}
+	if param.Schema.Type == facts.TypeArray {
+		if param.Location == "query" {
+			if param.Style == "" {
+				param.Style = "form"
+			}
+			if param.Explode == nil {
+				param.Explode = boolPointer(collectionFormat == "" || collectionFormat == "multi")
+			}
+		} else if param.Location == "header" {
+			if param.Style == "" {
+				param.Style = "simple"
+			}
+			if param.Explode == nil {
+				param.Explode = boolPointer(false)
+			}
+		}
+	}
 }
 
 // untypedRouteLabel renders the operation label (method + group-relative path)

@@ -165,23 +165,23 @@ pub(crate) fn write_sdk_docs(
         .transpose()?;
 
     if docs.reference {
-        out.write(
+        out.create(
             format!("{dir}/README.md"),
             sdk_readme(language, package, ir, docs, compat_dir.as_deref()),
-        );
-        out.write(
+        )?;
+        out.create(
             format!("{dir}/reference.md"),
             sdk_reference(language, package, ir),
-        );
+        )?;
     } else if docs.readme_links {
-        out.write(
+        out.create(
             format!("{dir}/README.md"),
             sdk_readme(language, package, ir, docs, compat_dir.as_deref()),
-        );
+        )?;
     }
 
     if let Some(compat_dir) = compat_dir {
-        write_openapi_generator_docs(out, dir, language, package, ir, model, &compat_dir);
+        write_openapi_generator_docs(out, dir, language, package, ir, model, &compat_dir)?;
     }
 
     Ok(())
@@ -195,26 +195,27 @@ fn write_openapi_generator_docs(
     ir: &ApiGraph,
     model: &SdkModel,
     compat_dir: &str,
-) {
-    out.write(
+) -> Result<(), CoreError> {
+    out.create(
         format!("{dir}/{compat_dir}/README.md"),
         compat_docs_index(language, package, model),
-    );
+    )?;
     for service in &model.services {
         let symbol = api_doc_symbol(&service.name);
         let file_name = doc_file_name(&symbol);
-        out.write(
+        out.create(
             format!("{dir}/{compat_dir}/{file_name}"),
             api_doc_page(language, package, ir, model, service, &symbol),
-        );
+        )?;
     }
     for schema in &model.schemas {
         let file_name = doc_file_name(&schema.name);
-        out.write(
+        out.create(
             format!("{dir}/{compat_dir}/{file_name}"),
             model_doc_page(language, package, ir, schema),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn sdk_readme(

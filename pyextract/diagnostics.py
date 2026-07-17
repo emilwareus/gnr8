@@ -4,9 +4,8 @@ A diagnostic is emitted (rule 3) whenever a fact cannot be derived from a single
 deterministic code source: an unresolvable/foreign type name, an untyped read, etc.
 The fact is then OMITTED — never guessed.
 
-A ``DiagnosticFact`` carries EXACTLY ``severity, message, file, line`` — ``line`` is
-a single 1-based int, NOT a span (facts.rs ``DiagnosticFact``). Severity is ``WARN``
-for every diagnostic this sidecar emits.
+A ``DiagnosticFact`` carries a stable code/category, optional operation/schema subjects, and an
+inclusive source span. Severity is ``WARN`` for every diagnostic this sidecar emits.
 """
 
 
@@ -16,7 +15,17 @@ class Diagnostics:
     def __init__(self):
         self._items = []
 
-    def warn(self, message, file, line):
+    def warn(
+        self,
+        message,
+        file,
+        line,
+        code="source.unresolved",
+        category="source",
+        operation=None,
+        schema=None,
+        subject=None,
+    ):
         """Record a WARN diagnostic.
 
         Args:
@@ -26,10 +35,16 @@ class Diagnostics:
         """
         self._items.append(
             {
+                "code": code,
                 "severity": "WARN",
+                "category": category,
                 "message": message,
                 "file": file,
                 "line": int(line),
+                "end_line": int(line),
+                **({"operation": operation} if operation else {}),
+                **({"schema": schema} if schema else {}),
+                **({"subject": subject} if subject else {}),
             }
         )
 
