@@ -87,6 +87,8 @@ is breaking. With `--contract`, exit 1 is reserved for missing required symbols 
 items; stale allowances are reported in `--json` under `contract_evaluation.stale_allowances` but do
 not fail the check. `--suggest` adds high-confidence migration snippets to human output and to the JSON
 `suggestions` array.
+Go comparison includes canonical exported struct, interface, alias, and defined-type declarations in
+addition to exported function and method signatures.
 
 ```bash
 gnr8 compat go \
@@ -116,6 +118,7 @@ require_exported_methods = []
 allow_missing_exported_types = []
 allow_missing_exported_functions = []
 allow_missing_exported_methods = []
+allow_exported_type_changes = []
 allow_exported_function_signature_changes = []
 allow_exported_method_signature_changes = []
 allow_missing_docs = []

@@ -298,6 +298,8 @@ pub struct GoCompatibilityContract {
     pub allow_missing_exported_functions: Vec<String>,
     /// Missing exported methods that are explicitly approved.
     pub allow_missing_exported_methods: Vec<String>,
+    /// Exported type declaration changes that are explicitly approved, keyed by type name.
+    pub allow_exported_type_changes: Vec<String>,
     /// Exported function signature changes that are explicitly approved, keyed by function name.
     pub allow_exported_function_signature_changes: Vec<String>,
     /// Exported method signature changes that are explicitly approved, keyed by `Receiver.Method`.
@@ -359,6 +361,8 @@ pub struct TypeScriptCompatibilityContract {
 pub struct GoSurface {
     /// Exported type names.
     pub exported_types: Vec<String>,
+    /// Canonical exported type declarations keyed by type name.
+    pub exported_type_declarations: BTreeMap<String, String>,
     /// Exported function signatures keyed by function name.
     pub exported_functions: BTreeMap<String, String>,
     /// Exported method signatures keyed by `Receiver.Method`.
@@ -378,6 +382,8 @@ pub struct GoSurfaceDiff {
     pub missing_exported_functions: Vec<String>,
     /// Exported methods present in old but missing in new.
     pub missing_exported_methods: Vec<String>,
+    /// Exported type declarations whose public shape changed.
+    pub exported_type_changes: Vec<GoTypeDeclarationChange>,
     /// Exported function signatures changed.
     pub exported_function_signature_changes: Vec<GoSignatureChange>,
     /// Exported method signatures changed.
@@ -395,6 +401,7 @@ impl GoSurfaceDiff {
         !self.missing_exported_types.is_empty()
             || !self.missing_exported_functions.is_empty()
             || !self.missing_exported_methods.is_empty()
+            || !self.exported_type_changes.is_empty()
             || !self.exported_function_signature_changes.is_empty()
             || !self.exported_method_signature_changes.is_empty()
             || !self.missing_docs.is_empty()
@@ -407,6 +414,7 @@ impl GoSurfaceDiff {
         !self.missing_exported_types.is_empty()
             || !self.missing_exported_functions.is_empty()
             || !self.missing_exported_methods.is_empty()
+            || !self.exported_type_changes.is_empty()
             || !self.exported_function_signature_changes.is_empty()
             || !self.exported_method_signature_changes.is_empty()
             || !self.package_metadata_changes.is_empty()
@@ -453,6 +461,17 @@ pub struct GoSignatureChange {
     /// Old normalized signature.
     pub old: String,
     /// New normalized signature.
+    pub new: String,
+}
+
+/// Changed Go exported type declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GoTypeDeclarationChange {
+    /// Exported type name.
+    pub symbol: String,
+    /// Old canonical declaration.
+    pub old: String,
+    /// New canonical declaration.
     pub new: String,
 }
 
@@ -577,6 +596,10 @@ pub fn diff_python_dirs(
 
 /// Evaluate a Go SDK diff against a compatibility contract.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "contract evaluation mirrors each Go diff and allow-list section explicitly"
+)]
 pub fn evaluate_go_contract(
     contract: &GoCompatibilityContract,
     diff: &GoSurfaceDiff,
@@ -621,6 +644,12 @@ pub fn evaluate_go_contract(
         &diff.missing_exported_methods,
         &mut stale_allowances,
     );
+    stale_go_type_allowances(
+        "go.allow_exported_type_changes",
+        &contract.allow_exported_type_changes,
+        &diff.exported_type_changes,
+        &mut stale_allowances,
+    );
     stale_signature_allowances(
         "go.allow_exported_function_signature_changes",
         &contract.allow_exported_function_signature_changes,
@@ -658,6 +687,10 @@ pub fn evaluate_go_contract(
         missing_exported_methods: filter_allowed_strings(
             &diff.missing_exported_methods,
             &contract.allow_missing_exported_methods,
+        ),
+        exported_type_changes: filter_allowed_go_type_changes(
+            &diff.exported_type_changes,
+            &contract.allow_exported_type_changes,
         ),
         exported_function_signature_changes: filter_allowed_signature_changes(
             &diff.exported_function_signature_changes,
@@ -913,18 +946,21 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
     files.sort();
 
     let mut exported_types = BTreeSet::new();
+    let mut exported_type_declarations = BTreeMap::new();
     let mut exported_functions = BTreeMap::new();
     let mut exported_methods = BTreeMap::new();
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
         let parsed = parse_go_file(&text);
-        exported_types.extend(parsed.types);
+        exported_types.extend(parsed.type_declarations.keys().cloned());
+        exported_type_declarations.extend(parsed.type_declarations);
         exported_functions.extend(parsed.functions);
         exported_methods.extend(parsed.methods);
     }
 
     Ok(GoSurface {
         exported_types: exported_types.into_iter().collect(),
+        exported_type_declarations,
         exported_functions,
         exported_methods,
         docs: doc_files(dir)?,
@@ -942,6 +978,10 @@ pub fn diff_go_surfaces(old: &GoSurface, new: &GoSurface) -> GoSurfaceDiff {
             &new.exported_functions,
         ),
         missing_exported_methods: missing_string_keys(&old.exported_methods, &new.exported_methods),
+        exported_type_changes: go_type_declaration_changes(
+            &old.exported_type_declarations,
+            &new.exported_type_declarations,
+        ),
         exported_function_signature_changes: go_signature_changes(
             &old.exported_functions,
             &new.exported_functions,
@@ -1106,17 +1146,18 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         parsed_files.insert(rel.clone(), parse_ts_file(&text));
     }
 
-    let public_origins = public_ts_export_origins(dir, &files)?;
+    let public_bindings = public_ts_export_bindings(dir, &files)?;
+    let identifier_renames = unambiguous_ts_public_identifier_renames(&public_bindings);
     for (rel, parsed) in parsed_files {
-        let public_symbols: BTreeSet<String> = public_origins
+        let bindings: BTreeMap<String, BTreeSet<String>> = public_bindings
             .iter()
-            .filter(|origin| origin.file == rel)
-            .map(|origin| origin.symbol.clone())
+            .filter(|(origin, _)| origin.file == rel)
+            .map(|(origin, names)| (origin.symbol.clone(), names.clone()))
             .collect();
-        if public_symbols.is_empty() {
+        if bindings.is_empty() {
             continue;
         }
-        public.merge(parsed, &public_symbols);
+        public.merge(&parsed, &bindings, &identifier_renames);
     }
 
     let mut export_cache = BTreeMap::new();
@@ -1158,68 +1199,87 @@ struct TsPublicSurfaceParts {
 }
 
 impl TsPublicSurfaceParts {
-    fn merge(&mut self, parsed: ParsedTsFile, public_symbols: &BTreeSet<String>) {
-        merge_interface_properties(
-            &mut self.interface_properties,
-            parsed
-                .interface_properties
-                .into_iter()
-                .filter(|(symbol, _)| public_symbols.contains(symbol))
-                .collect(),
-        );
-        merge_ts_declaration_shapes(
-            &mut self.type_declarations,
-            parsed
-                .type_declarations
-                .into_iter()
-                .filter(|(symbol, _)| public_symbols.contains(symbol))
-                .collect(),
-        );
-        merge_operation_return_types(
-            &mut self.operation_return_types,
-            parsed
-                .operation_return_types
-                .into_iter()
-                .filter(|(operation, _)| ts_operation_owner_is_public(operation, public_symbols))
-                .collect(),
-        );
-        self.operation_signatures.extend(
-            parsed
-                .operation_signatures
-                .into_iter()
-                .filter(|(operation, _)| ts_operation_owner_is_public(operation, public_symbols)),
-        );
-        self.api_classes.extend(
-            parsed
-                .api_classes
-                .into_iter()
-                .filter(|symbol| public_symbols.contains(symbol)),
-        );
-        self.api_factories.extend(
-            parsed
-                .api_factories
-                .into_iter()
-                .filter(|symbol| public_symbols.contains(symbol)),
-        );
-        self.operation_methods.extend(
-            parsed
-                .operation_methods
-                .into_iter()
-                .filter(|operation| ts_operation_owner_is_public(operation, public_symbols)),
-        );
-        self.request_aliases.extend(
-            parsed
-                .request_aliases
-                .into_iter()
-                .filter(|symbol| public_symbols.contains(symbol)),
-        );
+    fn merge(
+        &mut self,
+        parsed: &ParsedTsFile,
+        bindings: &BTreeMap<String, BTreeSet<String>>,
+        identifier_renames: &BTreeMap<String, String>,
+    ) {
+        for (origin, public_names) in bindings {
+            for public_name in public_names {
+                let mut renames = identifier_renames.clone();
+                renames.insert(origin.clone(), public_name.clone());
+                self.merge_binding(parsed, origin, public_name, &renames);
+            }
+        }
+    }
+
+    fn merge_binding(
+        &mut self,
+        parsed: &ParsedTsFile,
+        origin: &str,
+        public_name: &str,
+        renames: &BTreeMap<String, String>,
+    ) {
+        if let Some(properties) = parsed.interface_properties.get(origin) {
+            let properties = properties
+                .iter()
+                .map(|(name, property)| {
+                    let mut property = property.clone();
+                    property.ty = rename_ts_identifiers(&property.ty, renames);
+                    (name.clone(), property)
+                })
+                .collect();
+            merge_interface_properties(
+                &mut self.interface_properties,
+                BTreeMap::from([(public_name.to_string(), properties)]),
+            );
+        }
+        if let Some(shapes) = parsed.type_declarations.get(origin) {
+            merge_ts_declaration_shapes(
+                &mut self.type_declarations,
+                BTreeMap::from([(
+                    public_name.to_string(),
+                    shapes
+                        .iter()
+                        .map(|shape| rename_ts_identifiers(shape, renames))
+                        .collect(),
+                )]),
+            );
+        }
+
+        for (operation, return_type) in &parsed.operation_return_types {
+            if let Some(remapped) = remap_ts_operation_owner(operation, origin, public_name) {
+                self.operation_return_types
+                    .insert(remapped, rename_ts_identifiers(return_type, renames));
+            }
+        }
+        for (operation, signature) in &parsed.operation_signatures {
+            if let Some(remapped) = remap_ts_operation_owner(operation, origin, public_name) {
+                self.operation_signatures
+                    .insert(remapped, rename_ts_identifiers(signature, renames));
+            }
+        }
+        for operation in &parsed.operation_methods {
+            if let Some(remapped) = remap_ts_operation_owner(operation, origin, public_name) {
+                self.operation_methods.insert(remapped);
+            }
+        }
+        if parsed.api_classes.iter().any(|symbol| symbol == origin) {
+            self.api_classes.insert(public_name.to_string());
+        }
+        if parsed.api_factories.iter().any(|symbol| symbol == origin) {
+            self.api_factories.insert(public_name.to_string());
+        }
+        if parsed.request_aliases.iter().any(|symbol| symbol == origin) {
+            self.request_aliases.insert(public_name.to_string());
+        }
     }
 }
 
-fn ts_operation_owner_is_public(operation: &str, public_symbols: &BTreeSet<String>) -> bool {
-    operation
-        .split_once('.')
-        .is_some_and(|(owner, _)| public_symbols.contains(owner))
+fn remap_ts_operation_owner(operation: &str, origin: &str, public_name: &str) -> Option<String> {
+    let (owner, method) = operation.split_once('.')?;
+    (owner == origin).then(|| format!("{public_name}.{method}"))
 }
 
 /// Diff two already-extracted TypeScript surfaces.
@@ -1381,6 +1441,18 @@ fn filter_allowed_signature_changes(
         .collect()
 }
 
+fn filter_allowed_go_type_changes(
+    changes: &[GoTypeDeclarationChange],
+    allowed: &[String],
+) -> Vec<GoTypeDeclarationChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.symbol.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn filter_allowed_export_kind_mismatches(
     changes: &[TsExportKindMismatch],
     allowed: &[String],
@@ -1466,6 +1538,20 @@ fn stale_signature_allowances(
     label: &str,
     allowed: &[String],
     current: &[GoSignatureChange],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.symbol.clone()),
+        stale,
+    );
+}
+
+fn stale_go_type_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[GoTypeDeclarationChange],
     stale: &mut Vec<String>,
 ) {
     stale_keyed_allowances(
@@ -2558,6 +2644,73 @@ fn normalize_ts_signature(signature: &str) -> String {
     normalize_ts_tokens(signature)
 }
 
+fn rename_ts_identifiers(value: &str, renames: &BTreeMap<String, String>) -> String {
+    if renames.is_empty() {
+        return value.to_string();
+    }
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    let mut previous_token: Option<String> = None;
+    while let Some(ch) = chars.next() {
+        if matches!(ch, '\'' | '"' | '`') {
+            let mut literal = String::from(ch);
+            let quote = ch;
+            let mut escaped = false;
+            for next in chars.by_ref() {
+                literal.push(next);
+                if escaped {
+                    escaped = false;
+                } else if next == '\\' {
+                    escaped = true;
+                } else if next == quote {
+                    break;
+                }
+            }
+            output.push_str(&literal);
+            previous_token = Some(literal);
+            continue;
+        }
+        if ch.is_alphabetic() || ch == '_' || ch == '$' {
+            let mut identifier = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_alphanumeric() || *next == '_' || *next == '$')
+            {
+                if let Some(next) = chars.next() {
+                    identifier.push(next);
+                }
+            }
+            let replacement =
+                if ts_identifier_is_declaration_key(previous_token.as_deref(), chars.clone()) {
+                    &identifier
+                } else {
+                    renames.get(&identifier).unwrap_or(&identifier)
+                };
+            output.push_str(replacement);
+            previous_token = Some(identifier);
+        } else {
+            output.push(ch);
+            if !ch.is_whitespace() {
+                previous_token = Some(ch.to_string());
+            }
+        }
+    }
+    normalize_ts_tokens(&output)
+}
+
+fn ts_identifier_is_declaration_key(
+    previous: Option<&str>,
+    remaining: std::iter::Peekable<std::str::Chars<'_>>,
+) -> bool {
+    let following: Vec<char> = remaining.filter(|ch| !ch.is_whitespace()).take(2).collect();
+    match following.as_slice() {
+        [':', ..] | ['?', ':'] => true,
+        ['(', ..] if matches!(previous, Some("{" | ";" | ",")) => true,
+        ['=', ..] if !matches!(previous, Some("type" | "const")) => true,
+        _ => false,
+    }
+}
+
 fn normalize_ts_tokens(value: &str) -> String {
     let mut tokens = Vec::new();
     let mut chars = value.chars().peekable();
@@ -2948,35 +3101,65 @@ fn add_resolved_ts_export(
         .or_insert(TsResolvedExport { kind, origins });
 }
 
-fn public_ts_export_origins(
+fn public_ts_export_bindings(
     dir: &Path,
     files: &[PathBuf],
-) -> Result<BTreeSet<TsExportOrigin>, CoreError> {
+) -> Result<BTreeMap<TsExportOrigin, BTreeSet<String>>, CoreError> {
     let mut cache = BTreeMap::new();
-    let mut origins = BTreeSet::new();
+    let mut bindings = BTreeMap::new();
     if let Some(index) = ts_root_index(files) {
-        for resolved in
-            resolved_ts_exports_from_file(dir, index, &mut cache, &mut Vec::new())?.values()
-        {
-            origins.extend(resolved.origins.iter().cloned());
-        }
+        let exports = resolved_ts_exports_from_file(dir, index, &mut cache, &mut Vec::new())?;
+        add_ts_public_bindings(&mut bindings, &exports);
     } else {
         for file in files {
-            for resolved in
-                resolved_ts_exports_from_file(dir, file, &mut cache, &mut Vec::new())?.values()
-            {
-                origins.extend(resolved.origins.iter().cloned());
-            }
+            let exports = resolved_ts_exports_from_file(dir, file, &mut cache, &mut Vec::new())?;
+            add_ts_public_bindings(&mut bindings, &exports);
         }
     }
     for model_file in files.iter().filter(|path| is_model_file(path)) {
-        for resolved in
-            resolved_ts_exports_from_file(dir, model_file, &mut cache, &mut Vec::new())?.values()
-        {
-            origins.extend(resolved.origins.iter().cloned());
+        let exports = resolved_ts_exports_from_file(dir, model_file, &mut cache, &mut Vec::new())?;
+        add_ts_public_bindings(&mut bindings, &exports);
+    }
+    Ok(bindings)
+}
+
+fn add_ts_public_bindings(
+    into: &mut BTreeMap<TsExportOrigin, BTreeSet<String>>,
+    exports: &BTreeMap<String, TsResolvedExport>,
+) {
+    for (public_name, resolved) in exports {
+        for origin in &resolved.origins {
+            let semantic_name = if public_name == "default" {
+                &origin.symbol
+            } else {
+                public_name
+            };
+            into.entry(origin.clone())
+                .or_default()
+                .insert(semantic_name.clone());
         }
     }
-    Ok(origins)
+}
+
+fn unambiguous_ts_public_identifier_renames(
+    bindings: &BTreeMap<TsExportOrigin, BTreeSet<String>>,
+) -> BTreeMap<String, String> {
+    let mut candidates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (origin, public_names) in bindings {
+        candidates
+            .entry(origin.symbol.clone())
+            .or_default()
+            .extend(public_names.iter().cloned());
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(origin, public_names)| {
+            (public_names.len() == 1).then(|| {
+                let public_name = public_names.into_iter().next().unwrap_or_default();
+                (origin, public_name)
+            })
+        })
+        .collect()
 }
 
 fn add_export(into: &mut BTreeMap<String, TsExportKind>, name: &str, kind: TsExportKind) {
@@ -3024,13 +3207,6 @@ fn add_ts_declaration_shape(into: &mut BTreeMap<String, Vec<String>>, symbol: &s
         shapes.push(shape);
         shapes.sort();
     }
-}
-
-fn merge_operation_return_types(
-    into: &mut BTreeMap<String, String>,
-    return_types: BTreeMap<String, String>,
-) {
-    into.extend(return_types);
 }
 
 fn extract_root_exports(
@@ -4500,14 +4676,17 @@ fn python_entry_point_toml_table<'a>(
 
 #[derive(Default)]
 struct ParsedGoFile {
-    types: Vec<String>,
+    type_declarations: BTreeMap<String, String>,
     functions: BTreeMap<String, String>,
     methods: BTreeMap<String, String>,
 }
 
 fn parse_go_file(text: &str) -> ParsedGoFile {
-    let mut parsed = ParsedGoFile::default();
     let lines = go_source_lines_without_comments(text);
+    let mut parsed = ParsedGoFile {
+        type_declarations: extract_go_type_declarations(&lines),
+        ..ParsedGoFile::default()
+    };
     let mut brace_depth = 0_i32;
     let mut index = 0;
     while index < lines.len() {
@@ -4516,40 +4695,120 @@ fn parse_go_file(text: &str) -> ParsedGoFile {
             index += 1;
             continue;
         }
-        if brace_depth == 0 {
-            if line.starts_with("func ") {
-                let (declaration, last) = collect_go_function_declaration(&lines, index);
-                if let Some((name, signature)) = go_func_decl(&declaration) {
-                    if is_go_exported(&name) {
-                        parsed.functions.insert(name, signature);
-                    }
-                }
-                if let Some((receiver, method, signature)) = go_method_decl(&declaration) {
-                    if is_go_exported(&receiver) && is_go_exported(&method) {
-                        parsed
-                            .methods
-                            .insert(format!("{receiver}.{method}"), signature);
-                    }
-                }
-                brace_depth += lines[index..=last]
-                    .iter()
-                    .map(|line| go_brace_delta(line))
-                    .sum::<i32>();
-                index = last + 1;
-                continue;
-            }
-            if let Some(name) = go_type_decl(line) {
-                if is_go_exported(name) {
-                    parsed.types.push(name.to_string());
+        if brace_depth == 0 && line.starts_with("func ") {
+            let (declaration, last) = collect_go_function_declaration(&lines, index);
+            if let Some((name, signature)) = go_func_decl(&declaration) {
+                if is_go_exported(&name) {
+                    parsed.functions.insert(name, signature);
                 }
             }
+            if let Some((receiver, method, signature)) = go_method_decl(&declaration) {
+                if is_go_exported(&receiver) && is_go_exported(&method) {
+                    parsed
+                        .methods
+                        .insert(format!("{receiver}.{method}"), signature);
+                }
+            }
+            brace_depth += lines[index..=last]
+                .iter()
+                .map(|line| go_brace_delta(line))
+                .sum::<i32>();
+            index = last + 1;
+            continue;
         }
         brace_depth += go_brace_delta(line);
         index += 1;
     }
-    parsed.types.sort();
-    parsed.types.dedup();
     parsed
+}
+
+fn extract_go_type_declarations(lines: &[String]) -> BTreeMap<String, String> {
+    let mut declarations = BTreeMap::new();
+    let mut brace_depth = 0_i32;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if brace_depth == 0 && is_go_type_group_start(line) {
+            index += 1;
+            while index < lines.len() {
+                let spec = lines[index].trim();
+                if spec == ")" {
+                    break;
+                }
+                if spec.is_empty() {
+                    index += 1;
+                    continue;
+                }
+                let (declaration, last) = collect_go_type_declaration(lines, index, false);
+                add_go_type_declaration(&mut declarations, &declaration);
+                index = last + 1;
+            }
+        } else if brace_depth == 0 && go_type_decl(line).is_some() {
+            let (declaration, last) = collect_go_type_declaration(lines, index, true);
+            add_go_type_declaration(&mut declarations, &declaration);
+            brace_depth += lines[index..=last]
+                .iter()
+                .map(|line| go_brace_delta(line))
+                .sum::<i32>();
+            index = last + 1;
+            continue;
+        }
+        brace_depth += go_brace_delta(line);
+        index += 1;
+    }
+    declarations
+}
+
+fn is_go_type_group_start(line: &str) -> bool {
+    line.strip_prefix("type")
+        .is_some_and(|rest| rest.trim_start().starts_with('('))
+}
+
+fn collect_go_type_declaration(
+    lines: &[String],
+    start: usize,
+    includes_type_keyword: bool,
+) -> (String, usize) {
+    let mut declaration = if includes_type_keyword {
+        String::new()
+    } else {
+        "type ".to_string()
+    };
+    let mut index = start;
+    while index < lines.len() {
+        if !declaration.ends_with(' ') && !declaration.is_empty() {
+            declaration.push('\n');
+        }
+        declaration.push_str(lines[index].trim());
+        if go_type_declaration_complete(&declaration) {
+            break;
+        }
+        index += 1;
+    }
+    (declaration, index.min(lines.len().saturating_sub(1)))
+}
+
+fn go_type_declaration_complete(declaration: &str) -> bool {
+    if !go_declaration_delimiters_balanced(declaration) {
+        return false;
+    }
+    let trimmed = declaration.trim_end();
+    if trimmed.ends_with(" struct") || trimmed.ends_with(" interface") {
+        return false;
+    }
+    !matches!(
+        trimmed.chars().last(),
+        Some('=' | '|' | '~' | ',' | '(' | '[' | '{')
+    )
+}
+
+fn add_go_type_declaration(into: &mut BTreeMap<String, String>, declaration: &str) {
+    let Some(name) = go_type_decl(declaration.trim_start()) else {
+        return;
+    };
+    if is_go_exported(name) {
+        into.insert(name.to_string(), normalize_go_type_declaration(declaration));
+    }
 }
 
 fn collect_go_function_declaration(lines: &[String], start: usize) -> (String, usize) {
@@ -4864,6 +5123,112 @@ fn normalize_go_param_list(list: &str) -> String {
     normalized.join(", ")
 }
 
+fn normalize_go_type_declaration(declaration: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut chars = declaration.chars().peekable();
+    let mut saw_newline = false;
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            saw_newline |= ch == '\n';
+            continue;
+        }
+        if saw_newline
+            && tokens
+                .last()
+                .is_some_and(|token: &String| go_token_can_end_statement(token) && token != ";")
+            && ch != '}'
+        {
+            tokens.push(";".to_string());
+        }
+        saw_newline = false;
+        if ch.is_alphanumeric() || ch == '_' {
+            let mut token = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_alphanumeric() || *next == '_')
+            {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            let mut token = String::from(ch);
+            let quote = ch;
+            let mut escaped = false;
+            for next in chars.by_ref() {
+                token.push(next);
+                if quote != '`' && escaped {
+                    escaped = false;
+                } else if quote != '`' && next == '\\' {
+                    escaped = true;
+                } else if next == quote {
+                    break;
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+        let mut token = String::from(ch);
+        if ch == '.' && chars.peek() == Some(&'.') {
+            if let Some(next) = chars.next() {
+                token.push(next);
+            }
+            if chars.peek() == Some(&'.') {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+        } else if (matches!(ch, '<' | '>' | ':' | '=' | '!' | '&' | '|')
+            && chars.peek() == Some(&'='))
+            || (ch == '<' && chars.peek() == Some(&'-'))
+        {
+            if let Some(next) = chars.next() {
+                token.push(next);
+            }
+        }
+        if token == "}" && tokens.last().is_some_and(|previous| previous == ";") {
+            tokens.pop();
+        }
+        tokens.push(token);
+    }
+
+    let mut normalized = String::new();
+    let mut previous: Option<String> = None;
+    for token in tokens {
+        if !normalized.is_empty()
+            && previous
+                .as_deref()
+                .is_some_and(|previous| go_tokens_need_space(previous, &token))
+        {
+            normalized.push(' ');
+        }
+        normalized.push_str(&token);
+        previous = Some(token);
+    }
+    normalized.trim_end_matches(';').to_string()
+}
+
+fn go_token_can_end_statement(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || matches!(ch, '\'' | '"' | '`'))
+        || matches!(token, ")" | "]" | "}")
+}
+
+fn go_tokens_need_space(previous: &str, current: &str) -> bool {
+    let atom = |token: &str| {
+        token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || matches!(ch, '\'' | '"' | '`'))
+    };
+    atom(previous) && atom(current)
+}
+
 fn split_go_decl_at_top_level_name_space(value: &str) -> Option<(&str, &str)> {
     let mut paren = 0usize;
     let mut bracket = 0usize;
@@ -5130,6 +5495,22 @@ fn go_signature_changes(
                 symbol: symbol.clone(),
                 old: old_signature.clone(),
                 new: new_signature.clone(),
+            })
+        })
+        .collect()
+}
+
+fn go_type_declaration_changes(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Vec<GoTypeDeclarationChange> {
+    old.iter()
+        .filter_map(|(symbol, old_declaration)| {
+            let new_declaration = new.get(symbol)?;
+            (old_declaration != new_declaration).then(|| GoTypeDeclarationChange {
+                symbol: symbol.clone(),
+                old: old_declaration.clone(),
+                new: new_declaration.clone(),
             })
         })
         .collect()
@@ -5439,7 +5820,8 @@ mod tests {
         .unwrap();
 
         let surface = extract_typescript_surface(&old).unwrap();
-        assert!(surface.interface_properties.contains_key("InternalBook"));
+        assert!(surface.interface_properties.contains_key("Book"));
+        assert!(!surface.interface_properties.contains_key("InternalBook"));
         assert!(!surface.interface_properties.contains_key("Hidden"));
         assert!(!surface.api_classes.contains(&"HiddenApi".to_string()));
         let diff = diff_typescript_dirs(&old, &new).unwrap();
@@ -5447,6 +5829,124 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_semantic_surface_follows_stable_public_aliases() {
+        let old = temp_dir("ts-public-alias-old");
+        let new = temp_dir("ts-public-alias-new");
+        std::fs::write(
+            old.join("index.ts"),
+            "export { type OldInternalBook as Book } from \"./old-layout\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            old.join("old-layout.ts"),
+            "export interface OldInternalBook {\n  title: string;\n  next?: OldInternalBook;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            "export { type NewInternalBook as Book } from \"./new-layout\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("new-layout.ts"),
+            "export interface NewInternalBook {\n  title: string;\n  next?: NewInternalBook;\n}\n",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&old).unwrap();
+        assert!(surface.interface_properties.contains_key("Book"));
+        assert!(!surface.interface_properties.contains_key("OldInternalBook"));
+        assert!(surface.type_declarations["Book"]
+            .iter()
+            .all(|shape| !shape.contains("OldInternalBook")));
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert!(
+            !diff.is_breaking(),
+            "private declaration identity leaked into the public alias: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_public_aliases_still_report_semantic_drift() {
+        let old = temp_dir("ts-public-alias-drift-old");
+        let new = temp_dir("ts-public-alias-drift-new");
+        for dir in [&old, &new] {
+            std::fs::write(
+                dir.join("index.ts"),
+                "export { type InternalBook as Book } from \"./internal\";\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            old.join("internal.ts"),
+            "export interface InternalBook {\n  title: string;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("internal.ts"),
+            "export interface InternalBook {\n  title: number;\n}\n",
+        )
+        .unwrap();
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert_eq!(diff.interface_type_changes.len(), 1);
+        assert_eq!(diff.interface_type_changes[0].interface, "Book");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_alias_canonicalization_preserves_public_property_names() {
+        let old = temp_dir("ts-alias-property-old");
+        let stable = temp_dir("ts-alias-property-stable");
+        let changed = temp_dir("ts-alias-property-changed");
+        std::fs::write(
+            old.join("index.ts"),
+            "export { type OldInternal as Book } from \"./internal\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            old.join("internal.ts"),
+            "export type OldInternal = { OldInternal: string; next?: OldInternal };\n",
+        )
+        .unwrap();
+        for dir in [&stable, &changed] {
+            std::fs::write(
+                dir.join("index.ts"),
+                "export { type NewInternal as Book } from \"./internal\";\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            stable.join("internal.ts"),
+            "export type NewInternal = { OldInternal: string; next?: NewInternal };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            changed.join("internal.ts"),
+            "export type NewInternal = { NewInternal: string; next?: NewInternal };\n",
+        )
+        .unwrap();
+
+        let stable_diff = diff_typescript_dirs(&old, &stable).unwrap();
+        assert!(
+            !stable_diff.is_breaking(),
+            "a property key was mistaken for the private declaration: {stable_diff:?}"
+        );
+        let changed_diff = diff_typescript_dirs(&old, &changed).unwrap();
+        assert_eq!(changed_diff.type_declaration_changes.len(), 1);
+        assert_eq!(changed_diff.type_declaration_changes[0].symbol, "Book");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(stable);
+        let _ = std::fs::remove_dir_all(changed);
     }
 
     #[test]
@@ -6115,6 +6615,103 @@ export type Availability = typeof Availability[keyof typeof Availability];
     }
 
     #[test]
+    fn go_diff_catches_exported_type_shape_changes() {
+        let old = temp_dir("go-type-shape-old");
+        let new = temp_dir("go-type-shape-new");
+        std::fs::write(old.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        std::fs::write(new.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        std::fs::write(
+            old.join("models.go"),
+            r#"package sdk
+
+type (
+    Book struct {
+        Title string `json:"title"`
+        Tags []string `json:"tags,omitempty"`
+    }
+    Status = string
+    Reader interface {
+        Read([]byte) (int, error)
+    }
+    internal struct { Value string }
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("models.go"),
+            r#"package sdk
+
+type (
+    Book struct {
+        Title int `json:"title"`
+        Tags []string `json:"tags,omitempty"`
+    }
+    Status = int
+    Reader interface {
+        Read([]byte) error
+    }
+    internal struct { Value int }
+)
+"#,
+        )
+        .unwrap();
+
+        let old_surface = extract_go_surface(&old).unwrap();
+        assert_eq!(old_surface.exported_types, vec!["Book", "Reader", "Status"]);
+        assert!(!old_surface
+            .exported_type_declarations
+            .contains_key("internal"));
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert_eq!(
+            diff.exported_type_changes
+                .iter()
+                .map(|change| change.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Book", "Reader", "Status"]
+        );
+        assert!(diff.is_breaking());
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_type_shape_comparison_ignores_layout_and_comments() {
+        let old = temp_dir("go-type-layout-old");
+        let new = temp_dir("go-type-layout-new");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        }
+        std::fs::write(
+            old.join("models.go"),
+            r#"package sdk
+type Book struct {
+    Title string `json:"title"` // public title
+    Tags []string `json:"tags,omitempty"`
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("models.go"),
+            r#"package sdk
+type Book struct { Title string `json:"title"`; Tags []string `json:"tags,omitempty"` }
+"#,
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert!(
+            diff.exported_type_changes.is_empty(),
+            "formatting-only type drift was reported: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
     fn go_diff_ignores_parameter_and_result_names() {
         let old = temp_dir("go-old-param-names");
         let new = temp_dir("go-new-param-names");
@@ -6337,6 +6934,39 @@ export type Availability = typeof Availability[keyof typeof Availability];
             evaluation.unapproved_diff.missing_exported_types,
             vec!["Legacy".to_string()]
         );
+    }
+
+    #[test]
+    fn go_contract_can_allow_one_exported_type_change() {
+        let old = GoSurface {
+            exported_types: vec!["Book".to_string()],
+            exported_type_declarations: BTreeMap::from([(
+                "Book".to_string(),
+                "type Book struct{Title string}".to_string(),
+            )]),
+            ..GoSurface::default()
+        };
+        let new = GoSurface {
+            exported_types: vec!["Book".to_string()],
+            exported_type_declarations: BTreeMap::from([(
+                "Book".to_string(),
+                "type Book struct{Title int}".to_string(),
+            )]),
+            ..GoSurface::default()
+        };
+        let diff = diff_go_surfaces(&old, &new);
+        let evaluation = evaluate_go_contract(
+            &GoCompatibilityContract {
+                allow_exported_type_changes: vec!["Book".to_string()],
+                ..GoCompatibilityContract::default()
+            },
+            &diff,
+            &new,
+        );
+
+        assert!(!evaluation.breaking, "{evaluation:?}");
+        assert!(evaluation.unapproved_diff.exported_type_changes.is_empty());
+        assert!(evaluation.stale_allowances.is_empty());
     }
 
     #[test]

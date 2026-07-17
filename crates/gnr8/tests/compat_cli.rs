@@ -508,6 +508,55 @@ allow_missing_exported_types = ["LegacyBook"]
 }
 
 #[test]
+fn compat_go_reports_and_can_allow_exported_type_changes() {
+    let root = unique_temp_dir("go-type-change");
+    let old = root.join("old-go");
+    let new = root.join("new-go");
+    write_go_sdk(
+        &old,
+        "package sdk\n\ntype Book struct {\n    Title string `json:\"title\"`\n}\n",
+    );
+    write_go_sdk(
+        &new,
+        "package sdk\n\ntype Book struct {\n    Title int `json:\"title\"`\n}\n",
+    );
+
+    let base_args = [
+        "--json".to_string(),
+        "compat".to_string(),
+        "go".to_string(),
+        "--old".to_string(),
+        old.display().to_string(),
+        "--new".to_string(),
+        new.display().to_string(),
+    ];
+    let (ok, stdout, stderr) = run_gnr8(&root, &base_args);
+    assert!(
+        !ok,
+        "type drift must fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let report = parse_json(&stdout);
+    assert_eq!(report["diff"]["exported_type_changes"][0]["symbol"], "Book");
+
+    let contract = root.join("compat.toml");
+    std::fs::write(
+        &contract,
+        "[go]\nallow_exported_type_changes = [\"Book\"]\n",
+    )
+    .expect("write contract");
+    let mut contract_args = base_args.to_vec();
+    contract_args.extend(["--contract".to_string(), contract.display().to_string()]);
+    let (ok, stdout, stderr) = run_gnr8(&root, &contract_args);
+    assert!(
+        ok,
+        "allowed type drift should pass\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(parse_json(&stdout)["breaking"], false);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn compat_go_contract_missing_required_symbol_fails_even_with_allowed_drift() {
     let root = unique_temp_dir("go-required");
     let (old, new) = write_go_compat_pair(&root);

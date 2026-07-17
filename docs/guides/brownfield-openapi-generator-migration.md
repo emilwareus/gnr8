@@ -61,7 +61,7 @@ gnr8 compat go --old old-go-sdk --new generated/go
    The `cleanup` section lists owned files, stale generated files deleted by gnr8, protected hand-edited files, generated-looking unowned files, likely OpenAPI Generator package/config remnants, and old generator dependencies to remove.
 
 2. Inspect compatibility diffs.
-   TypeScript checks exports, API classes/factories, request aliases, method signatures, operation return wrappers, model optionality/nullability/type drift, type aliases, interface/class heritage, enum-like values, and package entry points. Go checks exported types, exported functions, exported methods, normalized signatures, docs presence, and `go.mod` metadata.
+   TypeScript checks exports, API classes/factories, request aliases, method signatures, operation return wrappers, model optionality/nullability/type drift, type aliases, interface/class heritage, enum-like values, and package entry points. Go checks exported type declarations, exported functions, exported methods, normalized signatures, docs presence, and `go.mod` metadata.
 
 3. Fix at the profile/config layer.
    Prefer `SdkProfile::typescript_fetch_compat()`, `SdkProfile::typescript_axios_compat()`, `SdkProfile::go_openapi_generator_compat()`, `SdkOperationAliases`, `OperationSelector`, `ApiOverrides`, and explicit output layout/profile controls over postprocessing generated files.

@@ -672,6 +672,12 @@ fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
     print_compat_list("missing exported methods", &diff.missing_exported_methods);
     print_compat_list("missing docs", &diff.missing_docs);
     print_compat_list("package metadata changes", &diff.package_metadata_changes);
+    for change in &diff.exported_type_changes {
+        println!(
+            "  exported type changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
     for change in &diff.exported_function_signature_changes {
         println!(
             "  exported function signature changed: {} ({} -> {})",
