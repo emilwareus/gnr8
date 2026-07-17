@@ -33,6 +33,8 @@ pub struct TypeScriptSurface {
     pub request_aliases: Vec<String>,
     /// Exported interface properties keyed by interface name, then property name.
     pub interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    /// Canonical public type declarations, including aliases, heritage, enums, and enum-like values.
+    pub type_declarations: BTreeMap<String, Vec<String>>,
     /// Operation/factory return types keyed by `Class.method` or `Factory.method`.
     pub operation_return_types: BTreeMap<String, String>,
     /// Operation/factory method signatures keyed by `Class.method` or `Factory.method`.
@@ -72,6 +74,8 @@ pub struct TypeScriptSurfaceDiff {
     pub interface_nullable_changes: Vec<TsInterfacePropertyChange>,
     /// Interface properties whose non-null type annotation changed.
     pub interface_type_changes: Vec<TsInterfacePropertyChange>,
+    /// Public type declarations whose alias, heritage, enum, or enum-like value shape changed.
+    pub type_declaration_changes: Vec<TsTypeDeclarationChange>,
     /// Operation/factory return type annotations changed or were removed.
     pub operation_return_type_changes: Vec<TsOperationReturnTypeChange>,
     /// Operation/factory method signatures changed or were removed.
@@ -220,6 +224,7 @@ impl TypeScriptSurfaceDiff {
             || !self.interface_optional_to_required.is_empty()
             || !self.interface_nullable_changes.is_empty()
             || !self.interface_type_changes.is_empty()
+            || !self.type_declaration_changes.is_empty()
             || !self.operation_return_type_changes.is_empty()
             || !self.operation_signature_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
@@ -242,6 +247,7 @@ impl TypeScriptSurfaceDiff {
             || !self.interface_optional_to_required.is_empty()
             || !self.interface_nullable_changes.is_empty()
             || !self.interface_type_changes.is_empty()
+            || !self.type_declaration_changes.is_empty()
             || !self.operation_return_type_changes.is_empty()
             || !self.operation_signature_changes.is_empty()
             || !self.package_entry_point_changes.is_empty()
@@ -334,6 +340,8 @@ pub struct TypeScriptCompatibilityContract {
     pub allow_missing_interface_properties: Vec<String>,
     /// Interface property changes approved as `Interface.property`.
     pub allow_interface_property_changes: Vec<String>,
+    /// Type declaration changes approved by exported declaration name.
+    pub allow_type_declaration_changes: Vec<String>,
     /// Operation return type changes approved by operation key.
     pub allow_operation_return_type_changes: Vec<String>,
     /// Operation signature changes approved by operation key.
@@ -490,6 +498,17 @@ pub struct TsInterfacePropertyChange {
     pub old: TsInterfaceProperty,
     /// New property shape.
     pub new: TsInterfaceProperty,
+}
+
+/// A changed or removed public TypeScript type declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TsTypeDeclarationChange {
+    /// Exported declaration name.
+    pub symbol: String,
+    /// Old canonical declaration shape.
+    pub old: Vec<String>,
+    /// New canonical declaration shapes; empty when the declaration disappeared.
+    pub new: Vec<String>,
 }
 
 /// A changed TypeScript operation or factory return type.
@@ -765,6 +784,12 @@ pub fn evaluate_typescript_contract(
             .map(ts_interface_property_change_key),
         &mut stale_allowances,
     );
+    stale_type_declaration_allowances(
+        "typescript.allow_type_declaration_changes",
+        &contract.allow_type_declaration_changes,
+        &diff.type_declaration_changes,
+        &mut stale_allowances,
+    );
     stale_operation_return_allowances(
         "typescript.allow_operation_return_type_changes",
         &contract.allow_operation_return_type_changes,
@@ -848,6 +873,10 @@ pub fn evaluate_typescript_contract(
         interface_type_changes: filter_allowed_interface_property_changes(
             &diff.interface_type_changes,
             &contract.allow_interface_property_changes,
+        ),
+        type_declaration_changes: filter_allowed_type_declaration_changes(
+            &diff.type_declaration_changes,
+            &contract.allow_type_declaration_changes,
         ),
         operation_return_type_changes: filter_allowed_operation_return_changes(
             &diff.operation_return_type_changes,
@@ -1074,6 +1103,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
     let mut operation_methods = BTreeSet::new();
     let mut request_aliases = BTreeSet::new();
     let mut interface_properties = BTreeMap::new();
+    let mut type_declarations = BTreeMap::new();
     let mut operation_return_types = BTreeMap::new();
     let mut operation_signatures = BTreeMap::new();
 
@@ -1081,6 +1111,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         let text = read_to_string(dir.join(rel))?;
         let parsed = parse_ts_file(&text);
         merge_interface_properties(&mut interface_properties, parsed.interface_properties);
+        merge_ts_declaration_shapes(&mut type_declarations, parsed.type_declarations);
         merge_operation_return_types(&mut operation_return_types, parsed.operation_return_types);
         operation_signatures.extend(parsed.operation_signatures);
         api_classes.extend(parsed.api_classes);
@@ -1107,6 +1138,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         operation_methods: operation_methods.into_iter().collect(),
         request_aliases: request_aliases.into_iter().collect(),
         interface_properties,
+        type_declarations,
         operation_return_types,
         operation_signatures,
         package_entry_points: package_entry_points(dir)?,
@@ -1139,6 +1171,10 @@ pub fn diff_typescript_surfaces(
         interface_nullable_changes: interface_nullable_changes(&interface_property_changes),
         interface_type_changes: interface_type_changes(&interface_property_changes),
         interface_property_changes,
+        type_declaration_changes: ts_type_declaration_changes(
+            &old.type_declarations,
+            &new.type_declarations,
+        ),
         operation_return_type_changes: operation_return_type_changes(
             &old.operation_return_types,
             &new.operation_return_types,
@@ -1305,6 +1341,18 @@ fn filter_allowed_interface_property_changes(
         .collect()
 }
 
+fn filter_allowed_type_declaration_changes(
+    changes: &[TsTypeDeclarationChange],
+    allowed: &[String],
+) -> Vec<TsTypeDeclarationChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.symbol.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn filter_allowed_operation_return_changes(
     changes: &[TsOperationReturnTypeChange],
     allowed: &[String],
@@ -1356,6 +1404,20 @@ fn stale_export_kind_allowances(
     label: &str,
     allowed: &[String],
     current: &[TsExportKindMismatch],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.symbol.clone()),
+        stale,
+    );
+}
+
+fn stale_type_declaration_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[TsTypeDeclarationChange],
     stale: &mut Vec<String>,
 ) {
     stale_keyed_allowances(
@@ -1422,6 +1484,7 @@ struct ParsedTsFile {
     operation_methods: Vec<String>,
     request_aliases: Vec<String>,
     interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    type_declarations: BTreeMap<String, Vec<String>>,
     operation_return_types: BTreeMap<String, String>,
     operation_signatures: BTreeMap<String, String>,
 }
@@ -1448,6 +1511,7 @@ enum TsDeclarationKind {
     TypeAlias,
     Class,
     Const,
+    Enum,
     Other,
 }
 
@@ -1468,6 +1532,27 @@ enum TsMethodParse {
     Incomplete,
     NotMethod,
     Method(TsParsedMethod),
+}
+
+#[derive(Clone, Copy)]
+enum TsDeclarationShapeKind {
+    Header,
+    Statement,
+    ConstStatement,
+    Enum,
+}
+
+struct TsDeclarationShapeState {
+    symbol: String,
+    kind: TsDeclarationShapeKind,
+    code: String,
+    structure: String,
+}
+
+enum TsDeclarationShapeProgress {
+    Incomplete,
+    Ignored,
+    Complete(String),
 }
 
 #[expect(
@@ -1606,6 +1691,7 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
             current_interface = None;
         }
     }
+    parsed.type_declarations = extract_ts_declaration_shapes(text);
     parsed
 }
 
@@ -1630,6 +1716,180 @@ fn collect_ts_method(state: &mut TsContainerState, line: &str) -> Option<TsParse
             Some(method)
         }
     }
+}
+
+fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
+    let code = sanitize_typescript(text, false);
+    let structure = sanitize_typescript(text, true);
+    let mut declarations = BTreeMap::new();
+    let mut pending: Option<TsDeclarationShapeState> = None;
+    for (raw, structural_raw) in code.lines().zip(structure.lines()) {
+        if let Some(state) = &mut pending {
+            append_ts_declaration_shape_line(state, raw, structural_raw);
+            match finish_ts_declaration_shape(state) {
+                TsDeclarationShapeProgress::Complete(shape) => {
+                    add_ts_declaration_shape(&mut declarations, &state.symbol, shape);
+                    pending = None;
+                }
+                TsDeclarationShapeProgress::Ignored => pending = None,
+                TsDeclarationShapeProgress::Incomplete => {}
+            }
+            continue;
+        }
+
+        let line = raw.trim();
+        let Some(declaration) = parse_exported_ts_declaration(line) else {
+            continue;
+        };
+        let Some(name) = declaration.name else {
+            continue;
+        };
+        let kind = match declaration.declaration_kind {
+            TsDeclarationKind::Interface | TsDeclarationKind::Class => {
+                TsDeclarationShapeKind::Header
+            }
+            TsDeclarationKind::TypeAlias => TsDeclarationShapeKind::Statement,
+            TsDeclarationKind::Const if !name.ends_with("ApiFactory") => {
+                TsDeclarationShapeKind::ConstStatement
+            }
+            TsDeclarationKind::Enum => TsDeclarationShapeKind::Enum,
+            TsDeclarationKind::Const | TsDeclarationKind::Other => continue,
+        };
+        let mut state = TsDeclarationShapeState {
+            symbol: declaration.export_name.to_string(),
+            kind,
+            code: String::new(),
+            structure: String::new(),
+        };
+        append_ts_declaration_shape_line(&mut state, raw, structural_raw);
+        match finish_ts_declaration_shape(&state) {
+            TsDeclarationShapeProgress::Complete(shape) => {
+                add_ts_declaration_shape(&mut declarations, &state.symbol, shape);
+            }
+            TsDeclarationShapeProgress::Ignored => {}
+            TsDeclarationShapeProgress::Incomplete => pending = Some(state),
+        }
+    }
+    declarations
+}
+
+fn append_ts_declaration_shape_line(
+    state: &mut TsDeclarationShapeState,
+    code: &str,
+    structure: &str,
+) {
+    if !state.code.is_empty() {
+        state.code.push('\n');
+        state.structure.push('\n');
+    }
+    state.code.push_str(code);
+    state.structure.push_str(structure);
+}
+
+fn finish_ts_declaration_shape(state: &TsDeclarationShapeState) -> TsDeclarationShapeProgress {
+    let end = match state.kind {
+        TsDeclarationShapeKind::Header => ts_top_level_body_open(&state.structure),
+        TsDeclarationShapeKind::Statement | TsDeclarationShapeKind::ConstStatement => {
+            ts_top_level_semicolon(&state.structure)
+        }
+        TsDeclarationShapeKind::Enum => ts_top_level_body_open(&state.structure)
+            .and_then(|open| ts_matching_brace_end(&state.structure, open))
+            .map(|end| end + 1),
+    };
+    let Some(end) = end else {
+        return TsDeclarationShapeProgress::Incomplete;
+    };
+    let prefix = corresponding_ts_code_prefix(&state.code, &state.structure, end);
+    let shape = canonical_ts_declaration(&prefix);
+    if matches!(state.kind, TsDeclarationShapeKind::ConstStatement) && !shape.contains("as const") {
+        return TsDeclarationShapeProgress::Ignored;
+    }
+    if shape.is_empty() {
+        TsDeclarationShapeProgress::Ignored
+    } else {
+        TsDeclarationShapeProgress::Complete(shape)
+    }
+}
+
+fn ts_top_level_body_open(value: &str) -> Option<usize> {
+    let mut angle_depth = 0_u32;
+    let mut square_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '[' => square_depth += 1,
+            ']' if square_depth > 0 => square_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '{' if angle_depth == 0 && square_depth == 0 && paren_depth == 0 => {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn ts_top_level_semicolon(value: &str) -> Option<usize> {
+    let mut angle_depth = 0_u32;
+    let mut square_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    for (idx, ch) in value.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '[' => square_depth += 1,
+            ']' if square_depth > 0 => square_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '{' => brace_depth += 1,
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            ';' if angle_depth == 0
+                && square_depth == 0
+                && paren_depth == 0
+                && brace_depth == 0 =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn ts_matching_brace_end(value: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    for (idx, ch) in value.char_indices().filter(|(idx, _)| *idx >= open) {
+        if ch == '{' {
+            depth += 1;
+        } else if ch == '}' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn corresponding_ts_code_prefix(code: &str, structure: &str, structural_end: usize) -> String {
+    let char_count = structure[..structural_end].chars().count();
+    code.chars().take(char_count).collect()
+}
+
+fn canonical_ts_declaration(declaration: &str) -> String {
+    let Some(mut rest) = strip_ts_keyword(declaration, "export") else {
+        return String::new();
+    };
+    while let Some(next) =
+        strip_ts_keyword(rest, "default").or_else(|| strip_ts_keyword(rest, "declare"))
+    {
+        rest = next;
+    }
+    normalize_ts_tokens(rest.trim().trim_end_matches(';').trim())
 }
 
 fn collect_interface_property(
@@ -1717,6 +1977,17 @@ enum TsSanitizeState {
     Regex,
 }
 
+impl TsSanitizeState {
+    fn quote_delimiter(self) -> Option<char> {
+        match self {
+            Self::SingleQuote => Some('\''),
+            Self::DoubleQuote => Some('"'),
+            Self::Template => Some('`'),
+            Self::Code | Self::LineComment | Self::BlockComment | Self::Regex => None,
+        }
+    }
+}
+
 fn sanitize_typescript(text: &str, erase_strings: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -1776,14 +2047,8 @@ fn sanitize_typescript(text: &str, erase_strings: bool) -> String {
             TsSanitizeState::SingleQuote
             | TsSanitizeState::DoubleQuote
             | TsSanitizeState::Template => {
-                let closing = match state {
-                    TsSanitizeState::SingleQuote => '\'',
-                    TsSanitizeState::DoubleQuote => '"',
-                    TsSanitizeState::Template => '`',
-                    TsSanitizeState::Code
-                    | TsSanitizeState::LineComment
-                    | TsSanitizeState::BlockComment
-                    | TsSanitizeState::Regex => unreachable!(),
+                let Some(closing) = state.quote_delimiter() else {
+                    continue;
                 };
                 out.push(if erase_strings && ch != '\n' { ' ' } else { ch });
                 if ch == '\\' {
@@ -1894,7 +2159,7 @@ fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>
     let (declaration_kind, export_kind, after_kind) =
         if let Some(after_const) = strip_ts_keyword(rest, "const") {
             if let Some(after_enum) = strip_ts_keyword(after_const, "enum") {
-                (TsDeclarationKind::Other, TsExportKind::Both, after_enum)
+                (TsDeclarationKind::Enum, TsExportKind::Both, after_enum)
             } else {
                 (TsDeclarationKind::Const, TsExportKind::Value, after_const)
             }
@@ -1905,7 +2170,7 @@ fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>
         } else if let Some(after) = strip_ts_keyword(rest, "class") {
             (TsDeclarationKind::Class, TsExportKind::Both, after)
         } else if let Some(after) = strip_ts_keyword(rest, "enum") {
-            (TsDeclarationKind::Other, TsExportKind::Both, after)
+            (TsDeclarationKind::Enum, TsExportKind::Both, after)
         } else if let Some(after) =
             strip_ts_keyword(rest, "namespace").or_else(|| strip_ts_keyword(rest, "module"))
         {
@@ -2477,6 +2742,25 @@ fn merge_interface_properties(
 ) {
     for (interface, fields) in properties {
         into.entry(interface).or_default().extend(fields);
+    }
+}
+
+fn merge_ts_declaration_shapes(
+    into: &mut BTreeMap<String, Vec<String>>,
+    declarations: BTreeMap<String, Vec<String>>,
+) {
+    for (symbol, shapes) in declarations {
+        for shape in shapes {
+            add_ts_declaration_shape(into, &symbol, shape);
+        }
+    }
+}
+
+fn add_ts_declaration_shape(into: &mut BTreeMap<String, Vec<String>>, symbol: &str, shape: String) {
+    let shapes = into.entry(symbol.to_string()).or_default();
+    if !shapes.contains(&shape) {
+        shapes.push(shape);
+        shapes.sort();
     }
 }
 
@@ -4655,6 +4939,27 @@ fn interface_type_changes(changes: &[TsInterfacePropertyChange]) -> Vec<TsInterf
         .collect()
 }
 
+fn ts_type_declaration_changes(
+    old: &BTreeMap<String, Vec<String>>,
+    new: &BTreeMap<String, Vec<String>>,
+) -> Vec<TsTypeDeclarationChange> {
+    old.iter()
+        .filter_map(|(symbol, old_shapes)| match new.get(symbol) {
+            Some(new_shapes) if old_shapes != new_shapes => Some(TsTypeDeclarationChange {
+                symbol: symbol.clone(),
+                old: old_shapes.clone(),
+                new: new_shapes.clone(),
+            }),
+            None => Some(TsTypeDeclarationChange {
+                symbol: symbol.clone(),
+                old: old_shapes.clone(),
+                new: Vec::new(),
+            }),
+            Some(_) => None,
+        })
+        .collect()
+}
+
 fn non_null_ts_type(ty: &str) -> String {
     ty.split('|')
         .map(str::trim)
@@ -4934,6 +5239,80 @@ export default class InternalDefault {}
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_diff_catches_alias_heritage_and_enum_like_value_changes() {
+        let old = temp_dir("ts-declarations-old");
+        let new = temp_dir("ts-declarations-new");
+        std::fs::write(
+            old.join("index.ts"),
+            r#"export type BookFormat =
+  "paperback"
+  | "hardcover";
+export interface Book<T extends string = string> extends Audited<T> {
+  title: string;
+}
+export const Availability = {
+  Available: "available",
+  Gone: "gone",
+} as const;
+export type Availability = typeof Availability[keyof typeof Availability];
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            r#"export type BookFormat = "paperback" | number;
+export interface Book<T extends string = string> extends Entity<T> {
+  title: string;
+}
+export const Availability = {
+  Available: "available",
+} as const;
+export type Availability = typeof Availability[keyof typeof Availability];
+"#,
+        )
+        .unwrap();
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert_eq!(
+            diff.type_declaration_changes
+                .iter()
+                .map(|change| change.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Availability", "Book", "BookFormat"]
+        );
+        assert!(diff.is_breaking());
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_declaration_shapes_ignore_formatting_only_changes() {
+        let old = temp_dir("ts-declarations-format-old");
+        let new = temp_dir("ts-declarations-format-new");
+        std::fs::write(
+            old.join("index.ts"),
+            "export type BookFormat =\n  \"paperback\"\n  | \"hardcover\";\nexport interface Book\n  extends Audited<BookFormat>\n{\n  title: string;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            "export type BookFormat = \"paperback\" | \"hardcover\";\nexport interface Book extends Audited<BookFormat> { title: string; }\n",
+        )
+        .unwrap();
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert!(
+            diff.type_declaration_changes.is_empty(),
+            "formatting-only declarations should compare equal: {:?}",
+            diff.type_declaration_changes
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
     }
 
     #[test]
@@ -5634,6 +6013,10 @@ export default class InternalDefault {}
                     },
                 )]),
             )]),
+            type_declarations: BTreeMap::from([(
+                "BookFormat".to_string(),
+                vec!["type BookFormat=\"paperback\" | \"hardcover\"".to_string()],
+            )]),
             operation_return_types: BTreeMap::from([(
                 "DefaultApi.createBook".to_string(),
                 "Promise<AxiosResponse<Book>>".to_string(),
@@ -5662,6 +6045,10 @@ export default class InternalDefault {}
                     },
                 )]),
             )]),
+            type_declarations: BTreeMap::from([(
+                "BookFormat".to_string(),
+                vec!["type BookFormat=number".to_string()],
+            )]),
             operation_return_types: BTreeMap::from([(
                 "DefaultApi.createBook".to_string(),
                 "Promise<Book>".to_string(),
@@ -5680,6 +6067,7 @@ export default class InternalDefault {}
                 "StaleRequest".to_string(),
             ],
             allow_interface_property_changes: vec!["Book.title".to_string()],
+            allow_type_declaration_changes: vec!["BookFormat".to_string()],
             allow_operation_return_type_changes: vec!["DefaultApi.createBook".to_string()],
             allow_operation_signature_changes: vec!["DefaultApi.createBook".to_string()],
             allow_export_kind_mismatches: vec!["Format".to_string()],

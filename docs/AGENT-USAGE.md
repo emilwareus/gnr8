@@ -166,6 +166,7 @@ allow_missing_operation_methods = []
 allow_missing_request_aliases = []
 allow_missing_interface_properties = []  # "Interface.property"
 allow_interface_property_changes = []    # "Interface.property"
+allow_type_declaration_changes = []       # type alias, heritage, or enum symbol
 allow_operation_return_type_changes = []
 allow_operation_signature_changes = []
 allow_export_kind_mismatches = []

@@ -630,6 +630,19 @@ fn print_typescript_compat_diff(diff: &gnr8::sdk::compat::TypeScriptSurfaceDiff)
             change.new.ty
         );
     }
+    for change in &diff.type_declaration_changes {
+        let new = if change.new.is_empty() {
+            "<missing>".to_string()
+        } else {
+            change.new.join(" + ")
+        };
+        println!(
+            "  type declaration changed: {} ({} -> {})",
+            change.symbol,
+            change.old.join(" + "),
+            new
+        );
+    }
     for change in &diff.operation_return_type_changes {
         println!(
             "  operation return changed: {} ({} -> {})",
