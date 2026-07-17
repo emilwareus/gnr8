@@ -951,11 +951,17 @@ pub fn extract_python_surface(dir: impl AsRef<Path>) -> Result<PythonSurface, Co
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
         if rel.file_name().and_then(|name| name.to_str()) == Some("__init__.py") {
-            public_exports.extend(parse_python_package_exports(rel, &text));
+            public_exports.extend(parse_python_package_exports(rel, &text)?);
         }
         let parsed = parse_python_file(&text, is_python_model_file(rel));
         exception_classes.extend(parsed.exceptions);
-        aliases.extend(parsed.aliases);
+        for (name, target) in parsed.aliases {
+            if aliases.insert(name.clone(), target).is_some() {
+                return Err(CoreError::Workspace {
+                    message: format!("Python SDK surface contains duplicate public alias '{name}'"),
+                });
+            }
+        }
         for (name, model) in parsed.models {
             if models.insert(name.clone(), model).is_some() {
                 return Err(CoreError::Workspace {
@@ -1976,8 +1982,10 @@ struct ParsedPythonFile {
 struct PythonClassState {
     name: String,
     indent: usize,
+    member_indent: Option<usize>,
     is_model: bool,
     is_exception: bool,
+    typed_dict_total: Option<bool>,
     model: PythonModelSurface,
 }
 
@@ -1985,65 +1993,85 @@ fn parse_python_file(text: &str, model_file: bool) -> ParsedPythonFile {
     let lines: Vec<&str> = text.lines().collect();
     let mut parsed = ParsedPythonFile::default();
     let mut current: Option<PythonClassState> = None;
+    let mut pending_decorators = Vec::new();
     let mut index = 0;
     while index < lines.len() {
         let raw = lines[index];
-        let trimmed = raw.trim();
+        let trimmed = strip_python_comment(raw).trim();
         let indent = python_indent(raw);
 
         if let Some(state) = current.as_ref() {
-            if !trimmed.is_empty()
-                && !trimmed.starts_with('#')
-                && indent <= state.indent
-                && !trimmed.starts_with('@')
-            {
+            if !trimmed.is_empty() && indent <= state.indent {
                 finish_python_class(&mut parsed, current.take());
                 continue;
             }
         }
 
         if current.is_none() && indent == 0 {
-            if let Some((name, bases)) = python_class_decl(trimmed) {
-                if !name.starts_with('_') {
-                    let is_exception = python_exception_bases(&bases);
-                    current = Some(PythonClassState {
-                        name,
-                        indent,
-                        is_model: model_file && !is_exception,
-                        is_exception,
-                        model: PythonModelSurface::default(),
-                    });
-                }
+            if trimmed.starts_with('@') {
+                pending_decorators.push(trimmed.to_string());
                 index += 1;
                 continue;
             }
-            if model_file {
-                if let Some((alias, target)) = python_type_alias(trimmed) {
-                    parsed.aliases.insert(alias, target);
+            if trimmed.starts_with("class ") {
+                let (signature, last) = collect_python_class_signature(&lines, index);
+                if let Some((name, bases)) = python_class_decl(&signature) {
+                    if !name.starts_with('_') {
+                        current = Some(start_python_class(
+                            name,
+                            &bases,
+                            indent,
+                            model_file,
+                            &pending_decorators,
+                        ));
+                    }
+                    pending_decorators.clear();
+                    index = last + 1;
+                    continue;
                 }
+            }
+            if !trimmed.is_empty() {
+                pending_decorators.clear();
+            }
+            if let Some((alias, target)) = python_type_alias(trimmed) {
+                parsed.aliases.insert(alias, target);
             }
         }
 
         if let Some(state) = current.as_mut() {
-            if indent == state.indent + 4 {
+            if trimmed.is_empty() || indent <= state.indent {
+                index += 1;
+                continue;
+            }
+            let member_indent = *state.member_indent.get_or_insert(indent);
+            if indent == member_indent {
                 if python_function_start(trimmed).is_some() {
                     let (signature, last) = collect_python_function_signature(&lines, index);
                     if let Some(method) = python_function_start(signature.trim()) {
                         match method.as_str() {
-                            "__init__" if state.is_model => {
+                            "__init__" => {
                                 state.model.constructor =
                                     Some(normalize_python_constructor(&signature));
                             }
-                            "from_dict" if state.is_model => state.model.has_from_dict = true,
-                            "to_dict" if state.is_model => state.model.has_to_dict = true,
+                            "from_dict" => state.model.has_from_dict = true,
+                            "to_dict" => state.model.has_to_dict = true,
                             _ => {}
                         }
                     }
                     index = last + 1;
                     continue;
                 }
-                if state.is_model {
-                    if let Some((field_name, field)) = parse_python_model_field(trimmed) {
+                if python_top_level_delimiter(trimmed, ':').is_some() {
+                    let (declaration, last) = collect_python_field_declaration(&lines, index);
+                    if let Some((field_name, mut field)) = parse_python_model_field(&declaration) {
+                        if !state.is_exception {
+                            state.is_model = true;
+                        }
+                        if state.typed_dict_total == Some(false)
+                            && python_outer_type_name(&field.ty) != Some("Required")
+                        {
+                            field.required = false;
+                        }
                         if let Some(alias) = &field.alias {
                             parsed
                                 .aliases
@@ -2051,6 +2079,8 @@ fn parse_python_file(text: &str, model_file: bool) -> ParsedPythonFile {
                         }
                         state.model.fields.insert(field_name, field);
                     }
+                    index = last + 1;
+                    continue;
                 }
             }
         }
@@ -2060,6 +2090,107 @@ fn parse_python_file(text: &str, model_file: bool) -> ParsedPythonFile {
     parsed.exceptions.sort();
     parsed.exceptions.dedup();
     parsed
+}
+
+fn start_python_class(
+    name: String,
+    bases: &str,
+    indent: usize,
+    model_file: bool,
+    decorators: &[String],
+) -> PythonClassState {
+    let is_exception = python_exception_bases(bases);
+    PythonClassState {
+        name,
+        indent,
+        member_indent: None,
+        is_model: !is_exception
+            && (model_file || python_model_bases(bases) || python_model_decorators(decorators)),
+        is_exception,
+        typed_dict_total: python_typed_dict_total(bases),
+        model: PythonModelSurface::default(),
+    }
+}
+
+fn collect_python_class_signature(lines: &[&str], start: usize) -> (String, usize) {
+    let mut signature = String::new();
+    let mut index = start;
+    while index < lines.len() {
+        if !signature.is_empty() {
+            signature.push(' ');
+        }
+        signature.push_str(strip_python_comment(lines[index]).trim());
+        if python_top_level_delimiter(&signature, ':').is_some() {
+            break;
+        }
+        index += 1;
+    }
+    (signature, index.min(lines.len().saturating_sub(1)))
+}
+
+fn collect_python_field_declaration(lines: &[&str], start: usize) -> (String, usize) {
+    let mut declaration = strip_python_comment(lines[start]).trim().to_string();
+    let mut index = start;
+    while python_has_unclosed_delimiters(&declaration) && index + 1 < lines.len() {
+        index += 1;
+        declaration.push(' ');
+        declaration.push_str(strip_python_comment(lines[index]).trim());
+    }
+    (declaration, index)
+}
+
+fn python_has_unclosed_delimiters(value: &str) -> bool {
+    let mut round = 0_u32;
+    let mut square = 0_u32;
+    let mut curly = 0_u32;
+    let mut quote = None;
+    let mut escape = false;
+    for ch in value.chars() {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => round += 1,
+            ')' => round = round.saturating_sub(1),
+            '[' => square += 1,
+            ']' => square = square.saturating_sub(1),
+            '{' => curly += 1,
+            '}' => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    round > 0 || square > 0 || curly > 0
+}
+
+fn strip_python_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escape = false;
+    for (index, ch) in line.char_indices() {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '#' => return &line[..index],
+            _ => {}
+        }
+    }
+    line
 }
 
 fn finish_python_class(parsed: &mut ParsedPythonFile, state: Option<PythonClassState>) {
@@ -2084,19 +2215,85 @@ fn python_indent(line: &str) -> usize {
 fn python_class_decl(line: &str) -> Option<(String, String)> {
     let rest = line.strip_prefix("class ")?;
     let name = ident_prefix(rest)?.to_string();
-    let after = rest[name.len()..].trim_start();
-    let bases = if let Some(after) = after.strip_prefix('(') {
-        after.split_once(')')?.0.to_string()
+    let mut after = rest[name.len()..].trim_start();
+    if after.starts_with('[') {
+        let close = matching_python_delimiter(after, 0, '[', ']')?;
+        after = after[close + 1..].trim_start();
+    }
+    let bases = if after.starts_with('(') {
+        let close = matching_python_delimiter(after, 0, '(', ')')?;
+        let bases = after[1..close].to_string();
+        after = after[close + 1..].trim_start();
+        bases
     } else {
         String::new()
     };
-    line.ends_with(':').then_some((name, bases))
+    (after == ":").then_some((name, bases))
 }
 
 fn python_exception_bases(bases: &str) -> bool {
     split_python_top_level(bases, ',').iter().any(|base| {
         let name = base.trim().rsplit('.').next().unwrap_or_default().trim();
         name == "BaseException" || name.ends_with("Exception") || name.ends_with("Error")
+    })
+}
+
+fn python_model_bases(bases: &str) -> bool {
+    split_python_top_level(bases, ',').iter().any(|base| {
+        let base = base.trim();
+        if base.contains('=') {
+            return false;
+        }
+        let name = base
+            .split_once('[')
+            .map_or(base, |(name, _)| name)
+            .rsplit('.')
+            .next()
+            .unwrap_or_default();
+        matches!(
+            name,
+            "BaseModel" | "BaseSettings" | "RootModel" | "TypedDict"
+        )
+    })
+}
+
+fn python_typed_dict_total(bases: &str) -> Option<bool> {
+    let parts = split_python_top_level(bases, ',');
+    let typed_dict = parts.iter().any(|base| {
+        let base = base.trim();
+        let name = base
+            .split_once('[')
+            .map_or(base, |(name, _)| name)
+            .rsplit('.')
+            .next()
+            .unwrap_or_default();
+        name == "TypedDict"
+    });
+    typed_dict.then(|| {
+        parts
+            .iter()
+            .find_map(|part| {
+                let equal = python_top_level_delimiter(part, '=')?;
+                (part[..equal].trim() == "total")
+                    .then(|| !matches!(part[equal + 1..].trim(), "False" | "false" | "0"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn python_model_decorators(decorators: &[String]) -> bool {
+    decorators.iter().any(|decorator| {
+        let name = decorator
+            .trim_start_matches('@')
+            .split_once('(')
+            .map_or_else(|| decorator.trim_start_matches('@'), |(name, _)| name)
+            .trim();
+        let leaf = name.rsplit('.').next().unwrap_or_default();
+        leaf == "dataclass"
+            || leaf == "define"
+            || leaf == "frozen"
+            || name == "attr.s"
+            || name == "attrs.mutable"
     })
 }
 
@@ -2121,7 +2318,7 @@ fn collect_python_function_signature(lines: &[&str], start: usize) -> (String, u
         if !signature.is_empty() {
             signature.push(' ');
         }
-        let part = lines[index].trim();
+        let part = strip_python_comment(lines[index]).trim();
         signature.push_str(part);
         for ch in part.chars() {
             if let Some(active) = quote {
@@ -2170,8 +2367,14 @@ fn parse_python_model_field(line: &str) -> Option<(String, PythonFieldSurface)> 
     if ty.starts_with("ClassVar[") || ty == "ClassVar" {
         return None;
     }
-    let required = default.is_none_or(python_default_is_required);
-    let alias = default.and_then(python_field_alias);
+    let required = if python_outer_type_name(&ty) == Some("NotRequired") {
+        false
+    } else {
+        default.is_none_or(python_default_is_required)
+    };
+    let alias = default
+        .and_then(python_field_alias)
+        .or_else(|| python_annotation_alias(annotation));
     Some((
         name.to_string(),
         PythonFieldSurface {
@@ -2189,54 +2392,117 @@ fn python_default_is_required(default: &str) -> bool {
         return true;
     }
     if let Some(args) = python_call_args(default, "Field") {
-        let args = args.trim();
-        if args.is_empty() || args == "..." || args.starts_with("..., ") {
-            return true;
+        if let Some(factory) = python_keyword_argument(args, "default_factory") {
+            return factory.trim() == "None" || python_missing_default(factory);
         }
-        if args.starts_with("default=")
-            || args.contains(", default=")
-            || args.starts_with("default_factory=")
-            || args.contains(", default_factory=")
-        {
-            return false;
+        if let Some(value) = python_keyword_argument(args, "default") {
+            return python_missing_default(value);
         }
-        let first = split_python_top_level(args, ',')
-            .first()
-            .map_or("", |value| value.trim());
-        return first.contains('=');
+        return python_first_positional_argument(args).is_none_or(python_missing_default);
     }
-    if let Some(args) = python_call_args(default, "field") {
-        return !(args.contains("default=") || args.contains("default_factory="));
+    for call in ["field", "ib", "attrib"] {
+        let Some(args) = python_call_args(default, call) else {
+            continue;
+        };
+        if let Some(factory) = python_keyword_argument(args, "default_factory")
+            .or_else(|| python_keyword_argument(args, "factory"))
+        {
+            return factory.trim() == "None" || python_missing_default(factory);
+        }
+        if let Some(value) = python_keyword_argument(args, "default") {
+            return python_missing_default(value);
+        }
+        return python_first_positional_argument(args).is_none_or(python_missing_default);
     }
     false
 }
 
 fn python_call_args<'a>(value: &'a str, name: &str) -> Option<&'a str> {
-    let value = value.strip_prefix(name)?.trim_start();
-    let value = value.strip_prefix('(')?;
-    value.rsplit_once(')').map(|(args, _)| args)
+    let value = value.trim();
+    let open = value.find('(')?;
+    let callable = value[..open].trim();
+    if callable.rsplit('.').next()? != name {
+        return None;
+    }
+    let close = matching_python_delimiter(value, open, '(', ')')?;
+    value[close + 1..]
+        .trim()
+        .is_empty()
+        .then_some(&value[open + 1..close])
+}
+
+fn python_missing_default(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "..." | "MISSING" | "dataclasses.MISSING" | "PydanticUndefined" | "Undefined"
+    )
+}
+
+fn python_first_positional_argument(args: &str) -> Option<&str> {
+    split_python_top_level(args, ',')
+        .into_iter()
+        .find_map(|part| {
+            let part = part.trim();
+            (!part.is_empty() && python_top_level_delimiter(part, '=').is_none()).then_some(part)
+        })
+}
+
+fn python_keyword_argument<'a>(args: &'a str, key: &str) -> Option<&'a str> {
+    split_python_top_level(args, ',')
+        .into_iter()
+        .find_map(|part| {
+            let equal = python_top_level_delimiter(part, '=')?;
+            (part[..equal].trim() == key).then(|| part[equal + 1..].trim())
+        })
 }
 
 fn python_field_alias(default: &str) -> Option<String> {
-    for key in ["alias", "serialization_alias"] {
-        if let Some(value) = python_keyword_string(default, key) {
-            return Some(value);
+    for call in ["Field", "field"] {
+        let Some(args) = python_call_args(default, call) else {
+            continue;
+        };
+        for key in ["alias", "validation_alias", "serialization_alias"] {
+            if let Some(value) = python_keyword_string(args, key) {
+                return Some(value);
+            }
         }
     }
     None
 }
 
-fn python_keyword_string(value: &str, key: &str) -> Option<String> {
-    let needle = format!("{key}=");
-    let start = value.find(&needle)? + needle.len();
-    let rest = value[start..].trim_start();
+fn python_annotation_alias(annotation: &str) -> Option<String> {
+    let compact = python_compact_type(annotation);
+    let (name, inner) = python_outer_generic(&compact)?;
+    if canonical_python_type_head(name) != "Annotated" {
+        return None;
+    }
+    split_python_top_level(inner, ',')
+        .into_iter()
+        .skip(1)
+        .find_map(python_field_alias)
+}
+
+fn python_keyword_string(args: &str, key: &str) -> Option<String> {
+    let rest = python_keyword_argument(args, key)?;
     let quote = rest.chars().next()?;
     if quote != '\'' && quote != '"' {
         return None;
     }
     let after = &rest[quote.len_utf8()..];
-    let end = after.find(quote)?;
-    Some(after[..end].to_string())
+    let mut escaped = false;
+    for (index, ch) in after.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return after[index + quote.len_utf8()..]
+                .trim()
+                .is_empty()
+                .then(|| after[..index].to_string());
+        }
+    }
+    None
 }
 
 fn normalize_python_constructor(signature: &str) -> String {
@@ -2249,7 +2515,11 @@ fn normalize_python_constructor(signature: &str) -> String {
     let mut parameters = Vec::new();
     for parameter in split_python_top_level(&signature[open + 1..close], ',') {
         let parameter = parameter.trim();
-        if parameter.is_empty() || parameter == "self" || parameter == "/" || parameter == "*" {
+        if parameter.is_empty() || parameter == "self" {
+            continue;
+        }
+        if parameter == "/" || parameter == "*" {
+            parameters.push(parameter.to_string());
             continue;
         }
         parameters.push(normalize_python_parameter(parameter));
@@ -2277,7 +2547,7 @@ fn normalize_python_parameter(parameter: &str) -> String {
         },
     );
     default.map_or(normalized.clone(), |default| {
-        format!("{normalized} = {}", collapse_python_whitespace(default))
+        format!("{normalized} = {}", python_compact_type(default))
     })
 }
 
@@ -2288,30 +2558,65 @@ fn canonical_python_type(annotation: &str) -> String {
     {
         ty = &ty[1..ty.len() - 1];
     }
-    let compact = python_compact_type(ty)
-        .replace("typing.", "")
-        .replace("List[", "list[")
-        .replace("Dict[", "dict[")
-        .replace("Tuple[", "tuple[")
-        .replace("Set[", "set[")
-        .replace("NoneType", "None");
-    if compact.starts_with("Optional[") && compact.ends_with(']') {
-        let inner = &compact[9..compact.len() - 1];
-        return canonical_python_union([canonical_python_type(inner), "None".to_string()]);
-    }
-    if compact.starts_with("Union[") && compact.ends_with(']') {
-        let inner = &compact[6..compact.len() - 1];
-        return canonical_python_union(
-            split_python_top_level(inner, ',')
-                .into_iter()
-                .map(canonical_python_type),
-        );
-    }
+    let compact = python_compact_type(ty);
     let union = split_python_top_level(&compact, '|');
     if union.len() > 1 {
         return canonical_python_union(union.into_iter().map(canonical_python_type));
     }
-    compact
+    if let Some((head, inner)) = python_outer_generic(&compact) {
+        let head = canonical_python_type_head(head);
+        if head == "Optional" {
+            return canonical_python_union([canonical_python_type(inner), "None".to_string()]);
+        }
+        if head == "Union" {
+            return canonical_python_union(
+                split_python_top_level(inner, ',')
+                    .into_iter()
+                    .map(canonical_python_type),
+            );
+        }
+        if head == "Literal" {
+            return format!("Literal[{}]", python_compact_type(inner));
+        }
+        let parts = split_python_top_level(inner, ',');
+        let arguments = parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| {
+                if head == "Annotated" && index > 0 {
+                    python_compact_type(part)
+                } else {
+                    canonical_python_type(part)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("{head}[{arguments}]");
+    }
+    canonical_python_type_head(&compact)
+}
+
+fn python_outer_generic(value: &str) -> Option<(&str, &str)> {
+    let open = value.find('[')?;
+    let close = matching_python_delimiter(value, open, '[', ']')?;
+    (close + 1 == value.len()).then_some((&value[..open], &value[open + 1..close]))
+}
+
+fn canonical_python_type_head(head: &str) -> String {
+    let bare = head
+        .strip_prefix("typing.")
+        .or_else(|| head.strip_prefix("typing_extensions."))
+        .unwrap_or(head);
+    match bare {
+        "List" => "list".to_string(),
+        "Dict" => "dict".to_string(),
+        "Tuple" => "tuple".to_string(),
+        "Set" => "set".to_string(),
+        "FrozenSet" => "frozenset".to_string(),
+        "Type" => "type".to_string(),
+        "NoneType" | "types.NoneType" => "None".to_string(),
+        _ => bare.to_string(),
+    }
 }
 
 fn canonical_python_union(parts: impl IntoIterator<Item = String>) -> String {
@@ -2322,9 +2627,25 @@ fn canonical_python_union(parts: impl IntoIterator<Item = String>) -> String {
 }
 
 fn python_type_is_nullable(ty: &str) -> bool {
-    split_python_top_level(ty, '|')
+    if split_python_top_level(ty, '|')
         .iter()
         .any(|part| part.trim() == "None")
+    {
+        return true;
+    }
+    let Some((head, inner)) = python_outer_generic(ty) else {
+        return false;
+    };
+    matches!(
+        canonical_python_type_head(head).as_str(),
+        "Annotated" | "Required" | "NotRequired"
+    ) && split_python_top_level(inner, ',')
+        .first()
+        .is_some_and(|inner| python_type_is_nullable(inner))
+}
+
+fn python_outer_type_name(ty: &str) -> Option<&str> {
+    python_outer_generic(ty).map(|(head, _)| head)
 }
 
 fn python_compact_type(value: &str) -> String {
@@ -2442,39 +2763,88 @@ fn collapse_python_whitespace(value: &str) -> String {
 
 fn python_type_alias(line: &str) -> Option<(String, String)> {
     let equal = python_top_level_delimiter(line, '=')?;
-    let left = line[..equal].trim();
+    let mut left = line[..equal].trim();
     let target = line[equal + 1..].trim();
+    let pep_695 = left.strip_prefix("type ").is_some();
+    if pep_695 {
+        left = left.strip_prefix("type ")?.trim_start();
+    }
     let (name, explicit) = left
         .split_once(':')
         .map_or((left, false), |(name, annotation)| {
             (name.trim(), annotation.contains("TypeAlias"))
         });
-    if name.starts_with('_') || ident_prefix(name) != Some(name) {
+    let alias_name = ident_prefix(name)?;
+    let remainder = name[alias_name.len()..].trim();
+    let valid_type_parameters = remainder.starts_with('[')
+        && matching_python_delimiter(remainder, 0, '[', ']') == Some(remainder.len() - 1);
+    if alias_name.starts_with('_') || (!remainder.is_empty() && !valid_type_parameters) {
         return None;
     }
-    let public_alias = name.chars().next().is_some_and(char::is_uppercase);
-    let target_is_type = target
-        .trim_start()
-        .chars()
-        .next()
-        .is_some_and(char::is_uppercase);
-    if !explicit && (!public_alias || !target_is_type) {
+    let public_alias = alias_name.chars().next().is_some_and(char::is_uppercase);
+    if !pep_695 && !explicit && (!public_alias || !python_alias_target_is_type(target)) {
         return None;
     }
-    Some((name.to_string(), canonical_python_type(target)))
+    let mut canonical = canonical_python_type(target);
+    if pep_695 && valid_type_parameters {
+        canonical = format!("{}=>{canonical}", python_compact_type(remainder));
+    }
+    Some((alias_name.to_string(), canonical))
 }
 
-fn parse_python_package_exports(rel: &Path, text: &str) -> Vec<String> {
+fn python_alias_target_is_type(target: &str) -> bool {
+    let compact = python_compact_type(target);
+    if compact.is_empty()
+        || compact.starts_with(['\'', '"', '{'])
+        || compact.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return false;
+    }
+    if let Some(open) = compact.find('(') {
+        let bracket = compact.find('[').unwrap_or(usize::MAX);
+        if open < bracket {
+            return false;
+        }
+    }
+    let head = compact
+        .split(['[', '|', ','])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let leaf = head.rsplit('.').next().unwrap_or(head);
+    leaf.chars().next().is_some_and(char::is_uppercase)
+        || matches!(
+            leaf,
+            "str"
+                | "int"
+                | "float"
+                | "bool"
+                | "bytes"
+                | "list"
+                | "dict"
+                | "tuple"
+                | "set"
+                | "frozenset"
+                | "type"
+                | "None"
+        )
+}
+
+fn parse_python_package_exports(rel: &Path, text: &str) -> Result<Vec<String>, CoreError> {
     let package = rel
         .parent()
         .map(python_path_components)
         .unwrap_or_default()
         .join(".");
-    let mut names = parse_python_all(text);
-    if names.is_empty() {
-        names = parse_python_import_exports(text);
-    }
-    names
+    let names = parse_python_all(text)
+        .map_err(|message| CoreError::Workspace {
+            message: format!(
+                "failed to extract Python package exports from {}: {message}",
+                rel.display()
+            ),
+        })?
+        .unwrap_or_else(|| parse_python_import_exports(text));
+    Ok(names
         .into_iter()
         .filter(|name| !name.starts_with('_'))
         .map(|name| {
@@ -2484,55 +2854,97 @@ fn parse_python_package_exports(rel: &Path, text: &str) -> Vec<String> {
                 format!("{package}.{name}")
             }
         })
-        .collect()
+        .collect())
 }
 
-fn parse_python_all(text: &str) -> Vec<String> {
-    let Some(start) = text.find("__all__") else {
-        return Vec::new();
-    };
-    let Some(equal) = text[start..].find('=') else {
-        return Vec::new();
-    };
-    let value = &text[start + equal + 1..];
-    let Some((open, open_char, close_char)) =
-        value.char_indices().find_map(|(index, ch)| match ch {
-            '[' => Some((index, '[', ']')),
-            '(' => Some((index, '(', ')')),
-            _ => None,
-        })
-    else {
-        return Vec::new();
-    };
-    let Some(close) = matching_python_delimiter(value, open, open_char, close_char) else {
-        return Vec::new();
-    };
-    python_quoted_values(&value[open + open_char.len_utf8()..close])
+fn parse_python_all(text: &str) -> Result<Option<Vec<String>>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut names = Vec::new();
+    let mut declared = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let raw = lines[index];
+        let line = strip_python_comment(raw).trim();
+        if python_indent(raw) != 0 || !line.starts_with("__all__") {
+            index += 1;
+            continue;
+        }
+        let Some(equal) = python_top_level_delimiter(line, '=') else {
+            index += 1;
+            continue;
+        };
+        let left = line[..equal].trim_end_matches('+').trim();
+        let declaration = left.split_once(':').map_or(left, |(name, _)| name.trim());
+        if declaration != "__all__" {
+            index += 1;
+            continue;
+        }
+        declared = true;
+        let augmented = line[..equal].trim_end().ends_with('+');
+        if !augmented {
+            names.clear();
+        }
+        let mut value = line[equal + 1..].trim().to_string();
+        while python_has_unclosed_delimiters(&value) && index + 1 < lines.len() {
+            index += 1;
+            value.push(' ');
+            value.push_str(strip_python_comment(lines[index]).trim());
+        }
+        let parsed = parse_python_all_value(&value)
+            .ok_or_else(|| format!("__all__ must be a literal list/tuple (found '{value}')"))?;
+        names.extend(parsed);
+        index += 1;
+    }
+    names.sort();
+    names.dedup();
+    Ok(declared.then_some(names))
 }
 
-fn python_quoted_values(value: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut quote = None;
-    let mut start = 0;
-    let mut escape = false;
-    for (index, ch) in value.char_indices() {
-        if let Some(active) = quote {
-            if escape {
-                escape = false;
-            } else if ch == '\\' {
-                escape = true;
-            } else if ch == active {
-                values.push(value[start..index].to_string());
-                quote = None;
+fn parse_python_all_value(value: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for part in split_python_top_level(value, '+') {
+        let part = part.trim();
+        let open = part.chars().next()?;
+        let close_char = match open {
+            '[' => ']',
+            '(' => ')',
+            _ => return None,
+        };
+        let close = matching_python_delimiter(part, 0, open, close_char)?;
+        if close + close_char.len_utf8() != part.len() {
+            return None;
+        }
+        for item in split_python_top_level(&part[open.len_utf8()..close], ',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
             }
-        } else if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-            start = index + ch.len_utf8();
+            names.push(python_exact_string_literal(item)?);
         }
     }
-    values.sort();
-    values.dedup();
-    values
+    Some(names)
+}
+
+fn python_exact_string_literal(value: &str) -> Option<String> {
+    let quote = value.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let after = &value[quote.len_utf8()..];
+    let mut escaped = false;
+    for (index, ch) in after.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return after[index + quote.len_utf8()..]
+                .trim()
+                .is_empty()
+                .then(|| after[..index].to_string());
+        }
+    }
+    None
 }
 
 fn parse_python_import_exports(text: &str) -> Vec<String> {
@@ -2661,27 +3073,29 @@ fn python_package_entry_points(dir: &Path) -> Result<BTreeMap<String, String>, C
     let mut entries = BTreeMap::new();
     let pyproject = dir.join("pyproject.toml");
     if pyproject.is_file() {
-        let text = read_to_string(pyproject)?;
-        let mut section = String::new();
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.starts_with('[') && line.ends_with(']') {
-                section = line[1..line.len() - 1].trim_matches('"').to_string();
-                continue;
+        let text = read_to_string(&pyproject)?;
+        let document: toml::Value =
+            toml::from_str(&text).map_err(|error| CoreError::Workspace {
+                message: format!(
+                    "failed to parse Python SDK package metadata {}: {error}",
+                    pyproject.display()
+                ),
+            })?;
+        if let Some(project_value) = document.get("project") {
+            let project = python_entry_point_toml_table(project_value, "project")?;
+            for table_name in ["scripts", "gui-scripts"] {
+                if let Some(value) = project.get(table_name) {
+                    let prefix = format!("project.{table_name}");
+                    let table = python_entry_point_toml_table(value, &prefix)?;
+                    collect_python_entry_point_table(&mut entries, &prefix, table)?;
+                }
             }
-            if section == "project.scripts"
-                || section == "project.gui-scripts"
-                || section.starts_with("project.entry-points.")
-            {
-                if let Some((key, value)) = line.split_once('=') {
-                    entries.insert(
-                        format!("{}.{}", section, key.trim().trim_matches('"')),
-                        value
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'')
-                            .to_string(),
-                    );
+            if let Some(value) = project.get("entry-points") {
+                let groups = python_entry_point_toml_table(value, "project.entry-points")?;
+                for (group, value) in groups {
+                    let prefix = format!("project.entry-points.{group}");
+                    let table = python_entry_point_toml_table(value, &prefix)?;
+                    collect_python_entry_point_table(&mut entries, &prefix, table)?;
                 }
             }
         }
@@ -2704,19 +3118,50 @@ fn python_package_entry_points(dir: &Path) -> Result<BTreeMap<String, String>, C
             if !raw.chars().next().is_some_and(char::is_whitespace) {
                 if let Some((name, value)) = line.split_once('=') {
                     group = name.trim().to_string();
-                    if !value.trim().is_empty() {
-                        entries.insert(format!("setup.cfg.{group}"), value.trim().to_string());
+                    let value = value.trim();
+                    if let Some((name, value)) = value.split_once('=') {
+                        entries.insert(
+                            format!("setup.cfg.{group}.{}", name.trim()),
+                            value.trim().to_string(),
+                        );
+                    } else if !value.is_empty() {
+                        entries.insert(format!("setup.cfg.{group}"), value.to_string());
                     }
                 }
-            } else if let Some((name, value)) = line.split_once('=') {
-                entries.insert(
-                    format!("setup.cfg.{group}.{}", name.trim()),
-                    value.trim().to_string(),
-                );
+            } else if !group.is_empty() {
+                if let Some((name, value)) = line.split_once('=') {
+                    entries.insert(
+                        format!("setup.cfg.{group}.{}", name.trim()),
+                        value.trim().to_string(),
+                    );
+                }
             }
         }
     }
     Ok(entries)
+}
+
+fn collect_python_entry_point_table(
+    entries: &mut BTreeMap<String, String>,
+    prefix: &str,
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<(), CoreError> {
+    for (name, value) in table {
+        let value = value.as_str().ok_or_else(|| CoreError::Workspace {
+            message: format!("Python SDK package entry point '{prefix}.{name}' must be a string"),
+        })?;
+        entries.insert(format!("{prefix}.{name}"), value.to_string());
+    }
+    Ok(())
+}
+
+fn python_entry_point_toml_table<'a>(
+    value: &'a toml::Value,
+    field: &str,
+) -> Result<&'a toml::map::Map<String, toml::Value>, CoreError> {
+    value.as_table().ok_or_else(|| CoreError::Workspace {
+        message: format!("Python SDK package metadata '{field}' must be a table"),
+    })
 }
 
 #[derive(Default)]
@@ -3453,6 +3898,204 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn python_surface_handles_model_syntax_independent_of_layout() {
+        let dir = temp_dir("python-modern-model-layout");
+        std::fs::create_dir_all(dir.join("sdk")).unwrap();
+        std::fs::write(
+            dir.join("sdk/book.py"),
+            "from typing import Annotated, Optional, Required, TypedDict\n\nclass Book(BaseModel):\n  title: Annotated[\n    Optional[str],\n    Field(alias = \"bookTitle\"),\n  ] = Field(default = None, alias = \"bookTitle\")  # wire name\n\n  @classmethod\n  def from_dict(cls, data):\n    return cls(**data)\n\n  def to_dict(self):\n    return {}\n\nclass Author(BaseModel):\n\tname: str\n\n@attrs.define\nclass Publisher:\n  name: str = attrs.field()\n  slug: str = attrs.field(factory=str)\n\nclass BookPatch(TypedDict, total=False):\n  title: str\n  id: Required[int]\n\ntype BookAlias = Book\n",
+        )
+        .unwrap();
+
+        let surface = extract_python_surface(&dir).unwrap();
+        let title = &surface.models["Book"].fields["title"];
+        assert!(!title.required);
+        assert!(title.nullable);
+        assert_eq!(title.alias.as_deref(), Some("bookTitle"));
+        assert!(surface.models["Book"].has_from_dict);
+        assert!(surface.models["Book"].has_to_dict);
+        assert_eq!(surface.models["Author"].fields["name"].ty, "str");
+        assert!(surface.models["Publisher"].fields["name"].required);
+        assert!(!surface.models["Publisher"].fields["slug"].required);
+        assert!(!surface.models["BookPatch"].fields["title"].required);
+        assert!(surface.models["BookPatch"].fields["id"].required);
+        assert_eq!(surface.aliases["BookAlias"], "Book");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn python_surface_preserves_user_type_identifiers_and_ignores_comments() {
+        let old = temp_dir("python-type-name-old");
+        let new = temp_dir("python-type-name-new");
+        std::fs::write(
+            old.join("models.py"),
+            "class Book(BaseModel):\n    values: MyList[str]  # old prose\n    owner: mytyping.Owner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("models.py"),
+            "class Book(BaseModel):\n    values: Mylist[str]  # new prose\n    owner: myOwner\n",
+        )
+        .unwrap();
+
+        let old_surface = extract_python_surface(&old).unwrap();
+        assert_eq!(
+            old_surface.models["Book"].fields["values"].ty,
+            "MyList[str]"
+        );
+        assert_eq!(
+            old_surface.models["Book"].fields["owner"].ty,
+            "mytyping.Owner"
+        );
+        let diff = diff_python_dirs(&old, &new).unwrap();
+        assert_eq!(diff.model_field_changes.len(), 2, "{diff:?}");
+
+        let equivalent = temp_dir("python-type-name-equivalent");
+        std::fs::write(
+            equivalent.join("models.py"),
+            "class Book(BaseModel):\n    values: MyList[str]  # rewritten prose\n    owner: mytyping.Owner\n",
+        )
+        .unwrap();
+        let comment_only_diff = diff_python_dirs(&old, &equivalent).unwrap();
+        assert!(
+            !comment_only_diff.is_breaking(),
+            "comments are not public API: {comment_only_diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+        let _ = std::fs::remove_dir_all(equivalent);
+    }
+
+    #[test]
+    fn python_surface_parses_semantically_equivalent_pyproject_entry_points() {
+        let table = temp_dir("python-entry-points-table");
+        let inline = temp_dir("python-entry-points-inline");
+        let invalid = temp_dir("python-entry-points-invalid");
+        std::fs::write(
+            table.join("pyproject.toml"),
+            "[project.scripts]\nsdk = \"sdk.cli:main\"\n\n[project.entry-points.\"sdk.plugins\"]\nbooks = \"sdk.books:plugin\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inline.join("pyproject.toml"),
+            "[project]\nscripts = { sdk = \"sdk.cli:main\" }\nentry-points = { \"sdk.plugins\" = { books = \"sdk.books:plugin\" } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            invalid.join("pyproject.toml"),
+            "[project.scripts]\nsdk = 42\n",
+        )
+        .unwrap();
+
+        let table_surface = extract_python_surface(&table).unwrap();
+        let inline_surface = extract_python_surface(&inline).unwrap();
+        assert_eq!(
+            table_surface.package_entry_points,
+            inline_surface.package_entry_points
+        );
+        assert_eq!(
+            table_surface.package_entry_points["project.entry-points.sdk.plugins.books"],
+            "sdk.books:plugin"
+        );
+        assert!(extract_python_surface(&invalid).is_err());
+
+        let _ = std::fs::remove_dir_all(table);
+        let _ = std::fs::remove_dir_all(inline);
+        let _ = std::fs::remove_dir_all(invalid);
+    }
+
+    #[test]
+    fn python_surface_preserves_constructor_calling_conventions() {
+        let positional = temp_dir("python-constructor-positional");
+        let keyword = temp_dir("python-constructor-keyword");
+        std::fs::write(
+            positional.join("models.py"),
+            "class Book:\n    def __init__(self, title: str, /):\n        pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            keyword.join("models.py"),
+            "class Book:\n    def __init__(self, *, title: str):\n        pass\n",
+        )
+        .unwrap();
+
+        let diff = diff_python_dirs(&positional, &keyword).unwrap();
+        assert_eq!(diff.constructor_changes.len(), 1, "{diff:?}");
+        assert_eq!(diff.constructor_changes[0].old, "(title: str, /)");
+        assert_eq!(diff.constructor_changes[0].new, "(*, title: str)");
+
+        let _ = std::fs::remove_dir_all(positional);
+        let _ = std::fs::remove_dir_all(keyword);
+    }
+
+    #[test]
+    fn python_surface_only_reads_real_all_assignments() {
+        let dir = temp_dir("python-real-all");
+        let empty = temp_dir("python-empty-all");
+        let dynamic = temp_dir("python-dynamic-all");
+        std::fs::create_dir_all(dir.join("sdk")).unwrap();
+        std::fs::create_dir_all(empty.join("sdk")).unwrap();
+        std::fs::create_dir_all(dynamic.join("sdk")).unwrap();
+        std::fs::write(
+            dir.join("sdk/__init__.py"),
+            "# __all__ is deliberately omitted\nPRIVATE_VALUES = [\"Private\"]\nfrom .models import Book\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sdk/models.py"), "class Book:\n    title: str\n").unwrap();
+        std::fs::write(
+            empty.join("sdk/__init__.py"),
+            "from .models import Book\n__all__ = [\"Legacy\"]\n__all__ = []\n",
+        )
+        .unwrap();
+        std::fs::write(empty.join("sdk/models.py"), "class Book:\n    title: str\n").unwrap();
+        std::fs::write(
+            dynamic.join("sdk/__init__.py"),
+            "__all__ = build_exports()\n",
+        )
+        .unwrap();
+
+        let surface = extract_python_surface(&dir).unwrap();
+        assert_eq!(surface.public_exports, vec!["sdk.Book"]);
+        assert!(extract_python_surface(&empty)
+            .unwrap()
+            .public_exports
+            .is_empty());
+        assert!(extract_python_surface(&dynamic).is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(empty);
+        let _ = std::fs::remove_dir_all(dynamic);
+    }
+
+    #[test]
+    fn python_surface_normalizes_setup_cfg_entry_point_layout() {
+        let inline = temp_dir("python-setup-cfg-inline");
+        let multiline = temp_dir("python-setup-cfg-multiline");
+        std::fs::write(
+            inline.join("setup.cfg"),
+            "[options.entry_points]\nconsole_scripts = sdk = sdk.cli:main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            multiline.join("setup.cfg"),
+            "[options.entry_points]\nconsole_scripts =\n    sdk = sdk.cli:main\n",
+        )
+        .unwrap();
+
+        let inline_surface = extract_python_surface(&inline).unwrap();
+        let multiline_surface = extract_python_surface(&multiline).unwrap();
+        assert_eq!(
+            inline_surface.package_entry_points,
+            multiline_surface.package_entry_points
+        );
+
+        let _ = std::fs::remove_dir_all(inline);
+        let _ = std::fs::remove_dir_all(multiline);
     }
 
     #[test]
