@@ -491,8 +491,18 @@ fn validate_output_paths(
     project_root: &Path,
     artifacts: &[Artifact],
 ) -> Result<(), crate::CoreError> {
+    let mut seen = BTreeSet::new();
     for artifact in artifacts {
         safe_output_path(project_root, &artifact.path)?;
+        if !seen.insert(artifact.path.as_str()) {
+            return Err(crate::CoreError::ArtifactOwnership {
+                code: "artifact.path_collision".to_string(),
+                path: artifact.path.clone(),
+                producer: artifact.producer.clone(),
+                message: "the artifact bundle contains the same output path more than once"
+                    .to_string(),
+            });
+        }
     }
     Ok(())
 }

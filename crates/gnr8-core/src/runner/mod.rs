@@ -37,18 +37,15 @@ pub const HOST_PROTOCOL_ENV: &str = "GNR8_HOST_PROTOCOL_VERSION";
 pub const HOST_VERSION_ENV: &str = "GNR8_HOST_CLI_VERSION";
 pub const HOST_CAPABILITY_ENV: &str = "GNR8_HOST_CAPABILITY_FINGERPRINT";
 
-const CAPABILITY_MANIFEST: &str = concat!(
-    "gnr8-core:",
-    env!("CARGO_PKG_VERSION"),
-    ";protocol:3;artifact-ownership:1;structured-diagnostics:1;openapi-exact:1"
-);
-
 /// Deterministic fingerprint for capabilities that must agree across the process boundary.
 #[must_use]
 pub fn capability_fingerprint() -> String {
-    blake3::hash(CAPABILITY_MANIFEST.as_bytes())
-        .to_hex()
-        .to_string()
+    let manifest = format!(
+        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION
+    );
+    blake3::hash(manifest.as_bytes()).to_hex().to_string()
 }
 
 /// The exit code for a usage error (unknown / missing subcommand). `0` = success, `1` = run error,

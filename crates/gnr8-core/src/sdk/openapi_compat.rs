@@ -141,6 +141,7 @@ struct CanonicalDocument {
     security_schemes: BTreeMap<String, Value>,
     operations: BTreeMap<String, CanonicalOperation>,
     schemas: BTreeMap<String, Value>,
+    external_documents: BTreeMap<String, Value>,
 }
 
 type SecurityRequirements = Vec<BTreeMap<String, Vec<String>>>;
@@ -153,10 +154,12 @@ struct CanonicalOperation {
     tags: Vec<String>,
     deprecated: bool,
     external_docs: Option<Value>,
+    servers: Vec<String>,
     parameters: BTreeMap<String, CanonicalParameter>,
     request_body: Option<CanonicalRequestBody>,
     responses: BTreeMap<String, CanonicalResponse>,
     security: SecurityRequirements,
+    callbacks: Option<Value>,
     extensions: BTreeMap<String, Value>,
 }
 
@@ -184,6 +187,7 @@ struct CanonicalRequestBody {
     description: Option<String>,
     required: bool,
     content: BTreeMap<String, CanonicalMedia>,
+    extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -191,6 +195,7 @@ struct CanonicalResponse {
     description: Option<String>,
     headers: BTreeMap<String, Value>,
     content: BTreeMap<String, CanonicalMedia>,
+    links: Option<Value>,
     extensions: BTreeMap<String, Value>,
 }
 
@@ -200,6 +205,7 @@ struct CanonicalMedia {
     example: Option<Value>,
     examples: Option<Value>,
     encoding: Option<Value>,
+    extensions: BTreeMap<String, Value>,
 }
 
 struct Canonicalizer {
@@ -222,6 +228,7 @@ impl Canonicalizer {
         let security_schemes = self.security_schemes();
         let schemas = self.schemas();
         let operations = self.operations()?;
+        let external_documents = self.canonical_external_documents()?;
         Ok(CanonicalDocument {
             metadata,
             servers,
@@ -229,6 +236,7 @@ impl Canonicalizer {
             security_schemes,
             operations,
             schemas,
+            external_documents,
         })
     }
 
@@ -238,6 +246,7 @@ impl Canonicalizer {
             for key in [
                 "title",
                 "version",
+                "summary",
                 "description",
                 "termsOfService",
                 "contact",
@@ -251,6 +260,23 @@ impl Canonicalizer {
         for key in ["externalDocs", "tags"] {
             if let Some(value) = self.document.root.get(key) {
                 metadata.insert(key.to_string(), normalize_generic(value));
+            }
+        }
+        if let Some(dialect) = self.document.root.get("jsonSchemaDialect") {
+            metadata.insert("jsonSchemaDialect".to_string(), normalize_generic(dialect));
+        }
+        for (key, value) in self
+            .document
+            .root
+            .as_object()
+            .map(all_extensions)
+            .unwrap_or_default()
+        {
+            metadata.insert(key, value);
+        }
+        if let Some(info) = self.document.root.get("info").and_then(Value::as_object) {
+            for (key, value) in all_extensions(info) {
+                metadata.insert(format!("info.{key}"), value);
             }
         }
         metadata
@@ -274,23 +300,20 @@ impl Canonicalizer {
                             .map(str::to_string)
                             .collect::<Vec<_>>()
                     })
-                    .filter(|items| !items.is_empty())
-                    .unwrap_or_else(|| vec!["https".to_string()]);
-                schemes
-                    .into_iter()
-                    .map(|scheme| normalize_server_url(&format!("{scheme}://{host}")))
-                    .collect()
+                    .filter(|items| !items.is_empty());
+                schemes.map_or_else(
+                    || vec![normalize_server_url(&format!("//{host}"))],
+                    |schemes| {
+                        schemes
+                            .into_iter()
+                            .map(|scheme| normalize_server_url(&format!("{scheme}://{host}")))
+                            .collect()
+                    },
+                )
             }
-            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
-                .document
-                .root
-                .get("servers")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|server| server.get("url").and_then(Value::as_str))
-                .map(normalize_server_url)
-                .collect(),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => {
+                canonical_server_urls(self.document.root.get("servers"))
+            }
         };
         servers.sort();
         servers.dedup();
@@ -407,6 +430,7 @@ impl Canonicalizer {
                 let mut tags = string_array(operation.get("tags"));
                 tags.sort();
                 tags.dedup();
+                let servers = self.operation_servers(item, operation);
                 operations.insert(
                     operation_label,
                     CanonicalOperation {
@@ -419,10 +443,12 @@ impl Canonicalizer {
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
                         external_docs: operation.get("externalDocs").map(normalize_generic),
+                        servers,
                         parameters,
                         request_body,
                         responses,
                         security,
+                        callbacks: operation.get("callbacks").map(normalize_generic),
                         extensions: extensions(operation),
                     },
                 );
@@ -502,21 +528,7 @@ impl Canonicalizer {
         consumes: &[String],
     ) -> Result<Option<CanonicalRequestBody>, CoreError> {
         if self.document.version != SpecVersion::Swagger2 {
-            let Some(raw) = operation.get("requestBody") else {
-                return Ok(None);
-            };
-            let body = self.resolve_object(raw, 0)?;
-            let Some(body) = body.as_object() else {
-                return Ok(None);
-            };
-            return Ok(Some(CanonicalRequestBody {
-                description: optional_string(body.get("description")),
-                required: body
-                    .get("required")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                content: canonical_content(body.get("content")),
-            }));
+            return self.openapi_request_body(operation);
         }
 
         let parameters = operation
@@ -591,6 +603,7 @@ impl Canonicalizer {
                         example: None,
                         examples: None,
                         encoding: None,
+                        extensions: BTreeMap::new(),
                     },
                 )
             })
@@ -599,6 +612,29 @@ impl Canonicalizer {
             description: body_description,
             required,
             content,
+            extensions: BTreeMap::new(),
+        }))
+    }
+
+    fn openapi_request_body(
+        &mut self,
+        operation: &Map<String, Value>,
+    ) -> Result<Option<CanonicalRequestBody>, CoreError> {
+        let Some(raw) = operation.get("requestBody") else {
+            return Ok(None);
+        };
+        let body = self.resolve_object(raw, 0)?;
+        let Some(body) = body.as_object() else {
+            return Ok(None);
+        };
+        Ok(Some(CanonicalRequestBody {
+            description: optional_string(body.get("description")),
+            required: body
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            content: canonical_content(body.get("content")),
+            extensions: extensions(body),
         }))
     }
 
@@ -638,6 +674,7 @@ impl Canonicalizer {
                                     example,
                                     examples: None,
                                     encoding: None,
+                                    extensions: BTreeMap::new(),
                                 },
                             )
                         })
@@ -648,24 +685,148 @@ impl Canonicalizer {
             } else {
                 canonical_content(response.get("content"))
             };
-            let headers = response
-                .get("headers")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flatten()
-                .map(|(name, value)| (name.to_ascii_lowercase(), normalize_generic(value)))
-                .collect();
+            let headers = self.response_headers(response)?;
             out.insert(
                 status.to_ascii_uppercase(),
                 CanonicalResponse {
                     description: optional_string(response.get("description")),
                     headers,
                     content,
+                    links: response.get("links").map(normalize_generic),
                     extensions: extensions(response),
                 },
             );
         }
         Ok(out)
+    }
+
+    fn operation_servers(
+        &self,
+        path_item: &Map<String, Value>,
+        operation: &Map<String, Value>,
+    ) -> Vec<String> {
+        match self.document.version {
+            SpecVersion::Swagger2 => {
+                let Some(host) = self.document.root.get("host").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let operation_schemes = string_array(operation.get("schemes"));
+                let schemes = if operation_schemes.is_empty() {
+                    let root_schemes = string_array(self.document.root.get("schemes"));
+                    (!root_schemes.is_empty()).then_some(root_schemes)
+                } else {
+                    Some(operation_schemes)
+                };
+                let mut servers = schemes.map_or_else(
+                    || vec![normalize_server_url(&format!("//{host}"))],
+                    |schemes| {
+                        schemes
+                            .into_iter()
+                            .map(|scheme| normalize_server_url(&format!("{scheme}://{host}")))
+                            .collect::<Vec<_>>()
+                    },
+                );
+                servers.sort();
+                servers.dedup();
+                servers
+            }
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => {
+                let raw = if operation.contains_key("servers") {
+                    operation.get("servers")
+                } else if path_item.contains_key("servers") {
+                    path_item.get("servers")
+                } else {
+                    self.document.root.get("servers")
+                };
+                canonical_server_urls(raw)
+            }
+        }
+    }
+
+    fn response_headers(
+        &mut self,
+        response: &Map<String, Value>,
+    ) -> Result<BTreeMap<String, Value>, CoreError> {
+        let headers = response
+            .get("headers")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut out = BTreeMap::new();
+        for (name, raw) in headers {
+            let resolved = self.resolve_object(&raw, 0)?;
+            let Some(header) = resolved.as_object() else {
+                continue;
+            };
+            let schema = parameter_schema(self.document.version, header);
+            let mut canonical = Map::new();
+            if let Some(description) = optional_string(header.get("description")) {
+                canonical.insert("description".to_string(), Value::String(description));
+            }
+            canonical.insert("schema".to_string(), schema);
+            canonical.insert("style".to_string(), Value::String("simple".to_string()));
+            canonical.insert("explode".to_string(), Value::Bool(false));
+            if let Some(examples) = header.get("examples").or_else(|| header.get("example")) {
+                canonical.insert("examples".to_string(), normalize_generic(examples));
+            }
+            for (key, value) in extensions(header) {
+                canonical.insert(key, value);
+            }
+            out.insert(name.to_ascii_lowercase(), Value::Object(canonical));
+        }
+        Ok(out)
+    }
+
+    fn canonical_external_documents(&mut self) -> Result<BTreeMap<String, Value>, CoreError> {
+        let root_parent = self
+            .document
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let mut queue = vec![(self.document.path.clone(), self.document.root.clone())];
+        let mut seen = BTreeSet::new();
+        let mut canonical = BTreeMap::new();
+
+        while let Some((owner_path, document)) = queue.pop() {
+            let mut references = Vec::new();
+            collect_references(&document, &mut references);
+            for reference in references {
+                let (path, _) = split_reference(&reference);
+                if path.is_empty() {
+                    continue;
+                }
+                let parent = owner_path.parent().unwrap_or_else(|| Path::new("."));
+                let external_path = lexical_normalize(&parent.join(path));
+                if !seen.insert(external_path.clone()) {
+                    continue;
+                }
+                let external = if let Some(cached) = self.external_documents.get(&external_path) {
+                    cached.clone()
+                } else {
+                    let text = std::fs::read_to_string(&external_path).map_err(|source| {
+                        CoreError::Io {
+                            message: format!(
+                                "failed to read OpenAPI compatibility reference '{}': {source}",
+                                external_path.display()
+                            ),
+                        }
+                    })?;
+                    let parsed = parse_json_or_yaml(&text, &external_path)?;
+                    self.external_documents
+                        .insert(external_path.clone(), parsed.clone());
+                    parsed
+                };
+                let key = external_path
+                    .strip_prefix(&root_parent)
+                    .unwrap_or(&external_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                canonical.insert(key, normalize_generic(&external));
+                queue.push((external_path, external));
+            }
+        }
+        Ok(canonical)
     }
 
     fn resolve_object(&mut self, value: &Value, depth: usize) -> Result<Value, CoreError> {
@@ -689,7 +850,7 @@ impl Canonicalizer {
                 .path
                 .parent()
                 .unwrap_or_else(|| Path::new("."));
-            let external_path = parent.join(path);
+            let external_path = lexical_normalize(&parent.join(path));
             if !self.external_documents.contains_key(&external_path) {
                 let text =
                     std::fs::read_to_string(&external_path).map_err(|source| CoreError::Io {
@@ -755,6 +916,58 @@ fn normalize_server_url(url: &str) -> String {
     } else {
         url.trim_end_matches('/').to_string()
     }
+}
+
+fn canonical_server_urls(value: Option<&Value>) -> Vec<String> {
+    let mut servers = value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|server| server.get("url").and_then(Value::as_str))
+        .map(normalize_server_url)
+        // An omitted OpenAPI servers array and an explicit `/` both select the document origin.
+        .filter(|url| url != "/")
+        .collect::<Vec<_>>();
+    servers.sort();
+    servers.dedup();
+    servers
+}
+
+fn collect_references(value: &Value, references: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                references.push(reference.to_string());
+            }
+            for child in object.values() {
+                collect_references(child, references);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_references(child, references);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn optional_string(value: Option<&Value>) -> Option<String> {
@@ -861,6 +1074,8 @@ fn parameter_schema(version: SpecVersion, parameter: &Map<String, Value>) -> Val
         "minItems",
         "maxItems",
         "uniqueItems",
+        "nullable",
+        "x-nullable",
     ];
     let mut schema = Map::new();
     for key in keys {
@@ -901,6 +1116,7 @@ fn canonical_content(value: Option<&Value>) -> BTreeMap<String, CanonicalMedia> 
                     encoding: media
                         .and_then(|item| item.get("encoding"))
                         .map(normalize_generic),
+                    extensions: media.map(extensions).unwrap_or_default(),
                 },
             )
         })
@@ -912,7 +1128,13 @@ fn normalize_swagger_security_scheme(value: &Value) -> Value {
         return normalize_generic(value);
     };
     match scheme.get("type").and_then(Value::as_str) {
-        Some("basic") => serde_json::json!({"type": "http", "scheme": "basic"}),
+        Some("basic") => {
+            let mut out = Map::new();
+            out.insert("type".to_string(), Value::String("http".to_string()));
+            out.insert("scheme".to_string(), Value::String("basic".to_string()));
+            add_security_scheme_common(&mut out, scheme);
+            Value::Object(out)
+        }
         Some("oauth2") => {
             let flow = scheme.get("flow").and_then(Value::as_str).unwrap_or("");
             let (flow_name, authorization_key, token_key) = match flow {
@@ -946,9 +1168,19 @@ fn normalize_swagger_security_scheme(value: &Value) -> Value {
             let mut out = Map::new();
             out.insert("type".to_string(), Value::String("oauth2".to_string()));
             out.insert("flows".to_string(), Value::Object(flows));
+            add_security_scheme_common(&mut out, scheme);
             Value::Object(out)
         }
         _ => normalize_generic(value),
+    }
+}
+
+fn add_security_scheme_common(out: &mut Map<String, Value>, scheme: &Map<String, Value>) {
+    if let Some(description) = scheme.get("description") {
+        out.insert("description".to_string(), normalize_generic(description));
+    }
+    for (key, value) in extensions(scheme) {
+        out.insert(key, value);
     }
 }
 
@@ -1035,13 +1267,13 @@ fn normalize_schema(value: &Value) -> Value {
 }
 
 fn normalize_reference(reference: &str) -> String {
-    let (_, fragment) = split_reference(reference);
+    let (path, fragment) = split_reference(reference);
     let fragment = fragment
         .replace("/definitions/", "/components/schemas/")
         .replace("/securityDefinitions/", "/components/securitySchemes/")
         .replace("/parameters/", "/components/parameters/")
         .replace("/responses/", "/components/responses/");
-    format!("#{fragment}")
+    format!("{path}#{fragment}")
 }
 
 fn normalize_generic(value: &Value) -> Value {
@@ -1071,6 +1303,14 @@ fn extensions(object: &Map<String, Value>) -> BTreeMap<String, Value> {
     object
         .iter()
         .filter(|(key, _)| key.starts_with("x-") && key.as_str() != "x-nullable")
+        .map(|(key, value)| (key.clone(), normalize_generic(value)))
+        .collect()
+}
+
+fn all_extensions(object: &Map<String, Value>) -> BTreeMap<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| key.starts_with("x-"))
         .map(|(key, value)| (key.clone(), normalize_generic(value)))
         .collect()
 }
@@ -1126,6 +1366,16 @@ fn diff_documents(old: &CanonicalDocument, new: &CanonicalDocument) -> Vec<OpenA
         &new.schemas,
         "/components/schemas",
         "schema",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
+    diff_map_values(
+        &old.external_documents,
+        &new.external_documents,
+        "/externalDocuments",
+        "external.document",
         None,
         None,
         None,
@@ -1197,7 +1447,13 @@ fn diff_operation(
             to_value(&old.external_docs),
             to_value(&new.external_docs),
         ),
+        ("servers", to_value(&old.servers), to_value(&new.servers)),
         ("security", to_value(&old.security), to_value(&new.security)),
+        (
+            "callbacks",
+            to_value(&old.callbacks),
+            to_value(&new.callbacks),
+        ),
         (
             "extensions",
             to_value(&old.extensions),
@@ -1559,7 +1815,9 @@ mod tests {
 
     use std::path::Path;
 
-    use super::{compare_documents, OpenApiCompatibilityPolicy, ParsedDocument};
+    use super::{
+        compare_documents, compare_openapi_files, OpenApiCompatibilityPolicy, ParsedDocument,
+    };
     use crate::sdk::openapi_source::{detect_version, parse_json_or_yaml};
 
     fn parsed(name: &str, text: &str) -> ParsedDocument {
@@ -1571,6 +1829,19 @@ mod tests {
             root,
             version,
         }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-openapi-compat-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture directory");
+        dir
     }
 
     #[test]
@@ -1673,5 +1944,62 @@ components:
         let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
             .expect("compare documents");
         assert_eq!(report.differences[0].code, "security.requirement.changed");
+    }
+
+    #[test]
+    fn operation_server_override_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"servers":[{"url":"https://api.example.test"}],"paths":{"/x":{"get":{"servers":[{"url":"https://edge.example.test"}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"servers":[{"url":"https://api.example.test"}],"paths":{"/x":{"get":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+        assert!(report
+            .differences
+            .iter()
+            .any(|difference| difference.code == "operation.servers.changed"));
+    }
+
+    #[test]
+    fn equivalent_swagger_and_openapi_response_headers_compare_equal() {
+        let swagger = parsed(
+            "old.json",
+            r#"{"swagger":"2.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"responses":{"200":{"description":"ok","headers":{"X-Request-Id":{"description":"request id","type":"string","format":"uuid"}}}}}}}}"#,
+        );
+        let openapi = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"responses":{"200":{"description":"ok","headers":{"X-Request-Id":{"description":"request id","schema":{"type":"string","format":"uuid"}}}}}}}}}"#,
+        );
+        let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+        assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn changed_external_schema_content_cannot_compare_equal() {
+        let old = temp_dir("external-old");
+        let new = temp_dir("external-new");
+        let root = r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"responses":{"200":{"description":"ok","content":{"application/json":{"schema":{"$ref":"schemas.json#/Book"}}}}}}}}}"#;
+        std::fs::write(old.join("openapi.json"), root).expect("write old root");
+        std::fs::write(new.join("openapi.json"), root).expect("write new root");
+        std::fs::write(old.join("schemas.json"), r#"{"Book":{"type":"string"}}"#)
+            .expect("write old schemas");
+        std::fs::write(new.join("schemas.json"), r#"{"Book":{"type":"integer"}}"#)
+            .expect("write new schemas");
+
+        let report = compare_openapi_files(
+            old.join("openapi.json"),
+            new.join("openapi.json"),
+            OpenApiCompatibilityPolicy::Exact,
+        )
+        .expect("compare documents");
+        assert!(!report.compatible);
+
+        std::fs::remove_dir_all(old).expect("remove old fixtures");
+        std::fs::remove_dir_all(new).expect("remove new fixtures");
     }
 }

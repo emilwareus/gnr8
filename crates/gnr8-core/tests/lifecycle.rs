@@ -656,6 +656,27 @@ fn regenerate_rejects_traversal_path() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn regenerate_rejects_duplicate_artifact_paths() {
+    let root = init_root("duplicate-artifact-path");
+    let err = lifecycle::regenerate(
+        &root,
+        &[
+            artifact("generated/client.go", "first"),
+            artifact("generated/client.go", "second"),
+        ],
+        false,
+    )
+    .expect_err("duplicate artifact paths must be rejected before writing");
+    assert!(
+        matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision"),
+        "a duplicate path must be an artifact ownership error, got {err:?}"
+    );
+    assert!(!root.join("generated/client.go").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 // ---------------------------------------------------------------------------
 // WS-03 — naming overrides via apply_naming + lower::to_openapi (real fixture graph)
 // ---------------------------------------------------------------------------
