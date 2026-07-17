@@ -1098,26 +1098,25 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
 
     let mut all_exports = BTreeMap::new();
     let mut model_exports = BTreeMap::new();
-    let mut api_classes = BTreeSet::new();
-    let mut api_factories = BTreeSet::new();
-    let mut operation_methods = BTreeSet::new();
-    let mut request_aliases = BTreeSet::new();
-    let mut interface_properties = BTreeMap::new();
-    let mut type_declarations = BTreeMap::new();
-    let mut operation_return_types = BTreeMap::new();
-    let mut operation_signatures = BTreeMap::new();
+    let mut public = TsPublicSurfaceParts::default();
+    let mut parsed_files = BTreeMap::new();
 
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
-        let parsed = parse_ts_file(&text);
-        merge_interface_properties(&mut interface_properties, parsed.interface_properties);
-        merge_ts_declaration_shapes(&mut type_declarations, parsed.type_declarations);
-        merge_operation_return_types(&mut operation_return_types, parsed.operation_return_types);
-        operation_signatures.extend(parsed.operation_signatures);
-        api_classes.extend(parsed.api_classes);
-        api_factories.extend(parsed.api_factories);
-        operation_methods.extend(parsed.operation_methods);
-        request_aliases.extend(parsed.request_aliases);
+        parsed_files.insert(rel.clone(), parse_ts_file(&text));
+    }
+
+    let public_origins = public_ts_export_origins(dir, &files)?;
+    for (rel, parsed) in parsed_files {
+        let public_symbols: BTreeSet<String> = public_origins
+            .iter()
+            .filter(|origin| origin.file == rel)
+            .map(|origin| origin.symbol.clone())
+            .collect();
+        if public_symbols.is_empty() {
+            continue;
+        }
+        public.merge(parsed, &public_symbols);
     }
 
     let mut export_cache = BTreeMap::new();
@@ -1133,17 +1132,94 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
     Ok(TypeScriptSurface {
         root_exports,
         model_exports,
-        api_classes: api_classes.into_iter().collect(),
-        api_factories: api_factories.into_iter().collect(),
-        operation_methods: operation_methods.into_iter().collect(),
-        request_aliases: request_aliases.into_iter().collect(),
-        interface_properties,
-        type_declarations,
-        operation_return_types,
-        operation_signatures,
+        api_classes: public.api_classes.into_iter().collect(),
+        api_factories: public.api_factories.into_iter().collect(),
+        operation_methods: public.operation_methods.into_iter().collect(),
+        request_aliases: public.request_aliases.into_iter().collect(),
+        interface_properties: public.interface_properties,
+        type_declarations: public.type_declarations,
+        operation_return_types: public.operation_return_types,
+        operation_signatures: public.operation_signatures,
         package_entry_points: package_entry_points(dir)?,
         docs: doc_files(dir)?,
     })
+}
+
+#[derive(Default)]
+struct TsPublicSurfaceParts {
+    api_classes: BTreeSet<String>,
+    api_factories: BTreeSet<String>,
+    operation_methods: BTreeSet<String>,
+    request_aliases: BTreeSet<String>,
+    interface_properties: BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    type_declarations: BTreeMap<String, Vec<String>>,
+    operation_return_types: BTreeMap<String, String>,
+    operation_signatures: BTreeMap<String, String>,
+}
+
+impl TsPublicSurfaceParts {
+    fn merge(&mut self, parsed: ParsedTsFile, public_symbols: &BTreeSet<String>) {
+        merge_interface_properties(
+            &mut self.interface_properties,
+            parsed
+                .interface_properties
+                .into_iter()
+                .filter(|(symbol, _)| public_symbols.contains(symbol))
+                .collect(),
+        );
+        merge_ts_declaration_shapes(
+            &mut self.type_declarations,
+            parsed
+                .type_declarations
+                .into_iter()
+                .filter(|(symbol, _)| public_symbols.contains(symbol))
+                .collect(),
+        );
+        merge_operation_return_types(
+            &mut self.operation_return_types,
+            parsed
+                .operation_return_types
+                .into_iter()
+                .filter(|(operation, _)| ts_operation_owner_is_public(operation, public_symbols))
+                .collect(),
+        );
+        self.operation_signatures.extend(
+            parsed
+                .operation_signatures
+                .into_iter()
+                .filter(|(operation, _)| ts_operation_owner_is_public(operation, public_symbols)),
+        );
+        self.api_classes.extend(
+            parsed
+                .api_classes
+                .into_iter()
+                .filter(|symbol| public_symbols.contains(symbol)),
+        );
+        self.api_factories.extend(
+            parsed
+                .api_factories
+                .into_iter()
+                .filter(|symbol| public_symbols.contains(symbol)),
+        );
+        self.operation_methods.extend(
+            parsed
+                .operation_methods
+                .into_iter()
+                .filter(|operation| ts_operation_owner_is_public(operation, public_symbols)),
+        );
+        self.request_aliases.extend(
+            parsed
+                .request_aliases
+                .into_iter()
+                .filter(|symbol| public_symbols.contains(symbol)),
+        );
+    }
+}
+
+fn ts_operation_owner_is_public(operation: &str, public_symbols: &BTreeSet<String>) -> bool {
+    operation
+        .split_once('.')
+        .is_some_and(|(owner, _)| public_symbols.contains(owner))
 }
 
 /// Diff two already-extracted TypeScript surfaces.
@@ -1479,6 +1555,7 @@ fn ts_interface_property_change_key(change: &TsInterfacePropertyChange) -> Strin
 #[derive(Default)]
 struct ParsedTsFile {
     exports: BTreeMap<String, TsExportKind>,
+    export_origins: BTreeMap<String, BTreeSet<String>>,
     api_classes: Vec<String>,
     api_factories: Vec<String>,
     operation_methods: Vec<String>,
@@ -1579,6 +1656,11 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
                 declaration.export_kind,
             );
             if let Some(name) = declaration.name {
+                parsed
+                    .export_origins
+                    .entry(declaration.export_name.to_string())
+                    .or_default()
+                    .insert(name.to_string());
                 if matches!(
                     declaration.declaration_kind,
                     TsDeclarationKind::Interface | TsDeclarationKind::TypeAlias
@@ -1756,7 +1838,7 @@ fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
             TsDeclarationKind::Const | TsDeclarationKind::Other => continue,
         };
         let mut state = TsDeclarationShapeState {
-            symbol: declaration.export_name.to_string(),
+            symbol: name.to_string(),
             kind,
             code: String::new(),
             structure: String::new(),
@@ -2610,6 +2692,18 @@ enum TsReexport {
     },
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TsExportOrigin {
+    file: PathBuf,
+    symbol: String,
+}
+
+#[derive(Clone)]
+struct TsResolvedExport {
+    kind: TsExportKind,
+    origins: BTreeSet<TsExportOrigin>,
+}
+
 fn ts_reexports(text: &str) -> Vec<TsReexport> {
     ts_reexport_statements(text)
         .iter()
@@ -2717,6 +2811,174 @@ fn parse_ts_reexport(statement: &str) -> Option<TsReexport> {
     Some(TsReexport::Named { exports, module })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "recursive re-export resolution keeps direct, star, and named provenance transitions together"
+)]
+fn resolved_ts_exports_from_file(
+    dir: &Path,
+    rel: &Path,
+    cache: &mut BTreeMap<PathBuf, BTreeMap<String, TsResolvedExport>>,
+    stack: &mut Vec<PathBuf>,
+) -> Result<BTreeMap<String, TsResolvedExport>, CoreError> {
+    if let Some(exports) = cache.get(rel) {
+        return Ok(exports.clone());
+    }
+    if stack.iter().any(|path| path == rel) {
+        return Ok(BTreeMap::new());
+    }
+    stack.push(rel.to_path_buf());
+
+    let text = read_to_string(dir.join(rel))?;
+    let parsed = parse_ts_file(&text);
+    let mut exports = BTreeMap::new();
+    for (name, kind) in &parsed.exports {
+        let origins = parsed
+            .export_origins
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(|symbol| TsExportOrigin {
+                file: rel.to_path_buf(),
+                symbol: symbol.clone(),
+            })
+            .collect();
+        add_resolved_ts_export(&mut exports, name, *kind, origins);
+    }
+
+    let base = rel.parent().unwrap_or_else(|| Path::new(""));
+    for reexport in ts_reexports(&text) {
+        match reexport {
+            TsReexport::Star {
+                module,
+                namespace,
+                type_only,
+            } => {
+                if let Some(namespace) = namespace {
+                    add_resolved_ts_export(
+                        &mut exports,
+                        &namespace,
+                        if type_only {
+                            TsExportKind::Type
+                        } else {
+                            TsExportKind::Value
+                        },
+                        BTreeSet::new(),
+                    );
+                    continue;
+                }
+                let Some(target) = resolve_ts_reexport_target(dir, base, rel, &module)? else {
+                    continue;
+                };
+                for (name, resolved) in resolved_ts_exports_from_file(dir, &target, cache, stack)? {
+                    if name == "default" {
+                        continue;
+                    }
+                    add_resolved_ts_export(
+                        &mut exports,
+                        &name,
+                        if type_only {
+                            TsExportKind::Type
+                        } else {
+                            resolved.kind
+                        },
+                        resolved.origins,
+                    );
+                }
+            }
+            TsReexport::Named {
+                exports: named,
+                module,
+            } => {
+                let (source_exports, fallback_file) = if let Some(module) = module {
+                    if let Some(target) = resolve_ts_reexport_target(dir, base, rel, &module)? {
+                        (
+                            resolved_ts_exports_from_file(dir, &target, cache, stack)?,
+                            Some(target),
+                        )
+                    } else {
+                        (BTreeMap::new(), None)
+                    }
+                } else {
+                    (exports.clone(), Some(rel.to_path_buf()))
+                };
+                for named_export in named {
+                    let source = source_exports.get(&named_export.source);
+                    let kind = if named_export.type_only {
+                        TsExportKind::Type
+                    } else {
+                        source.map_or(TsExportKind::Value, |resolved| resolved.kind)
+                    };
+                    let origins = source.map_or_else(
+                        || {
+                            fallback_file
+                                .iter()
+                                .map(|file| TsExportOrigin {
+                                    file: file.clone(),
+                                    symbol: named_export.source.clone(),
+                                })
+                                .collect()
+                        },
+                        |resolved| resolved.origins.clone(),
+                    );
+                    add_resolved_ts_export(&mut exports, &named_export.exported, kind, origins);
+                }
+            }
+        }
+    }
+
+    stack.pop();
+    cache.insert(rel.to_path_buf(), exports.clone());
+    Ok(exports)
+}
+
+fn add_resolved_ts_export(
+    into: &mut BTreeMap<String, TsResolvedExport>,
+    name: &str,
+    kind: TsExportKind,
+    origins: BTreeSet<TsExportOrigin>,
+) {
+    into.entry(name.to_string())
+        .and_modify(|existing| {
+            if existing.kind != kind {
+                existing.kind = TsExportKind::Both;
+            }
+            existing.origins.extend(origins.clone());
+        })
+        .or_insert(TsResolvedExport { kind, origins });
+}
+
+fn public_ts_export_origins(
+    dir: &Path,
+    files: &[PathBuf],
+) -> Result<BTreeSet<TsExportOrigin>, CoreError> {
+    let mut cache = BTreeMap::new();
+    let mut origins = BTreeSet::new();
+    if let Some(index) = ts_root_index(files) {
+        for resolved in
+            resolved_ts_exports_from_file(dir, index, &mut cache, &mut Vec::new())?.values()
+        {
+            origins.extend(resolved.origins.iter().cloned());
+        }
+    } else {
+        for file in files {
+            for resolved in
+                resolved_ts_exports_from_file(dir, file, &mut cache, &mut Vec::new())?.values()
+            {
+                origins.extend(resolved.origins.iter().cloned());
+            }
+        }
+    }
+    for model_file in files.iter().filter(|path| is_model_file(path)) {
+        for resolved in
+            resolved_ts_exports_from_file(dir, model_file, &mut cache, &mut Vec::new())?.values()
+        {
+            origins.extend(resolved.origins.iter().cloned());
+        }
+    }
+    Ok(origins)
+}
+
 fn add_export(into: &mut BTreeMap<String, TsExportKind>, name: &str, kind: TsExportKind) {
     into.entry(name.to_string())
         .and_modify(|existing| {
@@ -2776,13 +3038,23 @@ fn extract_root_exports(
     files: &[PathBuf],
     all_exports: &BTreeMap<String, TsExportKind>,
 ) -> Result<BTreeMap<String, TsExportKind>, CoreError> {
-    let index = Path::new("index.ts");
-    if !files.iter().any(|path| path == index) {
+    let Some(index) = ts_root_index(files) else {
         return Ok(all_exports.clone());
-    }
+    };
     let mut cache = BTreeMap::new();
     let mut stack = Vec::new();
     exports_from_file(dir, index, &mut cache, &mut stack)
+}
+
+fn ts_root_index(files: &[PathBuf]) -> Option<&Path> {
+    ["index.ts", "index.d.ts", "src/index.ts", "src/index.d.ts"]
+        .into_iter()
+        .find_map(|candidate| {
+            files
+                .iter()
+                .find(|path| path.as_path() == Path::new(candidate))
+                .map(PathBuf::as_path)
+        })
 }
 
 fn exports_from_file(
@@ -2906,7 +3178,10 @@ fn resolve_ts_module(dir: &Path, base: &Path, spec: &str) -> Option<PathBuf> {
     let joined = normalize_relative_path(&base.join(spec));
     [
         joined.with_extension("ts"),
+        joined.with_extension("d.ts"),
+        joined.with_extension("tsx"),
         joined.join("index.ts"),
+        joined.join("index.d.ts"),
         joined.clone(),
     ]
     .into_iter()
@@ -2947,7 +3222,11 @@ fn collect_ts_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
                 continue;
             }
             collect_ts_files(root, &path, out)?;
-        } else if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("ts")
+        } else if file_type.is_file()
+            && matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("ts" | "tsx")
+            )
         {
             let rel = path
                 .strip_prefix(root)
@@ -5130,6 +5409,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_semantic_surface_ignores_unreachable_private_modules() {
+        let old = temp_dir("ts-private-semantics-old");
+        let new = temp_dir("ts-private-semantics-new");
+        for dir in [&old, &new] {
+            std::fs::write(
+                dir.join("index.ts"),
+                "export { type InternalBook as Book } from \"./public\";\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("public.ts"),
+                "export interface InternalBook { title: string; }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            old.join("private.ts"),
+            "export interface Hidden { value: string; }\nexport class HiddenApi { async read(): Promise<string> {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("private.ts"),
+            "export interface Hidden { value: number; }\nexport class HiddenApi { async read(): Promise<number> {} }\n",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&old).unwrap();
+        assert!(surface.interface_properties.contains_key("InternalBook"));
+        assert!(!surface.interface_properties.contains_key("Hidden"));
+        assert!(!surface.api_classes.contains(&"HiddenApi".to_string()));
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert!(!diff.is_breaking(), "private module drift leaked: {diff:?}");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_declaration_file_barrels_define_the_public_root() {
+        let dir = temp_dir("ts-declaration-barrel");
+        std::fs::write(
+            dir.join("index.d.ts"),
+            "export type { Book } from \"./models\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("models.d.ts"),
+            "export interface Book { title: string; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("private.d.ts"),
+            "export interface Hidden { value: string; }\n",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&dir).unwrap();
+        assert_eq!(
+            surface.root_exports,
+            BTreeMap::from([("Book".to_string(), TsExportKind::Type)])
+        );
+        assert!(surface.interface_properties.contains_key("Book"));
+        assert!(!surface.interface_properties.contains_key("Hidden"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
