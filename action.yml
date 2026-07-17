@@ -74,6 +74,70 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate gnr8 action inputs
+      shell: bash
+      env:
+        CACHE_ENABLED: ${{ inputs.cache }}
+        INPUT_BINARY: ${{ inputs.gnr8-binary }}
+        INSTALL_METHOD: ${{ inputs.install-method }}
+        REQUESTED_VERSION: ${{ inputs.version }}
+        SETUP_GO: ${{ inputs.setup-go }}
+        SETUP_NODE: ${{ inputs.setup-node }}
+        SETUP_PYTHON: ${{ inputs.setup-python }}
+        SETUP_RUST: ${{ inputs.setup-rust }}
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+      run: |
+        set -euo pipefail
+        validate_boolean() {
+          local name="$1"
+          local value="$2"
+          if [[ "$value" != "true" && "$value" != "false" ]]; then
+            echo "gnr8 action: $name must be \"true\" or \"false\" (found \"$value\")" >&2
+            exit 2
+          fi
+        }
+
+        validate_boolean cache "$CACHE_ENABLED"
+        validate_boolean setup-go "$SETUP_GO"
+        validate_boolean setup-node "$SETUP_NODE"
+        validate_boolean setup-python "$SETUP_PYTHON"
+        validate_boolean setup-rust "$SETUP_RUST"
+
+        if [[ -z "$INPUT_BINARY" ]]; then
+          case "$INSTALL_METHOD" in
+            release | source | path) ;;
+            *)
+              echo "gnr8 action: install-method must be release, source, or path (found \"$INSTALL_METHOD\")" >&2
+              exit 2
+              ;;
+          esac
+        fi
+        if [[ -z "$INPUT_BINARY" && "$INSTALL_METHOD" == "release" \
+          && ( -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" == "latest" ) ]]; then
+          echo 'gnr8 action: version must be an exact release or "lock"; "latest" is not allowed for checks' >&2
+          exit 2
+        fi
+
+        directory_count=0
+        while IFS= read -r dir || [[ -n "$dir" ]]; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          [[ -z "$dir" || "$dir" == \#* ]] && continue
+          directory_count=$((directory_count + 1))
+          if [[ ! -d "$dir" ]]; then
+            echo "gnr8 action: working directory does not exist: $dir" >&2
+            exit 2
+          fi
+          if [[ ! -f "$dir/.gnr8/Cargo.toml" ]]; then
+            echo "gnr8 action: missing $dir/.gnr8/Cargo.toml" >&2
+            exit 2
+          fi
+        done <<< "$WORKING_DIRECTORIES"
+        if [[ "$directory_count" -eq 0 ]]; then
+          echo "gnr8 action: no working directories configured" >&2
+          exit 2
+        fi
+
     - name: Set up Rust
       if: ${{ inputs.setup-rust == 'true' }}
       uses: dtolnay/rust-toolchain@stable
@@ -149,65 +213,7 @@ runs:
         WORKING_DIRECTORIES: ${{ inputs.working-directories }}
       run: |
         set -euo pipefail
-        if [[ "$REQUESTED_VERSION" == "latest" || -z "$REQUESTED_VERSION" ]]; then
-          echo 'gnr8 action: version must be an exact release or "lock"; "latest" is not allowed for checks' >&2
-          exit 2
-        fi
-
-        locked_version() {
-          awk '
-            function emit() {
-              if (name == "gnr8" && version != "") {
-                print version
-                found = 1
-                exit
-              }
-            }
-            /^\[\[package\]\]$/ { emit(); name = ""; version = ""; next }
-            /^name = "/ { value = $0; sub(/^name = "/, "", value); sub(/"$/, "", value); name = value; next }
-            /^version = "/ { value = $0; sub(/^version = "/, "", value); sub(/"$/, "", value); version = value; next }
-            END { if (!found) emit() }
-          ' "$1"
-        }
-
-        requested="${REQUESTED_VERSION#v}"
-        resolved=""
-        while IFS= read -r dir || [[ -n "$dir" ]]; do
-          dir="${dir#"${dir%%[![:space:]]*}"}"
-          dir="${dir%"${dir##*[![:space:]]}"}"
-          [[ -z "$dir" || "$dir" == \#* ]] && continue
-          lock="$dir/.gnr8/Cargo.lock"
-          if [[ ! -f "$lock" ]]; then
-            echo "gnr8 action: missing $lock; commit a locked generation crate" >&2
-            exit 2
-          fi
-          locked="$(locked_version "$lock")"
-          if [[ -z "$locked" ]]; then
-            echo "gnr8 action: $lock does not contain the gnr8 package" >&2
-            exit 2
-          fi
-          if [[ -z "$resolved" ]]; then
-            resolved="$locked"
-          elif [[ "$resolved" != "$locked" ]]; then
-            echo "gnr8 action: generation crates pin different gnr8 versions ($resolved and $locked)" >&2
-            exit 2
-          fi
-        done <<< "$WORKING_DIRECTORIES"
-
-        if [[ -z "$resolved" ]]; then
-          echo "gnr8 action: no working directories configured" >&2
-          exit 2
-        fi
-        if [[ "$REQUESTED_VERSION" != "lock" && "$requested" != "$resolved" ]]; then
-          echo "gnr8 action: requested gnr8 $requested but .gnr8/Cargo.lock pins $resolved" >&2
-          exit 2
-        fi
-        if [[ ! "$resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-          echo "gnr8 action: lockfile gnr8 version is not an exact release: $resolved" >&2
-          exit 2
-        fi
-        echo "version=$resolved" >> "$GITHUB_OUTPUT"
-        echo "tag=v$resolved" >> "$GITHUB_OUTPUT"
+        "$GITHUB_ACTION_PATH/scripts/resolve-action-version.sh"
 
     - name: Install gnr8 release
       if: ${{ inputs.gnr8-binary == '' && inputs.install-method == 'release' }}
@@ -245,7 +251,10 @@ runs:
         fi
 
         if [[ "$INSTALL_METHOD" == "path" && -z "$INPUT_BINARY" ]]; then
-          bin="$(command -v gnr8)"
+          if ! bin="$(command -v gnr8)"; then
+            echo "gnr8 action: install-method path requires an executable gnr8 on PATH" >&2
+            exit 2
+          fi
         fi
 
         if [[ ! -x "$bin" ]]; then
