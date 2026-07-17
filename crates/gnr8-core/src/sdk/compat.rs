@@ -1080,17 +1080,22 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
         let parsed = parse_ts_file(&text);
-        merge_exports(&mut all_exports, &parsed.exports);
         merge_interface_properties(&mut interface_properties, parsed.interface_properties);
         merge_operation_return_types(&mut operation_return_types, parsed.operation_return_types);
         operation_signatures.extend(parsed.operation_signatures);
-        if is_model_file(rel) {
-            merge_exports(&mut model_exports, &parsed.exports);
-        }
         api_classes.extend(parsed.api_classes);
         api_factories.extend(parsed.api_factories);
         operation_methods.extend(parsed.operation_methods);
         request_aliases.extend(parsed.request_aliases);
+    }
+
+    let mut export_cache = BTreeMap::new();
+    for rel in &files {
+        let exports = exports_from_file(dir, rel, &mut export_cache, &mut Vec::new())?;
+        merge_exports(&mut all_exports, &exports);
+        if is_model_file(rel) {
+            merge_exports(&mut model_exports, &exports);
+        }
     }
 
     let root_exports = extract_root_exports(dir, &files, &all_exports)?;
@@ -1425,7 +1430,44 @@ struct ParsedTsFile {
 struct TsInterfaceState {
     name: String,
     depth: i32,
+    opened: bool,
     property: String,
+}
+
+#[derive(Default)]
+struct TsContainerState {
+    name: String,
+    depth: i32,
+    opened: bool,
+    pending_method: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TsDeclarationKind {
+    Interface,
+    TypeAlias,
+    Class,
+    Const,
+    Other,
+}
+
+struct TsExportedDeclaration<'a> {
+    name: Option<&'a str>,
+    export_name: &'a str,
+    export_kind: TsExportKind,
+    declaration_kind: TsDeclarationKind,
+}
+
+struct TsParsedMethod {
+    name: String,
+    return_type: Option<String>,
+    signature: String,
+}
+
+enum TsMethodParse {
+    Incomplete,
+    NotMethod,
+    Method(TsParsedMethod),
 }
 
 #[expect(
@@ -1434,73 +1476,89 @@ struct TsInterfaceState {
 )]
 fn parse_ts_file(text: &str) -> ParsedTsFile {
     let mut parsed = ParsedTsFile::default();
-    let mut current_api_class: Option<(String, i32)> = None;
-    let mut current_api_factory: Option<(String, i32)> = None;
+    let mut current_api_class: Option<TsContainerState> = None;
+    let mut current_api_factory: Option<TsContainerState> = None;
     let mut current_interface: Option<TsInterfaceState> = None;
-    for raw in text.lines() {
+    let code = sanitize_typescript(text, false);
+    let structure = sanitize_typescript(text, true);
+    for (raw, structural_raw) in code.lines().zip(structure.lines()) {
         let line = raw.trim();
+        let structural_line = structural_raw.trim();
         let mut starts_api_class = false;
         let mut starts_api_factory = false;
         let mut starts_interface = false;
-        if let Some(name) = strip_export_decl(line, "interface") {
-            add_export(&mut parsed.exports, name, TsExportKind::Type);
-            if name.ends_with("Request") {
-                parsed.request_aliases.push(name.to_string());
+        if let Some(declaration) = parse_exported_ts_declaration(line) {
+            add_export(
+                &mut parsed.exports,
+                declaration.export_name,
+                declaration.export_kind,
+            );
+            if let Some(name) = declaration.name {
+                if matches!(
+                    declaration.declaration_kind,
+                    TsDeclarationKind::Interface | TsDeclarationKind::TypeAlias
+                ) && name.ends_with("Request")
+                {
+                    parsed.request_aliases.push(name.to_string());
+                }
+                if declaration.declaration_kind == TsDeclarationKind::Interface {
+                    parsed
+                        .interface_properties
+                        .entry(name.to_string())
+                        .or_default();
+                    let depth = brace_delta(structural_line);
+                    current_interface = Some(TsInterfaceState {
+                        name: name.to_string(),
+                        depth,
+                        opened: depth > 0,
+                        property: String::new(),
+                    });
+                    starts_interface = true;
+                } else if declaration.declaration_kind == TsDeclarationKind::Class
+                    && name.ends_with("Api")
+                {
+                    let depth = brace_delta(structural_line);
+                    current_api_class = Some(TsContainerState {
+                        name: name.to_string(),
+                        depth,
+                        opened: depth > 0,
+                        pending_method: String::new(),
+                    });
+                    starts_api_class = true;
+                    parsed.api_classes.push(name.to_string());
+                } else if declaration.declaration_kind == TsDeclarationKind::Const
+                    && name.ends_with("ApiFactory")
+                {
+                    let depth = brace_delta(structural_line);
+                    parsed.api_factories.push(name.to_string());
+                    current_api_factory = Some(TsContainerState {
+                        name: name.to_string(),
+                        depth,
+                        opened: depth > 0,
+                        pending_method: String::new(),
+                    });
+                    starts_api_factory = true;
+                }
             }
-            parsed
-                .interface_properties
-                .entry(name.to_string())
-                .or_default();
-            let depth = brace_delta(line);
-            if depth > 0 {
-                current_interface = Some(TsInterfaceState {
-                    name: name.to_string(),
-                    depth,
-                    property: String::new(),
-                });
-                starts_interface = true;
-            }
-        } else if let Some(name) = strip_export_decl(line, "type") {
-            add_export(&mut parsed.exports, name, TsExportKind::Type);
-            if name.ends_with("Request") {
-                parsed.request_aliases.push(name.to_string());
-            }
-        } else if let Some(name) = strip_export_decl(line, "class") {
-            add_export(&mut parsed.exports, name, TsExportKind::Value);
-            if name.ends_with("Api") {
-                current_api_class = Some((name.to_string(), brace_delta(line).max(1)));
-                starts_api_class = true;
-                parsed.api_classes.push(name.to_string());
-            }
-        } else if let Some(name) = strip_export_decl(line, "const") {
-            add_export(&mut parsed.exports, name, TsExportKind::Value);
-            if name.ends_with("ApiFactory") {
-                parsed.api_factories.push(name.to_string());
-                current_api_factory = Some((name.to_string(), brace_delta(line).max(1)));
-                starts_api_factory = true;
-            }
-        } else if let Some(exports) = line.strip_prefix("export type {") {
-            parse_export_list(exports, TsExportKind::Type, &mut parsed.exports);
-        } else if let Some(exports) = line.strip_prefix("export {") {
-            parse_export_list(exports, TsExportKind::Value, &mut parsed.exports);
         }
 
         let mut close_api_class = false;
-        if let Some((class_name, depth)) = &mut current_api_class {
+        if let Some(class) = &mut current_api_class {
             if !starts_api_class {
-                if let Some((method, return_ty)) = parse_async_method_signature(line) {
-                    let key = format!("{class_name}.{method}");
-                    parsed.operation_methods.push(key.clone());
-                    if let Some(return_ty) = return_ty {
-                        parsed.operation_return_types.insert(key.clone(), return_ty);
+                if class.opened && (class.depth == 1 || !class.pending_method.is_empty()) {
+                    if let Some(method) = collect_ts_method(class, line) {
+                        let key = format!("{}.{}", class.name, method.name);
+                        parsed.operation_methods.push(key.clone());
+                        if let Some(return_ty) = method.return_type {
+                            parsed.operation_return_types.insert(key.clone(), return_ty);
+                        }
+                        parsed.operation_signatures.insert(key, method.signature);
                     }
-                    parsed
-                        .operation_signatures
-                        .insert(key, normalize_ts_signature(line));
                 }
-                *depth += brace_delta(line);
+                class.depth += brace_delta(structural_line);
+                class.opened |= class.depth > 0;
             }
-            if *depth <= 0 {
+            if class.opened && class.depth <= 0 {
                 close_api_class = true;
             }
         }
@@ -1509,18 +1567,21 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         }
 
         let mut close_api_factory = false;
-        if let Some((factory_name, depth)) = &mut current_api_factory {
+        if let Some(factory) = &mut current_api_factory {
             if !starts_api_factory {
-                if let Some((method, Some(return_ty))) = parse_method_signature(line) {
-                    let key = format!("{factory_name}.{method}");
-                    parsed.operation_return_types.insert(key.clone(), return_ty);
-                    parsed
-                        .operation_signatures
-                        .insert(key, normalize_ts_signature(line));
+                if factory.opened {
+                    if let Some(method) = collect_ts_method(factory, line) {
+                        if let Some(return_ty) = method.return_type {
+                            let key = format!("{}.{}", factory.name, method.name);
+                            parsed.operation_return_types.insert(key.clone(), return_ty);
+                            parsed.operation_signatures.insert(key, method.signature);
+                        }
+                    }
                 }
-                *depth += brace_delta(line);
+                factory.depth += brace_delta(structural_line);
+                factory.opened |= factory.depth > 0;
             }
-            if *depth <= 0 {
+            if factory.opened && factory.depth <= 0 {
                 close_api_factory = true;
             }
         }
@@ -1531,10 +1592,13 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         let mut close_interface = false;
         if let Some(interface) = &mut current_interface {
             if !starts_interface {
-                collect_interface_property(line, interface, &mut parsed.interface_properties);
-                interface.depth += brace_delta(line);
+                if interface.opened && (interface.depth == 1 || !interface.property.is_empty()) {
+                    collect_interface_property(line, interface, &mut parsed.interface_properties);
+                }
+                interface.depth += brace_delta(structural_line);
+                interface.opened |= interface.depth > 0;
             }
-            if interface.depth <= 0 {
+            if interface.opened && interface.depth <= 0 {
                 close_interface = true;
             }
         }
@@ -1543,6 +1607,29 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         }
     }
     parsed
+}
+
+fn collect_ts_method(state: &mut TsContainerState, line: &str) -> Option<TsParsedMethod> {
+    if state.pending_method.is_empty() {
+        if !could_start_ts_method(line) {
+            return None;
+        }
+        state.pending_method.push_str(line);
+    } else {
+        state.pending_method.push(' ');
+        state.pending_method.push_str(line);
+    }
+    match parse_ts_method_declaration(&state.pending_method) {
+        TsMethodParse::Incomplete => None,
+        TsMethodParse::NotMethod => {
+            state.pending_method.clear();
+            None
+        }
+        TsMethodParse::Method(method) => {
+            state.pending_method.clear();
+            Some(method)
+        }
+    }
 }
 
 fn collect_interface_property(
@@ -1556,6 +1643,7 @@ fn collect_interface_property(
             || line.starts_with("/*")
             || line.starts_with('*')
             || line.starts_with('[')
+            || line.starts_with('{')
             || line.starts_with('}'))
     {
         return;
@@ -1618,6 +1706,166 @@ fn interface_property_decl_complete(decl: &str) -> bool {
     false
 }
 
+#[derive(Clone, Copy)]
+enum TsSanitizeState {
+    Code,
+    LineComment,
+    BlockComment,
+    SingleQuote,
+    DoubleQuote,
+    Template,
+    Regex,
+}
+
+fn sanitize_typescript(text: &str, erase_strings: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut state = TsSanitizeState::Code;
+    let mut regex_escape = false;
+    let mut regex_character_class = false;
+    while let Some(ch) = chars.next() {
+        match state {
+            TsSanitizeState::Code => match (ch, chars.peek().copied()) {
+                ('/', Some('/')) => {
+                    chars.next();
+                    out.push_str("  ");
+                    state = TsSanitizeState::LineComment;
+                }
+                ('/', Some('*')) => {
+                    chars.next();
+                    out.push_str("  ");
+                    state = TsSanitizeState::BlockComment;
+                }
+                ('/', _) if ts_slash_starts_regex(&out) => {
+                    out.push(if erase_strings { ' ' } else { ch });
+                    regex_escape = false;
+                    regex_character_class = false;
+                    state = TsSanitizeState::Regex;
+                }
+                ('\'', _) => {
+                    out.push(if erase_strings { ' ' } else { ch });
+                    state = TsSanitizeState::SingleQuote;
+                }
+                ('"', _) => {
+                    out.push(if erase_strings { ' ' } else { ch });
+                    state = TsSanitizeState::DoubleQuote;
+                }
+                ('`', _) => {
+                    out.push(if erase_strings { ' ' } else { ch });
+                    state = TsSanitizeState::Template;
+                }
+                _ => out.push(ch),
+            },
+            TsSanitizeState::LineComment => {
+                if ch == '\n' {
+                    out.push(ch);
+                    state = TsSanitizeState::Code;
+                } else {
+                    out.push(' ');
+                }
+            }
+            TsSanitizeState::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    out.push_str("  ");
+                    state = TsSanitizeState::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+            TsSanitizeState::SingleQuote
+            | TsSanitizeState::DoubleQuote
+            | TsSanitizeState::Template => {
+                let closing = match state {
+                    TsSanitizeState::SingleQuote => '\'',
+                    TsSanitizeState::DoubleQuote => '"',
+                    TsSanitizeState::Template => '`',
+                    TsSanitizeState::Code
+                    | TsSanitizeState::LineComment
+                    | TsSanitizeState::BlockComment
+                    | TsSanitizeState::Regex => unreachable!(),
+                };
+                out.push(if erase_strings && ch != '\n' { ' ' } else { ch });
+                if ch == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(if erase_strings && escaped != '\n' {
+                            ' '
+                        } else {
+                            escaped
+                        });
+                    }
+                } else if ch == closing || (ch == '\n' && closing != '`') {
+                    state = TsSanitizeState::Code;
+                }
+            }
+            TsSanitizeState::Regex => {
+                out.push(if erase_strings && ch != '\n' { ' ' } else { ch });
+                if regex_escape {
+                    regex_escape = false;
+                } else if ch == '\\' {
+                    regex_escape = true;
+                } else if ch == '[' {
+                    regex_character_class = true;
+                } else if ch == ']' {
+                    regex_character_class = false;
+                } else if (ch == '/' && !regex_character_class) || ch == '\n' {
+                    state = TsSanitizeState::Code;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn ts_slash_starts_regex(output: &str) -> bool {
+    let trimmed = output.trim_end();
+    let Some(previous) = trimmed.chars().next_back() else {
+        return true;
+    };
+    if matches!(
+        previous,
+        '=' | '('
+            | ':'
+            | ','
+            | '!'
+            | '['
+            | '{'
+            | ';'
+            | '?'
+            | '&'
+            | '|'
+            | '*'
+            | '%'
+            | '^'
+            | '~'
+            | '<'
+            | '>'
+    ) {
+        return true;
+    }
+    let preceding_word: String = trimmed
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    matches!(
+        preceding_word.as_str(),
+        "return"
+            | "throw"
+            | "case"
+            | "delete"
+            | "void"
+            | "typeof"
+            | "yield"
+            | "await"
+            | "else"
+            | "do"
+    )
+}
+
 fn brace_delta(line: &str) -> i32 {
     line.chars().fold(0, |delta, ch| match ch {
         '{' => delta + 1,
@@ -1626,39 +1874,276 @@ fn brace_delta(line: &str) -> i32 {
     })
 }
 
-fn strip_export_decl<'a>(line: &'a str, kind: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix("export ")?;
-    let rest = rest.strip_prefix(kind)?;
-    let rest = rest.trim_start();
-    ident_prefix(rest)
-}
+fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>> {
+    let mut rest = strip_ts_keyword(line, "export")?;
+    let mut is_default = false;
+    loop {
+        if let Some(next) = strip_ts_keyword(rest, "default") {
+            is_default = true;
+            rest = next;
+        } else if let Some(next) = strip_ts_keyword(rest, "declare")
+            .or_else(|| strip_ts_keyword(rest, "abstract"))
+            .or_else(|| strip_ts_keyword(rest, "async"))
+        {
+            rest = next;
+        } else {
+            break;
+        }
+    }
 
-fn parse_async_method_signature(line: &str) -> Option<(&str, Option<String>)> {
-    let rest = line.strip_prefix("async ")?;
-    parse_method_signature(rest)
-}
+    let (declaration_kind, export_kind, after_kind) =
+        if let Some(after_const) = strip_ts_keyword(rest, "const") {
+            if let Some(after_enum) = strip_ts_keyword(after_const, "enum") {
+                (TsDeclarationKind::Other, TsExportKind::Both, after_enum)
+            } else {
+                (TsDeclarationKind::Const, TsExportKind::Value, after_const)
+            }
+        } else if let Some(after) = strip_ts_keyword(rest, "interface") {
+            (TsDeclarationKind::Interface, TsExportKind::Type, after)
+        } else if let Some(after) = strip_ts_keyword(rest, "type") {
+            (TsDeclarationKind::TypeAlias, TsExportKind::Type, after)
+        } else if let Some(after) = strip_ts_keyword(rest, "class") {
+            (TsDeclarationKind::Class, TsExportKind::Both, after)
+        } else if let Some(after) = strip_ts_keyword(rest, "enum") {
+            (TsDeclarationKind::Other, TsExportKind::Both, after)
+        } else if let Some(after) =
+            strip_ts_keyword(rest, "namespace").or_else(|| strip_ts_keyword(rest, "module"))
+        {
+            (TsDeclarationKind::Other, TsExportKind::Both, after)
+        } else if let Some(after) = strip_ts_keyword(rest, "function")
+            .or_else(|| strip_ts_keyword(rest, "let"))
+            .or_else(|| strip_ts_keyword(rest, "var"))
+        {
+            (TsDeclarationKind::Other, TsExportKind::Value, after)
+        } else if is_default {
+            return Some(TsExportedDeclaration {
+                name: None,
+                export_name: "default",
+                export_kind: TsExportKind::Value,
+                declaration_kind: TsDeclarationKind::Other,
+            });
+        } else {
+            return None;
+        };
 
-fn parse_method_signature(line: &str) -> Option<(&str, Option<String>)> {
-    let method = ident_prefix(line)?;
-    let rest = line.get(method.len()..)?.trim_start();
-    if !rest.starts_with('(') {
+    let name = ident_prefix(after_kind);
+    if name.is_none() && !is_default {
         return None;
     }
-    let return_ty = method_return_type(rest);
-    Some((method, return_ty))
+    Some(TsExportedDeclaration {
+        name,
+        export_name: if is_default { "default" } else { name? },
+        export_kind,
+        declaration_kind,
+    })
 }
 
-fn method_return_type(signature_tail: &str) -> Option<String> {
-    let close = signature_tail.find(')')?;
-    let after_paren = &signature_tail[close + 1..];
-    let rest = after_paren.trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let end = rest
-        .find('{')
-        .or_else(|| rest.find(';'))
-        .unwrap_or(rest.len());
-    let ty = rest[..end].trim();
-    (!ty.is_empty()).then(|| normalize_ts_type(ty))
+fn strip_ts_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
+    let value = value.trim_start();
+    let rest = value.strip_prefix(keyword)?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+    {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+fn could_start_ts_method(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    loop {
+        let Some(modifier) = ident_prefix(rest) else {
+            return false;
+        };
+        match modifier {
+            "private" | "protected" | "get" | "set" => return false,
+            "public" | "static" | "async" | "override" | "abstract" | "declare" => {
+                rest = rest[modifier.len()..].trim_start();
+            }
+            _ => break,
+        }
+    }
+    let Some(name) = ident_prefix(rest) else {
+        return false;
+    };
+    if matches!(
+        name,
+        "constructor" | "if" | "for" | "while" | "switch" | "catch" | "function" | "return" | "new"
+    ) {
+        return false;
+    }
+    let rest = rest[name.len()..].trim_start();
+    rest.starts_with('(') || rest.starts_with('<') || rest.starts_with("?(")
+}
+
+fn parse_ts_method_declaration(declaration: &str) -> TsMethodParse {
+    let declaration = declaration.trim();
+    let mut rest = declaration;
+    let mut retained_modifiers = Vec::new();
+    loop {
+        let Some(modifier) = ident_prefix(rest) else {
+            return TsMethodParse::NotMethod;
+        };
+        match modifier {
+            "private" | "protected" | "get" | "set" => return TsMethodParse::NotMethod,
+            "async" | "static" => {
+                retained_modifiers.push(modifier);
+                rest = rest[modifier.len()..].trim_start();
+            }
+            "public" | "override" | "abstract" | "declare" => {
+                rest = rest[modifier.len()..].trim_start();
+            }
+            _ => break,
+        }
+    }
+    let Some(method) = ident_prefix(rest) else {
+        return TsMethodParse::NotMethod;
+    };
+    if matches!(
+        method,
+        "constructor" | "if" | "for" | "while" | "switch" | "catch" | "function" | "return" | "new"
+    ) {
+        return TsMethodParse::NotMethod;
+    }
+    let method_start = declaration.len() - rest.len();
+    let mut tail = rest[method.len()..].trim_start();
+    if let Some(after_optional) = tail.strip_prefix('?') {
+        tail = after_optional.trim_start();
+    }
+    if tail.starts_with('<') {
+        let Some(generic_end) = matching_ts_delimiter(tail, 0, '<', '>') else {
+            return TsMethodParse::Incomplete;
+        };
+        tail = tail[generic_end + 1..].trim_start();
+    }
+    if !tail.starts_with('(') {
+        return TsMethodParse::NotMethod;
+    }
+    let Some(params_end) = matching_ts_delimiter(tail, 0, '(', ')') else {
+        return TsMethodParse::Incomplete;
+    };
+    let after_params = tail[params_end + 1..].trim_start();
+    if after_params.is_empty() {
+        return TsMethodParse::Incomplete;
+    }
+
+    let (return_type, signature_end) = if let Some(after_colon) = after_params.strip_prefix(':') {
+        let after_colon = after_colon.trim_start();
+        let Some(type_end) = ts_return_type_end(after_colon) else {
+            return TsMethodParse::Incomplete;
+        };
+        let return_type = after_colon[..type_end].trim();
+        if return_type.is_empty() {
+            return TsMethodParse::NotMethod;
+        }
+        let end = declaration.len() - after_colon.len() + type_end;
+        (Some(normalize_ts_type(return_type)), end)
+    } else if after_params.starts_with('{') || after_params.starts_with(';') {
+        (None, declaration.len() - after_params.len())
+    } else {
+        return TsMethodParse::NotMethod;
+    };
+
+    let mut public_signature = String::new();
+    if !retained_modifiers.is_empty() {
+        public_signature.push_str(&retained_modifiers.join(" "));
+        public_signature.push(' ');
+    }
+    public_signature.push_str(declaration[method_start..signature_end].trim());
+    TsMethodParse::Method(TsParsedMethod {
+        name: method.to_string(),
+        return_type,
+        signature: normalize_ts_signature(&public_signature),
+    })
+}
+
+fn matching_ts_delimiter(value: &str, open_idx: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quote = None;
+    let mut escape = false;
+    for (idx, ch) in value.char_indices().filter(|(idx, _)| *idx >= open_idx) {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            ch if ch == open => depth += 1,
+            ch if ch == close => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn ts_return_type_end(value: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escape = false;
+    let mut angle_depth = 0_u32;
+    let mut square_depth = 0_u32;
+    let mut paren_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    for (idx, ch) in value.char_indices() {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '<' => angle_depth += 1,
+            '>' if angle_depth > 0 => angle_depth -= 1,
+            '[' => square_depth += 1,
+            ']' if square_depth > 0 => square_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' if paren_depth > 0 => paren_depth -= 1,
+            '{' if angle_depth == 0 && square_depth == 0 && paren_depth == 0 => {
+                if brace_depth == 0 && ts_brace_starts_method_body(&value[..idx]) {
+                    return Some(idx);
+                }
+                brace_depth += 1;
+            }
+            '}' if brace_depth > 0 => brace_depth -= 1,
+            ';' if angle_depth == 0
+                && square_depth == 0
+                && paren_depth == 0
+                && brace_depth == 0 =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn ts_brace_starts_method_body(type_prefix: &str) -> bool {
+    let type_prefix = type_prefix.trim_end();
+    if type_prefix.is_empty() || type_prefix.ends_with("=>") {
+        return false;
+    }
+    !type_prefix
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '|' | '&' | '?' | ':' | ',' | '=' | '(' | '[' | '<'))
 }
 
 fn parse_interface_property(line: &str) -> Option<(String, TsInterfaceProperty)> {
@@ -1714,18 +2199,113 @@ fn property_name_and_optional(left: &str) -> Option<(String, bool)> {
 }
 
 fn normalize_ts_type(ty: &str) -> String {
-    ty.split_whitespace().collect::<Vec<_>>().join(" ")
+    normalize_ts_tokens(ty)
 }
 
 fn normalize_ts_signature(signature: &str) -> String {
     let signature = signature
-        .split_once('{')
-        .map_or(signature, |(signature, _)| signature)
         .trim()
         .trim_end_matches(';')
         .trim_end_matches(',')
         .trim();
-    signature.split_whitespace().collect::<Vec<_>>().join(" ")
+    normalize_ts_tokens(signature)
+}
+
+fn normalize_ts_tokens(value: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            let mut token = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_alphanumeric() || *next == '_' || *next == '$')
+            {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            let mut token = String::from(ch);
+            let quote = ch;
+            let mut escape = false;
+            for next in chars.by_ref() {
+                token.push(next);
+                if escape {
+                    escape = false;
+                } else if next == '\\' {
+                    escape = true;
+                } else if next == quote {
+                    break;
+                }
+            }
+            tokens.push(token);
+            continue;
+        }
+        let mut token = String::from(ch);
+        if ch == '.' && chars.peek() == Some(&'.') {
+            if let Some(next) = chars.next() {
+                token.push(next);
+            }
+            if chars.peek() == Some(&'.') {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            }
+        } else if ch == '=' && chars.peek() == Some(&'>') {
+            if let Some(next) = chars.next() {
+                token.push(next);
+            }
+        }
+        tokens.push(token);
+    }
+
+    let mut normalized: Vec<String> = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if matches!(token.as_str(), ")" | "]" | "}")
+            && normalized.last().is_some_and(|previous| previous == ",")
+        {
+            normalized.pop();
+        }
+        if normalized
+            .last()
+            .is_some_and(|previous| ts_tokens_need_space(previous, &token))
+        {
+            normalized.push(" ".to_string());
+        }
+        normalized.push(token);
+    }
+    normalized.concat()
+}
+
+fn ts_token_is_atom(token: &str) -> bool {
+    token.chars().next().is_some_and(|ch| {
+        ch.is_alphanumeric() || ch == '_' || ch == '$' || matches!(ch, '\'' | '"' | '`')
+    })
+}
+
+fn ts_tokens_need_space(previous: &str, current: &str) -> bool {
+    if ts_token_is_atom(previous) && ts_token_is_atom(current) {
+        return true;
+    }
+    if matches!(previous, "," | ":" | "|" | "&" | "=" | "=>")
+        && !matches!(current, ")" | "]" | "}" | "," | ";")
+    {
+        return true;
+    }
+    if previous == "{" && current != "}" {
+        return true;
+    }
+    if current == "}" && previous != "{" {
+        return true;
+    }
+    matches!(current, "|" | "&" | "=" | "=>")
 }
 
 fn ts_type_contains_null(ty: &str) -> bool {
@@ -1747,27 +2327,129 @@ fn ident_prefix(value: &str) -> Option<&str> {
     Some(&value[..end])
 }
 
-fn parse_export_list(exports: &str, kind: TsExportKind, into: &mut BTreeMap<String, TsExportKind>) {
-    let Some((list, _)) = exports.split_once('}') else {
-        return;
-    };
-    for part in list.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+struct TsNamedReexport {
+    source: String,
+    exported: String,
+    type_only: bool,
+}
+
+enum TsReexport {
+    Named {
+        exports: Vec<TsNamedReexport>,
+        module: Option<String>,
+    },
+    Star {
+        module: String,
+        namespace: Option<String>,
+        type_only: bool,
+    },
+}
+
+fn ts_reexports(text: &str) -> Vec<TsReexport> {
+    ts_reexport_statements(text)
+        .iter()
+        .filter_map(|statement| parse_ts_reexport(statement))
+        .collect()
+}
+
+fn ts_reexport_statements(text: &str) -> Vec<String> {
+    let code = sanitize_typescript(text, false);
+    let lines: Vec<_> = code.lines().collect();
+    let mut statements = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if !is_ts_reexport_start(line) {
+            index += 1;
             continue;
         }
-        let name = part
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .rsplit(|token| *token == "as")
-            .next()
-            .and_then(|tokens| tokens.last())
-            .copied()
-            .unwrap_or(part);
-        if let Some(name) = ident_prefix(name) {
-            add_export(into, name, kind);
+        let mut statement = line.to_string();
+        if line.starts_with("export {") || line.starts_with("export type {") {
+            while !statement.contains('}') && index + 1 < lines.len() {
+                index += 1;
+                statement.push(' ');
+                statement.push_str(lines[index].trim());
+            }
+            if statement
+                .split_once('}')
+                .is_some_and(|(_, suffix)| suffix.trim().is_empty())
+                && index + 1 < lines.len()
+                && lines[index + 1].trim_start().starts_with("from ")
+            {
+                index += 1;
+                statement.push(' ');
+                statement.push_str(lines[index].trim());
+            }
+        }
+        statements.push(statement);
+        index += 1;
+    }
+    statements
+}
+
+fn is_ts_reexport_start(line: &str) -> bool {
+    line.starts_with("export {")
+        || line.starts_with("export type {")
+        || line.starts_with("export *")
+        || line.starts_with("export type *")
+}
+
+fn parse_ts_reexport(statement: &str) -> Option<TsReexport> {
+    let mut rest = strip_ts_keyword(statement, "export")?;
+    let mut type_only = false;
+    if let Some(after_type) = strip_ts_keyword(rest, "type") {
+        if after_type.starts_with('{') || after_type.starts_with('*') {
+            type_only = true;
+            rest = after_type;
         }
     }
+    if let Some(after_star) = rest.strip_prefix('*') {
+        let mut after_star = after_star.trim_start();
+        let namespace = if let Some(after_as) = strip_ts_keyword(after_star, "as") {
+            let name = ident_prefix(after_as)?.to_string();
+            after_star = after_as[name.len()..].trim_start();
+            Some(name)
+        } else {
+            None
+        };
+        let after_from = strip_ts_keyword(after_star, "from")?;
+        return Some(TsReexport::Star {
+            module: quoted_module_spec(after_from)?.to_string(),
+            namespace,
+            type_only,
+        });
+    }
+
+    let after_open = rest.strip_prefix('{')?;
+    let (list, after_close) = after_open.split_once('}')?;
+    let module = strip_ts_keyword(after_close, "from")
+        .and_then(quoted_module_spec)
+        .map(str::to_string);
+    let mut exports = Vec::new();
+    for raw_export in list.split(',') {
+        let mut export = raw_export.trim();
+        if export.is_empty() {
+            continue;
+        }
+        let mut item_type_only = type_only;
+        if let Some(after_type) = strip_ts_keyword(export, "type") {
+            item_type_only = true;
+            export = after_type;
+        }
+        let source = ident_prefix(export)?;
+        let after_source = export[source.len()..].trim_start();
+        let exported = if let Some(after_as) = strip_ts_keyword(after_source, "as") {
+            ident_prefix(after_as)?
+        } else {
+            source
+        };
+        exports.push(TsNamedReexport {
+            source: source.to_string(),
+            exported: exported.to_string(),
+            type_only: item_type_only,
+        });
+    }
+    Some(TsReexport::Named { exports, module })
 }
 
 fn add_export(into: &mut BTreeMap<String, TsExportKind>, name: &str, kind: TsExportKind) {
@@ -1835,13 +2517,66 @@ fn exports_from_file(
 
     let text = read_to_string(dir.join(rel))?;
     let parsed = parse_ts_file(&text);
-    let mut exports = parsed.exports;
+    let direct_exports = parsed.exports;
+    let mut exports = direct_exports.clone();
     let base = rel.parent().unwrap_or_else(|| Path::new(""));
-    for line in text.lines().map(str::trim) {
-        if let Some(spec) = export_star_module_spec(line) {
-            if let Some(target) = resolve_ts_module(dir, base, spec) {
+    for reexport in ts_reexports(&text) {
+        match reexport {
+            TsReexport::Star {
+                module,
+                namespace,
+                type_only,
+            } => {
+                if let Some(namespace) = namespace {
+                    add_export(
+                        &mut exports,
+                        &namespace,
+                        if type_only {
+                            TsExportKind::Type
+                        } else {
+                            TsExportKind::Value
+                        },
+                    );
+                    continue;
+                }
+                let Some(target) = resolve_ts_reexport_target(dir, base, rel, &module)? else {
+                    continue;
+                };
                 let nested = exports_from_file(dir, &target, cache, stack)?;
-                merge_exports(&mut exports, &nested);
+                for (name, kind) in nested {
+                    if name == "default" {
+                        continue;
+                    }
+                    add_export(
+                        &mut exports,
+                        &name,
+                        if type_only { TsExportKind::Type } else { kind },
+                    );
+                }
+            }
+            TsReexport::Named {
+                exports: named,
+                module,
+            } => {
+                let source_exports = if let Some(module) = module {
+                    resolve_ts_reexport_target(dir, base, rel, &module)?
+                        .map(|target| exports_from_file(dir, &target, cache, stack))
+                        .transpose()?
+                        .unwrap_or_default()
+                } else {
+                    direct_exports.clone()
+                };
+                for named_export in named {
+                    let kind = if named_export.type_only {
+                        TsExportKind::Type
+                    } else {
+                        source_exports
+                            .get(&named_export.source)
+                            .copied()
+                            .unwrap_or(TsExportKind::Value)
+                    };
+                    add_export(&mut exports, &named_export.exported, kind);
+                }
             }
         }
     }
@@ -1851,9 +2586,22 @@ fn exports_from_file(
     Ok(exports)
 }
 
-fn export_star_module_spec(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("export * from ")?;
-    quoted_module_spec(rest)
+fn resolve_ts_reexport_target(
+    dir: &Path,
+    base: &Path,
+    source_file: &Path,
+    module: &str,
+) -> Result<Option<PathBuf>, CoreError> {
+    let target = resolve_ts_module(dir, base, module);
+    if module.starts_with('.') && target.is_none() {
+        return Err(CoreError::Workspace {
+            message: format!(
+                "TypeScript re-export in {} references missing module {module:?}",
+                source_file.display()
+            ),
+        });
+    }
+    Ok(target)
 }
 
 fn quoted_module_spec(value: &str) -> Option<&str> {
@@ -4077,6 +4825,115 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn typescript_extracts_multiline_modified_methods_without_structural_noise() {
+        let dir = temp_dir("ts-multiline-methods");
+        std::fs::write(
+            dir.join("index.ts"),
+            r"export default abstract class BooksApi {
+  // A stray closing brace in a comment must not end the class: }
+  public async getBook(
+    id: string,
+    options?: { trace?: boolean },
+  ): Promise<
+    Book
+  > {
+    const diagnostic = `body braces are not declarations: } {`;
+    const closingBrace = /}/;
+    return this.fetch(id, options);
+  }
+
+  listBooks(
+    options?: RequestOptions,
+  ): Promise<Book[]> {
+    return this.fetchAll(options);
+  }
+
+  protected async internalOnly(): Promise<void> {}
+  private hidden(): void {}
+}
+",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&dir).unwrap();
+        assert_eq!(surface.root_exports["default"], TsExportKind::Both);
+        assert_eq!(surface.api_classes, vec!["BooksApi"]);
+        assert_eq!(
+            surface.operation_methods,
+            vec!["BooksApi.getBook", "BooksApi.listBooks"]
+        );
+        assert_eq!(
+            surface.operation_return_types["BooksApi.getBook"],
+            "Promise<Book>"
+        );
+        assert_eq!(
+            surface.operation_signatures["BooksApi.getBook"],
+            "async getBook(id: string, options?: { trace?: boolean }): Promise<Book>"
+        );
+        assert_eq!(
+            surface.operation_signatures["BooksApi.listBooks"],
+            "listBooks(options?: RequestOptions): Promise<Book[]>"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_named_reexports_preserve_aliases_and_namespace_kinds() {
+        let dir = temp_dir("ts-named-reexports");
+        std::fs::write(
+            dir.join("index.ts"),
+            r#"export {
+  type Book as PublishedBook,
+  BookState as State,
+  BooksApi,
+} from "./public";
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("public.ts"),
+            r#"export interface Book {}
+export const BookState = { available: "available" } as const;
+export class BooksApi {}
+export default class InternalDefault {}
+"#,
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&dir).unwrap();
+        assert_eq!(
+            surface.root_exports,
+            BTreeMap::from([
+                ("BooksApi".to_string(), TsExportKind::Both),
+                ("PublishedBook".to_string(), TsExportKind::Type),
+                ("State".to_string(), TsExportKind::Value),
+            ])
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_export_star_does_not_reexport_default() {
+        let dir = temp_dir("ts-star-default");
+        std::fs::write(dir.join("index.ts"), "export * from \"./public\";\n").unwrap();
+        std::fs::write(
+            dir.join("public.ts"),
+            "export default class HiddenDefault {}\nexport interface Book {}\n",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&dir).unwrap();
+        assert_eq!(
+            surface.root_exports,
+            BTreeMap::from([("Book".to_string(), TsExportKind::Type)])
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
