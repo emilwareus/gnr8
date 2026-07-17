@@ -1811,16 +1811,12 @@ fn extract_root_exports(
     all_exports: &BTreeMap<String, TsExportKind>,
 ) -> Result<BTreeMap<String, TsExportKind>, CoreError> {
     let index = Path::new("index.ts");
-    if !dir.join(index).exists() {
+    if !files.iter().any(|path| path == index) {
         return Ok(all_exports.clone());
     }
     let mut cache = BTreeMap::new();
     let mut stack = Vec::new();
-    let root = exports_from_file(dir, index, &mut cache, &mut stack)?;
-    if root.is_empty() && files.iter().any(|path| path == Path::new("index.ts")) {
-        return Ok(all_exports.clone());
-    }
-    Ok(root)
+    exports_from_file(dir, index, &mut cache, &mut stack)
 }
 
 fn exports_from_file(
@@ -1913,12 +1909,14 @@ fn collect_ts_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
             ),
         })?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = sdk_entry_file_type(&entry, "TypeScript SDK")?;
+        if file_type.is_dir() {
             if path.file_name().and_then(|name| name.to_str()) == Some("node_modules") {
                 continue;
             }
             collect_ts_files(root, &path, out)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("ts") {
+        } else if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("ts")
+        {
             let rel = path
                 .strip_prefix(root)
                 .map_err(|err| CoreError::Workspace {
@@ -1939,6 +1937,28 @@ fn read_to_string(path: impl AsRef<Path>) -> Result<String, CoreError> {
     std::fs::read_to_string(path).map_err(|err| CoreError::Workspace {
         message: format!("failed to read {}: {err}", path.display()),
     })
+}
+
+fn sdk_entry_file_type(
+    entry: &std::fs::DirEntry,
+    surface: &str,
+) -> Result<std::fs::FileType, CoreError> {
+    let path = entry.path();
+    let file_type = entry.file_type().map_err(|error| CoreError::Workspace {
+        message: format!(
+            "failed to inspect {surface} path {}: {error}",
+            path.display()
+        ),
+    })?;
+    if file_type.is_symlink() {
+        return Err(CoreError::Workspace {
+            message: format!(
+                "{surface} surface traversal does not follow symbolic link {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(file_type)
 }
 
 fn is_model_file(path: &Path) -> bool {
@@ -3040,7 +3060,8 @@ fn collect_python_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Resu
             ),
         })?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = sdk_entry_file_type(&entry, "Python SDK")?;
+        if file_type.is_dir() {
             let skipped = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -3053,7 +3074,9 @@ fn collect_python_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Resu
             if !skipped {
                 collect_python_files(root, &path, out)?;
             }
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("py") {
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("py")
+        {
             let rel = path
                 .strip_prefix(root)
                 .map_err(|error| CoreError::Workspace {
@@ -3173,32 +3196,220 @@ struct ParsedGoFile {
 
 fn parse_go_file(text: &str) -> ParsedGoFile {
     let mut parsed = ParsedGoFile::default();
-    for raw in text.lines() {
-        let line = raw.trim();
+    let lines = go_source_lines_without_comments(text);
+    let mut brace_depth = 0_i32;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
         if line.is_empty() || line.starts_with("//") {
+            index += 1;
             continue;
         }
-        if let Some(name) = go_type_decl(line) {
-            if is_go_exported(name) {
-                parsed.types.push(name.to_string());
+        if brace_depth == 0 {
+            if line.starts_with("func ") {
+                let (declaration, last) = collect_go_function_declaration(&lines, index);
+                if let Some((name, signature)) = go_func_decl(&declaration) {
+                    if is_go_exported(&name) {
+                        parsed.functions.insert(name, signature);
+                    }
+                }
+                if let Some((receiver, method, signature)) = go_method_decl(&declaration) {
+                    if is_go_exported(&receiver) && is_go_exported(&method) {
+                        parsed
+                            .methods
+                            .insert(format!("{receiver}.{method}"), signature);
+                    }
+                }
+                brace_depth += lines[index..=last]
+                    .iter()
+                    .map(|line| go_brace_delta(line))
+                    .sum::<i32>();
+                index = last + 1;
+                continue;
+            }
+            if let Some(name) = go_type_decl(line) {
+                if is_go_exported(name) {
+                    parsed.types.push(name.to_string());
+                }
             }
         }
-        if let Some((name, signature)) = go_func_decl(line) {
-            if is_go_exported(&name) {
-                parsed.functions.insert(name, signature);
-            }
-        }
-        if let Some((receiver, method, signature)) = go_method_decl(line) {
-            if is_go_exported(&receiver) && is_go_exported(&method) {
-                parsed
-                    .methods
-                    .insert(format!("{receiver}.{method}"), signature);
-            }
-        }
+        brace_depth += go_brace_delta(line);
+        index += 1;
     }
     parsed.types.sort();
     parsed.types.dedup();
     parsed
+}
+
+fn collect_go_function_declaration(lines: &[String], start: usize) -> (String, usize) {
+    let mut declaration = String::new();
+    let mut index = start;
+    while index < lines.len() {
+        if !declaration.is_empty() {
+            declaration.push(' ');
+        }
+        declaration.push_str(lines[index].trim());
+        if go_function_body_open(&declaration).is_some() {
+            break;
+        }
+        if go_declaration_delimiters_balanced(&declaration) {
+            break;
+        }
+        index += 1;
+    }
+    (declaration, index.min(lines.len().saturating_sub(1)))
+}
+
+fn go_source_lines_without_comments(text: &str) -> Vec<String> {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    while let Some(ch) = chars.next() {
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+                output.push(ch);
+            }
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
+            } else if ch == '\n' {
+                output.push(ch);
+            }
+            continue;
+        }
+        if let Some(active) = quote {
+            output.push(ch);
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            line_comment = true;
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            block_comment = true;
+            if !output.ends_with(char::is_whitespace) {
+                output.push(' ');
+            }
+        } else {
+            if matches!(ch, '\'' | '"' | '`') {
+                quote = Some(ch);
+            }
+            output.push(ch);
+        }
+    }
+    output.lines().map(ToString::to_string).collect()
+}
+
+fn go_declaration_delimiters_balanced(value: &str) -> bool {
+    let mut round = 0_i32;
+    let mut square = 0_i32;
+    let mut curly = 0_i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if let Some(active) = quote {
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' => round += 1,
+            ')' => round -= 1,
+            '[' => square += 1,
+            ']' => square -= 1,
+            '{' => curly += 1,
+            '}' => curly -= 1,
+            _ => {}
+        }
+    }
+    round == 0 && square == 0 && curly == 0 && quote.is_none()
+}
+
+fn go_brace_delta(value: &str) -> i32 {
+    let mut quote = None;
+    let mut escaped = false;
+    value.chars().fold(0, |mut depth, ch| {
+        if let Some(active) = quote {
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            return depth;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        depth
+    })
+}
+
+fn go_function_body_open(value: &str) -> Option<usize> {
+    let mut round = 0_u32;
+    let mut square = 0_u32;
+    let mut curly = 0_u32;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if let Some(active) = quote {
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' => round += 1,
+            ')' => round = round.saturating_sub(1),
+            '[' => square += 1,
+            ']' => square = square.saturating_sub(1),
+            '{' if round == 0 && square == 0 && curly == 0 => {
+                let keyword = value[..index]
+                    .trim_end()
+                    .rsplit(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .next()
+                    .unwrap_or_default();
+                if matches!(keyword, "struct" | "interface") {
+                    curly += 1;
+                } else {
+                    return Some(index);
+                }
+            }
+            '{' => curly += 1,
+            '}' => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn go_type_decl(line: &str) -> Option<&str> {
@@ -3237,9 +3448,8 @@ fn go_receiver_type(receiver: &str) -> Option<String> {
 }
 
 fn normalize_go_signature(line: &str) -> String {
-    let signature = line
-        .split_once('{')
-        .map_or(line, |(signature, _)| signature)
+    let signature = go_function_body_open(line)
+        .map_or(line, |index| &line[..index])
         .trim();
     normalize_go_func_signature(signature)
         .unwrap_or_else(|| collapse_go_signature_whitespace(signature))
@@ -3315,29 +3525,32 @@ fn matching_go_delimiter(value: &str, open_at: usize, open: char, close: char) -
 }
 
 fn normalize_go_param_list(list: &str) -> String {
-    split_go_top_level_commas(list)
-        .into_iter()
-        .flat_map(normalize_go_param_decl)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn normalize_go_param_decl(decl: &str) -> Vec<String> {
-    let decl = collapse_go_signature_whitespace(decl);
-    if decl.is_empty() {
-        return Vec::new();
+    let mut normalized = Vec::new();
+    let mut pending_identifiers = Vec::new();
+    for declaration in split_go_top_level_commas(list) {
+        let declaration = collapse_go_signature_whitespace(declaration);
+        if declaration.is_empty() {
+            continue;
+        }
+        if let Some((names, ty)) = split_go_decl_at_top_level_name_space(&declaration) {
+            let name_count = names
+                .split(',')
+                .filter(|name| !name.trim().is_empty())
+                .count();
+            normalized.extend(std::iter::repeat_n(
+                ty.to_string(),
+                pending_identifiers.len() + name_count,
+            ));
+            pending_identifiers.clear();
+        } else if is_go_parameter_name(&declaration) {
+            pending_identifiers.push(declaration);
+        } else {
+            normalized.append(&mut pending_identifiers);
+            normalized.push(declaration);
+        }
     }
-    let Some((names, ty)) = split_go_decl_at_top_level_name_space(&decl) else {
-        return vec![decl];
-    };
-    if !is_go_identifier_list(names) {
-        return vec![decl];
-    }
-    let count = names
-        .split(',')
-        .filter(|name| !name.trim().is_empty())
-        .count();
-    std::iter::repeat_n(ty.to_string(), count).collect()
+    normalized.append(&mut pending_identifiers);
+    normalized.join(", ")
 }
 
 fn split_go_decl_at_top_level_name_space(value: &str) -> Option<(&str, &str)> {
@@ -3362,7 +3575,7 @@ fn split_go_decl_at_top_level_name_space(value: &str) -> Option<(&str, &str)> {
         } else if let Some(start) = current_space_start.take() {
             let names = value[..start].trim();
             let ty = value[index..].trim();
-            if !names.is_empty() && !ty.is_empty() && is_go_identifier_list(names) {
+            if !names.is_empty() && !ty.is_empty() && is_go_parameter_name_list(names) {
                 return Some((names, ty));
             }
         }
@@ -3395,11 +3608,41 @@ fn split_go_top_level_commas(value: &str) -> Vec<&str> {
     out
 }
 
-fn is_go_identifier_list(value: &str) -> bool {
-    value
-        .split(',')
-        .map(str::trim)
-        .all(|part| !part.is_empty() && ident_prefix(part) == Some(part))
+fn is_go_parameter_name_list(value: &str) -> bool {
+    value.split(',').map(str::trim).all(is_go_parameter_name)
+}
+
+fn is_go_parameter_name(value: &str) -> bool {
+    !value.is_empty()
+        && ident_prefix(value) == Some(value)
+        && !matches!(
+            value,
+            "break"
+                | "case"
+                | "chan"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "go"
+                | "goto"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
+        )
 }
 
 fn collapse_go_signature_whitespace(signature: &str) -> String {
@@ -3421,13 +3664,18 @@ fn collect_go_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
             message: format!("failed to read Go SDK dir entry {}: {err}", dir.display()),
         })?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = sdk_entry_file_type(&entry, "Go SDK")?;
+        if file_type.is_dir() {
             if path.file_name().and_then(|name| name.to_str()) == Some("vendor") {
                 continue;
             }
             collect_go_files(root, &path, out)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("go")
-            && path.file_name().and_then(|name| name.to_str()) != Some("go.mod")
+        } else if file_type.is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("go")
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_test.go"))
         {
             let rel = path
                 .strip_prefix(root)
@@ -3479,7 +3727,8 @@ fn collect_doc_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(
             message: format!("failed to read SDK doc dir entry {}: {err}", dir.display()),
         })?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = sdk_entry_file_type(&entry, "SDK documentation")?;
+        if file_type.is_dir() {
             if matches!(
                 path.file_name().and_then(|name| name.to_str()),
                 Some("vendor" | "node_modules")
@@ -3487,7 +3736,8 @@ fn collect_doc_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(
                 continue;
             }
             collect_doc_files(root, &path, out)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+        } else if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md")
+        {
             let rel = path
                 .strip_prefix(root)
                 .map_err(|err| CoreError::Workspace {
@@ -3804,6 +4054,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn empty_typescript_barrel_does_not_export_private_modules() {
+        let old = temp_dir("ts-root-barrel-old");
+        let new = temp_dir("ts-root-barrel-new");
+        std::fs::write(old.join("index.ts"), "export * from \"./models\";\n").unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            "// Intentionally no public exports.\n",
+        )
+        .unwrap();
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("models.ts"), "export interface Book {}\n").unwrap();
+        }
+
+        let new_surface = extract_typescript_surface(&new).unwrap();
+        assert!(new_surface.root_exports.is_empty());
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert_eq!(diff.missing_root_exports, vec!["Book"]);
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
     }
 
     #[test]
@@ -4290,6 +4563,121 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_diff_parses_multiline_signatures_and_grouped_parameter_names() {
+        let old = temp_dir("go-old-multiline-signature");
+        let new = temp_dir("go-new-multiline-signature");
+        let equivalent = temp_dir("go-equivalent-grouped-signature");
+        for dir in [&old, &new, &equivalent] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        }
+        std::fs::write(
+            old.join("client.go"),
+            "package sdk\n\nfunc NewClient(\n    host, token string,\n    retries int,\n) (*Client, error) {\n    return nil, nil\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("client.go"),
+            "package sdk\n\nfunc NewClient(\n    baseURL, bearer string,\n    retries string,\n) (*Client, error) {\n    return nil, nil\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            equivalent.join("client.go"),
+            "package sdk\n\nfunc NewClient(baseURL string, bearer string, retryCount int) (*Client, error) {\n    return nil, nil\n}\n",
+        )
+        .unwrap();
+
+        let changed = diff_go_dirs(&old, &new).unwrap();
+        assert_eq!(changed.exported_function_signature_changes.len(), 1);
+        let same = diff_go_dirs(&old, &equivalent).unwrap();
+        assert!(
+            same.exported_function_signature_changes.is_empty(),
+            "grouped parameter names are not part of the Go function type: {same:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+        let _ = std::fs::remove_dir_all(equivalent);
+    }
+
+    #[test]
+    fn go_surface_excludes_test_only_exports() {
+        let old = temp_dir("go-test-exports-old");
+        let new = temp_dir("go-test-exports-new");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+            std::fs::write(
+                dir.join("client.go"),
+                "package sdk\n\ntype Client struct{}\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            old.join("client_test.go"),
+            "package sdk\n\nfunc LegacyTestHelper() {}\n",
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert!(
+            !diff.is_breaking(),
+            "test helpers are not shipped API: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_surface_parses_bodyless_functions_and_comments_as_whitespace() {
+        let old = temp_dir("go-bodyless-old");
+        let new = temp_dir("go-bodyless-new");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        }
+        std::fs::write(
+            old.join("assembly.go"),
+            "package sdk\n\nfunc/* generated */External(value int)\nfunc Stable() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("assembly.go"),
+            "package sdk\n\nfunc External(value string)\nfunc Stable() {}\n",
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert_eq!(
+            diff.exported_function_signature_changes.len(),
+            1,
+            "{diff:?}"
+        );
+        assert_eq!(
+            diff.exported_function_signature_changes[0].symbol,
+            "External"
+        );
+        assert!(diff.missing_exported_functions.is_empty(), "{diff:?}");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sdk_surface_walk_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("ts-symlink-cycle");
+        std::fs::write(dir.join("index.ts"), "export interface Book {}\n").unwrap();
+        symlink(&dir, dir.join("loop")).unwrap();
+
+        let error = extract_typescript_surface(&dir).unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
+
+        let _ = std::fs::remove_file(dir.join("loop"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
