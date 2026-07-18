@@ -11,6 +11,9 @@ import {
   HttpCode,
 } from "@nestjs/common";
 
+const DYNAMIC_PATH = "/dynamic";
+const DYNAMIC_STATUS = 202;
+
 export class Thing {
   id: number;
 }
@@ -42,6 +45,27 @@ export class EdgesController {
   // single path (the dual `t.aliasSymbol` discriminator is gone).
   @Get("/named")
   getNamed(): Thing {
+    return new Thing();
+  }
+
+  @Get("/async")
+  async getAsync(): Promise<Thing> {
+    return new Thing();
+  }
+
+  @Get(DYNAMIC_PATH)
+  dynamicPath(): Thing {
+    return new Thing();
+  }
+
+  @Post("/dynamic-status")
+  @HttpCode(DYNAMIC_STATUS)
+  dynamicStatus(): Thing {
+    return new Thing();
+  }
+
+  @Get("/inferred")
+  inferredReturn() {
     return new Thing();
   }
 

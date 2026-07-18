@@ -64,19 +64,15 @@ function _decoratorName(decorator) {
   return null;
 }
 
-// Return the first string-literal argument of a decorator call (`@Get('/')` ->
-// "/", `@Param('bookId')` -> "bookId"), or null if there is none (`@Body()`).
+// Return the first argument when it is a string literal (`@Get('/')` -> "/",
+// `@Param('bookId')` -> "bookId"), or null for no/dynamic first argument.
 function _decoratorStringArg(decorator) {
   const expr = decorator.expression;
   if (!ts.isCallExpression(expr)) {
     return null;
   }
-  for (const arg of expr.arguments) {
-    if (ts.isStringLiteralLike(arg)) {
-      return arg.text;
-    }
-  }
-  return null;
+  const arg = expr.arguments[0];
+  return arg && ts.isStringLiteralLike(arg) ? arg.text : null;
 }
 
 // Return the integer argument of a decorator call (`@HttpCode(204)` -> 204), or
@@ -149,8 +145,26 @@ function _verbDecorator(loaded, methodDecl, diags) {
   for (const dec of _decorators(methodDecl)) {
     const name = _decoratorName(dec);
     if (name && Object.prototype.hasOwnProperty.call(_VERB_MAP, name)) {
+      const raw = _decoratorStringArg(dec);
+      const expr = dec.expression;
+      if (ts.isCallExpression(expr) && expr.arguments.length > 0 && raw === null) {
+        const sf = methodDecl.getSourceFile();
+        const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+        diags.warn(
+          "HTTP-verb decorator '@" +
+            name +
+            "' has a non-literal route path; route omitted (no fallback)",
+          load.relFile(loaded.targetDir, sf.fileName),
+          line,
+          {
+            code: "source.route.unresolved",
+            category: "source",
+            subject: methodDecl.name.getText(sf),
+          }
+        );
+        continue;
+      }
       if (chosen === null) {
-        const raw = _decoratorStringArg(dec);
         chosen = {
           method: _VERB_MAP[name],
           // A verb decorator with no string arg defaults to the group root `/`.
@@ -190,6 +204,19 @@ function _httpCodeOverride(loaded, methodDecl, diags, operation) {
     if (_decoratorName(dec) === "HttpCode") {
       const n = _decoratorNumberArg(dec);
       if (n === null) {
+        const sf = methodDecl.getSourceFile();
+        const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+        diags.warn(
+          "@HttpCode override is not an integer literal; override ignored (no fallback)",
+          load.relFile(loaded.targetDir, sf.fileName),
+          line,
+          {
+            code: "response.status.unresolved",
+            category: "response",
+            operation: operation,
+            subject: "HttpCode",
+          }
+        );
         return null;
       }
       if (n >= 100 && n <= 599) {
@@ -250,6 +277,19 @@ function _paramKind(paramDecl) {
 // diagnosed distinctly (WR-02) and the body omitted — never a guessed ref.
 function _responseRef(loaded, methodDecl, diags, registry, operation) {
   if (!methodDecl.type) {
+    const sf = methodDecl.getSourceFile();
+    const line = sf.getLineAndCharacterOfPosition(methodDecl.name.getStart(sf)).line + 1;
+    diags.warn(
+      "handler has no return type annotation; response body omitted (no fallback)",
+      load.relFile(loaded.targetDir, sf.fileName),
+      line,
+      {
+        code: "response.schema.unresolved",
+        category: "response",
+        operation: operation,
+        subject: methodDecl.name.getText(sf),
+      }
+    );
     return null;
   }
   const sf = methodDecl.getSourceFile();

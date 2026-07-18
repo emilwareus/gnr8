@@ -104,9 +104,22 @@ function mapType(loaded, node, diags, registry) {
 // which would resolve to the method's function/signature type. Returns the same
 // `{ schema, optional, nullable }` shape as `mapType`.
 function mapReturnType(loaded, methodDecl, diags, registry) {
-  const anno = methodDecl.type;
+  let anno = methodDecl.type;
   if (!anno) {
     return { schema: null, optional: false, nullable: false };
+  }
+  // NestJS handlers are commonly async. `Promise<T>` describes the runtime
+  // response body as T, so unwrap the syntactic and semantic return type before
+  // using the same field/parameter mapper. This is a direct type fact, not a
+  // fallback; unsupported Promise arity still follows the normal diagnostic path.
+  if (
+    ts.isTypeReferenceNode(anno) &&
+    ts.isIdentifier(anno.typeName) &&
+    anno.typeName.text === "Promise" &&
+    anno.typeArguments &&
+    anno.typeArguments.length === 1
+  ) {
+    anno = anno.typeArguments[0];
   }
   const full = loaded.checker.getTypeAtLocation(anno);
   return _mapAnnotated(loaded, full, anno, anno, diags, registry);

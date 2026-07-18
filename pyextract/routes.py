@@ -154,6 +154,20 @@ def _has_default(args, index):
     return index >= total - num_defaults
 
 
+def _warn_untyped_param(arg, path, method, abs_path, diags):
+    """Record a handler parameter whose role/type cannot be derived statically."""
+    diags.warn(
+        "untyped handler parameter '{}' on {} {} is omitted; parameter location "
+        "and schema cannot be inferred (no fallback)".format(arg.arg, method, path),
+        abs_path,
+        getattr(arg, "lineno", 0),
+        code="request.parameter.unresolved",
+        category="request_parameter",
+        operation="{} {}".format(method, path),
+        subject=arg.arg,
+    )
+
+
 def _is_union_alias(node):
     """Whether an alias value node is a ``Union[...]`` / ``A | B`` (a standalone schema)."""
     if isinstance(node, ast.Subscript):
@@ -220,6 +234,7 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     for index, arg in enumerate(pos):
         annotation = arg.annotation
         if annotation is None:
+            _warn_untyped_param(arg, path, method, abs_path, diags)
             continue
         # A parameter typed by a model/@dataclass class is the request body, not a param.
         body_ref = _resolves_to_class(annotation, in_module, table)
@@ -288,6 +303,7 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     for index, arg in enumerate(kwonly):
         annotation = arg.annotation
         if annotation is None:
+            _warn_untyped_param(arg, path, method, abs_path, diags)
             continue
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
@@ -348,25 +364,46 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     return params, request_body
 
 
-def _build_response(call):
-    """Build the single response fact from ``response_model=`` / ``status_code=``.
+def _build_response(call, operation, abs_path, diags):
+    """Build a safe status from ``status_code=`` and diagnose dynamic overrides.
 
-    ``status_code=`` Constant -> status (default 200 when absent); ``response_model=``
-    a class Name -> the response body $ref. The id is resolved by the caller's symtab
-    pass via the annotation name; here we capture the raw name node.
+    An absent override uses FastAPI's 200 default. A present override must be an
+    integer HTTP status in 100..599; anything else is incomplete source analysis
+    and retains the deterministic default with a denyable diagnostic.
     """
-    status = _const_kwarg(call, "status_code")
-    if not isinstance(status, int):
-        status = 200
-    return status
+    keyword = next((kw for kw in call.keywords if kw.arg == "status_code"), None)
+    if keyword is None:
+        return 200
+    status = keyword.value.value if isinstance(keyword.value, ast.Constant) else None
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        return status
+    diags.warn(
+        "FastAPI status_code on {} is not a constant HTTP status in 100..599; "
+        "using the framework default 200 (no fallback)".format(operation),
+        abs_path,
+        getattr(keyword.value, "lineno", 0),
+        code="response.status.unresolved",
+        category="response",
+        operation=operation,
+        subject="status_code",
+    )
+    return 200
 
 
-def _response_model_ref(call, in_module, table):
-    """Resolve a ``response_model=ClassName`` keyword to a schema $ref id, or None."""
-    for kw in call.keywords:
-        if kw.arg == "response_model":
-            return _resolves_to_schema_ref(kw.value, in_module, table)
-    return None
+def _response_model(call, func, in_module, table):
+    """Return ``(ref, source, intentional_empty)`` for a FastAPI response body."""
+    keyword = next((kw for kw in call.keywords if kw.arg == "response_model"), None)
+    if keyword is not None:
+        if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+            return None, keyword.value, True
+        return _resolves_to_schema_ref(keyword.value, in_module, table), keyword.value, False
+    if func.returns is None:
+        return None, func, False
+    if (
+        isinstance(func.returns, ast.Constant) and func.returns.value is None
+    ) or (isinstance(func.returns, ast.Name) and func.returns.id == "None"):
+        return None, func.returns, True
+    return _resolves_to_schema_ref(func.returns, in_module, table), func.returns, False
 
 
 def recognize_fastapi(modules, table, diags):
@@ -402,11 +439,26 @@ def recognize_fastapi(modules, table, diags):
                 )
                 continue
             method = decorator.func.attr.upper()
+            operation = "{} {}".format(method, path)
             params, request_body = _build_params(
                 stmt, path, method, module.dotted, abs_path, table, diags
             )
-            status = _build_response(decorator)
-            body_ref = _response_model_ref(decorator, module.dotted, table)
+            status = _build_response(decorator, operation, abs_path, diags)
+            body_ref, response_source, intentional_empty = _response_model(
+                decorator, stmt, module.dotted, table
+            )
+            if body_ref is None and not intentional_empty:
+                diags.warn(
+                    "FastAPI response schema on {} cannot be resolved from "
+                    "response_model or the return annotation; response body omitted "
+                    "(no fallback)".format(operation),
+                    abs_path,
+                    getattr(response_source, "lineno", 0),
+                    code="response.schema.unresolved",
+                    category="response",
+                    operation=operation,
+                    subject=stmt.name,
+                )
             response = {
                 "status": status,
                 "body": {"ref_id": body_ref} if body_ref is not None else None,
@@ -596,6 +648,40 @@ def _flask_body_and_params(
             if body_ref is not None and _reads_request_json(value):
                 if allows_body and request_body is None:
                     request_body = {"ref_id": body_ref}
+                elif allows_body:
+                    diags.warn(
+                        "handler has more than one typed request body on {} {}; only "
+                        "the first is recorded (no fallback)".format(method, path),
+                        abs_path,
+                        getattr(stmt, "lineno", 0),
+                        code="request.body.unresolved",
+                        category="request_body",
+                        operation="{} {}".format(method, path),
+                        subject=getattr(stmt.target, "id", "request body"),
+                    )
+                else:
+                    diags.warn(
+                        "typed request body on bodyless operation {} {} is omitted "
+                        "(no fallback)".format(method, path),
+                        abs_path,
+                        getattr(stmt, "lineno", 0),
+                        code="request.body.unresolved",
+                        category="request_body",
+                        operation="{} {}".format(method, path),
+                        subject=getattr(stmt.target, "id", "request body"),
+                    )
+                continue
+            if _reads_request_json(value):
+                diags.warn(
+                    "typed request body on {} {} has an unresolvable DTO annotation; "
+                    "body omitted (no fallback)".format(method, path),
+                    abs_path,
+                    getattr(stmt, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=getattr(stmt.target, "id", "request body"),
+                )
                 continue
             # Typed query param: an annotated local reading request.args.get(...).
             if _is_request_args_get(value):
@@ -767,10 +853,16 @@ def recognize_flask(modules, table, diags):
                     responses = [response]
                 else:
                     if method == methods[0]:
+                        reason = (
+                            "handler has no return annotation"
+                            if stmt.returns is None
+                            else "return annotation does not resolve to a model schema"
+                        )
                         diags.warn(
-                            "untyped response on {} {}: handler has no return "
-                            "annotation; response shape under-specified, no schema "
-                            "inferred".format(method, path),
+                            "untyped response on {} {}: {}; response shape "
+                            "under-specified, no schema inferred".format(
+                                method, path, reason
+                            ),
                             abs_path,
                             getattr(stmt, "lineno", 0),
                             code="response.schema.unresolved",

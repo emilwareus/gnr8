@@ -155,21 +155,93 @@ class FlaskBodylessMethodTests(unittest.TestCase):
         func = _func(self.SRC)
         table = SymbolTable(modules)
         diags = Diagnostics()
-        return routes._flask_body_and_params(
+        params, body = routes._flask_body_and_params(
             func, method, "/", "app.routes", modules[0].abs_path, table, diags
         )
+        return params, body, diags.items()
 
     def test_post_derives_body(self):
-        _params, body = self._run_multi("POST")
+        _params, body, diagnostics = self._run_multi("POST")
         self.assertEqual(body, {"ref_id": "app.dto.OrderInput"})
+        self.assertEqual(diagnostics, [])
 
     def test_get_omits_body(self):
-        _params, body = self._run_multi("GET")
+        _params, body, diagnostics = self._run_multi("GET")
         self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "GET /")
 
     def test_delete_omits_body(self):
-        _params, body = self._run_multi("DELETE")
+        _params, body, diagnostics = self._run_multi("DELETE")
         self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+
+
+class FastAPIDiagnosticCompletenessTests(unittest.TestCase):
+    DTO = "class Output:\n    value: str\n"
+
+    def _recognize(self, handler_source):
+        source = (
+            "from fastapi import FastAPI\n"
+            "from app.dto import Output\n"
+            "app = FastAPI()\n" + handler_source
+        )
+        modules = [
+            _FakeModule("app.main", source),
+            _FakeModule("app.dto", self.DTO),
+        ]
+        table = SymbolTable(modules)
+        diags = Diagnostics()
+        recognized = routes.recognize_fastapi(modules, table, diags)
+        return recognized, diags.items()
+
+    def test_return_annotation_supplies_response_when_model_kwarg_is_absent(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/items')\n"
+            "def list_items() -> Output:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            recognized[0]["responses"][0]["body"], {"ref_id": "app.dto.Output"}
+        )
+        self.assertEqual(diagnostics, [])
+
+    def test_untyped_parameter_and_missing_response_are_diagnosed(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/items')\n"
+            "def list_items(query):\n"
+            "    pass\n"
+        )
+        self.assertEqual(recognized[0]["params"], [])
+        self.assertEqual(
+            {diagnostic["code"] for diagnostic in diagnostics},
+            {"request.parameter.unresolved", "response.schema.unresolved"},
+        )
+        self.assertTrue(
+            all(diagnostic["operation"] == "GET /items" for diagnostic in diagnostics)
+        )
+
+    def test_dynamic_status_is_diagnosed_and_defaults_safely(self):
+        recognized, diagnostics = self._recognize(
+            "STATUS = 202\n"
+            "@app.post('/items', status_code=STATUS)\n"
+            "def create_item() -> Output:\n"
+            "    pass\n"
+        )
+        self.assertEqual(recognized[0]["responses"][0]["status"], 200)
+        diagnostic = next(
+            item for item in diagnostics if item["code"] == "response.status.unresolved"
+        )
+        self.assertEqual(diagnostic["operation"], "POST /items")
+
+    def test_explicit_none_response_model_is_intentionally_bodyless(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/health', response_model=None)\n"
+            "def health():\n"
+            "    pass\n"
+        )
+        self.assertIsNone(recognized[0]["responses"][0]["body"])
+        self.assertEqual(diagnostics, [])
 
 
 class FastAPIBodylessMethodTests(unittest.TestCase):
