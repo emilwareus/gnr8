@@ -1999,10 +1999,12 @@ fn apply_request_body_override(
     let op_index = find_operation_index(ir, matcher, "request body override")?;
     if let Some(schema_ref) = schema_ref {
         let resolved = resolve_schema_ref(ir, schema_ref, "request body override schema")?;
+        let identity = OperationDiagnosticIdentity::from(&ir.operations[op_index]);
         let op = &mut ir.operations[op_index];
         op.request_body = Some(SchemaRef { ref_id: resolved });
         op.request_body_required = required.unwrap_or(true);
         op.request_body_content_type = content_type.map(str::to_string);
+        remove_all_operation_diagnostics(ir, "request.body.unresolved", &identity);
         return Ok(());
     }
     let op = &mut ir.operations[op_index];
@@ -2054,7 +2056,7 @@ fn apply_response_override(
         });
     }
     let body = response_override_body(ir, override_.schema_ref.as_deref())?;
-    let op_span = ir.operations[op_index].provenance.clone();
+    let identity = OperationDiagnosticIdentity::from(&ir.operations[op_index]);
     let replacement = Response {
         status: override_.status,
         body,
@@ -2082,14 +2084,8 @@ fn apply_response_override(
         .retain(|response| response.status != override_.status);
     op.responses.push(replacement);
     op.responses.sort_by_key(|response| response.status);
-    if override_.body_kind == "binary"
-        && override_
-            .content_types
-            .iter()
-            .any(|content_type| content_type == "application/octet-stream")
-    {
-        remove_binary_octet_stream_default_diagnostics(ir, &op_span);
-    }
+    remove_one_operation_diagnostic(ir, "response.schema.unresolved", &identity);
+    remove_one_operation_diagnostic(ir, "response.media_type.unresolved", &identity);
     Ok(())
 }
 
@@ -2227,17 +2223,59 @@ fn remove_unresolved_parameter_diagnostics(ir: &mut ApiGraph, operation: &str, p
     });
 }
 
-fn remove_binary_octet_stream_default_diagnostics(
+#[derive(Debug, Clone)]
+struct OperationDiagnosticIdentity {
+    id: String,
+    handler: String,
+    route: String,
+    span: crate::graph::SourceSpan,
+}
+
+impl From<&crate::graph::Operation> for OperationDiagnosticIdentity {
+    fn from(operation: &crate::graph::Operation) -> Self {
+        Self {
+            id: operation.id.clone(),
+            handler: operation.handler.clone(),
+            route: format!("{} {}", operation.method, operation.path),
+            span: operation.provenance.clone(),
+        }
+    }
+}
+
+fn diagnostic_matches_operation(
+    diagnostic: &crate::graph::Diagnostic,
+    identity: &OperationDiagnosticIdentity,
+) -> bool {
+    if let Some(operation) = diagnostic.operation.as_deref() {
+        return operation == identity.id
+            || operation == identity.handler
+            || operation == identity.route;
+    }
+    diagnostic.file == identity.span.file
+        && diagnostic.line >= identity.span.start_line
+        && diagnostic.line <= identity.span.end_line
+}
+
+fn remove_all_operation_diagnostics(
     ir: &mut ApiGraph,
-    op_span: &crate::graph::SourceSpan,
+    code: &str,
+    identity: &OperationDiagnosticIdentity,
 ) {
     ir.diagnostics.retain(|diagnostic| {
-        let is_same_operation = diagnostic.file == op_span.file
-            && diagnostic.line >= op_span.start_line
-            && diagnostic.line <= op_span.end_line;
-        let is_resolved_binary_default = diagnostic.code == "response.media_type.unresolved";
-        !(is_same_operation && is_resolved_binary_default)
+        diagnostic.code != code || !diagnostic_matches_operation(diagnostic, identity)
     });
+}
+
+fn remove_one_operation_diagnostic(
+    ir: &mut ApiGraph,
+    code: &str,
+    identity: &OperationDiagnosticIdentity,
+) {
+    if let Some(index) = ir.diagnostics.iter().position(|diagnostic| {
+        diagnostic.code == code && diagnostic_matches_operation(diagnostic, identity)
+    }) {
+        ir.diagnostics.remove(index);
+    }
 }
 
 /// Enum ordering policy for generated OpenAPI/SDK surfaces.
@@ -7014,6 +7052,100 @@ mod tests {
                 .contains("request body override did not match any operation"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn typed_request_body_override_retires_resolved_diagnostic_before_policy() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.ImportBooksRequest".to_string(),
+                name: "ImportBooksRequest".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            operations: vec![grouped_test_operation(
+                "importBooks",
+                "POST",
+                "/books/import",
+                None,
+                "handlers.go",
+            )],
+            diagnostics: vec![diagnostic(
+                "request.body.unresolved",
+                DiagnosticCategory::RequestBody,
+                "multipart binding could not be inferred",
+                "handlers.go",
+                1,
+            )
+            .operation("POST /books/import")],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .multipart_request_body("POST", "/books/import", "app.ImportBooksRequest")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        DiagnosticPolicy::new()
+            .deny("request.body.unresolved")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(ir.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn response_override_retires_resolved_diagnostics_before_policy() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "dto.AuthSessionUser".to_string(),
+                name: "AuthSessionUser".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            operations: vec![grouped_test_operation(
+                "refresh",
+                "POST",
+                "/user/refresh",
+                None,
+                "auth.go",
+            )],
+            diagnostics: vec![
+                diagnostic(
+                    "response.schema.unresolved",
+                    DiagnosticCategory::Response,
+                    "dynamic response body",
+                    "auth.go",
+                    1,
+                )
+                .operation("refresh"),
+                diagnostic(
+                    "response.media_type.unresolved",
+                    DiagnosticCategory::Response,
+                    "dynamic response media type",
+                    "auth.go",
+                    1,
+                )
+                .operation("POST /user/refresh"),
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .response(
+                OperationSelector::post("/user/refresh"),
+                ResponseOverride::status(200)
+                    .json_schema("dto.AuthSessionUser")
+                    .media_type("application/vnd.oaiz+json"),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        DiagnosticPolicy::new()
+            .deny("response.schema.unresolved")
+            .deny("response.media_type.unresolved")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(ir.diagnostics.is_empty());
     }
 
     #[test]

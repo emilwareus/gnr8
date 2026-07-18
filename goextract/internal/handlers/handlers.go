@@ -2601,7 +2601,7 @@ func (a *Analyzer) analyzeData(
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.WarnCode("response.media_type.unresolved", "response", "unsupported binary response pattern: Gin Data content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
+		diags.ResponseMediaTypeUnresolved(route.Method, untypedRouteLabel(route), "unsupported binary response pattern: Gin Data content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,
@@ -2634,7 +2634,7 @@ func (a *Analyzer) analyzeDataFromReader(
 		contentType = responseContentType(value)
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.WarnCode("response.media_type.unresolved", "response", "unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
+		diags.ResponseMediaTypeUnresolved(route.Method, untypedRouteLabel(route), "unsupported binary response pattern: Gin DataFromReader content type is dynamic; defaulting to application/octet-stream (GO-05)", file, line)
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
 		Status:       status,

@@ -145,6 +145,22 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 	})
 }
 
+// ResponseMediaTypeUnresolved records a response whose status and body kind are
+// known but whose runtime media type is dynamic. The operation identity allows
+// a checked response override to retire exactly the diagnostic it resolves.
+func (a *Accumulator) ResponseMediaTypeUnresolved(method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.media_type.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   reason,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+	})
+}
+
 // UnsupportedRoutePattern records a Gin route registration shape that cannot be
 // lowered faithfully. The route is skipped rather than guessed so migration
 // review can fix the source pattern or add an explicit custom Source/Transform.

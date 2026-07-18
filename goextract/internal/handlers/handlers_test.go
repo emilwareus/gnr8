@@ -347,15 +347,14 @@ func dynamicContentType() string {
 	if len(methodFile.Responses) != 1 || methodFile.Responses[0].ContentType != "application/octet-stream" {
 		t.Fatalf("method content type helper should not fold through a same-named top-level helper, got %+v", methodFile.Responses)
 	}
-	found := false
+	foundOperations := map[string]bool{}
 	for _, item := range diags.Items() {
 		if strings.Contains(item.Message, "DataFromReader content type is dynamic") {
-			found = true
-			break
+			foundOperations[item.Operation] = true
 		}
 	}
-	if !found {
-		t.Fatalf("branching content type helper should emit dynamic-content diagnostic, got %+v", diags.Items())
+	if !foundOperations["GET /file"] || !foundOperations["GET /method-file"] {
+		t.Fatalf("dynamic-content diagnostics should identify both operations, got %+v", diags.Items())
 	}
 }
 
