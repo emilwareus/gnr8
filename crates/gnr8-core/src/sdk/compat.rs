@@ -5107,8 +5107,9 @@ fn normalize_go_param_list(list: &str) -> String {
                 .split(',')
                 .filter(|name| !name.trim().is_empty())
                 .count();
+            let ty = normalize_go_function_type_parameter_names(ty);
             normalized.extend(std::iter::repeat_n(
-                ty.to_string(),
+                ty,
                 pending_identifiers.len() + name_count,
             ));
             pending_identifiers.clear();
@@ -5116,7 +5117,7 @@ fn normalize_go_param_list(list: &str) -> String {
             pending_identifiers.push(declaration);
         } else {
             normalized.append(&mut pending_identifiers);
-            normalized.push(declaration);
+            normalized.push(normalize_go_function_type_parameter_names(&declaration));
         }
     }
     normalized.append(&mut pending_identifiers);
@@ -5124,6 +5125,8 @@ fn normalize_go_param_list(list: &str) -> String {
 }
 
 fn normalize_go_type_declaration(declaration: &str) -> String {
+    let declaration = normalize_go_interface_method_parameter_names(declaration);
+    let declaration = normalize_go_function_type_parameter_names(&declaration);
     let mut tokens = Vec::new();
     let mut chars = declaration.chars().peekable();
     let mut saw_newline = false;
@@ -5209,6 +5212,186 @@ fn normalize_go_type_declaration(declaration: &str) -> String {
         previous = Some(token);
     }
     normalized.trim_end_matches(';').to_string()
+}
+
+fn normalize_go_interface_method_parameter_names(value: &str) -> String {
+    let Some(interface) = value.find("interface") else {
+        return value.to_string();
+    };
+    if interface > 0
+        && value[..interface]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return value.to_string();
+    }
+    let after_keyword = interface + "interface".len();
+    let Some(open_offset) = value[after_keyword..].find('{') else {
+        return value.to_string();
+    };
+    let open = after_keyword + open_offset;
+    let Some(close) = matching_go_delimiter(value, open, '{', '}') else {
+        return value.to_string();
+    };
+    let body = normalize_go_interface_body(&value[open + 1..close]);
+    let mut normalized = String::with_capacity(value.len());
+    normalized.push_str(&value[..=open]);
+    normalized.push_str(&body);
+    normalized.push_str(&value[close..]);
+    normalized
+}
+
+fn normalize_go_interface_body(body: &str) -> String {
+    let mut normalized = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+    let mut nested_braces = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < body.len() {
+        let Some(ch) = body[cursor..].chars().next() else {
+            break;
+        };
+        if let Some(active) = quote {
+            normalized.push(ch);
+            cursor += ch.len_utf8();
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            normalized.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if ch == '{' {
+            nested_braces += 1;
+        } else if ch == '}' {
+            nested_braces = nested_braces.saturating_sub(1);
+        }
+        if nested_braces == 0 {
+            let remaining = &body[cursor..];
+            if let Some(method) = ident_prefix(remaining) {
+                let after_method = cursor + method.len();
+                let params = skip_go_whitespace(body, after_method);
+                if body[params..].starts_with('(') {
+                    let Some(params_end) = matching_go_delimiter(body, params, '(', ')') else {
+                        normalized.push_str(remaining);
+                        break;
+                    };
+                    normalized.push_str(method);
+                    normalized.push_str(&body[after_method..=params]);
+                    normalized.push_str(&normalize_go_param_list(&body[params + 1..params_end]));
+                    normalized.push(')');
+                    cursor = params_end + 1;
+
+                    let results = skip_go_whitespace(body, cursor);
+                    if body[results..].starts_with('(') {
+                        let Some(results_end) = matching_go_delimiter(body, results, '(', ')')
+                        else {
+                            normalized.push_str(&body[cursor..]);
+                            break;
+                        };
+                        normalized.push_str(&body[cursor..=results]);
+                        normalized
+                            .push_str(&normalize_go_param_list(&body[results + 1..results_end]));
+                        normalized.push(')');
+                        cursor = results_end + 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        normalized.push(ch);
+        cursor += ch.len_utf8();
+    }
+    normalized
+}
+
+fn normalize_go_function_type_parameter_names(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < value.len() {
+        let Some(ch) = value[cursor..].chars().next() else {
+            break;
+        };
+        if let Some(active) = quote {
+            normalized.push(ch);
+            cursor += ch.len_utf8();
+            if active != '`' && escaped {
+                escaped = false;
+            } else if active != '`' && ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            normalized.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        }
+        if value[cursor..].starts_with("func") && go_keyword_boundary(value, cursor, 4) {
+            let after_keyword = cursor + 4;
+            let params = skip_go_whitespace(value, after_keyword);
+            if value[params..].starts_with('(') {
+                let Some(params_end) = matching_go_delimiter(value, params, '(', ')') else {
+                    normalized.push_str(&value[cursor..]);
+                    break;
+                };
+                normalized.push_str(&value[cursor..=params]);
+                normalized.push_str(&normalize_go_param_list(&value[params + 1..params_end]));
+                normalized.push(')');
+                cursor = params_end + 1;
+
+                let results = skip_go_whitespace(value, cursor);
+                if value[results..].starts_with('(') {
+                    let Some(results_end) = matching_go_delimiter(value, results, '(', ')') else {
+                        normalized.push_str(&value[cursor..]);
+                        break;
+                    };
+                    normalized.push_str(&value[cursor..=results]);
+                    normalized.push_str(&normalize_go_param_list(&value[results + 1..results_end]));
+                    normalized.push(')');
+                    cursor = results_end + 1;
+                }
+                continue;
+            }
+        }
+        normalized.push(ch);
+        cursor += ch.len_utf8();
+    }
+    normalized
+}
+
+fn skip_go_whitespace(value: &str, mut cursor: usize) -> usize {
+    while cursor < value.len() {
+        let Some(ch) = value[cursor..].chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn go_keyword_boundary(value: &str, start: usize, len: usize) -> bool {
+    let before = value[..start].chars().next_back();
+    let after = value[start + len..].chars().next();
+    let is_identifier = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    before.is_none_or(|ch| !is_identifier(ch)) && after.is_none_or(|ch| !is_identifier(ch))
 }
 
 fn go_token_can_end_statement(token: &str) -> bool {
@@ -6740,6 +6923,47 @@ type Book struct { Title string `json:"title"`; Tags []string `json:"tags,omitem
             diff.exported_method_signature_changes
         );
         assert!(!diff.is_breaking(), "unexpected Go surface diff: {diff:?}");
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_diff_ignores_names_in_interface_methods_and_function_types() {
+        let old = temp_dir("go-old-type-param-names");
+        let new = temp_dir("go-new-type-param-names");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        }
+        std::fs::write(
+            old.join("types.go"),
+            r"package sdk
+type Reader interface {
+    Read(buffer []byte) (count int, err error)
+    Transform(callback func(input string) (output int, err error)) (done bool)
+}
+type Handler func(context string, request *Request) (response *Response, err error)
+",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("types.go"),
+            r"package sdk
+type Reader interface {
+    Read(payload []byte) (written int, failure error)
+    Transform(fn func(value string) (result int, failure error)) (complete bool)
+}
+type Handler func(ctx string, req *Request) (result *Response, failure error)
+",
+        )
+        .unwrap();
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+
+        assert!(
+            diff.exported_type_changes.is_empty(),
+            "parameter and result names are not part of Go type identity: {diff:?}"
+        );
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);
