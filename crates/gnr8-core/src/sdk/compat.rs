@@ -1030,17 +1030,26 @@ pub fn extract_python_surface(dir: impl AsRef<Path>) -> Result<PythonSurface, Co
     let mut files = Vec::new();
     collect_python_files(dir, dir, &mut files)?;
     files.sort();
+    let import_layout = python_import_layout(dir)?;
+    let files = files
+        .into_iter()
+        .filter_map(|path| {
+            import_layout
+                .module_name(&path)
+                .map(|module| (path, module))
+        })
+        .collect::<Vec<_>>();
 
-    let modules = files.iter().map(|path| python_module_name(path)).collect();
+    let modules = files.iter().map(|(_, module)| module.clone()).collect();
     let mut public_exports = BTreeSet::new();
     let mut models = BTreeMap::new();
     let mut exception_classes = BTreeSet::new();
     let mut aliases = BTreeMap::new();
 
-    for rel in &files {
+    for (rel, module) in &files {
         let text = read_to_string(dir.join(rel))?;
         if rel.file_name().and_then(|name| name.to_str()) == Some("__init__.py") {
-            public_exports.extend(parse_python_package_exports(rel, &text)?);
+            public_exports.extend(parse_python_package_exports(rel, module, &text)?);
         }
         let parsed = parse_python_file(&text, is_python_model_file(rel));
         exception_classes.extend(parsed.exceptions);
@@ -4352,12 +4361,11 @@ fn python_alias_target_is_type(target: &str) -> bool {
         )
 }
 
-fn parse_python_package_exports(rel: &Path, text: &str) -> Result<Vec<String>, CoreError> {
-    let package = rel
-        .parent()
-        .map(python_path_components)
-        .unwrap_or_default()
-        .join(".");
+fn parse_python_package_exports(
+    rel: &Path,
+    package: &str,
+    text: &str,
+) -> Result<Vec<String>, CoreError> {
     let names = parse_python_all(text)
         .map_err(|message| CoreError::Workspace {
             message: format!(
@@ -4370,7 +4378,7 @@ fn parse_python_package_exports(rel: &Path, text: &str) -> Result<Vec<String>, C
         .into_iter()
         .filter(|name| !name.starts_with('_'))
         .map(|name| {
-            if package.is_empty() {
+            if package == "__init__" {
                 name
             } else {
                 format!("{package}.{name}")
@@ -4516,7 +4524,96 @@ fn parse_python_import_exports(text: &str) -> Vec<String> {
     exports
 }
 
-fn python_module_name(path: &Path) -> String {
+#[derive(Default)]
+struct PythonImportLayout {
+    package_dirs: Vec<(PathBuf, String)>,
+}
+
+impl PythonImportLayout {
+    fn module_name(&self, path: &Path) -> Option<String> {
+        let (relative, package) = if self.package_dirs.is_empty() {
+            (path, "")
+        } else {
+            self.package_dirs.iter().find_map(|(directory, package)| {
+                path.strip_prefix(directory)
+                    .ok()
+                    .map(|relative| (relative, package.as_str()))
+            })?
+        };
+        Some(python_module_name(relative, package))
+    }
+}
+
+fn python_import_layout(dir: &Path) -> Result<PythonImportLayout, CoreError> {
+    let path = dir.join("pyproject.toml");
+    if !path.is_file() {
+        return Ok(PythonImportLayout::default());
+    }
+    let text = read_to_string(&path)?;
+    let document: toml::Value = toml::from_str(&text).map_err(|error| CoreError::Workspace {
+        message: format!(
+            "failed to parse Python SDK package metadata {}: {error}",
+            path.display()
+        ),
+    })?;
+    let Some(package_dirs) = document
+        .get("tool")
+        .and_then(|tool| tool.get("setuptools"))
+        .and_then(|setuptools| {
+            setuptools
+                .get("package-dir")
+                .or_else(|| setuptools.get("package_dir"))
+        })
+    else {
+        return Ok(PythonImportLayout::default());
+    };
+    let package_dirs = package_dirs
+        .as_table()
+        .ok_or_else(|| CoreError::Workspace {
+            message: "Python SDK package metadata 'tool.setuptools.package-dir' must be a table"
+                .to_string(),
+        })?;
+    let mut mappings = Vec::new();
+    for (package, directory) in package_dirs {
+        let directory = directory.as_str().ok_or_else(|| CoreError::Workspace {
+            message: format!("Python SDK package directory for '{package}' must be a string"),
+        })?;
+        mappings.push((python_relative_package_dir(directory)?, package.clone()));
+    }
+    mappings.sort_by(|(left_path, left_package), (right_path, right_package)| {
+        right_path
+            .components()
+            .count()
+            .cmp(&left_path.components().count())
+            .then_with(|| left_path.cmp(right_path))
+            .then_with(|| left_package.cmp(right_package))
+    });
+    Ok(PythonImportLayout {
+        package_dirs: mappings,
+    })
+}
+
+fn python_relative_package_dir(value: &str) -> Result<PathBuf, CoreError> {
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(CoreError::Workspace {
+                    message: format!(
+                        "Python SDK package directory must stay within the SDK root: '{value}'"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn python_module_name(path: &Path, package: &str) -> String {
     let mut parts = python_path_components(path);
     if let Some(last) = parts.last_mut() {
         *last = last.trim_end_matches(".py").to_string();
@@ -4524,10 +4621,15 @@ fn python_module_name(path: &Path) -> String {
     if parts.last().is_some_and(|part| part == "__init__") {
         parts.pop();
     }
-    if parts.is_empty() {
+    let suffix = parts.join(".");
+    if package.is_empty() && suffix.is_empty() {
         "__init__".to_string()
+    } else if package.is_empty() {
+        suffix
+    } else if suffix.is_empty() {
+        package.to_string()
     } else {
-        parts.join(".")
+        format!("{package}.{suffix}")
     }
 }
 
@@ -6534,6 +6636,78 @@ export type Availability = typeof Availability[keyof typeof Availability];
         assert_eq!(surface.aliases["BookAlias"], "Book");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn python_surface_uses_setuptools_import_package_mappings() {
+        let package_directory = temp_dir("python-package-directory-layout");
+        let mapped_root = temp_dir("python-mapped-root-layout");
+        let source_root = temp_dir("python-source-root-layout");
+
+        std::fs::create_dir_all(package_directory.join("sdk")).unwrap();
+        std::fs::write(
+            package_directory.join("sdk/__init__.py"),
+            "from .models import Book\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package_directory.join("sdk/models.py"),
+            "class Book(BaseModel):\n    title: str\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            mapped_root.join("pyproject.toml"),
+            "[tool.setuptools]\npackages = [\"sdk\"]\n\n[tool.setuptools.package-dir]\nsdk = \".\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mapped_root.join("__init__.py"),
+            "from .models import Book\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mapped_root.join("models.py"),
+            "class Book(BaseModel):\n    title: str\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(source_root.join("src/sdk")).unwrap();
+        std::fs::write(
+            source_root.join("pyproject.toml"),
+            "[tool.setuptools.package-dir]\n\"\" = \"src\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.join("src/sdk/__init__.py"),
+            "from .models import Book\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.join("src/sdk/models.py"),
+            "class Book(BaseModel):\n    title: str\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source_root.join("build_helper.py"),
+            "class NotDistributed(BaseModel):\n    value: str\n",
+        )
+        .unwrap();
+
+        let expected = extract_python_surface(&package_directory).unwrap();
+        for candidate in [&mapped_root, &source_root] {
+            let surface = extract_python_surface(candidate).unwrap();
+            assert_eq!(surface.modules, vec!["sdk", "sdk.models"]);
+            assert_eq!(surface.public_exports, vec!["sdk.Book"]);
+            assert_eq!(surface.models, expected.models);
+            assert!(!diff_python_dirs(&package_directory, candidate)
+                .unwrap()
+                .is_breaking());
+        }
+
+        let _ = std::fs::remove_dir_all(package_directory);
+        let _ = std::fs::remove_dir_all(mapped_root);
+        let _ = std::fs::remove_dir_all(source_root);
     }
 
     #[test]
