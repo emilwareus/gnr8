@@ -1197,7 +1197,7 @@ enum ParameterOverrideMode {
 }
 
 impl ParameterOverride {
-    /// Add the parameter only when no parameter with this name exists.
+    /// Add the parameter only when no parameter with this name and location exists.
     #[must_use]
     pub fn add_if_missing(parameter: RequestParameter) -> Self {
         Self {
@@ -1215,7 +1215,7 @@ impl ParameterOverride {
         }
     }
 
-    /// Intentionally replace any same-named parameter, recording the replacement diagnostic.
+    /// Intentionally replace a parameter with the same name and location, recording the change.
     #[must_use]
     pub fn replace(parameter: RequestParameter) -> Self {
         Self {
@@ -1606,12 +1606,18 @@ impl Transform for ApiOverrides {
         let mut touched = BTreeSet::new();
         for (selector, override_) in &self.parameters {
             let op_index = find_selected_operation_index(ir, selector, "parameter override")?;
-            let key = (op_index, override_.parameter.name.clone());
+            let key = (
+                op_index,
+                override_.parameter.name.clone(),
+                override_.parameter.location.clone(),
+            );
             if !touched.insert(key) {
                 return Err(CoreError::Config {
                     message: format!(
-                        "conflicting parameter overrides target {:?} on operation '{}'",
-                        override_.parameter.name, ir.operations[op_index].id
+                        "conflicting parameter overrides target {:?} in {} on operation '{}'",
+                        override_.parameter.name,
+                        override_.parameter.location,
+                        ir.operations[op_index].id
                     ),
                 });
             }
@@ -1741,62 +1747,42 @@ fn apply_typed_parameter_override(
 ) -> Result<(), CoreError> {
     validate_request_parameter(&override_.parameter)?;
     let requested = &override_.parameter;
-    let matches: Vec<usize> = ir.operations[op_index]
+    let same_name: Vec<usize> = ir.operations[op_index]
         .params
         .iter()
         .enumerate()
         .filter_map(|(index, existing)| (existing.name == requested.name).then_some(index))
         .collect();
-    let replaced = !matches.is_empty();
+    let exact_matches: Vec<usize> = same_name
+        .iter()
+        .copied()
+        .filter(|index| ir.operations[op_index].params[*index].location == requested.location)
+        .collect();
+    let replaced = !exact_matches.is_empty();
 
-    match override_.mode {
-        ParameterOverrideMode::AddIfMissing if replaced => {
-            return Err(CoreError::Config {
-                message: format!(
-                    "add_if_missing parameter {:?} already exists on operation '{}'",
-                    requested.name, ir.operations[op_index].id
-                ),
-            });
-        }
-        ParameterOverrideMode::CorrectExisting => {
-            let [existing_index] = matches.as_slice() else {
-                return Err(CoreError::Config {
-                    message: format!(
-                        "correct_existing parameter {:?} expected exactly one extracted parameter on operation '{}', found {}",
-                        requested.name,
-                        ir.operations[op_index].id,
-                        matches.len()
-                    ),
-                });
-            };
-            let existing = &ir.operations[op_index].params[*existing_index];
-            if existing.location != requested.location {
-                return Err(CoreError::Config {
-                    message: format!(
-                        "parameter {:?} location mismatch on operation '{}': extracted {}, override {}",
-                        requested.name,
-                        ir.operations[op_index].id,
-                        existing.location,
-                        requested.location
-                    ),
-                });
-            }
-            if request_parameter_matches(existing, requested) {
-                return Err(CoreError::Config {
-                    message: format!(
-                        "redundant parameter override {:?} on operation '{}' makes no change",
-                        requested.name, ir.operations[op_index].id
-                    ),
-                });
-            }
-        }
-        ParameterOverrideMode::AddIfMissing | ParameterOverrideMode::Replace => {}
+    if override_.mode == ParameterOverrideMode::AddIfMissing && replaced {
+        return Err(CoreError::Config {
+            message: format!(
+                "add_if_missing parameter {:?} already exists on operation '{}'",
+                requested.name, ir.operations[op_index].id
+            ),
+        });
+    }
+    if override_.mode == ParameterOverrideMode::CorrectExisting {
+        validate_existing_parameter_correction(
+            &ir.operations[op_index],
+            requested,
+            &same_name,
+            &exact_matches,
+        )?;
     }
 
     let op = &mut ir.operations[op_index];
     let operation_name = format!("{} {}", op.method, op.path);
     let span = op.provenance.clone();
-    op.params.retain(|existing| existing.name != requested.name);
+    op.params.retain(|existing| {
+        existing.name != requested.name || existing.location != requested.location
+    });
     op.params.push(crate::graph::Param {
         name: requested.name.clone(),
         location: requested.location.clone(),
@@ -1829,6 +1815,50 @@ fn apply_typed_parameter_override(
             .operation(operation_name)
             .subject(requested.name.clone()),
         );
+    }
+    Ok(())
+}
+
+fn validate_existing_parameter_correction(
+    operation: &crate::graph::Operation,
+    requested: &RequestParameter,
+    same_name: &[usize],
+    exact_matches: &[usize],
+) -> Result<(), CoreError> {
+    let [existing_index] = exact_matches else {
+        if exact_matches.is_empty() && !same_name.is_empty() {
+            let mut locations = same_name
+                .iter()
+                .map(|index| operation.params[*index].location.as_str())
+                .collect::<Vec<_>>();
+            locations.sort_unstable();
+            locations.dedup();
+            return Err(CoreError::Config {
+                message: format!(
+                    "parameter {:?} location mismatch on operation '{}': extracted {}, override {}",
+                    requested.name,
+                    operation.id,
+                    locations.join(", "),
+                    requested.location
+                ),
+            });
+        }
+        return Err(CoreError::Config {
+            message: format!(
+                "correct_existing parameter {:?} expected exactly one extracted parameter on operation '{}', found {}",
+                requested.name,
+                operation.id,
+                exact_matches.len()
+            ),
+        });
+    };
+    if request_parameter_matches(&operation.params[*existing_index], requested) {
+        return Err(CoreError::Config {
+            message: format!(
+                "redundant parameter override {:?} on operation '{}' makes no change",
+                requested.name, operation.id
+            ),
+        });
     }
     Ok(())
 }
@@ -6890,6 +6920,62 @@ mod tests {
             .apply(&mut ir, &cx())
             .unwrap_err();
         assert!(stale.to_string().contains("did not match"), "{stale}");
+    }
+
+    #[test]
+    fn typed_parameter_overrides_use_name_and_location_identity() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "getItem",
+                "GET",
+                "/items/{id}",
+                None,
+                "items.go",
+            )],
+            ..ApiGraph::default()
+        };
+        let selector = OperationSelector::get("/items/{id}");
+        ApiOverrides::new()
+            .parameter(
+                selector.clone(),
+                ParameterOverride::add_if_missing(RequestParameter::path("id", Type::uuid())),
+            )
+            .parameter(
+                selector.clone(),
+                ParameterOverride::add_if_missing(RequestParameter::query("id", Type::integer())),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        ApiOverrides::new()
+            .parameter(
+                selector.clone(),
+                ParameterOverride::correct_existing(
+                    RequestParameter::query("id", Type::integer()).required(),
+                ),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApiOverrides::new()
+            .parameter(
+                selector,
+                ParameterOverride::replace(RequestParameter::query("id", Type::boolean())),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let params = &ir.operations[0].params;
+        assert_eq!(params.len(), 2);
+        let path = params
+            .iter()
+            .find(|param| param.location == "path")
+            .unwrap();
+        let query = params
+            .iter()
+            .find(|param| param.location == "query")
+            .unwrap();
+        assert_eq!(path.schema, Type::uuid());
+        assert_eq!(query.schema, Type::boolean());
     }
 
     #[test]
