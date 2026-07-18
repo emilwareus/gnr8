@@ -140,6 +140,7 @@ struct CanonicalDocument {
     security: SecurityRequirements,
     security_schemes: BTreeMap<String, Value>,
     operations: BTreeMap<String, CanonicalOperation>,
+    webhooks: BTreeMap<String, CanonicalOperation>,
     schemas: BTreeMap<String, Value>,
     external_documents: BTreeMap<String, Value>,
 }
@@ -228,6 +229,7 @@ impl Canonicalizer {
         let security_schemes = self.security_schemes();
         let schemas = self.schemas();
         let operations = self.operations()?;
+        let webhooks = self.webhooks()?;
         let external_documents = self.canonical_external_documents()?;
         Ok(CanonicalDocument {
             metadata,
@@ -235,6 +237,7 @@ impl Canonicalizer {
             security,
             security_schemes,
             operations,
+            webhooks,
             schemas,
             external_documents,
         })
@@ -375,9 +378,6 @@ impl Canonicalizer {
         else {
             return Ok(BTreeMap::new());
         };
-        let root_consumes = string_array(self.document.root.get("consumes"));
-        let root_produces = string_array(self.document.root.get("produces"));
-        let root_security = canonical_security(self.document.root.get("security"));
         let base_path = if self.document.version == SpecVersion::Swagger2 {
             self.document
                 .root
@@ -388,8 +388,35 @@ impl Canonicalizer {
         } else {
             String::new()
         };
+        self.canonical_operations(paths, &base_path, true)
+    }
+
+    fn webhooks(&mut self) -> Result<BTreeMap<String, CanonicalOperation>, CoreError> {
+        if self.document.version != SpecVersion::OpenApi31 {
+            return Ok(BTreeMap::new());
+        }
+        let webhooks = self
+            .document
+            .root
+            .get("webhooks")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        self.canonical_operations(webhooks, "", false)
+    }
+
+    fn canonical_operations(
+        &mut self,
+        paths: Map<String, Value>,
+        base_path: &str,
+        include_server_path: bool,
+    ) -> Result<BTreeMap<String, CanonicalOperation>, CoreError> {
+        let root_consumes = string_array(self.document.root.get("consumes"));
+        let root_produces = string_array(self.document.root.get("produces"));
+        let root_security = canonical_security(self.document.root.get("security"));
         let mut operations = BTreeMap::new();
-        for (path, item) in paths {
+        for (path, raw_item) in paths {
+            let item = self.resolve_object(&raw_item, 0)?;
             let Some(item) = item.as_object() else {
                 continue;
             };
@@ -406,8 +433,12 @@ impl Canonicalizer {
                     continue;
                 };
                 let (servers, server_path) = self.operation_servers(item, operation);
-                let operation_base = join_contract_path(&base_path, &server_path);
-                let normalized_path = join_contract_path(&operation_base, &path);
+                let normalized_path = if include_server_path {
+                    let operation_base = join_contract_path(base_path, &server_path);
+                    join_contract_path(&operation_base, &path)
+                } else {
+                    path.clone()
+                };
                 let operation_label = format!("{} {normalized_path}", method.to_ascii_uppercase());
                 let consumes = string_array(operation.get("consumes"));
                 let consumes = if consumes.is_empty() {
@@ -1521,6 +1552,13 @@ fn diff_documents(old: &CanonicalDocument, new: &CanonicalDocument) -> Vec<OpenA
         &mut differences,
     );
     diff_operations(&old.operations, &new.operations, &mut differences);
+    diff_operation_collection(
+        &old.webhooks,
+        &new.webhooks,
+        "/webhooks",
+        "webhook",
+        &mut differences,
+    );
     differences
 }
 
@@ -1529,12 +1567,22 @@ fn diff_operations(
     new: &BTreeMap<String, CanonicalOperation>,
     differences: &mut Vec<OpenApiDifference>,
 ) {
+    diff_operation_collection(old, new, "/paths", "operation", differences);
+}
+
+fn diff_operation_collection(
+    old: &BTreeMap<String, CanonicalOperation>,
+    new: &BTreeMap<String, CanonicalOperation>,
+    base: &str,
+    code_prefix: &str,
+    differences: &mut Vec<OpenApiDifference>,
+) {
     for operation in union_keys(old, new) {
-        let location = operation_pointer(operation);
+        let location = operation_pointer(base, operation);
         match (old.get(operation), new.get(operation)) {
             (Some(old), Some(new)) => diff_operation(operation, &location, old, new, differences),
             (Some(old), None) => differences.push(difference(
-                "operation.missing",
+                &format!("{code_prefix}.missing"),
                 &location,
                 Some(operation),
                 None,
@@ -1543,7 +1591,7 @@ fn diff_operations(
                 None,
             )),
             (None, Some(new)) => differences.push(difference(
-                "operation.added",
+                &format!("{code_prefix}.added"),
                 &location,
                 Some(operation),
                 None,
@@ -1916,10 +1964,10 @@ fn union_keys<'a, T>(
     keys.into_iter()
 }
 
-fn operation_pointer(operation: &str) -> String {
+fn operation_pointer(base: &str, operation: &str) -> String {
     let (method, path) = operation.split_once(' ').unwrap_or((operation, ""));
     format!(
-        "/paths/{}/{method}",
+        "{base}/{}/{method}",
         escape_pointer(path),
         method = method.to_ascii_lowercase()
     )
@@ -2167,6 +2215,27 @@ components:
         let report = compare_documents(baseline, reordered, OpenApiCompatibilityPolicy::Exact)
             .expect("compare reordered server enum");
         assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn openapi_webhook_response_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Hooks","version":"1"},"paths":{},"webhooks":{"event":{"post":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Hooks","version":"1"},"paths":{},"webhooks":{"event":{"post":{"responses":{"200":{"description":"changed"}}}}}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(!report.compatible);
+        assert!(report.differences.iter().any(|difference| {
+            difference.code == "response.missing"
+                && difference.location == "/webhooks/event/post/responses/204"
+        }));
     }
 
     #[test]
