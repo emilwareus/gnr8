@@ -366,6 +366,9 @@ pub struct OperationDocsPolicy {
     /// Named request examples keyed by media type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_examples: Vec<MediaExample>,
+    /// Declared request media types that share the operation's request schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_content_types: Vec<String>,
     /// Response documentation keyed by status.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses: Vec<ResponseDocsPolicy>,

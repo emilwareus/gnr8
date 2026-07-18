@@ -411,12 +411,24 @@ fn lower_operation(
                 .request_body_content_type
                 .clone()
                 .unwrap_or_else(|| "application/json".to_string());
+            let mut content_types = docs
+                .map(|policy| policy.request_content_types.clone())
+                .unwrap_or_default();
+            if content_types.is_empty() {
+                content_types.push(content_type.clone());
+            } else if !content_types.contains(&content_type) {
+                content_types.insert(0, content_type.clone());
+            }
+            content_types.sort();
+            content_types.dedup();
             Some(RequestBody {
                 required: op.request_body_required,
                 examples: docs
-                    .map(|policy| media_examples_for(&policy.request_examples, &content_type))
+                    .map(|policy| {
+                        media_examples_for_content_types(&policy.request_examples, &content_types)
+                    })
                     .unwrap_or_default(),
-                content_type,
+                content_types,
                 schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
             })
         }
@@ -645,15 +657,6 @@ fn operation_tags(op: &GraphOp, docs: Option<&OperationDocsPolicy>) -> Vec<Strin
         || op.group.clone().into_iter().collect(),
         |policy| policy.tags.clone(),
     )
-}
-
-fn media_examples_for(
-    examples: &[crate::graph::MediaExample],
-    content_type: &str,
-) -> Vec<MediaExample> {
-    media_examples_matching(examples, |candidate| {
-        candidate.eq_ignore_ascii_case(content_type)
-    })
 }
 
 fn media_examples_for_content_types(
@@ -1907,6 +1910,7 @@ mod tests {
                 deprecated: false,
                 tags: Vec::new(),
                 request_examples: Vec::new(),
+                request_content_types: Vec::new(),
                 responses: vec![crate::graph::ResponseDocsPolicy {
                     status: 201,
                     description: None,

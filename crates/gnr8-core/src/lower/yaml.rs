@@ -204,14 +204,16 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
     let _ = writeln!(out, "{pad}requestBody:");
     let _ = writeln!(out, "{pad}{INDENT}required: {}", body.required);
     let _ = writeln!(out, "{pad}{INDENT}content:");
-    let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(&body.content_type));
-    let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
-    let _ = writeln!(
-        out,
-        "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
-        ref_pointer(&body.schema_ref)
-    );
-    write_examples(out, &body.examples, &body.content_type, depth + 3);
+    for content_type in &body.content_types {
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(content_type));
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
+        let _ = writeln!(
+            out,
+            "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
+            ref_pointer(&body.schema_ref)
+        );
+        write_examples(out, &body.examples, content_type, depth + 3);
+    }
 }
 
 /// Emit the `responses` map keyed by quoted status code.
@@ -652,7 +654,7 @@ mod tests {
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
-                content_type: "application/json".to_string(),
+                content_types: vec!["application/json".to_string()],
                 schema_ref: "CreateGoalInput".to_string(),
                 examples: Vec::new(),
             }),

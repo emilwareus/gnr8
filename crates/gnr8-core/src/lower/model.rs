@@ -150,8 +150,8 @@ pub(crate) struct Parameter {
 pub(crate) struct RequestBody {
     /// Whether the body is required.
     pub required: bool,
-    /// The request media type (`application/json`, `multipart/form-data`, ...).
-    pub content_type: String,
+    /// Every declared request media type that uses the same schema.
+    pub content_types: Vec<String>,
     /// The JSON-pointer name of the referenced schema (bare component name).
     pub schema_ref: String,
     /// Named examples for this media type.

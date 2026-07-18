@@ -207,12 +207,13 @@ fn write_parameter(param: &Parameter) -> Value {
 }
 
 fn write_request_body(body: &RequestBody) -> Value {
-    let mut media = Map::new();
-    media.insert("schema".to_string(), ref_schema(&body.schema_ref));
-    write_examples_into(&mut media, &body.examples, &body.content_type);
-
     let mut content = Map::new();
-    content.insert(body.content_type.clone(), Value::Object(media));
+    for content_type in &body.content_types {
+        let mut media = Map::new();
+        media.insert("schema".to_string(), ref_schema(&body.schema_ref));
+        write_examples_into(&mut media, &body.examples, content_type);
+        content.insert(content_type.clone(), Value::Object(media));
+    }
 
     let mut out = Map::new();
     out.insert("required".to_string(), Value::Bool(body.required));
@@ -540,7 +541,7 @@ mod tests {
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,
-                            content_type: "application/json".to_string(),
+                            content_types: vec!["application/json".to_string()],
                             schema_ref: "CreateGoalInput".to_string(),
                             examples: Vec::new(),
                         }),

@@ -3380,6 +3380,7 @@ impl Transform for DocumentOperation {
                     deprecated: false,
                     tags: Vec::new(),
                     request_examples: Vec::new(),
+                    request_content_types: Vec::new(),
                     responses: Vec::new(),
                 });
             apply_documentation_policy_updates(&mut policy, self, &resolved_errors);

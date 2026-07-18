@@ -726,6 +726,7 @@ impl Importer {
                 let mut request_body = None;
                 let mut request_body_required = false;
                 let mut request_body_content_type = None;
+                let mut request_body_content_types = Vec::new();
 
                 let all_parameters = self.merge_parameters(
                     &path_parameters,
@@ -778,22 +779,37 @@ impl Importer {
                     }
                 }
 
+                if self.version == SpecVersion::Swagger2 && request_body.is_some() {
+                    request_body_content_types = self.swagger_request_media_types(operation);
+                    request_body_content_type =
+                        preferred_request_media_type(&request_body_content_types)
+                            .filter(|media_type| *media_type != "application/json")
+                            .map(str::to_string);
+                }
+
                 if request_body.is_none() {
                     request_body = match self.version {
                         SpecVersion::Swagger2 => {
                             if form_fields.is_empty() {
                                 None
                             } else {
-                                request_body_content_type = Some(
-                                    if form_fields
-                                        .iter()
-                                        .any(|field| type_contains_bytes(&field.schema))
-                                    {
-                                        "multipart/form-data".to_string()
-                                    } else {
-                                        "application/x-www-form-urlencoded".to_string()
-                                    },
-                                );
+                                let fallback = if form_fields
+                                    .iter()
+                                    .any(|field| type_contains_bytes(&field.schema))
+                                {
+                                    "multipart/form-data"
+                                } else {
+                                    "application/x-www-form-urlencoded"
+                                };
+                                request_body_content_types =
+                                    self.swagger_declared_request_media_types(operation);
+                                if request_body_content_types.is_empty() {
+                                    request_body_content_types.push(fallback.to_string());
+                                }
+                                request_body_content_type =
+                                    preferred_request_media_type(&request_body_content_types)
+                                        .filter(|media_type| *media_type != "application/json")
+                                        .map(str::to_string);
                                 Some(self.insert_synthetic_schema(
                                     &format!("{operation_id}FormRequest"),
                                     Type::Object(form_fields),
@@ -802,8 +818,9 @@ impl Importer {
                         }
                         SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
                             .request_body_schema_ref(operation, &operation_id)
-                            .map(|(schema_ref, media_type, required)| {
+                            .map(|(schema_ref, media_type, media_types, required)| {
                                 request_body_required = required;
+                                request_body_content_types = media_types;
                                 if media_type != "application/json" {
                                     request_body_content_type = Some(media_type);
                                 }
@@ -844,6 +861,7 @@ impl Importer {
                         .map(str::to_string)
                         .collect(),
                     request_examples,
+                    request_content_types: request_body_content_types,
                     responses: response_docs,
                 });
                 let (security, security_alternatives) =
@@ -1012,7 +1030,7 @@ impl Importer {
         &mut self,
         operation: &Value,
         operation_id: &str,
-    ) -> Option<(SchemaRef, String, bool)> {
+    ) -> Option<(SchemaRef, String, Vec<String>, bool)> {
         let mut request_body = operation.get("requestBody")?.clone();
         if let Some(ref_value) = request_body.get("$ref").and_then(Value::as_str) {
             let Some(resolved) = self.resolve_ref_value(ref_value) else {
@@ -1054,14 +1072,46 @@ impl Importer {
             );
             return None;
         };
+        let content_types =
+            self.request_content_types_for_schema(content, media_type, schema, operation_id);
         Some((
             self.schema_ref_for(schema, &format!("{operation_id}Request")),
             media_type.to_string(),
+            content_types,
             request_body
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         ))
+    }
+
+    fn request_content_types_for_schema(
+        &mut self,
+        content: &serde_json::Map<String, Value>,
+        selected_media_type: &str,
+        selected_schema: &Value,
+        operation_id: &str,
+    ) -> Vec<String> {
+        let mut content_types = vec![selected_media_type.to_string()];
+        for (media_type, media) in content {
+            if media_type == selected_media_type {
+                continue;
+            }
+            let Some(schema) = media.get("schema") else {
+                self.warn_request_body(operation_id, media_type, "the media type has no schema");
+                continue;
+            };
+            if schema == selected_schema {
+                content_types.push(media_type.clone());
+            } else {
+                self.warn_request_body(
+                    operation_id,
+                    media_type,
+                    "the media type has a different request schema",
+                );
+            }
+        }
+        content_types
     }
 
     fn import_request_examples(&mut self, operation: &Value) -> Vec<MediaExample> {
@@ -1401,6 +1451,28 @@ impl Importer {
             .into_iter()
             .next()
             .unwrap_or_else(|| "application/json".to_string())
+    }
+
+    fn swagger_request_media_types(&self, operation: &Value) -> Vec<String> {
+        let declared = self.swagger_declared_request_media_types(operation);
+        if declared.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            declared
+        }
+    }
+
+    fn swagger_declared_request_media_types(&self, operation: &Value) -> Vec<String> {
+        operation
+            .get("consumes")
+            .and_then(Value::as_array)
+            .filter(|values| !values.is_empty())
+            .or_else(|| self.root.get("consumes").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
     }
 
     fn swagger_response_media_types(&self, operation: &Value) -> Vec<String> {
@@ -2216,6 +2288,19 @@ fn choose_content(content: &serde_json::Map<String, Value>) -> Option<(&str, &Va
         .map(|(media_type, media)| (media_type.as_str(), media))
 }
 
+fn preferred_request_media_type(content_types: &[String]) -> Option<&str> {
+    for preferred in [
+        "application/json",
+        "multipart/form-data",
+        "application/x-www-form-urlencoded",
+    ] {
+        if content_types.iter().any(|candidate| candidate == preferred) {
+            return Some(preferred);
+        }
+    }
+    content_types.first().map(String::as_str)
+}
+
 fn is_supported_request_media(media_type: &str) -> bool {
     matches!(
         media_type,
@@ -2900,6 +2985,62 @@ paths:
     }
 
     #[test]
+    fn preserves_request_media_types_that_share_a_schema() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      requestBody:
+        content:
+          application/json:
+            schema: &report { type: object, properties: { name: { type: string } } }
+          application/vnd.acme.report+json:
+            schema: *report
+            examples:
+              vendor: { value: { name: annual } }
+          text/plain:
+            schema: { type: string }
+      responses:
+        '201': { description: created }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let docs = &graph.operation_docs[0];
+        assert_eq!(
+            docs.request_content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.body.unresolved"
+                && diagnostic.subject.as_deref() == Some("text/plain")
+        }));
+
+        let yaml = to_openapi(&graph, "Report API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let operation = emitted.pointer("/paths/~1reports/post").unwrap();
+        assert_eq!(
+            operation.pointer(
+                "/requestBody/content/application~1vnd.acme.report+json/examples/vendor/value/name"
+            ),
+            Some(&Value::String("annual".to_string()))
+        );
+        assert!(operation
+            .pointer("/requestBody/content/text~1plain")
+            .is_none());
+    }
+
+    #[test]
     fn imports_openapi31_patch_and_binary_response() {
         let text = r"
 openapi: 3.1.0
@@ -3487,6 +3628,47 @@ definitions:
 
         assert_eq!(
             graph.operations[0].responses[0].content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        assert!(yaml.contains("application/json:"), "{yaml}");
+        assert!(yaml.contains("application/vnd.acme.report+json:"), "{yaml}");
+    }
+
+    #[test]
+    fn imports_all_swagger20_request_media_types() {
+        let text = r"
+swagger: '2.0'
+info: { title: Reports API, version: 1.0.0 }
+consumes: [application/json, application/vnd.acme.report+json]
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema: { $ref: '#/definitions/Report' }
+      responses:
+        '201': { description: created }
+definitions:
+  Report:
+    type: object
+    properties: { id: { type: string } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operation_docs[0].request_content_types,
             vec![
                 "application/json".to_string(),
                 "application/vnd.acme.report+json".to_string()
