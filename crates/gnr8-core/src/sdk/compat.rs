@@ -952,10 +952,30 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
     for rel in &files {
         let text = read_to_string(dir.join(rel))?;
         let parsed = parse_go_file(&text);
-        exported_types.extend(parsed.type_declarations.keys().cloned());
-        exported_type_declarations.extend(parsed.type_declarations);
-        exported_functions.extend(parsed.functions);
-        exported_methods.extend(parsed.methods);
+        exported_types.extend(
+            parsed
+                .type_declarations
+                .keys()
+                .map(|name| qualify_go_symbol(rel, name)),
+        );
+        exported_type_declarations.extend(
+            parsed
+                .type_declarations
+                .into_iter()
+                .map(|(name, declaration)| (qualify_go_symbol(rel, &name), declaration)),
+        );
+        exported_functions.extend(
+            parsed
+                .functions
+                .into_iter()
+                .map(|(name, signature)| (qualify_go_symbol(rel, &name), signature)),
+        );
+        exported_methods.extend(
+            parsed
+                .methods
+                .into_iter()
+                .map(|(name, signature)| (qualify_go_symbol(rel, &name), signature)),
+        );
     }
 
     Ok(GoSurface {
@@ -5509,6 +5529,25 @@ fn is_go_exported(name: &str) -> bool {
         .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
+fn qualify_go_symbol(path: &Path, symbol: &str) -> String {
+    let Some(parent) = path.parent() else {
+        return symbol.to_string();
+    };
+    let package_path = parent
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if package_path.is_empty() {
+        symbol.to_string()
+    } else {
+        format!("{package_path}.{symbol}")
+    }
+}
+
 fn collect_go_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CoreError> {
     let entries = std::fs::read_dir(dir).map_err(|err| CoreError::Workspace {
         message: format!("failed to read Go SDK dir {}: {err}", dir.display()),
@@ -7049,6 +7088,54 @@ type Handler func(ctx string, req *Request) (result *Response, failure error)
         assert!(
             !diff.is_breaking(),
             "test helpers are not shipped API: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_surface_namespaces_symbols_from_subpackages() {
+        let old = temp_dir("go-subpackage-symbols-old");
+        let new = temp_dir("go-subpackage-symbols-new");
+        for dir in [&old, &new] {
+            std::fs::create_dir_all(dir.join("models")).unwrap();
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+            std::fs::write(
+                dir.join("client.go"),
+                "package sdk\n\ntype Client struct { Value string }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            old.join("models/client.go"),
+            "package models\n\ntype Client struct { Value string }\nfunc NewClient(value string) *Client { return nil }\nfunc (c Client) ValueOrDefault() string { return c.Value }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("models/client.go"),
+            "package models\n\ntype Client struct { Value int }\nfunc NewClient(value int) *Client { return nil }\nfunc (c Client) ValueOrDefault() int { return c.Value }\n",
+        )
+        .unwrap();
+
+        let old_surface = extract_go_surface(&old).unwrap();
+        assert_eq!(old_surface.exported_types, vec!["Client", "models.Client"]);
+        assert!(old_surface
+            .exported_functions
+            .contains_key("models.NewClient"));
+        assert!(old_surface
+            .exported_methods
+            .contains_key("models.Client.ValueOrDefault"));
+
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert_eq!(diff.exported_type_changes[0].symbol, "models.Client");
+        assert_eq!(
+            diff.exported_function_signature_changes[0].symbol,
+            "models.NewClient"
+        );
+        assert_eq!(
+            diff.exported_method_signature_changes[0].symbol,
+            "models.Client.ValueOrDefault"
         );
 
         let _ = std::fs::remove_dir_all(old);
