@@ -738,7 +738,7 @@ impl Importer {
                         continue;
                     };
                     match parameter_object.get("in").and_then(Value::as_str) {
-                        Some("path" | "query") => {
+                        Some("path" | "query" | "header" | "cookie") => {
                             if let Some(param) = self.import_param(&parameter) {
                                 params.push(param);
                             }
@@ -2143,6 +2143,56 @@ components:
         assert!(fields.iter().any(|field| {
             field.json_name == "metadata" && matches!(field.schema, Type::Map { .. })
         }));
+    }
+
+    #[test]
+    fn imports_header_and_cookie_parameters_without_losing_wire_metadata() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          schema: { type: string }
+        - name: session
+          in: cookie
+          required: false
+          style: form
+          explode: true
+          schema: { type: string }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let params = &graph.operations[0].params;
+        assert!(params.iter().any(|param| {
+            param.name == "X-Signature" && param.location == "header" && param.required
+        }));
+        assert!(params.iter().any(|param| {
+            param.name == "session"
+                && param.location == "cookie"
+                && !param.required
+                && param.style.as_deref() == Some("form")
+                && param.explode == Some(true)
+        }));
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let yaml = to_openapi(&graph, "Parameter API", "/", &graph.security).unwrap();
+        assert!(
+            yaml.contains("name: X-Signature\n        in: header"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("name: session\n        in: cookie"), "{yaml}");
     }
 
     #[test]
