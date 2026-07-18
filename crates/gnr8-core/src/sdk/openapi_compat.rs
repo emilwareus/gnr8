@@ -139,7 +139,9 @@ struct CanonicalDocument {
     servers: Vec<Value>,
     security: SecurityRequirements,
     security_schemes: BTreeMap<String, Value>,
+    path_items: BTreeMap<String, Value>,
     operations: BTreeMap<String, CanonicalOperation>,
+    webhook_items: BTreeMap<String, Value>,
     webhooks: BTreeMap<String, CanonicalOperation>,
     schemas: BTreeMap<String, Value>,
     external_documents: BTreeMap<String, Value>,
@@ -228,7 +230,9 @@ impl Canonicalizer {
         let security = canonical_security(self.document.root.get("security"));
         let security_schemes = self.security_schemes();
         let schemas = self.schemas();
+        let path_items = self.path_item_metadata("paths", true)?;
         let operations = self.operations()?;
+        let webhook_items = self.path_item_metadata("webhooks", false)?;
         let webhooks = self.webhooks()?;
         let external_documents = self.canonical_external_documents()?;
         Ok(CanonicalDocument {
@@ -236,7 +240,9 @@ impl Canonicalizer {
             servers,
             security,
             security_schemes,
+            path_items,
             operations,
+            webhook_items,
             webhooks,
             schemas,
             external_documents,
@@ -389,6 +395,65 @@ impl Canonicalizer {
             String::new()
         };
         self.canonical_operations(paths, &base_path, true)
+    }
+
+    fn path_item_metadata(
+        &mut self,
+        container: &str,
+        include_server_path: bool,
+    ) -> Result<BTreeMap<String, Value>, CoreError> {
+        if container == "webhooks" && self.document.version != SpecVersion::OpenApi31 {
+            return Ok(BTreeMap::new());
+        }
+        let items = self
+            .document
+            .root
+            .get(container)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let base_path = if include_server_path && self.document.version == SpecVersion::Swagger2 {
+            self.document
+                .root
+                .get("basePath")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let empty_operation = Map::new();
+        let mut metadata = BTreeMap::new();
+        for (path, raw_item) in items {
+            if path.starts_with("x-") {
+                continue;
+            }
+            let item = self.resolve_object(&raw_item, 0)?;
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            let (servers, server_path) = self.operation_servers(item, &empty_operation);
+            let canonical_path = if include_server_path {
+                let operation_base = join_contract_path(&base_path, &server_path);
+                join_contract_path(&operation_base, &path)
+            } else {
+                path
+            };
+            let mut canonical = Map::new();
+            for field in ["summary", "description"] {
+                if let Some(value) = item.get(field) {
+                    canonical.insert(field.to_string(), normalize_generic(value));
+                }
+            }
+            if item.contains_key("servers") {
+                canonical.insert("servers".to_string(), to_value(&servers));
+            }
+            for (key, value) in extensions(item) {
+                canonical.insert(key, value);
+            }
+            metadata.insert(canonical_path, Value::Object(canonical));
+        }
+        Ok(metadata)
     }
 
     fn webhooks(&mut self) -> Result<BTreeMap<String, CanonicalOperation>, CoreError> {
@@ -1551,7 +1616,27 @@ fn diff_documents(old: &CanonicalDocument, new: &CanonicalDocument) -> Vec<OpenA
         None,
         &mut differences,
     );
+    diff_map_values(
+        &old.path_items,
+        &new.path_items,
+        "/paths",
+        "path.item",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
     diff_operations(&old.operations, &new.operations, &mut differences);
+    diff_map_values(
+        &old.webhook_items,
+        &new.webhook_items,
+        "/webhooks",
+        "webhook.item",
+        None,
+        None,
+        None,
+        &mut differences,
+    );
     diff_operation_collection(
         &old.webhooks,
         &new.webhooks,
@@ -2235,6 +2320,26 @@ components:
         assert!(report.differences.iter().any(|difference| {
             difference.code == "response.missing"
                 && difference.location == "/webhooks/event/post/responses/204"
+        }));
+    }
+
+    #[test]
+    fn openapi_path_item_metadata_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Paths","version":"1"},"paths":{"/events":{"summary":"Old summary","get":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Paths","version":"1"},"paths":{"/events":{"summary":"New summary","get":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report.differences.iter().any(|difference| {
+            difference.code == "path.item.summary.changed"
+                && difference.location == "/paths/~1events/summary"
         }));
     }
 
