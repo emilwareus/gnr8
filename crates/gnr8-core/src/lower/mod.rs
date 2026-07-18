@@ -477,7 +477,9 @@ fn lower_operation(
     };
 
     Ok(Operation {
-        operation_id: op.id.clone(),
+        operation_id: docs
+            .and_then(|policy| policy.openapi_operation_id.clone())
+            .unwrap_or_else(|| op.id.clone()),
         summary: docs.and_then(|policy| policy.summary.clone()),
         description: docs.and_then(|policy| policy.description.clone()),
         deprecated: docs.is_some_and(|policy| policy.deprecated),
@@ -1908,6 +1910,7 @@ mod tests {
             .operation_docs
             .push(crate::graph::OperationDocsPolicy {
                 operation_id: "createGoal".to_string(),
+                openapi_operation_id: None,
                 summary: None,
                 description: None,
                 deprecated: false,

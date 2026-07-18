@@ -351,6 +351,9 @@ pub enum PaginationTermination {
 pub struct OperationDocsPolicy {
     /// Operation id this documentation policy applies to.
     pub operation_id: String,
+    /// Exact public `OpenAPI` operation id when it differs from the graph's SDK-safe identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi_operation_id: Option<String>,
     /// Optional short operation summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,

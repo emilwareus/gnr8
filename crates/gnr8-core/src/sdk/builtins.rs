@@ -3405,6 +3405,7 @@ impl Transform for DocumentOperation {
                 .cloned()
                 .unwrap_or_else(|| OperationDocsPolicy {
                     operation_id,
+                    openapi_operation_id: None,
                     summary: None,
                     description: None,
                     deprecated: false,

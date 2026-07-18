@@ -705,6 +705,10 @@ impl Importer {
                     ));
                     continue;
                 };
+                let source_operation_id = operation_object
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
                 let operation_id = self.operation_id(method, &path, operation);
                 let group = operation_object
                     .get("tags")
@@ -831,6 +835,8 @@ impl Importer {
                 let request_examples = self.import_request_examples(operation);
                 self.operation_docs.push(OperationDocsPolicy {
                     operation_id: operation_id.clone(),
+                    openapi_operation_id: source_operation_id
+                        .filter(|source_id| source_id != &operation_id),
                     summary: operation_object
                         .get("summary")
                         .and_then(Value::as_str)
@@ -3034,6 +3040,40 @@ paths:
         assert_eq!(
             operation.pointer("/responses/201/content/application~1json/examples/created/value/id"),
             Some(&Value::String("report-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn preserves_public_operation_id_separately_from_sdk_identity() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Reports API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: reports.list-v1
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(graph.operations[0].id, "reportsListV1");
+        assert_eq!(graph.operations[0].handler, "reportsListV1");
+        assert_eq!(
+            graph.operation_docs[0].openapi_operation_id.as_deref(),
+            Some("reports.list-v1")
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        assert_eq!(
+            emitted
+                .pointer("/paths/~1reports/get/operationId")
+                .and_then(Value::as_str),
+            Some("reports.list-v1")
         );
     }
 
