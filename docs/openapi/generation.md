@@ -94,8 +94,8 @@ OpenApiSchemaAliases::new()
 - `clone_alias` emits a separate copy of the canonical schema body for consumers that require an
   independent component shape.
 
-Canonical names may be schema IDs or unambiguous generated names. Missing names, ambiguous names,
-collisions, and duplicate aliases fail generation.
+`canonical` must be the exact emitted component key; graph schema IDs are not resolved here. Unknown
+canonical names, alias collisions, and duplicate aliases fail generation.
 
 ## Field patches
 
