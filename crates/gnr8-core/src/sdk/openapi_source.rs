@@ -1041,97 +1041,137 @@ impl Importer {
                 continue;
             };
             let response = self.resolve_response(raw_response, operation_id, status_code);
-            if matches!(
-                self.version,
-                SpecVersion::OpenApi30 | SpecVersion::OpenApi31
-            ) {
-                if let Some(media) = response
-                    .get("content")
-                    .and_then(Value::as_object)
-                    .and_then(|content| content.get("text/event-stream"))
-                {
-                    responses.push(Response {
-                        status: status_code,
-                        body: media.get("schema").map(|schema| {
-                            self.schema_ref_for(
-                                schema,
-                                &format!("{operation_id}{status_code}Event"),
-                            )
-                        }),
-                        body_kind: "sse".to_string(),
-                        content_type: Some("text/event-stream".to_string()),
-                        content_types: vec!["text/event-stream".to_string()],
-                    });
-                    continue;
-                }
-            }
-            let selected: Option<(String, &Value)> = match self.version {
-                SpecVersion::Swagger2 => response
-                    .get("schema")
-                    .map(|schema| (self.swagger_response_media_type(operation), schema)),
-                SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => response
-                    .get("content")
-                    .and_then(Value::as_object)
-                    .and_then(choose_content)
-                    .and_then(|(media_type, media)| {
-                        media
-                            .get("schema")
-                            .map(|schema| (media_type.to_string(), schema))
+            responses.push(self.import_response(operation, &response, operation_id, status_code));
+        }
+        responses
+    }
+
+    fn import_response(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+        operation_id: &str,
+        status: u16,
+    ) -> Response {
+        if matches!(
+            self.version,
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31
+        ) {
+            if let Some(media) = response
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(|content| content.get("text/event-stream"))
+            {
+                return Response {
+                    status,
+                    body: media.get("schema").map(|schema| {
+                        self.schema_ref_for(schema, &format!("{operation_id}{status}Event"))
                     }),
+                    body_kind: "sse".to_string(),
+                    content_type: Some("text/event-stream".to_string()),
+                    content_types: vec!["text/event-stream".to_string()],
+                };
+            }
+        }
+        let selected: Option<(String, &Value)> = match self.version {
+            SpecVersion::Swagger2 => response
+                .get("schema")
+                .map(|schema| (self.swagger_response_media_type(operation), schema)),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => response
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(choose_content)
+                .and_then(|(media_type, media)| {
+                    media
+                        .get("schema")
+                        .map(|schema| (media_type.to_string(), schema))
+                }),
+        };
+        let Some((media_type, schema)) = selected else {
+            return Response {
+                status,
+                body: None,
+                body_kind: "empty".to_string(),
+                content_type: None,
+                content_types: Vec::new(),
             };
-            let Some((media_type, schema)) = selected else {
-                responses.push(Response {
-                    status: status_code,
-                    body: None,
-                    body_kind: "empty".to_string(),
-                    content_type: None,
-                    content_types: Vec::new(),
-                });
-                continue;
+        };
+        self.import_schema_response(
+            operation,
+            response,
+            operation_id,
+            status,
+            media_type,
+            schema,
+        )
+    }
+
+    fn import_schema_response(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+        operation_id: &str,
+        status: u16,
+        media_type: String,
+        schema: &Value,
+    ) -> Response {
+        if self.response_schema_is_binary(schema) {
+            let swagger_declared = if self.version == SpecVersion::Swagger2 {
+                self.swagger_declared_response_media_types(operation)
+            } else {
+                Vec::new()
             };
-            if self.response_schema_is_binary(schema) {
-                let content_type =
-                    if self.version == SpecVersion::Swagger2 && media_type == "application/json" {
-                        "application/octet-stream".to_string()
-                    } else {
-                        media_type
-                    };
-                let content_types = self.response_content_types_for_kind(
-                    &response,
+            let content_type = if self.version == SpecVersion::Swagger2
+                && swagger_declared.is_empty()
+                && media_type == "application/json"
+            {
+                "application/octet-stream".to_string()
+            } else {
+                media_type
+            };
+            let content_types = if self.version == SpecVersion::Swagger2 {
+                if swagger_declared.is_empty() {
+                    vec![content_type.clone()]
+                } else {
+                    swagger_declared
+                }
+            } else {
+                self.response_content_types_for_kind(
+                    response,
                     &content_type,
                     schema,
                     ImportedResponseKind::Binary,
                     operation_id,
-                    status_code,
-                );
-                responses.push(Response {
-                    status: status_code,
-                    body: None,
-                    body_kind: "binary".to_string(),
-                    content_type: Some(content_type.clone()),
-                    content_types,
-                });
-                continue;
-            }
-            let content_types = self.response_content_types_for_kind(
-                &response,
+                    status,
+                )
+            };
+            return Response {
+                status,
+                body: None,
+                body_kind: "binary".to_string(),
+                content_type: Some(content_type),
+                content_types,
+            };
+        }
+        let content_types = if self.version == SpecVersion::Swagger2 {
+            self.swagger_response_media_types(operation)
+        } else {
+            self.response_content_types_for_kind(
+                response,
                 &media_type,
                 schema,
                 ImportedResponseKind::Json,
                 operation_id,
-                status_code,
-            );
-            responses.push(Response {
-                status: status_code,
-                body: Some(
-                    self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response")),
-                ),
-                body_kind: "json".to_string(),
-                content_type: (media_type != "application/json").then_some(media_type.clone()),
-                content_types,
-            });
+                status,
+            )
+        };
+        Response {
+            status,
+            body: Some(self.schema_ref_for(schema, &format!("{operation_id}{status}Response"))),
+            body_kind: "json".to_string(),
+            content_type: (media_type != "application/json").then_some(media_type),
+            content_types,
         }
-        responses
     }
 
     fn resolve_response(&mut self, raw_response: &Value, operation_id: &str, status: u16) -> Value {
@@ -1203,20 +1243,32 @@ impl Importer {
     }
 
     fn swagger_response_media_type(&self, operation: &Value) -> String {
+        self.swagger_response_media_types(operation)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "application/json".to_string())
+    }
+
+    fn swagger_response_media_types(&self, operation: &Value) -> Vec<String> {
+        let declared = self.swagger_declared_response_media_types(operation);
+        if declared.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            declared
+        }
+    }
+
+    fn swagger_declared_response_media_types(&self, operation: &Value) -> Vec<String> {
         operation
             .get("produces")
             .and_then(Value::as_array)
-            .and_then(|values| values.first())
-            .and_then(Value::as_str)
-            .or_else(|| {
-                self.root
-                    .get("produces")
-                    .and_then(Value::as_array)
-                    .and_then(|values| values.first())
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("application/json")
-            .to_string()
+            .filter(|values| !values.is_empty())
+            .or_else(|| self.root.get("produces").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
     }
 
     fn response_schema_is_binary(&mut self, schema: &Value) -> bool {
@@ -3054,6 +3106,45 @@ paths:
         assert!(response.body.is_none());
         assert_eq!(response.body_kind, "binary");
         assert_eq!(response.content_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn imports_all_swagger20_response_media_types() {
+        let text = r"
+swagger: '2.0'
+info: { title: Reports API, version: 1.0.0 }
+produces: [application/json, application/vnd.acme.report+json]
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      responses:
+        '200':
+          description: report
+          schema: { $ref: '#/definitions/Report' }
+definitions:
+  Report:
+    type: object
+    properties:
+      id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operations[0].responses[0].content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        assert!(yaml.contains("application/json:"), "{yaml}");
+        assert!(yaml.contains("application/vnd.acme.report+json:"), "{yaml}");
     }
 
     #[test]
