@@ -3593,7 +3593,16 @@ func (a *Analyzer) parametersFromBoundType(
 				param.Default = literalForParameter(defaultText, schema)
 			}
 		}
-		applyParameterSerialization(&param, tag, options)
+		if reason := applyParameterSerialization(&param, tag, options); reason != "" && diags != nil {
+			diags.RequestParameterUnresolved(
+				name,
+				route.Method,
+				untypedRouteLabel(route),
+				reason,
+				file,
+				line,
+			)
+		}
 		out = append(out, param)
 	}
 	return out, true
@@ -3788,9 +3797,9 @@ func literalForParameter(value string, schema facts.Type) *facts.LiteralValue {
 	return &facts.LiteralValue{Type: "string", Value: value}
 }
 
-func applyParameterSerialization(param *facts.ParamFact, tag reflect.StructTag, options []string) {
+func applyParameterSerialization(param *facts.ParamFact, tag reflect.StructTag, options []string) string {
 	if param == nil {
-		return
+		return ""
 	}
 	param.Style = tag.Get("style")
 	if value := tag.Get("explode"); value != "" {
@@ -3809,13 +3818,24 @@ func applyParameterSerialization(param *facts.ParamFact, tag reflect.StructTag, 
 	}
 	if param.Schema.Type == facts.TypeArray {
 		if param.Location == "query" {
+			expectedStyle, expectedExplode, supported := queryCollectionSerialization(collectionFormat)
+			if !supported {
+				return "query array collection format " + strconv.Quote(collectionFormat) + " cannot be represented by the generated OpenAPI/SDK wire contract"
+			}
 			if param.Style == "" {
-				param.Style = "form"
+				param.Style = expectedStyle
+			} else if collectionFormat != "" && param.Style != expectedStyle {
+				return "query array style " + strconv.Quote(param.Style) + " conflicts with collection format " + strconv.Quote(collectionFormat)
 			}
 			if param.Explode == nil {
-				param.Explode = boolPointer(collectionFormat == "" || collectionFormat == "multi")
+				param.Explode = boolPointer(expectedExplode)
+			} else if collectionFormat != "" && *param.Explode != expectedExplode {
+				return "query array explode value conflicts with collection format " + strconv.Quote(collectionFormat)
 			}
 		} else if param.Location == "header" {
+			if collectionFormat != "" && collectionFormat != "csv" {
+				return "header array collection format " + strconv.Quote(collectionFormat) + " cannot be represented by OpenAPI simple serialization"
+			}
 			if param.Style == "" {
 				param.Style = "simple"
 			}
@@ -3823,6 +3843,22 @@ func applyParameterSerialization(param *facts.ParamFact, tag reflect.StructTag, 
 				param.Explode = boolPointer(false)
 			}
 		}
+	}
+	return ""
+}
+
+func queryCollectionSerialization(collectionFormat string) (style string, explode bool, supported bool) {
+	switch collectionFormat {
+	case "", "multi":
+		return "form", true, true
+	case "csv":
+		return "form", false, true
+	case "ssv":
+		return "spaceDelimited", false, true
+	case "pipes":
+		return "pipeDelimited", false, true
+	default:
+		return "", false, false
 	}
 }
 

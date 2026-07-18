@@ -1496,6 +1496,9 @@ type QueryInput struct {
 	Limit    int       `+"`"+`form:"limit,default=25"`+"`"+`
 	State    string    `+"`"+`form:"state" binding:"oneof=active paused"`+"`"+`
 	Day      time.Time `+"`"+`form:"day" time_format:"2006-01-02"`+"`"+`
+	Spaces   []string  `+"`"+`form:"spaces" collection_format:"ssv"`+"`"+`
+	Pipes    []string  `+"`"+`form:"pipes" collection_format:"pipes"`+"`"+`
+	Tabs     []string  `+"`"+`form:"tabs" collection_format:"tsv"`+"`"+`
 }
 
 type HeaderInput struct {
@@ -1563,6 +1566,14 @@ func (s Server) search(c *gin.Context) {
 	if day.Schema.Type != facts.TypeWellKnown || day.Schema.Of != facts.WellKnownDate {
 		t.Fatalf("time_format date must remain a date, got %+v", day.Schema)
 	}
+	spaces, _ := paramByName(code.Params, "spaces")
+	if spaces.Style != "spaceDelimited" || spaces.Explode == nil || *spaces.Explode {
+		t.Fatalf("ssv query serialization mismatch: %+v", spaces)
+	}
+	pipes, _ := paramByName(code.Params, "pipes")
+	if pipes.Style != "pipeDelimited" || pipes.Explode == nil || *pipes.Explode {
+		t.Fatalf("pipes query serialization mismatch: %+v", pipes)
+	}
 	signature, _ := paramByName(code.Params, "X-Webhook-Signature")
 	if signature.Location != "header" || !signature.Required || primName(signature.Schema) != facts.PrimString {
 		t.Fatalf("bound header mismatch: %+v", signature)
@@ -1600,10 +1611,17 @@ func (s Server) search(c *gin.Context) {
 	if primName(byName["attachment"].Schema) != facts.PrimBytes || !byName["attachment"].Required || primName(byName["title"].Schema) != facts.PrimString || primName(byName["note"].Schema) != facts.PrimString {
 		t.Fatalf("multipart fields mismatch: %+v", byName)
 	}
+	foundUnsupportedCollectionFormat := false
 	for _, item := range diagnostics.Items() {
 		if item.Code == "request.parameter.unresolved" && (item.Subject == "branchId" || strings.Contains(item.Message, "RequiredQueryUUID")) {
 			t.Fatalf("resolved multi-hop parameter must not emit incompleteness diagnostic: %+v", item)
 		}
+		if item.Code == "request.parameter.unresolved" && item.Subject == "tabs" && strings.Contains(item.Message, "tsv") {
+			foundUnsupportedCollectionFormat = true
+		}
+	}
+	if !foundUnsupportedCollectionFormat {
+		t.Fatalf("unsupported tsv serialization must emit request.parameter.unresolved: %+v", diagnostics.Items())
 	}
 }
 
