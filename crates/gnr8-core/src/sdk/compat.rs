@@ -1671,6 +1671,7 @@ fn ts_interface_property_change_key(change: &TsInterfacePropertyChange) -> Strin
 struct ParsedTsFile {
     exports: BTreeMap<String, TsExportKind>,
     export_origins: BTreeMap<String, BTreeSet<String>>,
+    declaration_kinds: BTreeMap<String, TsExportKind>,
     api_classes: Vec<String>,
     api_factories: Vec<String>,
     operation_methods: Vec<String>,
@@ -1707,11 +1708,12 @@ enum TsDeclarationKind {
     Other,
 }
 
-struct TsExportedDeclaration<'a> {
+struct TsParsedDeclaration<'a> {
     name: Option<&'a str>,
     export_name: &'a str,
     export_kind: TsExportKind,
     declaration_kind: TsDeclarationKind,
+    exported: bool,
 }
 
 struct TsParsedMethod {
@@ -1758,24 +1760,33 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
     let mut current_interface: Option<TsInterfaceState> = None;
     let code = sanitize_typescript(text, false);
     let structure = sanitize_typescript(text, true);
+    let mut top_level_depth = 0_i32;
     for (raw, structural_raw) in code.lines().zip(structure.lines()) {
         let line = raw.trim();
         let structural_line = structural_raw.trim();
         let mut starts_api_class = false;
         let mut starts_api_factory = false;
         let mut starts_interface = false;
-        if let Some(declaration) = parse_exported_ts_declaration(line) {
-            add_export(
-                &mut parsed.exports,
-                declaration.export_name,
-                declaration.export_kind,
-            );
+        if let Some(declaration) = (top_level_depth == 0)
+            .then(|| parse_ts_declaration(line))
+            .flatten()
+        {
             if let Some(name) = declaration.name {
                 parsed
-                    .export_origins
-                    .entry(declaration.export_name.to_string())
-                    .or_default()
-                    .insert(name.to_string());
+                    .declaration_kinds
+                    .insert(name.to_string(), declaration.export_kind);
+                if declaration.exported {
+                    add_export(
+                        &mut parsed.exports,
+                        declaration.export_name,
+                        declaration.export_kind,
+                    );
+                    parsed
+                        .export_origins
+                        .entry(declaration.export_name.to_string())
+                        .or_default()
+                        .insert(name.to_string());
+                }
                 if matches!(
                     declaration.declaration_kind,
                     TsDeclarationKind::Interface | TsDeclarationKind::TypeAlias
@@ -1821,6 +1832,12 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
                     });
                     starts_api_factory = true;
                 }
+            } else if declaration.exported {
+                add_export(
+                    &mut parsed.exports,
+                    declaration.export_name,
+                    declaration.export_kind,
+                );
             }
         }
 
@@ -1887,6 +1904,7 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         if close_interface {
             current_interface = None;
         }
+        top_level_depth += brace_delta(structural_line);
     }
     parsed.type_declarations = extract_ts_declaration_shapes(text);
     parsed
@@ -1920,6 +1938,7 @@ fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
     let structure = sanitize_typescript(text, true);
     let mut declarations = BTreeMap::new();
     let mut pending: Option<TsDeclarationShapeState> = None;
+    let mut top_level_depth = 0_i32;
     for (raw, structural_raw) in code.lines().zip(structure.lines()) {
         if let Some(state) = &mut pending {
             append_ts_declaration_shape_line(state, raw, structural_raw);
@@ -1931,14 +1950,22 @@ fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
                 TsDeclarationShapeProgress::Ignored => pending = None,
                 TsDeclarationShapeProgress::Incomplete => {}
             }
+            top_level_depth += brace_delta(structural_raw);
+            continue;
+        }
+
+        if top_level_depth != 0 {
+            top_level_depth += brace_delta(structural_raw);
             continue;
         }
 
         let line = raw.trim();
-        let Some(declaration) = parse_exported_ts_declaration(line) else {
+        let Some(declaration) = parse_ts_declaration(line) else {
+            top_level_depth += brace_delta(structural_raw);
             continue;
         };
         let Some(name) = declaration.name else {
+            top_level_depth += brace_delta(structural_raw);
             continue;
         };
         let kind = match declaration.declaration_kind {
@@ -1950,7 +1977,10 @@ fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
                 TsDeclarationShapeKind::ConstStatement
             }
             TsDeclarationKind::Enum => TsDeclarationShapeKind::Enum,
-            TsDeclarationKind::Const | TsDeclarationKind::Other => continue,
+            TsDeclarationKind::Const | TsDeclarationKind::Other => {
+                top_level_depth += brace_delta(structural_raw);
+                continue;
+            }
         };
         let mut state = TsDeclarationShapeState {
             symbol: name.to_string(),
@@ -1966,6 +1996,7 @@ fn extract_ts_declaration_shapes(text: &str) -> BTreeMap<String, Vec<String>> {
             TsDeclarationShapeProgress::Ignored => {}
             TsDeclarationShapeProgress::Incomplete => pending = Some(state),
         }
+        top_level_depth += brace_delta(structural_raw);
     }
     declarations
 }
@@ -2078,9 +2109,7 @@ fn corresponding_ts_code_prefix(code: &str, structure: &str, structural_end: usi
 }
 
 fn canonical_ts_declaration(declaration: &str) -> String {
-    let Some(mut rest) = strip_ts_keyword(declaration, "export") else {
-        return String::new();
-    };
+    let mut rest = strip_ts_keyword(declaration, "export").unwrap_or(declaration.trim_start());
     while let Some(next) =
         strip_ts_keyword(rest, "default").or_else(|| strip_ts_keyword(rest, "declare"))
     {
@@ -2336,11 +2365,15 @@ fn brace_delta(line: &str) -> i32 {
     })
 }
 
-fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>> {
-    let mut rest = strip_ts_keyword(line, "export")?;
+fn parse_ts_declaration(line: &str) -> Option<TsParsedDeclaration<'_>> {
+    let (mut rest, exported) =
+        strip_ts_keyword(line, "export").map_or((line.trim_start(), false), |rest| (rest, true));
     let mut is_default = false;
     loop {
         if let Some(next) = strip_ts_keyword(rest, "default") {
+            if !exported {
+                return None;
+            }
             is_default = true;
             rest = next;
         } else if let Some(next) = strip_ts_keyword(rest, "declare")
@@ -2378,11 +2411,12 @@ fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>
         {
             (TsDeclarationKind::Other, TsExportKind::Value, after)
         } else if is_default {
-            return Some(TsExportedDeclaration {
+            return Some(TsParsedDeclaration {
                 name: None,
                 export_name: "default",
                 export_kind: TsExportKind::Value,
                 declaration_kind: TsDeclarationKind::Other,
+                exported,
             });
         } else {
             return None;
@@ -2392,11 +2426,12 @@ fn parse_exported_ts_declaration(line: &str) -> Option<TsExportedDeclaration<'_>
     if name.is_none() && !is_default {
         return None;
     }
-    Some(TsExportedDeclaration {
+    Some(TsParsedDeclaration {
         name,
         export_name: if is_default { "default" } else { name? },
         export_kind,
         declaration_kind,
+        exported,
     })
 }
 
@@ -3089,7 +3124,16 @@ fn resolved_ts_exports_from_file(
                     let kind = if named_export.type_only {
                         TsExportKind::Type
                     } else {
-                        source.map_or(TsExportKind::Value, |resolved| resolved.kind)
+                        source.map_or_else(
+                            || {
+                                parsed
+                                    .declaration_kinds
+                                    .get(&named_export.source)
+                                    .copied()
+                                    .unwrap_or(TsExportKind::Value)
+                            },
+                            |resolved| resolved.kind,
+                        )
                     };
                     let origins = source.map_or_else(
                         || {
@@ -3329,6 +3373,7 @@ fn exports_from_file(
                         source_exports
                             .get(&named_export.source)
                             .copied()
+                            .or_else(|| parsed.declaration_kinds.get(&named_export.source).copied())
                             .unwrap_or(TsExportKind::Value)
                     };
                     add_export(&mut exports, &named_export.exported, kind);
@@ -6422,6 +6467,62 @@ export default class InternalDefault {}
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_local_exports_retain_declaration_kinds_and_shapes() {
+        let old = temp_dir("ts-local-exports-old");
+        let new = temp_dir("ts-local-exports-new");
+        std::fs::write(
+            old.join("index.ts"),
+            r"interface Book {
+  title: string;
+}
+class BooksApi {
+  getBook(): Promise<Book> { throw new Error(); }
+}
+function privateScope() {
+  interface Hidden { value: string; }
+}
+export { Book, BooksApi };
+",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            r"interface Book {
+  title: number;
+}
+class BooksApi {
+  getBook(): Promise<Book> { throw new Error(); }
+}
+function privateScope() {
+  interface Hidden { value: number; }
+}
+export { Book, BooksApi };
+",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&old).unwrap();
+        assert_eq!(surface.root_exports["Book"], TsExportKind::Type);
+        assert_eq!(surface.root_exports["BooksApi"], TsExportKind::Both);
+        assert_eq!(surface.api_classes, vec!["BooksApi"]);
+        assert_eq!(surface.operation_methods, vec!["BooksApi.getBook"]);
+        assert!(!surface.interface_properties.contains_key("Hidden"));
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert_eq!(diff.interface_type_changes.len(), 1, "{diff:?}");
+        assert_eq!(diff.interface_type_changes[0].interface, "Book");
+        assert!(
+            diff.type_declaration_changes
+                .iter()
+                .all(|change| change.symbol != "Hidden"),
+            "nested private declarations are not package exports: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
     }
 
     #[test]
