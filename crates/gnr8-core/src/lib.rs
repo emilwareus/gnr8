@@ -29,8 +29,8 @@
 //! [`sdk::builtins::OpenApi31`], [`sdk::builtins::GoSdk`], [`sdk::builtins::PySdk`], and
 //! [`sdk::builtins::TsSdk`].
 //!
-//! For agent-facing CLI workflows, run `gnr8 guide` or read
-//! <https://github.com/emilwareus/gnr8/blob/main/docs/AGENT-USAGE.md>.
+//! For agent-facing CLI workflows, run `gnr8 guide` or start with the
+//! <https://github.com/emilwareus/gnr8/blob/main/docs/agents/index.md> task index.
 
 // Existing module docs intentionally link some private implementation seams. Keep docs.rs builds
 // warning-free while the public crate root and SDK prelude remain the stable entry points.
