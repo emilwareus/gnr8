@@ -3129,14 +3129,9 @@ fn add_ts_public_bindings(
 ) {
     for (public_name, resolved) in exports {
         for origin in &resolved.origins {
-            let semantic_name = if public_name == "default" {
-                &origin.symbol
-            } else {
-                public_name
-            };
             into.entry(origin.clone())
                 .or_default()
-                .insert(semantic_name.clone());
+                .insert(public_name.clone());
         }
     }
 }
@@ -6195,25 +6190,51 @@ mod tests {
 
         let surface = extract_typescript_surface(&dir).unwrap();
         assert_eq!(surface.root_exports["default"], TsExportKind::Both);
-        assert_eq!(surface.api_classes, vec!["BooksApi"]);
+        assert_eq!(surface.api_classes, vec!["default"]);
         assert_eq!(
             surface.operation_methods,
-            vec!["BooksApi.getBook", "BooksApi.listBooks"]
+            vec!["default.getBook", "default.listBooks"]
         );
         assert_eq!(
-            surface.operation_return_types["BooksApi.getBook"],
+            surface.operation_return_types["default.getBook"],
             "Promise<Book>"
         );
         assert_eq!(
-            surface.operation_signatures["BooksApi.getBook"],
+            surface.operation_signatures["default.getBook"],
             "async getBook(id: string, options?: { trace?: boolean }): Promise<Book>"
         );
         assert_eq!(
-            surface.operation_signatures["BooksApi.listBooks"],
+            surface.operation_signatures["default.listBooks"],
             "listBooks(options?: RequestOptions): Promise<Book[]>"
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_default_export_internal_rename_is_not_public_drift() {
+        let old = temp_dir("ts-default-class-old");
+        let new = temp_dir("ts-default-class-new");
+        std::fs::write(
+            old.join("index.ts"),
+            "export default class InternalOld { getBook(): Promise<string> { throw new Error(); } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            "export default class InternalNew { getBook(): Promise<string> { throw new Error(); } }\n",
+        )
+        .unwrap();
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+
+        assert!(
+            !diff.is_breaking(),
+            "the local name behind a default export is not public identity: {diff:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
     }
 
     #[test]
