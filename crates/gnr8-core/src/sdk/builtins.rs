@@ -1793,6 +1793,7 @@ fn apply_typed_parameter_override(
         explode: requested.explode,
         allow_reserved: requested.allow_reserved,
         openapi_content: None,
+        openapi_fields: Vec::new(),
         provenance: span.clone(),
     });
     op.params.sort_by(|a, b| {
@@ -2028,6 +2029,7 @@ fn apply_query_param_override(
         explode: None,
         allow_reserved: false,
         openapi_content: None,
+        openapi_fields: Vec::new(),
         provenance: op.provenance.clone(),
     });
     op.params.sort_by(|a, b| {
@@ -6415,6 +6417,7 @@ mod tests {
             explode: None,
             allow_reserved: false,
             openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: span(),
         }
     }

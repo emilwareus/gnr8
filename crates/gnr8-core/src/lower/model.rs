@@ -149,6 +149,8 @@ pub(crate) struct Parameter {
     pub allow_reserved: bool,
     /// Exact `OpenAPI` 3 parameter `content` object, when content was used instead of schema.
     pub openapi_content: Option<serde_json::Value>,
+    /// Exact source parameter fields not otherwise represented by this model.
+    pub openapi_fields: Vec<(String, serde_json::Value)>,
     /// The parameter's schema (primitive, with optional `format`).
     pub schema: SchemaObject,
 }

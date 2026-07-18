@@ -205,9 +205,19 @@ fn write_parameter(param: &Parameter) -> Value {
     if param.allow_reserved {
         out.insert("allowReserved".to_string(), Value::Bool(true));
     }
+    let mut has_source_schema = false;
+    for (name, value) in &param.openapi_fields {
+        if name == "schema" {
+            has_source_schema = true;
+            if param.openapi_content.is_some() {
+                continue;
+            }
+        }
+        out.insert(name.clone(), value.clone());
+    }
     if let Some(content) = &param.openapi_content {
         out.insert("content".to_string(), content.clone());
-    } else {
+    } else if !has_source_schema {
         out.insert("schema".to_string(), write_schema(&param.schema));
     }
     Value::Object(out)

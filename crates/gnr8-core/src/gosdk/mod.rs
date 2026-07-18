@@ -1186,6 +1186,7 @@ mod tests {
                 explode: None,
                 allow_reserved: false,
                 openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: SourceSpan {
                     file: "/root/http.go".to_string(),
                     start_line: 1,
@@ -1202,6 +1203,7 @@ mod tests {
                 explode: None,
                 allow_reserved: false,
                 openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: SourceSpan {
                     file: "/root/http.go".to_string(),
                     start_line: 1,
@@ -1361,6 +1363,7 @@ mod tests {
             explode: None,
             allow_reserved: false,
             openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: SourceSpan {
                 file: "/root/http.go".to_string(),
                 start_line: 1,
@@ -1483,6 +1486,7 @@ mod tests {
             explode: None,
             allow_reserved: false,
             openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: SourceSpan {
                 file: "/root/http.go".to_string(),
                 start_line: 1,
@@ -2003,6 +2007,7 @@ mod tests {
                 explode: None,
                 allow_reserved: false,
                 openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: SourceSpan {
                     file: "/root/h.go".to_string(),
                     start_line: 1,

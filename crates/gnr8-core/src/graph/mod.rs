@@ -516,6 +516,13 @@ pub struct Param {
     /// losing the parameter media type and media-object metadata during source migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openapi_content: Option<serde_json::Value>,
+    /// Consumer-visible `OpenAPI` parameter fields not otherwise represented by this graph type.
+    ///
+    /// Entries are sorted by key. They include an imported `schema`, documentation, examples,
+    /// deprecation/empty-value flags, and vendor extensions. SDK targets continue to use the typed
+    /// fields above; the `OpenAPI` target re-emits these exact source values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openapi_fields: Vec<(String, serde_json::Value)>,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
@@ -873,6 +880,7 @@ impl Param {
             explode: param.explode,
             allow_reserved: param.allow_reserved,
             openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: relativize_span(&param.span, root),
         }
     }

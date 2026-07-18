@@ -3383,6 +3383,7 @@ mod tests {
                 explode: None,
                 allow_reserved: false,
                 openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: crate::graph::SourceSpan {
                     file: "main.ts".to_string(),
                     start_line: 4,

@@ -977,6 +977,7 @@ impl Importer {
             .and_then(Value::as_bool)
             .unwrap_or(location == "path");
         let (schema, openapi_content) = self.parameter_schema(parameter, operation_id, &name);
+        let openapi_fields = self.parameter_openapi_fields(parameter);
         let default = schema.get("default").and_then(literal_value);
         let imported = self.type_from_schema(schema);
         let (style, explode) =
@@ -994,8 +995,66 @@ impl Importer {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             openapi_content,
+            openapi_fields,
             provenance: self.span(),
         })
+    }
+
+    fn parameter_openapi_fields(&self, parameter: &Value) -> Vec<(String, Value)> {
+        let Some(parameter) = parameter.as_object() else {
+            return Vec::new();
+        };
+        let mut fields = BTreeMap::new();
+        for name in [
+            "description",
+            "deprecated",
+            "allowEmptyValue",
+            "example",
+            "examples",
+        ] {
+            if let Some(value) = parameter.get(name) {
+                fields.insert(name.to_string(), value.clone());
+            }
+        }
+        for (name, value) in parameter {
+            if name.starts_with("x-") {
+                fields.insert(name.clone(), value.clone());
+            }
+        }
+
+        if self.version == SpecVersion::Swagger2 {
+            let mut schema = serde_json::Map::new();
+            for name in [
+                "type",
+                "format",
+                "items",
+                "enum",
+                "default",
+                "minimum",
+                "maximum",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "minLength",
+                "maxLength",
+                "pattern",
+                "minItems",
+                "maxItems",
+                "uniqueItems",
+                "nullable",
+                "x-nullable",
+            ] {
+                if let Some(value) = parameter.get(name) {
+                    schema.insert(name.to_string(), value.clone());
+                }
+            }
+            if !schema.is_empty() {
+                fields.insert("schema".to_string(), Value::Object(schema));
+            }
+        } else if let Some(schema) = parameter.get("schema") {
+            fields.insert("schema".to_string(), schema.clone());
+        }
+
+        fields.into_iter().collect()
     }
 
     fn parameter_schema<'a>(
@@ -3177,6 +3236,71 @@ paths:
         assert!(emitted
             .pointer("/paths/~1search/get/parameters/0/schema")
             .is_none());
+    }
+
+    #[test]
+    fn preserves_parameter_schema_documentation_and_extensions() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - name: ids
+          in: query
+          description: Exact ids to include.
+          deprecated: true
+          allowEmptyValue: true
+          examples:
+            pair: { value: [1, 2] }
+          x-client-name: identifiers
+          schema:
+            type: array
+            minItems: 2
+            default: [1, 2]
+            items: { type: integer, format: int64 }
+            x-wire-type: csv-ids
+      responses: { '204': { description: ok } }
+";
+        let source = parse_json_or_yaml(text, std::path::Path::new("openapi.yaml")).unwrap();
+        let source_parameter = source.pointer("/paths/~1search/get/parameters/0").unwrap();
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let parameter = &graph.operations[0].params[0];
+        assert!(matches!(parameter.schema, Type::Array(_)));
+        assert_eq!(
+            parameter
+                .openapi_fields
+                .iter()
+                .find(|(name, _)| name == "schema")
+                .map(|(_, value)| value),
+            source_parameter.get("schema")
+        );
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let emitted_parameter = emitted.pointer("/paths/~1search/get/parameters/0").unwrap();
+        for field in [
+            "description",
+            "deprecated",
+            "allowEmptyValue",
+            "examples",
+            "x-client-name",
+            "schema",
+        ] {
+            assert_eq!(
+                emitted_parameter.get(field),
+                source_parameter.get(field),
+                "parameter field {field} drifted"
+            );
+        }
     }
 
     #[test]

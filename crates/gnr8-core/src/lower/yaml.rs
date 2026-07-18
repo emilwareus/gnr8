@@ -197,10 +197,21 @@ fn write_parameter(out: &mut String, param: &Parameter, depth: usize) {
     if param.allow_reserved {
         let _ = writeln!(out, "{pad}  allowReserved: true");
     }
+    let mut has_source_schema = false;
+    for (name, value) in &param.openapi_fields {
+        if name == "schema" {
+            has_source_schema = true;
+            if param.openapi_content.is_some() {
+                continue;
+            }
+        }
+        let value = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(out, "{pad}  {}: {value}", map_key(name));
+    }
     if let Some(content) = &param.openapi_content {
         let content = serde_json::to_string(content).unwrap_or_else(|_| "null".to_string());
         let _ = writeln!(out, "{pad}  content: {content}");
-    } else {
+    } else if !has_source_schema {
         let _ = writeln!(out, "{pad}  schema:");
         write_schema(out, &param.schema, depth + 2);
     }

@@ -393,20 +393,7 @@ fn lower_operation(
     let parameters = op
         .params
         .iter()
-        .map(|param| {
-            let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
-            schema.default_value.clone_from(&param.default);
-            Ok(Parameter {
-                name: param.name.clone(),
-                location: param.location.clone(),
-                required: param.required,
-                style: param.style.clone(),
-                explode: param.explode,
-                allow_reserved: param.allow_reserved,
-                openapi_content: param.openapi_content.clone(),
-                schema,
-            })
-        })
+        .map(|param| lower_parameter(param, ref_to_name))
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
     let request_body = match &op.request_body {
@@ -492,6 +479,25 @@ fn lower_operation(
         parameters,
         request_body,
         responses,
+    })
+}
+
+fn lower_parameter(
+    param: &crate::graph::Param,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<Parameter, crate::CoreError> {
+    let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
+    schema.default_value.clone_from(&param.default);
+    Ok(Parameter {
+        name: param.name.clone(),
+        location: param.location.clone(),
+        required: param.required,
+        style: param.style.clone(),
+        explode: param.explode,
+        allow_reserved: param.allow_reserved,
+        openapi_content: param.openapi_content.clone(),
+        openapi_fields: param.openapi_fields.clone(),
+        schema,
     })
 }
 
