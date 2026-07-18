@@ -738,7 +738,7 @@ impl Importer {
                     };
                     match parameter_object.get("in").and_then(Value::as_str) {
                         Some("path" | "query" | "header" | "cookie") => {
-                            if let Some(param) = self.import_param(&parameter) {
+                            if let Some(param) = self.import_param(&parameter, &operation_id) {
                                 params.push(param);
                             }
                         }
@@ -963,7 +963,7 @@ impl Importer {
         merged
     }
 
-    fn import_param(&mut self, parameter: &Value) -> Option<Param> {
+    fn import_param(&mut self, parameter: &Value, operation_id: &str) -> Option<Param> {
         let name = parameter.get("name").and_then(Value::as_str)?.to_string();
         let location = parameter.get("in").and_then(Value::as_str)?.to_string();
         let required = parameter
@@ -973,23 +973,74 @@ impl Importer {
         let schema = parameter.get("schema").unwrap_or(parameter);
         let default = schema.get("default").and_then(literal_value);
         let imported = self.type_from_schema(schema);
+        let (style, explode) =
+            self.import_parameter_serialization(parameter, &location, &imported.ty, operation_id);
         Some(Param {
             name,
             location,
             required,
             schema: imported.ty,
             default,
-            style: parameter
-                .get("style")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            explode: parameter.get("explode").and_then(Value::as_bool),
+            style,
+            explode,
             allow_reserved: parameter
                 .get("allowReserved")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             provenance: self.span(),
         })
+    }
+
+    fn import_parameter_serialization(
+        &mut self,
+        parameter: &Value,
+        location: &str,
+        schema: &Type,
+        operation_id: &str,
+    ) -> (Option<String>, Option<bool>) {
+        if self.version != SpecVersion::Swagger2 {
+            return (
+                parameter
+                    .get("style")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                parameter.get("explode").and_then(Value::as_bool),
+            );
+        }
+        if !matches!(schema, Type::Array(_)) {
+            return (None, None);
+        }
+
+        let collection = parameter
+            .get("collectionFormat")
+            .and_then(Value::as_str)
+            .unwrap_or("csv");
+        let serialization = match (location, collection) {
+            ("query", "multi") => ("form", true),
+            ("query", "ssv") => ("spaceDelimited", false),
+            ("query", "pipes") => ("pipeDelimited", false),
+            ("query" | "path" | "header", "csv") => ("form", false),
+            _ => {
+                let name = parameter
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("parameter");
+                self.warn_request_parameter(
+                    operation_id,
+                    name,
+                    &format!(
+                        "Swagger collectionFormat '{collection}' at location '{location}' has no representable OpenAPI 3 serialization"
+                    ),
+                );
+                ("form", false)
+            }
+        };
+        let style = if matches!(location, "path" | "header") {
+            "simple"
+        } else {
+            serialization.0
+        };
+        (Some(style.to_string()), Some(serialization.1))
     }
 
     fn field_from_parameter(&mut self, parameter: &Value) -> Option<FieldFact> {
@@ -1970,6 +2021,21 @@ impl Importer {
                 DiagnosticCategory::RequestBody,
                 "WARN",
                 format!("request body on operation '{operation_id}' is unresolved: {reason}"),
+                span,
+            )
+            .operation(operation_id)
+            .subject(subject),
+        );
+    }
+
+    fn warn_request_parameter(&mut self, operation_id: &str, subject: &str, reason: &str) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "request.parameter.unresolved",
+                DiagnosticCategory::RequestParameter,
+                "WARN",
+                format!("request parameter on operation '{operation_id}' is unresolved: {reason}"),
                 span,
             )
             .operation(operation_id)
@@ -3204,6 +3270,78 @@ paths:
                     .as_deref()
                     .is_some_and(|subject| subject.starts_with("200 "))
         }));
+    }
+
+    #[test]
+    fn imports_swagger20_array_collection_formats() {
+        let text = r"
+swagger: '2.0'
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - { name: ids, in: query, type: array, items: { type: string } }
+        - { name: tags, in: query, type: array, items: { type: string }, collectionFormat: multi }
+        - { name: spaces, in: query, type: array, items: { type: string }, collectionFormat: ssv }
+        - { name: pipes, in: query, type: array, items: { type: string }, collectionFormat: pipes }
+        - { name: X-Ids, in: header, type: array, items: { type: string } }
+        - { name: tabs, in: query, type: array, items: { type: string }, collectionFormat: tsv }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+        let param = |name: &str| {
+            graph.operations[0]
+                .params
+                .iter()
+                .find(|param| param.name == name)
+                .unwrap()
+        };
+
+        assert_eq!(
+            (param("ids").style.as_deref(), param("ids").explode),
+            (Some("form"), Some(false))
+        );
+        assert_eq!(
+            (param("tags").style.as_deref(), param("tags").explode),
+            (Some("form"), Some(true))
+        );
+        assert_eq!(
+            (param("spaces").style.as_deref(), param("spaces").explode),
+            (Some("spaceDelimited"), Some(false))
+        );
+        assert_eq!(
+            (param("pipes").style.as_deref(), param("pipes").explode),
+            (Some("pipeDelimited"), Some(false))
+        );
+        assert_eq!(
+            (param("X-Ids").style.as_deref(), param("X-Ids").explode),
+            (Some("simple"), Some(false))
+        );
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.parameter.unresolved"
+                && diagnostic.operation.as_deref() == Some("search")
+                && diagnostic.subject.as_deref() == Some("tabs")
+        }));
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let parameters = emitted
+            .pointer("/paths/~1search/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap();
+        let ids = parameters
+            .iter()
+            .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some("ids"))
+            .unwrap();
+        assert_eq!(ids.get("style").and_then(Value::as_str), Some("form"));
+        assert_eq!(ids.get("explode").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
