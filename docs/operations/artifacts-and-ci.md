@@ -56,10 +56,10 @@ output-anchor relationships are rejected.
 
 ## Force and baseline adoption
 
-- `gnr8 generate --force` permits overwriting protected edits and may prune generated-looking unowned
-  files below output anchors. Review the cleanup report first.
+- `gnr8 generate --force` permits overwriting protected edits and may delete any file below a target
+  output anchor that the current pipeline does not produce. Dedicate anchors to generated content.
 - `gnr8 generate --accept-generated-baseline` records the current generator result as an intentional
-  migration baseline and reports baseline adoption in JSON.
+  migration baseline, reports adoption in JSON, and uses the same overwrite/prune path as `--force`.
 
 Neither flag changes extraction semantics. Durable fixes still belong in service source or
 `.gnr8/src/main.rs`.
@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: emilwareus/gnr8@vX.Y.Z # replace with an exact release tag
+      - uses: emilwareus/gnr8@v0.1.21 # pin an exact released Action tag
         with:
           working-directories: |
             services/books

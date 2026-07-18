@@ -6,6 +6,7 @@ Run commands from the application repository root. Global options are:
 ```text
 --json          emit machine-readable output and suppress progress text
 -v, --verbose   show more detail; repeat for additional verbosity
+-h, --help      print help for the selected command
 -V, --version   print the CLI version
 ```
 
@@ -70,10 +71,10 @@ gnr8 --json generate
 Runs the project-local pipeline, plans writes, preserves hand-edited generated files, removes stale
 files previously owned by gnr8, and updates the ownership manifest.
 
-- `--force` permits overwriting protected edits and can prune generated-looking unowned files under
-  target output anchors. Inspect the plan first.
+- `--force` permits overwriting protected edits and can delete any file under a target output anchor
+  that the current pipeline no longer produces. Keep output anchors dedicated to generated content.
 - `--accept-generated-baseline` adopts the current generator result as an intentional migration
-  baseline. It permits replacement and reports `baseline_adopted` in JSON.
+  baseline. It uses the same overwrite/prune path as `--force` and reports `baseline_adopted` in JSON.
 
 JSON includes changed-file groups, counts, timings, diagnostics, cache mode, input/output identity,
 baseline state, and cleanup guidance.
@@ -98,12 +99,11 @@ gnr8 --json check
 Runs the same pipeline and write planner as `generate` but changes nothing. Exit status is `1` when
 generated artifacts are missing, stale, or protected by edits. A clean result exits `0`.
 
-Typical CI sequence:
+Developer and CI sequence:
 
 ```bash
-gnr8 generate   # developer workflow
-git diff --exit-code
-gnr8 check      # CI drift gate
+gnr8 generate   # developer: inspect and commit the result
+gnr8 check      # CI: fail on uncommitted generated drift
 ```
 
 ## `inspect`
