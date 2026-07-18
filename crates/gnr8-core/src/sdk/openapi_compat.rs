@@ -405,7 +405,9 @@ impl Canonicalizer {
                 let Some(operation) = operation.as_object() else {
                     continue;
                 };
-                let normalized_path = join_contract_path(&base_path, &path);
+                let (servers, server_path) = self.operation_servers(item, operation);
+                let operation_base = join_contract_path(&base_path, &server_path);
+                let normalized_path = join_contract_path(&operation_base, &path);
                 let operation_label = format!("{} {normalized_path}", method.to_ascii_uppercase());
                 let consumes = string_array(operation.get("consumes"));
                 let consumes = if consumes.is_empty() {
@@ -430,7 +432,6 @@ impl Canonicalizer {
                 let mut tags = string_array(operation.get("tags"));
                 tags.sort();
                 tags.dedup();
-                let servers = self.operation_servers(item, operation);
                 operations.insert(
                     operation_label,
                     CanonicalOperation {
@@ -709,11 +710,11 @@ impl Canonicalizer {
         &self,
         path_item: &Map<String, Value>,
         operation: &Map<String, Value>,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, String) {
         match self.document.version {
             SpecVersion::Swagger2 => {
                 let Some(host) = self.document.root.get("host").and_then(Value::as_str) else {
-                    return Vec::new();
+                    return (Vec::new(), String::new());
                 };
                 let operation_schemes = string_array(operation.get("schemes"));
                 let schemes = if operation_schemes.is_empty() {
@@ -733,7 +734,7 @@ impl Canonicalizer {
                 );
                 servers.sort_by_key(value_sort_key);
                 servers.dedup();
-                servers
+                (servers, String::new())
             }
             SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => {
                 let raw = if operation.contains_key("servers") {
@@ -743,7 +744,7 @@ impl Canonicalizer {
                 } else {
                     self.document.root.get("servers")
                 };
-                canonical_servers(raw)
+                canonical_servers_with_common_path(raw)
             }
         }
     }
@@ -949,6 +950,10 @@ fn canonical_server_url(url: &str) -> Value {
 }
 
 fn canonical_servers(value: Option<&Value>) -> Vec<Value> {
+    canonical_servers_with_common_path(value).0
+}
+
+fn canonical_servers_with_common_path(value: Option<&Value>) -> (Vec<Value>, String) {
     let mut servers = value
         .and_then(Value::as_array)
         .into_iter()
@@ -971,17 +976,70 @@ fn canonical_servers(value: Option<&Value>) -> Vec<Value> {
             for (key, value) in extensions(server) {
                 canonical.insert(key, value);
             }
-            // An omitted OpenAPI servers array and a bare `/` both select the document origin.
-            if canonical.len() == 1 && canonical.get("url").and_then(Value::as_str) == Some("/") {
-                None
-            } else {
-                Some(Value::Object(canonical))
-            }
+            Some(Value::Object(canonical))
         })
         .collect::<Vec<_>>();
+
+    let common_path = servers
+        .iter()
+        .filter_map(|server| server.get("url").and_then(Value::as_str))
+        .map(split_server_base_path)
+        .map(|(_, path)| path)
+        .collect::<BTreeSet<_>>();
+    let common_path = if !servers.is_empty() && common_path.len() == 1 {
+        common_path.into_iter().next().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !common_path.is_empty() {
+        for server in &mut servers {
+            let Some(url) = server.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            let (base, _) = split_server_base_path(url);
+            if let Some(url) = server.get_mut("url") {
+                *url = Value::String(base);
+            }
+        }
+    }
+
+    // An omitted OpenAPI servers array and a bare `/` both select the document origin.
+    servers.retain(|server| {
+        server.as_object().is_none_or(|server| {
+            server.len() != 1 || server.get("url").and_then(Value::as_str) != Some("/")
+        })
+    });
     servers.sort_by_key(value_sort_key);
     servers.dedup();
-    servers
+    (servers, common_path)
+}
+
+fn split_server_base_path(url: &str) -> (String, String) {
+    let url = normalize_server_url(url);
+    let path_start = if let Some(scheme) = url.find("://") {
+        url[scheme + 3..]
+            .find('/')
+            .map(|offset| scheme + 3 + offset)
+    } else if let Some(authority) = url.strip_prefix("//") {
+        authority.find('/').map(|offset| 2 + offset)
+    } else if url.starts_with('/') {
+        Some(0)
+    } else {
+        None
+    };
+    let Some(path_start) = path_start else {
+        return (url, String::new());
+    };
+    let path = normalize_server_url(&url[path_start..]);
+    if path == "/" {
+        return (url, String::new());
+    }
+    let base = if path_start == 0 {
+        "/".to_string()
+    } else {
+        url[..path_start].to_string()
+    };
+    (base, path)
 }
 
 fn normalize_server_variables(value: &Value) -> Value {
@@ -1989,6 +2047,23 @@ components:
         );
         let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
             .expect("compare documents");
+        assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn swagger_base_path_matches_openapi_server_path() {
+        let swagger = parsed(
+            "old.json",
+            r#"{"swagger":"2.0","info":{"title":"Books","version":"1"},"host":"api.example.test","schemes":["https"],"basePath":"/v1","paths":{"/books":{"get":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let openapi = parsed(
+            "new.json",
+            r#"{"openapi":"3.0.3","info":{"title":"Books","version":"1"},"servers":[{"url":"https://api.example.test/v1"}],"paths":{"/books":{"get":{"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+
+        let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
         assert!(report.compatible, "differences: {:?}", report.differences);
     }
 
