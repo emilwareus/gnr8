@@ -3637,15 +3637,16 @@ fn sdk_entry_file_type(
 }
 
 fn is_model_file(path: &Path) -> bool {
-    path == Path::new("models.ts")
-        || path
-            .components()
-            .next()
-            .and_then(|component| match component {
-                std::path::Component::Normal(name) => name.to_str(),
-                _ => None,
-            })
-            == Some("models")
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| matches!(stem, "model" | "models"))
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(name)
+                    if matches!(name.to_str(), Some("model" | "models"))
+            )
+        })
 }
 
 fn package_entry_points(dir: &Path) -> Result<BTreeMap<String, String>, CoreError> {
@@ -6564,6 +6565,45 @@ mod tests {
         assert!(!surface.interface_properties.contains_key("WrongRoot"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_model_surface_supports_source_and_singular_layouts() {
+        let models = temp_dir("ts-models-layout");
+        let source_models = temp_dir("ts-source-models-layout");
+        let singular_model = temp_dir("ts-singular-model-layout");
+        std::fs::create_dir_all(models.join("models")).unwrap();
+        std::fs::create_dir_all(source_models.join("src/models")).unwrap();
+        std::fs::create_dir_all(singular_model.join("src/model")).unwrap();
+        for path in [
+            models.join("models/book.ts"),
+            source_models.join("src/models/book.ts"),
+            singular_model.join("src/model/book.ts"),
+        ] {
+            std::fs::write(path, "export interface Book { title: string; }\n").unwrap();
+        }
+
+        let expected = extract_typescript_surface(&models).unwrap().model_exports;
+        assert_eq!(
+            expected,
+            BTreeMap::from([("Book".to_string(), TsExportKind::Type)])
+        );
+        assert_eq!(
+            extract_typescript_surface(&source_models)
+                .unwrap()
+                .model_exports,
+            expected
+        );
+        assert_eq!(
+            extract_typescript_surface(&singular_model)
+                .unwrap()
+                .model_exports,
+            expected
+        );
+
+        let _ = std::fs::remove_dir_all(models);
+        let _ = std::fs::remove_dir_all(source_models);
+        let _ = std::fs::remove_dir_all(singular_model);
     }
 
     #[test]
