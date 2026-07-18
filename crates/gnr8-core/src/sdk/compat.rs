@@ -489,6 +489,8 @@ pub struct TsExportKindMismatch {
 /// A TypeScript interface property declaration shape.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TsInterfaceProperty {
+    /// Whether the property is declared `readonly`.
+    pub readonly: bool,
     /// Whether the property is declared with `?:`.
     pub optional: bool,
     /// Whether the property type includes `null`.
@@ -1759,6 +1761,7 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
     let mut current_api_class: Option<TsContainerState> = None;
     let mut current_api_factory: Option<TsContainerState> = None;
     let mut current_interface: Option<TsInterfaceState> = None;
+    let mut interface_members = BTreeMap::new();
     let code = sanitize_typescript(text, false);
     let structure = sanitize_typescript(text, true);
     let mut top_level_depth = 0_i32;
@@ -1800,14 +1803,25 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
                         .interface_properties
                         .entry(name.to_string())
                         .or_default();
-                    let depth = brace_delta(structural_line);
-                    current_interface = Some(TsInterfaceState {
-                        name: name.to_string(),
-                        depth,
-                        opened: depth > 0,
-                        property: String::new(),
-                    });
-                    starts_interface = true;
+                    if let Some(members) = inline_ts_interface_members(line) {
+                        for member in members {
+                            record_interface_member(
+                                &member,
+                                name,
+                                &mut parsed.interface_properties,
+                                &mut interface_members,
+                            );
+                        }
+                    } else {
+                        let depth = brace_delta(structural_line);
+                        current_interface = Some(TsInterfaceState {
+                            name: name.to_string(),
+                            depth,
+                            opened: depth > 0,
+                            property: String::new(),
+                        });
+                        starts_interface = true;
+                    }
                 } else if declaration.declaration_kind == TsDeclarationKind::Class
                     && name.ends_with("Api")
                 {
@@ -1893,7 +1907,12 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         if let Some(interface) = &mut current_interface {
             if !starts_interface {
                 if interface.opened && (interface.depth == 1 || !interface.property.is_empty()) {
-                    collect_interface_property(line, interface, &mut parsed.interface_properties);
+                    collect_interface_member(
+                        line,
+                        interface,
+                        &mut parsed.interface_properties,
+                        &mut interface_members,
+                    );
                 }
                 interface.depth += brace_delta(structural_line);
                 interface.opened |= interface.depth > 0;
@@ -1908,6 +1927,7 @@ fn parse_ts_file(text: &str) -> ParsedTsFile {
         top_level_depth += brace_delta(structural_line);
     }
     parsed.type_declarations = extract_ts_declaration_shapes(text);
+    merge_ts_declaration_shapes(&mut parsed.type_declarations, interface_members);
     parsed
 }
 
@@ -2119,17 +2139,17 @@ fn canonical_ts_declaration(declaration: &str) -> String {
     normalize_ts_tokens(rest.trim().trim_end_matches(';').trim())
 }
 
-fn collect_interface_property(
+fn collect_interface_member(
     line: &str,
     state: &mut TsInterfaceState,
     properties: &mut BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    members: &mut BTreeMap<String, Vec<String>>,
 ) {
     if state.property.is_empty()
         && (line.is_empty()
             || line.starts_with("//")
             || line.starts_with("/*")
             || line.starts_with('*')
-            || line.starts_with('[')
             || line.starts_with('{')
             || line.starts_with('}'))
     {
@@ -2142,13 +2162,81 @@ fn collect_interface_property(
     if !interface_property_decl_complete(&state.property) {
         return;
     }
-    if let Some((property, shape)) = parse_interface_property(&state.property) {
+    record_interface_member(&state.property, &state.name, properties, members);
+    state.property.clear();
+}
+
+fn record_interface_member(
+    declaration: &str,
+    interface: &str,
+    properties: &mut BTreeMap<String, BTreeMap<String, TsInterfaceProperty>>,
+    members: &mut BTreeMap<String, Vec<String>>,
+) {
+    if let Some((property, shape)) = parse_interface_property(declaration) {
         properties
-            .entry(state.name.clone())
+            .entry(interface.to_string())
             .or_default()
             .insert(property, shape);
+    } else {
+        let member = normalize_ts_signature(declaration);
+        if !member.is_empty() {
+            add_ts_declaration_shape(members, interface, format!("member {member}"));
+        }
     }
-    state.property.clear();
+}
+
+fn inline_ts_interface_members(line: &str) -> Option<Vec<String>> {
+    let open = ts_top_level_body_open(line)?;
+    let close = matching_ts_delimiter(line, open, '{', '}')?;
+    let body = &line[open + 1..close];
+    Some(split_inline_ts_interface_members(body))
+}
+
+fn split_inline_ts_interface_members(body: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escape = false;
+    let mut round = 0_u32;
+    let mut square = 0_u32;
+    let mut curly = 0_u32;
+    let mut angle = 0_u32;
+    for (index, ch) in body.char_indices() {
+        if let Some(active) = quote {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' => round += 1,
+            ')' => round = round.saturating_sub(1),
+            '[' => square += 1,
+            ']' => square = square.saturating_sub(1),
+            '{' => curly += 1,
+            '}' => curly = curly.saturating_sub(1),
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
+            ';' | ',' if round == 0 && square == 0 && curly == 0 && angle == 0 => {
+                let member = body[start..index].trim();
+                if !member.is_empty() {
+                    members.push(member.to_string());
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let member = body[start..].trim();
+    if !member.is_empty() {
+        members.push(member.to_string());
+    }
+    members
 }
 
 fn interface_property_decl_complete(decl: &str) -> bool {
@@ -2655,11 +2743,12 @@ fn parse_interface_property(line: &str) -> Option<(String, TsInterfaceProperty)>
     if ty.is_empty() {
         return None;
     }
-    let (name, optional) = property_name_and_optional(left)?;
+    let (name, readonly, optional) = property_name_and_optional(left)?;
     let nullable = ts_type_contains_null(&ty);
     Some((
         name,
         TsInterfaceProperty {
+            readonly,
             optional,
             nullable,
             ty,
@@ -2680,20 +2769,25 @@ fn split_property_decl(line: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn property_name_and_optional(left: &str) -> Option<(String, bool)> {
+fn property_name_and_optional(left: &str) -> Option<(String, bool, bool)> {
+    let (left, readonly) = left
+        .strip_prefix("readonly ")
+        .map_or((left, false), |name| (name.trim_start(), true));
     let optional = left.ends_with('?');
     let name = left.trim_end_matches('?').trim();
-    if name.is_empty() {
+    if name.is_empty() || name.contains('(') {
         return None;
     }
     let name = if (name.starts_with('"') && name.ends_with('"'))
         || (name.starts_with('\'') && name.ends_with('\''))
     {
         name[1..name.len() - 1].to_string()
-    } else {
+    } else if ident_prefix(name) == Some(name) || name.chars().all(|ch| ch.is_ascii_digit()) {
         name.to_string()
+    } else {
+        return None;
     };
-    Some((name, optional))
+    Some((name, readonly, optional))
 }
 
 fn normalize_ts_type(ty: &str) -> String {
@@ -6607,6 +6701,68 @@ mod tests {
     }
 
     #[test]
+    fn typescript_interfaces_capture_inline_readonly_and_callable_members() {
+        let old = temp_dir("ts-interface-members-old");
+        let new = temp_dir("ts-interface-members-new");
+        std::fs::write(
+            old.join("index.ts"),
+            r"export interface BooksApi {
+  readonly version?: string;
+  getBook(id: string): Promise<Book>;
+  [key: string]: unknown;
+}
+export interface Inline { value: string; call(): string; }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("index.ts"),
+            r"export interface BooksApi {
+  version?: string;
+  getBook(id: string): Promise<number>;
+  [key: string]: number;
+}
+export interface Inline { value: number; call(): number; }
+",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&old).unwrap();
+        assert!(surface.interface_properties["BooksApi"]["version"].readonly);
+        assert_eq!(surface.interface_properties["Inline"]["value"].ty, "string");
+        assert!(surface.type_declarations["BooksApi"]
+            .iter()
+            .any(|shape| shape == "member getBook(id: string): Promise<Book>"));
+        assert!(
+            surface.type_declarations["BooksApi"]
+                .iter()
+                .any(|shape| shape == "member[key: string]: unknown"),
+            "{:?}",
+            surface.type_declarations["BooksApi"]
+        );
+
+        let diff = diff_typescript_dirs(&old, &new).unwrap();
+        assert!(diff
+            .interface_property_changes
+            .iter()
+            .any(|change| change.interface == "BooksApi" && change.property == "version"));
+        assert!(diff
+            .interface_type_changes
+            .iter()
+            .any(|change| change.interface == "Inline" && change.property == "value"));
+        assert_eq!(
+            diff.type_declaration_changes
+                .iter()
+                .map(|change| change.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["BooksApi", "Inline"]
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
     fn typescript_default_export_internal_rename_is_not_public_drift() {
         let old = temp_dir("ts-default-class-old");
         let new = temp_dir("ts-default-class-new");
@@ -7834,6 +7990,7 @@ type Handler func(ctx string, req *Request) (result *Response, failure error)
                 BTreeMap::from([(
                     "title".to_string(),
                     TsInterfaceProperty {
+                        readonly: false,
                         optional: true,
                         nullable: true,
                         ty: "string | null".to_string(),
@@ -7866,6 +8023,7 @@ type Handler func(ctx string, req *Request) (result *Response, failure error)
                 BTreeMap::from([(
                     "title".to_string(),
                     TsInterfaceProperty {
+                        readonly: false,
                         optional: false,
                         nullable: false,
                         ty: "string".to_string(),
@@ -7953,11 +8111,13 @@ type Handler func(ctx string, req *Request) (result *Response, failure error)
                 interface: "Book".to_string(),
                 property: "title".to_string(),
                 old: TsInterfaceProperty {
+                    readonly: false,
                     optional: true,
                     nullable: true,
                     ty: "string | null".to_string(),
                 },
                 new: TsInterfaceProperty {
+                    readonly: false,
                     optional: true,
                     nullable: false,
                     ty: "string".to_string(),
