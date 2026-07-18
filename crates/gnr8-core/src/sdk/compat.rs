@@ -1175,7 +1175,8 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         parsed_files.insert(rel.clone(), parse_ts_file(&text));
     }
 
-    let public_bindings = public_ts_export_bindings(dir, &files)?;
+    let root_index = ts_root_index(dir, &files)?;
+    let public_bindings = public_ts_export_bindings(dir, &files, root_index.as_deref())?;
     let identifier_renames = unambiguous_ts_public_identifier_renames(&public_bindings);
     for (rel, parsed) in parsed_files {
         let bindings: BTreeMap<String, BTreeSet<String>> = public_bindings
@@ -1198,7 +1199,7 @@ pub fn extract_typescript_surface(dir: impl AsRef<Path>) -> Result<TypeScriptSur
         }
     }
 
-    let root_exports = extract_root_exports(dir, &files, &all_exports)?;
+    let root_exports = extract_root_exports(dir, root_index.as_deref(), &all_exports)?;
     Ok(TypeScriptSurface {
         root_exports,
         model_exports,
@@ -3177,10 +3178,11 @@ fn add_resolved_ts_export(
 fn public_ts_export_bindings(
     dir: &Path,
     files: &[PathBuf],
+    root_index: Option<&Path>,
 ) -> Result<BTreeMap<TsExportOrigin, BTreeSet<String>>, CoreError> {
     let mut cache = BTreeMap::new();
     let mut bindings = BTreeMap::new();
-    if let Some(index) = ts_root_index(files) {
+    if let Some(index) = root_index {
         let exports = resolved_ts_exports_from_file(dir, index, &mut cache, &mut Vec::new())?;
         add_ts_public_bindings(&mut bindings, &exports);
     } else {
@@ -3279,10 +3281,10 @@ fn add_ts_declaration_shape(into: &mut BTreeMap<String, Vec<String>>, symbol: &s
 
 fn extract_root_exports(
     dir: &Path,
-    files: &[PathBuf],
+    root_index: Option<&Path>,
     all_exports: &BTreeMap<String, TsExportKind>,
 ) -> Result<BTreeMap<String, TsExportKind>, CoreError> {
-    let Some(index) = ts_root_index(files) else {
+    let Some(index) = root_index else {
         return Ok(all_exports.clone());
     };
     let mut cache = BTreeMap::new();
@@ -3290,15 +3292,124 @@ fn extract_root_exports(
     exports_from_file(dir, index, &mut cache, &mut stack)
 }
 
-fn ts_root_index(files: &[PathBuf]) -> Option<&Path> {
-    ["index.ts", "index.d.ts", "src/index.ts", "src/index.d.ts"]
+fn ts_root_index(dir: &Path, files: &[PathBuf]) -> Result<Option<PathBuf>, CoreError> {
+    for candidate in package_ts_root_candidates(dir)? {
+        let Some(candidate) = normalize_package_entry_path(&candidate) else {
+            continue;
+        };
+        for resolved in ts_entry_file_candidates(&candidate) {
+            if files.iter().any(|file| file == &resolved) {
+                return Ok(Some(resolved));
+            }
+        }
+    }
+    Ok(["index.ts", "index.d.ts", "src/index.ts", "src/index.d.ts"]
         .into_iter()
         .find_map(|candidate| {
             files
                 .iter()
                 .find(|path| path.as_path() == Path::new(candidate))
-                .map(PathBuf::as_path)
-        })
+                .cloned()
+        }))
+}
+
+fn package_ts_root_candidates(dir: &Path) -> Result<Vec<String>, CoreError> {
+    let path = dir.join("package.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = read_to_string(&path)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| CoreError::Workspace {
+            message: format!("failed to parse package.json for TypeScript SDK surface: {error}"),
+        })?;
+    let mut candidates = Vec::new();
+    for key in ["types", "typings"] {
+        if let Some(candidate) = value.get(key).and_then(serde_json::Value::as_str) {
+            candidates.push(candidate.to_string());
+        }
+    }
+    if let Some(exports) = value.get("exports") {
+        collect_ts_root_export_candidates(exports, &mut candidates, true);
+    }
+    Ok(candidates)
+}
+
+fn collect_ts_root_export_candidates(
+    value: &serde_json::Value,
+    candidates: &mut Vec<String>,
+    package_root: bool,
+) {
+    match value {
+        serde_json::Value::String(candidate) => candidates.push(candidate.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_ts_root_export_candidates(value, candidates, false);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            if package_root {
+                if let Some(root) = entries.get(".") {
+                    collect_ts_root_export_candidates(root, candidates, false);
+                    return;
+                }
+                if entries.keys().any(|key| key.starts_with('.')) {
+                    return;
+                }
+            }
+            for key in ["types", "typings", "import", "require", "default"] {
+                if let Some(candidate) = entries.get(key) {
+                    collect_ts_root_export_candidates(candidate, candidates, false);
+                }
+            }
+            for (condition, candidate) in entries {
+                if condition.starts_with("types@") {
+                    collect_ts_root_export_candidates(candidate, candidates, false);
+                }
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn normalize_package_entry_path(value: &str) -> Option<PathBuf> {
+    let mut path = PathBuf::new();
+    for component in Path::new(value).components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                path.pop().then_some(())?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(path)
+}
+
+fn ts_entry_file_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![path.to_path_buf()];
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("js" | "jsx") => {
+            candidates.push(path.with_extension("d.ts"));
+            candidates.push(path.with_extension("ts"));
+            candidates.push(path.with_extension("tsx"));
+        }
+        Some("mjs") => {
+            candidates.push(path.with_extension("d.mts"));
+            candidates.push(path.with_extension("mts"));
+        }
+        Some("cjs") => {
+            candidates.push(path.with_extension("d.cts"));
+            candidates.push(path.with_extension("cts"));
+        }
+        Some(_) => {}
+        None => {
+            candidates.push(path.join("index.d.ts"));
+            candidates.push(path.join("index.ts"));
+        }
+    }
+    candidates
 }
 
 fn exports_from_file(
@@ -3425,8 +3536,16 @@ fn resolve_ts_module(dir: &Path, base: &Path, spec: &str) -> Option<PathBuf> {
         joined.with_extension("ts"),
         joined.with_extension("d.ts"),
         joined.with_extension("tsx"),
+        joined.with_extension("mts"),
+        joined.with_extension("d.mts"),
+        joined.with_extension("cts"),
+        joined.with_extension("d.cts"),
         joined.join("index.ts"),
         joined.join("index.d.ts"),
+        joined.join("index.mts"),
+        joined.join("index.d.mts"),
+        joined.join("index.cts"),
+        joined.join("index.d.cts"),
         joined.clone(),
     ]
     .into_iter()
@@ -3470,7 +3589,7 @@ fn collect_ts_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
         } else if file_type.is_file()
             && matches!(
                 path.extension().and_then(|ext| ext.to_str()),
-                Some("ts" | "tsx")
+                Some("ts" | "tsx" | "mts" | "cts")
             )
         {
             let rel = path
@@ -3540,7 +3659,7 @@ fn package_entry_points(dir: &Path) -> Result<BTreeMap<String, String>, CoreErro
             message: format!("failed to parse package.json for TypeScript SDK surface: {err}"),
         })?;
     let mut out = BTreeMap::new();
-    for key in ["main", "module", "types", "exports"] {
+    for key in ["main", "module", "types", "typings", "exports"] {
         if let Some(value) = value.get(key) {
             out.insert(key.to_string(), value.to_string());
         }
@@ -6403,6 +6522,46 @@ mod tests {
             surface.operation_signatures["default.listBooks"],
             "listBooks(options?: RequestOptions): Promise<Book[]>"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn typescript_surface_follows_published_package_entry_point() {
+        let dir = temp_dir("ts-package-entry-point");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{
+  "types": "./missing/unbuilt.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "default": "./dist/public.js"
+    },
+    "./internal": "./src/internal.ts"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.ts"),
+            "export interface WrongRoot { value: string; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("dist/public.d.ts"),
+            "export interface Book { title: string; }\n",
+        )
+        .unwrap();
+
+        let surface = extract_typescript_surface(&dir).unwrap();
+        assert_eq!(
+            surface.root_exports,
+            BTreeMap::from([("Book".to_string(), TsExportKind::Type)])
+        );
+        assert!(surface.interface_properties.contains_key("Book"));
+        assert!(!surface.interface_properties.contains_key("WrongRoot"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
