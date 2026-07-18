@@ -721,15 +721,16 @@ impl Importer {
                 let mut request_body_required = false;
                 let mut request_body_content_type = None;
 
-                let mut all_parameters = path_parameters.clone();
-                if let Some(operation_parameters) =
-                    operation_object.get("parameters").and_then(Value::as_array)
-                {
-                    all_parameters.extend(operation_parameters.iter().cloned());
-                }
+                let all_parameters = self.merge_parameters(
+                    &path_parameters,
+                    operation_object
+                        .get("parameters")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
 
                 for parameter in all_parameters {
-                    let parameter = self.resolve_parameter(parameter);
                     let Some(parameter_object) = parameter.as_object() else {
                         self.warn(format!(
                             "parameter on {} {path} is not an object",
@@ -903,6 +904,25 @@ impl Importer {
             "parameter reference '{ref_value}' could not be resolved"
         ));
         parameter
+    }
+
+    fn merge_parameters(&mut self, path: &[Value], operation: &[Value]) -> Vec<Value> {
+        let mut merged = Vec::with_capacity(path.len() + operation.len());
+        for parameter in path.iter().chain(operation) {
+            let parameter = self.resolve_parameter(parameter.clone());
+            let identity = parameter_identity(&parameter);
+            if let Some((name, location)) = identity {
+                if let Some(existing) = merged.iter_mut().find(|existing| {
+                    parameter_identity(existing)
+                        .is_some_and(|candidate| candidate == (name.clone(), location.clone()))
+                }) {
+                    *existing = parameter;
+                    continue;
+                }
+            }
+            merged.push(parameter);
+        }
+        merged
     }
 
     fn import_param(&mut self, parameter: &Value) -> Option<Param> {
@@ -1627,6 +1647,13 @@ fn split_ref(ref_value: &str) -> (&str, &str) {
     }
 }
 
+fn parameter_identity(parameter: &Value) -> Option<(String, String)> {
+    Some((
+        parameter.get("name")?.as_str()?.to_string(),
+        parameter.get("in")?.as_str()?.to_string(),
+    ))
+}
+
 fn schema_id_from_pointer(pointer: &str) -> Option<String> {
     pointer
         .trim_start_matches('#')
@@ -2259,6 +2286,53 @@ components:
         );
         assert!(!graph.schemas.iter().any(|schema| schema.id == "Locale"));
         assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+    }
+
+    #[test]
+    fn operation_parameters_override_matching_path_parameters() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    parameters:
+      - name: locale
+        in: query
+        schema: { type: string }
+      - name: X-Trace-Id
+        in: header
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getReport
+      parameters:
+        - name: locale
+          in: query
+          required: true
+          schema: { type: integer, format: int32 }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let params = &graph.operations[0].params;
+        assert_eq!(params.len(), 2, "{params:?}");
+        let locale = params.iter().find(|param| param.name == "locale").unwrap();
+        assert!(locale.required);
+        assert_eq!(
+            locale.schema,
+            Type::Primitive(Prim::Int {
+                bits: 32,
+                signed: true
+            })
+        );
+        assert!(params
+            .iter()
+            .any(|param| param.name == "X-Trace-Id" && param.location == "header"));
     }
 
     #[test]
