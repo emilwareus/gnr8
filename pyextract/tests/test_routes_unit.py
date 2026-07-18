@@ -75,6 +75,8 @@ class FlaskQueryParamTargetTests(unittest.TestCase):
         items = diags.items()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["severity"], "WARN")
+        self.assertEqual(items[0]["code"], "request.parameter.unresolved")
+        self.assertEqual(items[0]["operation"], "GET /")
         self.assertIn("non-name target", items[0]["message"])
 
     def test_subscript_target_skipped_with_diagnostic(self):
@@ -181,7 +183,7 @@ class FastAPIBodylessMethodTests(unittest.TestCase):
     )
     DTO = "class CreateInput:\n    x: int\n"
 
-    def _body(self, method):
+    def _body_and_diags(self, method):
         modules = [
             _FakeModule("app.main", self.SRC),
             _FakeModule("app.dto", self.DTO),
@@ -192,16 +194,24 @@ class FastAPIBodylessMethodTests(unittest.TestCase):
         _params, body = routes._build_params(
             func, "/", method, "app.main", modules[0].abs_path, table, diags
         )
-        return body
+        return body, diags.items()
 
     def test_post_derives_body(self):
-        self.assertEqual(self._body("POST"), {"ref_id": "app.dto.CreateInput"})
+        body, diagnostics = self._body_and_diags("POST")
+        self.assertEqual(body, {"ref_id": "app.dto.CreateInput"})
+        self.assertEqual(diagnostics, [])
 
     def test_get_omits_body(self):
-        self.assertIsNone(self._body("GET"))
+        body, diagnostics = self._body_and_diags("GET")
+        self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "GET /")
 
     def test_delete_omits_body(self):
-        self.assertIsNone(self._body("DELETE"))
+        body, diagnostics = self._body_and_diags("DELETE")
+        self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "DELETE /")
 
 
 if __name__ == "__main__":
