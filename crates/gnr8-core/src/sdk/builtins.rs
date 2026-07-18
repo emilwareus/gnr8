@@ -958,6 +958,7 @@ pub struct ApiOverrides {
     request_bodies: Vec<RequestBodyOverride>,
     responses: Vec<(OperationSelector, ResponseOverride)>,
     default_responses: Vec<DefaultResponseOverride>,
+    configuration_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1503,6 +1504,10 @@ impl ApiOverrides {
     pub fn optional(mut self) -> Self {
         if let Some(body) = self.request_bodies.last_mut() {
             body.required = Some(false);
+        } else {
+            self.configuration_errors.push(
+                "ApiOverrides::optional() requires a preceding request-body override".to_string(),
+            );
         }
         self
     }
@@ -1564,10 +1569,17 @@ impl ApiOverrides {
     /// Attach an existing schema as the event envelope for the most recently configured SSE response.
     #[must_use]
     pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
-        if let Some((_, response)) = self.responses.last_mut() {
-            if response.body_kind == "sse" {
+        match self.responses.last_mut() {
+            Some((_, response)) if response.body_kind == "sse" => {
                 response.schema_ref = Some(schema.into());
             }
+            Some(_) => self.configuration_errors.push(
+                "ApiOverrides::event_schema() requires the preceding response to be SSE"
+                    .to_string(),
+            ),
+            None => self
+                .configuration_errors
+                .push("ApiOverrides::event_schema() requires a preceding SSE response".to_string()),
         }
         self
     }
@@ -1575,6 +1587,11 @@ impl ApiOverrides {
 
 impl Transform for ApiOverrides {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if let Some(message) = self.configuration_errors.first() {
+            return Err(CoreError::Config {
+                message: message.clone(),
+            });
+        }
         for override_ in &self.field_presence {
             apply_field_presence_override(
                 ir,
@@ -3775,6 +3792,7 @@ impl Transform for GroupOperations {
 #[derive(Debug, Clone, Default)]
 pub struct SdkOperationAliases {
     aliases: Vec<SdkOperationAlias>,
+    configuration_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3810,6 +3828,9 @@ impl SdkOperationAliases {
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         if let Some(alias) = self.aliases.last_mut() {
             alias.tag = Some(tag.into());
+        } else {
+            self.configuration_errors
+                .push("SdkOperationAliases::tag() requires a preceding operation()".to_string());
         }
         self
     }
@@ -3819,6 +3840,9 @@ impl SdkOperationAliases {
     pub fn name(mut self, name: impl Into<String>) -> Self {
         if let Some(alias) = self.aliases.last_mut() {
             alias.name = Some(name.into());
+        } else {
+            self.configuration_errors
+                .push("SdkOperationAliases::name() requires a preceding operation()".to_string());
         }
         self
     }
@@ -3826,6 +3850,11 @@ impl SdkOperationAliases {
 
 impl Transform for SdkOperationAliases {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if let Some(message) = self.configuration_errors.first() {
+            return Err(CoreError::Config {
+                message: message.clone(),
+            });
+        }
         for alias in &self.aliases {
             if alias.tag.is_none() && alias.name.is_none() {
                 return Err(CoreError::Config {
@@ -6278,6 +6307,38 @@ mod tests {
             CoreError::DiagnosticsDenied { codes }
                 if codes == vec!["request.parameter.unresolved".to_string()]
         ));
+    }
+
+    #[test]
+    fn fluent_modifiers_reject_missing_or_incompatible_predecessors() {
+        let mut ir = ApiGraph::default();
+
+        let optional = ApiOverrides::new()
+            .optional()
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(optional.to_string().contains("request-body override"));
+
+        let event_schema = ApiOverrides::new()
+            .json_response("GET", "/events", 200, "Event")
+            .event_schema("Envelope")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(event_schema
+            .to_string()
+            .contains("preceding response to be SSE"));
+
+        let alias_tag = SdkOperationAliases::new()
+            .tag("events")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(alias_tag.to_string().contains("preceding operation()"));
+
+        let alias_name = SdkOperationAliases::new()
+            .name("listEvents")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(alias_name.to_string().contains("preceding operation()"));
     }
 
     fn grouped_test_operation(
