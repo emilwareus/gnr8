@@ -896,8 +896,8 @@ impl Importer {
         let Some(ref_value) = parameter.get("$ref").and_then(Value::as_str) else {
             return parameter;
         };
-        if let Some((_, schema)) = self.resolve_ref_schema(ref_value) {
-            return schema;
+        if let Some(resolved) = self.resolve_ref_value(ref_value) {
+            return resolved;
         }
         self.warn(format!(
             "parameter reference '{ref_value}' could not be resolved"
@@ -1521,6 +1521,15 @@ impl Importer {
             .entry(id.clone())
             .or_insert_with(|| resolved.clone());
         Some((id, resolved))
+    }
+
+    fn resolve_ref_value(&mut self, ref_value: &str) -> Option<Value> {
+        let (file_part, pointer) = split_ref(ref_value);
+        if file_part.is_empty() {
+            return resolve_pointer(&self.root, pointer);
+        }
+        let external_doc = self.external_doc(file_part)?;
+        resolve_pointer(&external_doc, pointer)
     }
 
     fn external_doc(&mut self, file_part: &str) -> Option<Value> {
@@ -2193,6 +2202,63 @@ paths:
             "{yaml}"
         );
         assert!(yaml.contains("name: session\n        in: cookie"), "{yaml}");
+    }
+
+    #[test]
+    fn parameter_refs_do_not_alias_or_register_component_schemas() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      parameters:
+        - { $ref: '#/components/parameters/Trace' }
+        - { $ref: '#/components/parameters/Locale' }
+      responses: { '204': { description: ok } }
+components:
+  parameters:
+    Trace:
+      name: X-Trace-Id
+      in: header
+      required: true
+      schema: { type: string }
+    Locale:
+      name: locale
+      in: query
+      schema: { type: string }
+  schemas:
+    Trace:
+      type: object
+      properties:
+        id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert!(graph.operations[0]
+            .params
+            .iter()
+            .any(|param| param.name == "X-Trace-Id" && param.location == "header"));
+        assert!(graph.operations[0]
+            .params
+            .iter()
+            .any(|param| param.name == "locale" && param.location == "query"));
+        assert_eq!(
+            graph
+                .schemas
+                .iter()
+                .filter(|schema| schema.id == "Trace")
+                .count(),
+            1
+        );
+        assert!(!graph.schemas.iter().any(|schema| schema.id == "Locale"));
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
     }
 
     #[test]
