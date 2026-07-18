@@ -16,8 +16,8 @@
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
 use crate::analyze::facts::{
-    DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact, ResponseFact, RouteFact,
-    SchemaFact, TypeRef,
+    DiagnosticCategoryFact, DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact,
+    ResponseFact, RouteFact, SchemaFact, TypeRef,
 };
 
 // Re-export the neutral type vocabulary so the IR and the facts DTO share ONE definition (the IR
@@ -611,18 +611,18 @@ pub enum DiagnosticCategory {
     Compatibility,
 }
 
-impl DiagnosticCategory {
-    fn from_wire(value: &str) -> Self {
-        match value {
-            "request_parameter" => Self::RequestParameter,
-            "request_body" => Self::RequestBody,
-            "response" => Self::Response,
-            "schema" => Self::Schema,
-            "security" => Self::Security,
-            "override" => Self::Override,
-            "artifact" => Self::Artifact,
-            "compatibility" => Self::Compatibility,
-            _ => Self::Source,
+impl From<DiagnosticCategoryFact> for DiagnosticCategory {
+    fn from(category: DiagnosticCategoryFact) -> Self {
+        match category {
+            DiagnosticCategoryFact::Source => Self::Source,
+            DiagnosticCategoryFact::RequestParameter => Self::RequestParameter,
+            DiagnosticCategoryFact::RequestBody => Self::RequestBody,
+            DiagnosticCategoryFact::Response => Self::Response,
+            DiagnosticCategoryFact::Schema => Self::Schema,
+            DiagnosticCategoryFact::Security => Self::Security,
+            DiagnosticCategoryFact::Override => Self::Override,
+            DiagnosticCategoryFact::Artifact => Self::Artifact,
+            DiagnosticCategoryFact::Compatibility => Self::Compatibility,
         }
     }
 }
@@ -766,7 +766,7 @@ impl ApiGraph {
                 };
                 let mut diagnostic = Diagnostic::new(
                     diag.code,
-                    DiagnosticCategory::from_wire(&diag.category),
+                    DiagnosticCategory::from(diag.category),
                     diag.severity,
                     diag.message,
                     span,

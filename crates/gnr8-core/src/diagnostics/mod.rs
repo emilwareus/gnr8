@@ -87,13 +87,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::render;
-    use crate::analyze::facts::DiagnosticFact;
+    use crate::analyze::facts::{DiagnosticCategoryFact, DiagnosticFact};
 
     fn warn(message: &str, file: &str, line: u32) -> DiagnosticFact {
         DiagnosticFact {
             code: "source.unresolved".to_string(),
             severity: "WARN".to_string(),
-            category: "source".to_string(),
+            category: DiagnosticCategoryFact::Source,
             message: message.to_string(),
             file: file.to_string(),
             line,

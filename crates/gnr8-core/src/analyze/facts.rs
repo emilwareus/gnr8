@@ -465,7 +465,7 @@ pub(crate) struct DiagnosticFact {
     pub(crate) severity: String,
     /// Stable diagnostic category.
     #[serde(default = "default_diagnostic_category")]
-    pub(crate) category: String,
+    pub(crate) category: DiagnosticCategoryFact,
     /// The human-readable message (rule + identity).
     pub(crate) message: String,
     /// The source file the diagnostic applies to.
@@ -486,12 +486,30 @@ pub(crate) struct DiagnosticFact {
     pub(crate) subject: Option<String>,
 }
 
+/// Closed diagnostic categories accepted from language sidecars.
+///
+/// Keeping this as an enum makes category policy fail closed: a misspelled or newer category cannot
+/// be silently relabeled as `source` while crossing the sidecar boundary.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiagnosticCategoryFact {
+    Source,
+    RequestParameter,
+    RequestBody,
+    Response,
+    Schema,
+    Security,
+    Override,
+    Artifact,
+    Compatibility,
+}
+
 fn default_diagnostic_code() -> String {
     "source.unresolved".to_string()
 }
 
-fn default_diagnostic_category() -> String {
-    "source".to_string()
+fn default_diagnostic_category() -> DiagnosticCategoryFact {
+    DiagnosticCategoryFact::Source
 }
 
 /// File + line range provenance attached to nodes (D-07).
@@ -718,6 +736,28 @@ mod tests {
             assert!(
                 result.is_err(),
                 "deny_unknown_fields must reject an unexpected nested field key"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_diagnostic_category() {
+            let bad = br#"{
+              "module": "x",
+              "routes": [],
+              "schemas": [],
+              "diagnostics": [{
+                "code": "source.unresolved",
+                "severity": "WARN",
+                "category": "soruce",
+                "message": "misspelled category",
+                "file": "app.go",
+                "line": 1
+              }]
+            }"#;
+            let result: Result<GoFacts, _> = serde_json::from_slice(bad);
+            assert!(
+                result.is_err(),
+                "unknown diagnostic categories must fail the strict sidecar contract"
             );
         }
     }
