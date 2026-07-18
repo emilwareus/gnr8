@@ -144,6 +144,7 @@ struct CanonicalDocument {
     webhook_items: BTreeMap<String, Value>,
     webhooks: BTreeMap<String, CanonicalOperation>,
     schemas: BTreeMap<String, Value>,
+    components: BTreeMap<String, Value>,
     external_documents: BTreeMap<String, Value>,
 }
 
@@ -231,6 +232,7 @@ impl Canonicalizer {
         let security = canonical_security(self.document.root.get("security"));
         let security_schemes = self.security_schemes();
         let schemas = self.schemas();
+        let components = self.reusable_components()?;
         let path_items = self.path_item_metadata("paths", true)?;
         let operations = self.operations()?;
         let webhook_items = self.path_item_metadata("webhooks", false)?;
@@ -246,6 +248,7 @@ impl Canonicalizer {
             webhook_items,
             webhooks,
             schemas,
+            components,
             external_documents,
         })
     }
@@ -373,6 +376,161 @@ impl Canonicalizer {
             .flatten()
             .map(|(name, schema)| (name.clone(), normalize_schema(schema)))
             .collect()
+    }
+
+    fn reusable_components(&mut self) -> Result<BTreeMap<String, Value>, CoreError> {
+        let mut components = BTreeMap::new();
+        match self.document.version {
+            SpecVersion::Swagger2 => {
+                let consumes = string_array(self.document.root.get("consumes"));
+                let produces = string_array(self.document.root.get("produces"));
+                let parameters = self
+                    .document
+                    .root
+                    .get("parameters")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for (name, raw) in parameters {
+                    let resolved = self.resolve_object(&raw, 0)?;
+                    let Some(parameter) = resolved.as_object() else {
+                        continue;
+                    };
+                    if parameter.get("in").and_then(Value::as_str) == Some("body") {
+                        if let Some(body) = Self::swagger_body_component(parameter, &consumes) {
+                            insert_component(
+                                &mut components,
+                                "requestBodies",
+                                &name,
+                                to_value(&body),
+                            );
+                        }
+                    } else if let Some((_, parameter)) = self.canonical_parameter(parameter) {
+                        insert_component(
+                            &mut components,
+                            "parameters",
+                            &name,
+                            to_value(&parameter),
+                        );
+                    } else {
+                        insert_component(
+                            &mut components,
+                            "parameters",
+                            &name,
+                            normalize_generic(&resolved),
+                        );
+                    }
+                }
+                let responses = self
+                    .document
+                    .root
+                    .get("responses")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                for (name, raw) in responses {
+                    let resolved = self.resolve_object(&raw, 0)?;
+                    let Some(response) = resolved.as_object() else {
+                        continue;
+                    };
+                    let response = self.canonical_response(response, &produces)?;
+                    insert_component(&mut components, "responses", &name, to_value(&response));
+                }
+            }
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => {
+                let raw_components = self
+                    .document
+                    .root
+                    .get("components")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                self.add_openapi_components(&mut components, &raw_components)?;
+            }
+        }
+        Ok(components)
+    }
+
+    fn add_openapi_components(
+        &mut self,
+        components: &mut BTreeMap<String, Value>,
+        raw_components: &Map<String, Value>,
+    ) -> Result<(), CoreError> {
+        for (kind, values) in raw_components {
+            if matches!(kind.as_str(), "schemas" | "securitySchemes") {
+                continue;
+            }
+            if kind.starts_with("x-") {
+                components.insert(kind.clone(), normalize_generic(values));
+                continue;
+            }
+            let Some(values) = values.as_object() else {
+                components.insert(kind.clone(), normalize_generic(values));
+                continue;
+            };
+            for (name, raw) in values {
+                let resolved = self.resolve_object(raw, 0)?;
+                let normalized = self.canonical_openapi_component(kind, &resolved)?;
+                insert_component(components, kind, name, normalized);
+            }
+        }
+        Ok(())
+    }
+
+    fn canonical_openapi_component(
+        &mut self,
+        kind: &str,
+        value: &Value,
+    ) -> Result<Value, CoreError> {
+        let Some(object) = value.as_object() else {
+            return Ok(normalize_generic(value));
+        };
+        match kind {
+            "parameters" => Ok(self.canonical_parameter(object).map_or_else(
+                || normalize_generic(value),
+                |(_, parameter)| to_value(&parameter),
+            )),
+            "responses" => Ok(to_value(&self.canonical_response(object, &[])?)),
+            "requestBodies" => Ok(to_value(&Self::canonical_openapi_request_body(object))),
+            "headers" => Ok(self.canonical_header(object)),
+            _ => Ok(normalize_generic(value)),
+        }
+    }
+
+    fn swagger_body_component(
+        parameter: &Map<String, Value>,
+        consumes: &[String],
+    ) -> Option<CanonicalRequestBody> {
+        let schema = parameter.get("schema").map(normalize_schema)?;
+        let media_types = if consumes.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            consumes.to_vec()
+        };
+        let content = media_types
+            .into_iter()
+            .map(|media_type| {
+                (
+                    media_type,
+                    CanonicalMedia {
+                        schema: Some(schema.clone()),
+                        example: None,
+                        examples: None,
+                        encoding: None,
+                        extensions: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        Some(CanonicalRequestBody {
+            description: optional_string(parameter.get("description")),
+            required: parameter
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            content,
+            extensions: extensions(parameter),
+        })
     }
 
     fn operations(&mut self) -> Result<BTreeMap<String, CanonicalOperation>, CoreError> {
@@ -571,62 +729,67 @@ impl Canonicalizer {
             let Some(parameter) = resolved.as_object() else {
                 continue;
             };
-            let Some(location) = parameter.get("in").and_then(Value::as_str) else {
-                continue;
-            };
-            if matches!(location, "body" | "formData") {
-                continue;
+            if let Some((key, parameter)) = self.canonical_parameter(parameter) {
+                parameters.insert(key, parameter);
             }
-            let Some(raw_name) = parameter.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let name = if location == "header" {
-                raw_name.to_ascii_lowercase()
-            } else {
-                raw_name.to_string()
-            };
-            let schema = parameter_schema(self.document.version, parameter);
-            let (style, mut explode) =
-                parameter_serialization(self.document.version, parameter, location);
-            if !schema_is_collection(&schema) {
-                explode = false;
-            }
-            let key = format!("{location}/{name}");
-            parameters.insert(
-                key,
-                CanonicalParameter {
-                    name,
-                    location: location.to_string(),
-                    description: optional_string(parameter.get("description")),
-                    required: location == "path"
-                        || parameter
-                            .get("required")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    deprecated: parameter
-                        .get("deprecated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    style,
-                    explode,
-                    allow_reserved: parameter
-                        .get("allowReserved")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    allow_empty_value: parameter
-                        .get("allowEmptyValue")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    schema,
-                    examples: parameter
-                        .get("examples")
-                        .or_else(|| parameter.get("example"))
-                        .map(normalize_generic),
-                    extensions: extensions(parameter),
-                },
-            );
         }
         Ok(parameters)
+    }
+
+    fn canonical_parameter(
+        &self,
+        parameter: &Map<String, Value>,
+    ) -> Option<(String, CanonicalParameter)> {
+        let location = parameter.get("in").and_then(Value::as_str)?;
+        if matches!(location, "body" | "formData") {
+            return None;
+        }
+        let raw_name = parameter.get("name").and_then(Value::as_str)?;
+        let name = if location == "header" {
+            raw_name.to_ascii_lowercase()
+        } else {
+            raw_name.to_string()
+        };
+        let schema = parameter_schema(self.document.version, parameter);
+        let (style, mut explode) =
+            parameter_serialization(self.document.version, parameter, location);
+        if !schema_is_collection(&schema) {
+            explode = false;
+        }
+        let key = format!("{location}/{name}");
+        Some((
+            key,
+            CanonicalParameter {
+                name,
+                location: location.to_string(),
+                description: optional_string(parameter.get("description")),
+                required: location == "path"
+                    || parameter
+                        .get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                deprecated: parameter
+                    .get("deprecated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                style,
+                explode,
+                allow_reserved: parameter
+                    .get("allowReserved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                allow_empty_value: parameter
+                    .get("allowEmptyValue")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                schema,
+                examples: parameter
+                    .get("examples")
+                    .or_else(|| parameter.get("example"))
+                    .map(normalize_generic),
+                extensions: extensions(parameter),
+            },
+        ))
     }
 
     fn request_body(
@@ -734,7 +897,11 @@ impl Canonicalizer {
         let Some(body) = body.as_object() else {
             return Ok(None);
         };
-        Ok(Some(CanonicalRequestBody {
+        Ok(Some(Self::canonical_openapi_request_body(body)))
+    }
+
+    fn canonical_openapi_request_body(body: &Map<String, Value>) -> CanonicalRequestBody {
+        CanonicalRequestBody {
             description: optional_string(body.get("description")),
             required: body
                 .get("required")
@@ -742,7 +909,7 @@ impl Canonicalizer {
                 .unwrap_or(false),
             content: canonical_content(body.get("content")),
             extensions: extensions(body),
-        }))
+        }
     }
 
     fn responses(
@@ -759,52 +926,59 @@ impl Canonicalizer {
             let Some(response) = resolved.as_object() else {
                 continue;
             };
-            let content = if self.document.version == SpecVersion::Swagger2 {
-                if let Some(schema) = response.get("schema").map(normalize_schema) {
-                    let media_types = if produces.is_empty() {
-                        vec!["application/json".to_string()]
-                    } else {
-                        produces.to_vec()
-                    };
-                    media_types
-                        .into_iter()
-                        .map(|media_type| {
-                            let example = response
-                                .get("examples")
-                                .and_then(Value::as_object)
-                                .and_then(|examples| examples.get(&media_type))
-                                .map(normalize_generic);
-                            (
-                                media_type,
-                                CanonicalMedia {
-                                    schema: Some(schema.clone()),
-                                    example,
-                                    examples: None,
-                                    encoding: None,
-                                    extensions: BTreeMap::new(),
-                                },
-                            )
-                        })
-                        .collect()
-                } else {
-                    BTreeMap::new()
-                }
-            } else {
-                canonical_content(response.get("content"))
-            };
-            let headers = self.response_headers(response)?;
             out.insert(
                 status.to_ascii_uppercase(),
-                CanonicalResponse {
-                    description: optional_string(response.get("description")),
-                    headers,
-                    content,
-                    links: response.get("links").map(normalize_generic),
-                    extensions: extensions(response),
-                },
+                self.canonical_response(response, produces)?,
             );
         }
         Ok(out)
+    }
+
+    fn canonical_response(
+        &mut self,
+        response: &Map<String, Value>,
+        produces: &[String],
+    ) -> Result<CanonicalResponse, CoreError> {
+        let content = if self.document.version == SpecVersion::Swagger2 {
+            if let Some(schema) = response.get("schema").map(normalize_schema) {
+                let media_types = if produces.is_empty() {
+                    vec!["application/json".to_string()]
+                } else {
+                    produces.to_vec()
+                };
+                media_types
+                    .into_iter()
+                    .map(|media_type| {
+                        let example = response
+                            .get("examples")
+                            .and_then(Value::as_object)
+                            .and_then(|examples| examples.get(&media_type))
+                            .map(normalize_generic);
+                        (
+                            media_type,
+                            CanonicalMedia {
+                                schema: Some(schema.clone()),
+                                example,
+                                examples: None,
+                                encoding: None,
+                                extensions: BTreeMap::new(),
+                            },
+                        )
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            }
+        } else {
+            canonical_content(response.get("content"))
+        };
+        Ok(CanonicalResponse {
+            description: optional_string(response.get("description")),
+            headers: self.response_headers(response)?,
+            content,
+            links: response.get("links").map(normalize_generic),
+            extensions: extensions(response),
+        })
     }
 
     fn operation_servers(
@@ -865,34 +1039,37 @@ impl Canonicalizer {
             let Some(header) = resolved.as_object() else {
                 continue;
             };
-            let schema = parameter_schema(self.document.version, header);
-            let (style, mut explode) =
-                parameter_serialization(self.document.version, header, "header");
-            if !schema_is_collection(&schema) {
-                explode = false;
-            }
-            let mut canonical = Map::new();
-            if let Some(description) = optional_string(header.get("description")) {
-                canonical.insert("description".to_string(), Value::String(description));
-            }
-            canonical.insert("schema".to_string(), schema);
-            canonical.insert("style".to_string(), Value::String(style));
-            canonical.insert("explode".to_string(), Value::Bool(explode));
-            for field in ["required", "deprecated"] {
-                canonical.insert(
-                    field.to_string(),
-                    Value::Bool(header.get(field).and_then(Value::as_bool).unwrap_or(false)),
-                );
-            }
-            if let Some(examples) = header.get("examples").or_else(|| header.get("example")) {
-                canonical.insert("examples".to_string(), normalize_generic(examples));
-            }
-            for (key, value) in extensions(header) {
-                canonical.insert(key, value);
-            }
-            out.insert(name.to_ascii_lowercase(), Value::Object(canonical));
+            out.insert(name.to_ascii_lowercase(), self.canonical_header(header));
         }
         Ok(out)
+    }
+
+    fn canonical_header(&self, header: &Map<String, Value>) -> Value {
+        let schema = parameter_schema(self.document.version, header);
+        let (style, mut explode) = parameter_serialization(self.document.version, header, "header");
+        if !schema_is_collection(&schema) {
+            explode = false;
+        }
+        let mut canonical = Map::new();
+        if let Some(description) = optional_string(header.get("description")) {
+            canonical.insert("description".to_string(), Value::String(description));
+        }
+        canonical.insert("schema".to_string(), schema);
+        canonical.insert("style".to_string(), Value::String(style));
+        canonical.insert("explode".to_string(), Value::Bool(explode));
+        for field in ["required", "deprecated"] {
+            canonical.insert(
+                field.to_string(),
+                Value::Bool(header.get(field).and_then(Value::as_bool).unwrap_or(false)),
+            );
+        }
+        if let Some(examples) = header.get("examples").or_else(|| header.get("example")) {
+            canonical.insert("examples".to_string(), normalize_generic(examples));
+        }
+        for (key, value) in extensions(header) {
+            canonical.insert(key, value);
+        }
+        Value::Object(canonical)
     }
 
     fn canonical_external_documents(&mut self) -> Result<BTreeMap<String, Value>, CoreError> {
@@ -1019,6 +1196,23 @@ impl Canonicalizer {
             }
         }
         Ok(resolved)
+    }
+}
+
+fn insert_component(
+    components: &mut BTreeMap<String, Value>,
+    kind: &str,
+    name: &str,
+    value: Value,
+) {
+    let values = components
+        .entry(kind.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !values.is_object() {
+        *values = Value::Object(Map::new());
+    }
+    if let Some(values) = values.as_object_mut() {
+        values.insert(name.to_string(), value);
     }
 }
 
@@ -1675,6 +1869,7 @@ fn diff_documents(old: &CanonicalDocument, new: &CanonicalDocument) -> Vec<OpenA
         None,
         &mut differences,
     );
+    diff_components(&old.components, &new.components, &mut differences);
     diff_map_values(
         &old.external_documents,
         &new.external_documents,
@@ -1722,6 +1917,48 @@ fn diff_operations(
     differences: &mut Vec<OpenApiDifference>,
 ) {
     diff_operation_collection(old, new, "/paths", "operation", differences);
+}
+
+fn diff_components(
+    old: &BTreeMap<String, Value>,
+    new: &BTreeMap<String, Value>,
+    differences: &mut Vec<OpenApiDifference>,
+) {
+    for kind in union_keys(old, new) {
+        let location = format!("/components/{}", escape_pointer(kind));
+        let code = format!("component.{}", dotted(kind));
+        match (old.get(kind), new.get(kind)) {
+            (Some(old), Some(new)) => diff_json_value(
+                old,
+                new,
+                &location,
+                &format!("{code}.changed"),
+                None,
+                Some(kind),
+                None,
+                differences,
+            ),
+            (Some(old), None) => differences.push(difference(
+                &format!("{code}.missing"),
+                &location,
+                None,
+                Some(kind),
+                None,
+                Some(old.clone()),
+                None,
+            )),
+            (None, Some(new)) => differences.push(difference(
+                &format!("{code}.added"),
+                &location,
+                None,
+                Some(kind),
+                None,
+                None,
+                Some(new.clone()),
+            )),
+            (None, None) => {}
+        }
+    }
 }
 
 fn diff_operation_collection(
@@ -2267,6 +2504,43 @@ components:
             .expect("compare documents");
 
         assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn swagger_and_openapi_reusable_components_compare_equal() {
+        let swagger = parsed(
+            "old.json",
+            r#"{"swagger":"2.0","info":{"title":"Components","version":"1"},"produces":["application/json"],"paths":{},"parameters":{"Trace":{"name":"X-Trace","in":"header","type":"string"}},"responses":{"Error":{"description":"error","schema":{"type":"string"}}}}"#,
+        );
+        let openapi = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Components","version":"1"},"paths":{},"components":{"parameters":{"Trace":{"name":"X-Trace","in":"header","schema":{"type":"string"}}},"responses":{"Error":{"description":"error","content":{"application/json":{"schema":{"type":"string"}}}}}}}"#,
+        );
+
+        let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn unused_reusable_component_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Components","version":"1"},"paths":{},"components":{"responses":{"Error":{"description":"old"}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Components","version":"1"},"paths":{},"components":{"responses":{"Error":{"description":"new"}}}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report.differences.iter().any(|difference| {
+            difference.code == "component.responses.error.description.changed"
+                && difference.location == "/components/responses/Error/description"
+        }));
     }
 
     #[test]
