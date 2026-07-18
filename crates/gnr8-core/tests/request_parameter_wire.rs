@@ -335,7 +335,7 @@ func TestRequestParameterWireContract(t *testing.T) {
 		if got := r.URL.Query().Get("api_key"); got != "secret" {
 			t.Errorf("api_key = %q", got)
 		}
-		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a?x=1") {
+		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a%20b+c?x=1") {
 			t.Errorf("redirect was not allowReserved: %s", r.URL.RawQuery)
 		}
 		if got := r.URL.Query().Get("force"); got != "true" {
@@ -370,7 +370,7 @@ func TestRequestParameterWireContract(t *testing.T) {
 	client := NewClient(srv.URL, WithAPIKey("secret"))
 	_, err := client.SendWire(context.Background(), SendWireParams{
 		Statuses:   []string{"active", "pending"},
-		Redirect:   "https://example.test/a?x=1",
+		Redirect:   "https://example.test/a b+c?x=1",
 		XSignature: "sig",
 		Filters:    &filters,
 		XTags:      &tags,
@@ -434,7 +434,7 @@ func TestCompatibilityRequestParameterWireContract(t *testing.T) {
 		if got := r.URL.Query().Get("api_key"); got != "secret" {
 			t.Errorf("api_key = %q", got)
 		}
-		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a?x=1") {
+		if !strings.Contains(r.URL.RawQuery, "redirect=https://example.test/a%20b+c?x=1") {
 			t.Errorf("redirect was not allowReserved: %s", r.URL.RawQuery)
 		}
 		if got := r.URL.Query().Get("force"); got != "true" {
@@ -468,7 +468,7 @@ func TestCompatibilityRequestParameterWireContract(t *testing.T) {
 	ctx = WithAPIKey(ctx, "QueryKeyAuth", APIKey{Key: "secret"})
 	_, err := client.WireAPI.SendWire(ctx).
 		Statuses([]string{"active", "pending"}).
-		Redirect("https://example.test/a?x=1").
+		Redirect("https://example.test/a b+c?x=1").
 		XSignature("sig").
 		Filters(map[string]string{"z": "two", "a": "one"}).
 		XTags([]string{"red", "blue"}).
@@ -543,7 +543,7 @@ const transport: typeof fetch = async (input, init) => {
   if (url.searchParams.get("filters[a]") !== "one") throw new Error(url.search);
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
-  if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (!url.search.includes("redirect=https://example.test/a%20b+c?x=1")) throw new Error(url.search);
   if (url.searchParams.get("force") !== "true") throw new Error(url.search);
   if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
   if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
@@ -558,7 +558,7 @@ async function main(): Promise<void> {
   const client = new Client({ baseUrl: "https://api.test", fetch: transport, apiKey: "secret" });
   await client.sendWire(
     ["active", "pending"],
-    "https://example.test/a?x=1",
+    "https://example.test/a b+c?x=1",
     "sig",
     { z: "two", a: "one" },
     ["red", "blue"],
@@ -610,7 +610,7 @@ function verify(config: AxiosRequestConfig): void {
   if (url.searchParams.get("filters[a]") !== "one") throw new Error(url.search);
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
-  if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (!url.search.includes("redirect=https://example.test/a%20b+c?x=1")) throw new Error(url.search);
   if (url.searchParams.get("force") !== "true") throw new Error(url.search);
   if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
   if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
@@ -635,7 +635,7 @@ async function main(): Promise<void> {
   const api = new DefaultApi(configuration, undefined, transport);
   await api.sendWire({
     statuses: ["active", "pending"],
-    redirect: "https://example.test/a?x=1",
+    redirect: "https://example.test/a b+c?x=1",
     xSignature: "sig",
     filters: { z: "two", a: "one" },
     xTags: ["red", "blue"],
@@ -685,7 +685,7 @@ const transport: typeof fetch = async (input, init) => {
   if (url.searchParams.get("filters[a]") !== "one") throw new Error(url.search);
   if (url.searchParams.get("filters[z]") !== "two") throw new Error(url.search);
   if (url.searchParams.get("api_key") !== "secret") throw new Error(url.search);
-  if (!url.search.includes("redirect=https://example.test/a?x=1")) throw new Error(url.search);
+  if (!url.search.includes("redirect=https://example.test/a%20b+c?x=1")) throw new Error(url.search);
   if (url.searchParams.get("force") !== "true") throw new Error(url.search);
   if (!url.search.includes("strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1")) throw new Error(url.search);
   if (!url.search.includes("strict=https://free.test/a?x=1")) throw new Error(url.search);
@@ -705,7 +705,7 @@ async function main(): Promise<void> {
   const api = new DefaultApi(configuration);
   await api.sendWire({
     statuses: ["active", "pending"],
-    redirect: "https://example.test/a?x=1",
+    redirect: "https://example.test/a b+c?x=1",
     xSignature: "sig",
     filters: { z: "two", a: "one" },
     xTags: ["red", "blue"],
@@ -785,7 +785,7 @@ class Opener:
         assert query["filters[a]"] == ["one"], query
         assert query["filters[z]"] == ["two"], query
         assert query["api_key"] == ["secret"], query
-        assert "redirect=https://example.test/a?x=1" in parsed.query, parsed.query
+        assert "redirect=https://example.test/a%20b+c?x=1" in parsed.query, parsed.query
         assert query["force"] == ["true"], query
         assert "strict=https%3A%2F%2Fstrict.test%2Fa%3Fx%3D1" in parsed.query, parsed.query
         assert "strict=https://free.test/a?x=1" in parsed.query, parsed.query
@@ -800,7 +800,7 @@ class Opener:
 client = Client("https://api.test", api_key="secret", opener=Opener())
 client.send_wire(
     ["active", "pending"],
-    "https://example.test/a?x=1",
+    "https://example.test/a b+c?x=1",
     "sig",
     filters={"z": "two", "a": "one"},
     x_tags=["red", "blue"],

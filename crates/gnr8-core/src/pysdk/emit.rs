@@ -1458,9 +1458,9 @@ class Client:
         for index, (key, value) in enumerate(pairs):
             safe = reserved if index in allow_reserved else \"\"
             encoded.append(
-                urllib.parse.quote_plus(str(key), safe=\"\")
+                urllib.parse.quote(str(key), safe=\"\")
                 + \"=\"
-                + urllib.parse.quote_plus(str(value), safe=safe)
+                + urllib.parse.quote(str(value), safe=safe)
             )
         return \"&\".join(encoded)
 

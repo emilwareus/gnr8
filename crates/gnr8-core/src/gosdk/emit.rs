@@ -1841,7 +1841,7 @@ sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {
 for index, value := range values[key] {
-encoded := url.QueryEscape(value)
+encoded := strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
 if allowReserved[key][index] {
 encoded = strings.NewReplacer(
 \"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
@@ -1849,7 +1849,8 @@ encoded = strings.NewReplacer(
 \"%29\", \")\", \"%2A\", \"*\", \"%2B\", \"+\", \"%2C\", \",\", \"%3B\", \";\", \"%3D\", \"=\",
 ).Replace(encoded)
 }
-parts = append(parts, url.QueryEscape(key)+\"=\"+encoded)
+encodedKey := strings.ReplaceAll(url.QueryEscape(key), \"+\", \"%20\")
+parts = append(parts, encodedKey+\"=\"+encoded)
 }
 }
 return strings.Join(parts, \"&\")
@@ -2343,7 +2344,7 @@ sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {{
 for index, value := range values[key] {{
-encoded := url.QueryEscape(value)
+encoded := strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
 if allowReserved[key][index] {{
 encoded = strings.NewReplacer(
 \"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
@@ -2351,7 +2352,8 @@ encoded = strings.NewReplacer(
 \"%29\", \")\", \"%2A\", \"*\", \"%2B\", \"+\", \"%2C\", \",\", \"%3B\", \";\", \"%3D\", \"=\",
 ).Replace(encoded)
 }}
-parts = append(parts, url.QueryEscape(key)+\"=\"+encoded)
+encodedKey := strings.ReplaceAll(url.QueryEscape(key), \"+\", \"%20\")
+parts = append(parts, encodedKey+\"=\"+encoded)
 }}
 }}
 return strings.Join(parts, \"&\")
@@ -5238,7 +5240,7 @@ sort.Strings(keys)
 parts := make([]string, 0)
 for _, key := range keys {
 for index, value := range values[key] {
-encoded := url.QueryEscape(value)
+encoded := strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
 if allowReserved[key][index] {
 encoded = strings.NewReplacer(
 "%3A", ":", "%2F", "/", "%3F", "?", "%23", "#", "%5B", "[", "%5D", "]",
@@ -5246,7 +5248,8 @@ encoded = strings.NewReplacer(
 "%29", ")", "%2A", "*", "%2B", "+", "%2C", ",", "%3B", ";", "%3D", "=",
 ).Replace(encoded)
 }
-parts = append(parts, url.QueryEscape(key)+"="+encoded)
+encodedKey := strings.ReplaceAll(url.QueryEscape(key), "+", "%20")
+parts = append(parts, encodedKey+"="+encoded)
 }
 }
 return strings.Join(parts, "&")
