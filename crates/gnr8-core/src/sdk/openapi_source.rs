@@ -56,6 +56,7 @@ struct Importer {
     used_schema_names: BTreeSet<String>,
     diagnostics: Vec<Diagnostic>,
     external_docs: BTreeMap<PathBuf, Value>,
+    external_schema_ids: BTreeMap<String, String>,
     used_operation_ids: BTreeSet<String>,
     operation_security: Vec<crate::graph::OperationSecurityPolicy>,
     operation_docs: Vec<OperationDocsPolicy>,
@@ -261,6 +262,7 @@ impl Importer {
             used_schema_names: BTreeSet::new(),
             diagnostics: Vec::new(),
             external_docs: BTreeMap::new(),
+            external_schema_ids: BTreeMap::new(),
             used_operation_ids: BTreeSet::new(),
             operation_security: Vec::new(),
             operation_docs: Vec::new(),
@@ -1757,8 +1759,9 @@ impl Importer {
 
     fn resolve_ref_schema(&mut self, ref_value: &str) -> Option<(String, Value)> {
         let (file_part, pointer) = split_ref(ref_value);
-        let id = schema_id_from_pointer(pointer).unwrap_or_else(|| sanitize_identifier(ref_value));
         if file_part.is_empty() {
+            let id =
+                schema_id_from_pointer(pointer).unwrap_or_else(|| sanitize_identifier(ref_value));
             if let Some(schema) = self.raw_schemas.get(&id).cloned() {
                 return Some((id, schema));
             }
@@ -1767,11 +1770,23 @@ impl Importer {
             return Some((id, resolved));
         }
 
-        let external_doc = self.external_doc(file_part)?;
-        let resolved = resolve_pointer(&external_doc, pointer)?;
-        self.raw_schemas
-            .entry(id.clone())
-            .or_insert_with(|| resolved.clone());
+        let normalized_file = normalize_ref_file(file_part);
+        let key = format!("{normalized_file}#{pointer}");
+        if let Some(id) = self.external_schema_ids.get(&key) {
+            return self
+                .raw_schemas
+                .get(id)
+                .cloned()
+                .map(|schema| (id.clone(), schema));
+        }
+        let external_doc = self.external_doc(&normalized_file)?;
+        let mut resolved = resolve_pointer(&external_doc, pointer)?;
+        rebase_external_refs(&mut resolved, &normalized_file);
+        let base_id = schema_id_from_pointer(pointer)
+            .unwrap_or_else(|| sanitize_identifier(&normalized_file));
+        let id = unique_schema_id(&base_id, &self.raw_schemas);
+        self.external_schema_ids.insert(key, id.clone());
+        self.raw_schemas.insert(id.clone(), resolved.clone());
         Some((id, resolved))
     }
 
@@ -1780,8 +1795,11 @@ impl Importer {
         if file_part.is_empty() {
             return resolve_pointer(&self.root, pointer);
         }
-        let external_doc = self.external_doc(file_part)?;
-        resolve_pointer(&external_doc, pointer)
+        let normalized_file = normalize_ref_file(file_part);
+        let external_doc = self.external_doc(&normalized_file)?;
+        let mut resolved = resolve_pointer(&external_doc, pointer)?;
+        rebase_external_refs(&mut resolved, &normalized_file);
+        Some(resolved)
     }
 
     fn external_doc(&mut self, file_part: &str) -> Option<Value> {
@@ -1790,22 +1808,42 @@ impl Importer {
             .parent()
             .unwrap_or(self.project_root.as_path());
         let path = base_dir.join(file_part);
-        if let Some(doc) = self.external_docs.get(&path) {
-            return Some(doc.clone());
-        }
-        let text = match read_text(&path) {
-            Ok(text) => text,
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
             Err(err) => {
                 self.warn(format!(
-                    "failed to read external OpenAPI ref '{}': {err}",
+                    "failed to resolve external OpenAPI ref '{}': {err}",
                     path.display()
                 ));
                 return None;
             }
         };
-        match parse_json_or_yaml(&text, &path) {
+        let project_root =
+            std::fs::canonicalize(&self.project_root).unwrap_or_else(|_| self.project_root.clone());
+        if !canonical.starts_with(&project_root) {
+            self.warn(format!(
+                "external OpenAPI ref '{}' escapes project root '{}' and was rejected",
+                canonical.display(),
+                project_root.display()
+            ));
+            return None;
+        }
+        if let Some(doc) = self.external_docs.get(&canonical) {
+            return Some(doc.clone());
+        }
+        let text = match read_text(&canonical) {
+            Ok(text) => text,
+            Err(err) => {
+                self.warn(format!(
+                    "failed to read external OpenAPI ref '{}': {err}",
+                    canonical.display()
+                ));
+                return None;
+            }
+        };
+        match parse_json_or_yaml(&text, &canonical) {
             Ok(doc) => {
-                self.external_docs.insert(path, doc.clone());
+                self.external_docs.insert(canonical, doc.clone());
                 Some(doc)
             }
             Err(err) => {
@@ -1890,7 +1928,66 @@ fn split_ref(ref_value: &str) -> (&str, &str) {
             let pointer = if pointer.is_empty() { "/" } else { pointer };
             (file, pointer)
         }
-        None => ("", ref_value),
+        None => (ref_value, "/"),
+    }
+}
+
+fn normalize_ref_file(file: &str) -> String {
+    let absolute = file.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in file.split('/') {
+        if matches!(part, "" | ".") {
+            continue;
+        }
+        if part == ".." && parts.last().is_some_and(|last| *last != "..") {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+    let normalized = parts.join("/");
+    if absolute {
+        format!("/{normalized}")
+    } else {
+        normalized
+    }
+}
+
+fn rebase_external_refs(value: &mut Value, current_file: &str) {
+    match value {
+        Value::Object(object) => {
+            if let Some(ref_value) = object.get_mut("$ref") {
+                if let Some(original) = ref_value.as_str().map(str::to_string) {
+                    let (file_part, pointer) = split_ref(&original);
+                    if !file_part.contains("://") {
+                        let rebased_file = if file_part.is_empty() {
+                            current_file.to_string()
+                        } else if file_part.starts_with('/') {
+                            normalize_ref_file(file_part)
+                        } else {
+                            let parent = current_file
+                                .rsplit_once('/')
+                                .map_or("", |(parent, _)| parent);
+                            if parent.is_empty() {
+                                normalize_ref_file(file_part)
+                            } else {
+                                normalize_ref_file(&format!("{parent}/{file_part}"))
+                            }
+                        };
+                        *ref_value = Value::String(format!("{rebased_file}#{pointer}"));
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                rebase_external_refs(child, current_file);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rebase_external_refs(item, current_file);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -2257,6 +2354,20 @@ fn unique_synthetic_id(suggested: &str, raw_schemas: &BTreeMap<String, Value>) -
     let base = type_name(suggested);
     if !raw_schemas.contains_key(&base) {
         return base;
+    }
+    let mut index = 2_u32;
+    loop {
+        let candidate = format!("{base}{index}");
+        if !raw_schemas.contains_key(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn unique_schema_id(base: &str, raw_schemas: &BTreeMap<String, Value>) -> String {
+    if !raw_schemas.contains_key(base) {
+        return base.to_string();
     }
     let mut index = 2_u32;
     loop {
@@ -3426,6 +3537,124 @@ definitions:
                 .any(|schema| schema.id == "Shared.Error"),
             "OpenAPI 3.1 fixture should import a relative external $ref"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the complete external-ref fixture is easier to audit in one test"
+    )]
+    fn external_schema_refs_keep_file_identity_and_nested_ref_origin() {
+        let root = temp_project("external-ref-identity");
+        std::fs::write(
+            root.join("openapi.yaml"),
+            r"
+openapi: 3.1.0
+info: { title: External refs, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        '200':
+          description: A
+          content:
+            application/json:
+              schema: { $ref: './a.yaml#/components/schemas/Error' }
+  /b:
+    get:
+      operationId: getB
+      responses:
+        '200':
+          description: B
+          content:
+            application/json:
+              schema: { $ref: './b.yaml#/components/schemas/Error' }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.yaml"),
+            r"
+components:
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { $ref: '#/components/schemas/Detail' }
+    Detail:
+      type: object
+      properties: { fromA: { type: string } }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.yaml"),
+            r"
+components:
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { $ref: '#/components/schemas/Detail' }
+    Detail:
+      type: object
+      properties: { fromB: { type: integer } }
+",
+        )
+        .unwrap();
+
+        let graph = load_openapi(&root, "openapi.yaml").unwrap();
+        let response_ref = |path: &str| {
+            graph
+                .operations
+                .iter()
+                .find(|operation| operation.path == path)
+                .and_then(|operation| operation.responses.first())
+                .and_then(|response| response.body.as_ref())
+                .map(|body| body.ref_id.clone())
+                .unwrap()
+        };
+        let a_error = response_ref("/a");
+        let b_error = response_ref("/b");
+        assert_ne!(a_error, b_error, "external Error schemas must not collapse");
+
+        let detail_ref = |schema_id: &str| {
+            let schema = graph
+                .schemas
+                .iter()
+                .find(|schema| schema.id == schema_id)
+                .unwrap();
+            let Type::Object(fields) = &schema.body else {
+                panic!("expected object schema for {schema_id}");
+            };
+            let detail = fields
+                .iter()
+                .find(|field| field.json_name == "detail")
+                .unwrap();
+            let Type::Named(id) = &detail.schema else {
+                panic!("expected named detail ref for {schema_id}");
+            };
+            id.clone()
+        };
+        let a_detail = detail_ref(&a_error);
+        let b_detail = detail_ref(&b_error);
+        assert_ne!(
+            a_detail, b_detail,
+            "nested local refs must stay relative to their external document"
+        );
+        assert!(graph.schemas.iter().any(|schema| {
+            schema.id == a_detail
+                && matches!(&schema.body, Type::Object(fields) if fields.iter().any(|field| field.json_name == "fromA"))
+        }));
+        assert!(graph.schemas.iter().any(|schema| {
+            schema.id == b_detail
+                && matches!(&schema.body, Type::Object(fields) if fields.iter().any(|field| field.json_name == "fromB"))
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
