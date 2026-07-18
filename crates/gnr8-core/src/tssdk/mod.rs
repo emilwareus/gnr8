@@ -19,7 +19,7 @@ mod emit;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::graph::{ApiGraph, Field, Operation, Prim, Type};
+use crate::graph::{ApiGraph, Field, Operation, Param, Prim, Type};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
     api_key_credential_names, check_unique_schema_names, file_in_dir, file_stem,
@@ -817,6 +817,7 @@ export interface RequestOpts {
   method: HTTPMethod;
   headers?: HTTPHeaders;
   query?: HTTPQuery;
+  queryString?: string;
   body?: unknown;
 }
 
@@ -901,7 +902,7 @@ export class BaseAPI {
   }
 
   protected async request(context: RequestOpts, initOverrides: RequestInit = {}): Promise<Response> {
-    const query = querystring(context.query ?? {});
+    const query = context.queryString ?? querystring(context.query ?? {});
     const url = `${this.configuration.basePath}${context.path}${query ? `?${query}` : \"\"}`;
     const headers: HTTPHeaders = {
       ...this.configuration.headers,
@@ -1017,6 +1018,8 @@ import * as models from \"../models\";
 
 ",
     );
+    emit::emit_ts_wire_helpers(&mut out);
+    out.push('\n');
     if graph.operations.iter().any(is_multipart_operation) {
         out.push_str(
             "\
@@ -1085,12 +1088,13 @@ fn emit_fetch_operation_methods(
     )
     .map_err(ts_mod_sink)?;
     emit_fetch_path(out, base_path, op)?;
-    emit_fetch_query(out, op)?;
+    emit_fetch_query(out, graph, op)?;
     writeln!(
         out,
         "    const headerParameters: runtime.HTTPHeaders = {{}};"
     )
     .map_err(ts_mod_sink)?;
+    emit_compat_header_cookie_parameters(out, op, "headerParameters")?;
     for (auth_index, (header, names)) in operation_auth_header_names(graph, op)?
         .into_iter()
         .enumerate()
@@ -1128,7 +1132,7 @@ fn emit_fetch_operation_methods(
     )
     .map_err(ts_mod_sink)?;
     writeln!(out, "      headers: headerParameters,").map_err(ts_mod_sink)?;
-    writeln!(out, "      query: queryParameters,").map_err(ts_mod_sink)?;
+    writeln!(out, "      queryString,").map_err(ts_mod_sink)?;
     if let Some(fields) = &multipart_fields {
         let parts = fields
             .iter()
@@ -1279,29 +1283,156 @@ fn emit_fetch_path(
     Ok(())
 }
 
-fn emit_fetch_query(out: &mut String, op: &Operation) -> Result<(), crate::CoreError> {
-    writeln!(out, "    const queryParameters: runtime.HTTPQuery = {{}};").map_err(ts_mod_sink)?;
+fn emit_fetch_query(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    emit_compat_query(out, graph, op, "queryParameters", "queryString")
+}
+
+fn emit_compat_query(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+    parameter_name: &str,
+    query_string_name: &str,
+) -> Result<(), crate::CoreError> {
+    writeln!(out, "    const {parameter_name} = new URLSearchParams();").map_err(ts_mod_sink)?;
+    writeln!(out, "    const allowReserved = new Set<number>();").map_err(ts_mod_sink)?;
+    writeln!(out, "    let queryPairIndex = 0;").map_err(ts_mod_sink)?;
     for param in op.params.iter().filter(|param| param.location == "query") {
         let ident = emit::camel(&param.name);
-        if param.required {
-            writeln!(
-                out,
-                "    queryParameters[{}] = requestParameters.{ident};",
-                quoted_string_literal(&param.name)
-            )
-            .map_err(ts_mod_sink)?;
+        let padding = if param.required {
+            "    "
         } else {
             writeln!(out, "    if (requestParameters.{ident} !== undefined) {{")
                 .map_err(ts_mod_sink)?;
-            writeln!(
-                out,
-                "      queryParameters[{}] = requestParameters.{ident};",
-                quoted_string_literal(&param.name)
-            )
-            .map_err(ts_mod_sink)?;
+            "      "
+        };
+        writeln!(
+            out,
+            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, requestParameters.{ident}, {}, {})) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(emit::ts_parameter_style(param)),
+            emit::ts_parameter_explode(param)
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "{padding}  {parameter_name}.append(wireName, wireValue);"
+        )
+        .map_err(ts_mod_sink)?;
+        if param.allow_reserved {
+            writeln!(out, "{padding}  allowReserved.add(queryPairIndex);").map_err(ts_mod_sink)?;
+        }
+        writeln!(out, "{padding}  queryPairIndex += 1;").map_err(ts_mod_sink)?;
+        writeln!(out, "{padding}}}").map_err(ts_mod_sink)?;
+        if !param.required {
             writeln!(out, "    }}").map_err(ts_mod_sink)?;
         }
     }
+    for (auth_index, (wire_name, names)) in operation_auth_query_names(graph, op)?
+        .into_iter()
+        .enumerate()
+    {
+        let auth_var = format!("apiKeyQuery{auth_index}");
+        writeln!(
+            out,
+            "    const {auth_var} = await this.configuration.getApiKey({});",
+            names
+                .iter()
+                .map(|name| quoted_string_literal(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    if ({auth_var} !== undefined) {{").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      {parameter_name}.append({}, {auth_var});",
+            quoted_string_literal(&wire_name)
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "      queryPairIndex += 1;").map_err(ts_mod_sink)?;
+        writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    }
+    writeln!(
+        out,
+        "    const {query_string_name} = wireQueryString({parameter_name}, allowReserved);"
+    )
+    .map_err(ts_mod_sink)?;
+    Ok(())
+}
+
+fn emit_compat_header_cookie_parameters(
+    out: &mut String,
+    op: &Operation,
+    header_name: &str,
+) -> Result<(), crate::CoreError> {
+    let has_cookie = op.params.iter().any(|param| param.location == "cookie");
+    if has_cookie {
+        writeln!(out, "    const cookieParts: string[] = [];").map_err(ts_mod_sink)?;
+    }
+    for param in op
+        .params
+        .iter()
+        .filter(|param| param.location == "header" || param.location == "cookie")
+    {
+        let ident = emit::camel(&param.name);
+        let padding = if param.required {
+            "    "
+        } else {
+            writeln!(out, "    if (requestParameters.{ident} !== undefined) {{")
+                .map_err(ts_mod_sink)?;
+            "      "
+        };
+        emit_compat_header_cookie_parameter(out, param, &ident, padding, header_name)?;
+        if !param.required {
+            writeln!(out, "    }}").map_err(ts_mod_sink)?;
+        }
+    }
+    if has_cookie {
+        writeln!(out, "    if (cookieParts.length > 0) {{").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      {header_name}[\"Cookie\"] = {header_name}[\"Cookie\"] === undefined ? cookieParts.join(\"; \") : {header_name}[\"Cookie\"] + \"; \" + cookieParts.join(\"; \");"
+        )
+        .map_err(ts_mod_sink)?;
+        writeln!(out, "    }}").map_err(ts_mod_sink)?;
+    }
+    Ok(())
+}
+
+fn emit_compat_header_cookie_parameter(
+    out: &mut String,
+    param: &Param,
+    ident: &str,
+    padding: &str,
+    header_name: &str,
+) -> Result<(), crate::CoreError> {
+    writeln!(
+        out,
+        "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, requestParameters.{ident}, {}, {})) {{",
+        quoted_string_literal(&param.name),
+        quoted_string_literal(emit::ts_parameter_style(param)),
+        emit::ts_parameter_explode(param)
+    )
+    .map_err(ts_mod_sink)?;
+    if param.location == "header" {
+        writeln!(
+            out,
+            "{padding}  {header_name}[wireName] = {header_name}[wireName] === undefined ? wireValue : {header_name}[wireName] + \",\" + wireValue;"
+        )
+        .map_err(ts_mod_sink)?;
+    } else {
+        writeln!(
+            out,
+            "{padding}  cookieParts.push(encodeURIComponent(wireName) + \"=\" + encodeURIComponent(wireValue));"
+        )
+        .map_err(ts_mod_sink)?;
+    }
+    writeln!(out, "{padding}}}").map_err(ts_mod_sink)?;
     Ok(())
 }
 
@@ -1312,6 +1443,26 @@ fn operation_auth_header_names(
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for scheme in operation_api_key_schemes(graph, op)? {
         if scheme.location != ApiKeyLocation::Header {
+            continue;
+        }
+        let names = grouped.entry(scheme.name.clone()).or_default();
+        names.push(scheme.id);
+        names.push(scheme.name);
+    }
+    for names in grouped.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    Ok(grouped.into_iter().collect())
+}
+
+fn operation_auth_query_names(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<(String, Vec<String>)>, crate::CoreError> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for scheme in operation_api_key_schemes(graph, op)? {
+        if scheme.location != ApiKeyLocation::Query {
             continue;
         }
         let names = grouped.entry(scheme.name.clone()).or_default();
@@ -1464,6 +1615,8 @@ import * as models from \"./models\";
 
 ",
     );
+    emit::emit_ts_wire_helpers(&mut out);
+    out.push('\n');
 
     let grouped = grouped_operations(graph);
     for (service, ops) in grouped {
@@ -1557,12 +1710,13 @@ fn emit_axios_operation_method(
     )
     .map_err(ts_mod_sink)?;
     emit_axios_path(out, base_path, op)?;
-    emit_axios_query(out, op)?;
+    emit_axios_query(out, graph, op)?;
     writeln!(
         out,
         "    const localVarHeaderParameter: Record<string, string> = {{}};"
     )
     .map_err(ts_mod_sink)?;
+    emit_compat_header_cookie_parameters(out, op, "localVarHeaderParameter")?;
     for (auth_index, (header, names)) in operation_auth_header_names(graph, op)?
         .into_iter()
         .enumerate()
@@ -1604,8 +1758,11 @@ fn emit_axios_operation_method(
             quoted_string_literal(&op.method.to_uppercase())
         )
         .map_err(ts_mod_sink)?;
-        writeln!(out, "      url: this.basePath + localVarPath,").map_err(ts_mod_sink)?;
-        writeln!(out, "      params: localVarQueryParameter,").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      url: this.basePath + localVarPath + (localVarQueryString ? \"?\" + localVarQueryString : \"\"),"
+        )
+        .map_err(ts_mod_sink)?;
         if body_model.required {
             writeln!(out, "      data: requestParameters.body,").map_err(ts_mod_sink)?;
         } else {
@@ -1629,8 +1786,11 @@ fn emit_axios_operation_method(
             quoted_string_literal(&op.method.to_uppercase())
         )
         .map_err(ts_mod_sink)?;
-        writeln!(out, "      url: this.basePath + localVarPath,").map_err(ts_mod_sink)?;
-        writeln!(out, "      params: localVarQueryParameter,").map_err(ts_mod_sink)?;
+        writeln!(
+            out,
+            "      url: this.basePath + localVarPath + (localVarQueryString ? \"?\" + localVarQueryString : \"\"),"
+        )
+        .map_err(ts_mod_sink)?;
     }
     writeln!(out, "      headers: {{").map_err(ts_mod_sink)?;
     writeln!(
@@ -1898,34 +2058,18 @@ fn emit_axios_path(
     Ok(())
 }
 
-fn emit_axios_query(out: &mut String, op: &Operation) -> Result<(), crate::CoreError> {
-    writeln!(
+fn emit_axios_query(
+    out: &mut String,
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<(), crate::CoreError> {
+    emit_compat_query(
         out,
-        "    const localVarQueryParameter: Record<string, unknown> = {{}};"
+        graph,
+        op,
+        "localVarQueryParameter",
+        "localVarQueryString",
     )
-    .map_err(ts_mod_sink)?;
-    for param in op.params.iter().filter(|param| param.location == "query") {
-        let ident = emit::camel(&param.name);
-        if param.required {
-            writeln!(
-                out,
-                "    localVarQueryParameter[{}] = requestParameters.{ident};",
-                quoted_string_literal(&param.name)
-            )
-            .map_err(ts_mod_sink)?;
-        } else {
-            writeln!(out, "    if (requestParameters.{ident} !== undefined) {{")
-                .map_err(ts_mod_sink)?;
-            writeln!(
-                out,
-                "      localVarQueryParameter[{}] = requestParameters.{ident};",
-                quoted_string_literal(&param.name)
-            )
-            .map_err(ts_mod_sink)?;
-            writeln!(out, "    }}").map_err(ts_mod_sink)?;
-        }
-    }
-    Ok(())
 }
 
 struct RequestField {
@@ -2317,6 +2461,11 @@ mod tests {
                 required: true,
                 schema: Type::Primitive(Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: SourceSpan {
                     file: "/root/main.ts".to_string(),
                     start_line: 1,
@@ -2329,6 +2478,11 @@ mod tests {
                 required: true,
                 schema: Type::Primitive(Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: SourceSpan {
                     file: "/root/main.ts".to_string(),
                     start_line: 1,
@@ -2491,6 +2645,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "multipart compatibility fixture setup is intentionally explicit"
+    )]
     fn typescript_fetch_compat_flattens_multipart_form_fields() {
         let mut graph = sample_graph();
         graph.operations[0].handler = "executeImportJob".to_string();
@@ -2504,6 +2662,11 @@ mod tests {
             required: true,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,
@@ -2606,6 +2769,11 @@ mod tests {
             required: true,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,
@@ -2844,6 +3012,11 @@ mod tests {
             required: false,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,

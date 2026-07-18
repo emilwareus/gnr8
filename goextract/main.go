@@ -144,7 +144,7 @@ func run(targetDir string, scopes packageScopes, w *os.File) error {
 func addLoadDiagnostics(res *load.Result, diags *diag.Accumulator) {
 	for _, le := range res.Errors {
 		file, line := splitPos(le.Pos)
-		diags.Warn("go/packages load error: "+le.Msg, file, line)
+		diags.SourceLoadUnresolved("go/packages load error: "+le.Msg, file, line)
 	}
 }
 

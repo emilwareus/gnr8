@@ -278,18 +278,42 @@ schemas:
       start_line: 49
       end_line: 49
 diagnostics:
-  - severity: WARN
+  - code: request.parameter.unresolved
+    severity: WARN
+    category: request_parameter
     message: "untyped query param 'q' on GET /: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
     file: app/routes.py
     line: 42
-  - severity: WARN
+    span:
+      file: app/routes.py
+      start_line: 42
+      end_line: 42
+    operation: GET /
+    subject: q
+  - code: response.schema.unresolved
+    severity: WARN
+    category: response
     message: "untyped response on POST /raw: handler has no return annotation; response shape under-specified, no schema inferred"
     file: app/routes.py
     line: 69
-  - severity: WARN
+    span:
+      file: app/routes.py
+      start_line: 69
+      end_line: 69
+    operation: POST /raw
+    subject: create_order_raw
+  - code: request.body.unresolved
+    severity: WARN
+    category: request_body
     message: "untyped request body on POST /raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
     file: app/routes.py
     line: 78
+    span:
+      file: app/routes.py
+      start_line: 78
+      end_line: 78
+    operation: POST /raw
+    subject: payload
 base_path: /
 title: API
 security: []

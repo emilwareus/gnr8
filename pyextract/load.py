@@ -89,7 +89,11 @@ def load(target_dir, diags):
                 source = handle.read()
         except OSError as exc:
             diags.warn(
-                "could not read source file: {}".format(exc), abs_path, 0
+                "could not read source file: {}".format(exc),
+                abs_path,
+                0,
+                code="source.load.unresolved",
+                category="source",
             )
             continue
         try:
@@ -102,6 +106,8 @@ def load(target_dir, diags):
                 "could not parse Python source: {}".format(exc.msg),
                 abs_path,
                 line,
+                code="source.load.unresolved",
+                category="source",
             )
             continue
         modules.append(Module(dotted, tree, abs_path))

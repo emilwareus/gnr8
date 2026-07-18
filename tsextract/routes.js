@@ -42,6 +42,14 @@ const _PARAM_DECORATOR = "Param"; // -> location: path
 const _QUERY_DECORATOR = "Query"; // -> location: query
 const _BODY_DECORATOR = "Body"; // -> request_body (a TypeRef), NOT a param
 
+function _diagnosticsWithContext(diags, defaults) {
+  return {
+    warn(message, file, line, options = {}) {
+      diags.warn(message, file, line, { ...options, ...defaults });
+    },
+  };
+}
+
 // Return the simple callee name of a decorator (`@Get('/')` -> "Get"), or null
 // for a non-call / non-identifier decorator.
 function _decoratorName(decorator) {
@@ -56,19 +64,15 @@ function _decoratorName(decorator) {
   return null;
 }
 
-// Return the first string-literal argument of a decorator call (`@Get('/')` ->
-// "/", `@Param('bookId')` -> "bookId"), or null if there is none (`@Body()`).
+// Return the first argument when it is a string literal (`@Get('/')` -> "/",
+// `@Param('bookId')` -> "bookId"), or null for no/dynamic first argument.
 function _decoratorStringArg(decorator) {
   const expr = decorator.expression;
   if (!ts.isCallExpression(expr)) {
     return null;
   }
-  for (const arg of expr.arguments) {
-    if (ts.isStringLiteralLike(arg)) {
-      return arg.text;
-    }
-  }
-  return null;
+  const arg = expr.arguments[0];
+  return arg && ts.isStringLiteralLike(arg) ? arg.text : null;
 }
 
 // Return the integer argument of a decorator call (`@HttpCode(204)` -> 204), or
@@ -141,8 +145,26 @@ function _verbDecorator(loaded, methodDecl, diags) {
   for (const dec of _decorators(methodDecl)) {
     const name = _decoratorName(dec);
     if (name && Object.prototype.hasOwnProperty.call(_VERB_MAP, name)) {
+      const raw = _decoratorStringArg(dec);
+      const expr = dec.expression;
+      if (ts.isCallExpression(expr) && expr.arguments.length > 0 && raw === null) {
+        const sf = methodDecl.getSourceFile();
+        const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+        diags.warn(
+          "HTTP-verb decorator '@" +
+            name +
+            "' has a non-literal route path; route omitted (no fallback)",
+          load.relFile(loaded.targetDir, sf.fileName),
+          line,
+          {
+            code: "source.route.unresolved",
+            category: "source",
+            subject: methodDecl.name.getText(sf),
+          }
+        );
+        continue;
+      }
       if (chosen === null) {
-        const raw = _decoratorStringArg(dec);
         chosen = {
           method: _VERB_MAP[name],
           // A verb decorator with no string arg defaults to the group root `/`.
@@ -156,7 +178,13 @@ function _verbDecorator(loaded, methodDecl, diags) {
             name +
             "'; only the first verb is recorded, the extra route is dropped (no fallback)",
           load.relFile(loaded.targetDir, sf.fileName),
-          line
+          line,
+          {
+            code: "source.route.unresolved",
+            category: "source",
+            operation: chosen.method + " " + chosen.path,
+            subject: name,
+          }
         );
       }
     }
@@ -171,11 +199,24 @@ function _verbDecorator(loaded, methodDecl, diags) {
 // negatives `Number.isInteger` would otherwise pass) cannot be a valid status
 // (WR-05): diagnose it and return null — the deterministic method-derived status
 // then applies (the always-on default rule, not a recovery fallback).
-function _httpCodeOverride(loaded, methodDecl, diags) {
+function _httpCodeOverride(loaded, methodDecl, diags, operation) {
   for (const dec of _decorators(methodDecl)) {
     if (_decoratorName(dec) === "HttpCode") {
       const n = _decoratorNumberArg(dec);
       if (n === null) {
+        const sf = methodDecl.getSourceFile();
+        const line = sf.getLineAndCharacterOfPosition(dec.getStart(sf)).line + 1;
+        diags.warn(
+          "@HttpCode override is not an integer literal; override ignored (no fallback)",
+          load.relFile(loaded.targetDir, sf.fileName),
+          line,
+          {
+            code: "response.status.unresolved",
+            category: "response",
+            operation: operation,
+            subject: "HttpCode",
+          }
+        );
         return null;
       }
       if (n >= 100 && n <= 599) {
@@ -188,7 +229,13 @@ function _httpCodeOverride(loaded, methodDecl, diags) {
           n +
           ") is outside the valid HTTP status range (100-599); override ignored (no fallback)",
         load.relFile(loaded.targetDir, sf.fileName),
-        line
+        line,
+        {
+          code: "response.status.unresolved",
+          category: "response",
+          operation: operation,
+          subject: "HttpCode",
+        }
       );
       return null;
     }
@@ -228,15 +275,38 @@ function _paramKind(paramDecl) {
 // drops on `| null`. `ResponseFact.body` is a `TypeRef` (a bare ref_id), so ONLY
 // a `named` result is representable; an array/union/map/primitive return is
 // diagnosed distinctly (WR-02) and the body omitted — never a guessed ref.
-function _responseRef(loaded, methodDecl, diags, registry) {
+function _responseRef(loaded, methodDecl, diags, registry, operation) {
   if (!methodDecl.type) {
+    const sf = methodDecl.getSourceFile();
+    const line = sf.getLineAndCharacterOfPosition(methodDecl.name.getStart(sf)).line + 1;
+    diags.warn(
+      "handler has no return type annotation; response body omitted (no fallback)",
+      load.relFile(loaded.targetDir, sf.fileName),
+      line,
+      {
+        code: "response.schema.unresolved",
+        category: "response",
+        operation: operation,
+        subject: methodDecl.name.getText(sf),
+      }
+    );
     return null;
   }
   const sf = methodDecl.getSourceFile();
   const file = load.relFile(loaded.targetDir, sf.fileName);
   const line = sf.getLineAndCharacterOfPosition(methodDecl.type.getStart(sf)).line + 1;
 
-  const mapped = types.mapReturnType(loaded, methodDecl, diags, registry);
+  const mapped = types.mapReturnType(
+    loaded,
+    methodDecl,
+    _diagnosticsWithContext(diags, {
+      code: "response.schema.unresolved",
+      category: "response",
+      operation: operation,
+      subject: methodDecl.name.getText(sf),
+    }),
+    registry
+  );
   if (mapped.schema === null) {
     return null; // unresolvable type (mapReturnType already recorded the diagnostic)
   }
@@ -252,7 +322,13 @@ function _responseRef(loaded, methodDecl, diags, registry) {
       mapped.schema.type +
       "', not a named schema; a response body can only be a named ref (TypeRef), so the body is omitted (no fallback)",
     file,
-    line
+    line,
+    {
+      code: "response.schema.unresolved",
+      category: "response",
+      operation: operation,
+      subject: methodDecl.name.getText(sf),
+    }
   );
   return null;
 }
@@ -261,7 +337,7 @@ function _responseRef(loaded, methodDecl, diags, registry) {
 //   @Param -> location path, required true
 //   @Query -> location query, required = NOT (questionToken OR default initializer)
 //   @Body  -> request_body TypeRef (NOT a param)
-function _buildParams(loaded, methodDecl, diags, registry) {
+function _buildParams(loaded, methodDecl, diags, registry, operation) {
   const sf = methodDecl.getSourceFile();
   const params = [];
   let requestBody = null;
@@ -276,7 +352,17 @@ function _buildParams(loaded, methodDecl, diags, registry) {
       // The request body's schema: map the parameter's typed declaration to a
       // named ref (registering the DTO for transitive collection). The body is a
       // TypeRef (just the id), not a full param.
-      const mapped = types.mapType(loaded, paramDecl, diags, registry);
+      const mapped = types.mapType(
+        loaded,
+        paramDecl,
+        _diagnosticsWithContext(diags, {
+          code: "request.body.unresolved",
+          category: "request_body",
+          operation: operation,
+          subject: paramDecl.name.getText(sf),
+        }),
+        registry
+      );
       if (mapped.schema !== null && mapped.schema.type === "named") {
         if (requestBody === null) {
           requestBody = { ref_id: mapped.schema.of };
@@ -288,7 +374,13 @@ function _buildParams(loaded, methodDecl, diags, registry) {
           diags.warn(
             "handler has more than one @Body parameter; only the first is recorded, the extra body is dropped (no fallback)",
             load.relFile(loaded.targetDir, sf.fileName),
-            line
+            line,
+            {
+              code: "request.body.unresolved",
+              category: "request_body",
+              operation: operation,
+              subject: paramDecl.name.getText(sf),
+            }
           );
         }
       } else if (mapped.schema !== null) {
@@ -297,7 +389,13 @@ function _buildParams(loaded, methodDecl, diags, registry) {
         diags.warn(
           "@Body parameter is not a named DTO type; request body omitted (no fallback)",
           load.relFile(loaded.targetDir, sf.fileName),
-          line
+          line,
+          {
+            code: "request.body.unresolved",
+            category: "request_body",
+            operation: operation,
+            subject: paramDecl.name.getText(sf),
+          }
         );
       }
       continue;
@@ -314,12 +412,28 @@ function _buildParams(loaded, methodDecl, diags, registry) {
           (classified.kind === "path" ? "Param" : "Query") +
           " has no name argument; param omitted (no fallback)",
         load.relFile(loaded.targetDir, sf.fileName),
-        line
+        line,
+        {
+          code: "request.parameter.unresolved",
+          category: "request_parameter",
+          operation: operation,
+          subject: paramDecl.name.getText(sf),
+        }
       );
       continue;
     }
 
-    const mapped = types.mapType(loaded, paramDecl, diags, registry);
+    const mapped = types.mapType(
+      loaded,
+      paramDecl,
+      _diagnosticsWithContext(diags, {
+        code: "request.parameter.unresolved",
+        category: "request_parameter",
+        operation: operation,
+        subject: name,
+      }),
+      registry
+    );
     if (mapped.schema === null) {
       continue; // rule 3: unresolvable param omitted (diagnostic already recorded)
     }
@@ -389,21 +503,29 @@ function recognizeNestController(loaded, diags, registry) {
           continue; // a method with no HTTP-verb decorator is not a route
         }
         const handler = member.name.getText(sf);
+        const operation = verb.method + " " + verb.path;
 
         const { params, requestBody } = _buildParams(
           loaded,
           member,
           diags,
-          registry
+          registry,
+          operation
         );
 
-        const bodyRef = _responseRef(loaded, member, diags, registry);
+        const bodyRef = _responseRef(
+          loaded,
+          member,
+          diags,
+          registry,
+          operation
+        );
 
         // Status is METHOD-DERIVED (typed POST -> 201, else 200), overridden by
         // an explicit @HttpCode(n). A single deterministic rule (rule 3) — the
         // override is read first, the method-default applied otherwise; never a
         // try-typed-then-fallback chain.
-        const override = _httpCodeOverride(loaded, member, diags);
+        const override = _httpCodeOverride(loaded, member, diags, operation);
         const status =
           override !== null ? override : verb.method === "POST" ? 201 : 200;
 

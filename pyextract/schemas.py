@@ -168,6 +168,9 @@ def _build_class_schema(class_def, dotted, abs_path, table, diags):
                 "representable as a neutral string enum); schema omitted".format(name),
                 abs_path,
                 getattr(class_def, "lineno", 0),
+                code="schema.type.unresolved",
+                category="schema",
+                schema=qualified,
             )
             return None
         body = {"type": "enum", "of": members}

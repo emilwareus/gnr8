@@ -131,6 +131,8 @@ Without `--contract`, any surface diff is breaking. With `--contract`, only miss
 and unapproved diff items fail the command; stale allowances are reported in `--json` and do not fail.
 `--suggest` adds high-confidence migration snippets to human output and to the JSON `suggestions`
 array.
+Go comparison includes canonical exported struct, interface, alias, and defined-type declarations in
+addition to exported function and method signatures.
 
 Contract keys are optional arrays, except `allow.docs_layout_migration`, which defaults to `false`:
 
@@ -146,6 +148,7 @@ require_exported_methods = []
 allow_missing_exported_types = []
 allow_missing_exported_functions = []
 allow_missing_exported_methods = []
+allow_exported_type_changes = []
 allow_exported_function_signature_changes = []
 allow_exported_method_signature_changes = []
 allow_missing_docs = []
@@ -166,6 +169,7 @@ allow_missing_operation_methods = []
 allow_missing_request_aliases = []
 allow_missing_interface_properties = []  # "Interface.property"
 allow_interface_property_changes = []    # "Interface.property"
+allow_type_declaration_changes = []       # type alias, heritage, or enum symbol
 allow_operation_return_type_changes = []
 allow_operation_signature_changes = []
 allow_export_kind_mismatches = []

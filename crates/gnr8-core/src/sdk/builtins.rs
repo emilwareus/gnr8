@@ -16,9 +16,11 @@ use super::{
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
-    ApiGraph, MediaExample, OperationDocsPolicy, OperationRuntimePolicy, PaginationMode,
-    PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy, RuntimeHookKind,
-    RuntimePolicy, Schema, SchemaRef, SecurityScheme, Type,
+    ApiGraph, DiagnosticCategory, MediaExample, OpenApiContact, OpenApiLicense,
+    OpenApiMetadataPolicy, OpenApiServer, OperationDocsPolicy, OperationRuntimePolicy,
+    PaginationMode, PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy,
+    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SecurityRequirementGroup, SecurityScheme,
+    Type,
 };
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
@@ -40,6 +42,7 @@ use crate::CoreError;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------------------------------
@@ -544,6 +547,177 @@ impl Transform for SetTitle {
     }
 }
 
+/// Configure public OpenAPI document metadata in Rust code.
+#[derive(Debug, Clone, Default)]
+pub struct OpenApiMetadata {
+    title: Option<String>,
+    policy: OpenApiMetadataPolicy,
+}
+
+impl OpenApiMetadata {
+    /// Create empty metadata updates.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `info.title`.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set `info.version`.
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.policy.version = Some(version.into());
+        self
+    }
+
+    /// Set `info.description`.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.policy.description = Some(description.into());
+        self
+    }
+
+    /// Set `info.termsOfService`.
+    #[must_use]
+    pub fn terms_of_service(mut self, url: impl Into<String>) -> Self {
+        self.policy.terms_of_service = Some(url.into());
+        self
+    }
+
+    /// Set all optional contact fields.
+    #[must_use]
+    pub fn contact(mut self, contact: OpenApiContact) -> Self {
+        self.policy.contact = Some(contact);
+        self
+    }
+
+    /// Set the public license name and optional URL.
+    #[must_use]
+    pub fn license(mut self, license: OpenApiLicense) -> Self {
+        self.policy.license = Some(license);
+        self
+    }
+
+    /// Add one server URL.
+    #[must_use]
+    pub fn server(mut self, url: impl Into<String>) -> Self {
+        self.policy.servers.push(OpenApiServer::new(url));
+        self
+    }
+
+    /// Add one server URL with a public description.
+    #[must_use]
+    pub fn described_server(
+        mut self,
+        url: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        self.policy
+            .servers
+            .push(OpenApiServer::new(url).description(description));
+        self
+    }
+}
+
+impl Transform for OpenApiMetadata {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        validate_optional_metadata_value("OpenAPI title", self.title.as_deref())?;
+        validate_optional_metadata_value("OpenAPI version", self.policy.version.as_deref())?;
+        validate_optional_metadata_value(
+            "OpenAPI description",
+            self.policy.description.as_deref(),
+        )?;
+        validate_optional_metadata_value(
+            "OpenAPI terms of service",
+            self.policy.terms_of_service.as_deref(),
+        )?;
+        if let Some(contact) = &self.policy.contact {
+            validate_optional_metadata_value("OpenAPI contact name", contact.name.as_deref())?;
+            validate_optional_metadata_value("OpenAPI contact URL", contact.url.as_deref())?;
+            validate_optional_metadata_value("OpenAPI contact email", contact.email.as_deref())?;
+        }
+        if let Some(license) = &self.policy.license {
+            validate_metadata_value("OpenAPI license name", &license.name)?;
+            validate_optional_metadata_value("OpenAPI license URL", license.url.as_deref())?;
+        }
+        for server in &self.policy.servers {
+            validate_metadata_value("OpenAPI server URL", &server.url)?;
+            validate_optional_metadata_value(
+                "OpenAPI server description",
+                server.description.as_deref(),
+            )?;
+        }
+        if let Some(title) = &self.title {
+            ir.title.clone_from(title);
+        }
+        ir.openapi_metadata = self.policy.clone();
+        Ok(())
+    }
+}
+
+/// Fail the pipeline when selected structured diagnostics remain after preceding transforms.
+///
+/// Place this transform after explicit correction transforms so a resolved extraction limitation no
+/// longer trips the policy, and before targets so generation cannot write incomplete artifacts.
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticPolicy {
+    denied_codes: BTreeSet<String>,
+    denied_categories: BTreeSet<DiagnosticCategory>,
+}
+
+impl DiagnosticPolicy {
+    /// Create a policy that permits all diagnostics.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Deny one exact stable diagnostic code.
+    #[must_use]
+    pub fn deny(mut self, code: impl Into<String>) -> Self {
+        self.denied_codes.insert(code.into());
+        self
+    }
+
+    /// Deny every diagnostic in a category.
+    #[must_use]
+    pub fn deny_category(mut self, category: DiagnosticCategory) -> Self {
+        self.denied_categories.insert(category);
+        self
+    }
+}
+
+impl Transform for DiagnosticPolicy {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if self.denied_codes.iter().any(|code| code.trim().is_empty()) {
+            return Err(CoreError::Config {
+                message: "diagnostic policy codes must be non-empty".to_string(),
+            });
+        }
+        let codes: BTreeSet<String> = ir
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                self.denied_codes.contains(&diagnostic.code)
+                    || self.denied_categories.contains(&diagnostic.category)
+            })
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect();
+        if codes.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::DiagnosticsDenied {
+                codes: codes.into_iter().collect(),
+            })
+        }
+    }
+}
+
 /// Set or replace the typed success response for one operation.
 ///
 /// This is a graph-level correction hook for source frameworks where a handler's response type is not
@@ -779,9 +953,12 @@ impl Transform for SetSchemaFieldType {
 pub struct ApiOverrides {
     field_presence: Vec<FieldPresenceOverride>,
     query_params: Vec<QueryParamOverride>,
+    parameters: Vec<(OperationSelector, ParameterOverride)>,
+    security_overrides: Vec<(OperationSelector, SecurityOverride)>,
     request_bodies: Vec<RequestBodyOverride>,
-    responses: Vec<ResponseOverride>,
+    responses: Vec<(OperationSelector, ResponseOverride)>,
     default_responses: Vec<DefaultResponseOverride>,
+    configuration_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -805,14 +982,89 @@ struct RequestBodyOverride {
     content_type: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ResponseOverride {
-    matcher: OperationMatcher,
+/// Structured route response replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseOverride {
     status: u16,
     body_kind: String,
     content_type: Option<String>,
     content_types: Vec<String>,
     schema_ref: Option<String>,
+}
+
+impl ResponseOverride {
+    /// Start a bodyless response override for `status`.
+    #[must_use]
+    pub fn status(status: u16) -> Self {
+        Self {
+            status,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+            schema_ref: None,
+        }
+    }
+
+    /// Attach a JSON schema and default `application/json` media type.
+    #[must_use]
+    pub fn json_schema(mut self, schema: impl Into<String>) -> Self {
+        self.body_kind = "json".to_string();
+        self.schema_ref = Some(schema.into());
+        self.content_type = Some("application/json".to_string());
+        self.content_types = vec!["application/json".to_string()];
+        self
+    }
+
+    /// Emit a bodyless response (including a 204).
+    #[must_use]
+    pub fn empty(mut self) -> Self {
+        self.body_kind = "empty".to_string();
+        self.schema_ref = None;
+        self.content_type = None;
+        self.content_types.clear();
+        self
+    }
+
+    /// Emit a binary response with the given media type.
+    #[must_use]
+    pub fn binary(mut self, media_type: impl Into<String>) -> Self {
+        let media_type = media_type.into();
+        self.body_kind = "binary".to_string();
+        self.schema_ref = None;
+        self.content_type = Some(media_type.clone());
+        self.content_types = vec![media_type];
+        self
+    }
+
+    /// Emit a server-sent event response, optionally using an envelope schema.
+    #[must_use]
+    pub fn event_stream(mut self) -> Self {
+        self.body_kind = "sse".to_string();
+        self.schema_ref = None;
+        self.content_type = Some("text/event-stream".to_string());
+        self.content_types = vec!["text/event-stream".to_string()];
+        self
+    }
+
+    /// Attach an event envelope schema to an SSE response.
+    #[must_use]
+    pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema_ref = Some(schema.into());
+        self
+    }
+
+    /// Add a response media type without discarding existing alternatives.
+    #[must_use]
+    pub fn media_type(mut self, media_type: impl Into<String>) -> Self {
+        let media_type = media_type.into();
+        if self.content_type.is_none() {
+            self.content_type = Some(media_type.clone());
+        }
+        if !self.content_types.contains(&media_type) {
+            self.content_types.push(media_type);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -831,6 +1083,213 @@ pub struct QueryParam {
     schema: Type,
     required: bool,
     default: Option<LiteralValue>,
+}
+
+/// A typed request parameter at any OpenAPI parameter location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestParameter {
+    name: String,
+    location: String,
+    schema: Type,
+    required: bool,
+    default: Option<LiteralValue>,
+    style: Option<String>,
+    explode: Option<bool>,
+    allow_reserved: bool,
+}
+
+impl RequestParameter {
+    /// Build a parameter at an explicit location (`query`, `header`, `path`, or `cookie`).
+    #[must_use]
+    pub fn new(name: impl Into<String>, location: impl Into<String>, schema: Type) -> Self {
+        let location = location.into();
+        Self {
+            name: name.into(),
+            required: location == "path",
+            location,
+            schema,
+            default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+        }
+    }
+
+    /// Build a query parameter.
+    #[must_use]
+    pub fn query(name: impl Into<String>, schema: Type) -> Self {
+        Self::new(name, "query", schema)
+    }
+
+    /// Build a header parameter.
+    #[must_use]
+    pub fn header(name: impl Into<String>, schema: Type) -> Self {
+        Self::new(name, "header", schema)
+    }
+
+    /// Build a path parameter (always required).
+    #[must_use]
+    pub fn path(name: impl Into<String>, schema: Type) -> Self {
+        Self::new(name, "path", schema).required()
+    }
+
+    /// Build a cookie parameter.
+    #[must_use]
+    pub fn cookie(name: impl Into<String>, schema: Type) -> Self {
+        Self::new(name, "cookie", schema)
+    }
+
+    /// Require the parameter.
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Make the parameter optional. Path parameters are rejected during validation.
+    #[must_use]
+    pub const fn optional(mut self) -> Self {
+        self.required = false;
+        self
+    }
+
+    /// Set an exact literal default.
+    #[must_use]
+    pub fn default(mut self, value: LiteralValue) -> Self {
+        self.default = Some(value);
+        self
+    }
+
+    /// Set an explicit OpenAPI serialization style.
+    #[must_use]
+    pub fn style(mut self, style: impl Into<String>) -> Self {
+        self.style = Some(style.into());
+        self
+    }
+
+    /// Set explicit OpenAPI explode behavior.
+    #[must_use]
+    pub const fn explode(mut self, explode: bool) -> Self {
+        self.explode = Some(explode);
+        self
+    }
+
+    /// Permit reserved characters in query serialization.
+    #[must_use]
+    pub const fn allow_reserved(mut self, allow: bool) -> Self {
+        self.allow_reserved = allow;
+        self
+    }
+}
+
+/// Checked semantics for applying one typed request parameter override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterOverride {
+    mode: ParameterOverrideMode,
+    parameter: RequestParameter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterOverrideMode {
+    AddIfMissing,
+    CorrectExisting,
+    Replace,
+}
+
+impl ParameterOverride {
+    /// Add the parameter only when no parameter with this name and location exists.
+    #[must_use]
+    pub fn add_if_missing(parameter: RequestParameter) -> Self {
+        Self {
+            mode: ParameterOverrideMode::AddIfMissing,
+            parameter,
+        }
+    }
+
+    /// Correct an extracted parameter, failing when it is missing or already identical.
+    #[must_use]
+    pub fn correct_existing(parameter: RequestParameter) -> Self {
+        Self {
+            mode: ParameterOverrideMode::CorrectExisting,
+            parameter,
+        }
+    }
+
+    /// Intentionally replace a parameter with the same name and location, recording the change.
+    #[must_use]
+    pub fn replace(parameter: RequestParameter) -> Self {
+        Self {
+            mode: ParameterOverrideMode::Replace,
+            parameter,
+        }
+    }
+}
+
+/// Exact per-operation security replacement, preserving OpenAPI OR alternatives and AND groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityOverride {
+    alternatives: Vec<SecurityRequirementGroup>,
+}
+
+impl SecurityOverride {
+    /// Make an operation explicitly public (`security: []`).
+    #[must_use]
+    pub fn public() -> Self {
+        Self {
+            alternatives: Vec::new(),
+        }
+    }
+
+    /// Require one scheme, replacing any inherited document default.
+    #[must_use]
+    pub fn scheme(scheme: impl Into<String>) -> Self {
+        Self {
+            alternatives: vec![SecurityRequirementGroup {
+                schemes: vec![scheme.into()],
+            }],
+        }
+    }
+
+    /// Add an OR alternative containing one required scheme.
+    #[must_use]
+    pub fn or_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.alternatives.push(SecurityRequirementGroup {
+            schemes: vec![scheme.into()],
+        });
+        self
+    }
+
+    /// Add a scheme to the last alternative (AND). If none exists, create one.
+    #[must_use]
+    pub fn and_scheme(mut self, scheme: impl Into<String>) -> Self {
+        let scheme = scheme.into();
+        if let Some(group) = self.alternatives.last_mut() {
+            group.schemes.push(scheme);
+        } else {
+            self.alternatives.push(SecurityRequirementGroup {
+                schemes: vec![scheme],
+            });
+        }
+        self
+    }
+
+    /// Replace all alternatives from an iterator of AND groups.
+    #[must_use]
+    pub fn alternatives<I, G, S>(groups: I) -> Self
+    where
+        I: IntoIterator<Item = G>,
+        G: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            alternatives: groups
+                .into_iter()
+                .map(|group| SecurityRequirementGroup {
+                    schemes: group.into_iter().map(Into::into).collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl QueryParam {
@@ -952,6 +1411,27 @@ impl ApiOverrides {
         self
     }
 
+    /// Apply a checked, fully typed request parameter override to exactly one selected operation.
+    #[must_use]
+    pub fn parameter(mut self, selector: OperationSelector, override_: ParameterOverride) -> Self {
+        self.parameters.push((selector, override_));
+        self
+    }
+
+    /// Replace inherited security on exactly one selected operation.
+    #[must_use]
+    pub fn security(mut self, selector: OperationSelector, override_: SecurityOverride) -> Self {
+        self.security_overrides.push((selector, override_));
+        self
+    }
+
+    /// Replace one status response on exactly one selected operation.
+    #[must_use]
+    pub fn response(mut self, selector: OperationSelector, override_: ResponseOverride) -> Self {
+        self.responses.push((selector, override_));
+        self
+    }
+
     /// Target a request body on an operation matched by method and graph path.
     #[must_use]
     pub fn request_body(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
@@ -1024,6 +1504,10 @@ impl ApiOverrides {
     pub fn optional(mut self) -> Self {
         if let Some(body) = self.request_bodies.last_mut() {
             body.required = Some(false);
+        } else {
+            self.configuration_errors.push(
+                "ApiOverrides::optional() requires a preceding request-body override".to_string(),
+            );
         }
         self
     }
@@ -1036,17 +1520,10 @@ impl ApiOverrides {
         path: impl Into<String>,
         status: u16,
     ) -> Self {
-        self.responses.push(ResponseOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            status,
-            body_kind: "binary".to_string(),
-            content_type: Some("application/octet-stream".to_string()),
-            content_types: vec!["application/octet-stream".to_string()],
-            schema_ref: None,
-        });
+        self.responses.push((
+            OperationSelector::route(method, path),
+            ResponseOverride::status(status).binary("application/octet-stream"),
+        ));
         self
     }
 
@@ -1059,17 +1536,10 @@ impl ApiOverrides {
         status: u16,
         schema: impl Into<String>,
     ) -> Self {
-        self.responses.push(ResponseOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            status,
-            body_kind: "json".to_string(),
-            content_type: None,
-            content_types: vec!["application/json".to_string()],
-            schema_ref: Some(schema.into()),
-        });
+        self.responses.push((
+            OperationSelector::route(method, path),
+            ResponseOverride::status(status).json_schema(schema),
+        ));
         self
     }
 
@@ -1089,27 +1559,27 @@ impl ApiOverrides {
     /// Mark one response as server-sent events.
     #[must_use]
     pub fn sse_response(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
-        self.responses.push(ResponseOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            status: 200,
-            body_kind: "sse".to_string(),
-            content_type: Some("text/event-stream".to_string()),
-            content_types: vec!["text/event-stream".to_string()],
-            schema_ref: None,
-        });
+        self.responses.push((
+            OperationSelector::route(method, path),
+            ResponseOverride::status(200).event_stream(),
+        ));
         self
     }
 
     /// Attach an existing schema as the event envelope for the most recently configured SSE response.
     #[must_use]
     pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
-        if let Some(response) = self.responses.last_mut() {
-            if response.body_kind == "sse" {
+        match self.responses.last_mut() {
+            Some((_, response)) if response.body_kind == "sse" => {
                 response.schema_ref = Some(schema.into());
             }
+            Some(_) => self.configuration_errors.push(
+                "ApiOverrides::event_schema() requires the preceding response to be SSE"
+                    .to_string(),
+            ),
+            None => self
+                .configuration_errors
+                .push("ApiOverrides::event_schema() requires a preceding SSE response".to_string()),
         }
         self
     }
@@ -1117,6 +1587,11 @@ impl ApiOverrides {
 
 impl Transform for ApiOverrides {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if let Some(message) = self.configuration_errors.first() {
+            return Err(CoreError::Config {
+                message: message.clone(),
+            });
+        }
         for override_ in &self.field_presence {
             apply_field_presence_override(
                 ir,
@@ -1128,6 +1603,39 @@ impl Transform for ApiOverrides {
         for override_ in &self.query_params {
             apply_query_param_override(ir, &override_.matcher, &override_.param)?;
         }
+        let mut touched = BTreeSet::new();
+        for (selector, override_) in &self.parameters {
+            let op_index = find_selected_operation_index(ir, selector, "parameter override")?;
+            let key = (
+                op_index,
+                override_.parameter.name.clone(),
+                override_.parameter.location.clone(),
+            );
+            if !touched.insert(key) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "conflicting parameter overrides target {:?} in {} on operation '{}'",
+                        override_.parameter.name,
+                        override_.parameter.location,
+                        ir.operations[op_index].id
+                    ),
+                });
+            }
+            apply_typed_parameter_override(ir, op_index, override_)?;
+        }
+        let mut secured_operations = BTreeSet::new();
+        for (selector, override_) in &self.security_overrides {
+            let op_index = find_selected_operation_index(ir, selector, "security override")?;
+            if !secured_operations.insert(op_index) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "conflicting security overrides target operation '{}'",
+                        ir.operations[op_index].id
+                    ),
+                });
+            }
+            apply_security_override(ir, op_index, override_)?;
+        }
         for override_ in &self.request_bodies {
             apply_request_body_override(
                 ir,
@@ -1137,14 +1645,313 @@ impl Transform for ApiOverrides {
                 override_.content_type.as_deref(),
             )?;
         }
-        for override_ in &self.responses {
-            apply_response_override(ir, override_)?;
+        let mut response_keys = BTreeSet::new();
+        for (selector, override_) in &self.responses {
+            let op_index = find_selected_operation_index(ir, selector, "response override")?;
+            if !response_keys.insert((op_index, override_.status)) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "conflicting response overrides target status {} on operation '{}'",
+                        override_.status, ir.operations[op_index].id
+                    ),
+                });
+            }
+            apply_response_override(ir, op_index, override_)?;
         }
         for override_ in &self.default_responses {
             apply_default_response_override(ir, override_)?;
         }
         Ok(())
     }
+}
+
+fn apply_security_override(
+    ir: &mut ApiGraph,
+    op_index: usize,
+    override_: &SecurityOverride,
+) -> Result<(), CoreError> {
+    let mut alternatives = override_.alternatives.clone();
+    for group in &mut alternatives {
+        if group.schemes.is_empty() {
+            return Err(CoreError::Config {
+                message: "security alternatives must not contain an empty AND group".to_string(),
+            });
+        }
+        group.schemes.sort();
+        group.schemes.dedup();
+        for scheme in &group.schemes {
+            if !ir.security.iter().any(|known| known.id == *scheme) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "security override for operation '{}' references unknown scheme {scheme:?}",
+                        ir.operations[op_index].id
+                    ),
+                });
+            }
+        }
+    }
+    alternatives.sort_by(|a, b| a.schemes.cmp(&b.schemes));
+    alternatives.dedup();
+
+    let operation_id = ir.operations[op_index].id.clone();
+    if ir
+        .operation_security
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
+        .is_some_and(|policy| policy.alternatives == alternatives)
+    {
+        return Err(CoreError::Config {
+            message: format!("redundant security override on operation {operation_id:?}"),
+        });
+    }
+    let op = &mut ir.operations[op_index];
+    let operation_name = format!("{} {}", op.method, op.path);
+    let span = op.provenance.clone();
+    op.security = alternatives
+        .iter()
+        .flat_map(|group| group.schemes.iter().cloned())
+        .collect();
+    op.security.sort();
+    op.security.dedup();
+    op.security_overrides_global = true;
+    ir.operation_security
+        .retain(|policy| policy.operation_id != operation_id);
+    ir.operation_security
+        .push(crate::graph::OperationSecurityPolicy {
+            operation_id,
+            alternatives,
+        });
+    ir.operation_security
+        .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+    ir.diagnostics.retain(|diagnostic| {
+        diagnostic.code != "security.unresolved"
+            || diagnostic.operation.as_deref() != Some(operation_name.as_str())
+    });
+    ir.diagnostics.push(
+        crate::graph::Diagnostic::new(
+            "override.security.replaced",
+            DiagnosticCategory::Override,
+            "INFO",
+            format!("explicitly replaced security on {operation_name}"),
+            span,
+        )
+        .operation(operation_name),
+    );
+    Ok(())
+}
+
+fn apply_typed_parameter_override(
+    ir: &mut ApiGraph,
+    op_index: usize,
+    override_: &ParameterOverride,
+) -> Result<(), CoreError> {
+    validate_request_parameter(&override_.parameter)?;
+    let requested = &override_.parameter;
+    let same_name: Vec<usize> = ir.operations[op_index]
+        .params
+        .iter()
+        .enumerate()
+        .filter_map(|(index, existing)| (existing.name == requested.name).then_some(index))
+        .collect();
+    let exact_matches: Vec<usize> = same_name
+        .iter()
+        .copied()
+        .filter(|index| ir.operations[op_index].params[*index].location == requested.location)
+        .collect();
+    let replaced = !exact_matches.is_empty();
+
+    if override_.mode == ParameterOverrideMode::AddIfMissing && replaced {
+        return Err(CoreError::Config {
+            message: format!(
+                "add_if_missing parameter {:?} already exists on operation '{}'",
+                requested.name, ir.operations[op_index].id
+            ),
+        });
+    }
+    if override_.mode == ParameterOverrideMode::CorrectExisting {
+        validate_existing_parameter_correction(
+            &ir.operations[op_index],
+            requested,
+            &same_name,
+            &exact_matches,
+        )?;
+    }
+
+    let op = &mut ir.operations[op_index];
+    let operation_name = format!("{} {}", op.method, op.path);
+    let span = op.provenance.clone();
+    op.params.retain(|existing| {
+        existing.name != requested.name || existing.location != requested.location
+    });
+    op.params.push(crate::graph::Param {
+        name: requested.name.clone(),
+        location: requested.location.clone(),
+        required: requested.required,
+        schema: requested.schema.clone(),
+        default: requested.default.clone(),
+        style: requested.style.clone(),
+        explode: requested.explode,
+        allow_reserved: requested.allow_reserved,
+        openapi_content: None,
+        openapi_fields: Vec::new(),
+        provenance: span.clone(),
+    });
+    op.params.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.location.cmp(&b.location))
+    });
+    remove_unresolved_parameter_diagnostics(ir, &operation_name, &requested.name);
+    if override_.mode == ParameterOverrideMode::Replace && replaced {
+        ir.diagnostics.push(
+            crate::graph::Diagnostic::new(
+                "override.parameter.replaced",
+                DiagnosticCategory::Override,
+                "INFO",
+                format!(
+                    "explicitly replaced parameter '{}' on {operation_name}",
+                    requested.name
+                ),
+                span,
+            )
+            .operation(operation_name)
+            .subject(requested.name.clone()),
+        );
+    }
+    Ok(())
+}
+
+fn validate_existing_parameter_correction(
+    operation: &crate::graph::Operation,
+    requested: &RequestParameter,
+    same_name: &[usize],
+    exact_matches: &[usize],
+) -> Result<(), CoreError> {
+    let [existing_index] = exact_matches else {
+        if exact_matches.is_empty() && !same_name.is_empty() {
+            let mut locations = same_name
+                .iter()
+                .map(|index| operation.params[*index].location.as_str())
+                .collect::<Vec<_>>();
+            locations.sort_unstable();
+            locations.dedup();
+            return Err(CoreError::Config {
+                message: format!(
+                    "parameter {:?} location mismatch on operation '{}': extracted {}, override {}",
+                    requested.name,
+                    operation.id,
+                    locations.join(", "),
+                    requested.location
+                ),
+            });
+        }
+        return Err(CoreError::Config {
+            message: format!(
+                "correct_existing parameter {:?} expected exactly one extracted parameter on operation '{}', found {}",
+                requested.name,
+                operation.id,
+                exact_matches.len()
+            ),
+        });
+    };
+    if request_parameter_matches(&operation.params[*existing_index], requested) {
+        return Err(CoreError::Config {
+            message: format!(
+                "redundant parameter override {:?} on operation '{}' makes no change",
+                requested.name, operation.id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_request_parameter(parameter: &RequestParameter) -> Result<(), CoreError> {
+    if parameter.name.trim().is_empty() {
+        return Err(CoreError::Config {
+            message: "request parameter name must not be empty".to_string(),
+        });
+    }
+    let allowed_styles: &[&str] = match parameter.location.as_str() {
+        "query" => &["form", "spaceDelimited", "pipeDelimited", "deepObject"],
+        "cookie" => &["form"],
+        "path" => &["simple", "label", "matrix"],
+        "header" => &["simple"],
+        other => {
+            return Err(CoreError::Config {
+                message: format!(
+                    "request parameter {:?} has unsupported location {other:?}",
+                    parameter.name
+                ),
+            });
+        }
+    };
+    if parameter.location == "path" && !parameter.required {
+        return Err(CoreError::Config {
+            message: format!("path parameter {:?} must be required", parameter.name),
+        });
+    }
+    if parameter.allow_reserved && parameter.location != "query" {
+        return Err(CoreError::Config {
+            message: format!(
+                "allowReserved is only valid for query parameters ({} is {})",
+                parameter.name, parameter.location
+            ),
+        });
+    }
+    if parameter.style.as_deref().is_some_and(str::is_empty) {
+        return Err(CoreError::Config {
+            message: format!("parameter {:?} style must not be empty", parameter.name),
+        });
+    }
+    if let Some(style) = parameter.style.as_deref() {
+        if !allowed_styles.contains(&style) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "parameter {:?} style {style:?} is invalid for location {}",
+                    parameter.name, parameter.location
+                ),
+            });
+        }
+    }
+    if let Some(default) = &parameter.default {
+        if !literal_matches_parameter_type(default, &parameter.schema) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "parameter {:?} default type does not match its schema",
+                    parameter.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn literal_matches_parameter_type(value: &LiteralValue, schema: &Type) -> bool {
+    matches!(
+        (value, schema),
+        (
+            LiteralValue::String(_),
+            Type::Primitive(crate::graph::Prim::String) | Type::WellKnown(_) | Type::Enum(_)
+        ) | (
+            LiteralValue::Number(_),
+            Type::Primitive(crate::graph::Prim::Int { .. } | crate::graph::Prim::Float { .. })
+                | Type::WellKnown(crate::graph::WellKnown::Decimal)
+        ) | (
+            LiteralValue::Bool(_),
+            Type::Primitive(crate::graph::Prim::Bool)
+        )
+    )
+}
+
+fn request_parameter_matches(existing: &crate::graph::Param, requested: &RequestParameter) -> bool {
+    existing.name == requested.name
+        && existing.location == requested.location
+        && existing.required == requested.required
+        && existing.schema == requested.schema
+        && existing.default == requested.default
+        && existing.style == requested.style
+        && existing.explode == requested.explode
+        && existing.allow_reserved == requested.allow_reserved
 }
 
 fn apply_field_presence_override(
@@ -1218,6 +2025,11 @@ fn apply_query_param_override(
         required: param.required,
         schema: param.schema.clone(),
         default: param.default.clone(),
+        style: None,
+        explode: None,
+        allow_reserved: false,
+        openapi_content: None,
+        openapi_fields: Vec::new(),
         provenance: op.provenance.clone(),
     });
     op.params.sort_by(|a, b| {
@@ -1239,10 +2051,12 @@ fn apply_request_body_override(
     let op_index = find_operation_index(ir, matcher, "request body override")?;
     if let Some(schema_ref) = schema_ref {
         let resolved = resolve_schema_ref(ir, schema_ref, "request body override schema")?;
+        let identity = OperationDiagnosticIdentity::from(&ir.operations[op_index]);
         let op = &mut ir.operations[op_index];
         op.request_body = Some(SchemaRef { ref_id: resolved });
         op.request_body_required = required.unwrap_or(true);
         op.request_body_content_type = content_type.map(str::to_string);
+        remove_all_operation_diagnostics(ir, "request.body.unresolved", &identity);
         return Ok(());
     }
     let op = &mut ir.operations[op_index];
@@ -1262,15 +2076,40 @@ fn apply_request_body_override(
 
 fn apply_response_override(
     ir: &mut ApiGraph,
+    op_index: usize,
     override_: &ResponseOverride,
 ) -> Result<(), CoreError> {
-    let op_index = find_operation_index(ir, &override_.matcher, "response override")?;
+    validate_http_status(override_.status, "response override status")?;
+    if !matches!(
+        override_.body_kind.as_str(),
+        "json" | "binary" | "sse" | "empty"
+    ) {
+        return Err(CoreError::Config {
+            message: format!(
+                "response override {} has unsupported body kind {:?}",
+                override_.status, override_.body_kind
+            ),
+        });
+    }
+    if override_.body_kind == "json" && override_.schema_ref.is_none() {
+        return Err(CoreError::Config {
+            message: format!(
+                "JSON response override {} requires a schema",
+                override_.status
+            ),
+        });
+    }
+    if override_.body_kind == "empty" && override_.schema_ref.is_some() {
+        return Err(CoreError::Config {
+            message: format!(
+                "empty response override {} cannot carry a schema",
+                override_.status
+            ),
+        });
+    }
     let body = response_override_body(ir, override_.schema_ref.as_deref())?;
-    let op_span = ir.operations[op_index].provenance.clone();
-    let op = &mut ir.operations[op_index];
-    op.responses
-        .retain(|response| response.status != override_.status);
-    op.responses.push(Response {
+    let identity = OperationDiagnosticIdentity::from(&ir.operations[op_index]);
+    let replacement = Response {
         status: override_.status,
         body,
         body_kind: override_.body_kind.clone(),
@@ -1279,16 +2118,26 @@ fn apply_response_override(
             override_.content_type.as_deref(),
             &override_.content_types,
         ),
-    });
-    op.responses.sort_by_key(|response| response.status);
-    if override_.body_kind == "binary"
-        && override_
-            .content_types
-            .iter()
-            .any(|content_type| content_type == "application/octet-stream")
+    };
+    if ir.operations[op_index]
+        .responses
+        .iter()
+        .any(|response| response == &replacement)
     {
-        remove_binary_octet_stream_default_diagnostics(ir, &op_span);
+        return Err(CoreError::Config {
+            message: format!(
+                "redundant response override {} on operation '{}' makes no change",
+                override_.status, ir.operations[op_index].id
+            ),
+        });
     }
+    let op = &mut ir.operations[op_index];
+    op.responses
+        .retain(|response| response.status != override_.status);
+    op.responses.push(replacement);
+    op.responses.sort_by_key(|response| response.status);
+    remove_one_operation_diagnostic(ir, "response.schema.unresolved", &identity);
+    remove_one_operation_diagnostic(ir, "response.media_type.unresolved", &identity);
     Ok(())
 }
 
@@ -1414,27 +2263,71 @@ fn find_operation_index(
 }
 
 fn remove_untyped_query_diagnostics(ir: &mut ApiGraph, method: &str, path: &str, param_name: &str) {
-    let prefix = format!("untyped query param '{param_name}' on {method} {path}:");
-    ir.diagnostics
-        .retain(|diagnostic| !diagnostic.message.starts_with(&prefix));
+    let operation = format!("{method} {path}");
+    remove_unresolved_parameter_diagnostics(ir, &operation, param_name);
 }
 
-fn remove_binary_octet_stream_default_diagnostics(
+fn remove_unresolved_parameter_diagnostics(ir: &mut ApiGraph, operation: &str, param_name: &str) {
+    ir.diagnostics.retain(|diagnostic| {
+        diagnostic.code != "request.parameter.unresolved"
+            || diagnostic.operation.as_deref() != Some(operation)
+            || diagnostic.subject.as_deref() != Some(param_name)
+    });
+}
+
+#[derive(Debug, Clone)]
+struct OperationDiagnosticIdentity {
+    id: String,
+    handler: String,
+    route: String,
+    span: crate::graph::SourceSpan,
+}
+
+impl From<&crate::graph::Operation> for OperationDiagnosticIdentity {
+    fn from(operation: &crate::graph::Operation) -> Self {
+        Self {
+            id: operation.id.clone(),
+            handler: operation.handler.clone(),
+            route: format!("{} {}", operation.method, operation.path),
+            span: operation.provenance.clone(),
+        }
+    }
+}
+
+fn diagnostic_matches_operation(
+    diagnostic: &crate::graph::Diagnostic,
+    identity: &OperationDiagnosticIdentity,
+) -> bool {
+    if let Some(operation) = diagnostic.operation.as_deref() {
+        return operation == identity.id
+            || operation == identity.handler
+            || operation == identity.route;
+    }
+    diagnostic.file == identity.span.file
+        && diagnostic.line >= identity.span.start_line
+        && diagnostic.line <= identity.span.end_line
+}
+
+fn remove_all_operation_diagnostics(
     ir: &mut ApiGraph,
-    op_span: &crate::graph::SourceSpan,
+    code: &str,
+    identity: &OperationDiagnosticIdentity,
 ) {
     ir.diagnostics.retain(|diagnostic| {
-        let is_same_operation = diagnostic.file == op_span.file
-            && diagnostic.line >= op_span.start_line
-            && diagnostic.line <= op_span.end_line;
-        let is_resolved_binary_default = diagnostic
-            .message
-            .contains("unsupported binary response pattern")
-            && diagnostic
-                .message
-                .contains("defaulting to application/octet-stream");
-        !(is_same_operation && is_resolved_binary_default)
+        diagnostic.code != code || !diagnostic_matches_operation(diagnostic, identity)
     });
+}
+
+fn remove_one_operation_diagnostic(
+    ir: &mut ApiGraph,
+    code: &str,
+    identity: &OperationDiagnosticIdentity,
+) {
+    if let Some(index) = ir.diagnostics.iter().position(|diagnostic| {
+        diagnostic.code == code && diagnostic_matches_operation(diagnostic, identity)
+    }) {
+        ir.diagnostics.remove(index);
+    }
 }
 
 /// Enum ordering policy for generated OpenAPI/SDK surfaces.
@@ -1622,10 +2515,12 @@ pub struct ApplySecurity {
 
 /// Reusable operation selector for transforms that need to match routes by path, method, middleware,
 /// or boolean composition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationSelector {
     /// Match one operation id exactly.
     OperationId(String),
+    /// Match one exact HTTP method and graph path.
+    Route { method: String, path: String },
     /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
     PathPrefix(String),
     /// Match operations whose HTTP method is one of these uppercase method names.
@@ -1643,6 +2538,45 @@ impl OperationSelector {
     #[must_use]
     pub fn operation(id: impl Into<String>) -> Self {
         Self::OperationId(id.into())
+    }
+
+    /// Match one exact route.
+    #[must_use]
+    pub fn route(method: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::Route {
+            method: method.into().to_ascii_uppercase(),
+            path: path.into(),
+        }
+    }
+
+    /// Match one exact GET route.
+    #[must_use]
+    pub fn get(path: impl Into<String>) -> Self {
+        Self::route("GET", path)
+    }
+
+    /// Match one exact POST route.
+    #[must_use]
+    pub fn post(path: impl Into<String>) -> Self {
+        Self::route("POST", path)
+    }
+
+    /// Match one exact PUT route.
+    #[must_use]
+    pub fn put(path: impl Into<String>) -> Self {
+        Self::route("PUT", path)
+    }
+
+    /// Match one exact PATCH route.
+    #[must_use]
+    pub fn patch(path: impl Into<String>) -> Self {
+        Self::route("PATCH", path)
+    }
+
+    /// Match one exact DELETE route.
+    #[must_use]
+    pub fn delete(path: impl Into<String>) -> Self {
+        Self::route("DELETE", path)
     }
 
     /// Match operations whose graph path, or base-path-joined path, starts with `prefix`.
@@ -1827,6 +2761,7 @@ fn operation_selector_matches(
 ) -> bool {
     match selector {
         OperationSelector::OperationId(id) => op.id == *id,
+        OperationSelector::Route { method, path } => op.method == *method && op.path == *path,
         OperationSelector::PathPrefix(prefix) => {
             op.path.starts_with(prefix)
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
@@ -1842,6 +2777,33 @@ fn operation_selector_matches(
         OperationSelector::All(selectors) => selectors
             .iter()
             .all(|selector| operation_selector_matches(selector, op, base_path)),
+    }
+}
+
+fn find_selected_operation_index(
+    ir: &ApiGraph,
+    selector: &OperationSelector,
+    label: &str,
+) -> Result<usize, CoreError> {
+    let matches: Vec<usize> = ir
+        .operations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            operation_selector_matches(selector, operation, &ir.base_path).then_some(index)
+        })
+        .collect();
+    match matches.as_slice() {
+        [single] => Ok(*single),
+        [] => Err(CoreError::Config {
+            message: format!("{label} did not match any operation: {selector:?}"),
+        }),
+        many => Err(CoreError::Config {
+            message: format!(
+                "{label} must match exactly one operation but matched {}: {selector:?}",
+                many.len()
+            ),
+        }),
     }
 }
 
@@ -2447,11 +3409,13 @@ impl Transform for DocumentOperation {
                 .cloned()
                 .unwrap_or_else(|| OperationDocsPolicy {
                     operation_id,
+                    openapi_operation_id: None,
                     summary: None,
                     description: None,
                     deprecated: false,
                     tags: Vec::new(),
                     request_examples: Vec::new(),
+                    request_content_types: Vec::new(),
                     responses: Vec::new(),
                 });
             apply_documentation_policy_updates(&mut policy, self, &resolved_errors);
@@ -2864,6 +3828,7 @@ impl Transform for GroupOperations {
 #[derive(Debug, Clone, Default)]
 pub struct SdkOperationAliases {
     aliases: Vec<SdkOperationAlias>,
+    configuration_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2899,6 +3864,9 @@ impl SdkOperationAliases {
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         if let Some(alias) = self.aliases.last_mut() {
             alias.tag = Some(tag.into());
+        } else {
+            self.configuration_errors
+                .push("SdkOperationAliases::tag() requires a preceding operation()".to_string());
         }
         self
     }
@@ -2908,6 +3876,9 @@ impl SdkOperationAliases {
     pub fn name(mut self, name: impl Into<String>) -> Self {
         if let Some(alias) = self.aliases.last_mut() {
             alias.name = Some(name.into());
+        } else {
+            self.configuration_errors
+                .push("SdkOperationAliases::name() requires a preceding operation()".to_string());
         }
         self
     }
@@ -2915,6 +3886,11 @@ impl SdkOperationAliases {
 
 impl Transform for SdkOperationAliases {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        if let Some(message) = self.configuration_errors.first() {
+            return Err(CoreError::Config {
+                message: message.clone(),
+            });
+        }
         for alias in &self.aliases {
             if alias.tag.is_none() && alias.name.is_none() {
                 return Err(CoreError::Config {
@@ -3417,7 +4393,7 @@ impl Target for OpenApi31 {
         // truth — an `ApplySecurity` transform set them); never a re-implementation (CLAUDE.md rule 3).
         let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
         apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
-        out.write(self.path.clone(), crate::lower::write_openapi_yaml(&doc));
+        out.create(self.path.clone(), crate::lower::write_openapi_yaml(&doc))?;
         Ok(())
     }
 
@@ -3492,7 +4468,7 @@ impl Target for OpenApi31Json {
         }
         let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
         apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
-        out.write(self.path.clone(), crate::lower::write_openapi_json(&doc)?);
+        out.create(self.path.clone(), crate::lower::write_openapi_json(&doc)?)?;
         Ok(())
     }
 
@@ -3563,7 +4539,7 @@ impl Target for StaticFiles {
                     source_path.display()
                 ),
             })?;
-            out.write(format!("{to_dir}/{rel}"), text);
+            out.create(format!("{to_dir}/{rel}"), text)?;
         }
         Ok(())
     }
@@ -3890,14 +4866,14 @@ impl Target for GoSdk {
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
         if self.package_metadata {
-            out.write(
+            out.create(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
                 format!("module {}\n\ngo {}\n", self.module, self.go_version),
-            );
-            out.write(
+            )?;
+            out.create(
                 format!("{}/PUBLISHING.md", self.dir.trim_end_matches('/')),
                 publishing_recipe("Go", &self.module, &self.package_info)?,
-            );
+            )?;
         }
         Ok(())
     }
@@ -4614,13 +5590,7 @@ impl FormatCommand {
 
 impl PostProcess for FormatCommand {
     fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
-        let temp = unique_postprocess_dir(&cx.project_root)?;
-        std::fs::create_dir_all(&temp).map_err(|err| CoreError::Io {
-            message: format!(
-                "failed to create post-write temp dir {}: {err}",
-                temp.display()
-            ),
-        })?;
+        let temp = create_unique_postprocess_dir(&cx.project_root)?;
         let result = self.run_in_temp(out, &temp);
         let cleanup = std::fs::remove_dir_all(&temp);
         match (result, cleanup) {
@@ -4715,26 +5685,48 @@ impl FormatCommand {
                     path.display()
                 ),
             })?;
-            out.write(artifact_path, text);
+            out.rewrite(artifact_path, |_| text)?;
         }
         Ok(())
     }
 }
 
-fn unique_postprocess_dir(project_root: &Path) -> Result<PathBuf, CoreError> {
+static POSTPROCESS_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_postprocess_dir(project_root: &Path) -> Result<PathBuf, CoreError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| CoreError::Io {
             message: format!("system clock before Unix epoch: {err}"),
         })?
         .as_nanos();
-    Ok(std::env::temp_dir().join(format!(
-        "gnr8-post-write-{}-{nanos}",
-        project_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("project")
-    )))
+    let project = project_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    for _ in 0..128 {
+        let sequence = POSTPROCESS_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "gnr8-post-write-{project}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    message: format!(
+                        "failed to create post-write temp dir {}: {err}",
+                        candidate.display()
+                    ),
+                });
+            }
+        }
+    }
+    Err(CoreError::Io {
+        message: "failed to allocate a unique post-write temp directory after 128 attempts"
+            .to_string(),
+    })
 }
 
 fn temp_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, CoreError> {
@@ -4841,7 +5833,7 @@ impl PostProcess for Header {
             .map(|a| (a.path.clone(), format!("{GENERATED_HEADER}\n{}", a.text)))
             .collect();
         for (path, text) in rewrites {
-            out.write(path, text);
+            out.rewrite(path, |_| text)?;
         }
         Ok(())
     }
@@ -4898,7 +5890,7 @@ fn write_sdk_files(
     for file in files {
         // File names are program-controlled, but reject anything that can traverse out of `dir`.
         super::bundle::safe_frame_name(&file.name)?;
-        out.write(format!("{dir}/{}", file.name), file.contents);
+        out.create(format!("{dir}/{}", file.name), file.contents)?;
     }
     Ok(())
 }
@@ -5273,18 +6265,21 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
-        DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
-        Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
-        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
+        create_unique_postprocess_dir, sdk_package, ApiOverrides, ApplySecurity,
+        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, DocumentOperation,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, ParameterOverride,
+        PostProcess, PySdk, QueryParam, RequestParameter, ResponseOverride, SdkOperationAliases,
+        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
         Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
-        ApiGraph, Diagnostic, Field, Operation, PaginationMode, PaginationTermination, Param, Prim,
-        Response, RuntimeHookKind, Schema, SchemaRef, SourceSpan, Type,
+        ApiGraph, Diagnostic, DiagnosticCategory, Field, Operation, PaginationMode,
+        PaginationTermination, Param, Prim, Response, RuntimeHookKind, Schema, SchemaRef,
+        SourceSpan, Type,
     };
     use crate::sdk::docs::{write_sdk_docs, SdkDocs};
     use crate::sdk::layout::SdkFileLayout;
@@ -5293,6 +6288,7 @@ mod tests {
     use crate::sdk::surface::SdkTypeAliases;
     use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
+    use crate::CoreError;
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
@@ -5304,6 +6300,81 @@ mod tests {
             start_line: 10,
             end_line: 20,
         }
+    }
+
+    fn diagnostic(
+        code: &str,
+        category: DiagnosticCategory,
+        message: &str,
+        file: &str,
+        line: u32,
+    ) -> Diagnostic {
+        Diagnostic::new(
+            code,
+            category,
+            "WARN",
+            message,
+            SourceSpan {
+                file: file.to_string(),
+                start_line: line,
+                end_line: line,
+            },
+        )
+    }
+
+    #[test]
+    fn diagnostic_policy_denies_selected_code_after_transforms() {
+        let mut ir = ApiGraph {
+            diagnostics: vec![diagnostic(
+                "request.parameter.unresolved",
+                DiagnosticCategory::RequestParameter,
+                "parameter could not be inferred",
+                "handlers.go",
+                12,
+            )],
+            ..ApiGraph::default()
+        };
+        let error = DiagnosticPolicy::new()
+            .deny("request.parameter.unresolved")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::DiagnosticsDenied { codes }
+                if codes == vec!["request.parameter.unresolved".to_string()]
+        ));
+    }
+
+    #[test]
+    fn fluent_modifiers_reject_missing_or_incompatible_predecessors() {
+        let mut ir = ApiGraph::default();
+
+        let optional = ApiOverrides::new()
+            .optional()
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(optional.to_string().contains("request-body override"));
+
+        let event_schema = ApiOverrides::new()
+            .json_response("GET", "/events", 200, "Event")
+            .event_schema("Envelope")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(event_schema
+            .to_string()
+            .contains("preceding response to be SSE"));
+
+        let alias_tag = SdkOperationAliases::new()
+            .tag("events")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(alias_tag.to_string().contains("preceding operation()"));
+
+        let alias_name = SdkOperationAliases::new()
+            .name("listEvents")
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(alias_name.to_string().contains("preceding operation()"));
     }
 
     fn grouped_test_operation(
@@ -5342,6 +6413,11 @@ mod tests {
             required,
             schema: Type::Primitive(Prim::String),
             default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: span(),
         }
     }
@@ -5779,6 +6855,209 @@ mod tests {
     }
 
     #[test]
+    fn typed_parameter_override_modes_preserve_wire_metadata_and_fail_stale_changes() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "search",
+                "GET",
+                "/search",
+                None,
+                "search.go",
+            )],
+            ..ApiGraph::default()
+        };
+        let statuses = RequestParameter::query(
+            "statuses",
+            Type::array(Type::enumeration(["open", "closed"])),
+        )
+        .style("form")
+        .explode(true);
+        ApiOverrides::new()
+            .parameter(
+                OperationSelector::get("/search"),
+                ParameterOverride::add_if_missing(statuses),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert_eq!(ir.operations[0].params[0].style.as_deref(), Some("form"));
+        assert_eq!(ir.operations[0].params[0].explode, Some(true));
+
+        ApiOverrides::new()
+            .parameter(
+                OperationSelector::get("/search"),
+                ParameterOverride::correct_existing(
+                    RequestParameter::query(
+                        "statuses",
+                        Type::array(Type::enumeration(["open", "closed"])),
+                    )
+                    .required()
+                    .style("form")
+                    .explode(true),
+                ),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(ir.operations[0].params[0].required);
+
+        let redundant = ApiOverrides::new()
+            .parameter(
+                OperationSelector::get("/search"),
+                ParameterOverride::correct_existing(
+                    RequestParameter::query(
+                        "statuses",
+                        Type::array(Type::enumeration(["open", "closed"])),
+                    )
+                    .required()
+                    .style("form")
+                    .explode(true),
+                ),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(redundant.to_string().contains("redundant"), "{redundant}");
+
+        let stale = ApiOverrides::new()
+            .parameter(
+                OperationSelector::get("/missing"),
+                ParameterOverride::add_if_missing(RequestParameter::query(
+                    "limit",
+                    Type::integer(),
+                )),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(stale.to_string().contains("did not match"), "{stale}");
+    }
+
+    #[test]
+    fn typed_parameter_overrides_use_name_and_location_identity() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "getItem",
+                "GET",
+                "/items/{id}",
+                None,
+                "items.go",
+            )],
+            ..ApiGraph::default()
+        };
+        let selector = OperationSelector::get("/items/{id}");
+        ApiOverrides::new()
+            .parameter(
+                selector.clone(),
+                ParameterOverride::add_if_missing(RequestParameter::path("id", Type::uuid())),
+            )
+            .parameter(
+                selector.clone(),
+                ParameterOverride::add_if_missing(RequestParameter::query("id", Type::integer())),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        ApiOverrides::new()
+            .parameter(
+                selector.clone(),
+                ParameterOverride::correct_existing(
+                    RequestParameter::query("id", Type::integer()).required(),
+                ),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApiOverrides::new()
+            .parameter(
+                selector,
+                ParameterOverride::replace(RequestParameter::query("id", Type::boolean())),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let params = &ir.operations[0].params;
+        assert_eq!(params.len(), 2);
+        let path = params
+            .iter()
+            .find(|param| param.location == "path")
+            .unwrap();
+        let query = params
+            .iter()
+            .find(|param| param.location == "query")
+            .unwrap();
+        assert_eq!(path.schema, Type::uuid());
+        assert_eq!(query.schema, Type::boolean());
+    }
+
+    #[test]
+    fn metadata_response_and_security_overrides_preserve_exact_openapi_contract() {
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "refresh",
+                "POST",
+                "/user/refresh",
+                None,
+                "auth.go",
+            )],
+            schemas: vec![Schema {
+                id: "dto.AuthSessionUser".to_string(),
+                name: "AuthSessionUser".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        };
+        ApplySecurity::bearer("UserJWT")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApplySecurity::api_key("SandboxJWT", "X-Sandbox-JWT")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        OpenApiMetadata::new()
+            .title("OAIZ API")
+            .version("1.0.0")
+            .description("Existing public contract")
+            .terms_of_service("https://oaiz.example/terms")
+            .contact(crate::graph::OpenApiContact::new().email("api@oaiz.example"))
+            .license(crate::graph::OpenApiLicense::new("Proprietary"))
+            .server("https://api.oaiz.example")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        ApiOverrides::new()
+            .response(
+                OperationSelector::post("/user/refresh"),
+                ResponseOverride::status(200)
+                    .json_schema("dto.AuthSessionUser")
+                    .media_type("application/vnd.oaiz+json"),
+            )
+            .response(
+                OperationSelector::post("/user/refresh"),
+                ResponseOverride::status(204).empty(),
+            )
+            .security(
+                OperationSelector::post("/user/refresh"),
+                SecurityOverride::alternatives(vec![
+                    vec!["SandboxJWT"],
+                    vec!["SandboxJWT", "UserJWT"],
+                ]),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let yaml = crate::lower::to_openapi(&ir, &ir.title, "/", &ir.security).unwrap();
+        assert!(
+            yaml.contains("description: Existing public contract"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("url: 'https://api.oaiz.example'"), "{yaml}");
+        assert!(yaml.contains("application/vnd.oaiz+json"), "{yaml}");
+        assert!(yaml.contains("'204':"), "{yaml}");
+        assert!(yaml.contains("- SandboxJWT: []"), "{yaml}");
+        assert!(yaml.contains("  UserJWT: []"), "{yaml}");
+        assert!(ir
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "override.security.replaced"));
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "single request-body override scenario verifies create, replace, and optional semantics"
@@ -5949,6 +7228,100 @@ mod tests {
     }
 
     #[test]
+    fn typed_request_body_override_retires_resolved_diagnostic_before_policy() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "app.ImportBooksRequest".to_string(),
+                name: "ImportBooksRequest".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            operations: vec![grouped_test_operation(
+                "importBooks",
+                "POST",
+                "/books/import",
+                None,
+                "handlers.go",
+            )],
+            diagnostics: vec![diagnostic(
+                "request.body.unresolved",
+                DiagnosticCategory::RequestBody,
+                "multipart binding could not be inferred",
+                "handlers.go",
+                1,
+            )
+            .operation("POST /books/import")],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .multipart_request_body("POST", "/books/import", "app.ImportBooksRequest")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        DiagnosticPolicy::new()
+            .deny("request.body.unresolved")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(ir.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn response_override_retires_resolved_diagnostics_before_policy() {
+        let mut ir = ApiGraph {
+            schemas: vec![Schema {
+                id: "dto.AuthSessionUser".to_string(),
+                name: "AuthSessionUser".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            operations: vec![grouped_test_operation(
+                "refresh",
+                "POST",
+                "/user/refresh",
+                None,
+                "auth.go",
+            )],
+            diagnostics: vec![
+                diagnostic(
+                    "response.schema.unresolved",
+                    DiagnosticCategory::Response,
+                    "dynamic response body",
+                    "auth.go",
+                    1,
+                )
+                .operation("refresh"),
+                diagnostic(
+                    "response.media_type.unresolved",
+                    DiagnosticCategory::Response,
+                    "dynamic response media type",
+                    "auth.go",
+                    1,
+                )
+                .operation("POST /user/refresh"),
+            ],
+            ..ApiGraph::default()
+        };
+
+        ApiOverrides::new()
+            .response(
+                OperationSelector::post("/user/refresh"),
+                ResponseOverride::status(200)
+                    .json_schema("dto.AuthSessionUser")
+                    .media_type("application/vnd.oaiz+json"),
+            )
+            .apply(&mut ir, &cx())
+            .unwrap();
+        DiagnosticPolicy::new()
+            .deny("response.schema.unresolved")
+            .deny("response.media_type.unresolved")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(ir.diagnostics.is_empty());
+    }
+
+    #[test]
     fn query_param_date_lowers_to_openapi_date_and_cleans_untyped_diagnostic() {
         let mut ir = ApiGraph {
             operations: vec![Operation {
@@ -5967,14 +7340,15 @@ mod tests {
                 security_overrides_global: false,
                 provenance: span(),
             }],
-            diagnostics: vec![Diagnostic {
-                severity: "WARN".to_string(),
-                message:
-                    "untyped query param 'startDate' on GET /schedule/week: defaulting to string"
-                        .to_string(),
-                file: "handlers.go".to_string(),
-                line: 12,
-            }],
+            diagnostics: vec![diagnostic(
+                "request.parameter.unresolved",
+                DiagnosticCategory::RequestParameter,
+                "untyped query param 'startDate' on GET /schedule/week: defaulting to string",
+                "handlers.go",
+                12,
+            )
+            .operation("GET /schedule/week")
+            .subject("startDate")],
             ..ApiGraph::default()
         };
 
@@ -6023,18 +7397,20 @@ mod tests {
                 },
             }],
             diagnostics: vec![
-                Diagnostic {
-                    severity: "WARN".to_string(),
-                    message: "unsupported binary response pattern on GET /files/{fileId}/download: defaulting to application/octet-stream".to_string(),
-                    file: "handlers.go".to_string(),
-                    line: 12,
-                },
-                Diagnostic {
-                    severity: "WARN".to_string(),
-                    message: "unsupported binary response pattern on GET /other: defaulting to application/octet-stream".to_string(),
-                    file: "handlers.go".to_string(),
-                    line: 30,
-                },
+                diagnostic(
+                    "response.media_type.unresolved",
+                    DiagnosticCategory::Response,
+                    "unsupported binary response pattern on GET /files/{fileId}/download: defaulting to application/octet-stream",
+                    "handlers.go",
+                    12,
+                ),
+                diagnostic(
+                    "response.media_type.unresolved",
+                    DiagnosticCategory::Response,
+                    "unsupported binary response pattern on GET /other: defaulting to application/octet-stream",
+                    "handlers.go",
+                    30,
+                ),
             ],
             ..ApiGraph::default()
         };
@@ -7984,8 +9360,8 @@ func (s Server) create(c *gin.Context) {
     #[test]
     fn header_prepends_to_go_files_only_and_is_idempotent() {
         let mut out = Artifacts::new();
-        out.write("openapi.yaml", "openapi: 3.1.0\n");
-        out.write("sdk/client.go", "package sdk\n");
+        out.create("openapi.yaml", "openapi: 3.1.0\n").unwrap();
+        out.create("sdk/client.go", "package sdk\n").unwrap();
         Header::generated().run(&mut out, &cx()).unwrap();
         let go = out
             .files()
@@ -8020,7 +9396,8 @@ func (s Server) create(c *gin.Context) {
     #[test]
     fn format_command_rewrites_artifacts_before_host_ownership() {
         let mut out = Artifacts::new();
-        out.write("generated/openapi.json", "{\"openapi\":\"3.1.0\"}\n");
+        out.create("generated/openapi.json", "{\"openapi\":\"3.1.0\"}\n")
+            .unwrap();
         FormatCommand::new("/bin/sh")
             .args([
                 "-c",
@@ -8041,9 +9418,33 @@ func (s Server) create(c *gin.Context) {
     }
 
     #[test]
+    fn format_command_allocates_unique_temp_dirs_concurrently() {
+        const WORKERS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_unique_postprocess_dir(std::path::Path::new("/tmp/project"))
+                })
+            })
+            .collect();
+        let paths: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        let unique: std::collections::BTreeSet<_> = paths.iter().cloned().collect();
+        for path in &unique {
+            std::fs::remove_dir(path).unwrap();
+        }
+        assert_eq!(unique.len(), WORKERS);
+    }
+
+    #[test]
     fn format_command_rejects_undeclared_artifacts() {
         let mut out = Artifacts::new();
-        out.write("generated/openapi.json", "{}\n");
+        out.create("generated/openapi.json", "{}\n").unwrap();
         let err = FormatCommand::new("/bin/sh")
             .args([
                 "-c",

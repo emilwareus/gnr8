@@ -971,6 +971,7 @@ pub(crate) fn emit_client(package: &str) -> String {
         &[],
         &RuntimePolicy::default(),
         false,
+        false,
     )
 }
 
@@ -1069,10 +1070,74 @@ pub(crate) fn client_referenced_models(
         for error_body in error_response_bodies_of(op, graph)? {
             names.push(error_body.model);
         }
+        for param in &op.params {
+            collect_python_type_models(&param.schema, graph, &mut names)?;
+        }
     }
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+pub(crate) fn operations_need_parameter_literals(ops: &[&Operation]) -> bool {
+    ops.iter().any(|op| {
+        op.params
+            .iter()
+            .any(|param| type_contains_inline_enum(&param.schema))
+    })
+}
+
+fn type_contains_inline_enum(schema: &Type) -> bool {
+    match schema {
+        Type::Enum(_) => true,
+        Type::Array(items) => type_contains_inline_enum(items),
+        Type::Map { key, value } => {
+            type_contains_inline_enum(key) || type_contains_inline_enum(value)
+        }
+        Type::Union(variants) => variants.iter().any(type_contains_inline_enum),
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Named(_)
+        | Type::Object(_)
+        | Type::Any {} => false,
+    }
+}
+
+fn collect_python_type_models(
+    schema: &Type,
+    graph: &ApiGraph,
+    names: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    match schema {
+        Type::Named(ref_id) => {
+            let target = graph
+                .schemas
+                .iter()
+                .find(|candidate| &candidate.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "dangling parameter $ref '{ref_id}' is not among graph.schemas"
+                    ),
+                })?;
+            names.push(target.name.clone());
+        }
+        Type::Array(items) => collect_python_type_models(items, graph, names)?,
+        Type::Map { key, value } => {
+            collect_python_type_models(key, graph, names)?;
+            collect_python_type_models(value, graph, names)?;
+        }
+        Type::Union(variants) => {
+            for variant in variants {
+                collect_python_type_models(variant, graph, names)?;
+            }
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Object(_)
+        | Type::Enum(_)
+        | Type::Any {} => {}
+    }
+    Ok(())
 }
 
 fn pagination_item_model_name<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a str> {
@@ -1123,6 +1188,7 @@ pub(crate) fn emit_client_with_models(
     model_refs: &[String],
     runtime: &RuntimePolicy,
     has_pagination: bool,
+    has_parameter_literals: bool,
 ) -> String {
     let body_value = match model_style {
         PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            mode = \"python\" if body_encoding == \"multipart\" else \"json\"\n            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)\n        return self._wire_value(body)\n",
@@ -1150,7 +1216,11 @@ pub(crate) fn emit_client_with_models(
         "from collections.abc import Callable"
     };
     stdlib.push(collections.to_string());
-    stdlib.push("from typing import Any, Optional".to_string());
+    if has_parameter_literals {
+        stdlib.push("from typing import Any, Literal, Optional".to_string());
+    } else {
+        stdlib.push("from typing import Any, Optional".to_string());
+    }
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
@@ -1333,6 +1403,67 @@ class Client:
             return {{key: self._wire_value(item) for key, item in value.items()}}
         return value
 
+    @staticmethod
+    def _parameter_scalar(value: Any) -> str:
+        if isinstance(value, bool):
+            return \"true\" if value else \"false\"
+        return str(value)
+
+    def _parameter_pairs(
+        self,
+        name: str,
+        value: Any,
+        style: str,
+        explode: bool,
+    ) -> list[tuple[str, str]]:
+        value = self._wire_value(value)
+        if style == \"spaceDelimited\":
+            delimiter = \" \"
+        elif style == \"pipeDelimited\":
+            delimiter = \"|\"
+        else:
+            delimiter = \",\"
+        if isinstance(value, (list, tuple)):
+            parts = [self._parameter_scalar(item) for item in value]
+            if explode and style == \"form\":
+                return [(name, item) for item in parts]
+            return [(name, delimiter.join(parts))]
+        if isinstance(value, dict):
+            entries = sorted(value.items())
+            if style == \"deepObject\":
+                return [
+                    (f\"{{name}}[{{key}}]\", self._parameter_scalar(item))
+                    for key, item in entries
+                ]
+            if explode and style == \"form\":
+                return [
+                    (str(key), self._parameter_scalar(item)) for key, item in entries
+                ]
+            parts = []
+            for key, item in entries:
+                if explode:
+                    parts.append(f\"{{key}}={{self._parameter_scalar(item)}}\")
+                else:
+                    parts.extend((str(key), self._parameter_scalar(item)))
+            return [(name, delimiter.join(parts))]
+        return [(name, self._parameter_scalar(value))]
+
+    @staticmethod
+    def _encode_query(
+        pairs: list[tuple[str, str]],
+        allow_reserved: set[int],
+    ) -> str:
+        reserved = \":/?#[]@!$&'()*+,;=\"
+        encoded = []
+        for index, (key, value) in enumerate(pairs):
+            safe = reserved if index in allow_reserved else \"\"
+            encoded.append(
+                urllib.parse.quote(str(key), safe=\"\")
+                + \"=\"
+                + urllib.parse.quote(str(value), safe=safe)
+            )
+        return \"&\".join(encoded)
+
     def _encode_body(
         self,
         body: Optional[Any],
@@ -1400,6 +1531,7 @@ class Client:
         path: str,
         *,
         body: Optional[Any] = None,
+        request_headers: Optional[dict[str, str]] = None,
 {auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}        operation_id: str,
         path_template: str,
         content_type: str = \"application/json\",
@@ -1423,7 +1555,7 @@ class Client:
             or method in (\"GET\", \"HEAD\", \"OPTIONS\", \"PUT\", \"DELETE\")
         ):
             max_retries = 0
-        headers: dict[str, str] = {{}}
+        headers: dict[str, str] = dict(request_headers or {{}})
         if data is not None:
             headers[\"Content-Type\"] = content_type
 {auth_loop}        if idempotent and options.idempotency_key:
@@ -1696,6 +1828,7 @@ fn emit_operation(
 
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
     let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
 
     // The templated path tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token (a KeyError at runtime) nor an unused arg can slip through
@@ -1745,7 +1878,7 @@ fn emit_operation(
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
 
     // Signature: self, path params (positional), required body when present, required query
     // (positional), optional body when present, then optional query params (= None). This preserves
@@ -1755,12 +1888,20 @@ fn emit_operation(
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
         args.push(format!("body: {}", body.model));
     }
-    args.extend(required_query_idents.iter().cloned());
+    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        args.push(format!(
+            "{ident}: {}",
+            py_type(&param.schema, false, graph)?
+        ));
+    }
     if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
         args.push(format!("body: Optional[{}] = None", body.model));
     }
-    for ident in &optional_query_idents {
-        args.push(format!("{ident}=None"));
+    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        args.push(format!(
+            "{ident}: Optional[{}] = None",
+            py_type(&param.schema, false, graph)?
+        ));
     }
     args.push("request_options: Optional[RequestOptions] = None".to_string());
 
@@ -1795,15 +1936,23 @@ fn emit_operation(
 
     // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
     // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
-    // the wire key stays the ORIGINAL `p.name`.
+    // the wire key stays the ORIGINAL `p.name`. Track allowReserved by emitted-pair index rather than
+    // by name so exploded object keys retain the originating parameter's policy without accidentally
+    // granting that policy to another parameter with the same wire key.
     if !query_params.is_empty() || !auth_queries.is_empty() {
-        writeln!(out, "        _query = {{}}").map_err(sink)?;
+        writeln!(out, "        _query: list[tuple[str, str]] = []").map_err(sink)?;
+        writeln!(out, "        _allow_reserved: set[int] = set()").map_err(sink)?;
         for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-            writeln!(out, "        _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
+            if p.location == "query" {
+                emit_py_query_parameter(out, p, ident, "        ")?;
+            }
         }
         for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+            if p.location != "query" {
+                continue;
+            }
             writeln!(out, "        if {ident} is not None:").map_err(sink)?;
-            writeln!(out, "            _query[\"{}\"] = {ident}", p.name).map_err(sink)?;
+            emit_py_query_parameter(out, p, ident, "            ")?;
         }
         for query in &auth_queries {
             writeln!(
@@ -1816,7 +1965,7 @@ fn emit_operation(
             writeln!(out, "        if _auth_query_{}:", safe_ident(&snake(query))).map_err(sink)?;
             writeln!(
                 out,
-                "            _query[{}] = _auth_query_{}",
+                "            _query.append(({}, _auth_query_{}))",
                 quoted_string_literal(query),
                 safe_ident(&snake(query))
             )
@@ -1825,9 +1974,22 @@ fn emit_operation(
         writeln!(out, "        if _query:").map_err(sink)?;
         writeln!(
             out,
-            "            path = path + \"?\" + urllib.parse.urlencode(_query)"
+            "            path = path + \"?\" + self._encode_query(_query, _allow_reserved)"
         )
         .map_err(sink)?;
+    }
+
+    let has_request_headers = request_params
+        .iter()
+        .any(|param| param.location == "header" || param.location == "cookie");
+    if has_request_headers {
+        emit_py_header_cookie_parameters(
+            out,
+            &required_query,
+            &required_query_idents,
+            &optional_query,
+            &optional_query_idents,
+        )?;
     }
 
     // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
@@ -1842,6 +2004,9 @@ fn emit_operation(
             "body_encoding={}",
             quoted_string_literal(py_body_encoding(body.encoding))
         ));
+    }
+    if has_request_headers {
+        do_args.push("request_headers=_request_headers".to_string());
     }
     if !auth_headers.is_empty() {
         do_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
@@ -1917,6 +2082,128 @@ fn emit_operation(
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn py_parameter_style(param: &Param) -> &str {
+    param
+        .style
+        .as_deref()
+        .unwrap_or(match param.location.as_str() {
+            "header" => "simple",
+            _ => "form",
+        })
+}
+
+fn py_parameter_explode(param: &Param) -> bool {
+    param
+        .explode
+        .unwrap_or_else(|| py_parameter_style(param) == "form")
+}
+
+fn emit_py_query_parameter(
+    out: &mut String,
+    param: &Param,
+    ident: &str,
+    padding: &str,
+) -> Result<(), CoreError> {
+    let name = quoted_string_literal(&param.name);
+    let style = quoted_string_literal(py_parameter_style(param));
+    let explode = py_bool(py_parameter_explode(param));
+    if param.allow_reserved {
+        writeln!(
+            out,
+            "{padding}_pairs = self._parameter_pairs({name}, {ident}, {style}, {explode})"
+        )
+        .map_err(sink)?;
+        writeln!(
+            out,
+            "{padding}_allow_reserved.update(range(len(_query), len(_query) + len(_pairs)))"
+        )
+        .map_err(sink)?;
+        writeln!(out, "{padding}_query.extend(_pairs)").map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "{padding}_query.extend(self._parameter_pairs({name}, {ident}, {style}, {explode}))"
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_py_header_cookie_parameters(
+    out: &mut String,
+    required_params: &[&Param],
+    required_idents: &[String],
+    optional_params: &[&Param],
+    optional_idents: &[String],
+) -> Result<(), CoreError> {
+    writeln!(out, "        _request_headers: dict[str, str] = {{}}").map_err(sink)?;
+    let has_cookie = required_params
+        .iter()
+        .chain(optional_params.iter())
+        .any(|param| param.location == "cookie");
+    if has_cookie {
+        writeln!(out, "        _cookie_parts: list[str] = []").map_err(sink)?;
+    }
+    for (param, ident) in required_params.iter().zip(required_idents.iter()) {
+        if param.location == "header" || param.location == "cookie" {
+            emit_py_header_cookie_parameter(out, param, ident, "        ")?;
+        }
+    }
+    for (param, ident) in optional_params.iter().zip(optional_idents.iter()) {
+        if param.location != "header" && param.location != "cookie" {
+            continue;
+        }
+        writeln!(out, "        if {ident} is not None:").map_err(sink)?;
+        emit_py_header_cookie_parameter(out, param, ident, "            ")?;
+    }
+    if has_cookie {
+        writeln!(out, "        if _cookie_parts:").map_err(sink)?;
+        writeln!(
+            out,
+            "            _request_headers[\"Cookie\"] = \"; \".join(_cookie_parts)"
+        )
+        .map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_py_header_cookie_parameter(
+    out: &mut String,
+    param: &Param,
+    ident: &str,
+    padding: &str,
+) -> Result<(), CoreError> {
+    writeln!(
+        out,
+        "{padding}for _wire_name, _wire_value in self._parameter_pairs({}, {ident}, {}, {}):",
+        quoted_string_literal(&param.name),
+        quoted_string_literal(py_parameter_style(param)),
+        py_bool(py_parameter_explode(param))
+    )
+    .map_err(sink)?;
+    if param.location == "header" {
+        writeln!(out, "{padding}    if _wire_name in _request_headers:").map_err(sink)?;
+        writeln!(
+            out,
+            "{padding}        _request_headers[_wire_name] += \",\" + _wire_value"
+        )
+        .map_err(sink)?;
+        writeln!(out, "{padding}    else:").map_err(sink)?;
+        writeln!(
+            out,
+            "{padding}        _request_headers[_wire_name] = _wire_value"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "{padding}    _cookie_parts.append(urllib.parse.quote(_wire_name, safe=\"\") + \"=\" + urllib.parse.quote(_wire_value, safe=\"\"))"
+        )
+        .map_err(sink)?;
     }
     Ok(())
 }
@@ -2079,7 +2366,7 @@ fn py_pagination_args(
     graph: &ApiGraph,
 ) -> Result<(Vec<String>, Vec<String>), CoreError> {
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
     let body_model = request_body_model_of(op, graph)?;
     let ResolvedArgs {
         path_idents,
@@ -2087,7 +2374,7 @@ fn py_pagination_args(
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &query_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
 
     let mut args: Vec<String> = vec!["self".to_string()];
     let mut call_args: Vec<String> = Vec::new();
@@ -2858,6 +3145,11 @@ mod tests {
                 required: true,
                 schema: crate::graph::Type::Primitive(crate::graph::Prim::String),
                 default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
                 provenance: crate::graph::SourceSpan {
                     file: "main.py".to_string(),
                     start_line: 4,
@@ -2872,7 +3164,12 @@ mod tests {
                     && out.contains(") -> CreatedMessage:"),
                 "required body must stay before required query params:\n{out}"
             );
-            assert!(out.contains("_query[\"tenant\"] = tenant"), "{out}");
+            assert!(
+                out.contains(
+                    "_query.extend(self._parameter_pairs(\"tenant\", tenant, \"form\", True))"
+                ),
+                "{out}"
+            );
         }
 
         #[test]
@@ -2928,15 +3225,20 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("def list_books(")
-                    && out.contains("cursor=None")
+                    && out.contains("cursor: Optional[str] = None")
                     && out.contains("request_options: Optional[RequestOptions] = None")
                     && out.contains(") -> Any:"),
                 "{out}"
             );
             assert!(out.contains("if cursor is not None:"), "{out}");
-            assert!(out.contains("_query[\"cursor\"] = cursor"), "{out}");
             assert!(
-                out.contains("path = path + \"?\" + urllib.parse.urlencode(_query)"),
+                out.contains(
+                    "_query.extend(self._parameter_pairs(\"cursor\", cursor, \"form\", True))"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("path = path + \"?\" + self._encode_query(_query, _allow_reserved)"),
                 "{out}"
             );
             // body-less success returns the raw decode (None when empty).
@@ -2968,11 +3270,11 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("_query[\"api_key\"] = _auth_query_api_key"),
+                out.contains("_query.append((\"api_key\", _auth_query_api_key))"),
                 "{out}"
             );
             assert!(
-                out.contains("path = path + \"?\" + urllib.parse.urlencode(_query)"),
+                out.contains("path = path + \"?\" + self._encode_query(_query, _allow_reserved)"),
                 "{out}"
             );
         }
@@ -3029,7 +3331,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("def list_books(")
-                    && out.contains("cursor=None")
+                    && out.contains("cursor: Optional[str] = None")
                     && out.contains("request_options: Optional[RequestOptions] = None")
                     && out.contains(") -> bytes:"),
                 "{out}"
@@ -3064,7 +3366,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains("def list_books(")
-                    && out.contains("cursor=None")
+                    && out.contains("cursor: Optional[str] = None")
                     && out.contains("request_options: Optional[RequestOptions] = None")
                     && out.contains(") -> Optional[bytes]:"),
                 "{out}"
@@ -3132,6 +3434,7 @@ mod tests {
                 true,
                 &[],
                 &crate::graph::RuntimePolicy::default(),
+                false,
                 false,
             );
             assert!(out.contains("import base64"), "{out}");
@@ -3347,14 +3650,16 @@ mod tests {
             assert!(
                 out.contains("def search(")
                     && out.contains("q,")
-                    && out.contains("page=None")
+                    && out.contains("page: Optional[str] = None")
                     && out.contains("request_options: Optional[RequestOptions] = None")
                     && out.contains(") -> Any:"),
                 "{out}"
             );
             // required `q` is unconditionally written; optional `page` is guarded.
             assert!(
-                out.contains("        _query[\"q\"] = q"),
+                out.contains(
+                    "        _query.extend(self._parameter_pairs(\"q\", q, \"form\", True))"
+                ),
                 "required always sent:\n{out}"
             );
             assert!(

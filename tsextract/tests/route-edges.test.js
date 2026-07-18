@@ -29,6 +29,10 @@ function hasDiag(substr) {
   return diags.items().some((d) => d.message.includes(substr));
 }
 
+function diagWith(substr) {
+  return diags.items().find((d) => d.message.includes(substr));
+}
+
 // WR-01 happy path: a plain named return still resolves to its ref_id (the dual
 // `t.aliasSymbol` discriminator is replaced by the single mapType path).
 (function named_return_resolves_via_single_path() {
@@ -37,6 +41,41 @@ function hasDiag(substr) {
   assert.deepStrictEqual(r.responses[0].body, {
     ref_id: "src/edges.controller.Thing",
   });
+})();
+
+(function promise_return_unwraps_to_named_schema() {
+  const r = byHandler.getAsync;
+  assert.ok(r, "getAsync route missing");
+  assert.deepStrictEqual(r.responses[0].body, {
+    ref_id: "src/edges.controller.Thing",
+  });
+})();
+
+(function dynamic_route_path_is_diagnosed_and_omitted() {
+  assert.ok(!byHandler.dynamicPath, "dynamic path must not be guessed as '/'");
+  const diagnostic = diagWith("non-literal route path");
+  assert.ok(diagnostic, "dynamic route path must record a diagnostic");
+  assert.strictEqual(diagnostic.code, "source.route.unresolved");
+})();
+
+(function dynamic_httpcode_is_diagnosed_and_ignored() {
+  const r = byHandler.dynamicStatus;
+  assert.ok(r, "dynamicStatus route missing");
+  assert.strictEqual(r.responses[0].status, 201);
+  const diagnostic = diagWith("not an integer literal");
+  assert.ok(diagnostic, "dynamic @HttpCode must record a diagnostic");
+  assert.strictEqual(diagnostic.code, "response.status.unresolved");
+  assert.strictEqual(diagnostic.operation, "POST /dynamic-status");
+})();
+
+(function inferred_return_is_diagnosed() {
+  const r = byHandler.inferredReturn;
+  assert.ok(r, "inferredReturn route missing");
+  assert.strictEqual(r.responses[0].body, null);
+  const diagnostic = diagWith("no return type annotation");
+  assert.ok(diagnostic, "missing response annotation must record a diagnostic");
+  assert.strictEqual(diagnostic.code, "response.schema.unresolved");
+  assert.strictEqual(diagnostic.operation, "GET /inferred");
 })();
 
 // WR-01: a nullable named return (aliasSymbol dropped by TS on `| null`) resolves
@@ -58,6 +97,10 @@ function hasDiag(substr) {
     hasDiag("response type is a 'array'"),
     "array response must record a distinct 'array' diagnostic (WR-02)"
   );
+  const diagnostic = diagWith("response type is a 'array'");
+  assert.strictEqual(diagnostic.code, "response.schema.unresolved");
+  assert.strictEqual(diagnostic.category, "response");
+  assert.strictEqual(diagnostic.operation, "GET /array");
 })();
 
 // WR-03: a second HTTP-verb decorator is diagnosed and only one route emitted.
@@ -69,6 +112,10 @@ function hasDiag(substr) {
     hasDiag("second HTTP-verb decorator"),
     "a dropped extra verb must record a diagnostic (WR-03)"
   );
+  assert.strictEqual(
+    diagWith("second HTTP-verb decorator").code,
+    "source.route.unresolved"
+  );
 })();
 
 // WR-04: a second @Body is diagnosed (first-wins is surfaced, not silent).
@@ -76,6 +123,10 @@ function hasDiag(substr) {
   assert.ok(
     hasDiag("more than one @Body parameter"),
     "a duplicate @Body must record a diagnostic (WR-04)"
+  );
+  assert.strictEqual(
+    diagWith("more than one @Body parameter").code,
+    "request.body.unresolved"
   );
 })();
 
@@ -93,6 +144,10 @@ function hasDiag(substr) {
   assert.ok(
     hasDiag("outside the valid HTTP status range"),
     "an out-of-range @HttpCode must record a diagnostic (WR-05)"
+  );
+  assert.strictEqual(
+    diagWith("outside the valid HTTP status range").code,
+    "response.status.unresolved"
   );
   // No emitted status may be out of the u16 / HTTP range.
   for (const route of routes) {

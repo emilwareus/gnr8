@@ -491,8 +491,18 @@ fn validate_output_paths(
     project_root: &Path,
     artifacts: &[Artifact],
 ) -> Result<(), crate::CoreError> {
+    let mut seen = BTreeSet::new();
     for artifact in artifacts {
         safe_output_path(project_root, &artifact.path)?;
+        if !seen.insert(artifact.path.as_str()) {
+            return Err(crate::CoreError::ArtifactOwnership {
+                code: "artifact.path_collision".to_string(),
+                path: artifact.path.clone(),
+                producer: artifact.producer.clone(),
+                message: "the artifact bundle contains the same output path more than once"
+                    .to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -632,7 +642,7 @@ pub fn apply_naming(
     }
 
     // Apply every resolved rename in one pass (rename the schema id+name, then rewrite all refs).
-    for (old_id, _old_name, new_name) in &renames {
+    for (old_id, old_name, new_name) in &renames {
         for schema in &mut graph.schemas {
             if &schema.id == old_id {
                 schema.id.clone_from(new_name);
@@ -657,10 +667,57 @@ pub fn apply_naming(
             }
             for param in &mut op.params {
                 rewrite_schema_type_ref(&mut param.schema, old_id, new_name);
+                for (_, field) in &mut param.openapi_fields {
+                    rewrite_openapi_component_ref(field, old_id, old_name, new_name);
+                }
+                if let Some(content) = &mut param.openapi_content {
+                    rewrite_openapi_component_ref(content, old_id, old_name, new_name);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn rewrite_openapi_component_ref(
+    value: &mut serde_json::Value,
+    old_id: &str,
+    old_name: &str,
+    new_name: &str,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let old_id_ref = component_schema_ref(old_id);
+            let old_name_ref = component_schema_ref(old_name);
+            let should_rewrite = object
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reference| reference == old_id_ref || reference == old_name_ref);
+            if should_rewrite {
+                object.insert(
+                    "$ref".to_string(),
+                    serde_json::Value::String(component_schema_ref(new_name)),
+                );
+            }
+            for child in object.values_mut() {
+                rewrite_openapi_component_ref(child, old_id, old_name, new_name);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_openapi_component_ref(item, old_id, old_name, new_name);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn component_schema_ref(name: &str) -> String {
+    let pointer_segment = name.replace('~', "~0").replace('/', "~1");
+    format!("#/components/schemas/{pointer_segment}")
 }
 
 /// Rewrite every [`crate::graph::Type::Named`] reference equal to `old_id` to `new_id`, recursing
@@ -1030,10 +1087,7 @@ mod tests {
         // The dry-run seam must reject an escaping path with the SAME typed error as the write path, so
         // `gnr8 check` never mis-classifies it as drift (and the planner never hashes a file outside the
         // root). Parity with `apply_writes_rejects_a_traversal_output_path`.
-        let artifacts = vec![crate::sdk::Artifact {
-            path: "../escape.go".to_string(),
-            text: "x".to_string(),
-        }];
+        let artifacts = vec![crate::sdk::Artifact::new("../escape.go", "x")];
         let result = super::plan_only(std::path::Path::new("/tmp/proj-does-not-exist"), &artifacts);
         assert!(
             matches!(result, Err(crate::CoreError::Io { .. })),
@@ -1113,5 +1167,37 @@ mod tests {
         assert!(!is_under_output("internal/goal/ports/http.go", "sdk"));
         // An empty anchor never matches (a no-op anchor must not swallow the whole graph).
         assert!(!is_under_output("internal/dto.go", ""));
+    }
+
+    #[test]
+    fn type_renames_rewrite_preserved_parameter_schema_refs() {
+        let mut schema = serde_json::json!({
+            "oneOf": [
+                { "$ref": "#/components/schemas/legacy.Book" },
+                { "$ref": "#/components/schemas/Book" },
+                { "$ref": "external.yaml#/components/schemas/Book" }
+            ]
+        });
+
+        super::rewrite_openapi_component_ref(&mut schema, "legacy.Book", "Book", "PublicBook");
+
+        assert_eq!(
+            schema
+                .pointer("/oneOf/0/$ref")
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PublicBook")
+        );
+        assert_eq!(
+            schema
+                .pointer("/oneOf/1/$ref")
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PublicBook")
+        );
+        assert_eq!(
+            schema
+                .pointer("/oneOf/2/$ref")
+                .and_then(serde_json::Value::as_str),
+            Some("external.yaml#/components/schemas/Book")
+        );
     }
 }

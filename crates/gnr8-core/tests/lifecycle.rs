@@ -42,10 +42,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 
 /// One synthetic artifact (a `(path, text)` pair) — what the child's pipeline would emit.
 fn artifact(path: &str, text: &str) -> Artifact {
-    Artifact {
-        path: path.to_string(),
-        text: text.to_string(),
-    }
+    Artifact::new(path, text)
 }
 
 fn artifact_metadata(path: &str, text: &str) -> ArtifactMetadata {
@@ -657,6 +654,27 @@ fn regenerate_rejects_traversal_path() {
         "a traversal path must be CoreError::Io, got {err:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn regenerate_rejects_duplicate_artifact_paths() {
+    let root = init_root("duplicate-artifact-path");
+    let err = lifecycle::regenerate(
+        &root,
+        &[
+            artifact("generated/client.go", "first"),
+            artifact("generated/client.go", "second"),
+        ],
+        false,
+    )
+    .expect_err("duplicate artifact paths must be rejected before writing");
+    assert!(
+        matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision"),
+        "a duplicate path must be an artifact ownership error, got {err:?}"
+    );
+    assert!(!root.join("generated/client.go").exists());
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // ---------------------------------------------------------------------------

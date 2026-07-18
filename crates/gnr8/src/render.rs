@@ -197,8 +197,8 @@ fn append_diagnostics(out: &mut String, graph: &ApiGraph) {
     for diag in &graph.diagnostics {
         let _ = writeln!(
             out,
-            "  {}  {} ({}:{})",
-            diag.severity, diag.message, diag.file, diag.line
+            "  {}  [{}] {} ({}:{})",
+            diag.severity, diag.code, diag.message, diag.file, diag.line
         );
     }
 }

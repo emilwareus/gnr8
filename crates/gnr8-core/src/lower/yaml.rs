@@ -17,7 +17,7 @@
 
 use super::model::{
     Components, Info, MediaExample, OpenApiDoc, Operation, Parameter, PathItem, RequestBody,
-    ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
+    ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme, Server,
 };
 use crate::analyze::facts::LiteralValue;
 use std::fmt::Write as _;
@@ -34,6 +34,7 @@ pub(crate) fn write(doc: &OpenApiDoc) -> String {
     // `openapi: 3.1.0` is always the first line.
     let _ = writeln!(out, "openapi: {}", doc.openapi);
     write_info(&mut out, &doc.info);
+    write_servers(&mut out, &doc.servers);
     write_security(&mut out, &doc.security);
     write_paths(&mut out, &doc.paths);
     write_components(&mut out, &doc.components);
@@ -48,6 +49,41 @@ fn write_info(out: &mut String, info: &Info) {
     if let Some(desc) = &info.description {
         let _ = writeln!(out, "{INDENT}description: {}", scalar(desc));
     }
+    if let Some(terms) = &info.terms_of_service {
+        let _ = writeln!(out, "{INDENT}termsOfService: {}", scalar(terms));
+    }
+    if let Some(contact) = &info.contact {
+        let _ = writeln!(out, "{INDENT}contact:");
+        if let Some(name) = &contact.name {
+            let _ = writeln!(out, "{INDENT}{INDENT}name: {}", scalar(name));
+        }
+        if let Some(url) = &contact.url {
+            let _ = writeln!(out, "{INDENT}{INDENT}url: {}", scalar(url));
+        }
+        if let Some(email) = &contact.email {
+            let _ = writeln!(out, "{INDENT}{INDENT}email: {}", scalar(email));
+        }
+    }
+    if let Some(license) = &info.license {
+        let _ = writeln!(out, "{INDENT}license:");
+        let _ = writeln!(out, "{INDENT}{INDENT}name: {}", scalar(&license.name));
+        if let Some(url) = &license.url {
+            let _ = writeln!(out, "{INDENT}{INDENT}url: {}", scalar(url));
+        }
+    }
+}
+
+fn write_servers(out: &mut String, servers: &[Server]) {
+    if servers.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "servers:");
+    for server in servers {
+        let _ = writeln!(out, "{INDENT}- url: {}", scalar(&server.url));
+        if let Some(description) = &server.description {
+            let _ = writeln!(out, "{INDENT}{INDENT}description: {}", scalar(description));
+        }
+    }
 }
 
 /// Emit the top-level `security` list (`- ApiKeyAuth: []`). Omitted entirely when empty.
@@ -61,8 +97,14 @@ fn write_security(out: &mut String, security: &[SecurityRequirement]) {
 
 fn write_security_requirement(out: &mut String, security: &[SecurityRequirement], depth: usize) {
     let pad = INDENT.repeat(depth);
-    for (index, req) in security.iter().enumerate() {
-        let prefix = if index == 0 { "- " } else { "  " };
+    let mut current_alternative = None;
+    for req in security {
+        let prefix = if current_alternative == Some(req.alternative) {
+            "  "
+        } else {
+            current_alternative = Some(req.alternative);
+            "- "
+        };
         let _ = writeln!(
             out,
             "{pad}{prefix}{}: {}",
@@ -87,10 +129,13 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
     let pad = INDENT.repeat(depth);
     for (method, op) in [
         ("get", &item.get),
-        ("post", &item.post),
         ("put", &item.put),
-        ("patch", &item.patch),
+        ("post", &item.post),
         ("delete", &item.delete),
+        ("options", &item.options),
+        ("head", &item.head),
+        ("patch", &item.patch),
+        ("trace", &item.trace),
     ] {
         if let Some(op) = op {
             let _ = writeln!(out, "{pad}{method}:");
@@ -143,8 +188,33 @@ fn write_parameter(out: &mut String, param: &Parameter, depth: usize) {
     let _ = writeln!(out, "{pad}- name: {}", scalar(&param.name));
     let _ = writeln!(out, "{pad}  in: {}", param.location);
     let _ = writeln!(out, "{pad}  required: {}", param.required);
-    let _ = writeln!(out, "{pad}  schema:");
-    write_schema(out, &param.schema, depth + 2);
+    if let Some(style) = &param.style {
+        let _ = writeln!(out, "{pad}  style: {}", scalar(style));
+    }
+    if let Some(explode) = param.explode {
+        let _ = writeln!(out, "{pad}  explode: {explode}");
+    }
+    if param.allow_reserved {
+        let _ = writeln!(out, "{pad}  allowReserved: true");
+    }
+    let mut has_source_schema = false;
+    for (name, value) in &param.openapi_fields {
+        if name == "schema" {
+            has_source_schema = true;
+            if param.openapi_content.is_some() {
+                continue;
+            }
+        }
+        let value = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(out, "{pad}  {}: {value}", map_key(name));
+    }
+    if let Some(content) = &param.openapi_content {
+        let content = serde_json::to_string(content).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(out, "{pad}  content: {content}");
+    } else if !has_source_schema {
+        let _ = writeln!(out, "{pad}  schema:");
+        write_schema(out, &param.schema, depth + 2);
+    }
 }
 
 /// Emit a `requestBody` with source-inferred content type referencing a component schema.
@@ -153,14 +223,16 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
     let _ = writeln!(out, "{pad}requestBody:");
     let _ = writeln!(out, "{pad}{INDENT}required: {}", body.required);
     let _ = writeln!(out, "{pad}{INDENT}content:");
-    let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(&body.content_type));
-    let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
-    let _ = writeln!(
-        out,
-        "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
-        ref_pointer(&body.schema_ref)
-    );
-    write_examples(out, &body.examples, depth + 3);
+    for content_type in &body.content_types {
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(content_type));
+        let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
+        let _ = writeln!(
+            out,
+            "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
+            ref_pointer(&body.schema_ref)
+        );
+        write_examples(out, &body.examples, content_type, depth + 3);
+    }
 }
 
 /// Emit the `responses` map keyed by quoted status code.
@@ -184,68 +256,79 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
             scalar(&resp.description)
         );
         if resp.binary {
-            let content_type = resp
-                .content_type
-                .as_deref()
-                .unwrap_or("application/octet-stream");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{}:",
-                map_key(content_type)
-            );
-            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
-            );
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
-            );
-            write_examples(out, &resp.examples, depth + 4);
+            for content_type in response_media_types(resp, "application/octet-stream") {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                    map_key(content_type)
+                );
+                let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
+                );
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
+                );
+                write_examples(out, &resp.examples, content_type, depth + 4);
+            }
         } else if resp.event_stream {
-            let content_type = resp.content_type.as_deref().unwrap_or("text/event-stream");
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{}:",
-                map_key(content_type)
-            );
-            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
-            if let Some(schema_ref) = &resp.schema_ref {
+            for content_type in response_media_types(resp, "text/event-stream") {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                    map_key(content_type)
+                );
+                let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
+                if let Some(schema_ref) = &resp.schema_ref {
+                    let _ = writeln!(
+                        out,
+                        "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
+                        ref_pointer(schema_ref)
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
+                    );
+                }
+                write_examples(out, &resp.examples, content_type, depth + 4);
+            }
+        } else if let Some(schema_ref) = &resp.schema_ref {
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
+            for content_type in response_media_types(resp, "application/json") {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                    map_key(content_type)
+                );
+                let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
                 let _ = writeln!(
                     out,
                     "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
                     ref_pointer(schema_ref)
                 );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
-                );
+                write_examples(out, &resp.examples, content_type, depth + 4);
             }
-            write_examples(out, &resp.examples, depth + 4);
-        } else if let Some(schema_ref) = &resp.schema_ref {
-            let content_type = resp.content_type.as_deref().unwrap_or("application/json");
-            let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{}:",
-                map_key(content_type)
-            );
-            let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
-            let _ = writeln!(
-                out,
-                "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
-                ref_pointer(schema_ref)
-            );
-            write_examples(out, &resp.examples, depth + 4);
         }
     }
 }
 
-fn write_examples(out: &mut String, examples: &[MediaExample], depth: usize) {
+fn response_media_types<'a>(resp: &'a ResponseObj, fallback: &'static str) -> Vec<&'a str> {
+    if !resp.content_types.is_empty() {
+        return resp.content_types.iter().map(String::as_str).collect();
+    }
+    vec![resp.content_type.as_deref().unwrap_or(fallback)]
+}
+
+fn write_examples(out: &mut String, examples: &[MediaExample], content_type: &str, depth: usize) {
+    let examples: Vec<_> = examples
+        .iter()
+        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+        .collect();
     if examples.is_empty() {
         return;
     }
@@ -475,8 +558,12 @@ fn scalar(value: &str) -> String {
     }
 }
 
-/// Wrap a value in single quotes, escaping embedded single quotes per YAML rules (`'` → `''`).
+/// Wrap a value in quotes. Single-line values use YAML single quotes; control characters and line
+/// breaks use JSON's double-quoted escaping, which is also valid YAML and cannot change indentation.
 fn quote(value: &str) -> String {
+    if value.chars().any(char::is_control) {
+        return serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    }
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -506,10 +593,12 @@ fn needs_quoting(value: &str) -> bool {
     if LEADING_INDICATORS.contains(&first) {
         return true;
     }
-    // A `: ` or trailing `:` would start a mapping; `#` mid-value starts a comment.
-    value.contains(": ")
-        || value.ends_with(':')
-        || value.contains(" #")
+    // Quote these everywhere rather than trying to depend on a parser's YAML 1.1/1.2 mode. This is
+    // deliberately more conservative than the grammar: it keeps colons, comments and values such as
+    // `=` portable across noyalib, PyYAML and Ruby Psych.
+    value.contains(':')
+        || value.contains('#')
+        || value.contains('=')
         || looks_like_yaml_non_string(value)
 }
 
@@ -522,23 +611,53 @@ fn needs_key_quoting(value: &str) -> bool {
 
 fn looks_like_yaml_non_string(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    matches!(lower.as_str(), "true" | "false" | "null" | "~")
-        || value.parse::<i64>().is_ok()
+    matches!(
+        lower.as_str(),
+        "true"
+            | "false"
+            | "null"
+            | "~"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | "y"
+            | "n"
+            | ".nan"
+            | ".inf"
+            | "+.inf"
+            | "-.inf"
+    ) || value.parse::<i64>().is_ok()
         || value.parse::<u64>().is_ok()
         || value.parse::<f64>().is_ok()
+        || looks_like_yaml_date(value)
+}
+
+fn looks_like_yaml_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 10
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::write;
+    use crate::analyze::facts::LiteralValue;
     use crate::lower::model::{
         Components, Info, OpenApiDoc, Operation, PathItem, RequestBody, ResponseObj, SchemaObject,
         SecurityRequirement, SecurityScheme,
     };
+    use std::io::Write as _;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
 
     /// A minimal but non-trivial doc: one secured POST under `/goal/` with a request body + one
     /// response, plus one component schema with a uuid-format field and a free-form-map field.
@@ -554,7 +673,7 @@ mod tests {
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
-                content_type: "application/json".to_string(),
+                content_types: vec!["application/json".to_string()],
                 schema_ref: "CreateGoalInput".to_string(),
                 examples: Vec::new(),
             }),
@@ -564,6 +683,7 @@ mod tests {
                     description: "Goal created".to_string(),
                     schema_ref: Some("CommandMessageWithUUID".to_string()),
                     content_type: None,
+                    content_types: Vec::new(),
                     binary: false,
                     event_stream: false,
                     examples: Vec::new(),
@@ -601,10 +721,15 @@ mod tests {
                 title: "goalservice".to_string(),
                 version: "0.1.0".to_string(),
                 description: None,
+                terms_of_service: None,
+                contact: None,
+                license: None,
             },
+            servers: Vec::new(),
             security: vec![SecurityRequirement {
                 scheme: "ApiKeyAuth".to_string(),
                 scopes: vec![],
+                alternative: 0,
             }],
             paths: vec![("/goal/".to_string(), path_item)],
             components: Components {
@@ -699,6 +824,83 @@ mod tests {
         assert!(
             type_pos < format_pos,
             "type must be emitted before format:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_user_strings_round_trip_through_independent_yaml_parsers() {
+        let ambiguous = [
+            "=",
+            "account:read",
+            "true",
+            "false",
+            "null",
+            "on",
+            "off",
+            "yes",
+            "no",
+            "1e3",
+            "2026-07-16",
+            "value # comment",
+            "key: value",
+        ];
+        let mut doc = sample_doc();
+        let schema = &mut doc.components.schemas[0].1;
+        schema.enum_values = ambiguous.iter().map(|value| (*value).to_string()).collect();
+        schema.example = Some(LiteralValue::String("=".to_string()));
+        let yaml = write(&doc);
+
+        let parsed = crate::sdk::openapi_source::parse_json_or_yaml(
+            &yaml,
+            Path::new("portable-openapi.yaml"),
+        )
+        .unwrap();
+        let values = parsed["components"]["schemas"]["Foo"]["enum"]
+            .as_array()
+            .unwrap();
+        let round_trip: Vec<&str> = values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(round_trip, ambiguous);
+
+        assert_external_yaml_parser(
+            "python3",
+            &[
+                "-c",
+                "import sys, yaml; assert isinstance(yaml.safe_load(sys.stdin.read()), dict)",
+            ],
+            &yaml,
+        );
+        assert_external_yaml_parser(
+            "ruby",
+            &[
+                "-e",
+                "require 'yaml'; value = YAML.safe_load(STDIN.read, permitted_classes: [], permitted_symbols: [], aliases: false); raise unless value.is_a?(Hash)",
+            ],
+            &yaml,
+        );
+    }
+
+    fn assert_external_yaml_parser(program: &str, args: &[&str], yaml: &str) {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to start {program}: {err}"));
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(yaml.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{program} rejected generated YAML: {}\n{yaml}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
