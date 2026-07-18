@@ -1447,6 +1447,7 @@ func (c *Context) PostForm(string) string { return "" }
 func (c *Context) FormFile(string) (*multipart.FileHeader, error) { return nil, nil }
 func (c *Context) ShouldBindQuery(any) error { return nil }
 func (c *Context) ShouldBindHeader(any) error { return nil }
+func (c *Context) ShouldBind(any) error { return nil }
 func (c *Context) JSON(int, any) {}
 `)
 	mustWrite(t, filepath.Join(dir, "uuidstub", "go.mod"), "module github.com/google/uuid\n\ngo 1.22\n")
@@ -1482,6 +1483,7 @@ func MultipartParts(c *gin.Context, fileName, titleName string) {
 	mustWrite(t, filepath.Join(dir, "app.go"), `package typedrequests
 
 import (
+	"mime/multipart"
 	"time"
 
 	"example.com/typedrequests/requesthelpers"
@@ -1506,6 +1508,16 @@ type HeaderInput struct {
 	Retries   []int  `+"`"+`header:"X-Retry"`+"`"+`
 }
 
+type UploadMetadata struct {
+	Source string `+"`"+`json:"source"`+"`"+`
+}
+
+type UploadInput struct {
+	BoundFile *multipart.FileHeader `+"`"+`form:"boundFile" binding:"required"`+"`"+`
+	Metadata  UploadMetadata        `+"`"+`form:"metadata"`+"`"+`
+	Caption   string                `+"`"+`form:"caption,default=untitled"`+"`"+`
+}
+
 type Response struct { OK bool `+"`"+`json:"ok"`+"`"+` }
 
 func (s Server) Register() { s.R.GET("/search", s.search) }
@@ -1513,8 +1525,10 @@ func (s Server) Register() { s.R.GET("/search", s.search) }
 func (s Server) search(c *gin.Context) {
 	var query QueryInput
 	var headers HeaderInput
+	var upload UploadInput
 	_ = c.ShouldBindQuery(&query)
 	_ = c.ShouldBindHeader(&headers)
+	_ = c.ShouldBind(&upload)
 	_ = requesthelpers.RequiredQueryUUID(c, "branchId")
 	_ = c.QueryArray("labels")
 	_, _ = c.GetQueryArray("optionalLabels")
@@ -1610,6 +1624,15 @@ func (s Server) search(c *gin.Context) {
 	}
 	if primName(byName["attachment"].Schema) != facts.PrimBytes || !byName["attachment"].Required || primName(byName["title"].Schema) != facts.PrimString || primName(byName["note"].Schema) != facts.PrimString {
 		t.Fatalf("multipart fields mismatch: %+v", byName)
+	}
+	if primName(byName["boundFile"].Schema) != facts.PrimBytes || !byName["boundFile"].Required {
+		t.Fatalf("bound multipart file mismatch: %+v", byName["boundFile"])
+	}
+	if byName["metadata"].Schema.Type != facts.TypeNamed {
+		t.Fatalf("structured multipart metadata mismatch: %+v", byName["metadata"])
+	}
+	if byName["caption"].Meta == nil || byName["caption"].Meta.Default == nil || byName["caption"].Meta.Default.Value != "untitled" {
+		t.Fatalf("bound multipart scalar default mismatch: %+v", byName["caption"])
 	}
 	foundUnsupportedCollectionFormat := false
 	for _, item := range diagnostics.Items() {

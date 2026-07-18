@@ -159,6 +159,8 @@ type contextTraversal struct {
 	resolvedParam          map[string]bool
 	untypedQueryReads      *[]untypedQueryRead
 	formFields             map[string]facts.FieldFact
+	boundFormRefs          map[string]bool
+	manualFormFields       map[string]bool
 	formHasFile            *bool
 	hasBodyBind            *bool
 	allBodyBindsOptional   *bool
@@ -641,16 +643,52 @@ func (a *Analyzer) analyzeTraversedGinCall(
 	case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
 		bound := boundTypeFromCall(frame, call)
 		contentType := bindContentType(method, frame.decl.info, call, bound)
+		if isFormContentType(contentType) {
+			refID, ok := a.addBoundFormFields(
+				frame,
+				call,
+				traversal.formFields,
+				traversal.route,
+				traversal.diagnostics,
+			)
+			if !ok {
+				if traversal.diagnostics != nil {
+					file, line := positionOf(frame.decl.fset, call.Pos())
+					traversal.diagnostics.RequestBodyUnresolved(
+						method,
+						traversal.route.Method,
+						untypedRouteLabel(traversal.route),
+						"binding target does not resolve to a form object",
+						file,
+						line,
+					)
+				}
+				return
+			}
+			if refID != "" {
+				traversal.boundFormRefs[refID] = true
+			}
+			if contentType == "multipart/form-data" {
+				*traversal.formHasFile = true
+			}
+			*traversal.hasBodyBind = true
+			if !optionalBindPositions[call.Pos()] {
+				*traversal.allBodyBindsOptional = false
+			}
+			return
+		}
 		a.setTraversedRequestBody(frame, call, contentType, optionalBindPositions, traversal)
 	case "FormFile":
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
 			traversal.formFields[name] = formField(name, facts.PrimitiveType(facts.BytesPrim()), true)
+			traversal.manualFormFields[name] = true
 			*traversal.formHasFile = true
 		} else {
 			a.reportDynamicBodyFieldName(frame, call, traversal, method)
 		}
 	case "PostForm", "DefaultPostForm", "GetPostForm":
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
+			traversal.manualFormFields[name] = true
 			if _, exists := traversal.formFields[name]; !exists {
 				field := formField(name, facts.PrimitiveType(facts.StringPrim()), false)
 				if method == "DefaultPostForm" && len(call.Args) > 1 {
@@ -844,6 +882,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	seenStatus := map[uint16]bool{}
 	provisionalStatus := map[uint16]bool{}
 	formFields := map[string]facts.FieldFact{}
+	boundFormRefs := map[string]bool{}
+	manualFormFields := map[string]bool{}
 	formHasFile := false
 	contentTypeHint := ""
 	optionalBindPositions := collectOptionalBindPositions(h)
@@ -891,6 +931,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 					resolvedParam:          resolvedParam,
 					untypedQueryReads:      &untypedQueryReads,
 					formFields:             formFields,
+					boundFormRefs:          boundFormRefs,
+					manualFormFields:       manualFormFields,
 					formHasFile:            &formHasFile,
 					hasBodyBind:            &hasBodyBind,
 					allBodyBindsOptional:   &allBodyBindsOptional,
@@ -920,8 +962,24 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		case "ShouldBindHeader":
 			a.addBoundParameters(helperFrame{decl: h}, call, "header", &cf, seenParam, resolvedParam, route, diags)
 		case "ShouldBind", "Bind", "ShouldBindWith", "BindWith":
-			if ref, bound, ok := a.bindRequestType(h.info, call); ok {
-				contentType := bindContentType(name, h.info, call, bound)
+			frame := helperFrame{decl: h}
+			bound := boundTypeFromCall(frame, call)
+			contentType := bindContentType(name, h.info, call, bound)
+			if isFormContentType(contentType) {
+				refID, ok := a.addBoundFormFields(frame, call, formFields, route, diags)
+				if !ok {
+					reportDirectUnresolvedBody(diags, h, route, call, name, "binding target does not resolve to a form object")
+					break
+				}
+				if refID != "" {
+					boundFormRefs[refID] = true
+				}
+				formHasFile = formHasFile || contentType == "multipart/form-data"
+				hasBodyBind = true
+				if !optionalBindPositions[call.Pos()] {
+					allBodyBindsOptional = false
+				}
+			} else if ref, _, ok := a.bindRequestType(h.info, call); ok {
 				if contentType == "" {
 					reportDirectUnresolvedBody(diags, h, route, call, name, "binding media type is selected dynamically or is unsupported")
 				}
@@ -1011,12 +1069,14 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		case "FormFile":
 			if fname, ok := a.callStringArg(h, call, 0); ok {
 				formFields[fname] = formField(fname, facts.PrimitiveType(facts.BytesPrim()), true)
+				manualFormFields[fname] = true
 				formHasFile = true
 			} else {
 				reportDirectUnresolvedBody(diags, h, route, call, name, "multipart field name is dynamic")
 			}
 		case "PostForm", "DefaultPostForm", "GetPostForm":
 			if fname, ok := a.callStringArg(h, call, 0); ok {
+				manualFormFields[fname] = true
 				if _, seen := formFields[fname]; !seen {
 					field := formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
 					if name == "DefaultPostForm" && len(call.Args) > 1 {
@@ -1032,23 +1092,45 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		return true
 	})
-	if cf.RequestBody == nil && len(formFields) > 0 {
-		schemaID, schemaName := syntheticFormSchemaIdentity(route.Handler)
-		fields := make([]facts.FieldFact, 0, len(formFields))
-		for _, field := range formFields {
-			fields = append(fields, field)
+	if cf.RequestBody == nil && (len(formFields) > 0 || len(boundFormRefs) > 0) {
+		if len(boundFormRefs) == 1 && len(manualFormFields) == 0 {
+			for refID := range boundFormRefs {
+				cf.RequestBody = &facts.TypeRef{RefID: refID}
+			}
+			cf.RequestBodyContentType = "application/x-www-form-urlencoded"
+			if formHasFile {
+				cf.RequestBodyContentType = "multipart/form-data"
+			}
+		} else {
+			schemaID, schemaName := syntheticFormSchemaIdentity(route.Handler)
+			fields := make([]facts.FieldFact, 0, len(formFields))
+			for _, field := range formFields {
+				fields = append(fields, field)
+			}
+			cf.RequestBody = &facts.TypeRef{RefID: schemaID}
+			cf.RequestBodyContentType = "application/x-www-form-urlencoded"
+			if formHasFile {
+				cf.RequestBodyContentType = "multipart/form-data"
+			}
+			cf.Schemas = append(cf.Schemas, facts.SchemaFact{
+				ID:   schemaID,
+				Name: schemaName,
+				Body: facts.ObjectType(fields),
+				Span: spanOf(h.fset, declPos(h.decl)),
+			})
 		}
-		cf.RequestBody = &facts.TypeRef{RefID: schemaID}
-		cf.RequestBodyContentType = "application/x-www-form-urlencoded"
-		if formHasFile {
-			cf.RequestBodyContentType = "multipart/form-data"
+	} else if cf.RequestBody != nil && len(formFields) > 0 {
+		if diags != nil {
+			file, line := positionOf(h.fset, declPos(h.decl))
+			diags.RequestBodyUnresolved(
+				"form fields",
+				route.Method,
+				untypedRouteLabel(route),
+				"form or multipart fields conflict with an independently extracted request body",
+				file,
+				line,
+			)
 		}
-		cf.Schemas = append(cf.Schemas, facts.SchemaFact{
-			ID:   schemaID,
-			Name: schemaName,
-			Body: facts.ObjectType(fields),
-			Span: spanOf(h.fset, declPos(h.decl)),
-		})
 	}
 	if cf.RequestBody == nil {
 		if schema := a.rawJSONRequestSchema(h, route.Handler); schema != nil {
@@ -2359,6 +2441,62 @@ func formField(name string, schema facts.Type, required bool) facts.FieldFact {
 	}
 }
 
+func isFormContentType(contentType string) bool {
+	return contentType == "multipart/form-data" || contentType == "application/x-www-form-urlencoded"
+}
+
+func (a *Analyzer) addBoundFormFields(
+	frame helperFrame,
+	call *ast.CallExpr,
+	fields map[string]facts.FieldFact,
+	route routes.Route,
+	diags *diag.Accumulator,
+) (string, bool) {
+	bound := boundTypeFromCall(frame, call)
+	params, ok := a.parametersFromBoundType(bound, "form", frame.decl.fset, route, diags, map[string]bool{})
+	if !ok {
+		return "", false
+	}
+	for _, param := range params {
+		field := formField(param.Name, param.Schema, param.Required)
+		if param.Default != nil {
+			field.Meta = &facts.FieldMeta{Default: param.Default}
+		}
+		existing, exists := fields[param.Name]
+		if !exists {
+			fields[param.Name] = field
+			continue
+		}
+		if !reflect.DeepEqual(existing.Schema, field.Schema) {
+			existingSpecificity := parameterSchemaSpecificity(existing.Schema)
+			incomingSpecificity := parameterSchemaSpecificity(field.Schema)
+			switch {
+			case incomingSpecificity > existingSpecificity:
+				existing.Schema = field.Schema
+			case incomingSpecificity == existingSpecificity:
+				if diags != nil {
+					diags.RequestBodyUnresolved(
+						param.Name,
+						route.Method,
+						untypedRouteLabel(route),
+						"conflicting extracted schemas for form field "+param.Name,
+						param.Span.File,
+						param.Span.StartLine,
+					)
+				}
+			}
+		}
+		existing.Required = existing.Required || field.Required
+		existing.Optional = !existing.Required
+		if existing.Meta == nil {
+			existing.Meta = field.Meta
+		}
+		fields[param.Name] = existing
+	}
+	refID, _ := a.namedTypeID(bound)
+	return refID, true
+}
+
 func syntheticFormSchemaIdentity(handler string) (id string, name string) {
 	base := exportedIdentifier(handler)
 	if base == "" {
@@ -3555,14 +3693,25 @@ func (a *Analyzer) parametersFromBoundType(
 		schema, schemaOK := a.parameterType(field.Type(), tag)
 		if !schemaOK {
 			if diags != nil {
-				diags.RequestParameterUnresolved(
-					field.Name(),
-					route.Method,
-					untypedRouteLabel(route),
-					"unsupported "+location+" binding field type: "+field.Type().String(),
-					file,
-					line,
-				)
+				if location == "form" {
+					diags.RequestBodyUnresolved(
+						field.Name(),
+						route.Method,
+						untypedRouteLabel(route),
+						"unsupported form binding field type: "+field.Type().String(),
+						file,
+						line,
+					)
+				} else {
+					diags.RequestParameterUnresolved(
+						field.Name(),
+						route.Method,
+						untypedRouteLabel(route),
+						"unsupported "+location+" binding field type: "+field.Type().String(),
+						file,
+						line,
+					)
+				}
 			}
 			continue
 		}
@@ -3580,14 +3729,25 @@ func (a *Analyzer) parametersFromBoundType(
 		if defaultText, exists := parameterDefault(tag, options); exists {
 			if schema.Type == facts.TypeArray || schema.Type == facts.TypeMap || schema.Type == facts.TypeObject {
 				if diags != nil {
-					diags.RequestParameterUnresolved(
-						name,
-						route.Method,
-						untypedRouteLabel(route),
-						"structured parameter default cannot be represented losslessly",
-						file,
-						line,
-					)
+					if location == "form" {
+						diags.RequestBodyUnresolved(
+							name,
+							route.Method,
+							untypedRouteLabel(route),
+							"structured form field default cannot be represented losslessly",
+							file,
+							line,
+						)
+					} else {
+						diags.RequestParameterUnresolved(
+							name,
+							route.Method,
+							untypedRouteLabel(route),
+							"structured parameter default cannot be represented losslessly",
+							file,
+							line,
+						)
+					}
 				}
 			} else {
 				param.Default = literalForParameter(defaultText, schema)
