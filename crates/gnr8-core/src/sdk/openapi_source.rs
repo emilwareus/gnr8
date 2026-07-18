@@ -976,7 +976,7 @@ impl Importer {
             .get("required")
             .and_then(Value::as_bool)
             .unwrap_or(location == "path");
-        let schema = parameter.get("schema").unwrap_or(parameter);
+        let (schema, openapi_content) = self.parameter_schema(parameter, operation_id, &name);
         let default = schema.get("default").and_then(literal_value);
         let imported = self.type_from_schema(schema);
         let (style, explode) =
@@ -993,8 +993,60 @@ impl Importer {
                 .get("allowReserved")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            openapi_content,
             provenance: self.span(),
         })
+    }
+
+    fn parameter_schema<'a>(
+        &mut self,
+        parameter: &'a Value,
+        operation_id: &str,
+        name: &str,
+    ) -> (&'a Value, Option<Value>) {
+        if let Some(schema) = parameter.get("schema") {
+            if self.version != SpecVersion::Swagger2 && parameter.get("content").is_some() {
+                self.warn_request_parameter(
+                    operation_id,
+                    name,
+                    "the parameter defines both schema and content",
+                );
+            }
+            return (schema, None);
+        }
+        if self.version == SpecVersion::Swagger2 {
+            return (parameter, None);
+        }
+        let Some(content) = parameter.get("content") else {
+            return (parameter, None);
+        };
+        let Some(content_object) = content.as_object() else {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                "the parameter content value is not an object",
+            );
+            return (parameter, Some(content.clone()));
+        };
+        if content_object.len() != 1 {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                "the parameter content object must contain exactly one media type",
+            );
+        }
+        let Some((media_type, media)) = content_object.iter().next() else {
+            return (parameter, Some(content.clone()));
+        };
+        let Some(schema) = media.get("schema") else {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                &format!("parameter media type '{media_type}' has no schema"),
+            );
+            return (parameter, Some(content.clone()));
+        };
+        (schema, Some(content.clone()))
     }
 
     fn import_parameter_serialization(
@@ -3075,6 +3127,56 @@ paths:
                 .and_then(Value::as_str),
             Some("reports.list-v1")
         );
+    }
+
+    #[test]
+    fn preserves_parameter_content_while_extracting_its_sdk_type() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - name: filter
+          in: query
+          required: true
+          content:
+            application/json:
+              schema: { type: array, items: { type: integer, format: int64 } }
+              example: [1, 2]
+              x-codec: compact
+      responses: { '204': { description: ok } }
+";
+        let source = parse_json_or_yaml(text, std::path::Path::new("openapi.yaml")).unwrap();
+        let source_content = source
+            .pointer("/paths/~1search/get/parameters/0/content")
+            .unwrap();
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let parameter = &graph.operations[0].params[0];
+        assert!(matches!(parameter.schema, Type::Array(_)));
+        assert_eq!(parameter.openapi_content.as_ref(), Some(source_content));
+        assert!(graph
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "request.parameter.unresolved"));
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        assert_eq!(
+            emitted.pointer("/paths/~1search/get/parameters/0/content"),
+            Some(source_content)
+        );
+        assert!(emitted
+            .pointer("/paths/~1search/get/parameters/0/schema")
+            .is_none());
     }
 
     #[test]

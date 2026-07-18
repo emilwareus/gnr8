@@ -205,7 +205,11 @@ fn write_parameter(param: &Parameter) -> Value {
     if param.allow_reserved {
         out.insert("allowReserved".to_string(), Value::Bool(true));
     }
-    out.insert("schema".to_string(), write_schema(&param.schema));
+    if let Some(content) = &param.openapi_content {
+        out.insert("content".to_string(), content.clone());
+    } else {
+        out.insert("schema".to_string(), write_schema(&param.schema));
+    }
     Value::Object(out)
 }
 

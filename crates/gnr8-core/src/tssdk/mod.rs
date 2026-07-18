@@ -2464,6 +2464,7 @@ mod tests {
                 style: None,
                 explode: None,
                 allow_reserved: false,
+                openapi_content: None,
                 provenance: SourceSpan {
                     file: "/root/main.ts".to_string(),
                     start_line: 1,
@@ -2479,6 +2480,7 @@ mod tests {
                 style: None,
                 explode: None,
                 allow_reserved: false,
+                openapi_content: None,
                 provenance: SourceSpan {
                     file: "/root/main.ts".to_string(),
                     start_line: 1,
@@ -2641,6 +2643,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "multipart compatibility fixture setup is intentionally explicit"
+    )]
     fn typescript_fetch_compat_flattens_multipart_form_fields() {
         let mut graph = sample_graph();
         graph.operations[0].handler = "executeImportJob".to_string();
@@ -2657,6 +2663,7 @@ mod tests {
             style: None,
             explode: None,
             allow_reserved: false,
+            openapi_content: None,
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,
@@ -2762,6 +2769,7 @@ mod tests {
             style: None,
             explode: None,
             allow_reserved: false,
+            openapi_content: None,
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,
@@ -3003,6 +3011,7 @@ mod tests {
             style: None,
             explode: None,
             allow_reserved: false,
+            openapi_content: None,
             provenance: SourceSpan {
                 file: "/root/main.ts".to_string(),
                 start_line: 1,

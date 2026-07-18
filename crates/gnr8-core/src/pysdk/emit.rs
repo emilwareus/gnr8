@@ -3148,6 +3148,7 @@ mod tests {
                 style: None,
                 explode: None,
                 allow_reserved: false,
+                openapi_content: None,
                 provenance: crate::graph::SourceSpan {
                     file: "main.py".to_string(),
                     start_line: 4,

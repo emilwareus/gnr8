@@ -1792,6 +1792,7 @@ fn apply_typed_parameter_override(
         style: requested.style.clone(),
         explode: requested.explode,
         allow_reserved: requested.allow_reserved,
+        openapi_content: None,
         provenance: span.clone(),
     });
     op.params.sort_by(|a, b| {
@@ -2026,6 +2027,7 @@ fn apply_query_param_override(
         style: None,
         explode: None,
         allow_reserved: false,
+        openapi_content: None,
         provenance: op.provenance.clone(),
     });
     op.params.sort_by(|a, b| {
@@ -6412,6 +6414,7 @@ mod tests {
             style: None,
             explode: None,
             allow_reserved: false,
+            openapi_content: None,
             provenance: span(),
         }
     }

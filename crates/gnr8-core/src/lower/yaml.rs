@@ -197,8 +197,13 @@ fn write_parameter(out: &mut String, param: &Parameter, depth: usize) {
     if param.allow_reserved {
         let _ = writeln!(out, "{pad}  allowReserved: true");
     }
-    let _ = writeln!(out, "{pad}  schema:");
-    write_schema(out, &param.schema, depth + 2);
+    if let Some(content) = &param.openapi_content {
+        let content = serde_json::to_string(content).unwrap_or_else(|_| "null".to_string());
+        let _ = writeln!(out, "{pad}  content: {content}");
+    } else {
+        let _ = writeln!(out, "{pad}  schema:");
+        write_schema(out, &param.schema, depth + 2);
+    }
 }
 
 /// Emit a `requestBody` with source-inferred content type referencing a component schema.

@@ -510,6 +510,12 @@ pub struct Param {
     /// Whether reserved query characters may remain unescaped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_reserved: bool,
+    /// Exact `OpenAPI` 3 parameter `content` object, when the source used content instead of schema.
+    ///
+    /// SDK generators use [`Self::schema`] for typing; the `OpenAPI` target uses this value to avoid
+    /// losing the parameter media type and media-object metadata during source migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi_content: Option<serde_json::Value>,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
@@ -866,6 +872,7 @@ impl Param {
             style: param.style,
             explode: param.explode,
             allow_reserved: param.allow_reserved,
+            openapi_content: None,
             provenance: relativize_span(&param.span, root),
         }
     }

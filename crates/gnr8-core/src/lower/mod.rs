@@ -403,6 +403,7 @@ fn lower_operation(
                 style: param.style.clone(),
                 explode: param.explode,
                 allow_reserved: param.allow_reserved,
+                openapi_content: param.openapi_content.clone(),
                 schema,
             })
         })
