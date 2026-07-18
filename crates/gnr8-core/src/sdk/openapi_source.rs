@@ -1067,7 +1067,10 @@ impl Importer {
                 let content_types = self.response_content_types_for_kind(
                     response,
                     &content_type,
+                    schema,
                     ImportedResponseKind::Binary,
+                    operation_id,
+                    status_code,
                 );
                 responses.push(Response {
                     status: status_code,
@@ -1081,7 +1084,10 @@ impl Importer {
             let content_types = self.response_content_types_for_kind(
                 response,
                 &media_type,
+                schema,
                 ImportedResponseKind::Json,
+                operation_id,
+                status_code,
             );
             responses.push(Response {
                 status: status_code,
@@ -1100,7 +1106,10 @@ impl Importer {
         &mut self,
         response: &Value,
         selected_media_type: &str,
+        selected_schema: &Value,
         kind: ImportedResponseKind,
+        operation_id: &str,
+        status: u16,
     ) -> Vec<String> {
         let mut content_types = vec![selected_media_type.to_string()];
         let Some(content) = response.get("content").and_then(Value::as_object) else {
@@ -1111,13 +1120,35 @@ impl Importer {
                 continue;
             }
             let Some(schema) = media.get("schema") else {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has no schema",
+                );
                 continue;
             };
             let is_binary = self.response_schema_is_binary(schema);
-            if (kind == ImportedResponseKind::Binary && is_binary)
-                || (kind == ImportedResponseKind::Json && !is_binary)
-            {
+            let same_kind = (kind == ImportedResponseKind::Binary && is_binary)
+                || (kind == ImportedResponseKind::Json && !is_binary);
+            if !same_kind {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has a different response body kind",
+                );
+                continue;
+            }
+            if schema == selected_schema {
                 content_types.push(media_type.clone());
+            } else {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has a different response schema",
+                );
             }
         }
         content_types
@@ -1543,6 +1574,30 @@ impl Importer {
                 end_line: 1,
             },
         ));
+    }
+
+    fn warn_response_schema(
+        &mut self,
+        operation_id: &str,
+        status: u16,
+        media_type: &str,
+        reason: &str,
+    ) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "response.schema.unresolved",
+                DiagnosticCategory::Response,
+                "WARN",
+                format!(
+                    "response {status} on operation '{operation_id}' cannot preserve media type \
+                     '{media_type}': {reason}; the graph supports one response schema per status"
+                ),
+                span,
+            )
+            .operation(operation_id)
+            .subject(format!("{status} {media_type}")),
+        );
     }
 
     fn display_file(&self) -> String {
@@ -2221,6 +2276,52 @@ paths:
                 "application/vnd.acme.report+json".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn diagnoses_response_media_types_with_distinct_schemas_or_body_kinds() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Reports API, version: 1.0.0 }
+paths:
+  /reports/{id}:
+    get:
+      operationId: getReport
+      responses:
+        '200':
+          description: report
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+            application/vnd.acme.report+json:
+              schema: { type: object, properties: { name: { type: string } } }
+            application/pdf:
+              schema: { type: string, format: binary }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operations[0].responses[0].content_types,
+            vec!["application/json".to_string()]
+        );
+        let diagnostics: Vec<_> = graph
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "response.schema.unresolved")
+            .collect();
+        assert_eq!(diagnostics.len(), 2, "{:?}", graph.diagnostics);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.operation.as_deref() == Some("getReport")
+                && diagnostic
+                    .subject
+                    .as_deref()
+                    .is_some_and(|subject| subject.starts_with("200 "))
+        }));
     }
 
     #[test]
