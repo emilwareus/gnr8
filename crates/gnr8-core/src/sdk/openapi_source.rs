@@ -13,8 +13,8 @@ use crate::analyze::facts::{
     Constraints, FieldFact, FieldMeta, LiteralValue, Prim, Type, WellKnown,
 };
 use crate::graph::{
-    ApiGraph, Diagnostic, DiagnosticCategory, Operation, Param, Response, Schema, SchemaRef,
-    SecurityScheme, SourceSpan,
+    ApiGraph, Diagnostic, DiagnosticCategory, MediaExample, Operation, OperationDocsPolicy, Param,
+    Response, ResponseDocsPolicy, Schema, SchemaRef, SecurityScheme, SourceSpan,
 };
 use crate::CoreError;
 
@@ -58,6 +58,7 @@ struct Importer {
     external_docs: BTreeMap<PathBuf, Value>,
     used_operation_ids: BTreeSet<String>,
     operation_security: Vec<crate::graph::OperationSecurityPolicy>,
+    operation_docs: Vec<OperationDocsPolicy>,
 }
 
 /// Load an OpenAPI/Swagger document from `input`, resolved against `project_root`.
@@ -262,6 +263,7 @@ impl Importer {
             external_docs: BTreeMap::new(),
             used_operation_ids: BTreeSet::new(),
             operation_security: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
 
@@ -278,6 +280,8 @@ impl Importer {
         operations.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
         schemas.sort_by(|a, b| a.id.cmp(&b.id));
         self.operation_security
+            .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+        self.operation_docs
             .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
         self.diagnostics
             .sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
@@ -307,7 +311,7 @@ impl Importer {
             runtime: crate::graph::RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
-            operation_docs: Vec::new(),
+            operation_docs: std::mem::take(&mut self.operation_docs),
         })
     }
 
@@ -811,8 +815,35 @@ impl Importer {
                         .cmp(&b.name)
                         .then_with(|| a.location.cmp(&b.location))
                 });
-                let mut responses = self.import_responses(operation, &operation_id);
+                let (mut responses, response_docs) =
+                    self.import_responses(operation, &operation_id);
                 responses.sort_by_key(|response| response.status);
+                let request_examples = self.import_request_examples(operation);
+                self.operation_docs.push(OperationDocsPolicy {
+                    operation_id: operation_id.clone(),
+                    summary: operation_object
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    description: operation_object
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    deprecated: operation_object
+                        .get("deprecated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    tags: operation_object
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    request_examples,
+                    responses: response_docs,
+                });
                 let (security, security_alternatives) =
                     self.import_operation_security(operation_object, &operation_id);
                 let security_overrides_global = operation_object.contains_key("security");
@@ -1031,19 +1062,140 @@ impl Importer {
         ))
     }
 
-    fn import_responses(&mut self, operation: &Value, operation_id: &str) -> Vec<Response> {
+    fn import_request_examples(&mut self, operation: &Value) -> Vec<MediaExample> {
+        if self.version == SpecVersion::Swagger2 {
+            return Vec::new();
+        }
+        let Some(raw_body) = operation.get("requestBody") else {
+            return Vec::new();
+        };
+        let body = raw_body
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|ref_value| self.resolve_ref_value(ref_value))
+            .unwrap_or_else(|| raw_body.clone());
+        body.get("content")
+            .and_then(Value::as_object)
+            .map_or_else(Vec::new, |content| self.import_content_examples(content))
+    }
+
+    fn import_response_examples(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+    ) -> Vec<MediaExample> {
+        if self.version != SpecVersion::Swagger2 {
+            return response
+                .get("content")
+                .and_then(Value::as_object)
+                .map_or_else(Vec::new, |content| self.import_content_examples(content));
+        }
+        let Some(examples) = response.get("examples").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let accepted = self.swagger_response_media_types(operation);
+        examples
+            .iter()
+            .filter(|(content_type, _)| accepted.contains(content_type))
+            .map(|(content_type, value)| MediaExample {
+                name: "default".to_string(),
+                content_type: content_type.clone(),
+                summary: None,
+                description: None,
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    fn import_content_examples(
+        &mut self,
+        content: &serde_json::Map<String, Value>,
+    ) -> Vec<MediaExample> {
+        let mut imported = Vec::new();
+        for (content_type, media) in content {
+            if let Some(value) = media.get("example") {
+                imported.push(MediaExample {
+                    name: "default".to_string(),
+                    content_type: content_type.clone(),
+                    summary: None,
+                    description: None,
+                    value: value.clone(),
+                });
+            }
+            let Some(examples) = media.get("examples").and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, raw_example) in examples {
+                let example = raw_example
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|ref_value| self.resolve_ref_value(ref_value))
+                    .unwrap_or_else(|| raw_example.clone());
+                let (summary, description, value) = example.as_object().map_or_else(
+                    || (None, None, Some(example.clone())),
+                    |example| {
+                        (
+                            example
+                                .get("summary")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            example
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            example.get("value").cloned(),
+                        )
+                    },
+                );
+                let Some(value) = value else {
+                    self.warn(format!(
+                        "example '{name}' for media type '{content_type}' has no inline value and was not imported"
+                    ));
+                    continue;
+                };
+                imported.push(MediaExample {
+                    name: name.clone(),
+                    content_type: content_type.clone(),
+                    summary,
+                    description,
+                    value,
+                });
+            }
+        }
+        imported.sort_by(|a, b| {
+            a.content_type
+                .cmp(&b.content_type)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        imported
+    }
+
+    fn import_responses(
+        &mut self,
+        operation: &Value,
+        operation_id: &str,
+    ) -> (Vec<Response>, Vec<ResponseDocsPolicy>) {
         let mut responses = Vec::new();
+        let mut docs = Vec::new();
         let Some(response_map) = operation.get("responses").and_then(Value::as_object) else {
-            return responses;
+            return (responses, docs);
         };
         for (status, raw_response) in response_map {
             let Ok(status_code) = status.parse::<u16>() else {
                 continue;
             };
             let response = self.resolve_response(raw_response, operation_id, status_code);
+            docs.push(ResponseDocsPolicy {
+                status: status_code,
+                description: response
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                examples: self.import_response_examples(operation, &response),
+            });
             responses.push(self.import_response(operation, &response, operation_id, status_code));
         }
-        responses
+        (responses, docs)
     }
 
     fn import_response(
@@ -2128,6 +2280,7 @@ mod tests {
     use crate::sdk::builtins::{OpenApi, OpenApi31Json, TsSdk};
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::{Cx, Pipeline};
+    use serde_json::Value;
 
     #[test]
     fn detects_supported_spec_versions() {
@@ -2547,6 +2700,92 @@ components:
                 && diagnostic.operation.as_deref() == Some("getReport")
                 && diagnostic.subject.as_deref() == Some("200 #/components/responses/Missing")
         }));
+    }
+
+    #[test]
+    fn imports_operation_documentation_and_named_media_examples() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      summary: Create a report
+      description: Creates an audited report.
+      tags: [Reports, Audited]
+      deprecated: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+            examples:
+              primary:
+                summary: Main request
+                description: The normal request.
+                value: { name: quarterly }
+      responses:
+        '201':
+          description: Report created
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+              examples:
+                created:
+                  summary: Created response
+                  value: { id: report-1 }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let docs = &graph.operation_docs[0];
+        assert_eq!(docs.summary.as_deref(), Some("Create a report"));
+        assert_eq!(
+            docs.description.as_deref(),
+            Some("Creates an audited report.")
+        );
+        assert_eq!(docs.tags, vec!["Reports", "Audited"]);
+        assert!(docs.deprecated);
+        assert_eq!(docs.request_examples.len(), 1);
+        assert_eq!(
+            docs.responses[0].description.as_deref(),
+            Some("Report created")
+        );
+        assert_eq!(docs.responses[0].examples.len(), 1);
+
+        let yaml = to_openapi(&graph, "Report API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let operation = emitted.pointer("/paths/~1reports/post").unwrap();
+        assert_eq!(
+            operation.get("summary").and_then(Value::as_str),
+            Some("Create a report")
+        );
+        assert_eq!(
+            operation.get("tags").and_then(Value::as_array),
+            Some(&vec![
+                Value::String("Reports".to_string()),
+                Value::String("Audited".to_string())
+            ])
+        );
+        assert_eq!(
+            operation.pointer("/requestBody/content/application~1json/examples/primary/value/name"),
+            Some(&Value::String("quarterly".to_string()))
+        );
+        assert_eq!(
+            operation
+                .pointer("/responses/201/description")
+                .and_then(Value::as_str),
+            Some("Report created")
+        );
+        assert_eq!(
+            operation.pointer("/responses/201/content/application~1json/examples/created/value/id"),
+            Some(&Value::String("report-1".to_string()))
+        );
     }
 
     #[test]
