@@ -496,7 +496,9 @@ func constraintsEmpty(c *facts.Constraints) bool {
 }
 
 func unsupportedConstraintTag(diags *diag.Accumulator, tagKind, structName, fieldName, token, file string, line uint32) {
-	diags.Warn(
+	diags.SchemaMetadataUnresolved(
+		structName,
+		fieldName,
 		"unsupported "+tagKind+" tag on "+structName+"."+fieldName+": "+strconv.Quote(token)+
 			" ignored by gnr8 metadata extraction (GO-06)",
 		file,
@@ -520,7 +522,9 @@ func literalForSchema(
 	if schemaIsBool(schema) {
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			diags.Warn(
+			diags.SchemaMetadataUnresolved(
+				structName,
+				fieldName,
 				"default tag on "+structName+"."+fieldName+" is not a valid bool: "+strconv.Quote(value),
 				file,
 				line,
@@ -533,7 +537,9 @@ func literalForSchema(
 	}
 	if schemaIsNumeric(schema) {
 		if !validNumber(value) {
-			diags.Warn(
+			diags.SchemaMetadataUnresolved(
+				structName,
+				fieldName,
 				"default tag on "+structName+"."+fieldName+" is not a valid number: "+strconv.Quote(value),
 				file,
 				line,
@@ -687,7 +693,9 @@ func parseExtensions(value string) []facts.Extension {
 }
 
 func invalidSchemaTag(diags *diag.Accumulator, structName, fieldName, key, value, file string, line uint32) {
-	diags.Warn(
+	diags.SchemaMetadataUnresolved(
+		structName,
+		fieldName,
 		"invalid schema tag on "+structName+"."+fieldName+": "+key+"="+strconv.Quote(value)+
 			" ignored by gnr8 metadata extraction (GO-06)",
 		file,

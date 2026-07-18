@@ -34,6 +34,10 @@ function hasDiag(substr) {
   return diags.items().some((d) => d.message.includes(substr));
 }
 
+function diagWith(substr) {
+  return diags.items().find((d) => d.message.includes(substr));
+}
+
 // ---------------------------------------------------------------------------
 // CR-01: a non-schema-bearing alias is never a dangling named ref.
 // ---------------------------------------------------------------------------
@@ -170,6 +174,12 @@ function hasDiag(substr) {
     hasDiag("computed property name cannot be statically resolved"),
     "a computed non-literal name must record a diagnostic (rule 3)"
   );
+  const diagnostic = diagWith(
+    "computed property name cannot be statically resolved"
+  );
+  assert.strictEqual(diagnostic.code, "schema.type.unresolved");
+  assert.strictEqual(diagnostic.category, "schema");
+  assert.ok(diagnostic.schema.endsWith(".NameCases"));
 })();
 
 // ---------------------------------------------------------------------------

@@ -655,7 +655,7 @@ diagnostics:
       end_line: 47
     operation: GET /list
     subject: aggregation
-  - code: source.unresolved
+  - code: source.route.unresolved
     severity: WARN
     category: source
     message: "unsupported Gin route pattern: dynamic Gin group prefix; prefix skipped rather than guessed (GO-04)"

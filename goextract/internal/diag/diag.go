@@ -131,7 +131,7 @@ func (a *Accumulator) RequestBodyUnresolved(subject, method, route, reason, file
 // a c.JSON(...) whose status or body could not be resolved to a constant/named
 // type. The response is diagnosed rather than guessed or silently dropped; there
 // is no secondary source to recover it from (CLAUDE.md rule 3).
-func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32) {
+func (a *Accumulator) DynamicResponse(method, route, handler, reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Code:     "response.schema.unresolved",
 		Severity: severityWarn,
@@ -141,7 +141,24 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 		File:      file,
 		Line:      line,
 		EndLine:   line,
-		Operation: handler,
+		Operation: method + " " + route,
+		Subject:   handler,
+	})
+}
+
+// ResponseSchemaUnresolved records a response body that cannot be represented
+// faithfully even though the route is known.
+func (a *Accumulator) ResponseSchemaUnresolved(method, route, subject, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.schema.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   message,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
 	})
 }
 
@@ -177,6 +194,48 @@ func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) 
 	})
 }
 
+// SourceRouteUnresolved records a lossy route/group pattern when the caller has
+// already described whether the route was skipped or emitted relatively.
+func (a *Accumulator) SourceRouteUnresolved(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.route.unresolved",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+	})
+}
+
+// SourceLoadUnresolved records a source package/file that could not be loaded.
+func (a *Accumulator) SourceLoadUnresolved(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.load.unresolved",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+	})
+}
+
+// SourceHandlerAmbiguous records a handler lookup collision that prevents an
+// unambiguous association between a recognized route and its source function.
+func (a *Accumulator) SourceHandlerAmbiguous(subject, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.handler.ambiguous",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+		Subject:  subject,
+	})
+}
+
 // UnsupportedType records that a struct field's declared type has no faithful
 // neutral primitive (e.g. complex64/128, uintptr, an untyped constant kind), so
 // the extractor lowers it to free-form `any` rather than guessing a concrete
@@ -199,8 +258,24 @@ func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string
 	})
 }
 
-// Warn records a generic warning. Used for go/packages load errors (GO-06) and
-// any rule that does not have a dedicated helper.
+// SchemaMetadataUnresolved records a schema tag/default that could not be
+// represented faithfully and was ignored or retained only as a string.
+func (a *Accumulator) SchemaMetadataUnresolved(structName, fieldName, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.metadata.unresolved",
+		Severity: severityWarn,
+		Category: categorySchema,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+		Schema:   structName,
+		Subject:  fieldName,
+	})
+}
+
+// Warn records a backwards-compatible generic warning for callers that do not
+// yet have a dedicated structured helper.
 func (a *Accumulator) Warn(message, file string, line uint32) {
 	a.WarnCode("source.unresolved", categorySource, message, file, line)
 }

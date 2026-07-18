@@ -43,8 +43,8 @@ class _ContextDiags:
         self._defaults = defaults
 
     def warn(self, message, file, line, **options):
-        merged = dict(self._defaults)
-        merged.update(options)
+        merged = dict(options)
+        merged.update(self._defaults)
         self._diags.warn(message, file, line, **merged)
 
 

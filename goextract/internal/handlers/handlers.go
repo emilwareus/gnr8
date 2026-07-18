@@ -202,7 +202,7 @@ func (a *Analyzer) ReportRouteHandlerCollisions(recognized []routes.Route, diags
 	}
 	for _, collision := range a.collisions {
 		if routeHandlers[collision.name] {
-			diags.Warn(collision.message, collision.file, collision.line)
+			diags.SourceHandlerAmbiguous(collision.name, collision.message, collision.file, collision.line)
 		}
 	}
 }
@@ -221,7 +221,7 @@ func BuildIndex(res *load.Result, diags *diag.Accumulator) Index {
 	idx, collisions := buildIndex(res)
 	if diags != nil {
 		for _, collision := range collisions {
-			diags.Warn(collision.message, collision.file, collision.line)
+			diags.SourceHandlerAmbiguous(collision.name, collision.message, collision.file, collision.line)
 		}
 	}
 	return idx
@@ -2617,7 +2617,7 @@ func (a *Analyzer) analyzeJSON(
 	status, ok := statusOf(h.info, call.Args[0])
 	if !ok {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		diags.DynamicResponse(route.Method, untypedRouteLabel(route), route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
 
@@ -2629,7 +2629,7 @@ func (a *Analyzer) analyzeJSON(
 		body = &facts.TypeRef{RefID: id}
 	} else {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.DynamicResponse(route.Handler, "response body does not resolve to a named type", file, line)
+		diags.DynamicResponse(route.Method, untypedRouteLabel(route), route.Handler, "response body does not resolve to a named type", file, line)
 	}
 	file, line := positionOf(h.fset, call.Pos())
 	a.addJSONResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
@@ -2655,7 +2655,7 @@ func (a *Analyzer) analyzeStatus(
 	status, ok := statusOf(h.info, call.Args[0])
 	if !ok {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		diags.DynamicResponse(route.Method, untypedRouteLabel(route), route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
 	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{Status: status}, provisional)
@@ -2726,12 +2726,12 @@ func (a *Analyzer) analyzeData(
 	status, ok := statusOf(h.info, call.Args[0])
 	if !ok {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		diags.DynamicResponse(route.Method, untypedRouteLabel(route), route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
 	if !isByteSlice(h.info.TypeOf(call.Args[2])) {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.Warn("unsupported binary response pattern: Gin Data payload is not []byte (GO-05)", file, line)
+		diags.ResponseSchemaUnresolved(route.Method, untypedRouteLabel(route), route.Handler, "unsupported binary response pattern: Gin Data payload is not []byte (GO-05)", file, line)
 		return
 	}
 	contentType := "application/octet-stream"
@@ -2764,7 +2764,7 @@ func (a *Analyzer) analyzeDataFromReader(
 	status, ok := statusOf(h.info, call.Args[0])
 	if !ok {
 		file, line := positionOf(h.fset, call.Pos())
-		diags.DynamicResponse(route.Handler, "non-constant HTTP status", file, line)
+		diags.DynamicResponse(route.Method, untypedRouteLabel(route), route.Handler, "non-constant HTTP status", file, line)
 		return
 	}
 	contentType := "application/octet-stream"
@@ -2840,7 +2840,7 @@ func (a *Analyzer) addJSONResponse(
 		cf.Responses[idx] = response
 	case newPriority == existingPriority && newPriority >= 3 && response.Body != nil && existing.Body != nil && response.Body.RefID != existing.Body.RefID:
 		if diags != nil {
-			diags.Warn("conflicting typed success responses for "+route.Handler+" status "+strconv.FormatUint(uint64(response.Status), 10)+"; keeping first response body "+existing.Body.RefID+" (GO-05)", file, line)
+			diags.ResponseSchemaUnresolved(route.Method, untypedRouteLabel(route), route.Handler, "conflicting typed success responses for "+route.Handler+" status "+strconv.FormatUint(uint64(response.Status), 10)+"; keeping first response body "+existing.Body.RefID+" (GO-05)", file, line)
 		}
 	}
 }

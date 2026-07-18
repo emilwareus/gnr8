@@ -34,6 +34,11 @@ const ts = require("./ts");
 
 const load = require("./load");
 
+const _SCHEMA_TYPE_DIAGNOSTIC = {
+  code: "schema.type.unresolved",
+  category: "schema",
+};
+
 function _prim(prim, extra) {
   return { type: "primitive", of: Object.assign({ prim: prim }, extra || {}) };
 }
@@ -216,7 +221,8 @@ function _mapResidual(loaded, residual, fullAlias, diags, registry, file, line) 
   diags.warn(
     "unsupported type: no non-null/undefined arms; fact omitted (no fallback)",
     file,
-    line
+    line,
+    _SCHEMA_TYPE_DIAGNOSTIC
   );
   return null;
 }
@@ -249,7 +255,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
       diags.warn(
         "unsupported array type: element type unresolved; fact omitted (no fallback)",
         file,
-        line
+        line,
+        _SCHEMA_TYPE_DIAGNOSTIC
       );
       return null;
     }
@@ -282,7 +289,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
             checker.typeToString(t) +
             "': non-string key cannot be a deterministic map key; fact omitted (no fallback)",
           file,
-          line
+          line,
+          _SCHEMA_TYPE_DIAGNOSTIC
         );
         return null;
       }
@@ -323,7 +331,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
       checker.typeToString(t) +
       "': not a primitive/array/class/enum; fact omitted (no fallback)",
     file,
-    line
+    line,
+    _SCHEMA_TYPE_DIAGNOSTIC
   );
   return null;
 }
@@ -361,7 +370,8 @@ function _registerAlias(loaded, aliasSym, diags, registry, file, line) {
         info.name +
         "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
       file,
-      line
+      line,
+      _SCHEMA_TYPE_DIAGNOSTIC
     );
     return null;
   }
@@ -391,7 +401,8 @@ function _registerClass(loaded, sym, diags, registry, file, line) {
         info.name +
         "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
       file,
-      line
+      line,
+      _SCHEMA_TYPE_DIAGNOSTIC
     );
     return null;
   }

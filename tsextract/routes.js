@@ -45,7 +45,7 @@ const _BODY_DECORATOR = "Body"; // -> request_body (a TypeRef), NOT a param
 function _diagnosticsWithContext(diags, defaults) {
   return {
     warn(message, file, line, options = {}) {
-      diags.warn(message, file, line, { ...defaults, ...options });
+      diags.warn(message, file, line, { ...options, ...defaults });
     },
   };
 }

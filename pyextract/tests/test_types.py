@@ -105,6 +105,8 @@ class MappingArityTests(unittest.TestCase):
         items = diags.items()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["severity"], "WARN")
+        self.assertEqual(items[0]["code"], "schema.type.unresolved")
+        self.assertEqual(items[0]["category"], "schema")
         self.assertIn("exactly two type args", items[0]["message"])
         # rule 3: NEVER the fabricated string -> any default.
         self.assertNotEqual(
@@ -308,6 +310,8 @@ class NamedRefTests(unittest.TestCase):
         items = diags.items()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["severity"], "WARN")
+        self.assertEqual(items[0]["code"], "schema.type.unresolved")
+        self.assertEqual(items[0]["category"], "schema")
         self.assertNotEqual(t, {"type": "any", "of": {}})
 
 
