@@ -169,7 +169,7 @@ struct CanonicalOperation {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "OpenAPI parameters expose independent required, deprecated, explode, and allowReserved flags"
+    reason = "OpenAPI parameters expose independent required, deprecated, explode, allowReserved, and allowEmptyValue flags"
 )]
 struct CanonicalParameter {
     name: String,
@@ -180,6 +180,7 @@ struct CanonicalParameter {
     style: String,
     explode: bool,
     allow_reserved: bool,
+    allow_empty_value: bool,
     schema: Value,
     examples: Option<Value>,
     extensions: BTreeMap<String, Value>,
@@ -612,6 +613,10 @@ impl Canonicalizer {
                         .get("allowReserved")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    allow_empty_value: parameter
+                        .get("allowEmptyValue")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     schema,
                     examples: parameter
                         .get("examples")
@@ -861,13 +866,24 @@ impl Canonicalizer {
                 continue;
             };
             let schema = parameter_schema(self.document.version, header);
+            let (style, mut explode) =
+                parameter_serialization(self.document.version, header, "header");
+            if !schema_is_collection(&schema) {
+                explode = false;
+            }
             let mut canonical = Map::new();
             if let Some(description) = optional_string(header.get("description")) {
                 canonical.insert("description".to_string(), Value::String(description));
             }
             canonical.insert("schema".to_string(), schema);
-            canonical.insert("style".to_string(), Value::String("simple".to_string()));
-            canonical.insert("explode".to_string(), Value::Bool(false));
+            canonical.insert("style".to_string(), Value::String(style));
+            canonical.insert("explode".to_string(), Value::Bool(explode));
+            for field in ["required", "deprecated"] {
+                canonical.insert(
+                    field.to_string(),
+                    Value::Bool(header.get(field).and_then(Value::as_bool).unwrap_or(false)),
+                );
+            }
             if let Some(examples) = header.get("examples").or_else(|| header.get("example")) {
                 canonical.insert("examples".to_string(), normalize_generic(examples));
             }
@@ -2371,6 +2387,46 @@ components:
         let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
             .expect("compare documents");
         assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn parameter_allow_empty_value_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"parameters":[{"name":"filter","in":"query","allowEmptyValue":false,"schema":{"type":"string"}}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"parameters":[{"name":"filter","in":"query","allowEmptyValue":true,"schema":{"type":"string"}}],"responses":{"204":{"description":"ok"}}}}}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report
+            .differences
+            .iter()
+            .any(|difference| difference.code == "parameter.allow_empty_value.changed"));
+    }
+
+    #[test]
+    fn response_header_explode_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"responses":{"200":{"description":"ok","headers":{"X-Values":{"explode":false,"schema":{"type":"array","items":{"type":"string"}}}}}}}}}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/x":{"get":{"responses":{"200":{"description":"ok","headers":{"X-Values":{"explode":true,"schema":{"type":"array","items":{"type":"string"}}}}}}}}}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report
+            .differences
+            .iter()
+            .any(|difference| { difference.code == "response.headers.x-values.explode.changed" }));
     }
 
     #[test]
