@@ -796,12 +796,8 @@ impl Importer {
                         }
                         SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
                             .request_body_schema_ref(operation, &operation_id)
-                            .map(|(schema_ref, media_type)| {
-                                request_body_required = operation
-                                    .get("requestBody")
-                                    .and_then(|body| body.get("required"))
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
+                            .map(|(schema_ref, media_type, required)| {
+                                request_body_required = required;
                                 if media_type != "application/json" {
                                     request_body_content_type = Some(media_type);
                                 }
@@ -983,24 +979,33 @@ impl Importer {
         &mut self,
         operation: &Value,
         operation_id: &str,
-    ) -> Option<(SchemaRef, String)> {
-        let request_body = operation.get("requestBody")?;
-        if request_body.get("$ref").is_some() {
-            self.warn(format!(
-                "requestBody $ref on operation '{operation_id}' is not imported yet"
-            ));
-            return None;
+    ) -> Option<(SchemaRef, String, bool)> {
+        let mut request_body = operation.get("requestBody")?.clone();
+        if let Some(ref_value) = request_body.get("$ref").and_then(Value::as_str) {
+            let Some(resolved) = self.resolve_ref_value(ref_value) else {
+                self.warn_request_body(
+                    operation_id,
+                    ref_value,
+                    "the requestBody reference could not be resolved",
+                );
+                return None;
+            };
+            request_body = resolved;
         }
         let Some(content) = request_body.get("content").and_then(Value::as_object) else {
-            self.warn(format!(
-                "requestBody on operation '{operation_id}' has no content object"
-            ));
+            self.warn_request_body(
+                operation_id,
+                "requestBody",
+                "the requestBody has no content object",
+            );
             return None;
         };
         let Some((media_type, media)) = choose_content(content) else {
-            self.warn(format!(
-                "requestBody on operation '{operation_id}' has no supported media type"
-            ));
+            self.warn_request_body(
+                operation_id,
+                "requestBody",
+                "the requestBody has no supported media type",
+            );
             return None;
         };
         if !is_supported_request_media(media_type) {
@@ -1009,14 +1014,20 @@ impl Importer {
             ));
         }
         let Some(schema) = media.get("schema") else {
-            self.warn(format!(
-                "requestBody media type '{media_type}' on operation '{operation_id}' has no schema"
-            ));
+            self.warn_request_body(
+                operation_id,
+                media_type,
+                "the selected request media type has no schema",
+            );
             return None;
         };
         Some((
             self.schema_ref_for(schema, &format!("{operation_id}Request")),
             media_type.to_string(),
+            request_body
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ))
     }
 
@@ -1626,6 +1637,21 @@ impl Importer {
             )
             .operation(operation_id)
             .subject(format!("{status} {media_type}")),
+        );
+    }
+
+    fn warn_request_body(&mut self, operation_id: &str, subject: &str, reason: &str) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "request.body.unresolved",
+                DiagnosticCategory::RequestBody,
+                "WARN",
+                format!("request body on operation '{operation_id}' is unresolved: {reason}"),
+                span,
+            )
+            .operation(operation_id)
+            .subject(subject),
         );
     }
 
@@ -2333,6 +2359,67 @@ paths:
         assert!(params
             .iter()
             .any(|param| param.name == "X-Trace-Id" && param.location == "header"));
+    }
+
+    #[test]
+    fn imports_referenced_request_bodies_with_requiredness() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Upload API, version: 1.0.0 }
+paths:
+  /uploads:
+    post:
+      operationId: createUpload
+      requestBody: { $ref: '#/components/requestBodies/Upload' }
+      responses: { '204': { description: ok } }
+components:
+  requestBodies:
+    Upload:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Upload' }
+  schemas:
+    Upload:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let operation = &graph.operations[0];
+        assert!(operation.request_body_required);
+        assert_eq!(
+            operation
+                .request_body
+                .as_ref()
+                .map(|schema| schema.ref_id.as_str()),
+            Some("Upload")
+        );
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let unresolved = text.replace(
+            "#/components/requestBodies/Upload",
+            "#/components/requestBodies/Missing",
+        );
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            &unresolved,
+        )
+        .unwrap();
+        assert!(graph.operations[0].request_body.is_none());
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.body.unresolved"
+                && diagnostic.operation.as_deref() == Some("createUpload")
+                && diagnostic.subject.as_deref() == Some("#/components/requestBodies/Missing")
+        }));
     }
 
     #[test]
