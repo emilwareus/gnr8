@@ -1439,6 +1439,10 @@ fn normalize_schema(value: &Value) -> Value {
     let Value::Object(object) = value else {
         return normalize_generic(value);
     };
+    let (skip_minimum, exclusive_minimum) =
+        canonical_exclusive_bound(object, "minimum", "exclusiveMinimum");
+    let (skip_maximum, exclusive_maximum) =
+        canonical_exclusive_bound(object, "maximum", "exclusiveMaximum");
     let mut nullable = object
         .get("nullable")
         .or_else(|| object.get("x-nullable"))
@@ -1447,6 +1451,26 @@ fn normalize_schema(value: &Value) -> Value {
     let mut out = Map::new();
     for (key, value) in object {
         if matches!(key.as_str(), "nullable" | "x-nullable") {
+            continue;
+        }
+        if (key == "minimum" && skip_minimum) || (key == "maximum" && skip_maximum) {
+            continue;
+        }
+        if key == "exclusiveMinimum" {
+            if let Some(value) = &exclusive_minimum {
+                out.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+        if key == "exclusiveMaximum" {
+            if let Some(value) = &exclusive_maximum {
+                out.insert(key.clone(), value.clone());
+            }
+            continue;
+        }
+        if key == "additionalProperties"
+            && (value.as_bool() == Some(true) || value.as_object().is_some_and(Map::is_empty))
+        {
             continue;
         }
         if key == "$ref" {
@@ -1481,40 +1505,69 @@ fn normalize_schema(value: &Value) -> Value {
                 continue;
             }
         }
-        let normalized = match key.as_str() {
-            "properties" => Value::Object(
-                value
-                    .as_object()
-                    .into_iter()
-                    .flatten()
-                    .map(|(name, schema)| (name.clone(), normalize_schema(schema)))
-                    .collect(),
-            ),
-            "items" | "additionalProperties" | "not" => normalize_schema(value),
-            "allOf" | "anyOf" | "oneOf" => {
-                let mut items = value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(normalize_schema)
-                    .collect::<Vec<_>>();
-                items.sort_by_key(value_sort_key);
-                Value::Array(items)
-            }
-            "required" | "enum" => {
-                let mut items = value.as_array().cloned().unwrap_or_default();
-                items.sort_by_key(value_sort_key);
-                items.dedup();
-                Value::Array(items)
-            }
-            _ => normalize_generic(value),
-        };
+        let normalized = normalize_schema_keyword(key, value);
         out.insert(key.clone(), normalized);
     }
     if nullable {
         out.insert("x-gnr8-nullable".to_string(), Value::Bool(true));
     }
     Value::Object(out)
+}
+
+fn normalize_schema_keyword(key: &str, value: &Value) -> Value {
+    match key {
+        "properties" => Value::Object(
+            value
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, schema)| (name.clone(), normalize_schema(schema)))
+                .collect(),
+        ),
+        "items" | "additionalProperties" | "not" => normalize_schema(value),
+        "discriminator" => value.as_str().map_or_else(
+            || normalize_generic(value),
+            |property| {
+                Value::Object(Map::from_iter([(
+                    "propertyName".to_string(),
+                    Value::String(property.to_string()),
+                )]))
+            },
+        ),
+        "allOf" | "anyOf" | "oneOf" => {
+            let mut items = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(normalize_schema)
+                .collect::<Vec<_>>();
+            items.sort_by_key(value_sort_key);
+            Value::Array(items)
+        }
+        "required" | "enum" => {
+            let mut items = value.as_array().cloned().unwrap_or_default();
+            items.sort_by_key(value_sort_key);
+            items.dedup();
+            Value::Array(items)
+        }
+        _ => normalize_generic(value),
+    }
+}
+
+fn canonical_exclusive_bound(
+    schema: &Map<String, Value>,
+    inclusive: &str,
+    exclusive: &str,
+) -> (bool, Option<Value>) {
+    match schema.get(exclusive) {
+        Some(Value::Bool(true)) => schema
+            .get(inclusive)
+            .map_or((false, Some(Value::Bool(true))), |bound| {
+                (true, Some(bound.clone()))
+            }),
+        Some(Value::Bool(false)) | None => (false, None),
+        Some(bound) => (false, Some(bound.clone())),
+    }
 }
 
 fn normalize_reference(reference: &str) -> String {
@@ -2196,6 +2249,23 @@ components:
         );
         let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
             .expect("compare documents");
+        assert!(report.compatible, "differences: {:?}", report.differences);
+    }
+
+    #[test]
+    fn swagger_and_openapi_schema_dialect_forms_compare_equal() {
+        let swagger = parsed(
+            "old.json",
+            r#"{"swagger":"2.0","info":{"title":"Schemas","version":"1"},"paths":{},"definitions":{"Score":{"type":"number","minimum":1,"exclusiveMinimum":true},"Pet":{"type":"object","discriminator":"kind","properties":{"kind":{"type":"string"}}},"Metadata":{"type":"object","additionalProperties":true}}}"#,
+        );
+        let openapi = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Schemas","version":"1"},"paths":{},"components":{"schemas":{"Score":{"type":"number","exclusiveMinimum":1},"Pet":{"type":"object","discriminator":{"propertyName":"kind"},"properties":{"kind":{"type":"string"}}},"Metadata":{"type":"object"}}}}"#,
+        );
+
+        let report = compare_documents(swagger, openapi, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
         assert!(report.compatible, "differences: {:?}", report.differences);
     }
 
