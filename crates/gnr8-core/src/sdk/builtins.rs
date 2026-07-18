@@ -42,6 +42,7 @@ use crate::CoreError;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------------------------------
@@ -5524,13 +5525,7 @@ impl FormatCommand {
 
 impl PostProcess for FormatCommand {
     fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
-        let temp = unique_postprocess_dir(&cx.project_root)?;
-        std::fs::create_dir_all(&temp).map_err(|err| CoreError::Io {
-            message: format!(
-                "failed to create post-write temp dir {}: {err}",
-                temp.display()
-            ),
-        })?;
+        let temp = create_unique_postprocess_dir(&cx.project_root)?;
         let result = self.run_in_temp(out, &temp);
         let cleanup = std::fs::remove_dir_all(&temp);
         match (result, cleanup) {
@@ -5631,20 +5626,42 @@ impl FormatCommand {
     }
 }
 
-fn unique_postprocess_dir(project_root: &Path) -> Result<PathBuf, CoreError> {
+static POSTPROCESS_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_unique_postprocess_dir(project_root: &Path) -> Result<PathBuf, CoreError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| CoreError::Io {
             message: format!("system clock before Unix epoch: {err}"),
         })?
         .as_nanos();
-    Ok(std::env::temp_dir().join(format!(
-        "gnr8-post-write-{}-{nanos}",
-        project_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("project")
-    )))
+    let project = project_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    for _ in 0..128 {
+        let sequence = POSTPROCESS_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "gnr8-post-write-{project}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    message: format!(
+                        "failed to create post-write temp dir {}: {err}",
+                        candidate.display()
+                    ),
+                });
+            }
+        }
+    }
+    Err(CoreError::Io {
+        message: "failed to allocate a unique post-write temp directory after 128 attempts"
+            .to_string(),
+    })
 }
 
 fn temp_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, CoreError> {
@@ -6183,14 +6200,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
-        DiagnosticPolicy, DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin,
-        GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json,
-        OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaAliases, OpenApiSchemaPatch,
-        OperationSelector, ParameterOverride, PostProcess, PySdk, QueryParam, RequestParameter,
-        ResponseOverride, SdkOperationAliases, SdkPackageMetadata, SecurityOverride, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source,
-        StaticFiles, Target, Transform, TsSdk,
+        create_unique_postprocess_dir, sdk_package, ApiOverrides, ApplySecurity,
+        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, DocumentOperation,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata,
+        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, ParameterOverride,
+        PostProcess, PySdk, QueryParam, RequestParameter, ResponseOverride, SdkOperationAliases,
+        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
@@ -9242,6 +9260,30 @@ func (s Server) create(c *gin.Context) {
             artifact.text,
             "{\"openapi\":\"3.1.0\",\"formatted\":true}\n"
         );
+    }
+
+    #[test]
+    fn format_command_allocates_unique_temp_dirs_concurrently() {
+        const WORKERS: usize = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_unique_postprocess_dir(std::path::Path::new("/tmp/project"))
+                })
+            })
+            .collect();
+        let paths: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        let unique: std::collections::BTreeSet<_> = paths.iter().cloned().collect();
+        for path in &unique {
+            std::fs::remove_dir(path).unwrap();
+        }
+        assert_eq!(unique.len(), WORKERS);
     }
 
     #[test]
