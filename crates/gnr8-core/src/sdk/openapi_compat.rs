@@ -292,6 +292,13 @@ impl Canonicalizer {
                 metadata.insert(format!("info.{key}"), value);
             }
         }
+        for container in ["paths", "webhooks"] {
+            if let Some(object) = self.document.root.get(container).and_then(Value::as_object) {
+                for (key, value) in all_extensions(object) {
+                    metadata.insert(format!("{container}.{key}"), value);
+                }
+            }
+        }
         metadata
     }
 
@@ -2700,6 +2707,26 @@ components:
         assert!(report.differences.iter().any(|difference| {
             difference.code == "path.item.summary.changed"
                 && difference.location == "/paths/~1events/summary"
+        }));
+    }
+
+    #[test]
+    fn paths_object_extension_change_is_reported() {
+        let old = parsed(
+            "old.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Paths","version":"1"},"paths":{"x-display":"old"}}"#,
+        );
+        let new = parsed(
+            "new.json",
+            r#"{"openapi":"3.1.0","info":{"title":"Paths","version":"1"},"paths":{"x-display":"new"}}"#,
+        );
+
+        let report = compare_documents(old, new, OpenApiCompatibilityPolicy::Exact)
+            .expect("compare documents");
+
+        assert!(report.differences.iter().any(|difference| {
+            difference.code == "metadata.changed"
+                && difference.location == "/metadata/paths.x-display"
         }));
     }
 
