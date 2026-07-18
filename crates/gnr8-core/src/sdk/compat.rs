@@ -5559,7 +5559,11 @@ fn collect_go_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
         let path = entry.path();
         let file_type = sdk_entry_file_type(&entry, "Go SDK")?;
         if file_type.is_dir() {
-            if path.file_name().and_then(|name| name.to_str()) == Some("vendor") {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_ignored_go_directory)
+            {
                 continue;
             }
             collect_go_files(root, &path, out)?;
@@ -5580,6 +5584,12 @@ fn collect_go_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
         }
     }
     Ok(())
+}
+
+fn is_ignored_go_directory(name: &str) -> bool {
+    matches!(name, "vendor" | "internal" | "testdata")
+        || name.starts_with('.')
+        || name.starts_with('_')
 }
 
 fn go_package_metadata(dir: &Path) -> Result<BTreeMap<String, String>, CoreError> {
@@ -7136,6 +7146,40 @@ type Handler func(ctx string, req *Request) (result *Response, failure error)
         assert_eq!(
             diff.exported_method_signature_changes[0].symbol,
             "models.Client.ValueOrDefault"
+        );
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_surface_excludes_non_importable_package_directories() {
+        let old = temp_dir("go-private-packages-old");
+        let new = temp_dir("go-private-packages-new");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+            std::fs::write(
+                dir.join("client.go"),
+                "package sdk\n\ntype Client struct{}\n",
+            )
+            .unwrap();
+        }
+        for private_dir in ["internal", "testdata", "_scratch", ".generated"] {
+            let path = old.join(private_dir);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("legacy.go"),
+                "package private\n\ntype Legacy struct{}\nfunc LegacyHelper() {}\n",
+            )
+            .unwrap();
+        }
+
+        let old_surface = extract_go_surface(&old).unwrap();
+        assert_eq!(old_surface.exported_types, vec!["Client"]);
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert!(
+            !diff.is_breaking(),
+            "Go-ignored and internal packages are not public SDK surface: {diff:?}"
         );
 
         let _ = std::fs::remove_dir_all(old);
