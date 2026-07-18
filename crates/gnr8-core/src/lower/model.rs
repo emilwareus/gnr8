@@ -84,14 +84,20 @@ pub(crate) struct SecurityRequirement {
 pub(crate) struct PathItem {
     /// `GET` operation, if any.
     pub get: Option<Operation>,
-    /// `POST` operation, if any.
-    pub post: Option<Operation>,
     /// `PUT` operation, if any.
     pub put: Option<Operation>,
-    /// `PATCH` operation, if any.
-    pub patch: Option<Operation>,
+    /// `POST` operation, if any.
+    pub post: Option<Operation>,
     /// `DELETE` operation, if any.
     pub delete: Option<Operation>,
+    /// `OPTIONS` operation, if any.
+    pub options: Option<Operation>,
+    /// `HEAD` operation, if any.
+    pub head: Option<Operation>,
+    /// `PATCH` operation, if any.
+    pub patch: Option<Operation>,
+    /// `TRACE` operation, if any.
+    pub trace: Option<Operation>,
 }
 
 /// One HTTP operation (an `operationId` + its params/body/responses).

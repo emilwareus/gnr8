@@ -126,10 +126,13 @@ fn write_path_item(item: &PathItem) -> Value {
     let mut out = Map::new();
     for (method, op) in [
         ("get", &item.get),
-        ("post", &item.post),
         ("put", &item.put),
-        ("patch", &item.patch),
+        ("post", &item.post),
         ("delete", &item.delete),
+        ("options", &item.options),
+        ("head", &item.head),
+        ("patch", &item.patch),
+        ("trace", &item.trace),
     ] {
         if let Some(op) = op {
             out.insert(method.to_string(), write_operation(op));

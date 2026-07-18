@@ -340,7 +340,7 @@ impl Importer {
                 continue;
             };
             for (method, operation) in path_item {
-                if !is_http_method(method) || !is_lowerable_method(method) {
+                if !is_http_method(method) {
                     continue;
                 }
                 let Some(operation_object) = operation.as_object() else {
@@ -440,7 +440,7 @@ impl Importer {
                 continue;
             };
             for (method, operation) in path_item {
-                if !is_http_method(method) || !is_lowerable_method(method) {
+                if !is_http_method(method) {
                     continue;
                 }
                 let Some(operation_object) = operation.as_object() else {
@@ -696,15 +696,6 @@ impl Importer {
                 .unwrap_or_default();
             for (method, operation) in item_object {
                 if !is_http_method(method) {
-                    continue;
-                }
-                if !is_lowerable_method(method) {
-                    self.warn(format!(
-                        "operation {} {} uses HTTP method '{}', which gnr8 cannot lower yet",
-                        method.to_uppercase(),
-                        path,
-                        method.to_uppercase()
-                    ));
                     continue;
                 }
                 let Some(operation_object) = operation.as_object() else {
@@ -2330,10 +2321,6 @@ fn is_http_method(method: &str) -> bool {
     )
 }
 
-fn is_lowerable_method(method: &str) -> bool {
-    matches!(method, "get" | "put" | "post" | "patch" | "delete")
-}
-
 fn normalize_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "/" {
@@ -3504,31 +3491,70 @@ paths:
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-numeric response key"));
+    }
 
-        let unsupported_method = r"
+    #[test]
+    fn imports_and_lowers_every_openapi_http_method() {
+        let text = r"
 openapi: 3.1.0
-info: { title: Default Response API, version: 1.0.0 }
+info: { title: Methods API, version: 1.0.0 }
 paths:
   /items:
-    options:
-      operationId: itemOptions
-      responses:
-        default:
-          description: fallback
     get:
-      operationId: listItems
-      responses:
-        '204':
-          description: ok
+      operationId: getItems
+      responses: { '204': { description: ok } }
+    put:
+      operationId: putItems
+      responses: { '204': { description: ok } }
+    post:
+      operationId: postItems
+      responses: { '204': { description: ok } }
+    delete:
+      operationId: deleteItems
+      responses: { '204': { description: ok } }
+    options:
+      operationId: optionsItems
+      responses: { '204': { description: ok } }
+    head:
+      operationId: headItems
+      responses: { '204': { description: ok } }
+    patch:
+      operationId: patchItems
+      responses: { '204': { description: ok } }
+    trace:
+      operationId: traceItems
+      responses: { '204': { description: ok } }
 ";
         let graph = import_openapi_document(
             std::path::Path::new("."),
             std::path::PathBuf::from("openapi.yaml"),
-            unsupported_method,
+            text,
         )
         .unwrap();
-        assert_eq!(graph.operations.len(), 1);
-        assert_eq!(graph.operations[0].id, "listItems");
+        let methods = graph
+            .operations
+            .iter()
+            .map(|operation| operation.method.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            methods,
+            std::collections::BTreeSet::from([
+                "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"
+            ])
+        );
+
+        let yaml = to_openapi(&graph, "Methods API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        for method in [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ] {
+            assert!(
+                emitted
+                    .pointer(&format!("/paths/~1items/{method}"))
+                    .is_some(),
+                "generated OpenAPI omitted {method}: {yaml}"
+            );
+        }
     }
 
     #[test]

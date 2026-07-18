@@ -356,10 +356,13 @@ fn place_operation(
 ) -> Result<(), crate::CoreError> {
     let slot = match method {
         "GET" => &mut item.get,
-        "POST" => &mut item.post,
         "PUT" => &mut item.put,
-        "PATCH" => &mut item.patch,
+        "POST" => &mut item.post,
         "DELETE" => &mut item.delete,
+        "OPTIONS" => &mut item.options,
+        "HEAD" => &mut item.head,
+        "PATCH" => &mut item.patch,
+        "TRACE" => &mut item.trace,
         other => {
             return Err(crate::CoreError::Lowering {
                 message: format!("unsupported HTTP method '{other}' for operation lowering"),

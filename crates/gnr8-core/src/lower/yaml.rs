@@ -129,10 +129,13 @@ fn write_path_item(out: &mut String, item: &PathItem, depth: usize) {
     let pad = INDENT.repeat(depth);
     for (method, op) in [
         ("get", &item.get),
-        ("post", &item.post),
         ("put", &item.put),
-        ("patch", &item.patch),
+        ("post", &item.post),
         ("delete", &item.delete),
+        ("options", &item.options),
+        ("head", &item.head),
+        ("patch", &item.patch),
+        ("trace", &item.trace),
     ] {
         if let Some(op) = op {
             let _ = writeln!(out, "{pad}{method}:");
