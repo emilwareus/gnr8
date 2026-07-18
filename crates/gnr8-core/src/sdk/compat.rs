@@ -288,18 +288,24 @@ pub struct CompatibilityAllow {
 pub struct GoCompatibilityContract {
     /// Exported types that must exist in the candidate SDK.
     pub require_exported_types: Vec<String>,
+    /// Exported constants and variables that must exist in the candidate SDK.
+    pub require_exported_values: Vec<String>,
     /// Exported functions that must exist in the candidate SDK.
     pub require_exported_functions: Vec<String>,
     /// Exported methods that must exist in the candidate SDK.
     pub require_exported_methods: Vec<String>,
     /// Missing exported types that are explicitly approved.
     pub allow_missing_exported_types: Vec<String>,
+    /// Missing exported constants and variables that are explicitly approved.
+    pub allow_missing_exported_values: Vec<String>,
     /// Missing exported functions that are explicitly approved.
     pub allow_missing_exported_functions: Vec<String>,
     /// Missing exported methods that are explicitly approved.
     pub allow_missing_exported_methods: Vec<String>,
     /// Exported type declaration changes that are explicitly approved, keyed by type name.
     pub allow_exported_type_changes: Vec<String>,
+    /// Exported constant and variable declaration changes that are explicitly approved.
+    pub allow_exported_value_changes: Vec<String>,
     /// Exported function signature changes that are explicitly approved, keyed by function name.
     pub allow_exported_function_signature_changes: Vec<String>,
     /// Exported method signature changes that are explicitly approved, keyed by `Receiver.Method`.
@@ -363,6 +369,8 @@ pub struct GoSurface {
     pub exported_types: Vec<String>,
     /// Canonical exported type declarations keyed by type name.
     pub exported_type_declarations: BTreeMap<String, String>,
+    /// Canonical exported constant and variable declarations keyed by symbol name.
+    pub exported_values: BTreeMap<String, String>,
     /// Exported function signatures keyed by function name.
     pub exported_functions: BTreeMap<String, String>,
     /// Exported method signatures keyed by `Receiver.Method`.
@@ -378,12 +386,16 @@ pub struct GoSurface {
 pub struct GoSurfaceDiff {
     /// Exported types present in old but missing in new.
     pub missing_exported_types: Vec<String>,
+    /// Exported constants and variables present in old but missing in new.
+    pub missing_exported_values: Vec<String>,
     /// Exported functions present in old but missing in new.
     pub missing_exported_functions: Vec<String>,
     /// Exported methods present in old but missing in new.
     pub missing_exported_methods: Vec<String>,
     /// Exported type declarations whose public shape changed.
     pub exported_type_changes: Vec<GoTypeDeclarationChange>,
+    /// Exported constant and variable declarations whose public shape or value changed.
+    pub exported_value_changes: Vec<GoValueDeclarationChange>,
     /// Exported function signatures changed.
     pub exported_function_signature_changes: Vec<GoSignatureChange>,
     /// Exported method signatures changed.
@@ -399,9 +411,11 @@ impl GoSurfaceDiff {
     #[must_use]
     pub fn is_breaking(&self) -> bool {
         !self.missing_exported_types.is_empty()
+            || !self.missing_exported_values.is_empty()
             || !self.missing_exported_functions.is_empty()
             || !self.missing_exported_methods.is_empty()
             || !self.exported_type_changes.is_empty()
+            || !self.exported_value_changes.is_empty()
             || !self.exported_function_signature_changes.is_empty()
             || !self.exported_method_signature_changes.is_empty()
             || !self.missing_docs.is_empty()
@@ -412,9 +426,11 @@ impl GoSurfaceDiff {
     #[must_use]
     pub fn has_code_breaks(&self) -> bool {
         !self.missing_exported_types.is_empty()
+            || !self.missing_exported_values.is_empty()
             || !self.missing_exported_functions.is_empty()
             || !self.missing_exported_methods.is_empty()
             || !self.exported_type_changes.is_empty()
+            || !self.exported_value_changes.is_empty()
             || !self.exported_function_signature_changes.is_empty()
             || !self.exported_method_signature_changes.is_empty()
             || !self.package_metadata_changes.is_empty()
@@ -468,6 +484,17 @@ pub struct GoSignatureChange {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GoTypeDeclarationChange {
     /// Exported type name.
+    pub symbol: String,
+    /// Old canonical declaration.
+    pub old: String,
+    /// New canonical declaration.
+    pub new: String,
+}
+
+/// Changed Go exported constant or variable declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GoValueDeclarationChange {
+    /// Exported constant or variable name.
     pub symbol: String,
     /// Old canonical declaration.
     pub old: String,
@@ -615,6 +642,12 @@ pub fn evaluate_go_contract(
         &mut missing_required,
     );
     require_map_keys(
+        "go.require_exported_values",
+        &contract.require_exported_values,
+        &new.exported_values,
+        &mut missing_required,
+    );
+    require_map_keys(
         "go.require_exported_functions",
         &contract.require_exported_functions,
         &new.exported_functions,
@@ -635,6 +668,12 @@ pub fn evaluate_go_contract(
         &mut stale_allowances,
     );
     stale_string_allowances(
+        "go.allow_missing_exported_values",
+        &contract.allow_missing_exported_values,
+        &diff.missing_exported_values,
+        &mut stale_allowances,
+    );
+    stale_string_allowances(
         "go.allow_missing_exported_functions",
         &contract.allow_missing_exported_functions,
         &diff.missing_exported_functions,
@@ -650,6 +689,12 @@ pub fn evaluate_go_contract(
         "go.allow_exported_type_changes",
         &contract.allow_exported_type_changes,
         &diff.exported_type_changes,
+        &mut stale_allowances,
+    );
+    stale_go_value_allowances(
+        "go.allow_exported_value_changes",
+        &contract.allow_exported_value_changes,
+        &diff.exported_value_changes,
         &mut stale_allowances,
     );
     stale_signature_allowances(
@@ -682,6 +727,10 @@ pub fn evaluate_go_contract(
             &diff.missing_exported_types,
             &contract.allow_missing_exported_types,
         ),
+        missing_exported_values: filter_allowed_strings(
+            &diff.missing_exported_values,
+            &contract.allow_missing_exported_values,
+        ),
         missing_exported_functions: filter_allowed_strings(
             &diff.missing_exported_functions,
             &contract.allow_missing_exported_functions,
@@ -693,6 +742,10 @@ pub fn evaluate_go_contract(
         exported_type_changes: filter_allowed_go_type_changes(
             &diff.exported_type_changes,
             &contract.allow_exported_type_changes,
+        ),
+        exported_value_changes: filter_allowed_go_value_changes(
+            &diff.exported_value_changes,
+            &contract.allow_exported_value_changes,
         ),
         exported_function_signature_changes: filter_allowed_signature_changes(
             &diff.exported_function_signature_changes,
@@ -949,6 +1002,7 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
 
     let mut exported_types = BTreeSet::new();
     let mut exported_type_declarations = BTreeMap::new();
+    let mut exported_values = BTreeMap::new();
     let mut exported_functions = BTreeMap::new();
     let mut exported_methods = BTreeMap::new();
     for rel in &files {
@@ -963,6 +1017,12 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
         exported_type_declarations.extend(
             parsed
                 .type_declarations
+                .into_iter()
+                .map(|(name, declaration)| (qualify_go_symbol(rel, &name), declaration)),
+        );
+        exported_values.extend(
+            parsed
+                .values
                 .into_iter()
                 .map(|(name, declaration)| (qualify_go_symbol(rel, &name), declaration)),
         );
@@ -983,6 +1043,7 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
     Ok(GoSurface {
         exported_types: exported_types.into_iter().collect(),
         exported_type_declarations,
+        exported_values,
         exported_functions,
         exported_methods,
         docs: doc_files(dir)?,
@@ -995,6 +1056,7 @@ pub fn extract_go_surface(dir: impl AsRef<Path>) -> Result<GoSurface, CoreError>
 pub fn diff_go_surfaces(old: &GoSurface, new: &GoSurface) -> GoSurfaceDiff {
     GoSurfaceDiff {
         missing_exported_types: missing_values(&old.exported_types, &new.exported_types),
+        missing_exported_values: missing_string_keys(&old.exported_values, &new.exported_values),
         missing_exported_functions: missing_string_keys(
             &old.exported_functions,
             &new.exported_functions,
@@ -1003,6 +1065,10 @@ pub fn diff_go_surfaces(old: &GoSurface, new: &GoSurface) -> GoSurfaceDiff {
         exported_type_changes: go_type_declaration_changes(
             &old.exported_type_declarations,
             &new.exported_type_declarations,
+        ),
+        exported_value_changes: go_value_declaration_changes(
+            &old.exported_values,
+            &new.exported_values,
         ),
         exported_function_signature_changes: go_signature_changes(
             &old.exported_functions,
@@ -1485,6 +1551,18 @@ fn filter_allowed_go_type_changes(
         .collect()
 }
 
+fn filter_allowed_go_value_changes(
+    changes: &[GoValueDeclarationChange],
+    allowed: &[String],
+) -> Vec<GoValueDeclarationChange> {
+    let allowed: BTreeSet<&str> = allowed.iter().map(String::as_str).collect();
+    changes
+        .iter()
+        .filter(|change| !allowed.contains(change.symbol.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn filter_allowed_export_kind_mismatches(
     changes: &[TsExportKindMismatch],
     allowed: &[String],
@@ -1584,6 +1662,20 @@ fn stale_go_type_allowances(
     label: &str,
     allowed: &[String],
     current: &[GoTypeDeclarationChange],
+    stale: &mut Vec<String>,
+) {
+    stale_keyed_allowances(
+        label,
+        allowed,
+        current.iter().map(|change| change.symbol.clone()),
+        stale,
+    );
+}
+
+fn stale_go_value_allowances(
+    label: &str,
+    allowed: &[String],
+    current: &[GoValueDeclarationChange],
     stale: &mut Vec<String>,
 ) {
     stale_keyed_allowances(
@@ -5053,6 +5145,7 @@ fn python_entry_point_toml_table<'a>(
 #[derive(Default)]
 struct ParsedGoFile {
     type_declarations: BTreeMap<String, String>,
+    values: BTreeMap<String, String>,
     functions: BTreeMap<String, String>,
     methods: BTreeMap<String, String>,
 }
@@ -5061,6 +5154,7 @@ fn parse_go_file(text: &str) -> ParsedGoFile {
     let lines = go_source_lines_without_comments(text);
     let mut parsed = ParsedGoFile {
         type_declarations: extract_go_type_declarations(&lines),
+        values: extract_go_value_declarations(&lines),
         ..ParsedGoFile::default()
     };
     let mut brace_depth = 0_i32;
@@ -5096,6 +5190,165 @@ fn parse_go_file(text: &str) -> ParsedGoFile {
         index += 1;
     }
     parsed
+}
+
+fn extract_go_value_declarations(lines: &[String]) -> BTreeMap<String, String> {
+    let mut declarations = BTreeMap::new();
+    let mut brace_depth = 0_i32;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        if brace_depth == 0 {
+            if let Some(keyword) = go_value_group_keyword(line) {
+                let mut group_index = 0usize;
+                let mut inherited_const_spec = None;
+                index += 1;
+                while index < lines.len() {
+                    let spec = lines[index].trim();
+                    if spec == ")" {
+                        break;
+                    }
+                    if spec.is_empty() {
+                        index += 1;
+                        continue;
+                    }
+                    let (spec, last) = collect_go_value_spec(lines, index, false);
+                    add_go_value_declaration(
+                        &mut declarations,
+                        keyword,
+                        &spec,
+                        Some(group_index),
+                        &mut inherited_const_spec,
+                    );
+                    group_index += 1;
+                    index = last + 1;
+                }
+                index += 1;
+                continue;
+            }
+            if let Some((keyword, _)) = go_value_declaration_start(line) {
+                let (declaration, last) = collect_go_value_spec(lines, index, true);
+                let spec = declaration
+                    .strip_prefix(keyword)
+                    .map_or(declaration.as_str(), str::trim_start);
+                let mut inherited_const_spec = None;
+                add_go_value_declaration(
+                    &mut declarations,
+                    keyword,
+                    spec,
+                    None,
+                    &mut inherited_const_spec,
+                );
+                index = last + 1;
+                continue;
+            }
+        }
+        brace_depth += go_brace_delta(line);
+        index += 1;
+    }
+    declarations
+}
+
+fn go_value_group_keyword(line: &str) -> Option<&'static str> {
+    ["const", "var"].into_iter().find(|keyword| {
+        line.strip_prefix(keyword)
+            .is_some_and(|rest| rest.trim_start() == "(")
+    })
+}
+
+fn go_value_declaration_start(line: &str) -> Option<(&'static str, &str)> {
+    ["const", "var"].into_iter().find_map(|keyword| {
+        let rest = line.strip_prefix(keyword)?;
+        rest.chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+            .then_some((keyword, rest.trim_start()))
+    })
+}
+
+fn collect_go_value_spec(
+    lines: &[String],
+    start: usize,
+    includes_keyword: bool,
+) -> (String, usize) {
+    let mut declaration = String::new();
+    let mut index = start;
+    while index < lines.len() {
+        if !declaration.is_empty() {
+            declaration.push('\n');
+        }
+        declaration.push_str(lines[index].trim());
+        if go_value_declaration_complete(&declaration, includes_keyword) {
+            break;
+        }
+        index += 1;
+    }
+    (declaration, index.min(lines.len().saturating_sub(1)))
+}
+
+fn go_value_declaration_complete(declaration: &str, includes_keyword: bool) -> bool {
+    if !go_declaration_delimiters_balanced(declaration) {
+        return false;
+    }
+    let declaration = if includes_keyword {
+        go_value_declaration_start(declaration.trim_start()).map_or(declaration, |(_, spec)| spec)
+    } else {
+        declaration
+    };
+    !matches!(
+        declaration.trim_end().chars().last(),
+        None | Some('=' | ',' | '+' | '-' | '/' | '%' | '&' | '|' | '^' | '!' | '<' | '>')
+    )
+}
+
+fn add_go_value_declaration(
+    into: &mut BTreeMap<String, String>,
+    keyword: &str,
+    spec: &str,
+    group_index: Option<usize>,
+    inherited_const_spec: &mut Option<String>,
+) {
+    let explicit = spec.contains('=');
+    let effective_const_spec = if keyword == "const" {
+        if explicit {
+            *inherited_const_spec = Some(spec.to_string());
+        }
+        inherited_const_spec.as_deref()
+    } else {
+        None
+    };
+    let mut declaration = normalize_go_type_declaration(&format!("{keyword} {spec}"));
+    if keyword == "const" && !explicit {
+        if let Some(inherited) = effective_const_spec {
+            declaration.push_str(";implicit=");
+            declaration.push_str(&normalize_go_type_declaration(inherited));
+        }
+    }
+    if let (Some(index), Some(effective)) = (group_index, effective_const_spec) {
+        if go_contains_identifier(effective, "iota") {
+            let _ =
+                std::fmt::Write::write_fmt(&mut declaration, format_args!(";iota-index={index}"));
+        }
+    }
+    for name in go_value_spec_names(spec) {
+        if is_go_exported(name) {
+            into.insert(name.to_string(), declaration.clone());
+        }
+    }
+}
+
+fn go_value_spec_names(spec: &str) -> Vec<&str> {
+    let names = spec.split_once('=').map_or(spec, |(names, _)| names);
+    split_go_top_level_commas(names)
+        .into_iter()
+        .filter_map(|part| ident_prefix(part.trim()))
+        .collect()
+}
+
+fn go_contains_identifier(value: &str, expected: &str) -> bool {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|part| part == expected)
 }
 
 fn extract_go_type_declarations(lines: &[String]) -> BTreeMap<String, String> {
@@ -6096,6 +6349,22 @@ fn go_type_declaration_changes(
         .filter_map(|(symbol, old_declaration)| {
             let new_declaration = new.get(symbol)?;
             (old_declaration != new_declaration).then(|| GoTypeDeclarationChange {
+                symbol: symbol.clone(),
+                old: old_declaration.clone(),
+                new: new_declaration.clone(),
+            })
+        })
+        .collect()
+}
+
+fn go_value_declaration_changes(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+) -> Vec<GoValueDeclarationChange> {
+    old.iter()
+        .filter_map(|(symbol, old_declaration)| {
+            let new_declaration = new.get(symbol)?;
+            (old_declaration != new_declaration).then(|| GoValueDeclarationChange {
                 symbol: symbol.clone(),
                 old: old_declaration.clone(),
                 new: new_declaration.clone(),
@@ -7554,6 +7823,94 @@ type (
             vec!["Book", "Reader", "Status"]
         );
         assert!(diff.is_breaking());
+
+        let _ = std::fs::remove_dir_all(old);
+        let _ = std::fs::remove_dir_all(new);
+    }
+
+    #[test]
+    fn go_diff_catches_exported_constants_variables_and_iota_changes() {
+        let old = temp_dir("go-values-old");
+        let new = temp_dir("go-values-new");
+        for dir in [&old, &new] {
+            std::fs::write(dir.join("go.mod"), "module example.com/sdk\n\ngo 1.23\n").unwrap();
+        }
+        std::fs::write(
+            old.join("values.go"),
+            r#"package sdk
+
+const (
+    Available Status = "available"
+    Pending Status = "pending"
+)
+const (
+    First = iota
+    Second
+)
+const Legacy = "legacy"
+
+var DefaultTimeout = 30 * time.Second
+var (
+    DefaultClient = &Client{
+        Timeout: DefaultTimeout,
+    }
+)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            new.join("values.go"),
+            r#"package sdk
+
+const (
+    Available Status = "in_stock"
+    Pending Status = "pending"
+)
+const (
+    _ = iota
+    First = iota
+    Second
+)
+
+var DefaultTimeout = 60 * time.Second
+var (
+    DefaultClient = &Client{
+        Timeout: DefaultTimeout,
+    }
+)
+"#,
+        )
+        .unwrap();
+
+        let old_surface = extract_go_surface(&old).unwrap();
+        assert!(old_surface.exported_values.contains_key("Available"));
+        assert!(old_surface.exported_values.contains_key("DefaultClient"));
+        let diff = diff_go_dirs(&old, &new).unwrap();
+        assert_eq!(diff.missing_exported_values, vec!["Legacy"]);
+        assert_eq!(
+            diff.exported_value_changes
+                .iter()
+                .map(|change| change.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Available", "DefaultTimeout", "First", "Second"]
+        );
+
+        let evaluation = evaluate_go_contract(
+            &GoCompatibilityContract {
+                require_exported_values: vec!["Available".to_string()],
+                allow_missing_exported_values: vec!["Legacy".to_string()],
+                allow_exported_value_changes: vec![
+                    "Available".to_string(),
+                    "DefaultTimeout".to_string(),
+                    "First".to_string(),
+                    "Second".to_string(),
+                ],
+                ..GoCompatibilityContract::default()
+            },
+            &diff,
+            &extract_go_surface(&new).unwrap(),
+        );
+        assert!(!evaluation.breaking, "{evaluation:?}");
 
         let _ = std::fs::remove_dir_all(old);
         let _ = std::fs::remove_dir_all(new);

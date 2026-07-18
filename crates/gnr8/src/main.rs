@@ -665,6 +665,7 @@ fn print_typescript_compat_diff(diff: &gnr8::sdk::compat::TypeScriptSurfaceDiff)
 
 fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
     print_compat_list("missing exported types", &diff.missing_exported_types);
+    print_compat_list("missing exported values", &diff.missing_exported_values);
     print_compat_list(
         "missing exported functions",
         &diff.missing_exported_functions,
@@ -675,6 +676,12 @@ fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
     for change in &diff.exported_type_changes {
         println!(
             "  exported type changed: {} ({} -> {})",
+            change.symbol, change.old, change.new
+        );
+    }
+    for change in &diff.exported_value_changes {
+        println!(
+            "  exported value changed: {} ({} -> {})",
             change.symbol, change.old, change.new
         );
     }
