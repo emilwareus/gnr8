@@ -51,6 +51,19 @@ jobs:
       - name: Refresh Cargo.lock
         run: cargo build --workspace
 
+      - name: Refresh committed example lockfiles
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          find examples -path '*/.gnr8/Cargo.toml' -print0 |
+            while IFS= read -r -d '' manifest; do
+              cargo update \
+                --manifest-path "$manifest" \
+                -p gnr8 \
+                --precise "$NEW_VERSION"
+            done
+
       - name: Commit and push to main
         env:
           NEW_VERSION: ${{ steps.bump.outputs.version }}
@@ -58,7 +71,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock 'examples/*/.gnr8/Cargo.lock'
           if git diff --staged --quiet; then
             echo "::error::No version changes to commit."
             exit 1

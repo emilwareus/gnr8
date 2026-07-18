@@ -24,14 +24,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: not a file: {args.path}", file=sys.stderr)
         return 1
 
-    line = checksum_line(args.path)
+    line = checksum_line(args.path).encode("utf-8")
     if args.output is None:
-        sys.stdout.write(line)
+        # Bypass TextIO newline translation so Windows emits a portable LF-only
+        # checksum file when stdout is redirected by the release script.
+        sys.stdout.buffer.write(line)
     else:
-        args.output.write_text(line, encoding="utf-8")
+        args.output.write_bytes(line)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

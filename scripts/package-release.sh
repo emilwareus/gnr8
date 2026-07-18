@@ -75,5 +75,14 @@ Runtime toolchains:
 EOF
 
 tar -C "$stage" -czf "$dist/$archive" .
-python3 "$ROOT/scripts/sha256_file.py" "$dist/$archive" > "$dist/$archive.sha256"
+checksum="$dist/$archive.sha256"
+python3 "$ROOT/scripts/sha256_file.py" "$dist/$archive" --output "$checksum"
+python3 - "$checksum" <<'PY'
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+if not data.endswith(b"\n") or b"\r" in data:
+    raise SystemExit("checksum file must use LF-only line endings")
+PY
 echo "$dist/$archive"
