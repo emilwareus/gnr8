@@ -488,6 +488,14 @@ fn lower_parameter(
 ) -> Result<Parameter, crate::CoreError> {
     let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
     schema.default_value.clone_from(&param.default);
+    let mut openapi_content = param.openapi_content.clone();
+    if let Some(content) = &mut openapi_content {
+        rewrite_parameter_local_refs(content, ref_to_name);
+    }
+    let mut openapi_fields = param.openapi_fields.clone();
+    for (_, value) in &mut openapi_fields {
+        rewrite_parameter_local_refs(value, ref_to_name);
+    }
     Ok(Parameter {
         name: param.name.clone(),
         location: param.location.clone(),
@@ -495,10 +503,50 @@ fn lower_parameter(
         style: param.style.clone(),
         explode: param.explode,
         allow_reserved: param.allow_reserved,
-        openapi_content: param.openapi_content.clone(),
-        openapi_fields: param.openapi_fields.clone(),
+        openapi_content,
+        openapi_fields,
         schema,
     })
+}
+
+fn rewrite_parameter_local_refs(value: &mut serde_json::Value, refs: &BTreeMap<&str, &str>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let rewritten = object
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| rewrite_local_component_ref(reference, refs));
+            if let Some(reference) = rewritten {
+                object.insert("$ref".to_string(), serde_json::Value::String(reference));
+            }
+            for child in object.values_mut() {
+                rewrite_parameter_local_refs(child, refs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_parameter_local_refs(item, refs);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn rewrite_local_component_ref(reference: &str, refs: &BTreeMap<&str, &str>) -> Option<String> {
+    let tail = reference.strip_prefix("#/components/schemas/")?;
+    let (raw_name, suffix) = tail
+        .split_once('/')
+        .map_or((tail, None), |(name, suffix)| (name, Some(suffix)));
+    let name = raw_name.replace("~1", "/").replace("~0", "~");
+    let public_name = refs.get(name.as_str())?;
+    let public_name = public_name.replace('~', "~0").replace('/', "~1");
+    Some(suffix.map_or_else(
+        || format!("#/components/schemas/{public_name}"),
+        |suffix| format!("#/components/schemas/{public_name}/{suffix}"),
+    ))
 }
 
 fn lower_responses(

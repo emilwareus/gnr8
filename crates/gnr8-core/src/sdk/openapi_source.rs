@@ -3304,6 +3304,72 @@ paths:
     }
 
     #[test]
+    fn rewrites_preserved_parameter_refs_to_emitted_component_names() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Books API, version: 1.0.0 }
+paths:
+  /books:
+    get:
+      operationId: listBooks
+      parameters:
+        - name: book
+          in: query
+          schema: { $ref: '#/components/schemas/legacy.Book' }
+        - name: filter
+          in: query
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/legacy.Book' }
+      responses: { '204': { description: ok } }
+components:
+  schemas:
+    legacy.Book:
+      type: object
+      properties: { id: { type: string } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        let component_name = &graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == "legacy.Book")
+            .unwrap()
+            .name;
+        let expected_ref = format!("#/components/schemas/{component_name}");
+
+        let yaml = to_openapi(&graph, "Books API", "/", &graph.security).unwrap();
+        validate_openapi_artifact(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let parameters = emitted
+            .pointer("/paths/~1books/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap();
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap()
+        };
+        assert_eq!(
+            parameter("book")
+                .pointer("/schema/$ref")
+                .and_then(Value::as_str),
+            Some(expected_ref.as_str())
+        );
+        assert_eq!(
+            parameter("filter")
+                .pointer("/content/application~1json/schema/$ref")
+                .and_then(Value::as_str),
+            Some(expected_ref.as_str())
+        );
+    }
+
+    #[test]
     fn preserves_request_media_types_that_share_a_schema() {
         let text = r"
 openapi: 3.1.0
