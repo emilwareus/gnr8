@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # Transforms and overrides
 
+[Agent docs index](../agents/index.md)
+
 Transforms change the shared `ApiGraph` before any target renders it. Use them for facts that static
 extraction cannot recover, public API policy, compatibility names, runtime behavior, and docs.
 

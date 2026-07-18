@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # Artifacts, lifecycle, and CI
 
+[Agent docs index](../agents/index.md)
+
 The project-local `.gnr8` binary is an untrusted pure generator. The installed gnr8 CLI validates its
 versioned JSON bundle, computes a safe write plan, and is the only component that mutates application
 outputs.

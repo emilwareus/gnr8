@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # OpenAPI compatibility
 
+[Agent docs index](../agents/index.md)
+
 `gnr8 compat openapi` is an exact semantic comparator for JSON/YAML Swagger 2.0 and OpenAPI 3.0/3.1
 documents. “Compatible” means no consumer-visible difference after supported cross-version
 normalization—not merely “no breaking changes.” Additions also count as differences.

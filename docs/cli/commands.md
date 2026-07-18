@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # CLI command reference
 
+[Agent docs index](../agents/index.md)
+
 Run commands from the application repository root. Global options are:
 
 ```text

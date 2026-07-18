@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # OpenAPI generation
 
+[Agent docs index](../agents/index.md)
+
 `OpenApi31` emits deterministic OpenAPI 3.1 YAML. `OpenApi31Json` emits the same lowered document as
 pretty JSON. Both consume the final shared graph, so transforms also affect generated SDKs.
 

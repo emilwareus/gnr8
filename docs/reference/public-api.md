@@ -1,6 +1,9 @@
 <!-- generated-by: gsd-doc-writer -->
 # Public API map
 
+[Agent docs index](../agents/index.md) ·
+[latest rustdoc](https://docs.rs/gnr8/latest/gnr8/sdk/prelude/index.html)
+
 Application pipelines should normally import:
 
 ```rust

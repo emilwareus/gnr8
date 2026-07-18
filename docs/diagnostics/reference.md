@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # Diagnostics reference
 
+[Agent docs index](../agents/index.md)
+
 Diagnostics are structured evidence that extraction or an explicit override was incomplete, lossy,
 or intentional. They travel with the graph and appear in `inspect`, `generate`, `check`, and `doctor`.
 Warnings do not fail generation unless `DiagnosticPolicy` denies them.

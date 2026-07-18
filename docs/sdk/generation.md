@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # SDK generation
 
+[Agent docs index](../agents/index.md)
+
 `GoSdk`, `PySdk`, and `TsSdk` render one shared graph into language-native clients, models, runtime
 support, generated reference docs, and optional package metadata. Configure API meaning in transforms;
 configure file/public-surface policy on the target.

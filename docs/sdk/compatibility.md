@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # SDK compatibility
 
+[Agent docs index](../agents/index.md)
+
 SDK compatibility commands statically compare a baseline directory (`--old`) with a candidate
 directory (`--new`). They do not compile, import, or execute the packages. Exit `1` means an
 unapproved backward-incompatible public-surface difference was found.

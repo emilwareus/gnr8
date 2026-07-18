@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # Sources and extraction
 
+[Agent docs index](../agents/index.md)
+
 A `Source` statically converts one input into the shared `ApiGraph`. Code sources invoke language
 sidecars but never import, start, or call the application. Ambiguous facts produce structured
 diagnostics instead of inferred guesses.

@@ -1,6 +1,8 @@
 <!-- generated-by: gsd-doc-writer -->
 # Pipeline configuration
 
+[Agent docs index](../agents/index.md)
+
 The only gnr8 configuration is a project-local Rust binary at `.gnr8/src/main.rs`. It depends on the
 `gnr8` crate, composes a `Pipeline`, and hands it to `gnr8::runner::run`.
 
