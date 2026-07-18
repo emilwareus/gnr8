@@ -1036,10 +1036,11 @@ impl Importer {
         let Some(response_map) = operation.get("responses").and_then(Value::as_object) else {
             return responses;
         };
-        for (status, response) in response_map {
+        for (status, raw_response) in response_map {
             let Ok(status_code) = status.parse::<u16>() else {
                 continue;
             };
+            let response = self.resolve_response(raw_response, operation_id, status_code);
             if matches!(
                 self.version,
                 SpecVersion::OpenApi30 | SpecVersion::OpenApi31
@@ -1096,7 +1097,7 @@ impl Importer {
                         media_type
                     };
                 let content_types = self.response_content_types_for_kind(
-                    response,
+                    &response,
                     &content_type,
                     schema,
                     ImportedResponseKind::Binary,
@@ -1113,7 +1114,7 @@ impl Importer {
                 continue;
             }
             let content_types = self.response_content_types_for_kind(
-                response,
+                &response,
                 &media_type,
                 schema,
                 ImportedResponseKind::Json,
@@ -1131,6 +1132,22 @@ impl Importer {
             });
         }
         responses
+    }
+
+    fn resolve_response(&mut self, raw_response: &Value, operation_id: &str, status: u16) -> Value {
+        let Some(ref_value) = raw_response.get("$ref").and_then(Value::as_str) else {
+            return raw_response.clone();
+        };
+        if let Some(resolved) = self.resolve_ref_value(ref_value) {
+            return resolved;
+        }
+        self.warn_response_schema(
+            operation_id,
+            status,
+            ref_value,
+            "the response reference could not be resolved",
+        );
+        raw_response.clone()
     }
 
     fn response_content_types_for_kind(
@@ -2419,6 +2436,64 @@ components:
             diagnostic.code == "request.body.unresolved"
                 && diagnostic.operation.as_deref() == Some("createUpload")
                 && diagnostic.subject.as_deref() == Some("#/components/requestBodies/Missing")
+        }));
+    }
+
+    #[test]
+    fn imports_referenced_responses_and_diagnoses_missing_refs() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      responses:
+        '200': { $ref: '#/components/responses/Report' }
+components:
+  responses:
+    Report:
+      description: report
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Report' }
+  schemas:
+    Report:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let response = &graph.operations[0].responses[0];
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_kind, "json");
+        assert_eq!(
+            response.body.as_ref().map(|schema| schema.ref_id.as_str()),
+            Some("Report")
+        );
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let unresolved = text.replace(
+            "#/components/responses/Report",
+            "#/components/responses/Missing",
+        );
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            &unresolved,
+        )
+        .unwrap();
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "response.schema.unresolved"
+                && diagnostic.operation.as_deref() == Some("getReport")
+                && diagnostic.subject.as_deref() == Some("200 #/components/responses/Missing")
         }));
     }
 
