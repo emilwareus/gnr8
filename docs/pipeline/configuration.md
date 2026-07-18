@@ -34,6 +34,7 @@ Required shape:
 - Transforms run in declaration order against one mutable `ApiGraph`.
 - Every target reads the same final graph and adds artifacts.
 - Post-processors run in declaration order after all targets.
+- `.post_write(stage)` is a compatibility alias for `.post(stage)`.
 - All configured paths are project-relative unless an API explicitly states otherwise.
 
 ## Stage traits
@@ -113,12 +114,37 @@ impl Target for SummaryTarget {
             format!("operations={}\n", graph.operations.len()),
         )
     }
+
+    fn output_anchors(&self) -> Vec<String> {
+        vec!["generated/summary.txt".to_string()]
+    }
 }
 ```
 
 Use `create` for a new path, `overlay` for intentional full replacement, and `rewrite` for an
 intentional in-place transformation. Collisions and missing ownership targets are errors. See
 [Artifacts and CI](../operations/artifacts-and-ci.md).
+
+## Custom-stage cache and ownership hooks
+
+Default trait hooks are conservative or empty. Override them when a custom stage touches project
+files:
+
+| Trait hook | Override when | Effect |
+|---|---|---|
+| `Source::cache_input_roots` | the source has enumerable input roots | enables the verified pre-child no-op path; `None` disables it |
+| `Target::cache_input_files` | the target reads templates/static project files | folds those files into the artifact-cache key |
+| `Target::output_anchors` | the target emits project paths | enables stale cleanup and prevents generated-source re-ingestion |
+| `PostProcess::cache_key_fragment` | output depends on executable/config state | invalidates cached artifacts when that state changes |
+| `Target::producer`, `PostProcess::producer` | a stable custom label is preferable | records ownership/audit identity; defaults to the Rust type name |
+
+For direct library tooling, `Pipeline::build_ir(&cx)` runs source plus transforms, while
+`Pipeline::run(&cx)` also runs targets and post-processors. Normal `.gnr8` binaries must use
+`gnr8::runner::run`, which implements the versioned host/child boundary.
+
+`Artifacts::files` borrows sorted files, `into_files` consumes the set, and `from_files` restores a
+sorted set. Deprecated `Artifacts::write` is a create-only compatibility alias; use `create`,
+`overlay`, or `rewrite` so ownership intent is explicit.
 
 ## Dependency and lockfile policy
 

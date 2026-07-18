@@ -36,9 +36,11 @@ to align the installed CLI with `.gnr8/Cargo.lock`.
 | `Artifacts::create(path, text)` | path does not exist | `created` |
 | `Artifacts::overlay(path, text)` | path already exists | full replacement, `overlaid` |
 | `Artifacts::rewrite(path, fn)` | path already exists | in-place transform, `rewritten` |
+| `Artifacts::write(path, text)` | path does not exist | deprecated create-only alias |
 
 Artifacts stay sorted by path. Every transition records the prior and new producer. A target should
 normally create; a post-processor should rewrite. Collisions or missing overlay/rewrite targets fail.
+`write` never replaces an existing path.
 
 ## Host write safety
 

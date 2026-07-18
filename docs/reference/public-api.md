@@ -17,14 +17,14 @@ the feature pages for behavior and examples; use rustdoc for complete method sig
 
 | Symbol | Use |
 |---|---|
-| `Pipeline` | compose one source, ordered transforms, targets, and post-processors |
+| `Pipeline` | compose stages; optionally run/build IR directly or inspect cache/output declarations |
 | `Source` | trait for project source/artifact → `ApiGraph` |
 | `Transform` | trait for ordered graph mutation |
 | `Target` | trait for graph → artifacts |
 | `PostProcess` | trait for artifact transformation after targets |
 | `Cx` | stage context containing project root |
 | `Artifact` | one project-relative UTF-8 generated file plus ownership metadata |
-| `Artifacts` | sorted artifact set with create/overlay/rewrite enforcement |
+| `Artifacts` | sorted artifact set with explicit ownership plus borrow/consume/restore helpers |
 | `ArtifactMetadata` | artifact path and content hash without text |
 | `FileStamp` | cached path/length/mtime/hash identity |
 
