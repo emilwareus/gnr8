@@ -211,7 +211,7 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
         "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
         ref_pointer(&body.schema_ref)
     );
-    write_examples(out, &body.examples, depth + 3);
+    write_examples(out, &body.examples, &body.content_type, depth + 3);
 }
 
 /// Emit the `responses` map keyed by quoted status code.
@@ -251,7 +251,7 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                     out,
                     "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}format: binary"
                 );
-                write_examples(out, &resp.examples, depth + 4);
+                write_examples(out, &resp.examples, content_type, depth + 4);
             }
         } else if resp.event_stream {
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
@@ -274,7 +274,7 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                         "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}type: string"
                     );
                 }
-                write_examples(out, &resp.examples, depth + 4);
+                write_examples(out, &resp.examples, content_type, depth + 4);
             }
         } else if let Some(schema_ref) = &resp.schema_ref {
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
@@ -290,7 +290,7 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
                     "{pad}{INDENT}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
                     ref_pointer(schema_ref)
                 );
-                write_examples(out, &resp.examples, depth + 4);
+                write_examples(out, &resp.examples, content_type, depth + 4);
             }
         }
     }
@@ -303,7 +303,11 @@ fn response_media_types<'a>(resp: &'a ResponseObj, fallback: &'static str) -> Ve
     vec![resp.content_type.as_deref().unwrap_or(fallback)]
 }
 
-fn write_examples(out: &mut String, examples: &[MediaExample], depth: usize) {
+fn write_examples(out: &mut String, examples: &[MediaExample], content_type: &str, depth: usize) {
+    let examples: Vec<_> = examples
+        .iter()
+        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+        .collect();
     if examples.is_empty() {
         return;
     }

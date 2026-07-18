@@ -182,6 +182,8 @@ pub(crate) struct ResponseObj {
 pub(crate) struct MediaExample {
     /// Example key under the `OpenAPI` `examples` map.
     pub name: String,
+    /// Media type whose content entry owns this example.
+    pub content_type: String,
     /// Optional short example summary.
     pub summary: Option<String>,
     /// Optional longer example description.

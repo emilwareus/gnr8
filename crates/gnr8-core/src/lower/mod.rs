@@ -565,11 +565,9 @@ fn lower_response(
             description: response_docs
                 .and_then(|response| response.description.clone())
                 .unwrap_or_else(|| default_response_description(resp.status)),
-            examples: content_type
-                .as_deref()
-                .and_then(|content_type| {
-                    response_docs
-                        .map(|response| media_examples_for(&response.examples, content_type))
+            examples: response_docs
+                .map(|response| {
+                    media_examples_for_content_types(&response.examples, &content_types)
                 })
                 .unwrap_or_default(),
             schema_ref,
@@ -653,17 +651,45 @@ fn media_examples_for(
     examples: &[crate::graph::MediaExample],
     content_type: &str,
 ) -> Vec<MediaExample> {
+    media_examples_matching(examples, |candidate| {
+        candidate.eq_ignore_ascii_case(content_type)
+    })
+}
+
+fn media_examples_for_content_types(
+    examples: &[crate::graph::MediaExample],
+    content_types: &[String],
+) -> Vec<MediaExample> {
+    media_examples_matching(examples, |candidate| {
+        content_types
+            .iter()
+            .any(|content_type| candidate.eq_ignore_ascii_case(content_type))
+    })
+}
+
+fn media_examples_matching<F>(
+    examples: &[crate::graph::MediaExample],
+    matches: F,
+) -> Vec<MediaExample>
+where
+    F: Fn(&str) -> bool,
+{
     let mut out = examples
         .iter()
-        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+        .filter(|example| matches(&example.content_type))
         .map(|example| MediaExample {
             name: example.name.clone(),
+            content_type: example.content_type.clone(),
             summary: example.summary.clone(),
             description: example.description.clone(),
             value: example.value.clone(),
         })
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| {
+        a.content_type
+            .cmp(&b.content_type)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 
@@ -1859,6 +1885,72 @@ mod tests {
         assert!(
             !json_text.contains("min_length"),
             "internal metadata key leaked into JSON:\n{json_text}"
+        );
+    }
+
+    #[test]
+    fn response_examples_stay_scoped_to_their_media_type() {
+        let mut graph = sample_graph();
+        let operation = graph
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == "createGoal")
+            .unwrap();
+        operation.responses[0].content_types =
+            vec!["application/json".to_string(), "text/plain".to_string()];
+        graph
+            .operation_docs
+            .push(crate::graph::OperationDocsPolicy {
+                operation_id: "createGoal".to_string(),
+                summary: None,
+                description: None,
+                deprecated: false,
+                tags: Vec::new(),
+                request_examples: Vec::new(),
+                responses: vec![crate::graph::ResponseDocsPolicy {
+                    status: 201,
+                    description: None,
+                    examples: vec![
+                        crate::graph::MediaExample {
+                            name: "sample".to_string(),
+                            content_type: "application/json".to_string(),
+                            summary: None,
+                            description: None,
+                            value: serde_json::json!({ "format": "json" }),
+                        },
+                        crate::graph::MediaExample {
+                            name: "sample".to_string(),
+                            content_type: "text/plain".to_string(),
+                            summary: None,
+                            description: None,
+                            value: serde_json::json!("plain"),
+                        },
+                    ],
+                }],
+            });
+
+        let json_text = to_openapi_json(&graph, "goalservice", "/goal", &[]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_media_examples_are_scoped(&json);
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &[]).unwrap();
+        let parsed = crate::sdk::openapi_source::parse_json_or_yaml(
+            &yaml,
+            std::path::Path::new("openapi.yaml"),
+        )
+        .unwrap();
+        assert_media_examples_are_scoped(&parsed);
+    }
+
+    fn assert_media_examples_are_scoped(document: &serde_json::Value) {
+        let content = &document["paths"]["/goal/"]["post"]["responses"]["201"]["content"];
+        assert_eq!(
+            content["application/json"]["examples"]["sample"]["value"],
+            serde_json::json!({ "format": "json" })
+        );
+        assert_eq!(
+            content["text/plain"]["examples"]["sample"]["value"],
+            serde_json::json!("plain")
         );
     }
 

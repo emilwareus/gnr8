@@ -209,7 +209,7 @@ fn write_parameter(param: &Parameter) -> Value {
 fn write_request_body(body: &RequestBody) -> Value {
     let mut media = Map::new();
     media.insert("schema".to_string(), ref_schema(&body.schema_ref));
-    write_examples_into(&mut media, &body.examples);
+    write_examples_into(&mut media, &body.examples, &body.content_type);
 
     let mut content = Map::new();
     content.insert(body.content_type.clone(), Value::Object(media));
@@ -252,7 +252,7 @@ fn write_response(response: &ResponseObj) -> Value {
         for content_type in response_media_types(response, "application/octet-stream") {
             let mut media = Map::new();
             media.insert("schema".to_string(), Value::Object(schema.clone()));
-            write_examples_into(&mut media, &response.examples);
+            write_examples_into(&mut media, &response.examples, content_type);
             content.insert(content_type.to_string(), Value::Object(media));
         }
         out.insert("content".to_string(), Value::Object(content));
@@ -269,7 +269,7 @@ fn write_response(response: &ResponseObj) -> Value {
         for content_type in response_media_types(response, "text/event-stream") {
             let mut media = Map::new();
             media.insert("schema".to_string(), schema.clone());
-            write_examples_into(&mut media, &response.examples);
+            write_examples_into(&mut media, &response.examples, content_type);
             content.insert(content_type.to_string(), Value::Object(media));
         }
         out.insert("content".to_string(), Value::Object(content));
@@ -279,7 +279,7 @@ fn write_response(response: &ResponseObj) -> Value {
         for content_type in response_media_types(response, "application/json") {
             let mut media = Map::new();
             media.insert("schema".to_string(), schema.clone());
-            write_examples_into(&mut media, &response.examples);
+            write_examples_into(&mut media, &response.examples, content_type);
             content.insert(content_type.to_string(), Value::Object(media));
         }
         out.insert("content".to_string(), Value::Object(content));
@@ -294,12 +294,16 @@ fn response_media_types<'a>(response: &'a ResponseObj, fallback: &'static str) -
     vec![response.content_type.as_deref().unwrap_or(fallback)]
 }
 
-fn write_examples_into(media: &mut Map<String, Value>, examples: &[MediaExample]) {
-    if examples.is_empty() {
-        return;
-    }
+fn write_examples_into(
+    media: &mut Map<String, Value>,
+    examples: &[MediaExample],
+    content_type: &str,
+) {
     let mut examples_out = Map::new();
-    for example in examples {
+    for example in examples
+        .iter()
+        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+    {
         let mut body = Map::new();
         if let Some(summary) = &example.summary {
             body.insert("summary".to_string(), Value::String(summary.clone()));
@@ -313,7 +317,9 @@ fn write_examples_into(media: &mut Map<String, Value>, examples: &[MediaExample]
         body.insert("value".to_string(), example.value.clone());
         examples_out.insert(example.name.clone(), Value::Object(body));
     }
-    media.insert("examples".to_string(), Value::Object(examples_out));
+    if !examples_out.is_empty() {
+        media.insert("examples".to_string(), Value::Object(examples_out));
+    }
 }
 
 fn write_components(components: &Components) -> Value {
