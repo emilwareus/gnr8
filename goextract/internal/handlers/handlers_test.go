@@ -74,6 +74,34 @@ func TestCreateGoalRequestAndResponses(t *testing.T) {
 	}
 }
 
+func TestUnknownHandlerProducesErrorDiagnostic(t *testing.T) {
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(&load.Result{}, "example.com/service", diags)
+	route := routes.Route{
+		Method:  "GET",
+		Path:    "/missing",
+		Handler: "missingHandler",
+		Span: facts.SourceSpan{
+			File:      "internal/http.go",
+			StartLine: 27,
+			EndLine:   27,
+		},
+	}
+
+	analyzer.Analyze(route, diags)
+	items := diags.Items()
+	if len(items) != 1 {
+		t.Fatalf("want one unknown-handler diagnostic, got %+v", items)
+	}
+	got := items[0]
+	if got.Severity != "ERROR" || !strings.Contains(got.Message, "unknown handler 'missingHandler'") {
+		t.Fatalf("want actionable unknown-handler diagnostic, got %+v", got)
+	}
+	if got.File != "internal/http.go" || got.Line != 27 {
+		t.Fatalf("want route registration provenance, got %+v", got)
+	}
+}
+
 // TestStatusFromGoConstant proves status numbers come from go/constant resolution
 // of http.StatusXxx, not a hardcoded name->number map: 201, 400, 200 all appear
 // exactly as the net/http constants define them.

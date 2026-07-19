@@ -227,10 +227,10 @@ This SDK compiles and is exercised by `crates/gnr8-core/tests/sdk_compile.rs` (a
 ## 6. Diagnose with `gnr8 doctor`
 
 `gnr8 doctor` (added in Phase 5) is a **read-only** health aggregator. It groups four lifecycle
-facts, stale/drift status of the generated outputs, and the informational analysis diagnostics — each
-WARN carries a `file:line` plus a short *why* and *fix*. It exits **0** when healthy and **1** only on
-an actionable problem (missing init, invalid config, missing Go toolchain, input/output overlap, or
-any stale/drifted output). Informational unsupported-pattern WARNs do **not** make it red.
+facts, stale/drift status of the generated outputs, and analysis diagnostics — each diagnostic carries
+a `file:line` plus a short *why* and *fix*. It exits **0** when healthy and **1** on an actionable
+problem: lifecycle/toolchain/pipeline failure, stale or drifted output, SDK readiness failure, or an
+ERROR-severity extraction diagnostic. Informational unsupported-pattern WARNs do **not** make it red.
 
 ```bash
 "$GNR8" doctor

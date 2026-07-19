@@ -317,12 +317,11 @@ Single package `<go_module last segment>`, files: `client.go`, `models.go`, `ope
 - Imports stdlib only (`net/http`, `context`, `encoding/json`, `time`, `fmt`, `net/url`) → the generated SDK `go build`s with zero third-party requires.
 
 ## Diagnostics
-Each carries severity + message + `file:line` provenance. Classes: free-form map (`map[string]any`),
-untyped query param, dynamic/unresolvable response, unsupported Gin
-route pattern, duplicate handler name. Diagnostics are non-fatal to generation (output still produced)
-EXCEPT a dangling `$ref` (a route
-references a type with no schema) which IS fatal — see Errors. `gnr8 doctor` aggregates them; `gnr8
-inspect graph <dir>` lists them.
+Each carries severity + message + `file:line` provenance. WARN classes include free-form maps,
+untyped query params, dynamic responses, unsupported static patterns, and duplicate handler names.
+ERROR classes include unknown handlers, missing response facts, and package-load failures; any ERROR
+makes `gnr8 doctor` unhealthy. Lowering also fails on incomplete response/request media facts and
+dangling refs. `gnr8 inspect graph <dir>` lists every diagnostic.
 
 ## Lifecycle semantics
 - **Ownership:** generate records a blake3 hash per output in `.gnr8/cache/manifest.json`. If an output

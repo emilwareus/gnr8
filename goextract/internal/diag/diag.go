@@ -12,6 +12,7 @@ package diag
 import "github.com/gnr8/goextract/internal/facts"
 
 const severityWarn = "WARN"
+const severityError = "ERROR"
 
 // Accumulator collects DiagnosticFact values during extraction.
 type Accumulator struct {
@@ -97,8 +98,44 @@ func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string
 	})
 }
 
-// Warn records a generic warning. Used for go/packages load errors (GO-06) and
-// any rule that does not have a dedicated helper.
+// UnknownHandler records a recognized route whose handler declaration/body is
+// unavailable. This is an error because emitting empty request/response facts
+// would make extraction coverage look complete when it is not.
+func (a *Accumulator) UnknownHandler(handler, method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityError,
+		Message: "unknown handler '" + handler + "' for " + method + " " + route +
+			"; route extraction is incomplete and generation must not be treated as healthy (GO-06)",
+		File: file,
+		Line: line,
+	})
+}
+
+// MissingResponses records a handler that was analyzed but supplied no static
+// response evidence. Bodyless responses still have a status fact, so zero facts
+// means extraction coverage is incomplete rather than intentionally bodyless.
+func (a *Accumulator) MissingResponses(handler, method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityError,
+		Message: "missing response facts for handler '" + handler + "' on " + method + " " + route +
+			"; add a statically recognizable response or explicit code configuration (GO-06)",
+		File: file,
+		Line: line,
+	})
+}
+
+// Error records an actionable extraction failure that permits the helper to
+// return its partial facts solely for diagnostics and review.
+func (a *Accumulator) Error(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Severity: severityError,
+		Message:  message,
+		File:     file,
+		Line:     line,
+	})
+}
+
+// Warn records a generic non-fatal warning.
 func (a *Accumulator) Warn(message, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Severity: severityWarn,

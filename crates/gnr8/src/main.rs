@@ -1787,11 +1787,14 @@ fn run_doctor(output: Output) -> Result<()> {
     // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
     // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
     let total_start = Instant::now();
-    let mut bundle = if initialized {
+    let (mut bundle, mut pipeline_error) = if initialized {
         output.progress("doctor: running pipeline");
-        child::run_child(&root, "__emit").ok()
+        match child::run_child(&root, "__emit") {
+            Ok(bundle) => (Some(bundle), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        }
     } else {
-        None
+        (None, None)
     };
     let pipeline_ran = bundle.is_some();
     let cache_input_roots = bundle
@@ -1813,7 +1816,16 @@ fn run_doctor(output: Output) -> Result<()> {
         .as_mut()
         .map(|bundle| collect_sdk_readiness(&root, bundle))
         .unwrap_or_default();
-    let drift = bundle.as_mut().and_then(|b| plan_bundle(&root, b).ok());
+    let drift = match bundle.as_mut() {
+        Some(bundle) => match plan_bundle(&root, bundle) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                pipeline_error = Some(format!("output drift planning failed: {error:#}"));
+                None
+            }
+        },
+        None => None,
+    };
 
     let report = doctor::DoctorReport::assemble(
         initialized,
@@ -1823,6 +1835,7 @@ fn run_doctor(output: Output) -> Result<()> {
         diagnostics,
         drift.as_ref(),
     )
+    .with_pipeline_error(pipeline_error)
     .with_sdk_readiness(sdk_readiness)
     .with_runtime(
         doctor::DoctorRuntime {
