@@ -30,7 +30,7 @@ use crate::analyze::{facts::DiagnosticFact, helper, Lang};
 pub fn collect(fixture_dir: &str) -> Result<String, crate::CoreError> {
     // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
     // sidecar dir) AND diagnostic file paths relativize against the same root the helper saw.
-    let target = helper::resolve_target(fixture_dir);
+    let target = helper::resolve_target(fixture_dir)?;
     // The IDENTICAL single deterministic dispatch as `analyze::build_graph` — one detector, one
     // path per language, never a fallback chain (CLAUDE.md rule 3). `render`/`relativize` below are
     // language-agnostic and reused unchanged.

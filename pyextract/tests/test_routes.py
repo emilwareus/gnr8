@@ -25,6 +25,7 @@ ROUTE_KEYS = {
     "operation_id",
     "params",
     "request_body",
+    "request_body_content_type",
     "responses",
     "span",
 }

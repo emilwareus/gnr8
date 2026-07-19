@@ -342,6 +342,9 @@ def recognize_fastapi(modules, table, diags):
                     "operation_id": stmt.name,
                     "params": params,
                     "request_body": request_body,
+                    "request_body_content_type": (
+                        "application/json" if request_body is not None else None
+                    ),
                     "responses": [response],
                     "span": _span(abs_path, stmt),
                 }
@@ -681,6 +684,9 @@ def recognize_flask(modules, table, diags):
                         "operation_id": stmt.name,
                         "params": path_params + query_params,
                         "request_body": request_body,
+                        "request_body_content_type": (
+                            "application/json" if request_body is not None else None
+                        ),
                         "responses": responses,
                         "span": _span(abs_path, stmt),
                     }

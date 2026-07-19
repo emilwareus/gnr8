@@ -427,6 +427,8 @@ function recognizeNestController(loaded, diags, registry) {
           operation_id: handler,
           params: params,
           request_body: requestBody,
+          request_body_content_type:
+            requestBody === null ? null : "application/json",
           responses: responses,
           span: {
             file: rel,

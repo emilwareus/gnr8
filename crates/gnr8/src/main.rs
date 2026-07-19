@@ -1829,8 +1829,11 @@ fn run_doctor(output: Output) -> Result<()> {
             binary_path: std::env::current_exe()
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned()),
-            resource_dir: gnr8::resource::resource_dir()
-                .map(|path| path.to_string_lossy().into_owned()),
+            resource_dir: Some(
+                gnr8::resource::resource_dir()?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             output_anchors,
         },
         doctor::DoctorTimings {

@@ -100,7 +100,7 @@ fn run_child_stdout(project_root: &Path, subcommand: &str) -> Result<(String, Ve
     }
 
     let invocation = child_invocation(project_root, &manifest, subcommand);
-    let output = invocation.command().output().map_err(|err| {
+    let output = invocation.command()?.output().map_err(|err| {
         let cargo = cargo_binary();
         CoreError::ChildRun {
             message: format!(
@@ -197,7 +197,7 @@ enum ChildInvocation {
 }
 
 impl ChildInvocation {
-    fn command(&self) -> Command {
+    fn command(&self) -> Result<Command, CoreError> {
         let mut command = match self {
             Self::Direct {
                 binary,
@@ -226,10 +226,9 @@ impl ChildInvocation {
                 command
             }
         };
-        if let Some(resource_dir) = gnr8::resource::resource_dir() {
-            command.env(gnr8::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
-        }
-        command
+        let resource_dir = gnr8::resource::resource_dir()?;
+        command.env(gnr8::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
+        Ok(command)
     }
 
     fn description(&self, fallback_cargo: &str) -> String {
