@@ -42,11 +42,14 @@ These checks passed during the remediation session:
 | TypeScript emitter tests | 50 PASS |
 | Generated TypeScript SDK compile gates | 5 PASS |
 | Focused route-prefix snapshots and sidecar tests | PASS |
+| `make check` | BLOCKED after 358 Rust library tests passed; 4 Go-dependent tests could not start without `go` |
 
-The local environment does not contain `go` or `gofmt`. Go extractor/fixture tests, Go-backed
-snapshots, generated Go compile/runtime tests, example regeneration, and therefore the complete
-`make check` gate cannot be represented as green here. The Go runtime regression tests are committed
-and run when the toolchain is present; skipped tests are not counted as local execution evidence.
+The local environment does not contain `go` or `gofmt`. The final `make check` run completed formatting
+and clippy, then stopped in `cargo test --all-features`: 358 library tests passed and four tests failed
+with `GoToolchainMissing`. Go extractor/fixture tests, Go-backed snapshots, generated Go
+compile/runtime tests, example regeneration, and therefore the complete gate cannot be represented as
+green here. The Go runtime regression tests are committed and run when the toolchain is present;
+skipped tests are not counted as local execution evidence.
 
 ## Release gate
 
