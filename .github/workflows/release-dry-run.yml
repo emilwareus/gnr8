@@ -18,16 +18,28 @@ permissions:
   contents: read
 
 jobs:
-  crates-publish-dry-run:
-    name: crates.io publish --dry-run
+  full-release-gate:
+    name: Full gate + host archive smoke + publish dry-run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo publish --dry-run
-        run: DRY_RUN=1 ./scripts/publish-crates.sh
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: goextract/go.mod
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Run release-local-check
+        run: ./scripts/release-local-check.sh
 
   build-cli:
     name: CLI ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
@@ -83,4 +95,3 @@ jobs:
           name: gnr8-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
           path: target/release-local-dist/dist/*
           if-no-files-found: error
-

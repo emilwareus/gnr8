@@ -211,7 +211,7 @@ contract (the committed graph/OpenAPI snapshots are the spec).
 
 | Frontend | Lang | Status | Recognized | Limits / diagnostics |
 |---|---|---|---|---|
-| Gin | Go | full | static nested route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | dynamic route paths skipped and dynamic group prefixes omitted with diagnostics; `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
+| Gin | Go | full | static nested route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | dynamic route paths skipped and dynamic group prefixes omitted with diagnostics; `map[string]any` free-form (diag); untyped `c.Query` → string (diag); this frontend recognizes Gin, not arbitrary Go routers. |
 | FastAPI | Python | full | `@app`/`@router` verbs, static router/include prefixes, path params (template∩args), typed query params (defaults→required/optional), Pydantic/`@dataclass` bodies, `response_model=` or typed handler returns, collection responses, `status_code=`, `Literal`/`Enum`, `Union` aliases; `Depends` injection is excluded | static `ast` only (never imports/executes the target); unresolvable/foreign type → diagnostic + omit (no guess). |
 | Flask | Python | typed-envelope (honest second-class) | `@app.route`/`methods=`, `Blueprint(url_prefix=)`, `<int:id>` converter path params, OPT-IN typed DTOs/returns; method-derived status (typed `POST`→201, else 200) | untyped `request.json` / unannotated `request.args` / missing return annotation → **diagnostic, NEVER inferred**. State plainly: untyped surfaces are NOT recovered (typed-envelope only). |
 | NestJS | TypeScript | class-DTO scope | `@nestjs/common` verb + `@Param`/`@Query`/`@Body` decorators, statically composed `@Controller` prefix, DTO **classes**, enums + string-literal-union, synchronous or `Promise<T>` returns, collection responses, method-derived status (`@HttpCode` override) | DTO **classes** only (bare `interface`s are erased — not extracted); never reads `@nestjs/swagger` / `zod` / `class-validator` (rule 1); unresolvable → diagnostic + omit. |
@@ -344,7 +344,7 @@ dangling refs. `gnr8 inspect graph <dir>` lists every diagnostic.
   pointers so JSON `null` remains distinct from a scalar zero value.
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
-- Gin-only, Go-only.
+- The Go frontend recognizes Gin route registration, not arbitrary Go routers.
 
 ## Errors → cause → fix
 | Message (substring) | Cause | Fix |

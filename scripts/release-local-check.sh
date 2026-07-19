@@ -37,6 +37,9 @@ esac
 if [[ -n "${asset_os:-}" ]]; then
   echo "==> package host archive: ${asset_os}-${asset_arch}"
   TARGET="$host_target" ASSET_OS="$asset_os" ASSET_ARCH="$asset_arch" scripts/package-release.sh
+  echo "==> smoke unpacked host archive"
+  scripts/smoke-release-archive.sh \
+    "target/release-local-dist/dist/gnr8-${asset_os}-${asset_arch}.tar.gz"
 fi
 
 if [[ "${WITH_LINUX_AARCH64:-}" == "1" ]]; then
@@ -63,4 +66,3 @@ else
 fi
 
 echo "OK release-local-check complete."
-
