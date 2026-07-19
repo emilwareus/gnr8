@@ -278,8 +278,9 @@ func (a *Accumulator) Error(message, file string, line uint32) {
 	})
 }
 
-// Warn records a generic non-fatal warning.
-func (a *Accumulator) Warn(message, file string, line uint32) {
+// SchemaMetadataUnresolved records a schema tag/default that could not be
+// represented faithfully and was ignored or retained only as a string.
+func (a *Accumulator) SchemaMetadataUnresolved(structName, fieldName, message, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Code:     "schema.metadata.unresolved",
 		Severity: severityWarn,

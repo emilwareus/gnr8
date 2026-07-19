@@ -1,9 +1,8 @@
 """Flask bookstore routes — STATIC fixture source (Phase 1).
 
-Routing uses Flask `Blueprint`s with a URL prefix (the blueprint-prefix shape):
-the operation paths in the neutral graph are group-relative (`/`, `/<int:order_id>`)
-and the `/orders` prefix is a lowering-time base path (rule 1: never folded into
-the code-derived path). Path params use Flask's `<int:order_id>` converter.
+Routing uses a Flask `Blueprint` with a static URL prefix. The extractor composes
+that `/orders` prefix into each neutral-graph operation path. Path params use
+Flask's `<int:order_id>` converter.
 
 The HONEST envelope (PYSRC-02): typed handlers -> facts; raw `request.json` /
 unannotated `request.args.get(...)` -> a DIAGNOSTIC, never a guess (rule 3).
@@ -70,8 +69,9 @@ def create_order_raw():
     """POST /orders/raw — the HONEST untyped envelope.
 
     The body is read straight from `request.json` with NO typed DTO and NO return
-    annotation, so neither the request body nor the response is a fact: the
-    Phase-2 extractor must emit a DIAGNOSTIC (rule 3, no guessing). The extra
+    annotation, so neither the request body nor the response is a source fact: the
+    extractor emits a DIAGNOSTIC, and `.gnr8` explicitly declares the bodyless
+    `201` response (rule 3, no guessing). The extra
     non-fact prose here (rule 1) only positions the `request.json` read on the
     snapshot's asserted line; it encodes nothing about the API surface itself.
     """

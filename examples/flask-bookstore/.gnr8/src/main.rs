@@ -14,8 +14,8 @@
 //! This reproduces the committed `examples/flask-bookstore/generated/` output. Every setting is a method
 //! call below — there is no `config.toml`:
 //!   inputs            → Flask::new().inputs(["."])       (the static `app/` package; never executed)
-//!   base_path         → SetBasePath::new("/orders")      (the Blueprint url_prefix — a runtime value,
-//!                                                          never folded into the code-derived path)
+//!   route prefix      → Flask extraction composes the Blueprint's static `/orders` prefix
+//!   raw response      → ApiOverrides declares POST `/orders/raw` as an empty `201` response
 //!   title             → SetTitle::new("Bookstore Orders API")
 //!   output.openapi    → OpenApi31::new().to("generated/openapi.yaml")
 //!   output.sdk + module → PySdk::new().module("example.com/orders/sdk").to("generated/sdk")
@@ -33,10 +33,17 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(Flask::new().inputs(["."]))
-            .transform(SetBasePath::new("/orders"))
+            .transform(ApiOverrides::new().response(
+                OperationSelector::post("/orders/raw"),
+                ResponseOverride::status(201).empty(),
+            ))
             .transform(SetTitle::new("Bookstore Orders API"))
             .target(OpenApi31::new().to("generated/openapi.yaml"))
-            .target(PySdk::new().module("example.com/orders/sdk").to("generated/sdk"))
+            .target(
+                PySdk::new()
+                    .module("example.com/orders/sdk")
+                    .to("generated/sdk"),
+            )
             .post(Header::generated()),
     )
 }

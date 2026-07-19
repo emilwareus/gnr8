@@ -270,8 +270,13 @@ runs:
         WORKING_DIRECTORIES: ${{ inputs.working-directories }}
         GNR8_BIN: ${{ steps.binary.outputs.path }}
         EXTRA_ARGS: ${{ inputs.extra-args }}
+        INPUT_BINARY: ${{ inputs.gnr8-binary }}
+        INSTALL_METHOD: ${{ inputs.install-method }}
       run: |
         set -euo pipefail
+        if [[ -z "$INPUT_BINARY" && "$INSTALL_METHOD" == "source" ]]; then
+          export GNR8_RESOURCE_DIR="$GITHUB_ACTION_PATH"
+        fi
         dirs=()
         while IFS= read -r dir || [[ -n "$dir" ]]; do
           dir="${dir#"${dir%%[![:space:]]*}"}"

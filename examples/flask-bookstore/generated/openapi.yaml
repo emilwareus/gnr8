@@ -38,8 +38,8 @@ paths:
     post:
       operationId: create_order_raw
       responses:
-        'default':
-          description: Default response
+        '201':
+          description: Response 201
   '/orders/{order_id}':
     get:
       operationId: get_order
