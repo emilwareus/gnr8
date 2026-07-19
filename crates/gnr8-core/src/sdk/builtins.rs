@@ -5277,6 +5277,16 @@ mod tests {
         }
     }
 
+    fn bodyless_response(status: u16) -> Response {
+        Response {
+            status,
+            body: None,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+        }
+    }
+
     fn grouped_test_operation(
         id: &str,
         method: &str,
@@ -5383,7 +5393,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
-                    responses: vec![],
+                    responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
                     provenance: span(),
@@ -5399,7 +5409,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
-                    responses: vec![],
+                    responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
                     provenance: span(),
@@ -5415,7 +5425,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
-                    responses: vec![],
+                    responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
                     provenance: span(),
@@ -5669,8 +5679,8 @@ mod tests {
                         ref_id: "app.MarkReadRequest".to_string(),
                     }),
                     request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
+                    request_body_content_type: Some("application/json".to_string()),
+                    responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
                     provenance: span(),
@@ -5933,7 +5943,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
-                responses: vec![],
+                responses: vec![bodyless_response(200)],
                 security: Vec::new(),
                 security_overrides_global: false,
                 provenance: span(),
