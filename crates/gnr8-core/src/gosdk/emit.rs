@@ -126,15 +126,15 @@ pub(crate) fn compat_exported(name: &str) -> String {
 /// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
 ///
 /// ALL Go-specific type mapping lives HERE — this is the correct home for per-target mapping (IR-03 /
-/// docs/extensibility.md §2a): `WellKnown::DateTime → time.Time`, `Int → int64`, `Float → float32`,
+/// docs/extensibility.md §2a): `WellKnown::DateTime → time.Time`, `Int → int64`, and each floating
+/// point width is preserved,
 /// `Map`/`Any → map[string]any`. The match over [`Type`] is exhaustive — no `_ =>` / `other =>` arm —
 /// so a future variant fails to compile here until handled (T-03).
 ///
-/// `nullable` controls pointer wrapping for value types (`*float32`, `*bool`, `*TargetDirection`, …):
-/// a NULLABLE value type becomes `*T`. Strings, slices, and maps are already nilable in Go so they are
-/// never pointer-wrapped (matches `expected/sdk/models.go`, where an optional string stays `string`
-/// with omitempty and only nullable value types like `NextCursor` become `*string`). The optional axis
-/// is NOT read here — it drives `,omitempty` in [`json_tag`], not the pointer (the two are distinct).
+/// `nullable` controls pointer wrapping for value types (`*float64`, `*string`, `*bool`,
+/// `*TargetDirection`, …): a NULLABLE value type becomes `*T`. Slices and maps are already nilable in
+/// Go and are not pointer-wrapped. The optional axis is NOT read here — it drives `,omitempty` in
+/// [`json_tag`], not the pointer (the two are distinct).
 ///
 /// # Errors
 ///
@@ -142,8 +142,8 @@ pub(crate) fn compat_exported(name: &str) -> String {
 /// represent (e.g. [`Type::Union`] — Go has no sum types).
 fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
     let base = match schema {
-        // A base scalar maps to its Go type; the integer/float width is a target concern (TARGET-API
-        // §4: number → float32 — the generator narrows; the diagnostic is already in the graph).
+        // A base scalar maps to its Go type. Floating-point width is preserved so an OpenAPI number
+        // (64-bit by default) is never silently narrowed.
         Type::Primitive(prim) => go_primitive(prim).to_string(),
         // A well-known scalar maps to the Go type that carries it: a date-time is a `time.Time`, a
         // uuid is a string (Go-ism LOCAL to this target — never in lowering, IR-03).
@@ -202,20 +202,24 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
             });
         }
     };
-    // Strings/maps are nilable already; value types get a pointer when nullable.
-    let is_value = matches!(base.as_str(), "bool" | "int64" | "float32" | "time.Time");
+    // Strings are value types too: *string distinguishes JSON null from "". Slices/maps remain
+    // naturally nilable and do not need an additional pointer layer.
+    let is_value = matches!(
+        base.as_str(),
+        "string" | "bool" | "int64" | "float32" | "float64" | "time.Time"
+    );
     Ok(maybe_pointer(base, nullable, is_value))
 }
 
-/// Map a neutral [`Prim`] to its Go type (Go-ism LOCAL to this target — IR-03). Integer width is
-/// narrowed to `int64` and float to `float32` per TARGET-API §4 (the narrowing diagnostic is already
-/// in the graph); a byte string maps to Go `[]byte`.
+/// Map a neutral [`Prim`] to its Go type (Go-ism LOCAL to this target — IR-03). Integers carry as
+/// `int64`; floating-point width is preserved; a byte string maps to Go `[]byte`.
 fn go_primitive(prim: &Prim) -> &'static str {
     match prim {
         Prim::String => "string",
         Prim::Bool => "bool",
         Prim::Int { .. } => "int64",
-        Prim::Float { .. } => "float32",
+        Prim::Float { bits: 32 } => "float32",
+        Prim::Float { .. } => "float64",
         Prim::Bytes => "[]byte",
     }
 }
@@ -4141,11 +4145,12 @@ fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError
         "string" => Ok(accessor.to_string()),
         "int64" => Ok(format!("strconv.FormatInt({accessor}, 10)")),
         "float32" => Ok(format!("strconv.FormatFloat(float64({accessor}), 'g', -1, 32)")),
+        "float64" => Ok(format!("strconv.FormatFloat({accessor}, 'g', -1, 64)")),
         "bool" => Ok(format!("strconv.FormatBool({accessor})")),
         "time.Time" => Ok(format!("{accessor}.Format(time.RFC3339)")),
         other => Err(CoreError::SdkGen {
             message: format!(
-                "unsupported query-param Go type '{other}': only string/int64/float32/bool/time.Time \
+                "unsupported query-param Go type '{other}': only string/int64/float32/float64/bool/time.Time \
                  query parameters can be URL-encoded"
             ),
         }),
@@ -4159,7 +4164,7 @@ fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError
 /// [`query_string_expr`] during emission, so this stays infallible for the import pre-scan).
 fn query_extra_import(value_ty: &str) -> Option<&'static str> {
     match value_ty {
-        "int64" | "float32" | "bool" => Some("strconv"),
+        "int64" | "float32" | "float64" | "bool" => Some("strconv"),
         "time.Time" => Some("time"),
         _ => None,
     }
@@ -5538,6 +5543,20 @@ mod tests {
         use crate::graph::{Prim, Type, WellKnown};
 
         #[test]
+        fn openapi_number_preserves_float64_precision() {
+            let graph = sample_graph();
+            let number = Type::Primitive(Prim::Float { bits: 64 });
+            assert_eq!(go_type(&number, false, &graph).unwrap(), "float64");
+        }
+
+        #[test]
+        fn nullable_string_uses_pointer_representation() {
+            let graph = sample_graph();
+            let string = Type::Primitive(Prim::String);
+            assert_eq!(go_type(&string, true, &graph).unwrap(), "*string");
+        }
+
+        #[test]
         fn value_types_get_a_pointer_only_when_nullable() {
             // Pointer-wrapping reads the NULLABLE axis (RESEARCH Pitfall 4): a nullable value type is
             // `*T`, a non-nullable value type is `T`.
@@ -5555,9 +5574,9 @@ mod tests {
             });
             assert_eq!(go_type(&integer, false, &graph).unwrap(), "int64");
 
-            // strings are nilable already → never pointer-wrapped, even when nullable.
+            // A nullable string must distinguish JSON null from the empty string.
             let string = Type::Primitive(Prim::String);
-            assert_eq!(go_type(&string, true, &graph).unwrap(), "string");
+            assert_eq!(go_type(&string, true, &graph).unwrap(), "*string");
 
             let date_time = Type::WellKnown(WellKnown::DateTime);
             assert_eq!(go_type(&date_time, false, &graph).unwrap(), "time.Time");

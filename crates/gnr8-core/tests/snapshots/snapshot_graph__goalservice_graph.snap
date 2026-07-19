@@ -250,7 +250,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: workflowChainIds
@@ -378,7 +378,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: uuid
@@ -553,7 +553,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: workflowChainIds
@@ -572,18 +572,6 @@ schemas:
       start_line: 39
       end_line: 39
 diagnostics:
-  - severity: WARN
-    message: "float64 -> float32 narrowing: field CreateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 32
-  - severity: WARN
-    message: "float64 -> float32 narrowing: field UpdateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 43
-  - severity: WARN
-    message: "float64 -> float32 narrowing: field GoalResponse.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 57
   - severity: WARN
     message: "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1)"
     file: internal/common/dto/goal.go

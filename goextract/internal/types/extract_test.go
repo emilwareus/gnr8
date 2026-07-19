@@ -444,12 +444,26 @@ func TestGoalResponseWellKnownAndFreeFormMap(t *testing.T) {
 	}
 }
 
-func TestFloat64Diagnostics(t *testing.T) {
-	_, diags := extractFixture(t)
+func TestFloat64WidthIsPreserved(t *testing.T) {
+	schemas, diags := extractFixture(t)
 	owners := []string{"CreateGoalInput", "UpdateGoalInput", "GoalResponse"}
 	for _, owner := range owners {
-		if !hasDiag(diags, "float64 -> float32 narrowing", owner+".TargetValue") {
-			t.Errorf("expected float64 narrowing diagnostic for %s.TargetValue, got %v", owner, diags)
+		schema, ok := schemaByName(schemas, owner)
+		if !ok {
+			t.Fatalf("schema %s not found", owner)
+		}
+		field, ok := fieldByJSON(schema, "targetValue")
+		if !ok {
+			t.Fatalf("targetValue field not found on %s", owner)
+		}
+		prim, ok := field.Schema.Of.(*facts.Prim)
+		if !ok || prim.Prim != facts.PrimFloat || prim.Bits == nil || *prim.Bits != 64 {
+			t.Errorf("%s.TargetValue: want float64 fact, got %+v", owner, field.Schema)
+		}
+	}
+	for _, d := range diags {
+		if containsAll(d.Message, "float64", "float32") {
+			t.Errorf("precision-preserving extraction emitted stale narrowing diagnostic: %+v", d)
 		}
 	}
 	// Every diagnostic must carry a file:line.

@@ -245,17 +245,13 @@ LIFECYCLE
 OUTPUTS (0 stale, 0 drifted, 5 unchanged)
   (all outputs up to date)
 
-DIAGNOSTICS (20 informational — expected PoC limitations)
-  WARN  float64 -> float32 narrowing: field CreateGoalInput.TargetValue (*float64) loses precision
-        in the generated Go SDK ... (internal/common/dto/goal.go:32)
-        why: Go `float64` is narrowed in the generated SDK and loses precision
-        fix: keep the field as `float64` end-to-end, or accept the documented precision trade-off
+DIAGNOSTICS (17 informational — expected limitations)
   WARN  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties:
         true ... (internal/common/dto/goal.go:62)
   WARN  untyped query param 'cursor' on GET /list ... (internal/goal/ports/handlers.go:57)
-  ... (untyped query params x3, float64 narrowing, free-form map, and duplicate-handler WARNs)
+  ... (untyped query params, free-form map, and duplicate-handler WARNs)
 
-healthy — 0 actionable problems (20 informational diagnostic(s))
+healthy — 0 actionable problems (17 informational diagnostic(s))
 ```
 
 ```bash
@@ -263,12 +259,12 @@ healthy — 0 actionable problems (20 informational diagnostic(s))
 # exit=0   (healthy: the WARNs are informational, not actionable)
 ```
 
-> **Why 20 informational diagnostics, not 7?** The scratch copy contains *both* the committed
+> **Why 17 informational diagnostics, not 4?** The scratch copy contains *both* the committed
 > `expected/sdk/*.go` golden files *and* the freshly generated `sdk/*.go`. With `GoGin::new().inputs(["."])`,
 > `gnr8` faithfully analyzes the whole module and reports the extra "duplicate handler name" WARNs
 > (one per SDK symbol that now exists in two trees). This is correct read-only behavior — the verdict
 > stays **healthy / exit 0** because all of them are informational. A real project (without a
-> committed `expected/sdk/`) sees the canonical 7 unsupported-pattern WARNs. Machine-readable form is
+> committed `expected/sdk/`) sees the canonical 4 unsupported-pattern WARNs. Machine-readable form is
 > available via `gnr8 doctor --json`.
 
 ## 7. THE HEADLINE EDIT — change one Go source field

@@ -830,11 +830,10 @@ func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.Type {
 		// signed int. The neutral Prim::Int { signed } exists precisely so a
 		// target can distinguish uint64 from int64 (one source of truth per fact).
 		return facts.PrimitiveType(facts.IntPrim(64, false))
-	case gotypes.Float32, gotypes.Float64:
-		// float64 -> float32 narrowing warning (TARGET-API.md §5.2). Report the
-		// field identity, the DECLARED type (e.g. "*float64"), and its position.
-		ctx.diags.Floatf(ctx.structName, ctx.fieldName, ctx.declaredType, ctx.file, ctx.line)
+	case gotypes.Float32:
 		return facts.PrimitiveType(facts.FloatPrim(32))
+	case gotypes.Float64:
+		return facts.PrimitiveType(facts.FloatPrim(64))
 	default:
 		// An unsupported basic kind (complex64/128, uintptr, untyped constants,
 		// ...) has no faithful neutral primitive. Emit a diagnostic and fall back

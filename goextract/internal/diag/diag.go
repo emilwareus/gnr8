@@ -23,19 +23,6 @@ func New() *Accumulator {
 	return &Accumulator{items: []facts.DiagnosticFact{}}
 }
 
-// Floatf records the float64 -> float32 narrowing warning for a struct field
-// (TARGET-API.md §5.2). goType is the rendered Go type (e.g. "*float64").
-func (a *Accumulator) Floatf(structName, fieldName, goType, file string, line uint32) {
-	a.items = append(a.items, facts.DiagnosticFact{
-		Severity: severityWarn,
-		Message: "float64 -> float32 narrowing: field " + structName + "." + fieldName +
-			" (" + goType + ") loses precision in the generated Go SDK; map to float64 or " +
-			"surface a compatibility diagnostic (TARGET-API.md §5.2)",
-		File: file,
-		Line: line,
-	})
-}
-
 // FreeFormMap records the free-form map warning for a struct field
 // (TARGET-API.md §5.1): map[string]any lowers to additionalProperties: true.
 func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, line uint32) {

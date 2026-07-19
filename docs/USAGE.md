@@ -211,7 +211,7 @@ contract (the committed graph/OpenAPI snapshots are the spec).
 
 | Frontend | Lang | Status | Recognized | Limits / diagnostics |
 |---|---|---|---|---|
-| Gin | Go | full | static nested route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | dynamic route paths skipped and dynamic group prefixes omitted with diagnostics; `float64`→`float32` narrowing (diag); `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
+| Gin | Go | full | static nested route groups, path/query params, `ShouldBindJSON` body, `c.JSON` responses, const enums, nested structs | dynamic route paths skipped and dynamic group prefixes omitted with diagnostics; `map[string]any` free-form (diag); untyped `c.Query` → string (diag); Gin-only. |
 | FastAPI | Python | full | `@app`/`@router` verbs, static router/include prefixes, path params (template∩args), typed query params (defaults→required/optional), Pydantic/`@dataclass` bodies, `response_model=` or typed handler returns, collection responses, `status_code=`, `Literal`/`Enum`, `Union` aliases; `Depends` injection is excluded | static `ast` only (never imports/executes the target); unresolvable/foreign type → diagnostic + omit (no guess). |
 | Flask | Python | typed-envelope (honest second-class) | `@app.route`/`methods=`, `Blueprint(url_prefix=)`, `<int:id>` converter path params, OPT-IN typed DTOs/returns; method-derived status (typed `POST`→201, else 200) | untyped `request.json` / unannotated `request.args` / missing return annotation → **diagnostic, NEVER inferred**. State plainly: untyped surfaces are NOT recovered (typed-envelope only). |
 | NestJS | TypeScript | class-DTO scope | `@nestjs/common` verb + `@Param`/`@Query`/`@Body` decorators, statically composed `@Controller` prefix, DTO **classes**, enums + string-literal-union, synchronous or `Promise<T>` returns, collection responses, method-derived status (`@HttpCode` override) | DTO **classes** only (bare `interface`s are erased — not extracted); never reads `@nestjs/swagger` / `zod` / `class-validator` (rule 1); unresolvable → diagnostic + omit. |
@@ -296,10 +296,11 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | `string` | `string` | `string` | |
 | `bool` | `boolean` | `bool` | |
 | `int`/`int64` | `integer` | `int64` | |
-| `float64` | `number` | **`float32`** | ⚠ narrows precision → diagnostic emitted |
+| `float32` | `number`/`float` | `float32` | width preserved |
+| `float64` | `number`/`double` | `float64` | width preserved |
 | `time.Time` | `string`/`date-time` | `time.Time` | |
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
-| `*T` | nullable, source-optional | **value `T` + `,omitempty`** (pointer dropped) | schema `required` is still tag-driven. |
+| `*T` | nullable, source-optional | `*T`; `,omitempty` only when optional | preserves JSON `null` separately from scalar zero values. |
 | `,omitempty` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability. |
 | `[]T` | `array` | `[]T` | |
 | `map[string]T` | `object`,`additionalProperties:true` | `map[string]T` | free-form → diagnostic |
@@ -316,8 +317,8 @@ Single package `<go_module last segment>`, files: `client.go`, `models.go`, `ope
 - Imports stdlib only (`net/http`, `context`, `encoding/json`, `time`, `fmt`, `net/url`) → the generated SDK `go build`s with zero third-party requires.
 
 ## Diagnostics
-Each carries severity + message + `file:line` provenance. Classes: `float64->float32` narrowing,
-free-form map (`map[string]any`), untyped query param, dynamic/unresolvable response, unsupported Gin
+Each carries severity + message + `file:line` provenance. Classes: free-form map (`map[string]any`),
+untyped query param, dynamic/unresolvable response, unsupported Gin
 route pattern, duplicate handler name. Diagnostics are non-fatal to generation (output still produced)
 EXCEPT a dangling `$ref` (a route
 references a type with no schema) which IS fatal — see Errors. `gnr8 doctor` aggregates them; `gnr8
@@ -336,9 +337,8 @@ inspect graph <dir>` lists them.
 ## Known quirks / limits (do not treat as bugs unless fixing them)
 - Static Gin group prefixes are folded only when they are literal strings. Dynamic route paths are
   skipped with diagnostics; dynamic group prefixes are omitted with diagnostics.
-- `float64` → SDK `float32` (precision narrowing).
-- Optional pointer fields → value type + `,omitempty` in the Go SDK (pointer-ness lost there), while
-  the graph still carries nullability for OpenAPI and TypeScript targets.
+- Optional and nullable are independent: optional fields use `,omitempty`; nullable scalar fields use
+  pointers so JSON `null` remains distinct from a scalar zero value.
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - Gin-only, Go-only.

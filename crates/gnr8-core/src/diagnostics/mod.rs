@@ -2,13 +2,12 @@
 //!
 //! [`collect`] runs the `goextract` helper, takes the diagnostics it emits (each a severity + a
 //! machine-stable rule/identity message + a `file:line`), and renders them to a canonical text block.
-//! The rendered text reconciles with `fixtures/goalservice/expected/diagnostics.txt`: 7 `WARN` lines
-//! — float64-narrowing ×3, free-form-map ×1, untyped-query ×3 — in a stable, reviewable order.
+//! The rendered text reconciles with `fixtures/goalservice/expected/diagnostics.txt`: free-form-map
+//! ×1 and untyped-query ×3 in a stable, reviewable order.
 //!
 //! Canonical phrasing (Open Q2 / RESEARCH Pitfall 4): the helper normalizes each rule to ONE template
-//! carrying the field-or-route identity, so the three float64 lines share trailing phrasing rather
-//! than the slightly-divergent wording in the hand-authored `expected/diagnostics.txt`. We render each
-//! diagnostic as `WARN  <message> (<file>:<line>)` (severity + identity + source location, D-10),
+//! carrying the field-or-route identity. We render each diagnostic as
+//! `WARN  <message> (<file>:<line>)` (severity + identity + source location, D-10),
 //! relativizing the file path against the analyzed module so the output is portable + byte-stable.
 //! The `snapshot_diagnostics` test locks the exact final text.
 

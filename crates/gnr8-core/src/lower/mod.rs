@@ -20,7 +20,7 @@
 //! ## Diagnostics (OAPI-03)
 //!
 //! Lowering does NOT re-derive diagnostics. The graph already carries the byte-locked Phase-2
-//! diagnostics (float64 narrowing, free-form maps, untyped query params); they are surfaced through
+//! diagnostics (free-form maps, untyped query params, unsupported dynamic patterns); they are surfaced through
 //! the existing `diagnostics::collect` path (the green `snapshot_diagnostics`). `to_openapi` is
 //! non-fatal on diagnostics — a graph with a non-empty `diagnostics` vector still lowers successfully
 //! — and it never drops or recomputes them. The representational decision the diagnostics describe
