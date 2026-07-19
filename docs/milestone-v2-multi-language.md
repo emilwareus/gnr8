@@ -152,6 +152,7 @@ export). The Flask fixture additionally encodes the **honest second-class envelo
   SDK for a **FastAPI**, a **Flask**, and a **NestJS** service.
 - The **same IR** lowers identically across Go / FastAPI / Flask / NestJS — proven by a shared snapshot
   shape (one OpenAPI per fixture, structurally aligned).
-- Every sidecar is stdlib-only *in its language* (Python `ast`: ✓; TS: per the recorded decision);
-  **zero OSS in `gnr8-core`**; no convention coupling; no fallback paths; deterministic.
+- Every sidecar follows the recorded toolchain decision (Python `ast`: ✓; TS: the project's compiler);
+  `gnr8-core` uses focused commodity dependencies while owning the pipeline; generated SDKs are
+  dependency-free; no convention coupling; no fallback paths; deterministic.
 - Honest, documented per-language supported-envelope tables (especially Flask's limits).

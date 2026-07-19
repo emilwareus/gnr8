@@ -445,6 +445,8 @@ the built-in `fetch`. PySdk emits Pydantic v2 `BaseModel` models by default, wit
 `.dataclasses()` available for stdlib-only model consumers. The `tsextract` sidecar resolves the
 **project's own `typescript`** toolchain (required, not shipped — see CLAUDE.md); every other sidecar is
 stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small Rust dependency set.
+The CLI's focused open-source dependencies support bounded commodity concerns; the source-to-SDK
+pipeline remains gnr8-owned end to end.
 
 TypeScript migration compatibility is explicit. `TsSdk::new().compatibility(TsCompatibility::OpenApiGenerator)`
 is a concise alias for `TsSdk::new().profile(SdkProfile::openapi_generator_compat())`. It emits an

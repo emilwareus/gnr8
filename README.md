@@ -5,6 +5,8 @@
 `gnr8` reads your service code, builds a language- and router-agnostic model of its API, and generates
 an **OpenAPI 3.1** document and a client **SDK** from it. The generation lifecycle is **configured in
 code**, so you, or an AI agent, can adapt exactly how it parses and generates for your project.
+gnr8 owns this pipeline end to end while using focused open-source libraries for commodity concerns;
+the generated Go, Python, and TypeScript SDKs use only their standard libraries.
 
 > Status: **early release candidate.** Supported frontends are **Go + Gin**, **Python FastAPI**,
 > **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**, with OpenAPI 3.1 plus

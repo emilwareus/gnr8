@@ -50,6 +50,10 @@ The `share/gnr8` tree is required because source extraction shells out to the Go
 sidecars, and archive installs can scaffold `.gnr8` with a local path dependency for offline use.
 `gnr8` discovers this tree automatically from the archive layout; `GNR8_RESOURCE_DIR` can override it.
 
+The CLI and engine use focused open-source dependencies for commodity concerns such as serialization,
+CLI parsing, and file watching. gnr8 owns the source-to-OpenAPI-to-SDK pipeline itself; generated SDKs
+remain standard-library-only.
+
 ## GitHub Release
 
 1. Make sure `main` is green.

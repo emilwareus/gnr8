@@ -109,9 +109,10 @@ and **TypeScript (NestJS)**. 6 phases / 19 plans / 43 tasks.
 - **`.gnr8/` built-ins:** Sources `GoGin`/`FastApi`/`Flask`/`NestJs`; Targets `OpenApi31`/`GoSdk`/`PySdk`/`TsSdk`.
 - **Examples:** `examples/{bookstore(Go),fastapi-bookstore,nestjs-bookstore}` — real committed output,
   byte-identical regen proven by the `make examples-check` cross-language determinism gate.
-- **Invariants held:** gnr8-core ships ZERO OSS (v2.0 added no new crate); each sidecar stdlib-only in its
-  language; `typescript` is a **required user toolchain** (resolved from the target project, never shipped)
-  — recorded in CLAUDE.md; one source of truth per fact; no fallback paths; deterministic byte-identical.
+- **Invariants held:** gnr8 owns the source-to-SDK pipeline and uses focused dependencies for commodity
+  concerns; generated SDKs remain standard-library-only. `typescript` is a **required user toolchain**
+  (resolved from the target project, never shipped). One source of truth per fact and deterministic,
+  byte-identical output remain requirements.
 - **Quality:** `make check` green (fmt, clippy `-D warnings`, all Rust tests, Python `unittest`, TS `tsc`
   typecheck, 6 multi-language acceptance snapshots, hermetic SDK round-trips, cross-language determinism).
 - **Known tech debt (carried/deferred):** gnr8-core OSS known-debt (serde/serde_json/blake3/thiserror —
@@ -180,7 +181,7 @@ The core product bet is that a small Rust engine can own orchestration, graph ma
 | Design for more source and target languages, but do not start multi-language | The core should not bake in Go-only assumptions, but Go must prove the model first. | ✓ Good (v1.0 proved the model; v2.0 now adds TS + Python) |
 | v2.0: add TypeScript (NestJS) + Python (FastAPI/Flask) — parse + generate | The router-agnostic IR is the narrow waist; each new language is a sidecar emitting the same JSON facts + one new SDK `Target`. The whole Rust lowering/OpenAPI pipeline is reused. | ✓ Good — v2.0 (4 language paths green; one neutral facts contract, reused lowering, no per-language branch) |
 | Python sidecar uses stdlib `ast`; resolve types via an owned cross-module symbol table, never importing user code | `ast` is Python's stdlib (the `go/types` analog); importing user code = executing it (a security boundary). Static-only; unresolved types → diagnostic, never a fallback (rule 3). | ✓ Good — v2.0 (`pyextract` static-only; owned symbol table; unresolved→diagnostic, no fallback) |
-| TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar | TS has no stdlib type-checker; `typescript` is the language's own reference compiler (the `go/types` analog). It is a **required user toolchain, not a shipped/bundled/vendored dependency**: `tsextract` resolves the USER's own `typescript` from the target project (`tsextract/ts.js`) — exactly as `goextract` uses the user's `go` and `pyextract` uses `python3`. **gnr8 ships ZERO OSS** (gnr8-core takes no crates; nothing is vendored; the devDependency is gitignored and backs only gnr8's own tests). Rule 2 holds literally — this is a toolchain prerequisite, NOT a loosening. Bright line: facts come ONLY from the source's own TS types, never from `@nestjs/swagger`/`zod`/`class-validator` (rule 1); generated SDKs stay dependency-free. | ✓ Good (required user toolchain; gnr8 ships none. FUT-04 stdlib-pure TS path could remove even the prerequisite) |
+| TypeScript sidecar uses the `typescript` Compiler API in an isolated Node sidecar | TS has no stdlib type-checker; `typescript` is the language's own reference compiler (the `go/types` analog). It is a **required user toolchain, not a bundled dependency**: `tsextract` resolves the user's own `typescript` from the target project (`tsextract/ts.js`) — exactly as `goextract` uses the user's `go` and `pyextract` uses `python3`. gnr8 itself uses focused commodity dependencies while owning the API pipeline end to end; generated SDKs stay standard-library-only. | ✓ Good (required user toolchain; generated SDK remains dependency-free) |
 | Use Rust best-practice guardrails | Keeps the future implementation maintainable and measurable. | ✓ Good |
 
 ## Evolution
