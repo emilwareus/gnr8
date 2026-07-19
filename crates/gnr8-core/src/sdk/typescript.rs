@@ -8,12 +8,10 @@ pub enum TsModelPropertyPolicy {
     /// Preserve the graph's presence facts exactly: optional fields use `?:`, required fields do not.
     #[default]
     Strict,
-    /// Match OpenAPI Generator model shape: schema-required fields are required, and fields omitted
-    /// from the schema `required` list use `?:`.
-    OpenApiRequired,
-    /// Emit every generated model property as optional for legacy OpenAPI Generator assignment
-    /// compatibility.
-    OpenApiGeneratorLoose,
+    /// Derive optional markers from the OpenAPI schema `required` list.
+    SchemaRequired,
+    /// Emit every generated model property as optional.
+    AllOptional,
 }
 
 impl TsModelPropertyPolicy {
@@ -25,30 +23,23 @@ impl TsModelPropertyPolicy {
 
     /// Legacy-loose property declarations.
     #[must_use]
-    pub const fn openapi_generator_loose() -> Self {
-        Self::OpenApiGeneratorLoose
+    pub const fn all_optional() -> Self {
+        Self::AllOptional
     }
 
-    /// OpenAPI Generator-style property declarations.
+    /// OpenAPI schema-required property declarations.
     #[must_use]
     pub const fn openapi_required() -> Self {
-        Self::OpenApiRequired
+        Self::SchemaRequired
     }
 
     pub(crate) const fn field_optional(self, graph_required: bool, graph_optional: bool) -> bool {
         match self {
             Self::Strict => graph_optional,
-            Self::OpenApiRequired => !graph_required,
-            Self::OpenApiGeneratorLoose => true,
+            Self::SchemaRequired => !graph_required,
+            Self::AllOptional => true,
         }
     }
-}
-
-/// TypeScript compatibility profiles exposed as a concise target-level API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TsCompatibility {
-    /// OpenAPI Generator-compatible TypeScript SDK surface.
-    OpenApiGenerator,
 }
 
 /// How generated TypeScript model/interface properties represent nullable values.
@@ -104,8 +95,6 @@ pub enum TsResponsePolicy {
     /// Return decoded response bodies directly as `Promise<T>`.
     #[default]
     DataOnly,
-    /// Return Axios response wrappers as `Promise<AxiosResponse<T>>`.
-    AxiosResponseWrapper,
 }
 
 impl TsResponsePolicy {
@@ -114,27 +103,14 @@ impl TsResponsePolicy {
     pub const fn data_only() -> Self {
         Self::DataOnly
     }
-
-    /// Return Axios response wrappers.
-    #[must_use]
-    pub const fn axios_response_wrapper() -> Self {
-        Self::AxiosResponseWrapper
-    }
-
-    pub(crate) const fn is_axios_response_wrapper(self) -> bool {
-        matches!(self, Self::AxiosResponseWrapper)
-    }
 }
 
-/// How the fetch compatibility profile emits the root `index.ts` barrel.
+/// How the TypeScript SDK emits the root `index.ts` barrel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TsBarrelExports {
     /// Re-export every API, runtime, and model symbol.
     #[default]
     Star,
-    /// Export runtime and models broadly, but only API classes from `./apis` to avoid request/model
-    /// name collisions seen in OpenAPI Generator migrations.
-    OpenApiGeneratorCompat,
 }
 
 impl TsBarrelExports {
@@ -142,12 +118,6 @@ impl TsBarrelExports {
     #[must_use]
     pub const fn star() -> Self {
         Self::Star
-    }
-
-    /// Emit the OpenAPI Generator-compatible root barrel.
-    #[must_use]
-    pub const fn openapi_generator_compat() -> Self {
-        Self::OpenApiGeneratorCompat
     }
 }
 
@@ -173,36 +143,8 @@ impl TsSdkOptions {
         }
     }
 
-    pub(crate) fn openapi_generator_compat() -> Self {
-        Self {
-            model_properties: TsModelPropertyPolicy::OpenApiRequired,
-            nullable: TsNullablePolicy::ExplicitNull,
-            response: TsResponsePolicy::AxiosResponseWrapper,
-            request_body_param_name: "body".to_string(),
-            init_override_function: false,
-            barrel_exports: TsBarrelExports::Star,
-        }
-    }
-
-    pub(crate) fn fetch_compat() -> Self {
-        Self {
-            model_properties: TsModelPropertyPolicy::OpenApiRequired,
-            nullable: TsNullablePolicy::ExplicitNull,
-            response: TsResponsePolicy::DataOnly,
-            request_body_param_name: "body".to_string(),
-            init_override_function: true,
-            barrel_exports: TsBarrelExports::Star,
-        }
-    }
-
-    pub(crate) fn for_profile(profile: &SdkProfile) -> Self {
-        if profile.is_typescript_axios_compat() {
-            Self::openapi_generator_compat()
-        } else if profile.is_typescript_fetch_compat() {
-            Self::fetch_compat()
-        } else {
-            Self::strict()
-        }
+    pub(crate) fn for_profile(_profile: &SdkProfile) -> Self {
+        Self::strict()
     }
 }
 

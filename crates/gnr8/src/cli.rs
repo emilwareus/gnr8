@@ -76,47 +76,6 @@ pub(crate) enum Commands {
     },
     /// Summarize unsupported patterns and lifecycle issues.
     Doctor,
-    /// Compare generated SDK public surfaces for compatibility.
-    Compat {
-        /// Compatibility check to run.
-        #[command(subcommand)]
-        action: CompatAction,
-    },
-}
-
-/// SDK compatibility subcommands.
-#[derive(Debug, Subcommand)]
-pub(crate) enum CompatAction {
-    /// Compare two generated TypeScript SDK directories.
-    Typescript {
-        /// Old/baseline SDK directory.
-        #[arg(long)]
-        old: String,
-        /// New/candidate SDK directory.
-        #[arg(long)]
-        new: String,
-        /// Optional compatibility contract TOML path.
-        #[arg(long)]
-        contract: Option<String>,
-        /// Print high-confidence config suggestions for detected drift.
-        #[arg(long)]
-        suggest: bool,
-    },
-    /// Compare two generated Go SDK directories.
-    Go {
-        /// Old/baseline SDK directory.
-        #[arg(long)]
-        old: String,
-        /// New/candidate SDK directory.
-        #[arg(long)]
-        new: String,
-        /// Optional compatibility contract TOML path.
-        #[arg(long)]
-        contract: Option<String>,
-        /// Print high-confidence config suggestions for detected drift.
-        #[arg(long)]
-        suggest: bool,
-    },
 }
 
 /// Source frontend presets for `gnr8 init`.
@@ -191,7 +150,7 @@ mod tests {
     // the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+    use super::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
     use clap::Parser;
 
     #[test]
@@ -258,30 +217,6 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
             Commands::Doctor
-        ));
-        assert!(matches!(
-            Cli::try_parse_from([
-                "gnr8",
-                "compat",
-                "typescript",
-                "--old",
-                "old-sdk",
-                "--new",
-                "new-sdk"
-            ])
-            .unwrap()
-            .command,
-            Commands::Compat {
-                action: CompatAction::Typescript { .. }
-            }
-        ));
-        assert!(matches!(
-            Cli::try_parse_from(["gnr8", "compat", "go", "--old", "old-sdk", "--new", "new-sdk"])
-                .unwrap()
-                .command,
-            Commands::Compat {
-                action: CompatAction::Go { .. }
-            }
         ));
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "guide"]).unwrap().command,

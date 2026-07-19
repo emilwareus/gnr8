@@ -100,7 +100,7 @@ methods, params/query/body decorators, DTO classes, enums, and unions. It does n
 class-validator metadata.
 
 OpenAPI/Swagger source reads JSON or YAML Swagger 2.0, OpenAPI 3.0, and OpenAPI 3.1 artifacts into
-the same API graph used by code-first sources. Use it for brownfield generator replacement, then target
+the same API graph used by code-first sources. Import a specification directly, then target
 `OpenApi31`, `TsSdk`, `GoSdk`, or other SDK targets from that one graph.
 
 ```rust
@@ -109,94 +109,13 @@ Pipeline::new()
     .target(
         TsSdk::new()
             .module("@acme/books")
-            .to("generated/typescript")
-            .profile(SdkProfile::typescript_fetch_compat()),
+            .to("generated/typescript"),
     )
     .target(
         GoSdk::new()
             .module("example.com/acme/books")
-            .to("generated/go")
-            .profile(SdkProfile::go_openapi_generator_compat()),
+            .to("generated/go"),
     )
-```
-
-Compatibility checks compare old and new generated SDK surfaces:
-
-```bash
-gnr8 compat typescript --old old-typescript-sdk --new generated/typescript --contract sdk-compat.toml
-gnr8 compat go --old old-go-sdk --new generated/go --contract sdk-compat.toml --suggest
-```
-
-Without `--contract`, any surface diff is breaking. With `--contract`, only missing required symbols
-and unapproved diff items fail the command; stale allowances are reported in `--json` and do not fail.
-`--suggest` adds high-confidence migration snippets to human output and to the JSON `suggestions`
-array.
-
-Contract keys are optional arrays, except `allow.docs_layout_migration`, which defaults to `false`:
-
-```toml
-[allow]
-docs_layout_migration = false
-missing_docs = []
-
-[go]
-require_exported_types = []
-require_exported_functions = []
-require_exported_methods = []
-allow_missing_exported_types = []
-allow_missing_exported_functions = []
-allow_missing_exported_methods = []
-allow_exported_function_signature_changes = []
-allow_exported_method_signature_changes = []
-allow_missing_docs = []
-allow_package_metadata_changes = []
-
-[typescript]
-require_root_exports = []
-require_model_exports = []
-require_api_classes = []
-require_api_factories = []
-require_operation_methods = []
-require_request_aliases = []
-allow_missing_root_exports = []
-allow_missing_model_exports = []
-allow_missing_api_classes = []
-allow_missing_api_factories = []
-allow_missing_operation_methods = []
-allow_missing_request_aliases = []
-allow_missing_interface_properties = []  # "Interface.property"
-allow_interface_property_changes = []    # "Interface.property"
-allow_operation_return_type_changes = []
-allow_operation_signature_changes = []
-allow_export_kind_mismatches = []
-allow_package_entry_point_changes = []
-allow_missing_docs = []
-```
-
-For OpenAPI Generator migrations, use compatibility profiles first and clean profiles later:
-
-```rust
-TsSdk::new()
-    .module("@acme/books")
-    .to("generated/typescript")
-    .profile(SdkProfile::typescript_fetch_compat())
-    .layout(SdkFileLayout::split().model_file_template("models/{schema_kebab}.ts"));
-
-GoSdk::new()
-    .module("example.com/acme/books")
-    .to("generated/go")
-    .profile(SdkProfile::go_openapi_generator_compat())
-    .request_builder_aliases(
-        GoRequestBuilderAliases::new()
-            .operation("POST", "/books")
-            .body("Book")
-            .operation("GET", "/books")
-            .query("PageSize", "pageSize"),
-    )
-    .query_setter_argument_policy(
-        GoQuerySetterArgumentPolicy::typed().any_for_queries(["sort", "filter"]),
-    )
-    .execute_compatibility(GoExecuteCompatibility::preserve_legacy().route("GET", "/books"));
 ```
 
 Request-body creation helpers create or replace `op.request_body`, set the content type, and default to
@@ -227,10 +146,6 @@ OpenApi31::new()
         ),
     );
 ```
-
-`gnr8 generate --json` includes a `cleanup` section for migration review: files gnr8 owns, stale
-generated files removed, generated-looking unowned files, protected hand edits, legacy package files,
-and old generator dependencies to remove.
 
 ## Generated SDKs
 

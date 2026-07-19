@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sdk::profile::SdkProfile;
 
-/// How OpenAPI Generator-compatible model constructors accept required pointer fields.
+/// How generated model constructors accept required pointer fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RequiredPointerConstructorPolicy {
     /// Preserve pointer parameters for required pointer fields.
@@ -28,7 +28,7 @@ impl RequiredPointerConstructorPolicy {
     }
 }
 
-/// How `time.Time` query values are serialized in OpenAPI Generator-compatible helpers.
+/// How `time.Time` query values are serialized in generated request helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueryTimeFormat {
     /// Use the default `fmt.Sprint` behavior.
@@ -50,13 +50,9 @@ impl QueryTimeFormat {
     pub const fn date_only_at_midnight_else_rfc3339() -> Self {
         Self::DateOnlyAtMidnightElseRfc3339
     }
-
-    pub(crate) const fn needs_time_import(self) -> bool {
-        matches!(self, Self::DateOnlyAtMidnightElseRfc3339)
-    }
 }
 
-/// Which setters are emitted on OpenAPI Generator-compatible request builders.
+/// Which setters are emitted on generated request builders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GoRequestBuilderScope {
     /// Emit only setters used by the operation.
@@ -78,13 +74,9 @@ impl GoRequestBuilderScope {
     pub const fn global() -> Self {
         Self::Global
     }
-
-    pub(crate) const fn is_global(self) -> bool {
-        matches!(self, Self::Global)
-    }
 }
 
-/// How OpenAPI Generator-compatible query setter arguments are typed.
+/// How generated query setter arguments are typed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GoQuerySetterArgumentPolicy {
     /// Use the query parameter's generated Go type.
@@ -190,23 +182,9 @@ impl GoQuerySetterArgumentPolicy {
                 .is_some_and(|setters| setters.contains(setter)),
         }
     }
-
-    pub(crate) fn request_names(&self) -> BTreeSet<String> {
-        match self {
-            Self::SelectiveAny(any_for) => any_for.keys().cloned().collect(),
-            Self::Typed | Self::Any => BTreeSet::new(),
-        }
-    }
-
-    pub(crate) fn setters_for(&self, request: &str) -> BTreeSet<String> {
-        match self {
-            Self::SelectiveAny(any_for) => any_for.get(request).cloned().unwrap_or_default(),
-            Self::Typed | Self::Any => BTreeSet::new(),
-        }
-    }
 }
 
-/// Additional methods to emit on OpenAPI Generator-compatible request builders.
+/// Additional user-selected methods to emit on generated request builders.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GoRequestBuilderAliases {
     pub(crate) body: BTreeMap<String, BTreeSet<String>>,
@@ -294,10 +272,6 @@ impl GoRequestBuilderAliases {
             .map(|aliases| aliases.iter().cloned().collect())
             .unwrap_or_default()
     }
-
-    pub(crate) fn request_names(&self) -> BTreeSet<String> {
-        self.body.keys().chain(self.query.keys()).cloned().collect()
-    }
 }
 
 /// Builder returned by [`GoRequestBuilderAliases::operation`] and
@@ -326,7 +300,7 @@ impl GoRequestBuilderOperationAliases {
     }
 }
 
-/// Compatibility wrappers for OpenAPI Generator-compatible `Execute` methods.
+/// User-selected wrappers for generated `Execute` methods.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GoExecuteCompatibility {
     preserve_legacy_requests: BTreeSet<String>,
@@ -368,14 +342,6 @@ impl GoExecuteCompatibility {
     pub(crate) fn preserves(&self, request: &str, operation: &str) -> bool {
         self.preserve_legacy_requests.contains(request)
             || self.preserve_legacy_operations.contains(operation)
-    }
-
-    pub(crate) fn request_names(&self) -> &BTreeSet<String> {
-        &self.preserve_legacy_requests
-    }
-
-    pub(crate) fn operation_names(&self) -> &BTreeSet<String> {
-        &self.preserve_legacy_operations
     }
 }
 

@@ -29,7 +29,6 @@
 
 pub mod builtins;
 pub mod bundle;
-pub mod compat;
 pub mod docs;
 pub(crate) mod emit_common;
 pub mod go;
@@ -908,18 +907,14 @@ pub mod prelude {
     };
     pub use super::docs::SdkDocs;
     pub use super::go::{
-        GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
-        GoRequestBuilderOperationAliases, GoRequestBuilderScope, QueryTimeFormat,
-        RequiredPointerConstructorPolicy,
+        GoQuerySetterArgumentPolicy, GoRequestBuilderAliases, GoRequestBuilderOperationAliases,
     };
     pub use super::layout::{OperationFileSplit, SdkFileLayout};
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::profile::SdkProfile;
     pub use super::surface::SdkTypeAliases;
-    pub use super::typescript::{
-        TsBarrelExports, TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
-    };
+    pub use super::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,

@@ -2,7 +2,7 @@
 
 Dense reference for operating and editing gnr8. Terse by design. Source of truth for behavior is the
 code; this matches the current build. Product invariants: [`../CLAUDE.md`](../CLAUDE.md) (one source per
-fact, no third-party deps, no fallback/dual paths, config supplies what typed source can't).
+fact, an end-to-end owned generation chain, no fallback chains, config supplies what typed source can't).
 
 ## What it is / isn't
 - Reads source services or existing OpenAPI artifacts into a router-agnostic API graph, emits
@@ -65,9 +65,6 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
-| `gnr8 compat typescript` | `--old <dir> --new <dir> [--contract <path>] [--suggest]` | old/new TypeScript SDK dirs | — | **0 compatible; 1 breaking** |
-| `gnr8 compat go` | `--old <dir> --new <dir> [--contract <path>] [--suggest]` | old/new Go SDK dirs | — | **0 compatible; 1 breaking** |
-
 `doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
 reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
 | `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 1 on error |
@@ -80,82 +77,6 @@ Notes:
   outputs and the `.gnr8/target`/`.gnr8/cache` dirs (no regen loop).
 - No command panics on bad input/missing toolchain — typed error → clean stderr + non-zero. A `.gnr8/`
   that is missing, won't compile, or whose `cargo` is absent surfaces as an actionable error.
-
-### Compatibility contracts and suggestions
-`gnr8 compat` compares old/new SDK directories. Without `--contract`, any detected public-surface drift
-is breaking. With `--contract`, exit 1 is reserved for missing required symbols or unapproved diff
-items; stale allowances are reported in `--json` under `contract_evaluation.stale_allowances` but do
-not fail the check. `--suggest` adds high-confidence migration snippets to human output and to the JSON
-`suggestions` array.
-
-```bash
-gnr8 compat go \
-  --old old-go-sdk \
-  --new generated/go \
-  --contract sdk-compat.toml \
-  --suggest
-
-gnr8 --json compat typescript \
-  --old old-typescript-sdk \
-  --new generated/typescript \
-  --contract sdk-compat.toml \
-  --suggest
-```
-
-Contract files are TOML. Every key is optional and defaults to `false` or an empty list.
-
-```toml
-[allow]
-docs_layout_migration = false
-missing_docs = []
-
-[go]
-require_exported_types = []
-require_exported_functions = []
-require_exported_methods = []
-allow_missing_exported_types = []
-allow_missing_exported_functions = []
-allow_missing_exported_methods = []
-allow_exported_function_signature_changes = []
-allow_exported_method_signature_changes = []
-allow_missing_docs = []
-allow_package_metadata_changes = []
-
-[typescript]
-require_root_exports = []
-require_model_exports = []
-require_api_classes = []
-require_api_factories = []
-require_operation_methods = []
-require_request_aliases = []
-allow_missing_root_exports = []
-allow_missing_model_exports = []
-allow_missing_api_classes = []
-allow_missing_api_factories = []
-allow_missing_operation_methods = []
-allow_missing_request_aliases = []
-allow_missing_interface_properties = []      # "Interface.property"
-allow_interface_property_changes = []        # "Interface.property"
-allow_operation_return_type_changes = []     # "Class.method" or "Factory.method"
-allow_operation_signature_changes = []       # "Class.method" or "Factory.method"
-allow_export_kind_mismatches = []
-allow_package_entry_point_changes = []
-allow_missing_docs = []
-```
-
-Example gate:
-
-```toml
-[go]
-require_exported_types = ["Book", "ApiListBooksRequest"]
-allow_exported_method_signature_changes = ["ApiListBooksRequest.Execute"]
-
-[typescript]
-require_root_exports = ["Book", "DefaultApi"]
-allow_interface_property_changes = ["Book.title"]
-allow_operation_return_type_changes = ["DefaultApi.listBooks"]
-allow_operation_signature_changes = ["DefaultApi.listBooks"]
-```
 
 ## Config: the `.gnr8/` crate (code, not TOML)
 **There is no config file.** Configuration is a small Rust **binary crate** at `.gnr8/` that depends on
@@ -226,151 +147,6 @@ fn main() -> std::process::ExitCode {
     )
 }
 ```
-
-Brownfield OpenAPI Generator replacement:
-```rust
-use gnr8::sdk::prelude::*;
-
-fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
-        Pipeline::new()
-            .source(OpenApi::new().input("openapi.yaml"))
-            .target(OpenApi31::new().to("generated/openapi.yaml"))
-            .target(
-                TsSdk::new()
-                    .module("@acme/books")
-                    .to("generated/typescript")
-                    .profile(SdkProfile::typescript_fetch_compat()),
-            )
-            .target(
-                GoSdk::new()
-                    .module("example.com/acme/books")
-                    .to("generated/go")
-                    .profile(SdkProfile::go_openapi_generator_compat()),
-            ),
-    )
-}
-```
-
-Compatibility layout controls stay on the SDK targets, separate from the clean defaults:
-
-```rust
-TsSdk::new()
-    .module("@acme/books")
-    .to("generated/typescript")
-    .profile(SdkProfile::typescript_fetch_compat())
-    .layout(
-        SdkFileLayout::split()
-            .operations_per_endpoint()
-            .operation_file_template("apis/{service_kebab}/{operation_kebab}.ts")
-            .model_file_template("models/{schema_kebab}.ts"),
-    )
-    .package_metadata(true)
-    .docs(true);
-
-GoSdk::new()
-    .module("example.com/acme/books")
-    .to("generated/go")
-    .profile(SdkProfile::go_openapi_generator_compat())
-    .source_only(); // suppress docs and package metadata when an outer package owns them
-```
-
-For the complete compact, per-tag, per-endpoint, and template file-layout rules, see
-[`docs/sdk-file-layout.md`](sdk-file-layout.md).
-
-Go OpenAPI Generator compatibility controls can be selected by old request-builder type name, operation
-id, or graph route. Route/operation selectors are resolved during generation and fail with a config
-error if they match nothing or match ambiguously.
-
-```rust
-GoSdk::new()
-    .module("example.com/acme/books")
-    .to("generated/go")
-    .profile(SdkProfile::go_openapi_generator_compat())
-    .request_builder_aliases(
-        GoRequestBuilderAliases::new()
-            .operation("POST", "/books")
-            .body("Book")
-            .operation("GET", "/books")
-            .query("PageSize", "pageSize"),
-    )
-    .query_setter_argument_policy(
-        GoQuerySetterArgumentPolicy::typed()
-            .any_for_query("pageSize")
-            .any_for_queries(["sort", "filter"])
-            .any_for_route_query("GET", "/books", "includeArchived"),
-    )
-    .execute_compatibility(GoExecuteCompatibility::preserve_legacy().route("GET", "/books"));
-```
-
-Route-scoped auth, legacy SDK names, and source-fact overrides stay in `.gnr8/src/main.rs` as regular
-Rust:
-
-```rust
-let active_school = OperationSelector::any([
-    OperationSelector::path_prefix("/v1/schools/active/"),
-    OperationSelector::path_prefix("/v1/import-jobs/"),
-]);
-let mutating = OperationSelector::methods(["POST", "PUT", "PATCH", "DELETE"]);
-
-Pipeline::new()
-    .source(GoGin::new().inputs(["backend"]))
-    .transform(
-        ApplySecurity::api_key("ActiveSchoolAuth", "X-Plint-School-Id")
-            .when(active_school.clone()),
-    )
-    .transform(
-        ApplySecurity::api_key("CSRFAuth", "X-CSRF-Token")
-            .when(OperationSelector::all([
-                OperationSelector::any([
-                    active_school,
-                    OperationSelector::path_prefix("/v1/governance/"),
-                ]),
-                mutating,
-            ])),
-    )
-    .transform(
-        ApiOverrides::new()
-            .query_param(
-                "GET",
-                "/v1/schools/active/schedule/week",
-                QueryParam::new("startDate").date().required(),
-            )
-            .json_request_body("POST", "/v1/schools/active/coursework/search", "SearchCourseworkRequest")
-            .optional()
-            .binary_response("GET", "/v1/schools/active/files/{fileId}/download", 200),
-    )
-    .transform(
-        SdkOperationAliases::new()
-            .operation("GET", "/v1/schools/active/files/{fileId}/download")
-            .tag("files")
-            .name("downloadSchoolFile")
-            .operation("POST", "/v1/schools/active/coursework/search")
-            .tag("coursework")
-            .name("searchCoursework"),
-    )
-    .target(
-        TsSdk::new()
-            .module("@acme/books")
-            .to("generated/typescript")
-            .profile(SdkProfile::typescript_fetch_compat()),
-    )
-    .target(
-        GoSdk::new()
-            .module("example.com/acme/books")
-            .to("generated/go")
-            .profile(SdkProfile::go_openapi_generator_compat()),
-    );
-```
-
-The TypeScript fetch profile emits `runtime.ts`, `apis/index.ts`, `models/index.ts`, grouped API
-classes, raw methods such as `getCourseworkSubmissionAttachmentRaw(...)`, and value methods such as
-`getCourseworkSubmissionAttachment(...)`. Binary responses return `BlobApiResponse`; JSON responses
-return `JSONApiResponse`; empty responses return `VoidApiResponse`.
-
-The Go OpenAPI Generator profile emits `client.go`, `configuration.go`, `errors.go`, `utils.go`, and
-grouped `api_*.go` files with request builders and `Execute()` methods. Operation-scoped API-key
-headers are only sent by operations whose selectors matched.
 
 ### Writing your own stage (the escape hatch is code)
 Anything the built-ins don't cover, you implement as a trait and add to the pipeline — no forking a
@@ -447,15 +223,6 @@ the built-in `fetch`. PySdk emits Pydantic v2 `BaseModel` models by default, wit
 stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small Rust dependency set.
 The CLI's focused open-source dependencies support bounded commodity concerns; the source-to-SDK
 pipeline remains gnr8-owned end to end.
-
-TypeScript migration compatibility is explicit. `TsSdk::new().compatibility(TsCompatibility::OpenApiGenerator)`
-is a concise alias for `TsSdk::new().profile(SdkProfile::openapi_generator_compat())`. It emits an
-Axios-style TypeScript SDK with runtime enum objects, request aliases, model `?` markers derived from
-schema `required`, explicit `T | null` nullability, and `Promise<AxiosResponse<T>>` operation returns.
-Override the pieces independently with `.model_property_policy(TsModelPropertyPolicy::Strict)`,
-`.model_property_policy(TsModelPropertyPolicy::OpenApiGeneratorLoose)`,
-`.nullable_policy(TsNullablePolicy::OmitNullFromOptionalProperties)`, or
-`.response_policy(TsResponsePolicy::DataOnly)`.
 
 Graph-level field requiredness overrides are available for source quirks and legacy migration patches:
 
@@ -592,10 +359,6 @@ inspect graph <dir>` lists them.
 ```
 # generate + verify in CI
 gnr8 generate && gnr8 check            # check exits 1 if generate left drift
-
-# brownfield SDK migration gates
-gnr8 compat typescript --old old-typescript-sdk --new generated/typescript --contract sdk-compat.toml
-gnr8 compat go --old old-go-sdk --new generated/go --contract sdk-compat.toml --suggest
 
 # inspect what it sees (no generation, takes a dir)
 gnr8 inspect routes ./internal         # human table; add --json for machine

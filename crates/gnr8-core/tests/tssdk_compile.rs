@@ -54,20 +54,6 @@ const PACKAGE: &str = "bookstore";
 /// The four files the `tssdk` bundle always frames (D-06 fixed alpha push order, mod.rs).
 const SDK_FILES: [&str; 4] = ["client.ts", "errors.ts", "index.ts", "models.ts"];
 
-/// Files emitted by the OpenAPI-generator compatibility profile.
-const AXIOS_SDK_FILES: [&str; 6] = [
-    "api.ts",
-    "base.ts",
-    "configuration.ts",
-    "errors.ts",
-    "index.ts",
-    "models.ts",
-];
-
-/// Files emitted by the `typescript-fetch` OpenAPI-generator compatibility profile.
-const FETCH_COMPAT_SDK_FILES: [&str; 4] =
-    ["apis/index.ts", "index.ts", "models/index.ts", "runtime.ts"];
-
 /// Whether the `node` + vendored `tsc` toolchain is available so this test skips gracefully if it is
 /// absent. Checks BOTH `node` (drives tsextract AND tsc) and the vendored compiler file existing.
 fn toolchain_available() -> bool {
@@ -140,26 +126,6 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn run_tsc_project(dir: &Path) -> Result<String, gnr8::CoreError> {
-    let output = Command::new("node")
-        .args([TSC, "--project", "tsconfig.json"])
-        .current_dir(dir)
-        .output()
-        .map_err(|source| gnr8::CoreError::TypeScriptToolchainMissing { source })?;
-    if !output.status.success() {
-        let mut captured = String::from_utf8_lossy(&output.stdout).into_owned();
-        captured.push_str(&String::from_utf8_lossy(&output.stderr));
-        return Err(gnr8::CoreError::GoBuild {
-            code: output.status.code(),
-            stderr: captured,
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Materialize the generated SDK into a fresh temp dir as flat `<dir>/client.ts` etc., returning the
-/// dir. Unlike the Python twin (which nests a `bookstore/` package), `tssdk::write_to_dir` writes the
-/// four files FLAT (the bundle's fixed frame names), so there is no package subdir.
 fn materialize_sdk() -> PathBuf {
     let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
@@ -378,91 +344,6 @@ fn collect_ts_files(dir: &Path) -> Vec<String> {
     files
 }
 
-fn materialize_axios_sdk() -> PathBuf {
-    use gnr8::sdk::prelude::*;
-
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
-    let root = unique_temp_dir("axios-root");
-    let mut artifacts = Artifacts::new();
-    TsSdk::new()
-        .module("example.com/bookstore/sdk")
-        .to("sdk")
-        .profile(SdkProfile::openapi_generator_compat())
-        .generate(&graph, &mut artifacts, &Cx::new(root.clone()))
-        .expect("axios profile SDK generation must succeed");
-    for artifact in artifacts.files() {
-        let path = root.join(&artifact.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create artifact parent");
-        }
-        std::fs::write(path, &artifact.text).expect("write generated artifact");
-    }
-    write_axios_type_stub(&root.join("sdk"));
-    root.join("sdk")
-}
-
-fn materialize_fetch_compat_sdk() -> PathBuf {
-    use gnr8::sdk::prelude::*;
-
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
-        .expect("Phase 4 build_graph must succeed (requires node for the tsextract sidecar)");
-    let root = unique_temp_dir("fetch-root");
-    let mut artifacts = Artifacts::new();
-    TsSdk::new()
-        .module("example.com/bookstore/sdk")
-        .to("sdk")
-        .profile(SdkProfile::typescript_fetch_compat())
-        .generate(&graph, &mut artifacts, &Cx::new(root.clone()))
-        .expect("typescript-fetch profile SDK generation must succeed");
-    for artifact in artifacts.files() {
-        let path = root.join(&artifact.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create artifact parent");
-        }
-        std::fs::write(path, &artifact.text).expect("write generated artifact");
-    }
-    root.join("sdk")
-}
-
-fn write_axios_type_stub(dir: &Path) {
-    let axios_dir = dir.join("node_modules/axios");
-    std::fs::create_dir_all(&axios_dir).expect("create axios stub dir");
-    std::fs::write(
-        axios_dir.join("package.json"),
-        r#"{"name":"axios","version":"1.0.0","types":"index.d.ts"}"#,
-    )
-    .expect("write axios package stub");
-    std::fs::write(
-        axios_dir.join("index.d.ts"),
-        r"
-export interface AxiosRequestConfig {
-  method?: string;
-  url?: string;
-  params?: unknown;
-  data?: unknown;
-  headers?: unknown;
-  validateStatus?: (status: number) => boolean;
-  [key: string]: unknown;
-}
-export interface AxiosResponse<T = unknown> {
-  status: number;
-  headers: Record<string, unknown>;
-  data: T;
-}
-export interface AxiosInstance {
-  request<T = unknown>(config: AxiosRequestConfig): Promise<AxiosResponse<T>>;
-}
-declare const axios: AxiosInstance;
-export default axios;
-",
-    )
-    .expect("write axios type stub");
-}
-
-/// TSSDK-02 + the supply-chain gate: the generated SDK type-checks under `tsc --noEmit --strict --lib
-/// es2022,dom` (exit 0) using ONLY the vendored compiler, and carries ZERO third-party runtime imports
-/// (grepped over the written files — `axios`/`node-fetch`/`@types`/`from "http"`).
 #[test]
 fn generated_sdk_typechecks_with_vendored_tsc() {
     if !toolchain_available() {
@@ -501,69 +382,6 @@ fn generated_sdk_typechecks_with_vendored_tsc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
-}
-
-#[test]
-fn generated_typescript_package_builds_declared_entrypoints() {
-    if !toolchain_available() {
-        eprintln!("skipping TypeScript package build: node/tsc toolchain unavailable");
-        return;
-    }
-    let dir = materialize_fetch_compat_sdk();
-    let result = run_tsc_project(&dir);
-    assert!(
-        result.is_ok(),
-        "generated npm package must build: {result:?}"
-    );
-
-    let package_text =
-        std::fs::read_to_string(dir.join("package.json")).expect("read package.json");
-    let package: serde_json::Value =
-        serde_json::from_str(&package_text).expect("package.json must parse");
-    for field in ["main", "types"] {
-        let relative = package[field]
-            .as_str()
-            .expect("package entrypoint must be a string")
-            .trim_start_matches("./");
-        assert!(
-            dir.join(relative).is_file(),
-            "package {field} entrypoint must exist after build: {relative}"
-        );
-    }
-
-    let commonjs = Command::new("node")
-        .args([
-            "--eval",
-            "const sdk = require('.'); if (typeof sdk.Configuration !== 'function') process.exit(1);",
-        ])
-        .current_dir(&dir)
-        .output()
-        .expect("run CommonJS package consumer");
-    assert!(
-        commonjs.status.success(),
-        "CommonJS package consumer failed: {}",
-        String::from_utf8_lossy(&commonjs.stderr)
-    );
-
-    let esm = Command::new("node")
-        .args([
-            "--input-type=module",
-            "--eval",
-            "import { Configuration } from 'sdk'; if (typeof Configuration !== 'function') process.exit(1);",
-        ])
-        .current_dir(&dir)
-        .output()
-        .expect("run ESM package consumer");
-    assert!(
-        esm.status.success(),
-        "ESM package consumer failed: {}",
-        String::from_utf8_lossy(&esm.stderr)
-    );
-
-    let _ = std::fs::remove_dir_all(
-        dir.parent()
-            .expect("generated fetch SDK should have a temp parent"),
-    );
 }
 
 #[test]
@@ -637,117 +455,6 @@ fn split_generated_sdk_with_group_facades_typechecks_with_vendored_tsc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
-}
-
-#[test]
-fn openapi_generator_axios_profile_typechecks_with_test_local_axios_stub() {
-    if !toolchain_available() {
-        eprintln!("skipping tssdk axios compile: node/tsc toolchain unavailable");
-        return;
-    }
-    let dir = materialize_axios_sdk();
-
-    for name in AXIOS_SDK_FILES {
-        assert!(
-            dir.join(name).exists(),
-            "expected {name} in {}",
-            dir.display()
-        );
-    }
-    let api = std::fs::read_to_string(dir.join("api.ts")).expect("read api.ts");
-    assert!(
-        api.contains("from \"axios\""),
-        "axios profile must use axios imports:\n{api}"
-    );
-    let package = std::fs::read_to_string(dir.join("package.json")).expect("read package.json");
-    assert!(
-        package.contains("\"axios\""),
-        "axios profile package.json must declare axios:\n{package}"
-    );
-    std::fs::write(
-        dir.join("consumer.ts"),
-        r#"
-import { BookFormat, DefaultApiFactory } from "./index";
-
-async function smoke(): Promise<void> {
-  const api = DefaultApiFactory();
-  const response = await api.listBooks({ genre: "fiction" });
-  response.status.toFixed();
-  response.headers;
-  response.data.books;
-  const format: BookFormat = BookFormat.Hardcover;
-  void format;
-}
-
-void smoke;
-"#,
-    )
-    .expect("write axios consumer smoke test");
-
-    let mut ts_files = AXIOS_SDK_FILES.to_vec();
-    ts_files.push("consumer.ts");
-    let result = run_tsc(&ts_files, &dir);
-    assert!(
-        result.is_ok(),
-        "axios profile must type-check against the test-local axios stub: {result:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
-}
-
-#[test]
-fn typescript_fetch_compat_profile_typechecks_with_raw_response_consumer() {
-    if !toolchain_available() {
-        eprintln!("skipping tssdk fetch compat compile: node/tsc toolchain unavailable");
-        return;
-    }
-    let dir = materialize_fetch_compat_sdk();
-
-    for name in FETCH_COMPAT_SDK_FILES {
-        assert!(
-            dir.join(name).exists(),
-            "expected {name} in {}",
-            dir.display()
-        );
-    }
-    let runtime = std::fs::read_to_string(dir.join("runtime.ts")).expect("read runtime.ts");
-    for snippet in [
-        "export class BaseAPI",
-        "export class Configuration",
-        "export class JSONApiResponse<T>",
-        "export class VoidApiResponse",
-        "export class BlobApiResponse",
-    ] {
-        assert!(runtime.contains(snippet), "missing {snippet}:\n{runtime}");
-    }
-
-    std::fs::write(
-        dir.join("consumer.ts"),
-        r#"
-import { Configuration, DefaultApi } from "./index";
-
-async function smoke(): Promise<void> {
-  const api = new DefaultApi(new Configuration({ basePath: "https://example.test" }));
-  const raw = await api.listBooksRaw({ genre: "fiction" });
-  raw.raw.status.toFixed();
-  const value = await raw.value();
-  value.books;
-}
-
-void smoke;
-"#,
-    )
-    .expect("write fetch consumer smoke test");
-
-    let mut ts_files = FETCH_COMPAT_SDK_FILES.to_vec();
-    ts_files.push("consumer.ts");
-    let result = run_tsc(&ts_files, &dir);
-    assert!(
-        result.is_ok(),
-        "typescript-fetch profile must type-check with the raw response consumer: {result:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
 }
 
 /// TSSDK-03: the materialized SDK is byte-identical across two independent generate->write runs

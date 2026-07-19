@@ -13,10 +13,10 @@ mod doctor;
 mod render;
 mod watch;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands, CompatAction, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::collections::{BTreeMap, BTreeSet};
+use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -40,7 +40,6 @@ fn main() -> Result<()> {
         Commands::Check => run_check(output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
         Commands::Doctor => run_doctor(output),
-        Commands::Compat { action } => run_compat(action, output),
     }
 }
 
@@ -231,365 +230,6 @@ fn run_guide(topic: Option<GuideTopic>, output: Output) -> Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "language-specific compat rendering stays together for CLI readability"
-)]
-fn run_compat(action: &CompatAction, output: Output) -> Result<()> {
-    match action {
-        CompatAction::Typescript {
-            old,
-            new,
-            contract,
-            suggest,
-        } => {
-            let contract_path = contract.as_deref();
-            let contract = load_compat_contract(contract_path)?;
-            let old_surface = gnr8::sdk::compat::extract_typescript_surface(old)?;
-            let new_surface = gnr8::sdk::compat::extract_typescript_surface(new)?;
-            let diff = gnr8::sdk::compat::diff_typescript_surfaces(&old_surface, &new_surface);
-            let evaluation = contract.as_ref().map(|contract| {
-                gnr8::sdk::compat::evaluate_typescript_contract(
-                    &contract.typescript,
-                    &diff,
-                    &new_surface,
-                )
-                .with_global_docs_allowance(&contract.allow)
-            });
-            let effective_diff = evaluation
-                .as_ref()
-                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
-            let suggestions = if *suggest {
-                gnr8::sdk::compat::suggest_typescript_compat(effective_diff)
-            } else {
-                Vec::new()
-            };
-            let breaking = evaluation
-                .as_ref()
-                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
-            let allowed_missing_docs =
-                allowed_missing_docs(&diff.missing_docs, &effective_diff.missing_docs);
-            if output.json {
-                #[derive(serde::Serialize)]
-                struct CompatReport<'a> {
-                    language: &'static str,
-                    old: &'a str,
-                    new: &'a str,
-                    contract: Option<&'a str>,
-                    breaking: bool,
-                    docs_breaking: bool,
-                    allowed_missing_docs: &'a [String],
-                    diff: &'a gnr8::sdk::compat::TypeScriptSurfaceDiff,
-                    contract_evaluation:
-                        Option<&'a gnr8::sdk::compat::TypeScriptContractEvaluation>,
-                    suggestions: &'a [String],
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&CompatReport {
-                        language: "typescript",
-                        old,
-                        new,
-                        contract: contract_path,
-                        breaking,
-                        docs_breaking: effective_diff.has_doc_breaks(),
-                        allowed_missing_docs: &allowed_missing_docs,
-                        diff: &diff,
-                        contract_evaluation: evaluation.as_ref(),
-                        suggestions: &suggestions,
-                    })?
-                );
-            } else if breaking {
-                output.progress("compat typescript: breaking changes detected");
-                if let Some(evaluation) = &evaluation {
-                    print_compat_list(
-                        "missing required contract symbols",
-                        &evaluation.missing_required,
-                    );
-                }
-                print_typescript_compat_diff(effective_diff);
-            } else {
-                output.progress("compat typescript: compatible");
-            }
-            if !output.json {
-                print_compat_suggestions(&suggestions);
-            }
-            if breaking {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        CompatAction::Go {
-            old,
-            new,
-            contract,
-            suggest,
-        } => {
-            let contract_path = contract.as_deref();
-            let contract = load_compat_contract(contract_path)?;
-            let old_surface = gnr8::sdk::compat::extract_go_surface(old)?;
-            let new_surface = gnr8::sdk::compat::extract_go_surface(new)?;
-            let diff = gnr8::sdk::compat::diff_go_surfaces(&old_surface, &new_surface);
-            let evaluation = contract.as_ref().map(|contract| {
-                gnr8::sdk::compat::evaluate_go_contract(&contract.go, &diff, &new_surface)
-                    .with_global_docs_allowance(&contract.allow)
-            });
-            let effective_diff = evaluation
-                .as_ref()
-                .map_or(&diff, |evaluation| &evaluation.unapproved_diff);
-            let suggestions = if *suggest {
-                gnr8::sdk::compat::suggest_go_compat(effective_diff)
-            } else {
-                Vec::new()
-            };
-            let breaking = evaluation
-                .as_ref()
-                .map_or_else(|| diff.is_breaking(), |evaluation| evaluation.breaking);
-            let allowed_missing_docs =
-                allowed_missing_docs(&diff.missing_docs, &effective_diff.missing_docs);
-            if output.json {
-                #[derive(serde::Serialize)]
-                struct CompatReport<'a> {
-                    language: &'static str,
-                    old: &'a str,
-                    new: &'a str,
-                    contract: Option<&'a str>,
-                    breaking: bool,
-                    docs_breaking: bool,
-                    allowed_missing_docs: &'a [String],
-                    diff: &'a gnr8::sdk::compat::GoSurfaceDiff,
-                    contract_evaluation: Option<&'a gnr8::sdk::compat::GoContractEvaluation>,
-                    suggestions: &'a [String],
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&CompatReport {
-                        language: "go",
-                        old,
-                        new,
-                        contract: contract_path,
-                        breaking,
-                        docs_breaking: effective_diff.has_doc_breaks(),
-                        allowed_missing_docs: &allowed_missing_docs,
-                        diff: &diff,
-                        contract_evaluation: evaluation.as_ref(),
-                        suggestions: &suggestions,
-                    })?
-                );
-            } else if breaking {
-                output.progress("compat go: breaking changes detected");
-                if let Some(evaluation) = &evaluation {
-                    print_compat_list(
-                        "missing required contract symbols",
-                        &evaluation.missing_required,
-                    );
-                }
-                print_go_compat_diff(effective_diff);
-            } else {
-                output.progress("compat go: compatible");
-            }
-            if !output.json {
-                print_compat_suggestions(&suggestions);
-            }
-            if breaking {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn load_compat_contract(
-    path: Option<&str>,
-) -> Result<Option<gnr8::sdk::compat::CompatibilityContract>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let contract_path = Path::new(path);
-    if !contract_path.exists() {
-        anyhow::bail!("compat contract does not exist: {path}");
-    }
-    let text = std::fs::read_to_string(contract_path)
-        .with_context(|| format!("failed to read compat contract: {path}"))?;
-    let contract = toml::from_str(&text)
-        .with_context(|| format!("failed to parse compat contract TOML: {path}"))?;
-    Ok(Some(contract))
-}
-
-trait GoContractEvaluationExt {
-    fn with_global_docs_allowance(
-        self,
-        allow: &gnr8::sdk::compat::CompatibilityAllow,
-    ) -> gnr8::sdk::compat::GoContractEvaluation;
-}
-
-impl GoContractEvaluationExt for gnr8::sdk::compat::GoContractEvaluation {
-    fn with_global_docs_allowance(
-        mut self,
-        allow: &gnr8::sdk::compat::CompatibilityAllow,
-    ) -> gnr8::sdk::compat::GoContractEvaluation {
-        apply_global_docs_stale_allowances(
-            "allow.missing_docs",
-            allow,
-            &self.unapproved_diff.missing_docs,
-            &mut self.stale_allowances,
-        );
-        self.unapproved_diff.missing_docs =
-            unallowed_missing_docs(&self.unapproved_diff.missing_docs, allow);
-        self.breaking = !self.missing_required.is_empty() || self.unapproved_diff.is_breaking();
-        self
-    }
-}
-
-trait TypeScriptContractEvaluationExt {
-    fn with_global_docs_allowance(
-        self,
-        allow: &gnr8::sdk::compat::CompatibilityAllow,
-    ) -> gnr8::sdk::compat::TypeScriptContractEvaluation;
-}
-
-impl TypeScriptContractEvaluationExt for gnr8::sdk::compat::TypeScriptContractEvaluation {
-    fn with_global_docs_allowance(
-        mut self,
-        allow: &gnr8::sdk::compat::CompatibilityAllow,
-    ) -> gnr8::sdk::compat::TypeScriptContractEvaluation {
-        apply_global_docs_stale_allowances(
-            "allow.missing_docs",
-            allow,
-            &self.unapproved_diff.missing_docs,
-            &mut self.stale_allowances,
-        );
-        self.unapproved_diff.missing_docs =
-            unallowed_missing_docs(&self.unapproved_diff.missing_docs, allow);
-        self.breaking = !self.missing_required.is_empty() || self.unapproved_diff.is_breaking();
-        self
-    }
-}
-
-fn apply_global_docs_stale_allowances(
-    label: &str,
-    allow: &gnr8::sdk::compat::CompatibilityAllow,
-    current: &[String],
-    stale: &mut Vec<String>,
-) {
-    if allow.docs_layout_migration {
-        return;
-    }
-    let current: BTreeSet<&str> = current.iter().map(String::as_str).collect();
-    for doc in &allow.missing_docs {
-        if !current.contains(doc.as_str()) {
-            stale.push(format!("{label}: {doc}"));
-        }
-    }
-}
-
-fn unallowed_missing_docs(
-    missing_docs: &[String],
-    allow: &gnr8::sdk::compat::CompatibilityAllow,
-) -> Vec<String> {
-    if allow.docs_layout_migration {
-        return Vec::new();
-    }
-    missing_docs
-        .iter()
-        .filter(|doc| !allow.missing_docs.iter().any(|allowed| allowed == *doc))
-        .cloned()
-        .collect()
-}
-
-fn allowed_missing_docs(missing_docs: &[String], unallowed: &[String]) -> Vec<String> {
-    missing_docs
-        .iter()
-        .filter(|doc| !unallowed.iter().any(|unallowed| unallowed == *doc))
-        .cloned()
-        .collect()
-}
-
-fn print_typescript_compat_diff(diff: &gnr8::sdk::compat::TypeScriptSurfaceDiff) {
-    print_compat_list("missing root exports", &diff.missing_root_exports);
-    print_compat_list("missing model exports", &diff.missing_model_exports);
-    print_compat_list("missing API classes", &diff.missing_api_classes);
-    print_compat_list("missing API factories", &diff.missing_api_factories);
-    print_compat_list("missing operation methods", &diff.missing_operation_methods);
-    print_compat_list("missing request aliases", &diff.missing_request_aliases);
-    print_compat_list("package entry changes", &diff.package_entry_point_changes);
-    print_compat_list("missing docs", &diff.missing_docs);
-    for missing in &diff.missing_interface_properties {
-        println!(
-            "  missing interface property: {}.{}",
-            missing.interface, missing.property
-        );
-    }
-    for change in &diff.interface_property_changes {
-        println!(
-            "  interface property changed: {}.{} (optional {} -> {}, nullable {} -> {}, type {} -> {})",
-            change.interface,
-            change.property,
-            change.old.optional,
-            change.new.optional,
-            change.old.nullable,
-            change.new.nullable,
-            change.old.ty,
-            change.new.ty
-        );
-    }
-    for change in &diff.operation_return_type_changes {
-        println!(
-            "  operation return changed: {} ({} -> {})",
-            change.operation, change.old, change.new
-        );
-    }
-    for change in &diff.operation_signature_changes {
-        println!(
-            "  operation signature changed: {} ({} -> {})",
-            change.operation, change.old, change.new
-        );
-    }
-    for mismatch in &diff.export_kind_mismatches {
-        println!(
-            "  export kind mismatch: {} ({:?} -> {:?})",
-            mismatch.symbol, mismatch.old, mismatch.new
-        );
-    }
-}
-
-fn print_go_compat_diff(diff: &gnr8::sdk::compat::GoSurfaceDiff) {
-    print_compat_list("missing exported types", &diff.missing_exported_types);
-    print_compat_list(
-        "missing exported functions",
-        &diff.missing_exported_functions,
-    );
-    print_compat_list("missing exported methods", &diff.missing_exported_methods);
-    print_compat_list("missing docs", &diff.missing_docs);
-    print_compat_list("package metadata changes", &diff.package_metadata_changes);
-    for change in &diff.exported_function_signature_changes {
-        println!(
-            "  exported function signature changed: {} ({} -> {})",
-            change.symbol, change.old, change.new
-        );
-    }
-    for change in &diff.exported_method_signature_changes {
-        println!(
-            "  exported method signature changed: {} ({} -> {})",
-            change.symbol, change.old, change.new
-        );
-    }
-}
-
-fn print_compat_suggestions(suggestions: &[String]) {
-    print_compat_list("suggestions", suggestions);
-}
-
-fn print_compat_list(label: &str, values: &[String]) {
-    if values.is_empty() {
-        return;
-    }
-    println!("  {label}:");
-    for value in values {
-        println!("    {value}");
-    }
-}
-
 fn guide_for(topic: Option<GuideTopic>) -> Guide {
     match topic {
         None => Guide {
@@ -601,7 +241,7 @@ fn guide_for(topic: Option<GuideTopic>) -> Guide {
         Some(GuideTopic::GoGinToPythonTypescript) => Guide {
             id: "go-gin-to-python-typescript",
             title: "Go/Gin Backend to Python and TypeScript SDKs",
-            summary: "Complex Go/Gin setup with OpenAPI plus two SDK targets and compatibility transforms.",
+            summary: "Complex Go/Gin setup with OpenAPI plus Python and TypeScript SDK targets.",
             markdown: GO_GIN_PY_TS_GUIDE,
         },
         Some(GuideTopic::PythonApisToPythonSdk) => Guide {
@@ -660,24 +300,6 @@ struct LifecycleReport {
     artifact_files: usize,
     /// Whether `--accept-generated-baseline` was used.
     baseline_adopted: bool,
-    /// Migration cleanup classification for reviewing stale/generated-looking files.
-    cleanup: CleanupReport,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct CleanupReport {
-    /// Files currently owned by this generation run.
-    owned_files: Vec<String>,
-    /// Stale generated files deleted during this generation.
-    stale_generated_files: Vec<String>,
-    /// Generated-looking files that are not owned by this run.
-    generated_looking_unowned_files: Vec<String>,
-    /// Hand-edited generated files protected from overwrite.
-    protected_hand_edited_files: Vec<String>,
-    /// Package/config files likely left from `OpenAPI` Generator-era output.
-    legacy_package_files: Vec<String>,
-    /// Package dependencies likely no longer needed after replacing `OpenAPI` Generator output.
-    obsolete_package_dependencies: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -759,7 +381,6 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
     }
 
     if output.json {
-        let cleanup = migration_cleanup_report(&root, &outcome);
         let counts = LifecycleCounts {
             written: outcome.written.len(),
             unchanged: outcome.unchanged.len(),
@@ -783,7 +404,6 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
             source_files,
             artifact_files,
             baseline_adopted: accept_generated_baseline,
-            cleanup,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -805,189 +425,6 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
         output.verbose_paths("skipped", &outcome.skipped);
     }
     Ok(())
-}
-
-fn migration_cleanup_report(
-    root: &Path,
-    outcome: &gnr8::lifecycle::GenerateOutcome,
-) -> CleanupReport {
-    let mut owned_files = Vec::new();
-    owned_files.extend(outcome.written.iter().cloned());
-    owned_files.extend(outcome.unchanged.iter().cloned());
-    owned_files.extend(outcome.skipped.iter().cloned());
-    owned_files.sort();
-    owned_files.dedup();
-
-    let owned: BTreeSet<String> = owned_files.iter().cloned().collect();
-    let legacy_package_files = legacy_openapi_generator_files(root);
-    let generated_looking_unowned_files = legacy_package_files
-        .iter()
-        .filter(|path| !owned.contains(*path))
-        .cloned()
-        .collect();
-
-    CleanupReport {
-        owned_files,
-        stale_generated_files: outcome.deleted.clone(),
-        generated_looking_unowned_files,
-        protected_hand_edited_files: outcome.skipped.clone(),
-        obsolete_package_dependencies: legacy_openapi_generator_dependencies(root),
-        legacy_package_files,
-    }
-}
-
-fn legacy_openapi_generator_files(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_legacy_openapi_generator_files(root, root, 0, &mut out);
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn collect_legacy_openapi_generator_files(
-    root: &Path,
-    dir: &Path,
-    depth: usize,
-    out: &mut Vec<String>,
-) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if should_skip_cleanup_scan_dir(&path) {
-                continue;
-            }
-            collect_legacy_openapi_generator_files(root, &path, depth + 1, out);
-            continue;
-        }
-        let Some(rel) = path.strip_prefix(root).ok().map(path_to_slash_string) else {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        if legacy_openapi_generator_filename(name)
-            || legacy_openapi_generator_package_file(name, &path)
-        {
-            out.push(rel);
-        }
-    }
-}
-
-fn should_skip_cleanup_scan_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | ".gnr8" | "node_modules" | "target" | "vendor")
-    )
-}
-
-fn legacy_openapi_generator_filename(name: &str) -> bool {
-    matches!(
-        name,
-        ".openapi-generator-ignore" | "git_push.sh" | "openapitools.json"
-    ) || name == ".openapi-generator"
-}
-
-fn legacy_openapi_generator_package_file(name: &str, path: &Path) -> bool {
-    if !matches!(
-        name,
-        "package.json" | "go.mod" | "pom.xml" | "build.gradle" | "build.gradle.kts"
-    ) {
-        return false;
-    }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    text.contains("openapi-generator")
-        || text.contains("@openapitools")
-        || text.contains("github.com/antihax/optional")
-}
-
-fn legacy_openapi_generator_dependencies(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_legacy_openapi_generator_dependencies(root, root, 0, &mut out);
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn collect_legacy_openapi_generator_dependencies(
-    root: &Path,
-    dir: &Path,
-    depth: usize,
-    out: &mut Vec<String>,
-) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if should_skip_cleanup_scan_dir(&path) {
-                continue;
-            }
-            collect_legacy_openapi_generator_dependencies(root, &path, depth + 1, out);
-            continue;
-        }
-        let Some(rel) = path.strip_prefix(root).ok().map(path_to_slash_string) else {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        match name {
-            "package.json" => {
-                for dep in [
-                    "@openapitools/openapi-generator-cli",
-                    "openapi-generator",
-                    "typescript-axios",
-                    "typescript-fetch",
-                ] {
-                    if text.contains(dep) {
-                        out.push(format!("{rel}: {dep}"));
-                    }
-                }
-            }
-            "go.mod" => {
-                for dep in ["github.com/antihax/optional"] {
-                    if text.contains(dep) {
-                        out.push(format!("{rel}: {dep}"));
-                    }
-                }
-            }
-            "pom.xml" | "build.gradle" | "build.gradle.kts" => {
-                for dep in ["org.openapitools", "openapi-generator"] {
-                    if text.contains(dep) {
-                        out.push(format!("{rel}: {dep}"));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn path_to_slash_string(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => part.to_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Run `gnr8 check`: run the user's `.gnr8/` pipeline, then DRY-RUN the same `plan_writes` decision (no
@@ -2545,12 +1982,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        allowed_missing_docs, link_typescript_node_modules, local_node_modules,
-        local_typescript_compiler, reconcile_doctor_source_probe, typescript_compiler,
-        unallowed_missing_docs, validate_typescript_package_entrypoints, MaterializedTarget,
-        TypeScriptCompiler,
+        link_typescript_node_modules, local_node_modules, local_typescript_compiler,
+        reconcile_doctor_source_probe, typescript_compiler,
+        validate_typescript_package_entrypoints, MaterializedTarget, TypeScriptCompiler,
     };
-    use gnr8::sdk::compat::CompatibilityAllow;
     use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
@@ -2622,7 +2057,7 @@ mod tests {
     #[test]
     fn typescript_readiness_reuses_installed_package_dependencies() {
         let root = temp_root("output-dependencies");
-        let dependency = root.join("node_modules/axios/index.d.ts");
+        let dependency = root.join("node_modules/example-package/index.d.ts");
         std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
         std::fs::write(&dependency, "export {};\n").unwrap();
         let materialized = root.join("materialized");
@@ -2633,7 +2068,9 @@ mod tests {
             Some(root.join("node_modules"))
         );
         link_typescript_node_modules(&root, "generated/sdk", &materialized).unwrap();
-        assert!(materialized.join("node_modules/axios/index.d.ts").is_file());
+        assert!(materialized
+            .join("node_modules/example-package/index.d.ts")
+            .is_file());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2682,32 +2119,5 @@ mod tests {
         });
 
         assert!(!root.exists());
-    }
-
-    #[test]
-    fn compat_contract_can_allow_all_docs_layout_migration() {
-        let allow = CompatibilityAllow {
-            docs_layout_migration: true,
-            missing_docs: Vec::new(),
-        };
-        let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
-
-        assert!(unallowed_missing_docs(&missing, &allow).is_empty());
-    }
-
-    #[test]
-    fn compat_contract_can_allow_selected_missing_docs_only() {
-        let allow = CompatibilityAllow {
-            docs_layout_migration: false,
-            missing_docs: vec!["docs/Book.md".to_string()],
-        };
-        let missing = vec!["docs/BooksApi.md".to_string(), "docs/Book.md".to_string()];
-        let unallowed = unallowed_missing_docs(&missing, &allow);
-
-        assert_eq!(unallowed, vec!["docs/BooksApi.md".to_string()]);
-        assert_eq!(
-            allowed_missing_docs(&missing, &unallowed),
-            vec!["docs/Book.md".to_string()]
-        );
     }
 }

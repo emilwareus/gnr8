@@ -37,8 +37,6 @@ pub struct SdkModel {
     pub docs_metadata: SdkDocsMetadata,
     /// File layout plan.
     pub file_plan: SdkFilePlan,
-    /// Compatibility metadata.
-    pub compatibility: SdkCompatibility,
 }
 
 /// Auth metadata used by generated clients.
@@ -292,15 +290,6 @@ pub struct SdkFilePlan {
     pub model_file_template: Option<String>,
 }
 
-/// Compatibility metadata for this model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SdkCompatibility {
-    /// Profile name.
-    pub profile: String,
-    /// Whether OpenAPI-generator compatibility was requested.
-    pub openapi_generator_compat: bool,
-}
-
 impl SdkModel {
     /// Build a deterministic SDK planning model.
     ///
@@ -317,7 +306,7 @@ impl SdkModel {
         base_path: impl Into<String>,
         layout: &SdkFileLayout,
         aliases: &SdkTypeAliases,
-        profile: &SdkProfile,
+        _profile: &SdkProfile,
     ) -> Result<Self, CoreError> {
         let package = package.into();
         let base_path = base_path.into();
@@ -481,10 +470,6 @@ impl SdkModel {
                     .operation_file_template_ref()
                     .map(ToString::to_string),
                 model_file_template: layout.model_file_template_ref().map(ToString::to_string),
-            },
-            compatibility: SdkCompatibility {
-                profile: profile.name().to_string(),
-                openapi_generator_compat: !profile.is_minimal(),
             },
         })
     }
@@ -696,10 +681,10 @@ mod tests {
     }
 
     #[test]
-    fn sdk_model_is_deterministic_and_carries_compatibility_metadata() {
+    fn sdk_model_is_deterministic_and_carries_layout_metadata() {
         let aliases = SdkTypeAliases::new().type_alias("Book", "BookPayload");
         let layout = SdkFileLayout::split().model_dir("models");
-        let profile = SdkProfile::openapi_generator_compat();
+        let profile = SdkProfile::minimal();
 
         let a = SdkModel::build(&graph(), "books", "/api", &layout, &aliases, &profile).unwrap();
         let b = SdkModel::build(&graph(), "books", "/api", &layout, &aliases, &profile).unwrap();
@@ -709,7 +694,6 @@ mod tests {
         assert_eq!(a.operations[0].request_schema.as_deref(), Some("Book"));
         assert_eq!(a.schemas[0].kind, SdkSchemaKind::Object);
         assert_eq!(a.aliases[0].alias, "BookPayload");
-        assert!(a.compatibility.openapi_generator_compat);
         assert_eq!(a.file_plan.model_dir.as_deref(), Some("models"));
     }
 

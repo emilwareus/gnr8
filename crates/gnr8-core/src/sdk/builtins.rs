@@ -33,8 +33,7 @@ use crate::sdk::model_style::PyModelStyle;
 use crate::sdk::profile::SdkProfile;
 use crate::sdk::surface::SdkTypeAliases;
 use crate::sdk::typescript::{
-    TsBarrelExports, TsCompatibility, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy,
-    TsSdkOptions,
+    TsBarrelExports, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
 };
 use crate::CoreError;
 use std::collections::BTreeSet;
@@ -3646,7 +3645,7 @@ impl GoSdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::default(),
+            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: true,
             package_info: SdkPackageMetadata::default(),
@@ -3730,7 +3729,7 @@ impl GoSdk {
         self
     }
 
-    /// Set how required pointer fields are represented in OpenAPI Generator-compatible constructors.
+    /// Set how required pointer fields are represented in generated constructors.
     #[must_use]
     pub const fn required_pointer_constructor_policy(
         mut self,
@@ -3754,14 +3753,14 @@ impl GoSdk {
         self
     }
 
-    /// Add request-builder body/query alias setters for OpenAPI Generator-compatible output.
+    /// Add user-configured request-builder body/query alias setters.
     #[must_use]
     pub fn request_builder_aliases(mut self, aliases: GoRequestBuilderAliases) -> Self {
         self.request_builder_aliases = Some(aliases);
         self
     }
 
-    /// Set how OpenAPI Generator-compatible query setter arguments are typed.
+    /// Set how generated query setter arguments are typed.
     #[must_use]
     pub fn query_setter_argument_policy(mut self, policy: GoQuerySetterArgumentPolicy) -> Self {
         self.query_setter_argument_policy = Some(policy);
@@ -3888,7 +3887,7 @@ impl Target for GoSdk {
             self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
-        write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
+        write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs);
         if self.package_metadata {
             out.write(
                 format!("{}/go.mod", self.dir.trim_end_matches('/')),
@@ -3947,7 +3946,7 @@ impl PySdk {
             layout: SdkFileLayout::compact(),
             model_style: PyModelStyle::default(),
             aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::default(),
+            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: true,
             package_info: SdkPackageMetadata::default(),
@@ -4130,7 +4129,7 @@ impl Target for PySdk {
             ir,
             &model,
             &self.docs,
-        )?;
+        );
         Ok(())
     }
 
@@ -4183,7 +4182,7 @@ impl TsSdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::default(),
+            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: None,
             package_info: SdkPackageMetadata::default(),
@@ -4279,16 +4278,6 @@ impl TsSdk {
         self.docs(false).package_metadata(false)
     }
 
-    /// Set a TypeScript compatibility profile.
-    #[must_use]
-    pub fn compatibility(self, compatibility: TsCompatibility) -> Self {
-        match compatibility {
-            TsCompatibility::OpenApiGenerator => {
-                self.profile(SdkProfile::openapi_generator_compat())
-            }
-        }
-    }
-
     /// Set how model interface properties use `?:`.
     #[must_use]
     pub const fn model_property_policy(mut self, policy: TsModelPropertyPolicy) -> Self {
@@ -4317,7 +4306,7 @@ impl TsSdk {
         self
     }
 
-    /// Enable or disable OpenAPI Generator-compatible `InitOverrideFunction` support.
+    /// Enable or disable the generated `InitOverrideFunction` hook.
     #[must_use]
     pub const fn init_override_function(mut self, enabled: bool) -> Self {
         self.init_override_function = Some(enabled);
@@ -4362,9 +4351,7 @@ impl TsSdk {
     }
 
     fn effective_package_metadata(&self) -> bool {
-        self.package_metadata.unwrap_or_else(|| {
-            self.profile.is_typescript_fetch_compat() || self.profile.is_typescript_axios_compat()
-        })
+        self.package_metadata.unwrap_or(false)
     }
 }
 
@@ -4419,11 +4406,7 @@ impl Target for TsSdk {
             let package_name = self.package_info.resolved_name(&package)?;
             files.push(super::bundle::SdkFile {
                 name: "package.json".to_string(),
-                contents: ts_package_json(
-                    &package_name,
-                    &self.package_info,
-                    self.profile.is_typescript_axios_compat(),
-                )?,
+                contents: ts_package_json(&package_name, &self.package_info)?,
             });
             files.push(super::bundle::SdkFile {
                 name: "PUBLISHING.md".to_string(),
@@ -4450,7 +4433,7 @@ impl Target for TsSdk {
             ir,
             &model,
             &self.docs,
-        )?;
+        );
         Ok(())
     }
 
@@ -5018,22 +5001,13 @@ fn pyproject_urls(metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
     Ok(out)
 }
 
-fn ts_package_json(
-    package: &str,
-    metadata: &SdkPackageMetadata,
-    axios: bool,
-) -> Result<String, CoreError> {
+fn ts_package_json(package: &str, metadata: &SdkPackageMetadata) -> Result<String, CoreError> {
     let version = metadata.resolved_version()?;
-    let dependencies = if axios {
-        "\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  },"
-    } else {
-        ""
-    };
     Ok(format!(
         "{{
   \"name\": {},
   \"version\": {},
-  \"type\": \"commonjs\",{}{}
+  \"type\": \"commonjs\",{}
   \"main\": \"./dist/index.js\",
   \"types\": \"./dist/index.d.ts\",
   \"exports\": {{
@@ -5057,7 +5031,6 @@ fn ts_package_json(
 ",
         quoted_string_literal(package),
         quoted_string_literal(&version),
-        dependencies,
         ts_optional_package_fields(metadata)?
     ))
 }
@@ -5274,24 +5247,22 @@ mod tests {
 
     use super::{
         sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
-        DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
-        Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk,
-        QueryParam, SdkOperationAliases, SdkPackageMetadata, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
-        Transform, TsSdk,
+        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiSchemaAliases,
+        OpenApiSchemaPatch, OperationSelector, PostProcess, PySdk, QueryParam, SdkOperationAliases,
+        SdkPackageMetadata, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
         ApiGraph, Diagnostic, Field, Operation, PaginationMode, PaginationTermination, Param, Prim,
         Response, RuntimeHookKind, Schema, SchemaRef, SourceSpan, Type,
     };
-    use crate::sdk::docs::{write_sdk_docs, SdkDocs};
+
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::model::SdkModel;
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::surface::SdkTypeAliases;
-    use crate::sdk::typescript::TsCompatibility;
     use crate::sdk::Artifacts;
 
     fn cx() -> Cx {
@@ -6475,129 +6446,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn operation_documentation_transform_populates_openapi_and_sdk_docs() {
-        let mut create =
-            grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
-        create.request_body = Some(SchemaRef {
-            ref_id: "app.BookInput".to_string(),
-        });
-        create.responses = vec![Response {
-            status: 201,
-            body: Some(SchemaRef {
-                ref_id: "app.Book".to_string(),
-            }),
-            body_kind: "json".to_string(),
-            content_type: None,
-            content_types: vec!["application/json".to_string()],
-        }];
-        let mut ir = ApiGraph {
-            operations: vec![create],
-            schemas: vec![
-                Schema {
-                    id: "app.ApiError".to_string(),
-                    name: "ApiError".to_string(),
-                    body: Type::Object(Vec::new()),
-                    enum_source_order: Vec::new(),
-                    provenance: span(),
-                },
-                Schema {
-                    id: "app.Book".to_string(),
-                    name: "Book".to_string(),
-                    body: Type::Object(Vec::new()),
-                    enum_source_order: Vec::new(),
-                    provenance: span(),
-                },
-                Schema {
-                    id: "app.BookInput".to_string(),
-                    name: "BookInput".to_string(),
-                    body: Type::Object(Vec::new()),
-                    enum_source_order: Vec::new(),
-                    provenance: span(),
-                },
-            ],
-            ..ApiGraph::default()
-        };
-
-        DocumentOperation::when(OperationSelector::operation("createBook"))
-            .summary("Create a book")
-            .description("Creates a book from catalog input.")
-            .deprecated()
-            .tags(["Catalog", "Books"])
-            .request_example_json("minimal", serde_json::json!({ "title": "Dune" }))
-            .response_description(201, "Book created")
-            .response_example_json(201, "created", serde_json::json!({ "id": "book_1" }))
-            .json_error_response(422, "ApiError", "Validation failed")
-            .apply(&mut ir, &cx())
-            .unwrap();
-
-        let yaml = crate::lower::to_openapi(&ir, "books", "/", &[]).unwrap();
-        assert!(yaml.contains("summary: Create a book"), "{yaml}");
-        assert!(yaml.contains("deprecated: true"), "{yaml}");
-        assert!(yaml.contains("tags: [Books, Catalog]"), "{yaml}");
-        assert!(yaml.contains("'422':"), "{yaml}");
-        assert!(yaml.contains("description: Validation failed"), "{yaml}");
-        assert!(yaml.contains("examples:"), "{yaml}");
-        assert!(yaml.contains("minimal:"), "{yaml}");
-        assert!(yaml.contains(r#"value: {"title":"Dune"}"#), "{yaml}");
-
-        let model = SdkModel::build(
-            &ir,
-            "books",
-            "/",
-            &SdkFileLayout::compact(),
-            &SdkTypeAliases::default(),
-            &SdkProfile::minimal(),
-        )
-        .unwrap();
-        let docs = model
-            .docs_metadata
-            .operations
-            .iter()
-            .find(|docs| docs.operation_id == "createBook")
-            .unwrap();
-        assert_eq!(docs.summary.as_deref(), Some("Create a book"));
-        assert!(docs.deprecated);
-        assert_eq!(docs.tags, vec!["Books", "Catalog"]);
-
-        let mut out = Artifacts::new();
-        write_sdk_docs(
-            &mut out,
-            "sdk",
-            "Go",
-            "books",
-            &ir,
-            &model,
-            &SdkDocs::both(),
-        )
-        .unwrap();
-        let reference = out
-            .files()
-            .iter()
-            .find(|file| file.path == "sdk/reference.md")
-            .unwrap();
-        assert!(
-            reference.text.contains("Create a book")
-                && reference.text.contains("Validation failed")
-                && reference.text.contains("`minimal` (`application/json`)"),
-            "{}",
-            reference.text
-        );
-        let api_docs = out
-            .files()
-            .iter()
-            .find(|file| file.path == "sdk/docs/BooksApi.md")
-            .unwrap();
-        assert!(
-            api_docs.text.contains("Deprecated: yes")
-                && api_docs.text.contains("Book created")
-                && api_docs.text.contains("ApiError.md"),
-            "{}",
-            api_docs.text
-        );
-    }
-
-    #[test]
     fn pagination_transform_rejects_missing_query_parameter() {
         let mut ir = ApiGraph {
             operations: vec![grouped_test_operation(
@@ -6777,72 +6625,6 @@ mod tests {
     }
 
     #[test]
-    fn api_overrides_force_field_presence_for_openapi_and_typescript() {
-        let mut ir = ApiGraph {
-            schemas: vec![Schema {
-                id: "app.User".to_string(),
-                name: "User".to_string(),
-                body: Type::Object(vec![
-                    Field {
-                        json_name: "settings".to_string(),
-                        required: false,
-                        optional: true,
-                        nullable: false,
-                        schema: Type::Primitive(Prim::String),
-                        description: None,
-                        example: None,
-                        meta: FieldMeta::default(),
-                    },
-                    Field {
-                        json_name: "stable".to_string(),
-                        required: true,
-                        optional: false,
-                        nullable: false,
-                        schema: Type::Primitive(Prim::String),
-                        description: None,
-                        example: None,
-                        meta: FieldMeta::default(),
-                    },
-                ]),
-                enum_source_order: Vec::new(),
-                provenance: span(),
-            }],
-            ..ApiGraph::default()
-        };
-
-        ApiOverrides::new()
-            .force_required("User", "settings")
-            .force_optional("User", "stable")
-            .apply(&mut ir, &cx())
-            .unwrap();
-
-        let mut openapi_out = Artifacts::new();
-        OpenApi31::new()
-            .to("openapi.yaml")
-            .generate(&ir, &mut openapi_out, &cx())
-            .unwrap();
-        let yaml = openapi_out.files()[0].text.as_str();
-        assert!(yaml.contains("required: [settings]"), "{yaml}");
-
-        let mut ts_out = Artifacts::new();
-        TsSdk::new()
-            .module("example.com/user/sdk")
-            .to("sdk")
-            .profile(SdkProfile::openapi_generator_compat())
-            .generate(&ir, &mut ts_out, &cx())
-            .unwrap();
-        let models = ts_out
-            .files()
-            .iter()
-            .find(|artifact| artifact.path == "sdk/models.ts")
-            .unwrap()
-            .text
-            .as_str();
-        assert!(models.contains("settings: string;"), "{models}");
-        assert!(models.contains("stable?: string;"), "{models}");
-    }
-
-    #[test]
     fn api_overrides_unknown_field_is_a_config_error() {
         let mut ir = ApiGraph {
             schemas: vec![Schema {
@@ -6875,44 +6657,6 @@ mod tests {
         assert!(
             err.to_string().contains("does not match any graph schema"),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn ts_sdk_compatibility_alias_uses_openapi_generator_profile() {
-        let ir = ApiGraph {
-            schemas: vec![Schema {
-                id: "app.User".to_string(),
-                name: "User".to_string(),
-                body: Type::Object(vec![Field {
-                    json_name: "id".to_string(),
-                    required: true,
-                    optional: false,
-                    nullable: false,
-                    schema: Type::Primitive(Prim::String),
-                    description: None,
-                    example: None,
-                    meta: FieldMeta::default(),
-                }]),
-                enum_source_order: Vec::new(),
-                provenance: span(),
-            }],
-            ..ApiGraph::default()
-        };
-        let mut out = Artifacts::new();
-
-        TsSdk::new()
-            .module("example.com/user/sdk")
-            .to("sdk")
-            .compatibility(TsCompatibility::OpenApiGenerator)
-            .generate(&ir, &mut out, &cx())
-            .unwrap();
-
-        assert!(
-            out.files()
-                .iter()
-                .any(|artifact| artifact.path == "sdk/api.ts"),
-            "compatibility alias should emit OpenAPI Generator API surface"
         );
     }
 
@@ -7403,100 +7147,6 @@ mod tests {
     }
 
     #[test]
-    fn sdk_docs_openapi_generator_compat_emits_per_symbol_markdown() {
-        let mut ir = ApiGraph {
-            title: "Bookstore".to_string(),
-            base_path: "/api".to_string(),
-            ..ApiGraph::default()
-        };
-        ir.schemas.push(Schema {
-            id: "Book".to_string(),
-            name: "Book".to_string(),
-            body: Type::Object(vec![Field {
-                json_name: "title".to_string(),
-                required: true,
-                optional: false,
-                nullable: false,
-                schema: Type::Primitive(Prim::String),
-                description: None,
-                example: None,
-                meta: FieldMeta::default(),
-            }]),
-            enum_source_order: Vec::new(),
-            provenance: span(),
-        });
-        ir.schemas.push(Schema {
-            id: "CreateBookRequest".to_string(),
-            name: "CreateBookRequest".to_string(),
-            body: Type::Object(Vec::new()),
-            enum_source_order: Vec::new(),
-            provenance: span(),
-        });
-        ir.operations.push(Operation {
-            id: "createBook".to_string(),
-            method: "POST".to_string(),
-            path: "/books".to_string(),
-            handler: "createBook".to_string(),
-            group: Some("books".to_string()),
-            middleware: Vec::new(),
-            params: Vec::new(),
-            request_body: Some(SchemaRef {
-                ref_id: "CreateBookRequest".to_string(),
-            }),
-            request_body_required: true,
-            request_body_content_type: None,
-            responses: vec![Response {
-                status: 201,
-                body: Some(SchemaRef {
-                    ref_id: "Book".to_string(),
-                }),
-                body_kind: "json".to_string(),
-                content_type: None,
-                content_types: Vec::new(),
-            }],
-            security: Vec::new(),
-            security_overrides_global: false,
-            provenance: span(),
-        });
-
-        let mut out = Artifacts::new();
-        TsSdk::new()
-            .module("@example/bookstore")
-            .to("generated/sdk-ts")
-            .docs(SdkDocs::both())
-            .generate(&ir, &mut out, &cx())
-            .unwrap();
-
-        let paths = out
-            .files()
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        for expected in [
-            "generated/sdk-ts/README.md",
-            "generated/sdk-ts/reference.md",
-            "generated/sdk-ts/docs/README.md",
-            "generated/sdk-ts/docs/BooksApi.md",
-            "generated/sdk-ts/docs/Book.md",
-            "generated/sdk-ts/docs/CreateBookRequest.md",
-        ] {
-            assert!(
-                paths.contains(&expected),
-                "expected {expected} in generated paths: {paths:?}"
-            );
-        }
-        let readme = out
-            .files()
-            .iter()
-            .find(|file| file.path == "generated/sdk-ts/README.md")
-            .unwrap();
-        assert!(readme.text.contains("[SDK reference](reference.md)"));
-        assert!(readme
-            .text
-            .contains("[OpenAPI Generator-compatible docs](docs/README.md)"));
-    }
-
-    #[test]
     fn pysdk_target_writes_under_the_output_dir_and_is_deterministic() {
         let ir = ApiGraph::default();
         let target = PySdk::new()
@@ -7734,100 +7384,6 @@ mod tests {
             assert!(
                 out.files().iter().any(|file| file.path == path),
                 "package configuration should emit {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn tssdk_fetch_compat_emits_package_metadata_and_source_only_can_disable_it() {
-        let ir = ApiGraph::default();
-
-        let mut compat_out = Artifacts::new();
-        TsSdk::new()
-            .module("@example/bookstore-sdk")
-            .to("generated/sdk-ts")
-            .profile(SdkProfile::typescript_fetch_compat())
-            .package(
-                SdkPackageMetadata::new()
-                    .name("@example/bookstore-sdk")
-                    .version("2.0.0")
-                    .description("Bookstore SDK")
-                    .license("MIT")
-                    .repository("https://example.com/repo.git")
-                    .homepage("https://example.com")
-                    .keywords(["bookstore", "sdk"]),
-            )
-            .generate(&ir, &mut compat_out, &cx())
-            .unwrap();
-        let package_json = compat_out
-            .files()
-            .iter()
-            .find(|file| file.path == "generated/sdk-ts/package.json")
-            .expect("typescript-fetch compat should emit package metadata by default");
-        let parsed_package: serde_json::Value =
-            serde_json::from_str(&package_json.text).expect("package.json must parse as JSON");
-        assert_eq!(parsed_package["name"], "@example/bookstore-sdk");
-        assert!(package_json
-            .text
-            .contains("\"types\": \"./dist/index.d.ts\""));
-        assert!(package_json.text.contains("\"main\": \"./dist/index.js\""));
-        assert!(package_json.text.contains("\"prebuild\":"));
-        assert!(package_json.text.contains("\"prepack\": \"npm run build\""));
-        assert!(package_json.text.contains("\"version\": \"2.0.0\""));
-        assert!(package_json
-            .text
-            .contains("\"description\": \"Bookstore SDK\""));
-        assert!(package_json.text.contains("\"license\": \"MIT\""));
-        assert!(package_json
-            .text
-            .contains("\"keywords\": [\"bookstore\", \"sdk\"]"));
-        let ts_publishing = compat_out
-            .files()
-            .iter()
-            .find(|file| file.path == "generated/sdk-ts/PUBLISHING.md")
-            .expect("TsSdk must emit a publishing recipe with package metadata");
-        assert!(ts_publishing.text.contains("npm pack --dry-run"));
-        assert!(ts_publishing.text.contains("npm run build"));
-        let tsconfig = compat_out
-            .files()
-            .iter()
-            .find(|file| file.path == "generated/sdk-ts/tsconfig.json")
-            .expect("TsSdk package metadata must include a build configuration");
-        assert!(tsconfig.text.contains("\"declaration\": true"));
-
-        let mut axios_out = Artifacts::new();
-        TsSdk::new()
-            .module("@example/bookstore-sdk")
-            .to("generated/sdk-ts")
-            .profile(SdkProfile::typescript_axios_compat())
-            .generate(&ir, &mut axios_out, &cx())
-            .unwrap();
-        let axios_package_json = axios_out
-            .files()
-            .iter()
-            .find(|file| file.path == "generated/sdk-ts/package.json")
-            .expect("typescript-axios compat should emit package metadata by default");
-        assert!(axios_package_json.text.contains("\"axios\""));
-
-        let mut source_only_out = Artifacts::new();
-        TsSdk::new()
-            .module("@example/bookstore-sdk")
-            .to("generated/sdk-ts")
-            .profile(SdkProfile::typescript_fetch_compat())
-            .source_only()
-            .generate(&ir, &mut source_only_out, &cx())
-            .unwrap();
-
-        for path in [
-            "generated/sdk-ts/package.json",
-            "generated/sdk-ts/PUBLISHING.md",
-            "generated/sdk-ts/tsconfig.json",
-            "generated/sdk-ts/README.md",
-            "generated/sdk-ts/reference.md",
-        ] {
-            assert!(
-                !source_only_out.files().iter().any(|file| file.path == path),
-                "source_only should not emit {path}"
             );
         }
     }

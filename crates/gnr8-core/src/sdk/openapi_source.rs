@@ -2512,7 +2512,7 @@ paths:
                 TsSdk::new()
                     .module("@acme/books")
                     .to("generated/ts")
-                    .profile(SdkProfile::typescript_fetch_compat()),
+                    .profile(SdkProfile::minimal()),
             )
             .run(&Cx::new(&root))
             .unwrap();
@@ -2524,10 +2524,10 @@ paths:
             .map(|artifact| artifact.path.as_str())
             .collect::<Vec<_>>();
         assert!(paths.contains(&"generated/openapi.json"));
+        assert!(paths.contains(&"generated/ts/client.ts"));
+        assert!(paths.contains(&"generated/ts/errors.ts"));
         assert!(paths.contains(&"generated/ts/index.ts"));
-        assert!(paths.contains(&"generated/ts/runtime.ts"));
-        assert!(paths.contains(&"generated/ts/apis/index.ts"));
-        assert!(paths.contains(&"generated/ts/models/index.ts"));
+        assert!(paths.contains(&"generated/ts/models.ts"));
 
         let _ = std::fs::remove_dir_all(root);
     }
