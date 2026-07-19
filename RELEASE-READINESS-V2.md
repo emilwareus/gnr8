@@ -19,11 +19,12 @@ Python/FastAPI or Flask, and TypeScript/NestJS services. It is not enough to pro
 understanding, arbitrary OpenAPI migration, behavioral parity with mature generators, or a
 self-contained/runtime-free install.
 
-The release decision remains conditional because this workspace has no Go toolchain. The final local
-`make check` completed formatting and clippy, then stopped with 358 passing Rust library tests and four
-`GoToolchainMissing` failures. Go-backed extraction, generated Go compilation/runtime behavior,
-example regeneration, and the full gate need to pass in PR CI or on a Go-equipped clean machine. A
-skipped or unavailable suite is not positive evidence.
+The release decision remains conditional because this workspace has no Go toolchain and lacks
+PyYAML/pip for one independent-parser test. After reconciling current `main`, formatting, clippy, 41
+CLI tests, 108 Python extractor tests, all TypeScript extractor tests, and 403 Rust library tests
+passed. The Rust diagnostic run explicitly filtered four Go-dependent tests and the PyYAML-dependent
+test, then the next Go-backed integration test stopped with `GoToolchainMissing`. CI installs both
+prerequisites; its complete result, not these filtered local runs, must decide the release.
 
 ## What is now release credible
 
@@ -50,12 +51,13 @@ skipped or unavailable suite is not positive evidence.
 These are not reasons to undo the P0 work. They define the boundary between an honest early-access
 release and a broad market launch.
 
-1. **OpenAPI import fidelity (P1.1).** Resolve referenced request bodies/responses; retain parameter
-   serialization, docs, deprecation, examples, tags, default/range responses, and reject lossy media
-   collapse explicitly. Validate against a real anonymized Swagger 2.0/OpenAPI 3.0/3.1 corpus and
-   generated consumers.
-2. **Framework parameter fidelity (P1.2).** Model headers, cookies, aliases, defaults, explicit
-   query/path/body markers, and serialization metadata end to end. Framework recognition must account
+1. **OpenAPI import fidelity (remaining P1.1).** Current `main` adds referenced request/response,
+   parameter serialization, operation docs/examples/tags, and multi-media preservation. Default/range
+   responses, explicit rejection of every lossy collapse, a real anonymized Swagger 2.0/OpenAPI
+   3.0/3.1 corpus, and generated-consumer proof still remain.
+2. **Framework parameter fidelity (remaining P1.2).** OpenAPI-imported headers, cookies,
+   style/explode, aliases, and preserved fields are now modeled. Native framework extraction still
+   needs broader header/cookie/alias/default/marker coverage, and framework recognition must account
    for imported symbols rather than matching decorator/constructor names alone.
 3. **Status and error extraction (P1.3).** Extract common multiple-success and typed-error declarations
    such as FastAPI `responses=` and Flask returned status tuples, or issue blocking diagnostics that
@@ -91,9 +93,8 @@ arbitrary framework code, or safely migrates arbitrary OpenAPI documents.
 
 ## Release decision
 
-1. Resolve the branch against current `main` without reintroducing removed compatibility behavior.
-2. Require PR #41's complete release dry-run and every Go-backed test to pass without skips.
-3. Review the produced archives and published prerequisite wording once more.
-4. If those checks pass, ship as an early-access release with the constrained positioning above.
-5. Keep broad launch and migration claims blocked on P1.1–P1.6 evidence, with P1.7 completed before
+1. Require PR #41's complete release dry-run and every Go-backed test to pass without skips.
+2. Review the produced archives and published prerequisite wording once more.
+3. If those checks pass, ship as an early-access release with the constrained positioning above.
+4. Keep broad launch and migration claims blocked on P1.1–P1.6 evidence, with P1.7 completed before
    actively directing prospective users to the public repository.

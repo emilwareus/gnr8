@@ -70,6 +70,8 @@ class LoadTests(unittest.TestCase):
         items = diags.items()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["severity"], "WARN")
+        self.assertEqual(items[0]["code"], "source.load.unresolved")
+        self.assertEqual(items[0]["category"], "source")
         self.assertIn("could not parse", items[0]["message"])
         self.assertTrue(items[0]["file"].endswith("bad.py"))
         self.assertGreaterEqual(items[0]["line"], 1)

@@ -60,21 +60,22 @@ pub(crate) fn write_sdk_docs(
     ir: &ApiGraph,
     _model: &SdkModel,
     docs: &SdkDocs,
-) {
+) -> Result<(), crate::CoreError> {
     if docs.is_none() {
-        return;
+        return Ok(());
     }
     let dir = dir.trim_end_matches('/');
     if docs.reference {
-        out.write(
+        out.create(
             format!("{dir}/README.md"),
             sdk_readme(language, package, ir),
-        );
-        out.write(
+        )?;
+        out.create(
             format!("{dir}/reference.md"),
             sdk_reference(language, package, ir),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {

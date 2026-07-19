@@ -35,6 +35,7 @@ pub mod go;
 pub mod layout;
 pub mod model;
 pub mod model_style;
+pub mod openapi_compat;
 pub(crate) mod openapi_source;
 pub mod profile;
 pub mod surface;
@@ -94,6 +95,57 @@ pub struct Artifact {
     pub path: String,
     /// The file's full UTF-8 text contents.
     pub text: String,
+    /// The target or post-processor that most recently took ownership of this artifact.
+    #[serde(default = "legacy_artifact_producer")]
+    pub producer: String,
+    /// How the current producer obtained ownership.
+    #[serde(default)]
+    pub ownership: ArtifactOwnership,
+    /// Every explicit overlay or rewrite, in application order.
+    #[serde(default)]
+    pub rewrite_chain: Vec<ArtifactRewrite>,
+}
+
+impl Artifact {
+    /// Construct an artifact for lifecycle APIs outside a running pipeline.
+    #[must_use]
+    pub fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            text: text.into(),
+            producer: "external".to_string(),
+            ownership: ArtifactOwnership::Created,
+            rewrite_chain: Vec::new(),
+        }
+    }
+}
+
+fn legacy_artifact_producer() -> String {
+    "legacy-bundle".to_string()
+}
+
+/// The explicit operation through which an artifact's current producer obtained ownership.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactOwnership {
+    /// The path was created when it did not previously exist.
+    #[default]
+    Created,
+    /// An existing path was intentionally replaced in full.
+    Overlaid,
+    /// An existing path was intentionally transformed in place.
+    Rewritten,
+}
+
+/// One recorded ownership transition after initial creation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArtifactRewrite {
+    /// Whether the transition was an overlay or a rewrite.
+    pub ownership: ArtifactOwnership,
+    /// Stage that previously owned the artifact.
+    pub previous_producer: String,
+    /// Stage that applied this transition.
+    pub producer: String,
 }
 
 /// A generated file's identity without its full text payload.
@@ -123,14 +175,24 @@ pub struct FileStamp {
 
 /// The accumulating set of generated files, kept **sorted by path** for determinism.
 ///
-/// Targets and post-processors call [`Artifacts::write`]; the set keeps itself ordered so two runs
-/// over unchanged input serialize byte-identically regardless of the order stages ran (the standing
-/// determinism invariant). Writing the same path twice replaces the prior contents (last write wins
-/// for a given path) — a post-processor rewriting a file in place is the intended use.
-#[derive(Debug, Clone, Default)]
+/// Targets call [`Artifacts::create`], while intentional replacement uses [`Artifacts::overlay`] or
+/// [`Artifacts::rewrite`]. The set keeps itself ordered so two runs over unchanged input serialize
+/// byte-identically regardless of the order stages ran (the standing determinism invariant).
+#[derive(Debug, Clone)]
 pub struct Artifacts {
     /// The files, maintained in ascending `path` order (no map → deterministic iteration).
     files: Vec<Artifact>,
+    /// The pipeline stage responsible for the next ownership transition.
+    current_producer: String,
+}
+
+impl Default for Artifacts {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            current_producer: "direct".to_string(),
+        }
+    }
 }
 
 impl Artifacts {
@@ -140,23 +202,147 @@ impl Artifacts {
         Self::default()
     }
 
-    /// Add (or replace) the file at `path` with `text`, keeping the set sorted by path.
+    /// Create a new artifact, failing with `artifact.path_collision` if the path already exists.
     ///
-    /// A binary search locates the slot: an existing path's contents are overwritten in place; a new
-    /// path is inserted at its sorted position. This keeps [`Artifacts::files`] totally ordered after
-    /// every write, so the emitted bundle is deterministic without a final sort pass.
-    pub fn write(&mut self, path: impl Into<String>, text: impl Into<String>) {
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ArtifactOwnership`] when another stage already owns `path`.
+    pub fn create(
+        &mut self,
+        path: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<(), CoreError> {
         let path = path.into();
         let text = text.into();
         match self.files.binary_search_by(|a| a.path.cmp(&path)) {
             Ok(index) => {
-                // Overwrite an existing path's contents (e.g. a post-processor rewriting a file).
-                if let Some(existing) = self.files.get_mut(index) {
-                    existing.text = text;
-                }
+                let owner = self
+                    .files
+                    .get(index)
+                    .map_or("unknown", |artifact| artifact.producer.as_str());
+                Err(self.ownership_error(
+                    "artifact.path_collision",
+                    path,
+                    format!("path is already owned by {owner}; use overlay or rewrite explicitly"),
+                ))
             }
-            Err(index) => self.files.insert(index, Artifact { path, text }),
+            Err(index) => {
+                self.files.insert(
+                    index,
+                    Artifact {
+                        path,
+                        text,
+                        producer: self.current_producer.clone(),
+                        ownership: ArtifactOwnership::Created,
+                        rewrite_chain: Vec::new(),
+                    },
+                );
+                Ok(())
+            }
         }
+    }
+
+    /// Intentionally replace an existing artifact in full and record the ownership transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ArtifactOwnership`] when `path` does not exist.
+    pub fn overlay(
+        &mut self,
+        path: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        let path = path.into();
+        let text = text.into();
+        let index = self
+            .files
+            .binary_search_by(|a| a.path.cmp(&path))
+            .map_err(|_| {
+                self.ownership_error(
+                    "artifact.overlay_missing",
+                    path.clone(),
+                    "overlay requires an existing artifact".to_string(),
+                )
+            })?;
+        self.replace_at(index, text, ArtifactOwnership::Overlaid);
+        Ok(())
+    }
+
+    /// Transform an existing artifact and record the ownership transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ArtifactOwnership`] when `path` does not exist.
+    pub fn rewrite<F>(&mut self, path: impl Into<String>, rewrite: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&str) -> String,
+    {
+        let path = path.into();
+        let index = self
+            .files
+            .binary_search_by(|a| a.path.cmp(&path))
+            .map_err(|_| {
+                self.ownership_error(
+                    "artifact.rewrite_missing",
+                    path.clone(),
+                    "rewrite requires an existing artifact".to_string(),
+                )
+            })?;
+        let text = self
+            .files
+            .get(index)
+            .map(|artifact| rewrite(&artifact.text))
+            .ok_or_else(|| {
+                self.ownership_error(
+                    "artifact.rewrite_missing",
+                    path,
+                    "rewrite requires an existing artifact".to_string(),
+                )
+            })?;
+        self.replace_at(index, text, ArtifactOwnership::Rewritten);
+        Ok(())
+    }
+
+    /// Compatibility alias for callers migrating from the old API. It now has create-only semantics
+    /// and can never silently replace an existing path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ArtifactOwnership`] when another stage already owns `path`.
+    #[deprecated(note = "use create, overlay, or rewrite to make artifact ownership explicit")]
+    pub fn write(
+        &mut self,
+        path: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        self.create(path, text)
+    }
+
+    fn replace_at(&mut self, index: usize, text: String, ownership: ArtifactOwnership) {
+        if let Some(existing) = self.files.get_mut(index) {
+            let previous_producer = existing.producer.clone();
+            existing.text = text;
+            existing.ownership = ownership;
+            existing.producer.clone_from(&self.current_producer);
+            existing.rewrite_chain.push(ArtifactRewrite {
+                ownership,
+                previous_producer,
+                producer: self.current_producer.clone(),
+            });
+        }
+    }
+
+    fn ownership_error(&self, code: &str, path: String, message: String) -> CoreError {
+        CoreError::ArtifactOwnership {
+            code: code.to_string(),
+            path,
+            producer: self.current_producer.clone(),
+            message,
+        }
+    }
+
+    fn begin_stage(&mut self, producer: String) {
+        self.current_producer = producer;
     }
 
     /// The generated files, sorted by path.
@@ -175,7 +361,10 @@ impl Artifacts {
     #[must_use]
     pub fn from_files(mut files: Vec<Artifact>) -> Self {
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Self { files }
+        Self {
+            files,
+            current_producer: "restored-cache".to_string(),
+        }
     }
 }
 
@@ -230,6 +419,11 @@ pub trait Target {
     /// `$ref`, an unsupported scheme, …) or generation otherwise fails. Never panics.
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
 
+    /// Stable producer label recorded on artifacts created by this target.
+    fn producer(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     /// Project files this target reads while generating artifacts.
     ///
     /// These files are folded into the artifact-cache key. Targets that only depend on the frozen IR
@@ -266,6 +460,11 @@ pub trait PostProcess {
     ///
     /// Returns a typed [`CoreError`] if the post-processing step fails. Never panics.
     fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
+
+    /// Stable producer label recorded on artifacts changed by this post-processor.
+    fn producer(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
 
     /// Extra cache key material for this post-processor.
     ///
@@ -473,10 +672,12 @@ impl Pipeline {
         }
 
         let mut artifacts = Artifacts::new();
-        for target in &self.targets {
+        for (index, target) in self.targets.iter().enumerate() {
+            artifacts.begin_stage(format!("target[{index}]:{}", target.producer()));
             target.generate(&ir, &mut artifacts, cx)?;
         }
-        for post in &self.posts {
+        for (index, post) in self.posts.iter().enumerate() {
+            artifacts.begin_stage(format!("post[{index}]:{}", post.producer()));
             post.run(&mut artifacts, cx)?;
         }
         save_artifact_cache(cx, &cache_key, artifacts.files());
@@ -897,11 +1098,12 @@ pub struct RunOutcome {
 /// [`Artifact`], every built-in stage, and the public [`crate::graph::SecurityScheme`].
 pub mod prelude {
     pub use super::builtins::{
-        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, DocumentOperation,
-        EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
-        MarkIdempotent, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector, PySdk, QueryParam,
-        RenameOperation, RenameType, SdkOperationAliases, SdkPackageMetadata, SetBasePath,
+        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, DiagnosticPolicy,
+        DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
+        Header, MarkIdempotent, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
+        OpenApiMetadata, OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector,
+        ParameterOverride, PySdk, QueryParam, RenameOperation, RenameType, RequestParameter,
+        ResponseOverride, SdkOperationAliases, SdkPackageMetadata, SecurityOverride, SetBasePath,
         SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
         TsSdk,
     };
@@ -920,7 +1122,8 @@ pub mod prelude {
         Target, Transform,
     };
     pub use crate::graph::{
-        PaginationMode, PaginationTermination, RuntimeHookKind, SecurityScheme,
+        DiagnosticCategory, OpenApiContact, OpenApiLicense, OpenApiServer, PaginationMode,
+        PaginationTermination, RuntimeHookKind, SecurityScheme, Type,
     };
 }
 
@@ -962,7 +1165,7 @@ mod tests {
             let text = std::fs::read_to_string(&path).map_err(|err| CoreError::Io {
                 message: format!("failed to read {}: {err}", path.display()),
             })?;
-            out.write(self.dest, text);
+            out.create(self.dest, text)?;
             Ok(())
         }
 
@@ -983,16 +1186,22 @@ mod tests {
     }
 
     #[test]
-    fn artifacts_stay_sorted_and_overwrite_in_place() {
+    fn artifact_ownership_is_explicit_and_sorted() {
         let mut a = Artifacts::new();
-        a.write("b.go", "B1");
-        a.write("a.go", "A");
-        a.write("c.go", "C");
-        a.write("b.go", "B2"); // overwrite
+        a.create("b.go", "B1").unwrap();
+        a.create("a.go", "A").unwrap();
+        a.create("c.go", "C").unwrap();
+        let collision = a.create("b.go", "B2").unwrap_err();
+        assert!(
+            matches!(collision, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision")
+        );
+        a.overlay("b.go", "B2").unwrap();
         let paths: Vec<&str> = a.files().iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a.go", "b.go", "c.go"], "sorted by path");
         let b = a.files().iter().find(|f| f.path == "b.go").unwrap();
-        assert_eq!(b.text, "B2", "last write wins for a given path");
+        assert_eq!(b.text, "B2");
+        assert_eq!(b.ownership, super::ArtifactOwnership::Overlaid);
+        assert_eq!(b.rewrite_chain.len(), 1);
     }
 
     #[test]

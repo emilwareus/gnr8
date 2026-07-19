@@ -217,6 +217,8 @@ def _map(node, in_module, table, diags):
         "unsupported type annotation: {}".format(_describe(node)),
         _file_of(table, in_module),
         getattr(node, "lineno", 0),
+        code="schema.type.unresolved",
+        category="schema",
     )
     return None
 
@@ -242,6 +244,8 @@ def _map_subscript(node, in_module, table, diags):
                 "fact omitted (no fallback)".format(base),
                 _file_of(table, in_module),
                 getattr(node, "lineno", 0),
+                code="schema.type.unresolved",
+                category="schema",
             )
             return None
         key = _map(args[0], in_module, table, diags)
@@ -260,6 +264,8 @@ def _map_subscript(node, in_module, table, diags):
                 "fact omitted (no fallback)".format(base),
                 _file_of(table, in_module),
                 getattr(node, "lineno", 0),
+                code="schema.type.unresolved",
+                category="schema",
             )
             return None
         return {"type": "enum", "of": members}
@@ -279,6 +285,8 @@ def _map_subscript(node, in_module, table, diags):
         "unsupported generic type: {}".format(base),
         _file_of(table, in_module),
         getattr(node, "lineno", 0),
+        code="schema.type.unresolved",
+        category="schema",
     )
     return None
 
@@ -302,6 +310,8 @@ def _map_union(arg_nodes, in_module, table, diags):
             "(no fallback)",
             _file_of(table, in_module),
             getattr(arg_nodes[0], "lineno", 0) if arg_nodes else 0,
+            code="schema.type.unresolved",
+            category="schema",
         )
         return None
     return {"type": "union", "of": members}
@@ -316,6 +326,8 @@ def _map_named(node, name, in_module, table, diags):
             "fact omitted (no fallback)".format(simple),
             _file_of(table, in_module),
             getattr(node, "lineno", 0),
+            code="schema.type.unresolved",
+            category="schema",
         )
         return None
     if res.kind == "alias":

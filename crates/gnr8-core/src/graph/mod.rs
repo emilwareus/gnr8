@@ -16,8 +16,8 @@
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
 use crate::analyze::facts::{
-    DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact, ResponseFact, RouteFact,
-    SchemaFact, TypeRef,
+    DiagnosticCategoryFact, DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact,
+    ResponseFact, RouteFact, SchemaFact, TypeRef,
 };
 
 // Re-export the neutral type vocabulary so the IR and the facts DTO share ONE definition (the IR
@@ -54,10 +54,19 @@ pub struct ApiGraph {
     /// The `OpenAPI` document title (`info.title`) — set by a transform (`SetTitle`), read by targets.
     /// Defaults to `"API"`.
     pub title: String,
+    /// Public `OpenAPI` document metadata configured in Rust.
+    #[serde(default, skip_serializing_if = "OpenApiMetadataPolicy::is_empty")]
+    pub openapi_metadata: OpenApiMetadataPolicy,
     /// The API security schemes — set by a transform (`ApplySecurity`), read by targets. The single
     /// source of truth for the generated `security` requirement + `components.securitySchemes`
     /// (CLAUDE.md rule 4). Defaults to empty (no security).
     pub security: Vec<SecurityScheme>,
+    /// Exact top-level `OpenAPI` security alternatives. Empty preserves the legacy derived policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_requirements: Vec<SecurityRequirementGroup>,
+    /// Exact per-operation `OpenAPI` security alternatives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_security: Vec<OperationSecurityPolicy>,
     /// Generated SDK runtime behavior policy — set by runtime transforms, read by SDK targets.
     #[serde(default, skip_serializing_if = "RuntimePolicy::is_default")]
     pub runtime: RuntimePolicy,
@@ -92,13 +101,145 @@ impl Default for ApiGraph {
             diagnostics: Vec::new(),
             base_path: default_base_path(),
             title: default_title(),
+            openapi_metadata: OpenApiMetadataPolicy::default(),
             security: Vec::new(),
+            security_requirements: Vec::new(),
+            operation_security: Vec::new(),
             runtime: RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
             operation_docs: Vec::new(),
         }
     }
+}
+
+/// Public `OpenAPI` document metadata that cannot be inferred reliably from runtime source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenApiMetadataPolicy {
+    /// API contract version (`info.version`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Long API description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Terms-of-service URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terms_of_service: Option<String>,
+    /// Public contact metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<OpenApiContact>,
+    /// Public license metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<OpenApiLicense>,
+    /// Server entries, in configured order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<OpenApiServer>,
+}
+
+impl OpenApiMetadataPolicy {
+    fn is_empty(value: &Self) -> bool {
+        value == &Self::default()
+    }
+}
+
+/// `OpenAPI` contact metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenApiContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+}
+
+impl OpenApiContact {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn email(mut self, email: impl Into<String>) -> Self {
+        self.email = Some(email.into());
+        self
+    }
+}
+
+/// `OpenAPI` license metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenApiLicense {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl OpenApiLicense {
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: None,
+        }
+    }
+
+    #[must_use]
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+}
+
+/// `OpenAPI` server metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenApiServer {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl OpenApiServer {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            description: None,
+        }
+    }
+
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+/// One AND group inside an `OpenAPI` security alternatives list.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SecurityRequirementGroup {
+    /// Scheme ids that must all be satisfied for this alternative.
+    pub schemes: Vec<String>,
+}
+
+/// Exact security alternatives for one operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperationSecurityPolicy {
+    pub operation_id: String,
+    /// Empty means explicitly public; otherwise each entry is an OR alternative whose ids are combined
+    /// with AND.
+    pub alternatives: Vec<SecurityRequirementGroup>,
 }
 
 /// Generated SDK runtime behavior configured by code-as-config transforms.
@@ -210,6 +351,9 @@ pub enum PaginationTermination {
 pub struct OperationDocsPolicy {
     /// Operation id this documentation policy applies to.
     pub operation_id: String,
+    /// Exact public `OpenAPI` operation id when it differs from the graph's SDK-safe identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi_operation_id: Option<String>,
     /// Optional short operation summary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -225,6 +369,9 @@ pub struct OperationDocsPolicy {
     /// Named request examples keyed by media type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub request_examples: Vec<MediaExample>,
+    /// Declared request media types that share the operation's request schema.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_content_types: Vec<String>,
     /// Response documentation keyed by status.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses: Vec<ResponseDocsPolicy>,
@@ -354,12 +501,34 @@ pub struct Param {
     /// Source-inferred default value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<LiteralValue>,
+    /// Explicit `OpenAPI` serialization style, if non-default behavior was inferred or configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// Explicit `OpenAPI` explode behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explode: Option<bool>,
+    /// Whether reserved query characters may remain unescaped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_reserved: bool,
+    /// Exact `OpenAPI` 3 parameter `content` object, when the source used content instead of schema.
+    ///
+    /// SDK generators use [`Self::schema`] for typing; the `OpenAPI` target uses this value to avoid
+    /// losing the parameter media type and media-object metadata during source migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi_content: Option<serde_json::Value>,
+    /// Consumer-visible `OpenAPI` parameter fields not otherwise represented by this graph type.
+    ///
+    /// Entries are sorted by key. They include an imported `schema`, documentation, examples,
+    /// deprecation/empty-value flags, and vendor extensions. SDK targets continue to use the typed
+    /// fields above; the `OpenAPI` target re-emits these exact source values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub openapi_fields: Vec<(String, serde_json::Value)>,
     /// Source provenance for the parameter access (D-07).
     pub provenance: SourceSpan,
 }
 
 /// One response of an operation keyed by HTTP status.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Response {
     /// The HTTP status code (e.g. `201`).
     pub status: u16,
@@ -429,26 +598,129 @@ pub struct Schema {
 }
 
 /// A reference to a schema by its stable id.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaRef {
     /// The referenced schema id.
     pub ref_id: String,
 }
 
-/// One diagnostic (lossy/unsupported pattern) with a source location (D-10).
+/// Stable class of diagnostic for policy matching and reporting.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCategory {
+    /// A source or route pattern could not be analyzed.
+    Source,
+    /// A request parameter fact is incomplete or ambiguous.
+    RequestParameter,
+    /// A request-body fact is incomplete or ambiguous.
+    RequestBody,
+    /// A response fact is incomplete or ambiguous.
+    Response,
+    /// A schema fact is incomplete or lossy.
+    Schema,
+    /// A security fact is incomplete or contradictory.
+    Security,
+    /// An explicit override changed or contradicted an extracted fact.
+    Override,
+    /// An artifact producer or rewrite violated ownership rules.
+    Artifact,
+    /// A compatibility comparison found contract drift.
+    Compatibility,
+}
+
+impl From<DiagnosticCategoryFact> for DiagnosticCategory {
+    fn from(category: DiagnosticCategoryFact) -> Self {
+        match category {
+            DiagnosticCategoryFact::Source => Self::Source,
+            DiagnosticCategoryFact::RequestParameter => Self::RequestParameter,
+            DiagnosticCategoryFact::RequestBody => Self::RequestBody,
+            DiagnosticCategoryFact::Response => Self::Response,
+            DiagnosticCategoryFact::Schema => Self::Schema,
+            DiagnosticCategoryFact::Security => Self::Security,
+            DiagnosticCategoryFact::Override => Self::Override,
+            DiagnosticCategoryFact::Artifact => Self::Artifact,
+            DiagnosticCategoryFact::Compatibility => Self::Compatibility,
+        }
+    }
+}
+
+/// One diagnostic (lossy/unsupported pattern) with a stable identity and source location (D-10).
 ///
 /// Derives `Deserialize` as well as `Serialize` so it survives the host↔child JSON boundary inside
 /// an [`crate::runner::ArtifactBundle`] (the host deserializes the child's emitted bundle).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
+    /// Stable dotted identity used by [`crate::sdk::builtins::DiagnosticPolicy`].
+    pub code: String,
     /// Severity, `"WARN"` or `"ERROR"`.
     pub severity: String,
+    /// Stable category used for broader policy matching.
+    pub category: DiagnosticCategory,
     /// The human-readable message (rule + identity).
     pub message: String,
     /// The source file the diagnostic applies to (module-relative).
     pub file: String,
     /// The 1-based line number.
     pub line: u32,
+    /// Full inclusive source span.
+    pub span: SourceSpan,
+    /// HTTP operation identity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Schema identity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// Parameter, field, or other narrow subject identity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl Diagnostic {
+    /// Construct a structured diagnostic while retaining the legacy `file`/`line` projection.
+    #[must_use]
+    pub fn new(
+        code: impl Into<String>,
+        category: DiagnosticCategory,
+        severity: impl Into<String>,
+        message: impl Into<String>,
+        span: SourceSpan,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity: severity.into(),
+            category,
+            message: message.into(),
+            file: span.file.clone(),
+            line: span.start_line,
+            span,
+            operation: None,
+            schema: None,
+            subject: None,
+        }
+    }
+
+    /// Associate the diagnostic with an HTTP operation.
+    #[must_use]
+    pub fn operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    /// Associate the diagnostic with a schema.
+    #[must_use]
+    pub fn schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
+    /// Associate the diagnostic with a parameter, field, or other narrow subject.
+    #[must_use]
+    pub fn subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
 }
 
 /// File + line-range provenance attached to every graph node (D-07).
@@ -500,11 +772,28 @@ impl ApiGraph {
         let mut diagnostics: Vec<Diagnostic> = facts
             .diagnostics
             .into_iter()
-            .map(|diag: DiagnosticFact| Diagnostic {
-                severity: diag.severity,
-                message: diag.message,
-                file: relativize(&diag.file, &root),
-                line: diag.line,
+            .map(|diag: DiagnosticFact| {
+                let file = relativize(&diag.file, &root);
+                let span = SourceSpan {
+                    file,
+                    start_line: diag.line,
+                    end_line: if diag.end_line == 0 {
+                        diag.line
+                    } else {
+                        diag.end_line
+                    },
+                };
+                let mut diagnostic = Diagnostic::new(
+                    diag.code,
+                    DiagnosticCategory::from(diag.category),
+                    diag.severity,
+                    diag.message,
+                    span,
+                );
+                diagnostic.operation = diag.operation;
+                diagnostic.schema = diag.schema;
+                diagnostic.subject = diag.subject;
+                diagnostic
             })
             .collect();
         diagnostics.sort_by(|a, b| {
@@ -523,7 +812,10 @@ impl ApiGraph {
             // by transforms (SetBasePath / SetTitle / ApplySecurity) before targets read it.
             base_path: default_base_path(),
             title: default_title(),
+            openapi_metadata: OpenApiMetadataPolicy::default(),
             security: Vec::new(),
+            security_requirements: Vec::new(),
+            operation_security: Vec::new(),
             runtime: RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
@@ -584,6 +876,11 @@ impl Param {
             required: param.required,
             schema: normalize_type(param.schema),
             default: param.default,
+            style: param.style,
+            explode: param.explode,
+            allow_reserved: param.allow_reserved,
+            openapi_content: None,
+            openapi_fields: Vec::new(),
             provenance: relativize_span(&param.span, root),
         }
     }

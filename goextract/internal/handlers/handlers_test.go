@@ -375,15 +375,14 @@ func dynamicContentType() string {
 	if len(methodFile.Responses) != 1 || methodFile.Responses[0].ContentType != "application/octet-stream" {
 		t.Fatalf("method content type helper should not fold through a same-named top-level helper, got %+v", methodFile.Responses)
 	}
-	found := false
+	foundOperations := map[string]bool{}
 	for _, item := range diags.Items() {
 		if strings.Contains(item.Message, "DataFromReader content type is dynamic") {
-			found = true
-			break
+			foundOperations[item.Operation] = true
 		}
 	}
-	if !found {
-		t.Fatalf("branching content type helper should emit dynamic-content diagnostic, got %+v", diags.Items())
+	if !foundOperations["GET /file"] || !foundOperations["GET /method-file"] {
+		t.Fatalf("dynamic-content diagnostics should identify both operations, got %+v", diags.Items())
 	}
 }
 
@@ -899,7 +898,7 @@ func parseRequest[T any](c *gin.Context) (T, error) {
 	}
 }
 
-func TestGenericJSONBodyHelperRequiresTypeParamBind(t *testing.T) {
+func TestGenericJSONBodyHelperPreservesConcreteEnvelopeBind(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/genericbodyguard
 
@@ -962,8 +961,9 @@ func parseEnvelope[T any](c *gin.Context) (T, error) {
 	for _, r := range routes.Recognize(res) {
 		cf = analyzer.Analyze(r, diags)
 	}
-	if cf.RequestBody != nil || cf.RequestBodyContentType != "" {
-		t.Fatalf("generic helper binding a concrete envelope should not infer CreateRequest body, got body=%+v content_type=%q", cf.RequestBody, cf.RequestBodyContentType)
+	assertBodySuffix(t, cf.RequestBody, "Envelope")
+	if cf.RequestBodyContentType != "application/json" {
+		t.Fatalf("generic helper's concrete envelope bind should remain the request body, got body=%+v content_type=%q", cf.RequestBody, cf.RequestBodyContentType)
 	}
 }
 
@@ -1431,6 +1431,442 @@ func (s Server) getThing(c *gin.Context) {
 	assertResponseSuffix(t, cf.Responses, 200, "GetThing200Response")
 }
 
+func TestModuleOwnedMultiHopTypedParametersAndMultipartAreExtracted(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/typedrequests
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v0.0.0
+	github.com/google/uuid v0.0.0
+)
+
+replace github.com/gin-gonic/gin => ./ginstub
+replace github.com/google/uuid => ./uuidstub
+`)
+	for _, subdir := range []string{"ginstub", "uuidstub", "requesthelpers"} {
+		if err := os.Mkdir(filepath.Join(dir, subdir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", subdir, err)
+		}
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import (
+	"mime/multipart"
+	"net/http"
+)
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct { Request *http.Request }
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) Query(string) string { return "" }
+func (c *Context) GetQuery(string) (string, bool) { return "", false }
+func (c *Context) QueryArray(string) []string { return nil }
+func (c *Context) GetQueryArray(string) ([]string, bool) { return nil, false }
+func (c *Context) QueryMap(string) map[string]string { return nil }
+func (c *Context) GetHeader(string) string { return "" }
+func (c *Context) Cookie(string) (string, error) { return "", nil }
+func (c *Context) GetPostForm(string) (string, bool) { return "", false }
+func (c *Context) PostForm(string) string { return "" }
+func (c *Context) FormFile(string) (*multipart.FileHeader, error) { return nil, nil }
+func (c *Context) ShouldBindQuery(any) error { return nil }
+func (c *Context) ShouldBindHeader(any) error { return nil }
+func (c *Context) ShouldBind(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "uuidstub", "go.mod"), "module github.com/google/uuid\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "uuidstub", "uuid.go"), `package uuid
+
+type UUID [16]byte
+func MustParse(string) UUID { return UUID{} }
+`)
+	mustWrite(t, filepath.Join(dir, "requesthelpers", "helpers.go"), `package requesthelpers
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+func RequiredQueryUUID(c *gin.Context, name string) uuid.UUID {
+	return uuid.MustParse(requiredQuery(c, name))
+}
+
+func requiredQuery(c *gin.Context, name string) string {
+	return queryValue(c, name)
+}
+
+func queryValue(c *gin.Context, name string) string {
+	return c.Query(name)
+}
+
+func MultipartParts(c *gin.Context, fileName, titleName string) {
+	_, _ = c.FormFile(fileName)
+	_ = c.PostForm(titleName)
+}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package typedrequests
+
+import (
+	"mime/multipart"
+	"time"
+
+	"example.com/typedrequests/requesthelpers"
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+
+type QueryInput struct {
+	Statuses []string  `+"`"+`form:"statuses" binding:"required"`+"`"+`
+	Force    bool      `+"`"+`form:"force"`+"`"+`
+	Limit    int       `+"`"+`form:"limit,default=25"`+"`"+`
+	State    string    `+"`"+`form:"state" binding:"oneof=active paused"`+"`"+`
+	Day      time.Time `+"`"+`form:"day" time_format:"2006-01-02"`+"`"+`
+	Spaces   []string  `+"`"+`form:"spaces" collection_format:"ssv"`+"`"+`
+	Pipes    []string  `+"`"+`form:"pipes" collection_format:"pipes"`+"`"+`
+	Tabs     []string  `+"`"+`form:"tabs" collection_format:"tsv"`+"`"+`
+}
+
+type HeaderInput struct {
+	Signature string `+"`"+`header:"X-Webhook-Signature" binding:"required"`+"`"+`
+	Retries   []int  `+"`"+`header:"X-Retry"`+"`"+`
+}
+
+type UploadMetadata struct {
+	Source string `+"`"+`json:"source"`+"`"+`
+}
+
+type UploadInput struct {
+	BoundFile *multipart.FileHeader `+"`"+`form:"boundFile" binding:"required"`+"`"+`
+	Metadata  UploadMetadata        `+"`"+`form:"metadata"`+"`"+`
+	Caption   string                `+"`"+`form:"caption,default=untitled"`+"`"+`
+}
+
+type Response struct { OK bool `+"`"+`json:"ok"`+"`"+` }
+
+func (s Server) Register() { s.R.GET("/search", s.search) }
+
+func (s Server) search(c *gin.Context) {
+	var query QueryInput
+	var headers HeaderInput
+	var upload UploadInput
+	_ = c.ShouldBindQuery(&query)
+	_ = c.ShouldBindHeader(&headers)
+	_ = c.ShouldBind(&upload)
+	_ = requesthelpers.RequiredQueryUUID(c, "branchId")
+	_ = c.QueryArray("labels")
+	_, _ = c.GetQueryArray("optionalLabels")
+	_ = c.QueryMap("filters")
+	_ = c.GetHeader("X-Direct")
+	_ = c.Request.Header.Get("X-Request-Direct")
+	_, _ = c.Cookie("session")
+	_, _ = c.GetPostForm("note")
+	requesthelpers.MultipartParts(c, "attachment", "title")
+	c.JSON(200, Response{OK: true})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load typed request fixture: %v", err)
+	}
+	diagnostics := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/typedrequests", diagnostics)
+	var code handlers.CodeFacts
+	for _, route := range routes.Recognize(res) {
+		code = analyzer.Analyze(route, diagnostics)
+	}
+
+	branch, ok := paramByName(code.Params, "branchId")
+	if !ok || !branch.Required || branch.Location != "query" || branch.Schema.Type != facts.TypeWellKnown || branch.Schema.Of != facts.WellKnownUUID {
+		t.Fatalf("multi-hop cross-package UUID query must be exact, got %+v", branch)
+	}
+	if !strings.Contains(branch.Span.File, "requesthelpers") || branch.Span.StartLine == 0 {
+		t.Fatalf("helper-derived parameter must preserve inner source span, got %+v", branch.Span)
+	}
+	statuses, ok := paramByName(code.Params, "statuses")
+	if !ok || !statuses.Required || statuses.Schema.Type != facts.TypeArray || statuses.Style != "form" || statuses.Explode == nil || !*statuses.Explode {
+		t.Fatalf("bound query array must preserve type/required/style/explode, got %+v", statuses)
+	}
+	force, _ := paramByName(code.Params, "force")
+	if primName(force.Schema) != facts.PrimBool || force.Required {
+		t.Fatalf("bound bool query mismatch: %+v", force)
+	}
+	limit, _ := paramByName(code.Params, "limit")
+	if primName(limit.Schema) != facts.PrimInt || limit.Default == nil || limit.Default.Type != "number" || limit.Default.Value != "25" {
+		t.Fatalf("bound integer/default mismatch: %+v", limit)
+	}
+	state, _ := paramByName(code.Params, "state")
+	if state.Schema.Type != facts.TypeEnum {
+		t.Fatalf("binding oneof must become an enum, got %+v", state.Schema)
+	}
+	day, _ := paramByName(code.Params, "day")
+	if day.Schema.Type != facts.TypeWellKnown || day.Schema.Of != facts.WellKnownDate {
+		t.Fatalf("time_format date must remain a date, got %+v", day.Schema)
+	}
+	spaces, _ := paramByName(code.Params, "spaces")
+	if spaces.Style != "spaceDelimited" || spaces.Explode == nil || *spaces.Explode {
+		t.Fatalf("ssv query serialization mismatch: %+v", spaces)
+	}
+	pipes, _ := paramByName(code.Params, "pipes")
+	if pipes.Style != "pipeDelimited" || pipes.Explode == nil || *pipes.Explode {
+		t.Fatalf("pipes query serialization mismatch: %+v", pipes)
+	}
+	signature, _ := paramByName(code.Params, "X-Webhook-Signature")
+	if signature.Location != "header" || !signature.Required || primName(signature.Schema) != facts.PrimString {
+		t.Fatalf("bound header mismatch: %+v", signature)
+	}
+	retries, _ := paramByName(code.Params, "X-Retry")
+	if retries.Style != "simple" || retries.Explode == nil || *retries.Explode {
+		t.Fatalf("header array serialization mismatch: %+v", retries)
+	}
+	filters, _ := paramByName(code.Params, "filters")
+	if filters.Schema.Type != facts.TypeMap || filters.Style != "deepObject" || filters.Explode == nil || !*filters.Explode {
+		t.Fatalf("QueryMap serialization mismatch: %+v", filters)
+	}
+	for _, headerName := range []string{"X-Direct", "X-Request-Direct"} {
+		header, exists := paramByName(code.Params, headerName)
+		if !exists || header.Location != "header" || !header.Required {
+			t.Fatalf("missing direct header %s: %+v", headerName, code.Params)
+		}
+	}
+	cookie, _ := paramByName(code.Params, "session")
+	if cookie.Location != "cookie" || !cookie.Required {
+		t.Fatalf("cookie mismatch: %+v", cookie)
+	}
+
+	if code.RequestBody == nil || code.RequestBodyContentType != "multipart/form-data" || len(code.Schemas) != 1 {
+		t.Fatalf("helper-wrapped multipart body mismatch: body=%+v type=%q schemas=%+v", code.RequestBody, code.RequestBodyContentType, code.Schemas)
+	}
+	fields, ok := code.Schemas[0].Body.Of.([]facts.FieldFact)
+	if !ok {
+		t.Fatalf("multipart schema must be an object: %+v", code.Schemas[0].Body)
+	}
+	byName := map[string]facts.FieldFact{}
+	for _, field := range fields {
+		byName[field.JSONName] = field
+	}
+	if primName(byName["attachment"].Schema) != facts.PrimBytes || !byName["attachment"].Required || primName(byName["title"].Schema) != facts.PrimString || primName(byName["note"].Schema) != facts.PrimString {
+		t.Fatalf("multipart fields mismatch: %+v", byName)
+	}
+	if primName(byName["boundFile"].Schema) != facts.PrimBytes || !byName["boundFile"].Required {
+		t.Fatalf("bound multipart file mismatch: %+v", byName["boundFile"])
+	}
+	if byName["metadata"].Schema.Type != facts.TypeNamed {
+		t.Fatalf("structured multipart metadata mismatch: %+v", byName["metadata"])
+	}
+	if byName["caption"].Meta == nil || byName["caption"].Meta.Default == nil || byName["caption"].Meta.Default.Value != "untitled" {
+		t.Fatalf("bound multipart scalar default mismatch: %+v", byName["caption"])
+	}
+	foundUnsupportedCollectionFormat := false
+	for _, item := range diagnostics.Items() {
+		if item.Code == "request.parameter.unresolved" && (item.Subject == "branchId" || strings.Contains(item.Message, "RequiredQueryUUID")) {
+			t.Fatalf("resolved multi-hop parameter must not emit incompleteness diagnostic: %+v", item)
+		}
+		if item.Code == "request.parameter.unresolved" && item.Subject == "tabs" && strings.Contains(item.Message, "tsv") {
+			foundUnsupportedCollectionFormat = true
+		}
+	}
+	if !foundUnsupportedCollectionFormat {
+		t.Fatalf("unsupported tsv serialization must emit request.parameter.unresolved: %+v", diagnostics.Items())
+	}
+}
+
+func TestContextHelperCyclesAndExternalBoundariesAreDiagnosed(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/helperdiagnostics
+
+go 1.22
+
+require (
+	github.com/gin-gonic/gin v0.0.0
+	example.net/external v0.0.0
+)
+
+replace github.com/gin-gonic/gin => ./ginstub
+replace example.net/external => ./external
+`)
+	for _, subdir := range []string{"ginstub", "external"} {
+		if err := os.Mkdir(filepath.Join(dir, subdir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", subdir, err)
+		}
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+func (e *Engine) GET(string, HandlerFunc) {}
+`)
+	mustWrite(t, filepath.Join(dir, "external", "go.mod"), "module example.net/external\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "external", "external.go"), `package external
+
+import "github.com/gin-gonic/gin"
+func Read(*gin.Context) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package helperdiagnostics
+
+import (
+	"example.net/external"
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct{ R *gin.Engine }
+func (s Server) Register() { s.R.GET("/broken", s.broken) }
+func (s Server) broken(c *gin.Context) { cycleA(c); external.Read(c) }
+func cycleA(c *gin.Context) { cycleB(c) }
+func cycleB(c *gin.Context) { cycleA(c) }
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load helper diagnostic fixture: %v", err)
+	}
+	diagnostics := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/helperdiagnostics", diagnostics)
+	for _, route := range routes.Recognize(res) {
+		_ = analyzer.Analyze(route, diagnostics)
+	}
+	cycle, external := false, false
+	for _, item := range diagnostics.Items() {
+		if item.Code != "request.parameter.unresolved" || item.Operation != "GET /broken" {
+			continue
+		}
+		cycle = cycle || strings.Contains(item.Message, "cycle detected")
+		external = external || strings.Contains(item.Message, "external package example.net/external")
+	}
+	if !cycle || !external {
+		t.Fatalf("cycle and external context boundaries must both be diagnosed: %+v", diagnostics.Items())
+	}
+}
+
+func TestDirectRequestFactsPreferTypedEvidenceAndDiagnoseEveryIncompleteShape(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/requestdiagnostics
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import (
+	"mime/multipart"
+	"net/http"
+)
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct { Request *http.Request }
+func (e *Engine) POST(string, HandlerFunc) {}
+func (c *Context) Query(string) string { return "" }
+func (c *Context) Param(string) string { return "" }
+func (c *Context) GetHeader(string) string { return "" }
+func (c *Context) Cookie(string) (string, error) { return "", nil }
+func (c *Context) FormFile(string) (*multipart.FileHeader, error) { return nil, nil }
+func (c *Context) PostForm(string) string { return "" }
+func (c *Context) ShouldBindJSON(any) error { return nil }
+func (c *Context) ShouldBindQuery(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package requestdiagnostics
+
+import "github.com/gin-gonic/gin"
+
+const limitName = "limit"
+
+type Server struct{ R *gin.Engine }
+type SearchQuery struct { Limit int `+"`"+`form:"limit"`+"`"+` }
+type GoodBody struct { Name string `+"`"+`json:"name"`+"`"+` }
+type OtherBody struct { ID string `+"`"+`json:"id"`+"`"+` }
+type Response struct { OK bool `+"`"+`json:"ok"`+"`"+` }
+
+func (s Server) Register() { s.R.POST("/broken", s.broken) }
+
+func (s Server) broken(c *gin.Context) {
+	var query SearchQuery
+	_ = c.Query(limitName)
+	_ = c.ShouldBindQuery(&query)
+
+	dynamic := limitName
+	_ = c.Param(dynamic)
+	_ = c.GetHeader(dynamic)
+	_, _ = c.Cookie(dynamic)
+	_ = c.Request.Header.Get(dynamic)
+	_, _ = c.FormFile(dynamic)
+	_ = c.PostForm(dynamic)
+
+	loose := map[string]any{}
+	_ = c.ShouldBindJSON(&loose)
+	good := new(GoodBody)
+	_ = c.ShouldBindJSON(good)
+	var other OtherBody
+	_ = c.ShouldBindJSON(&other)
+	c.JSON(200, Response{OK: true})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load request diagnostic fixture: %v", err)
+	}
+	diagnostics := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/requestdiagnostics", diagnostics)
+	var code handlers.CodeFacts
+	for _, route := range routes.Recognize(res) {
+		code = analyzer.Analyze(route, diagnostics)
+	}
+
+	limit, ok := paramByName(code.Params, "limit")
+	if !ok || primName(limit.Schema) != facts.PrimInt {
+		t.Fatalf("typed binding must replace earlier untyped query evidence, got %+v", limit)
+	}
+	assertBodySuffix(t, code.RequestBody, "GoodBody")
+
+	parameterSubjects := map[string]bool{}
+	bodyReasons := []string{}
+	for _, item := range diagnostics.Items() {
+		if item.Operation != "POST /broken" {
+			t.Fatalf("request completeness diagnostic lost operation identity: %+v", item)
+		}
+		switch item.Code {
+		case "request.parameter.unresolved":
+			parameterSubjects[item.Subject] = true
+			if item.Subject == "limit" || strings.Contains(item.Message, "untyped query param 'limit'") {
+				t.Fatalf("resolved constant-name typed query emitted a false incompleteness diagnostic: %+v", item)
+			}
+		case "request.body.unresolved":
+			bodyReasons = append(bodyReasons, item.Message)
+		}
+	}
+	for _, subject := range []string{"Param", "GetHeader", "Cookie", "Request.Header.Get"} {
+		if !parameterSubjects[subject] {
+			t.Fatalf("missing dynamic-name parameter diagnostic for %s: %+v", subject, diagnostics.Items())
+		}
+	}
+	for _, reason := range []string{
+		"multipart field name is dynamic",
+		"form field name is dynamic",
+		"binding target does not resolve to a named schema",
+		"conflicting body evidence",
+	} {
+		if !sliceContainsText(bodyReasons, reason) {
+			t.Fatalf("missing request.body.unresolved reason %q: %+v", reason, diagnostics.Items())
+		}
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 type facts2Diag struct {
@@ -1443,6 +1879,15 @@ func mustWrite(t *testing.T, path string, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+func sliceContainsText(values []string, needle string) bool {
+	for _, value := range values {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertBinaryOctetStreamResponse(t *testing.T, responses []facts.ResponseFact) {

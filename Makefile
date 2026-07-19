@@ -6,7 +6,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test red check all examples-check install
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install
 
 # Auto-format the workspace in place.
 fmt:
@@ -67,7 +67,16 @@ pyextract-test:
 	python3 -m unittest discover pyextract/tests
 
 tsextract-test: tsextract-deps
-	@command -v node >/dev/null 2>&1 && (cd tsextract && for test in tests/*.test.js; do node "$$test"; done) || echo "node absent — TS sidecar tests skipped"
+	@if command -v node >/dev/null 2>&1; then \
+		set -e; cd tsextract; for test in tests/*.test.js; do node "$$test"; done; \
+	else \
+		echo "node absent — TS sidecar tests skipped"; \
+	fi
+
+# Exercise the composite action's exact direct-dependency version resolver against real and
+# adversarial lock graphs (including a conflicting transitive gnr8 version).
+action-test:
+	bash scripts/test-action-version.sh
 
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
@@ -115,6 +124,6 @@ examples-check: tsextract-deps
 	for dir in examples/*/generated; do diff -ru "$$tmp/$$dir" "$$dir"; done
 
 # Full local gate, mirrors CI.
-check: fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test examples-check
+check: fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
 
 all: check

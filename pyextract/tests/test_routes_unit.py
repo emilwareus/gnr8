@@ -75,6 +75,8 @@ class FlaskQueryParamTargetTests(unittest.TestCase):
         items = diags.items()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["severity"], "WARN")
+        self.assertEqual(items[0]["code"], "request.parameter.unresolved")
+        self.assertEqual(items[0]["operation"], "GET /")
         self.assertIn("non-name target", items[0]["message"])
 
     def test_subscript_target_skipped_with_diagnostic(self):
@@ -153,21 +155,93 @@ class FlaskBodylessMethodTests(unittest.TestCase):
         func = _func(self.SRC)
         table = SymbolTable(modules)
         diags = Diagnostics()
-        return routes._flask_body_and_params(
+        params, body = routes._flask_body_and_params(
             func, method, "/", "app.routes", modules[0].abs_path, table, diags
         )
+        return params, body, diags.items()
 
     def test_post_derives_body(self):
-        _params, body = self._run_multi("POST")
+        _params, body, diagnostics = self._run_multi("POST")
         self.assertEqual(body, {"ref_id": "app.dto.OrderInput"})
+        self.assertEqual(diagnostics, [])
 
     def test_get_omits_body(self):
-        _params, body = self._run_multi("GET")
+        _params, body, diagnostics = self._run_multi("GET")
         self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "GET /")
 
     def test_delete_omits_body(self):
-        _params, body = self._run_multi("DELETE")
+        _params, body, diagnostics = self._run_multi("DELETE")
         self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+
+
+class FastAPIDiagnosticCompletenessTests(unittest.TestCase):
+    DTO = "class Output:\n    value: str\n"
+
+    def _recognize(self, handler_source):
+        source = (
+            "from fastapi import FastAPI\n"
+            "from app.dto import Output\n"
+            "app = FastAPI()\n" + handler_source
+        )
+        modules = [
+            _FakeModule("app.main", source),
+            _FakeModule("app.dto", self.DTO),
+        ]
+        table = SymbolTable(modules)
+        diags = Diagnostics()
+        recognized = routes.recognize_fastapi(modules, table, diags)
+        return recognized, diags.items()
+
+    def test_return_annotation_supplies_response_when_model_kwarg_is_absent(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/items')\n"
+            "def list_items() -> Output:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            recognized[0]["responses"][0]["body"], {"ref_id": "app.dto.Output"}
+        )
+        self.assertEqual(diagnostics, [])
+
+    def test_untyped_parameter_and_missing_response_are_diagnosed(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/items')\n"
+            "def list_items(query):\n"
+            "    pass\n"
+        )
+        self.assertEqual(recognized[0]["params"], [])
+        self.assertEqual(
+            {diagnostic["code"] for diagnostic in diagnostics},
+            {"request.parameter.unresolved", "response.schema.unresolved"},
+        )
+        self.assertTrue(
+            all(diagnostic["operation"] == "GET /items" for diagnostic in diagnostics)
+        )
+
+    def test_dynamic_status_is_diagnosed_and_defaults_safely(self):
+        recognized, diagnostics = self._recognize(
+            "STATUS = 202\n"
+            "@app.post('/items', status_code=STATUS)\n"
+            "def create_item() -> Output:\n"
+            "    pass\n"
+        )
+        self.assertEqual(recognized[0]["responses"][0]["status"], 200)
+        diagnostic = next(
+            item for item in diagnostics if item["code"] == "response.status.unresolved"
+        )
+        self.assertEqual(diagnostic["operation"], "POST /items")
+
+    def test_explicit_none_response_model_is_intentionally_bodyless(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/health', response_model=None)\n"
+            "def health():\n"
+            "    pass\n"
+        )
+        self.assertIsNone(recognized[0]["responses"][0]["body"])
+        self.assertEqual(diagnostics, [])
 
 
 class FastAPIBodylessMethodTests(unittest.TestCase):
@@ -181,7 +255,7 @@ class FastAPIBodylessMethodTests(unittest.TestCase):
     )
     DTO = "class CreateInput:\n    x: int\n"
 
-    def _body(self, method):
+    def _body_and_diags(self, method):
         modules = [
             _FakeModule("app.main", self.SRC),
             _FakeModule("app.dto", self.DTO),
@@ -192,16 +266,24 @@ class FastAPIBodylessMethodTests(unittest.TestCase):
         _params, body = routes._build_params(
             func, "/", method, "app.main", modules[0].abs_path, table, diags
         )
-        return body
+        return body, diags.items()
 
     def test_post_derives_body(self):
-        self.assertEqual(self._body("POST"), {"ref_id": "app.dto.CreateInput"})
+        body, diagnostics = self._body_and_diags("POST")
+        self.assertEqual(body, {"ref_id": "app.dto.CreateInput"})
+        self.assertEqual(diagnostics, [])
 
     def test_get_omits_body(self):
-        self.assertIsNone(self._body("GET"))
+        body, diagnostics = self._body_and_diags("GET")
+        self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "GET /")
 
     def test_delete_omits_body(self):
-        self.assertIsNone(self._body("DELETE"))
+        body, diagnostics = self._body_and_diags("DELETE")
+        self.assertIsNone(body)
+        self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
+        self.assertEqual(diagnostics[0]["operation"], "DELETE /")
 
 
 class StaticPrefixCompositionTests(unittest.TestCase):
@@ -222,7 +304,7 @@ class StaticPrefixCompositionTests(unittest.TestCase):
             "app = FastAPI()\n"
             "router = APIRouter(prefix='/books')\n"
             "app.include_router(router, prefix='/v1')\n"
-            "@router.get('/')\n"
+            "@router.get('/', response_model=None)\n"
             "def list_books():\n"
             "    pass\n"
         )
@@ -233,10 +315,10 @@ class StaticPrefixCompositionTests(unittest.TestCase):
         found, diags = self._recognize_fastapi(
             "books = APIRouter(prefix='/books')\n"
             "users = APIRouter(prefix='/users')\n"
-            "@books.get('/{item_id}')\n"
+            "@books.get('/{item_id}', response_model=None)\n"
             "def get_book(item_id: str):\n"
             "    pass\n"
-            "@users.get('/{item_id}')\n"
+            "@users.get('/{item_id}', response_model=None)\n"
             "def get_user(item_id: str):\n"
             "    pass\n"
         )

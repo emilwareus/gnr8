@@ -23,11 +23,30 @@ use crate::graph::Diagnostic;
 use crate::sdk::{Artifact, Cx, FileStamp, Pipeline};
 use crate::CoreError;
 
-/// The current artifact-bundle wire-schema version. Bumped on any breaking change to the JSON shape;
-/// the host (the `gnr8` binary) rejects a bundle whose `version` differs from this, so a `.gnr8/`
+/// The current host/child protocol version. Bumped on any breaking change to the JSON shape;
+/// the host (the `gnr8` binary) rejects a bundle whose `protocol_version` differs from this, so a `.gnr8/`
 /// crate built against a skewed `gnr8-core` fails with an actionable error instead of a confusing
 /// parse error or silently-wrong output (forward/back-compat across the boundary).
-pub const BUNDLE_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Backwards-compatible constant name for integrations that previously inspected the bundle version.
+pub const BUNDLE_VERSION: u32 = PROTOCOL_VERSION;
+
+/// Environment variables carried from the host into the generation child.
+pub const HOST_PROTOCOL_ENV: &str = "GNR8_HOST_PROTOCOL_VERSION";
+pub const HOST_VERSION_ENV: &str = "GNR8_HOST_CLI_VERSION";
+pub const HOST_CAPABILITY_ENV: &str = "GNR8_HOST_CAPABILITY_FINGERPRINT";
+
+/// Deterministic fingerprint for capabilities that must agree across the process boundary.
+#[must_use]
+pub fn capability_fingerprint() -> String {
+    let manifest = format!(
+        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION
+    );
+    blake3::hash(manifest.as_bytes()).to_hex().to_string()
+}
 
 /// The exit code for a usage error (unknown / missing subcommand). `0` = success, `1` = run error,
 /// `2` = usage, mirroring conventional CLI exit semantics.
@@ -40,8 +59,18 @@ const EXIT_USAGE: u8 = 2;
 /// runner owns the protocol; re-exported from there for the host to consume.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactBundle {
-    /// The wire-schema version ([`BUNDLE_VERSION`]).
-    pub version: u32,
+    /// The wire-schema/protocol version ([`PROTOCOL_VERSION`]).
+    #[serde(alias = "version")]
+    pub protocol_version: u32,
+    /// The exact host CLI version that requested generation.
+    #[serde(default)]
+    pub cli_version: String,
+    /// The exact `gnr8-core` version linked into the generation child.
+    #[serde(default)]
+    pub core_version: String,
+    /// Hash of protocol-relevant child capabilities.
+    #[serde(default)]
+    pub capability_fingerprint: String,
     /// The generated files, sorted by path (the pipeline keeps them ordered).
     pub artifacts: Vec<Artifact>,
     /// Diagnostics the IR carried after transforms (lossy/unsupported source patterns).
@@ -72,7 +101,10 @@ impl ArtifactBundle {
         cache_input_stamps: Vec<FileStamp>,
     ) -> Self {
         Self {
-            version: BUNDLE_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            cli_version: host_cli_version(),
+            core_version: env!("CARGO_PKG_VERSION").to_string(),
+            capability_fingerprint: capability_fingerprint(),
             artifacts,
             diagnostics,
             output_anchors,
@@ -127,6 +159,11 @@ pub fn run(pipeline: Pipeline) -> ExitCode {
     };
     let cx = Cx::new(cwd);
 
+    if let Err(err) = validate_host_handshake() {
+        eprintln!("gnr8: {err}");
+        return ExitCode::FAILURE;
+    }
+
     let result = match mode {
         Mode::Emit => emit(&pipeline, &cx),
         Mode::Inspect => inspect(&pipeline, &cx),
@@ -141,6 +178,54 @@ pub fn run(pipeline: Pipeline) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn host_cli_version() -> String {
+    std::env::var(HOST_VERSION_ENV).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Validate host-provided protocol values before source extraction or target generation begins.
+fn validate_host_handshake() -> Result<(), CoreError> {
+    let protocol = std::env::var(HOST_PROTOCOL_ENV).ok();
+    let version = std::env::var(HOST_VERSION_ENV).ok();
+    let fingerprint = std::env::var(HOST_CAPABILITY_ENV).ok();
+    if protocol.is_none() && version.is_none() && fingerprint.is_none() {
+        // Direct child invocation remains useful for local development and runner unit tests.
+        return Ok(());
+    }
+    let (Some(protocol), Some(version), Some(fingerprint)) = (protocol, version, fingerprint)
+    else {
+        return Err(CoreError::Protocol {
+            message: "the host supplied an incomplete compatibility handshake".to_string(),
+        });
+    };
+    let parsed = protocol.parse::<u32>().map_err(|_| CoreError::Protocol {
+        message: format!("host protocol version {protocol:?} is not an integer"),
+    })?;
+    if parsed != PROTOCOL_VERSION {
+        return Err(CoreError::Protocol {
+            message: format!(
+                "host protocol {parsed} does not match child protocol {PROTOCOL_VERSION}; align the gnr8 CLI and .gnr8/Cargo.lock"
+            ),
+        });
+    }
+    let child_version = env!("CARGO_PKG_VERSION");
+    if version != child_version {
+        return Err(CoreError::Protocol {
+            message: format!(
+                "host CLI {version} does not match child gnr8-core {child_version}; align the installed CLI and .gnr8/Cargo.lock"
+            ),
+        });
+    }
+    let expected = capability_fingerprint();
+    if fingerprint != expected {
+        return Err(CoreError::Protocol {
+            message: format!(
+                "host capability fingerprint {fingerprint} does not match child fingerprint {expected}; rebuild both sides at one exact version"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Run the full pipeline and serialize the [`ArtifactBundle`] as compact JSON.
@@ -199,8 +284,8 @@ mod tests {
     // so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{emit, inspect, ArtifactBundle, BUNDLE_VERSION};
-    use crate::graph::ApiGraph;
+    use super::{capability_fingerprint, emit, inspect, ArtifactBundle, PROTOCOL_VERSION};
+    use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
     use crate::sdk::{Cx, Pipeline, Source};
     use crate::CoreError;
 
@@ -210,12 +295,17 @@ mod tests {
         fn load(&self, _cx: &Cx) -> Result<ApiGraph, CoreError> {
             Ok(ApiGraph {
                 title: "Stub API".to_string(),
-                diagnostics: vec![crate::graph::Diagnostic {
-                    severity: "WARN".to_string(),
-                    message: "stub diagnostic".to_string(),
-                    file: "x.go".to_string(),
-                    line: 1,
-                }],
+                diagnostics: vec![Diagnostic::new(
+                    "source.stub",
+                    DiagnosticCategory::Source,
+                    "WARN",
+                    "stub diagnostic",
+                    SourceSpan {
+                        file: "x.go".to_string(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                )],
                 ..ApiGraph::default()
             })
         }
@@ -230,7 +320,10 @@ mod tests {
         // A pipeline with no targets still emits a valid (empty-artifacts) bundle carrying diagnostics.
         let json = emit(&Pipeline::new().source(StubSource), &cx()).unwrap();
         let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
-        assert_eq!(bundle.version, BUNDLE_VERSION);
+        assert_eq!(bundle.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(bundle.cli_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(bundle.core_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(bundle.capability_fingerprint, capability_fingerprint());
         assert!(bundle.artifacts.is_empty());
         assert_eq!(bundle.diagnostics.len(), 1);
         assert_eq!(bundle.diagnostics[0].message, "stub diagnostic");

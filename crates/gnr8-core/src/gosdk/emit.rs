@@ -185,14 +185,10 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
                     .to_string(),
             });
         }
-        // An inline enum is likewise only emitted as a named newtype; an inline one is unsupported.
-        Type::Enum(_) => {
-            return Err(CoreError::SdkGen {
-                message: "inline enum type is unsupported by the Go SDK target \
-                          (expected a named $ref)"
-                    .to_string(),
-            });
-        }
+        // Request parameters can carry an inline closed string set. Go has no anonymous enum type,
+        // so its faithful wire carrier is string; named enum schemas still use their generated
+        // newtype through the `Type::Named` arm above.
+        Type::Enum(_) => "string".to_string(),
         // Go has no sum types: a union is a target capability gap, surfaced as an EXPLICIT typed error
         // arm (T-03), never a silent catch-all. (The Go fixture exercises no unions.)
         Type::Union(_) => {
@@ -1450,6 +1446,7 @@ pub(crate) fn emit_compat_client_surface(
             "net/url",
             "path/filepath",
             "reflect",
+            "sort",
             "strings",
         ],
         &body,
@@ -1716,6 +1713,99 @@ return parts[0], omitempty
 return field.Name, omitempty
 }}
 
+type compatParameterPair struct {{
+Name string
+Value string
+}}
+
+func compatParameterPairs(name string, input any, style string, explode bool) []compatParameterPair {{
+value := reflect.ValueOf(input)
+for value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) {{
+if value.IsNil() {{
+return nil
+}}
+value = value.Elem()
+}}
+if !value.IsValid() {{
+return nil
+}}
+delimiter := \",\"
+if style == \"spaceDelimited\" {{
+delimiter = \" \"
+}} else if style == \"pipeDelimited\" {{
+delimiter = \"|\"
+}}
+switch value.Kind() {{
+case reflect.Slice, reflect.Array:
+parts := make([]string, 0, value.Len())
+for index := 0; index < value.Len(); index++ {{
+parts = append(parts, compatQueryValue(value.Index(index).Interface()))
+}}
+if explode && style == \"form\" {{
+pairs := make([]compatParameterPair, 0, len(parts))
+for _, part := range parts {{
+pairs = append(pairs, compatParameterPair{{Name: name, Value: part}})
+}}
+return pairs
+}}
+return []compatParameterPair{{{{Name: name, Value: strings.Join(parts, delimiter)}}}}
+case reflect.Map:
+keys := value.MapKeys()
+sort.Slice(keys, func(i, j int) bool {{
+return fmt.Sprint(keys[i].Interface()) < fmt.Sprint(keys[j].Interface())
+}})
+pairs := make([]compatParameterPair, 0, len(keys))
+parts := make([]string, 0, len(keys)*2)
+for _, keyValue := range keys {{
+key := fmt.Sprint(keyValue.Interface())
+item := compatQueryValue(value.MapIndex(keyValue).Interface())
+if style == \"deepObject\" {{
+pairs = append(pairs, compatParameterPair{{Name: name + \"[\" + key + \"]\", Value: item}})
+}} else if explode && style == \"form\" {{
+pairs = append(pairs, compatParameterPair{{Name: key, Value: item}})
+}} else if explode {{
+parts = append(parts, key+\"=\"+item)
+}} else {{
+parts = append(parts, key, item)
+}}
+}}
+if len(pairs) > 0 {{
+return pairs
+}}
+return []compatParameterPair{{{{Name: name, Value: strings.Join(parts, delimiter)}}}}
+default:
+return []compatParameterPair{{{{Name: name, Value: compatQueryValue(input)}}}}
+}}
+}}
+
+func compatEncodeQuery(values url.Values, allowReserved map[string]map[int]bool) string {{
+keys := make([]string, 0, len(values))
+for key := range values {{
+keys = append(keys, key)
+}}
+sort.Strings(keys)
+parts := make([]string, 0)
+for _, key := range keys {{
+for index, value := range values[key] {{
+encoded := strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
+if allowReserved[key][index] {{
+encoded = strings.NewReplacer(
+\"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
+\"%40\", \"@\", \"%21\", \"!\", \"%24\", \"$\", \"%26\", \"&\", \"%27\", \"'\", \"%28\", \"(\",
+\"%29\", \")\", \"%2A\", \"*\", \"%2B\", \"+\", \"%2C\", \",\", \"%3B\", \";\", \"%3D\", \"=\",
+).Replace(encoded)
+}}
+encodedKey := strings.ReplaceAll(url.QueryEscape(key), \"+\", \"%20\")
+parts = append(parts, encodedKey+\"=\"+encoded)
+}}
+}}
+return strings.Join(parts, \"&\")
+}}
+
+func compatCookieEscape(value string) string {{
+return strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
+}}
+
 func compatDefaultAuthHeader() string {{
 return {}
 }}
@@ -1754,23 +1844,32 @@ params.Set(key, compatQueryValue(value))
 }}
 }}
 
-func compatApplyAPIKey(req *http.Request, ctx context.Context, scheme string, header string) {{
-if req.Header.Get(header) != \"\" || ctx == nil {{
-return
+func compatAPIKeyValue(ctx context.Context, scheme string, name string) string {{
+if ctx == nil {{
+return \"\"
 }}
 values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
 apiKey, ok := values[scheme]
 if !ok {{
-apiKey, ok = values[header]
+apiKey, ok = values[name]
 }}
 if !ok || apiKey.Key == \"\" {{
-return
+return \"\"
 }}
 value := apiKey.Key
 if apiKey.Prefix != \"\" {{
 value = apiKey.Prefix + \" \" + value
 }}
+return value
+}}
+
+func compatApplyAPIKey(req *http.Request, ctx context.Context, scheme string, header string) {{
+if req.Header.Get(header) != \"\" {{
+return
+}}
+if value := compatAPIKeyValue(ctx, scheme, header); value != \"\" {{
 req.Header.Set(header, value)
+}}
 }}
 ",
         quoted_string_literal(default_auth_header)
@@ -1897,6 +1996,18 @@ fn emit_compat_request(
     });
     let query_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location == "query").collect();
+    let header_params: Vec<&crate::graph::Param> = op
+        .params
+        .iter()
+        .filter(|p| p.location == "header")
+        .collect();
+    let cookie_params: Vec<&crate::graph::Param> = op
+        .params
+        .iter()
+        .filter(|p| p.location == "cookie")
+        .collect();
+    let request_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location != "path").collect();
     let body_model = request_body_model_of(op, graph)?;
     let multipart_fields =
         compat_multipart_fields(body_model.as_ref().map(|body| body.model.as_str()), graph)?;
@@ -1972,7 +2083,7 @@ fn emit_compat_request(
         )
         .map_err(sink)?;
     }
-    for param in &query_params {
+    for param in &request_params {
         writeln!(
             body,
             "{} *{}",
@@ -2008,16 +2119,17 @@ fn emit_compat_request(
             emit_compat_body_setter(body, &request_name, &setter)?;
         }
     }
-    for param in &query_params {
+    for param in &request_params {
         let setter = compat_exported(&param.name);
         for setter in compat_method_names(&setter) {
             if compat_request_reserved_method(&setter) || !emitted_methods.insert(setter.clone()) {
                 continue;
             }
-            if options
-                .sdk
-                .query_setter_argument_policy
-                .is_any_for(&request_name, &setter)
+            if param.location == "query"
+                && options
+                    .sdk
+                    .query_setter_argument_policy
+                    .is_any_for(&request_name, &setter)
             {
                 emit_compat_extra_query_setter(body, &request_name, &setter, &param.name, "any")?;
             } else {
@@ -2145,6 +2257,8 @@ fn emit_compat_request(
         &return_model,
         &path_params,
         &query_params,
+        &header_params,
+        &cookie_params,
     )?;
     writeln!(body, "}}").map_err(sink)?;
 
@@ -2336,6 +2450,8 @@ fn emit_compat_execute_body(
     return_model: &str,
     path_params: &[&crate::graph::Param],
     query_params: &[&crate::graph::Param],
+    header_params: &[&crate::graph::Param],
+    cookie_params: &[&crate::graph::Param],
 ) -> Result<(), CoreError> {
     let returns_value = return_model != "struct{}";
     let returns_slice = return_model.starts_with("[]");
@@ -2430,7 +2546,7 @@ fn emit_compat_execute_body(
     }
 
     emit_compat_request_url(body, op, base_path, path_params, returns_value)?;
-    emit_compat_query(body, query_params, include_extra_query)?;
+    emit_compat_query(body, op, graph, query_params, include_extra_query)?;
     writeln!(
         body,
         "req, err := http.NewRequestWithContext(r.ctx, {}, parsedURL.String(), reqBody)",
@@ -2456,6 +2572,7 @@ fn emit_compat_execute_body(
     .map_err(sink)?;
     writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    emit_compat_header_cookie_params(body, header_params, cookie_params)?;
     if has_extra_header {
         writeln!(body, "for key, value := range r.extraHeader {{").map_err(sink)?;
         writeln!(body, "req.Header.Set(key, value)").map_err(sink)?;
@@ -2618,31 +2735,114 @@ fn emit_compat_request_url(
 
 fn emit_compat_query(
     body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
     query_params: &[&crate::graph::Param],
     include_extra_query: bool,
 ) -> Result<(), CoreError> {
-    if !query_params.is_empty() {
-        writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
-        for param in query_params {
-            let field = lower_camel(&param.name);
-            writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+    let query_api_keys: Vec<_> = operation_api_key_schemes(graph, op)?
+        .into_iter()
+        .filter(|scheme| scheme.location == ApiKeyLocation::Query)
+        .collect();
+    if query_params.is_empty() && !include_extra_query && query_api_keys.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
+    let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
+    if has_allow_reserved {
+        writeln!(body, "compatAllowReserved := map[string]map[int]bool{{}}").map_err(sink)?;
+    }
+    for param in query_params {
+        let field = lower_camel(&param.name);
+        writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+        writeln!(
+            body,
+            "for _, pair := range compatParameterPairs({}, *r.{field}, {}, {}) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(parameter_style(param)),
+            parameter_explode(param)
+        )
+        .map_err(sink)?;
+        writeln!(body, "q.Add(pair.Name, pair.Value)").map_err(sink)?;
+        if param.allow_reserved {
+            writeln!(body, "if compatAllowReserved[pair.Name] == nil {{").map_err(sink)?;
+            writeln!(body, "compatAllowReserved[pair.Name] = map[int]bool{{}}").map_err(sink)?;
+            writeln!(body, "}}").map_err(sink)?;
             writeln!(
                 body,
-                "compatSetQueryValue(q, {}, *r.{field})",
-                quoted_string_literal(&param.name)
+                "compatAllowReserved[pair.Name][len(q[pair.Name])-1] = true"
             )
             .map_err(sink)?;
-            writeln!(body, "}}").map_err(sink)?;
         }
-        writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
     }
     if include_extra_query {
-        writeln!(body, "if len(r.extraQuery) > 0 {{").map_err(sink)?;
-        writeln!(body, "q := parsedURL.Query()").map_err(sink)?;
         writeln!(body, "for key, value := range r.extraQuery {{").map_err(sink)?;
         writeln!(body, "compatSetQueryValue(q, key, value)").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
+    }
+    for scheme in query_api_keys {
+        writeln!(
+            body,
+            "if key := compatAPIKeyValue(r.ctx, {}, {}); key != \"\" {{",
+            quoted_string_literal(&scheme.id),
+            quoted_string_literal(&scheme.name)
+        )
+        .map_err(sink)?;
+        writeln!(body, "q.Set({}, key)", quoted_string_literal(&scheme.name)).map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    if has_allow_reserved {
+        writeln!(
+            body,
+            "parsedURL.RawQuery = compatEncodeQuery(q, compatAllowReserved)"
+        )
+        .map_err(sink)?;
+    } else {
         writeln!(body, "parsedURL.RawQuery = q.Encode()").map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_compat_header_cookie_params(
+    body: &mut String,
+    header_params: &[&crate::graph::Param],
+    cookie_params: &[&crate::graph::Param],
+) -> Result<(), CoreError> {
+    for param in header_params {
+        let field = lower_camel(&param.name);
+        writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+        writeln!(
+            body,
+            "for _, pair := range compatParameterPairs({}, *r.{field}, {}, {}) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(parameter_style(param)),
+            parameter_explode(param)
+        )
+        .map_err(sink)?;
+        writeln!(body, "req.Header.Add(pair.Name, pair.Value)").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    for param in cookie_params {
+        let field = lower_camel(&param.name);
+        writeln!(body, "if r.{field} != nil {{").map_err(sink)?;
+        writeln!(
+            body,
+            "for _, pair := range compatParameterPairs({}, *r.{field}, {}, {}) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(parameter_style(param)),
+            parameter_explode(param)
+        )
+        .map_err(sink)?;
+        writeln!(
+            body,
+            "req.AddCookie(&http.Cookie{{Name: compatCookieEscape(pair.Name), Value: compatCookieEscape(pair.Value)}})"
+        )
+        .map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
     Ok(())
@@ -3136,6 +3336,10 @@ fn emit_operations_inner(
         emit_pagination_helpers(&mut body, op, graph)?;
     }
     emit_request_body_helpers(&mut body, &body_encodings)?;
+    let needs_wire_helpers = ops.iter().any(|op| operation_needs_wire_helpers(op));
+    if needs_wire_helpers {
+        emit_wire_parameter_helpers(&mut body);
+    }
     // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
     // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
     // need strconv/time. This stays correct when split layout emits one operation per file.
@@ -3191,6 +3395,9 @@ fn emit_operations_inner(
         imports.push("io");
     }
     imports.extend(query_imports(ops, graph)?);
+    if needs_wire_helpers {
+        imports.extend(["fmt", "net/url", "reflect", "sort", "strings", "time"]);
+    }
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
     if ops
         .iter()
@@ -3302,12 +3509,27 @@ fn emit_operation(
         .filter(|p| p.location == "path")
         .map(|p| p.name.as_str())
         .collect();
-    let query_params: Vec<&crate::graph::Param> =
-        op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location != "path").collect();
+    let query_params: Vec<&crate::graph::Param> = request_params
+        .iter()
+        .copied()
+        .filter(|p| p.location == "query")
+        .collect();
+    let header_params: Vec<&crate::graph::Param> = request_params
+        .iter()
+        .copied()
+        .filter(|p| p.location == "header")
+        .collect();
+    let cookie_params: Vec<&crate::graph::Param> = request_params
+        .iter()
+        .copied()
+        .filter(|p| p.location == "cookie")
+        .collect();
 
     // A params struct is emitted (and taken as an arg) only when the op has query params.
-    if !query_params.is_empty() {
-        emit_params_struct(body, &method_name, &query_params, graph)?;
+    if !request_params.is_empty() {
+        emit_params_struct(body, &method_name, &request_params, graph)?;
         writeln!(body).map_err(sink)?;
     }
 
@@ -3332,7 +3554,7 @@ fn emit_operation(
     for p in &path_params {
         args.push(format!("{} string", lower_camel(p)));
     }
-    if !query_params.is_empty() {
+    if !request_params.is_empty() {
         args.push(format!("params {method_name}Params"));
     }
     if let Some(body_model) = &body_model {
@@ -3369,6 +3591,8 @@ fn emit_operation(
         base_path,
         &path_params,
         &query_params,
+        &header_params,
+        &cookie_params,
         &success,
         &auth_headers,
         &auth_queries,
@@ -3615,8 +3839,8 @@ fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs
         .filter(|p| p.location == "path")
         .map(|p| p.name.as_str())
         .collect();
-    let query_params: Vec<&crate::graph::Param> =
-        op.params.iter().filter(|p| p.location == "query").collect();
+    let request_params: Vec<&crate::graph::Param> =
+        op.params.iter().filter(|p| p.location != "path").collect();
     let body_model = request_body_model_of(op, graph)?;
 
     let mut args = vec!["ctx context.Context".to_string()];
@@ -3626,7 +3850,7 @@ fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs
         args.push(format!("{ident} string"));
         call_args.push(ident);
     }
-    if !query_params.is_empty() {
+    if !request_params.is_empty() {
         args.push(format!("params {method_name}Params"));
         call_args.push("params".to_string());
     }
@@ -3855,6 +4079,8 @@ fn emit_request_dispatch(
     base_path: &str,
     path_params: &[&str],
     query_params: &[&crate::graph::Param],
+    header_params: &[&crate::graph::Param],
+    cookie_params: &[&crate::graph::Param],
     success: &SuccessResponses,
     auth_headers: &[String],
     auth_queries: &[String],
@@ -3910,6 +4136,10 @@ fn emit_request_dispatch(
     // Query parameter encoding.
     if !query_params.is_empty() || !auth_queries.is_empty() {
         writeln!(body, "q := req.URL.Query()").map_err(sink)?;
+        let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
+        if has_allow_reserved {
+            writeln!(body, "wireAllowReserved := map[string]map[int]bool{{}}").map_err(sink)?;
+        }
         for p in query_params {
             let field = exported(&p.name);
             // WR-02: `url.Values.Set` takes a string, so a non-string typed query field is coerced to
@@ -3917,13 +4147,47 @@ fn emit_request_dispatch(
             // all-string fixture byte-identical). The required path reads the value directly; the
             // optional path dereferences the pointer inside the nil-guard.
             let value_ty = go_type(&p.schema, false, graph)?;
-            if p.required {
-                let expr = query_string_expr(&value_ty, &format!("params.{field}"))?;
-                writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
+            let accessor = if p.required {
+                format!("params.{field}")
             } else {
                 writeln!(body, "if params.{field} != nil {{").map_err(sink)?;
-                let expr = query_string_expr(&value_ty, &format!("*params.{field}"))?;
+                format!("*params.{field}")
+            };
+            if parameter_needs_pair_helper(p) {
+                writeln!(
+                    body,
+                    "for _, pair := range wireParameterPairs({}, {accessor}, {}, {}) {{",
+                    quoted_string_literal(&p.name),
+                    quoted_string_literal(parameter_style(p)),
+                    parameter_explode(p)
+                )
+                .map_err(sink)?;
+                writeln!(body, "q.Add(pair.Name, pair.Value)").map_err(sink)?;
+                if p.allow_reserved {
+                    writeln!(body, "if wireAllowReserved[pair.Name] == nil {{").map_err(sink)?;
+                    writeln!(body, "wireAllowReserved[pair.Name] = map[int]bool{{}}")
+                        .map_err(sink)?;
+                    writeln!(body, "}}").map_err(sink)?;
+                    writeln!(
+                        body,
+                        "wireAllowReserved[pair.Name][len(q[pair.Name])-1] = true"
+                    )
+                    .map_err(sink)?;
+                }
+                writeln!(body, "}}").map_err(sink)?;
+            } else {
+                let expr = query_string_expr(&value_ty, &accessor)?;
                 writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
+                if p.allow_reserved {
+                    writeln!(
+                        body,
+                        "wireAllowReserved[{}] = map[int]bool{{0: true}}",
+                        quoted_string_literal(&p.name)
+                    )
+                    .map_err(sink)?;
+                }
+            }
+            if !p.required {
                 writeln!(body, "}}").map_err(sink)?;
             }
         }
@@ -3939,8 +4203,18 @@ fn emit_request_dispatch(
             writeln!(body, "q.Set({}, c.apiKey)", quoted_string_literal(query)).map_err(sink)?;
             writeln!(body, "}}").map_err(sink)?;
         }
-        writeln!(body, "req.URL.RawQuery = q.Encode()").map_err(sink)?;
+        if has_allow_reserved {
+            writeln!(
+                body,
+                "req.URL.RawQuery = encodeWireQuery(q, wireAllowReserved)"
+            )
+            .map_err(sink)?;
+        } else {
+            writeln!(body, "req.URL.RawQuery = q.Encode()").map_err(sink)?;
+        }
     }
+
+    emit_header_and_cookie_params(body, header_params, cookie_params, graph)?;
 
     // Auth headers.
     for header in auth_headers {
@@ -4178,7 +4452,7 @@ fn query_extra_import(value_ty: &str) -> Option<&'static str> {
 fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static str>, CoreError> {
     let mut extra: BTreeSet<&'static str> = BTreeSet::new();
     for op in ops {
-        for p in op.params.iter().filter(|p| p.location == "query") {
+        for p in op.params.iter().filter(|p| p.location != "path") {
             let value_ty = go_type(&p.schema, false, graph)?;
             if let Some(imp) = query_extra_import(&value_ty) {
                 extra.insert(imp);
@@ -4186,6 +4460,214 @@ fn query_imports(ops: &[&Operation], graph: &ApiGraph) -> Result<Vec<&'static st
         }
     }
     Ok(extra.into_iter().collect())
+}
+
+fn parameter_style(param: &crate::graph::Param) -> &str {
+    param
+        .style
+        .as_deref()
+        .unwrap_or(match param.location.as_str() {
+            "header" => "simple",
+            _ => "form",
+        })
+}
+
+fn parameter_explode(param: &crate::graph::Param) -> bool {
+    param
+        .explode
+        .unwrap_or_else(|| parameter_style(param) == "form")
+}
+
+fn parameter_needs_pair_helper(param: &crate::graph::Param) -> bool {
+    matches!(
+        param.schema,
+        Type::Array(_) | Type::Map { .. } | Type::Any {} | Type::Primitive(Prim::Bytes)
+    )
+}
+
+fn operation_needs_wire_helpers(op: &Operation) -> bool {
+    op.params.iter().any(|param| {
+        param.allow_reserved || parameter_needs_pair_helper(param) || param.location == "cookie"
+    })
+}
+
+fn emit_header_and_cookie_params(
+    body: &mut String,
+    header_params: &[&crate::graph::Param],
+    cookie_params: &[&crate::graph::Param],
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    for param in header_params {
+        emit_non_query_parameter(body, param, graph, "header")?;
+    }
+    for param in cookie_params {
+        emit_non_query_parameter(body, param, graph, "cookie")?;
+    }
+    Ok(())
+}
+
+fn emit_non_query_parameter(
+    body: &mut String,
+    param: &crate::graph::Param,
+    graph: &ApiGraph,
+    location: &str,
+) -> Result<(), CoreError> {
+    let field = exported(&param.name);
+    let accessor = if param.required {
+        format!("params.{field}")
+    } else {
+        writeln!(body, "if params.{field} != nil {{").map_err(sink)?;
+        format!("*params.{field}")
+    };
+    if parameter_needs_pair_helper(param) {
+        writeln!(
+            body,
+            "for _, pair := range wireParameterPairs({}, {accessor}, {}, {}) {{",
+            quoted_string_literal(&param.name),
+            quoted_string_literal(parameter_style(param)),
+            parameter_explode(param)
+        )
+        .map_err(sink)?;
+        if location == "header" {
+            writeln!(body, "req.Header.Add(pair.Name, pair.Value)").map_err(sink)?;
+        } else {
+            writeln!(
+                body,
+                "req.AddCookie(&http.Cookie{{Name: wireCookieEscape(pair.Name), Value: wireCookieEscape(pair.Value)}})"
+            )
+            .map_err(sink)?;
+        }
+        writeln!(body, "}}").map_err(sink)?;
+    } else {
+        let value_type = go_type(&param.schema, false, graph)?;
+        let value = query_string_expr(&value_type, &accessor)?;
+        if location == "header" {
+            writeln!(
+                body,
+                "req.Header.Set({}, {value})",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(sink)?;
+        } else {
+            writeln!(
+                body,
+                "req.AddCookie(&http.Cookie{{Name: wireCookieEscape({}), Value: wireCookieEscape({value})}})",
+                quoted_string_literal(&param.name)
+            )
+            .map_err(sink)?;
+        }
+    }
+    if !param.required {
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    Ok(())
+}
+
+fn emit_wire_parameter_helpers(body: &mut String) {
+    body.push_str(
+        r##"
+
+type wireParameterPair struct {
+Name string
+Value string
+}
+
+func wireParameterPairs(name string, input any, style string, explode bool) []wireParameterPair {
+value := reflect.ValueOf(input)
+for value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) {
+if value.IsNil() {
+return nil
+}
+value = value.Elem()
+}
+if !value.IsValid() {
+return nil
+}
+delimiter := ","
+if style == "spaceDelimited" {
+delimiter = " "
+} else if style == "pipeDelimited" {
+delimiter = "|"
+}
+switch value.Kind() {
+case reflect.Slice, reflect.Array:
+parts := make([]string, 0, value.Len())
+for index := 0; index < value.Len(); index++ {
+parts = append(parts, wireParameterScalar(value.Index(index).Interface()))
+}
+if explode && style == "form" {
+pairs := make([]wireParameterPair, 0, len(parts))
+for _, part := range parts {
+pairs = append(pairs, wireParameterPair{Name: name, Value: part})
+}
+return pairs
+}
+return []wireParameterPair{{Name: name, Value: strings.Join(parts, delimiter)}}
+case reflect.Map:
+keys := value.MapKeys()
+sort.Slice(keys, func(i, j int) bool {
+return fmt.Sprint(keys[i].Interface()) < fmt.Sprint(keys[j].Interface())
+})
+pairs := make([]wireParameterPair, 0, len(keys))
+parts := make([]string, 0, len(keys)*2)
+for _, keyValue := range keys {
+key := fmt.Sprint(keyValue.Interface())
+item := wireParameterScalar(value.MapIndex(keyValue).Interface())
+if style == "deepObject" {
+pairs = append(pairs, wireParameterPair{Name: name + "[" + key + "]", Value: item})
+} else if explode && style == "form" {
+pairs = append(pairs, wireParameterPair{Name: key, Value: item})
+} else if explode {
+parts = append(parts, key+"="+item)
+} else {
+parts = append(parts, key, item)
+}
+}
+if len(pairs) > 0 {
+return pairs
+}
+return []wireParameterPair{{Name: name, Value: strings.Join(parts, delimiter)}}
+default:
+return []wireParameterPair{{Name: name, Value: wireParameterScalar(input)}}
+}
+}
+
+func wireParameterScalar(value any) string {
+if instant, ok := value.(time.Time); ok {
+return instant.Format(time.RFC3339)
+}
+return fmt.Sprint(value)
+}
+
+func encodeWireQuery(values url.Values, allowReserved map[string]map[int]bool) string {
+keys := make([]string, 0, len(values))
+for key := range values {
+keys = append(keys, key)
+}
+sort.Strings(keys)
+parts := make([]string, 0)
+for _, key := range keys {
+for index, value := range values[key] {
+encoded := strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+if allowReserved[key][index] {
+encoded = strings.NewReplacer(
+"%3A", ":", "%2F", "/", "%3F", "?", "%23", "#", "%5B", "[", "%5D", "]",
+"%40", "@", "%21", "!", "%24", "$", "%26", "&", "%27", "'", "%28", "(",
+"%29", ")", "%2A", "*", "%2B", "+", "%2C", ",", "%3B", ";", "%3D", "=",
+).Replace(encoded)
+}
+encodedKey := strings.ReplaceAll(url.QueryEscape(key), "+", "%20")
+parts = append(parts, encodedKey+"="+encoded)
+}
+}
+return strings.Join(parts, "&")
+}
+
+func wireCookieEscape(value string) string {
+return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+}
+"##,
+    );
 }
 
 fn request_body_encodings(

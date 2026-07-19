@@ -139,7 +139,7 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 	for obj := range rawGroups {
 		raw := rawGroups[obj]
 		if diags != nil && !raw.static {
-			diags.Warn("unsupported Gin route pattern: dynamic Gin group prefix; prefix skipped rather than guessed (GO-04)", raw.span.File, raw.span.StartLine)
+			diags.SourceRouteUnresolved("unsupported Gin route pattern: dynamic Gin group prefix; prefix skipped rather than guessed (GO-04)", raw.span.File, raw.span.StartLine)
 		}
 		g := groupOf(groups, obj)
 		g.prefix = resolveGroupPrefix(obj, rawGroups, map[gotypes.Object]bool{})
@@ -192,7 +192,7 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 				secured = secured || g.secured
 			} else if prefix == "" && receiverIsGinRouterGroup(info, call) && diags != nil {
 				span := spanOf(fset, call.Pos(), call.End())
-				diags.Warn("unsupported Gin route pattern: route registered on router group parameter; prefix cannot be inferred across helper calls, so the route is emitted relative (GO-04)", span.File, span.StartLine)
+				diags.SourceRouteUnresolved("unsupported Gin route pattern: route registered on router group parameter; prefix cannot be inferred across helper calls, so the route is emitted relative (GO-04)", span.File, span.StartLine)
 			}
 		}
 

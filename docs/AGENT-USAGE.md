@@ -3,6 +3,9 @@
 This guide is for coding agents using gnr8 inside an application repository. It is not contributor
 guidance for the gnr8 repository.
 
+For task-scoped reference pages covering every command, source, transform, target, compatibility
+gate, diagnostic, and CI behavior, start at the [agent documentation index](agents/index.md).
+
 ## What gnr8 Does
 
 gnr8 reads service source code, builds an API graph, and generates OpenAPI 3.1 plus typed client SDKs.

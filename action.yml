@@ -15,9 +15,9 @@ inputs:
     required: false
     default: "release"
   version:
-    description: Release tag to install when install-method is "release". Use "latest" for the latest release.
+    description: Exact release version to install, or "lock" to resolve gnr8 from .gnr8/Cargo.lock.
     required: false
-    default: "latest"
+    default: "lock"
   extra-args:
     description: Extra arguments passed to `gnr8 check`.
     required: false
@@ -74,6 +74,70 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate gnr8 action inputs
+      shell: bash
+      env:
+        CACHE_ENABLED: ${{ inputs.cache }}
+        INPUT_BINARY: ${{ inputs.gnr8-binary }}
+        INSTALL_METHOD: ${{ inputs.install-method }}
+        REQUESTED_VERSION: ${{ inputs.version }}
+        SETUP_GO: ${{ inputs.setup-go }}
+        SETUP_NODE: ${{ inputs.setup-node }}
+        SETUP_PYTHON: ${{ inputs.setup-python }}
+        SETUP_RUST: ${{ inputs.setup-rust }}
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+      run: |
+        set -euo pipefail
+        validate_boolean() {
+          local name="$1"
+          local value="$2"
+          if [[ "$value" != "true" && "$value" != "false" ]]; then
+            echo "gnr8 action: $name must be \"true\" or \"false\" (found \"$value\")" >&2
+            exit 2
+          fi
+        }
+
+        validate_boolean cache "$CACHE_ENABLED"
+        validate_boolean setup-go "$SETUP_GO"
+        validate_boolean setup-node "$SETUP_NODE"
+        validate_boolean setup-python "$SETUP_PYTHON"
+        validate_boolean setup-rust "$SETUP_RUST"
+
+        if [[ -z "$INPUT_BINARY" ]]; then
+          case "$INSTALL_METHOD" in
+            release | source | path) ;;
+            *)
+              echo "gnr8 action: install-method must be release, source, or path (found \"$INSTALL_METHOD\")" >&2
+              exit 2
+              ;;
+          esac
+        fi
+        if [[ -z "$INPUT_BINARY" && "$INSTALL_METHOD" == "release" \
+          && ( -z "$REQUESTED_VERSION" || "$REQUESTED_VERSION" == "latest" ) ]]; then
+          echo 'gnr8 action: version must be an exact release or "lock"; "latest" is not allowed for checks' >&2
+          exit 2
+        fi
+
+        directory_count=0
+        while IFS= read -r dir || [[ -n "$dir" ]]; do
+          dir="${dir#"${dir%%[![:space:]]*}"}"
+          dir="${dir%"${dir##*[![:space:]]}"}"
+          [[ -z "$dir" || "$dir" == \#* ]] && continue
+          directory_count=$((directory_count + 1))
+          if [[ ! -d "$dir" ]]; then
+            echo "gnr8 action: working directory does not exist: $dir" >&2
+            exit 2
+          fi
+          if [[ ! -f "$dir/.gnr8/Cargo.toml" ]]; then
+            echo "gnr8 action: missing $dir/.gnr8/Cargo.toml" >&2
+            exit 2
+          fi
+        done <<< "$WORKING_DIRECTORIES"
+        if [[ "$directory_count" -eq 0 ]]; then
+          echo "gnr8 action: no working directories configured" >&2
+          exit 2
+        fi
+
     - name: Set up Rust
       if: ${{ inputs.setup-rust == 'true' }}
       uses: dtolnay/rust-toolchain@stable
@@ -140,11 +204,22 @@ runs:
           ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-
           ${{ inputs.cache-key-prefix }}-${{ runner.os }}-
 
+    - name: Resolve exact gnr8 release version
+      id: version
+      if: ${{ inputs.gnr8-binary == '' && inputs.install-method == 'release' }}
+      shell: bash
+      env:
+        REQUESTED_VERSION: ${{ inputs.version }}
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+      run: |
+        set -euo pipefail
+        "$GITHUB_ACTION_PATH/scripts/resolve-action-version.sh"
+
     - name: Install gnr8 release
       if: ${{ inputs.gnr8-binary == '' && inputs.install-method == 'release' }}
       shell: bash
       env:
-        GNR8_RELEASE_TAG: ${{ inputs.version }}
+        GNR8_RELEASE_TAG: ${{ steps.version.outputs.tag }}
         GNR8_BIN_DIR: ${{ runner.temp }}/gnr8-bin
       run: |
         set -euo pipefail
@@ -176,7 +251,10 @@ runs:
         fi
 
         if [[ "$INSTALL_METHOD" == "path" && -z "$INPUT_BINARY" ]]; then
-          bin="$(command -v gnr8)"
+          if ! bin="$(command -v gnr8)"; then
+            echo "gnr8 action: install-method path requires an executable gnr8 on PATH" >&2
+            exit 2
+          fi
         fi
 
         if [[ ! -x "$bin" ]]; then

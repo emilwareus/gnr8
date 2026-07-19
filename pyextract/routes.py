@@ -34,6 +34,19 @@ _FLASK_CTORS = frozenset({"Flask", "Blueprint"})
 _BODYLESS_METHODS = frozenset({"GET", "HEAD", "DELETE"})
 
 
+class _ContextDiags:
+    """Attach operation-aware defaults to diagnostics emitted by shared type mapping."""
+
+    def __init__(self, diags, **defaults):
+        self._diags = diags
+        self._defaults = defaults
+
+    def warn(self, message, file, line, **options):
+        merged = dict(options)
+        merged.update(self._defaults)
+        self._diags.warn(message, file, line, **merged)
+
+
 def _span(abs_path, node):
     line = getattr(node, "lineno", 0)
     return {"file": abs_path, "start_line": line, "end_line": line}
@@ -268,6 +281,20 @@ def _has_default(args, index):
     return index >= total - num_defaults
 
 
+def _warn_untyped_param(arg, path, method, abs_path, diags):
+    """Record a handler parameter whose role/type cannot be derived statically."""
+    diags.warn(
+        "untyped handler parameter '{}' on {} {} is omitted; parameter location "
+        "and schema cannot be inferred (no fallback)".format(arg.arg, method, path),
+        abs_path,
+        getattr(arg, "lineno", 0),
+        code="request.parameter.unresolved",
+        category="request_parameter",
+        operation="{} {}".format(method, path),
+        subject=arg.arg,
+    )
+
+
 def _positional_default(args, index):
     """Return the default AST node for a positional argument, or ``None``."""
     total = len(_positional_args(args))
@@ -363,6 +390,7 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     for index, arg in enumerate(pos):
         annotation = arg.annotation
         if annotation is None:
+            _warn_untyped_param(arg, path, method, abs_path, diags)
             continue
         if _is_dependency_parameter(
             annotation, _positional_default(func.args, index)
@@ -373,11 +401,42 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         if body_ref is not None and arg.arg not in path_names:
             if allows_body and request_body is None:
                 request_body = {"ref_id": body_ref}
+            elif allows_body:
+                diags.warn(
+                    "handler has more than one typed request body; only the first "
+                    "is recorded (no fallback)",
+                    abs_path,
+                    getattr(arg, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=arg.arg,
+                )
+            else:
+                diags.warn(
+                    "model-typed parameter '{}' on bodyless operation {} {} is "
+                    "omitted (no fallback)".format(arg.arg, method, path),
+                    abs_path,
+                    getattr(arg, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=arg.arg,
+                )
             continue
 
         in_path = arg.arg in path_names
         schema, _nullable = types.map_field_annotation(
-            annotation, in_module, table, diags
+            annotation,
+            in_module,
+            table,
+            _ContextDiags(
+                diags,
+                code="request.parameter.unresolved",
+                category="request_parameter",
+                operation="{} {}".format(method, path),
+                subject=arg.arg,
+            ),
         )
         if schema is None:
             continue
@@ -404,6 +463,7 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     for index, arg in enumerate(kwonly):
         annotation = arg.annotation
         if annotation is None:
+            _warn_untyped_param(arg, path, method, abs_path, diags)
             continue
         default = kw_defaults[index] if index < len(kw_defaults) else None
         if _is_dependency_parameter(annotation, default):
@@ -412,10 +472,41 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         if body_ref is not None and arg.arg not in path_names:
             if allows_body and request_body is None:
                 request_body = {"ref_id": body_ref}
+            elif allows_body:
+                diags.warn(
+                    "handler has more than one typed request body; only the first "
+                    "is recorded (no fallback)",
+                    abs_path,
+                    getattr(arg, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=arg.arg,
+                )
+            else:
+                diags.warn(
+                    "model-typed parameter '{}' on bodyless operation {} {} is "
+                    "omitted (no fallback)".format(arg.arg, method, path),
+                    abs_path,
+                    getattr(arg, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=arg.arg,
+                )
             continue
         in_path = arg.arg in path_names
         schema, _nullable = types.map_field_annotation(
-            annotation, in_module, table, diags
+            annotation,
+            in_module,
+            table,
+            _ContextDiags(
+                diags,
+                code="request.parameter.unresolved",
+                category="request_parameter",
+                operation="{} {}".format(method, path),
+                subject=arg.arg,
+            ),
         )
         if schema is None:
             continue
@@ -436,16 +527,29 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
     return params, request_body
 
 
-def _build_response(call):
+def _build_response(call, operation, abs_path, diags):
     """Build the response status from ``status_code=``.
 
     ``status_code=`` Constant -> status (default 200 when absent). Response schema selection is
     handled separately from an explicit ``response_model=`` or the handler return annotation.
     """
-    status = _const_kwarg(call, "status_code")
-    if not isinstance(status, int):
-        status = 200
-    return status
+    keyword = next((kw for kw in call.keywords if kw.arg == "status_code"), None)
+    if keyword is None:
+        return 200
+    status = keyword.value.value if isinstance(keyword.value, ast.Constant) else None
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        return status
+    diags.warn(
+        "FastAPI status_code on {} is not a constant HTTP status in 100..599; "
+        "using the framework default 200 (no fallback)".format(operation),
+        abs_path,
+        getattr(keyword.value, "lineno", 0),
+        code="response.status.unresolved",
+        category="response",
+        operation=operation,
+        subject="status_code",
+    )
+    return 200
 
 
 def _response_annotation(call, func):
@@ -537,16 +641,26 @@ def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
                     "(no fallback)",
                     abs_path,
                     getattr(stmt, "lineno", 0),
+                    code="source.route.unresolved",
+                    category="source",
+                    subject=stmt.name,
                 )
                 continue
             binding_name = decorator.func.value.id
             path = _join_static_paths(bindings[binding_name], route_path)
             method = decorator.func.attr.upper()
+            operation = "{} {}".format(method, path)
             params, request_body = _build_params(
                 stmt, path, method, module.dotted, abs_path, table, diags
             )
-            status = _build_response(decorator)
+            status = _build_response(decorator, operation, abs_path, diags)
             response_annotation = _response_annotation(decorator, stmt)
+            intentional_empty = any(
+                kw.arg == "response_model"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is None
+                for kw in decorator.keywords
+            )
             body_ref = _response_schema_ref(
                 response_annotation,
                 stmt,
@@ -556,6 +670,18 @@ def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
                 diags,
                 synthetic_schemas,
             )
+            if body_ref is None and not intentional_empty:
+                diags.warn(
+                    "FastAPI response schema on {} cannot be resolved from "
+                    "response_model or the return annotation; response body omitted "
+                    "(no fallback)".format(operation),
+                    abs_path,
+                    getattr(response_annotation or stmt, "lineno", 0),
+                    code="response.schema.unresolved",
+                    category="response",
+                    operation=operation,
+                    subject=stmt.name,
+                )
             response = {
                 "status": status,
                 "body": {"ref_id": body_ref} if body_ref is not None else None,
@@ -765,6 +891,40 @@ def _flask_body_and_params(
             if body_ref is not None and _reads_request_json(value):
                 if allows_body and request_body is None:
                     request_body = {"ref_id": body_ref}
+                elif allows_body:
+                    diags.warn(
+                        "handler has more than one typed request body on {} {}; only "
+                        "the first is recorded (no fallback)".format(method, path),
+                        abs_path,
+                        getattr(stmt, "lineno", 0),
+                        code="request.body.unresolved",
+                        category="request_body",
+                        operation="{} {}".format(method, path),
+                        subject=getattr(stmt.target, "id", "request body"),
+                    )
+                else:
+                    diags.warn(
+                        "typed request body on bodyless operation {} {} is omitted "
+                        "(no fallback)".format(method, path),
+                        abs_path,
+                        getattr(stmt, "lineno", 0),
+                        code="request.body.unresolved",
+                        category="request_body",
+                        operation="{} {}".format(method, path),
+                        subject=getattr(stmt.target, "id", "request body"),
+                    )
+                continue
+            if _reads_request_json(value):
+                diags.warn(
+                    "typed request body on {} {} has an unresolvable DTO annotation; "
+                    "body omitted (no fallback)".format(method, path),
+                    abs_path,
+                    getattr(stmt, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=getattr(stmt.target, "id", "request body"),
+                )
                 continue
             # Typed query param: an annotated local reading request.args.get(...).
             if _is_request_args_get(value):
@@ -777,10 +937,23 @@ def _flask_body_and_params(
                         "omitted (no fallback)".format(method, path),
                         abs_path,
                         getattr(stmt, "lineno", 0),
+                        code="request.parameter.unresolved",
+                        category="request_parameter",
+                        operation="{} {}".format(method, path),
+                        subject="query parameter",
                     )
                     continue
                 schema, _nullable = types.map_field_annotation(
-                    annotation, in_module, table, diags
+                    annotation,
+                    in_module,
+                    table,
+                    _ContextDiags(
+                        diags,
+                        code="request.parameter.unresolved",
+                        category="request_parameter",
+                        operation="{} {}".format(method, path),
+                        subject=stmt.target.id,
+                    ),
                 )
                 if schema is not None:
                     params.append(
@@ -808,6 +981,10 @@ def _flask_body_and_params(
                     "inferred".format(method, path),
                     abs_path,
                     getattr(stmt, "lineno", 0),
+                    code="request.body.unresolved",
+                    category="request_body",
+                    operation="{} {}".format(method, path),
+                    subject=target_name or "request body",
                 )
                 continue
             # Untyped query param: a plain assign reading request.args.get(...).
@@ -818,6 +995,10 @@ def _flask_body_and_params(
                     "type inferred as string only".format(target_name, method, path),
                     abs_path,
                     getattr(stmt, "lineno", 0),
+                    code="request.parameter.unresolved",
+                    category="request_parameter",
+                    operation="{} {}".format(method, path),
+                    subject=target_name or "query parameter",
                 )
                 continue
 
@@ -869,6 +1050,9 @@ def recognize_flask(modules, table, diags):
                     "(no fallback)",
                     abs_path,
                     getattr(stmt, "lineno", 0),
+                    code="source.route.unresolved",
+                    category="source",
+                    subject=stmt.name,
                 )
                 continue
             relative_path, path_converters = _flask_path(raw_path)
@@ -917,12 +1101,22 @@ def recognize_flask(modules, table, diags):
                     responses = [response]
                 else:
                     if method == methods[0]:
+                        reason = (
+                            "handler has no return annotation"
+                            if stmt.returns is None
+                            else "return annotation does not resolve to a model schema"
+                        )
                         diags.warn(
-                            "untyped response on {} {}: handler has no return "
-                            "annotation; response shape under-specified, no schema "
-                            "inferred".format(method, path),
+                            "untyped response on {} {}: {}; response shape "
+                            "under-specified, no schema inferred".format(
+                                method, path, reason
+                            ),
                             abs_path,
                             getattr(stmt, "lineno", 0),
+                            code="response.schema.unresolved",
+                            category="response",
+                            operation="{} {}".format(method, path),
+                            subject=stmt.name,
                         )
                     responses = []
                 routes.append(

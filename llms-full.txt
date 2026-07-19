@@ -94,4 +94,19 @@ SDK outputs include `README.md` and `reference.md` with operation/schema summari
   intended.
 - Stale output: run `gnr8 generate`, then commit generated artifacts.
 
-For more detail, read `docs/AGENT-USAGE.md` and `docs/USAGE.md`.
+## Task-Scoped Reference
+
+Prefer one focused Markdown page instead of loading every document:
+
+- Start/router: `docs/agents/index.md`
+- CLI: `docs/cli/commands.md`
+- Pipeline and transforms: `docs/pipeline/configuration.md`, `docs/pipeline/transforms.md`
+- Sources: `docs/extraction/sources.md`
+- OpenAPI generation: `docs/openapi/generation.md`
+- SDK generation: `docs/sdk/generation.md`
+- Diagnostics: `docs/diagnostics/reference.md`
+- Artifacts and CI: `docs/operations/artifacts-and-ci.md`
+- Public Rust API: `docs/reference/public-api.md`
+
+`docs/AGENT-USAGE.md` remains a single-page onboarding summary; `docs/USAGE.md` is the older dense
+reference.

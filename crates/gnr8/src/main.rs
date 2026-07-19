@@ -1958,8 +1958,8 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
     }
     for diag in diagnostics {
         eprintln!(
-            "{}: {} ({}:{})",
-            diag.severity, diag.message, diag.file, diag.line
+            "{} [{}]: {} ({}:{})",
+            diag.severity, diag.code, diag.message, diag.file, diag.line
         );
     }
 }

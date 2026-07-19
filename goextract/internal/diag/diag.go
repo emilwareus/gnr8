@@ -14,6 +14,14 @@ import "github.com/gnr8/goextract/internal/facts"
 const severityWarn = "WARN"
 const severityError = "ERROR"
 
+const (
+	categorySource           = "source"
+	categoryRequestParameter = "request_parameter"
+	categoryRequestBody      = "request_body"
+	categoryResponse         = "response"
+	categorySchema           = "schema"
+)
+
 // Accumulator collects DiagnosticFact values during extraction.
 type Accumulator struct {
 	items []facts.DiagnosticFact
@@ -28,12 +36,17 @@ func New() *Accumulator {
 // (TARGET-API.md §5.1): map[string]any lowers to additionalProperties: true.
 func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.free_form_map",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message: "free-form map field: " + structName + "." + fieldName +
 			" (" + goType + ") lowers to additionalProperties: true; downstream generators " +
 			"may mishandle untyped maps (TARGET-API.md §5.1)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
 	})
 }
 
@@ -45,12 +58,55 @@ func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, li
 // on the Rust side in 02-03).
 func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.parameter.unresolved",
 		Severity: severityWarn,
+		Category: categoryRequestParameter,
 		Message: "untyped query param '" + name + "' on " + method + " " + route +
 			": read via c.Query with no binding struct; param type/required-ness " +
 			"under-specified, type inferred as string only (TARGET-API.md §5.4)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   name,
+	})
+}
+
+// RequestParameterUnresolved records a helper boundary where a Gin context was
+// passed but the module-owned implementation could not be traversed. Keeping
+// this distinct from an untyped direct Query read lets CI deny incomplete call
+// graph analysis with the same stable request.parameter.unresolved identity.
+func (a *Accumulator) RequestParameterUnresolved(subject, method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.parameter.unresolved",
+		Severity: severityWarn,
+		Category: categoryRequestParameter,
+		Message: "request parameter analysis stopped at " + subject + " on " + method + " " + route +
+			": " + reason + "; add an explicit parameter override or keep the helper within the loaded module",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
+	})
+}
+
+// RequestBodyUnresolved records a request-body shape or media type that Gin
+// accepts at runtime but the extractor cannot represent faithfully. The stable
+// code is intentionally distinct from request-parameter failures so callers can
+// deny incomplete body extraction independently.
+func (a *Accumulator) RequestBodyUnresolved(subject, method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.body.unresolved",
+		Severity: severityWarn,
+		Category: categoryRequestBody,
+		Message: "request body analysis is incomplete for " + subject + " on " + method + " " + route +
+			": " + reason + "; add an explicit body override or use a statically typed binding",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
 	})
 }
 
@@ -58,13 +114,50 @@ func (a *Accumulator) UntypedQueryParam(name, method, route, file string, line u
 // a c.JSON(...) whose status or body could not be resolved to a constant/named
 // type. The response is diagnosed rather than guessed or silently dropped; there
 // is no secondary source to recover it from (CLAUDE.md rule 3).
-func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32) {
+func (a *Accumulator) DynamicResponse(method, route, handler, reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "response.schema.unresolved",
 		Severity: severityWarn,
+		Category: categoryResponse,
 		Message: "dynamic response in handler " + handler + ": " + reason +
 			"; cannot infer a typed response from code (TARGET-API.md §5; D-05)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   handler,
+	})
+}
+
+// ResponseSchemaUnresolved records a response body that cannot be represented
+// faithfully even though the route is known.
+func (a *Accumulator) ResponseSchemaUnresolved(method, route, subject, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.schema.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   message,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
+	})
+}
+
+// ResponseMediaTypeUnresolved records a response whose status and body kind are
+// known but whose runtime media type is dynamic. The operation identity allows
+// a checked response override to retire exactly the diagnostic it resolves.
+func (a *Accumulator) ResponseMediaTypeUnresolved(method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.media_type.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   reason,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
 	})
 }
 
@@ -73,11 +166,56 @@ func (a *Accumulator) DynamicResponse(handler, reason, file string, line uint32)
 // review can fix the source pattern or add an explicit custom Source/Transform.
 func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.route.unresolved",
 		Severity: severityWarn,
+		Category: categorySource,
 		Message: "unsupported Gin route pattern: " + reason +
 			"; route skipped rather than guessed (GO-04)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+	})
+}
+
+// SourceRouteUnresolved records a lossy route/group pattern when the caller has
+// already described whether the route was skipped or emitted relatively.
+func (a *Accumulator) SourceRouteUnresolved(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.route.unresolved",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+	})
+}
+
+// SourceLoadUnresolved records a source package/file that could not be loaded.
+func (a *Accumulator) SourceLoadUnresolved(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.load.unresolved",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+	})
+}
+
+// SourceHandlerAmbiguous records a handler lookup collision that prevents an
+// unambiguous association between a recognized route and its source function.
+func (a *Accumulator) SourceHandlerAmbiguous(subject, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.handler.ambiguous",
+		Severity: severityWarn,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
+		Subject:  subject,
 	})
 }
 
@@ -89,12 +227,17 @@ func (a *Accumulator) UnsupportedRoutePattern(reason, file string, line uint32) 
 // type, mirroring Floatf/FreeFormMap.
 func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.type.unresolved",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message: "unsupported field type: " + structName + "." + fieldName +
 			" (" + goType + ") has no neutral primitive; lowered to free-form any " +
 			"rather than guessing a concrete type (GO-06)",
-		File: file,
-		Line: line,
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
 	})
 }
 
@@ -138,10 +281,34 @@ func (a *Accumulator) Error(message, file string, line uint32) {
 // Warn records a generic non-fatal warning.
 func (a *Accumulator) Warn(message, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.metadata.unresolved",
 		Severity: severityWarn,
+		Category: categorySchema,
 		Message:  message,
 		File:     file,
 		Line:     line,
+		EndLine:  line,
+		Schema:   structName,
+		Subject:  fieldName,
+	})
+}
+
+// Warn records a backwards-compatible generic warning for callers that do not
+// yet have a dedicated structured helper.
+func (a *Accumulator) Warn(message, file string, line uint32) {
+	a.WarnCode("source.unresolved", categorySource, message, file, line)
+}
+
+// WarnCode records a warning with an explicit stable code and category.
+func (a *Accumulator) WarnCode(code, category, message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     code,
+		Severity: severityWarn,
+		Category: category,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
 	})
 }
 

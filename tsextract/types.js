@@ -34,6 +34,11 @@ const ts = require("./ts");
 
 const load = require("./load");
 
+const _SCHEMA_TYPE_DIAGNOSTIC = {
+  code: "schema.type.unresolved",
+  category: "schema",
+};
+
 function _prim(prim, extra) {
   return { type: "primitive", of: Object.assign({ prim: prim }, extra || {}) };
 }
@@ -102,6 +107,19 @@ function mapReturnType(loaded, methodDecl, diags, registry) {
   const anno = _unwrapPromiseAnnotation(methodDecl.type);
   if (!anno) {
     return { schema: null, optional: false, nullable: false };
+  }
+  // NestJS handlers are commonly async. `Promise<T>` describes the runtime
+  // response body as T, so unwrap the syntactic and semantic return type before
+  // using the same field/parameter mapper. This is a direct type fact, not a
+  // fallback; unsupported Promise arity still follows the normal diagnostic path.
+  if (
+    ts.isTypeReferenceNode(anno) &&
+    ts.isIdentifier(anno.typeName) &&
+    anno.typeName.text === "Promise" &&
+    anno.typeArguments &&
+    anno.typeArguments.length === 1
+  ) {
+    anno = anno.typeArguments[0];
   }
   const full = loaded.checker.getTypeAtLocation(anno);
   return _mapAnnotated(loaded, full, anno, anno, diags, registry);
@@ -229,7 +247,8 @@ function _mapResidual(loaded, residual, fullAlias, diags, registry, file, line) 
   diags.warn(
     "unsupported type: no non-null/undefined arms; fact omitted (no fallback)",
     file,
-    line
+    line,
+    _SCHEMA_TYPE_DIAGNOSTIC
   );
   return null;
 }
@@ -262,7 +281,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
       diags.warn(
         "unsupported array type: element type unresolved; fact omitted (no fallback)",
         file,
-        line
+        line,
+        _SCHEMA_TYPE_DIAGNOSTIC
       );
       return null;
     }
@@ -295,7 +315,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
             checker.typeToString(t) +
             "': non-string key cannot be a deterministic map key; fact omitted (no fallback)",
           file,
-          line
+          line,
+          _SCHEMA_TYPE_DIAGNOSTIC
         );
         return null;
       }
@@ -336,7 +357,8 @@ function _mapSingle(loaded, t, diags, registry, file, line) {
       checker.typeToString(t) +
       "': not a primitive/array/class/enum; fact omitted (no fallback)",
     file,
-    line
+    line,
+    _SCHEMA_TYPE_DIAGNOSTIC
   );
   return null;
 }
@@ -374,7 +396,8 @@ function _registerAlias(loaded, aliasSym, diags, registry, file, line) {
         info.name +
         "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
       file,
-      line
+      line,
+      _SCHEMA_TYPE_DIAGNOSTIC
     );
     return null;
   }
@@ -404,7 +427,8 @@ function _registerClass(loaded, sym, diags, registry, file, line) {
         info.name +
         "' is declared outside the target tree (lib/node_modules); fact omitted (no fallback)",
       file,
-      line
+      line,
+      _SCHEMA_TYPE_DIAGNOSTIC
     );
     return null;
   }

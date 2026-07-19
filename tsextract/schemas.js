@@ -270,7 +270,13 @@ function _buildClassSchema(loaded, entry, diags, registry) {
       diags.warn(
         "computed property name cannot be statically resolved; field omitted (no fallback)",
         load.relFile(loaded.targetDir, sf.fileName),
-        sf.getLineAndCharacterOfPosition(member.getStart(sf)).line + 1
+        sf.getLineAndCharacterOfPosition(member.getStart(sf)).line + 1,
+        {
+          code: "schema.type.unresolved",
+          category: "schema",
+          schema: entry.id,
+          subject: member.name.getText(sf),
+        }
       );
       continue;
     }
@@ -329,7 +335,12 @@ function _buildAliasSchema(loaded, entry, diags, registry) {
           entry.name +
           "': not a named class; fact omitted (no fallback)",
         load.relFile(loaded.targetDir, sf.fileName),
-        sf.getLineAndCharacterOfPosition(aliasDecl.getStart(sf)).line + 1
+        sf.getLineAndCharacterOfPosition(aliasDecl.getStart(sf)).line + 1,
+        {
+          code: "schema.type.unresolved",
+          category: "schema",
+          schema: entry.id,
+        }
       );
       return null;
     }

@@ -316,12 +316,12 @@ export class Client {
   ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
     const searchParams = new URLSearchParams();
-    searchParams.set("genre", String(genre));
+    searchParams.append("genre", String(genre));
     if (cursor !== undefined) {
-      searchParams.set("cursor", String(cursor));
+      searchParams.append("cursor", String(cursor));
     }
     if (sort !== undefined) {
-      searchParams.set("sort", String(sort));
+      searchParams.append("sort", String(sort));
     }
     const qs = searchParams.toString();
     if (qs) {
@@ -415,7 +415,7 @@ export class Client {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
-      searchParams.set("fmt", String(fmt));
+      searchParams.append("fmt", String(fmt));
     }
     const qs = searchParams.toString();
     if (qs) {

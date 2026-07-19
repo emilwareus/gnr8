@@ -123,6 +123,34 @@ class FlaskRouteTests(unittest.TestCase):
         for expected in EXPECTED_DIAGS:
             self.assertIn(expected, messages)
         self.assertEqual(len(self.doc["diagnostics"]), 3)
+        self.assertEqual(
+            {d["code"] for d in self.doc["diagnostics"]},
+            {
+                "request.body.unresolved",
+                "request.parameter.unresolved",
+                "response.schema.unresolved",
+            },
+        )
+        diagnostics = {d["code"]: d for d in self.doc["diagnostics"]}
+        self.assertEqual(
+            diagnostics["request.parameter.unresolved"]["operation"], "GET /orders/"
+        )
+        self.assertEqual(
+            diagnostics["request.parameter.unresolved"]["category"],
+            "request_parameter",
+        )
+        self.assertEqual(
+            diagnostics["request.body.unresolved"]["operation"], "POST /orders/raw"
+        )
+        self.assertEqual(
+            diagnostics["request.body.unresolved"]["category"], "request_body"
+        )
+        self.assertEqual(
+            diagnostics["response.schema.unresolved"]["operation"], "POST /orders/raw"
+        )
+        self.assertEqual(
+            diagnostics["response.schema.unresolved"]["category"], "response"
+        )
 
 
 if __name__ == "__main__":

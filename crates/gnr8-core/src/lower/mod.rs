@@ -117,7 +117,7 @@ pub(crate) fn build_openapi_doc(
         .collect();
 
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
-    let security = build_security(security)?;
+    let security = build_security(security, &graph.security_requirements)?;
     ensure_operation_security_refs(graph, &security)?;
     let global_security = security
         .requirements
@@ -130,9 +130,40 @@ pub(crate) fn build_openapi_doc(
         openapi: "3.1.0",
         info: Info {
             title: title.to_string(),
-            version: "0.1.0".to_string(),
-            description: None,
+            version: graph
+                .openapi_metadata
+                .version
+                .clone()
+                .unwrap_or_else(|| "0.1.0".to_string()),
+            description: graph.openapi_metadata.description.clone(),
+            terms_of_service: graph.openapi_metadata.terms_of_service.clone(),
+            contact: graph
+                .openapi_metadata
+                .contact
+                .as_ref()
+                .map(|contact| model::Contact {
+                    name: contact.name.clone(),
+                    url: contact.url.clone(),
+                    email: contact.email.clone(),
+                }),
+            license: graph
+                .openapi_metadata
+                .license
+                .as_ref()
+                .map(|license| model::License {
+                    name: license.name.clone(),
+                    url: license.url.clone(),
+                }),
         },
+        servers: graph
+            .openapi_metadata
+            .servers
+            .iter()
+            .map(|server| model::Server {
+                url: server.url.clone(),
+                description: server.description.clone(),
+            })
+            .collect(),
         security: security.requirements,
         paths,
         components: Components {
@@ -159,6 +190,31 @@ fn ensure_operation_security_refs(
             }
         }
     }
+    for requirement in &graph.security_requirements {
+        for scheme in &requirement.schemes {
+            if !known.contains(scheme.as_str()) {
+                return Err(crate::CoreError::Lowering {
+                    message: format!(
+                        "top-level security requirement references unknown scheme '{scheme}'"
+                    ),
+                });
+            }
+        }
+    }
+    for policy in &graph.operation_security {
+        for requirement in &policy.alternatives {
+            for scheme in &requirement.schemes {
+                if !known.contains(scheme.as_str()) {
+                    return Err(crate::CoreError::Lowering {
+                        message: format!(
+                            "operation '{}' references unknown security scheme '{scheme}'",
+                            policy.operation_id
+                        ),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -181,7 +237,10 @@ struct LoweredSecurity {
 ///
 /// Returns [`crate::CoreError::Lowering`] for a scheme whose `kind`/`location` the `PoC` does not
 /// support, so an unsupported scheme is a clear error rather than a silently dropped one.
-fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, crate::CoreError> {
+fn build_security(
+    security: &[GraphSecurityScheme],
+    configured_requirements: &[crate::graph::SecurityRequirementGroup],
+) -> Result<LoweredSecurity, crate::CoreError> {
     // Sort by scheme id so the emitted requirement + schemes are deterministic regardless of input
     // order (GRAPH-02), and reject a duplicate id rather than silently collapsing one.
     let mut schemes: Vec<&GraphSecurityScheme> = security.iter().collect();
@@ -207,10 +266,11 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
                 ),
             });
         }
-        if scheme.global {
+        if configured_requirements.is_empty() && scheme.global {
             requirements.push(SecurityRequirement {
                 scheme: scheme.id.clone(),
                 scopes: vec![],
+                alternative: 0,
             });
         }
         components.push((
@@ -221,6 +281,17 @@ fn build_security(security: &[GraphSecurityScheme]) -> Result<LoweredSecurity, c
                 name: scheme.name.clone(),
             },
         ));
+    }
+    if !configured_requirements.is_empty() {
+        for (alternative, requirement) in configured_requirements.iter().enumerate() {
+            for scheme in &requirement.schemes {
+                requirements.push(SecurityRequirement {
+                    scheme: scheme.clone(),
+                    scopes: Vec::new(),
+                    alternative,
+                });
+            }
+        }
     }
     Ok(LoweredSecurity {
         requirements,
@@ -254,6 +325,7 @@ fn build_paths(
         let operation = lower_operation(
             op,
             operation_docs_policy(graph, &op.id),
+            operation_security_policy(graph, &op.id),
             ref_to_name,
             global_security,
         )?;
@@ -284,10 +356,13 @@ fn place_operation(
 ) -> Result<(), crate::CoreError> {
     let slot = match method {
         "GET" => &mut item.get,
-        "POST" => &mut item.post,
         "PUT" => &mut item.put,
-        "PATCH" => &mut item.patch,
+        "POST" => &mut item.post,
         "DELETE" => &mut item.delete,
+        "OPTIONS" => &mut item.options,
+        "HEAD" => &mut item.head,
+        "PATCH" => &mut item.patch,
+        "TRACE" => &mut item.trace,
         other => {
             return Err(crate::CoreError::Lowering {
                 message: format!("unsupported HTTP method '{other}' for operation lowering"),
@@ -311,22 +386,14 @@ fn place_operation(
 fn lower_operation(
     op: &GraphOp,
     docs: Option<&OperationDocsPolicy>,
+    exact_security: Option<&crate::graph::OperationSecurityPolicy>,
     ref_to_name: &BTreeMap<&str, &str>,
     global_security: &[String],
 ) -> Result<Operation, crate::CoreError> {
     let parameters = op
         .params
         .iter()
-        .map(|param| {
-            let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
-            schema.default_value.clone_from(&param.default);
-            Ok(Parameter {
-                name: param.name.clone(),
-                location: param.location.clone(),
-                required: param.required,
-                schema,
-            })
-        })
+        .map(|param| lower_parameter(param, ref_to_name))
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
     let request_body = match &op.request_body {
@@ -340,12 +407,22 @@ fn lower_operation(
                             op.id
                         ),
                     })?;
+            let mut content_types = docs
+                .map(|policy| policy.request_content_types.clone())
+                .unwrap_or_default();
+            if !content_types.contains(&content_type) {
+                content_types.push(content_type);
+            }
+            content_types.sort();
+            content_types.dedup();
             Some(RequestBody {
                 required: op.request_body_required,
                 examples: docs
-                    .map(|policy| media_examples_for(&policy.request_examples, &content_type))
+                    .map(|policy| {
+                        media_examples_for_content_types(&policy.request_examples, &content_types)
+                    })
                     .unwrap_or_default(),
-                content_type,
+                content_types,
                 schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
             })
         }
@@ -353,34 +430,126 @@ fn lower_operation(
     };
 
     let responses = lower_responses(op, docs, ref_to_name)?;
-    let mut operation_security = Vec::new();
-    if !op.security.is_empty() {
-        if !op.security_overrides_global {
-            operation_security.extend(global_security.iter().cloned());
+    let operation_security = if let Some(policy) = exact_security {
+        policy
+            .alternatives
+            .iter()
+            .enumerate()
+            .flat_map(|(alternative, group)| {
+                group
+                    .schemes
+                    .iter()
+                    .cloned()
+                    .map(move |scheme| SecurityRequirement {
+                        scheme,
+                        scopes: Vec::new(),
+                        alternative,
+                    })
+            })
+            .collect()
+    } else {
+        let mut scheme_ids = Vec::new();
+        if !op.security.is_empty() {
+            if !op.security_overrides_global {
+                scheme_ids.extend(global_security.iter().cloned());
+            }
+            scheme_ids.extend(op.security.iter().cloned());
         }
-        operation_security.extend(op.security.iter().cloned());
-    }
-    operation_security.sort();
-    operation_security.dedup();
-
-    Ok(Operation {
-        operation_id: op.id.clone(),
-        summary: docs.and_then(|policy| policy.summary.clone()),
-        description: docs.and_then(|policy| policy.description.clone()),
-        deprecated: docs.is_some_and(|policy| policy.deprecated),
-        tags: operation_tags(op, docs),
-        security: operation_security
+        scheme_ids.sort();
+        scheme_ids.dedup();
+        scheme_ids
             .into_iter()
             .map(|scheme| SecurityRequirement {
                 scheme,
                 scopes: Vec::new(),
+                alternative: 0,
             })
-            .collect(),
-        security_explicit: op.security_overrides_global || !op.security.is_empty(),
+            .collect()
+    };
+
+    Ok(Operation {
+        operation_id: docs
+            .and_then(|policy| policy.openapi_operation_id.clone())
+            .unwrap_or_else(|| op.id.clone()),
+        summary: docs.and_then(|policy| policy.summary.clone()),
+        description: docs.and_then(|policy| policy.description.clone()),
+        deprecated: docs.is_some_and(|policy| policy.deprecated),
+        tags: operation_tags(op, docs),
+        security: operation_security,
+        security_explicit: exact_security.is_some()
+            || op.security_overrides_global
+            || !op.security.is_empty(),
         parameters,
         request_body,
         responses,
     })
+}
+
+fn lower_parameter(
+    param: &crate::graph::Param,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<Parameter, crate::CoreError> {
+    let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
+    schema.default_value.clone_from(&param.default);
+    let mut openapi_content = param.openapi_content.clone();
+    if let Some(content) = &mut openapi_content {
+        rewrite_parameter_local_refs(content, ref_to_name);
+    }
+    let mut openapi_fields = param.openapi_fields.clone();
+    for (_, value) in &mut openapi_fields {
+        rewrite_parameter_local_refs(value, ref_to_name);
+    }
+    Ok(Parameter {
+        name: param.name.clone(),
+        location: param.location.clone(),
+        required: param.required,
+        style: param.style.clone(),
+        explode: param.explode,
+        allow_reserved: param.allow_reserved,
+        openapi_content,
+        openapi_fields,
+        schema,
+    })
+}
+
+fn rewrite_parameter_local_refs(value: &mut serde_json::Value, refs: &BTreeMap<&str, &str>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let rewritten = object
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| rewrite_local_component_ref(reference, refs));
+            if let Some(reference) = rewritten {
+                object.insert("$ref".to_string(), serde_json::Value::String(reference));
+            }
+            for child in object.values_mut() {
+                rewrite_parameter_local_refs(child, refs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_parameter_local_refs(item, refs);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn rewrite_local_component_ref(reference: &str, refs: &BTreeMap<&str, &str>) -> Option<String> {
+    let tail = reference.strip_prefix("#/components/schemas/")?;
+    let (raw_name, suffix) = tail
+        .split_once('/')
+        .map_or((tail, None), |(name, suffix)| (name, Some(suffix)));
+    let name = raw_name.replace("~1", "/").replace("~0", "~");
+    let public_name = refs.get(name.as_str())?;
+    let public_name = public_name.replace('~', "~0").replace('/', "~1");
+    Some(suffix.map_or_else(
+        || format!("#/components/schemas/{public_name}"),
+        |suffix| format!("#/components/schemas/{public_name}/{suffix}"),
+    ))
 }
 
 fn lower_responses(
@@ -416,90 +585,96 @@ fn lower_response(
             .iter()
             .find(|response| response.status == resp.status)
     });
-    let (schema_ref, content_type, binary, event_stream) = match resp.body_kind.as_str() {
-        "json" => {
-            let schema_ref = match &resp.body {
-                Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
-                None => None,
-            };
-            (
-                schema_ref,
-                Some(response_content_type(op, resp)?),
-                false,
-                false,
-            )
-        }
-        "empty" => {
-            ensure_response_has_no_schema(op, resp, "empty")?;
-            (None, None, false, false)
-        }
-        "binary" => {
-            ensure_response_has_no_schema(op, resp, "binary")?;
-            (None, Some(response_content_type(op, resp)?), true, false)
-        }
-        "sse" => {
-            let schema_ref = match &resp.body {
-                Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
-                None => None,
-            };
-            (
-                schema_ref,
-                Some(response_content_type(op, resp)?),
-                false,
-                true,
-            )
-        }
-        other => {
-            return Err(crate::CoreError::Lowering {
-                message: format!(
-                    "operation '{}' response {} has unsupported body_kind {other:?}",
-                    op.id, resp.status
-                ),
-            });
-        }
-    };
+    let (schema_ref, content_type, content_types, binary, event_stream) =
+        match resp.body_kind.as_str() {
+            "json" => {
+                let schema_ref = match &resp.body {
+                    Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
+                    None => None,
+                };
+                let content_types = response_content_types(op, resp)?;
+                (
+                    schema_ref,
+                    content_types.first().cloned(),
+                    content_types,
+                    false,
+                    false,
+                )
+            }
+            "empty" => {
+                ensure_response_has_no_schema(op, resp, "empty")?;
+                (None, None, Vec::new(), false, false)
+            }
+            "binary" => {
+                ensure_response_has_no_schema(op, resp, "binary")?;
+                let content_types = response_content_types(op, resp)?;
+                (
+                    None,
+                    content_types.first().cloned(),
+                    content_types,
+                    true,
+                    false,
+                )
+            }
+            "sse" => {
+                let schema_ref = match &resp.body {
+                    Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
+                    None => None,
+                };
+                let content_types = response_content_types(op, resp)?;
+                (
+                    schema_ref,
+                    content_types.first().cloned(),
+                    content_types,
+                    false,
+                    true,
+                )
+            }
+            other => {
+                return Err(crate::CoreError::Lowering {
+                    message: format!(
+                        "operation '{}' response {} has unsupported body_kind {other:?}",
+                        op.id, resp.status
+                    ),
+                });
+            }
+        };
     Ok((
         resp.status.to_string(),
         ResponseObj {
             description: response_docs
                 .and_then(|response| response.description.clone())
                 .unwrap_or_else(|| default_response_description(resp.status)),
-            examples: content_type
-                .as_deref()
-                .and_then(|content_type| {
-                    response_docs
-                        .map(|response| media_examples_for(&response.examples, content_type))
+            examples: response_docs
+                .map(|response| {
+                    media_examples_for_content_types(&response.examples, &content_types)
                 })
                 .unwrap_or_default(),
             schema_ref,
             content_type,
+            content_types,
             binary,
             event_stream,
         },
     ))
 }
 
-fn response_content_type(
+fn response_content_types(
     op: &GraphOp,
     resp: &crate::graph::Response,
-) -> Result<String, crate::CoreError> {
-    match resp.content_types.as_slice() {
-        [content_type] => Ok(content_type.clone()),
-        [] => Err(crate::CoreError::Lowering {
+) -> Result<Vec<String>, crate::CoreError> {
+    if resp.content_types.is_empty() {
+        return Err(crate::CoreError::Lowering {
             message: format!(
                 "operation '{}' response {} has a body but no response content type",
                 op.id, resp.status
             ),
-        }),
-        content_types => Err(crate::CoreError::Lowering {
-            message: format!(
-                "operation '{}' response {} declares multiple response content types ({}) but this target requires exactly one",
-                op.id,
-                resp.status,
-                content_types.join(", ")
-            ),
-        }),
+        });
     }
+    let mut content_types = resp.content_types.clone();
+    content_types.sort();
+    content_types.dedup();
+    Ok(content_types)
 }
 
 fn ensure_response_has_no_schema(
@@ -528,6 +703,16 @@ fn operation_docs_policy<'a>(
         .find(|policy| policy.operation_id == operation_id)
 }
 
+fn operation_security_policy<'a>(
+    graph: &'a ApiGraph,
+    operation_id: &str,
+) -> Option<&'a crate::graph::OperationSecurityPolicy> {
+    graph
+        .operation_security
+        .iter()
+        .find(|policy| policy.operation_id == operation_id)
+}
+
 fn operation_tags(op: &GraphOp, docs: Option<&OperationDocsPolicy>) -> Vec<String> {
     docs.filter(|policy| !policy.tags.is_empty()).map_or_else(
         || op.group.clone().into_iter().collect(),
@@ -535,21 +720,40 @@ fn operation_tags(op: &GraphOp, docs: Option<&OperationDocsPolicy>) -> Vec<Strin
     )
 }
 
-fn media_examples_for(
+fn media_examples_for_content_types(
     examples: &[crate::graph::MediaExample],
-    content_type: &str,
+    content_types: &[String],
 ) -> Vec<MediaExample> {
+    media_examples_matching(examples, |candidate| {
+        content_types
+            .iter()
+            .any(|content_type| candidate.eq_ignore_ascii_case(content_type))
+    })
+}
+
+fn media_examples_matching<F>(
+    examples: &[crate::graph::MediaExample],
+    matches: F,
+) -> Vec<MediaExample>
+where
+    F: Fn(&str) -> bool,
+{
     let mut out = examples
         .iter()
-        .filter(|example| example.content_type.eq_ignore_ascii_case(content_type))
+        .filter(|example| matches(&example.content_type))
         .map(|example| MediaExample {
             name: example.name.clone(),
+            content_type: example.content_type.clone(),
             summary: example.summary.clone(),
             description: example.description.clone(),
             value: example.value.clone(),
         })
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| {
+        a.content_type
+            .cmp(&b.content_type)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     out
 }
 
@@ -1777,6 +1981,74 @@ mod tests {
         assert!(
             !json_text.contains("min_length"),
             "internal metadata key leaked into JSON:\n{json_text}"
+        );
+    }
+
+    #[test]
+    fn response_examples_stay_scoped_to_their_media_type() {
+        let mut graph = sample_graph();
+        let operation = graph
+            .operations
+            .iter_mut()
+            .find(|operation| operation.id == "createGoal")
+            .unwrap();
+        operation.responses[0].content_types =
+            vec!["application/json".to_string(), "text/plain".to_string()];
+        graph
+            .operation_docs
+            .push(crate::graph::OperationDocsPolicy {
+                operation_id: "createGoal".to_string(),
+                openapi_operation_id: None,
+                summary: None,
+                description: None,
+                deprecated: false,
+                tags: Vec::new(),
+                request_examples: Vec::new(),
+                request_content_types: Vec::new(),
+                responses: vec![crate::graph::ResponseDocsPolicy {
+                    status: 201,
+                    description: None,
+                    examples: vec![
+                        crate::graph::MediaExample {
+                            name: "sample".to_string(),
+                            content_type: "application/json".to_string(),
+                            summary: None,
+                            description: None,
+                            value: serde_json::json!({ "format": "json" }),
+                        },
+                        crate::graph::MediaExample {
+                            name: "sample".to_string(),
+                            content_type: "text/plain".to_string(),
+                            summary: None,
+                            description: None,
+                            value: serde_json::json!("plain"),
+                        },
+                    ],
+                }],
+            });
+
+        let json_text = to_openapi_json(&graph, "goalservice", "/goal", &[]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_media_examples_are_scoped(&json);
+
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &[]).unwrap();
+        let parsed = crate::sdk::openapi_source::parse_json_or_yaml(
+            &yaml,
+            std::path::Path::new("openapi.yaml"),
+        )
+        .unwrap();
+        assert_media_examples_are_scoped(&parsed);
+    }
+
+    fn assert_media_examples_are_scoped(document: &serde_json::Value) {
+        let content = &document["paths"]["/goal/"]["post"]["responses"]["201"]["content"];
+        assert_eq!(
+            content["application/json"]["examples"]["sample"]["value"],
+            serde_json::json!({ "format": "json" })
+        );
+        assert_eq!(
+            content["text/plain"]["examples"]["sample"]["value"],
+            serde_json::json!("plain")
         );
     }
 

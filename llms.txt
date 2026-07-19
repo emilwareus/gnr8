@@ -6,8 +6,18 @@
 
 Start here when using gnr8 from an AI coding agent:
 
-- [Agent Usage Guide](docs/AGENT-USAGE.md): initialize, configure `.gnr8`, generate, check, recover
-  from errors, consume generated SDKs, and choose scenario guides.
+- [Task-Routed Agent Docs](docs/agents/index.md): choose one focused page instead of loading the full
+  documentation set.
+- [CLI Commands](docs/cli/commands.md): syntax, flags, JSON, and exit behavior.
+- [Pipeline Configuration](docs/pipeline/configuration.md): `.gnr8/src/main.rs` and custom stages.
+- [Transforms](docs/pipeline/transforms.md): selectors, overrides, security, runtime, pagination, docs.
+- [Sources](docs/extraction/sources.md): Go/Gin, FastAPI, Flask, NestJS, and OpenAPI extraction.
+- [OpenAPI](docs/openapi/generation.md): generation, metadata, aliases, and patches.
+- [SDK Generation](docs/sdk/generation.md): Go, Python, and TypeScript targets/profiles/layouts.
+- [Diagnostics](docs/diagnostics/reference.md): stable codes, categories, gates, and remediation.
+- [Artifacts and CI](docs/operations/artifacts-and-ci.md): ownership, caches, Action, and write safety.
+- [Public API Map](docs/reference/public-api.md): all SDK prelude symbols.
+- [Agent Usage Guide](docs/AGENT-USAGE.md): single-page onboarding and recovery summary.
 - [Go/Gin to Python and TypeScript SDKs](docs/guides/go-gin-to-python-typescript.md): complex Go
   backend to OpenAPI plus two SDK targets.
 - [Python APIs to Python SDK](docs/guides/python-apis-to-python-sdk.md): FastAPI or Flask typed
@@ -37,3 +47,5 @@ gnr8 guide nestjs-to-typescript-sdk
 Full context file:
 
 - [llms-full.txt](llms-full.txt): compact combined documentation for larger context windows.
+
+Prefer the task-routed Markdown pages above; load `llms-full.txt` only when broad context is required.

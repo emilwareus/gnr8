@@ -49,6 +49,9 @@ class EmptyEnumOmissionTests(unittest.TestCase):
         )
         self.assertIsNone(schema)
         self.assertTrue(diags.items(), "expected a diagnostic for the empty enum")
+        self.assertEqual(diags.items()[0]["code"], "schema.type.unresolved")
+        self.assertEqual(diags.items()[0]["category"], "schema")
+        self.assertEqual(diags.items()[0]["schema"], "app.models.Priority")
 
     def test_auto_enum_omitted_with_diagnostic(self):
         schema, diags = self._build(

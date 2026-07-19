@@ -291,6 +291,12 @@ diagnostics:
     message: "untyped request body on POST /orders/raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
     file: app/routes.py
     line: 78
+    span:
+      file: app/routes.py
+      start_line: 78
+      end_line: 78
+    operation: POST /raw
+    subject: payload
 base_path: /
 title: API
 security: []

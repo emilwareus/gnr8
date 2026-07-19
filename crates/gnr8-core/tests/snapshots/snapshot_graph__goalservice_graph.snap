@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_graph.rs
-assertion_line: 26
 expression: graph
 ---
 module: github.com/gnr8/gnr8-fixtures/goalservice
@@ -576,22 +575,58 @@ diagnostics:
     message: "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1)"
     file: internal/common/dto/goal.go
     line: 62
-  - severity: WARN
+    span:
+      file: internal/common/dto/goal.go
+      start_line: 62
+      end_line: 62
+    schema: GoalResponse
+    subject: Metadata
+  - code: request.parameter.unresolved
+    severity: WARN
+    category: request_parameter
     message: "untyped query param 'cursor' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
     line: 45
-  - severity: WARN
+    span:
+      file: internal/goal/ports/handlers.go
+      start_line: 45
+      end_line: 45
+    operation: GET /list
+    subject: cursor
+  - code: request.parameter.unresolved
+    severity: WARN
+    category: request_parameter
     message: "untyped query param 'page_size' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
     line: 46
-  - severity: WARN
+    span:
+      file: internal/goal/ports/handlers.go
+      start_line: 46
+      end_line: 46
+    operation: GET /list
+    subject: page_size
+  - code: request.parameter.unresolved
+    severity: WARN
+    category: request_parameter
     message: "untyped query param 'aggregation' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
     line: 47
-  - severity: WARN
+    span:
+      file: internal/goal/ports/handlers.go
+      start_line: 47
+      end_line: 47
+    operation: GET /list
+    subject: aggregation
+  - code: source.route.unresolved
+    severity: WARN
+    category: source
     message: "unsupported Gin route pattern: dynamic Gin group prefix; prefix skipped rather than guessed (GO-04)"
     file: internal/goal/ports/http.go
     line: 52
+    span:
+      file: internal/goal/ports/http.go
+      start_line: 52
+      end_line: 52
 base_path: /
 title: API
 security: []

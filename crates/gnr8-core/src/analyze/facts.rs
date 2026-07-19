@@ -91,6 +91,15 @@ pub(crate) struct ParamFact {
     /// Source-inferred default value, when a query helper exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default: Option<LiteralValue>,
+    /// Explicit `OpenAPI` serialization style when source/config determines it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) style: Option<String>,
+    /// Explicit `OpenAPI` explode behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) explode: Option<bool>,
+    /// Whether reserved characters may remain unescaped in a query value.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) allow_reserved: bool,
     /// Source provenance for the parameter access.
     pub(crate) span: SourceSpan,
 }
@@ -146,7 +155,7 @@ pub(crate) struct SchemaFact {
 /// the single field representation for both the wire DTO and the public IR (the IR
 /// mirrors the wire contract — one definition prevents drift). Derives `Serialize`
 /// because it appears inside [`Type::Object`], which the graph serializes.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldFact {
     /// The effective serialized field name.
@@ -174,7 +183,7 @@ pub struct FieldFact {
 }
 
 /// Optional field-level metadata used by OpenAPI/SDK generators.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldMeta {
     /// JSON Schema/OpenAPI validation constraints.
@@ -204,7 +213,7 @@ impl FieldMeta {
 
 /// JSON Schema/OpenAPI validation constraints. Numeric values are stored as strings so the metadata
 /// stays `Eq`/deterministic while writers can still render them as JSON/YAML numbers.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Constraints {
     /// String minimum length (`minLength`).
@@ -281,7 +290,7 @@ pub struct Extension {
 /// (`Any` carries an empty payload, `{"type": "any", "of": {}}`). The adjacent
 /// representation rejects any key beyond `type`/`of`, preserving the strict
 /// deserialize discipline at the enum boundary.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", content = "of", rename_all = "snake_case")]
 pub enum Type {
     /// A base scalar (string, bool, sized int, sized float, bytes).
@@ -315,12 +324,75 @@ pub enum Type {
     Any {},
 }
 
+impl Type {
+    /// A string scalar.
+    #[must_use]
+    pub fn string() -> Self {
+        Self::Primitive(Prim::String)
+    }
+
+    /// A boolean scalar.
+    #[must_use]
+    pub fn boolean() -> Self {
+        Self::Primitive(Prim::Bool)
+    }
+
+    /// A signed 64-bit integer scalar.
+    #[must_use]
+    pub fn integer() -> Self {
+        Self::Primitive(Prim::Int {
+            bits: 64,
+            signed: true,
+        })
+    }
+
+    /// A 64-bit floating-point scalar.
+    #[must_use]
+    pub fn number() -> Self {
+        Self::Primitive(Prim::Float { bits: 64 })
+    }
+
+    /// A UUID-formatted string scalar.
+    #[must_use]
+    pub fn uuid() -> Self {
+        Self::WellKnown(WellKnown::Uuid)
+    }
+
+    /// An RFC 3339 date-time scalar.
+    #[must_use]
+    pub fn date_time() -> Self {
+        Self::WellKnown(WellKnown::DateTime)
+    }
+
+    /// A full-date scalar.
+    #[must_use]
+    pub fn date() -> Self {
+        Self::WellKnown(WellKnown::Date)
+    }
+
+    /// A homogeneous array.
+    #[must_use]
+    pub fn array(items: Self) -> Self {
+        Self::Array(Box::new(items))
+    }
+
+    /// A closed string enum.
+    #[must_use]
+    pub fn enumeration<I, S>(members: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Enum(members.into_iter().map(Into::into).collect())
+    }
+}
+
 /// A base scalar primitive. Serialized internally-tagged on `prim`, so sized
 /// variants carry their width inline (`{"prim": "int", "bits": 64, "signed": true}`,
 /// `{"prim": "string"}`). Internal tagging keeps the wire form flat and easy to
 /// mirror in a sidecar; `Prim` has only unit and struct variants, for which the
 /// internally-tagged representation round-trips cleanly even when buffered.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "prim", rename_all = "snake_case")]
 pub enum Prim {
     /// A unicode string.
@@ -347,7 +419,7 @@ pub enum Prim {
 /// maps these into its own language (a date-time becomes the target's date/time
 /// type); the neutral vocabulary stays target-agnostic. Serialized as a plain
 /// `snake_case` string (e.g. `"uuid"`, `"date_time"`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WellKnown {
     /// A UUID (preserves the former `format: "uuid"` fact).
@@ -366,6 +438,14 @@ pub enum WellKnown {
     Uri,
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a reference to the field value"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// A reference to a schema by its stable id.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,14 +458,58 @@ pub(crate) struct TypeRef {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiagnosticFact {
+    /// Stable dotted diagnostic identity.
+    #[serde(default = "default_diagnostic_code")]
+    pub(crate) code: String,
     /// Severity, `"WARN"` or `"ERROR"`.
     pub(crate) severity: String,
+    /// Stable diagnostic category.
+    #[serde(default = "default_diagnostic_category")]
+    pub(crate) category: DiagnosticCategoryFact,
     /// The human-readable message (rule + identity).
     pub(crate) message: String,
     /// The source file the diagnostic applies to.
     pub(crate) file: String,
     /// The 1-based line number.
     pub(crate) line: u32,
+    /// The inclusive 1-based end line; defaults to `line` when absent.
+    #[serde(default)]
+    pub(crate) end_line: u32,
+    /// HTTP operation identity when the diagnostic belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operation: Option<String>,
+    /// Schema identity when the diagnostic belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) schema: Option<String>,
+    /// Parameter, field, or other narrow subject identity when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subject: Option<String>,
+}
+
+/// Closed diagnostic categories accepted from language sidecars.
+///
+/// Keeping this as an enum makes category policy fail closed: a misspelled or newer category cannot
+/// be silently relabeled as `source` while crossing the sidecar boundary.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiagnosticCategoryFact {
+    Source,
+    RequestParameter,
+    RequestBody,
+    Response,
+    Schema,
+    Security,
+    Override,
+    Artifact,
+    Compatibility,
+}
+
+fn default_diagnostic_code() -> String {
+    "source.unresolved".to_string()
+}
+
+fn default_diagnostic_category() -> DiagnosticCategoryFact {
+    DiagnosticCategoryFact::Source
 }
 
 /// File + line range provenance attached to nodes (D-07).
@@ -612,6 +736,28 @@ mod tests {
             assert!(
                 result.is_err(),
                 "deny_unknown_fields must reject an unexpected nested field key"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_diagnostic_category() {
+            let bad = br#"{
+              "module": "x",
+              "routes": [],
+              "schemas": [],
+              "diagnostics": [{
+                "code": "source.unresolved",
+                "severity": "WARN",
+                "category": "soruce",
+                "message": "misspelled category",
+                "file": "app.go",
+                "line": 1
+              }]
+            }"#;
+            let result: Result<GoFacts, _> = serde_json::from_slice(bad);
+            assert!(
+                result.is_err(),
+                "unknown diagnostic categories must fail the strict sidecar contract"
             );
         }
     }

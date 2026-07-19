@@ -37,19 +37,21 @@ These checks passed during the remediation session:
 |---|---|
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
 | CLI unit tests, including doctor health policy | 41 PASS |
-| Python extractor suite after FastAPI changes | 104 PASS |
+| Python extractor suite after FastAPI changes and current-main reconciliation | 108 PASS |
 | TypeScript extractor suites after NestJS changes | PASS |
 | TypeScript emitter tests | 50 PASS |
 | Generated TypeScript SDK compile gates | 5 PASS |
 | Focused route-prefix snapshots and sidecar tests | PASS |
-| `make check` | BLOCKED after 358 Rust library tests passed; 4 Go-dependent tests could not start without `go` |
+| Post-rebase Rust diagnostic run | 403 library tests PASS with 5 environment-dependent tests filtered; next Go-backed integration stopped on missing `go` |
 
-The local environment does not contain `go` or `gofmt`. The final `make check` run completed formatting
-and clippy, then stopped in `cargo test --all-features`: 358 library tests passed and four tests failed
-with `GoToolchainMissing`. Go extractor/fixture tests, Go-backed snapshots, generated Go
-compile/runtime tests, example regeneration, and therefore the complete gate cannot be represented as
-green here. The Go runtime regression tests are committed and run when the toolchain is present;
-skipped tests are not counted as local execution evidence.
+The local environment does not contain `go`, `gofmt`, Python `pip`, or PyYAML. After rebasing onto the
+current `main`, formatting, clippy, 41 CLI tests, 108 Python extractor tests, all TypeScript extractor
+tests, and 403 Rust library tests passed. That Rust diagnostic run explicitly filtered four tests that
+require Go and one independent-parser test that requires PyYAML; the next Go-backed integration test
+then stopped with `GoToolchainMissing`. The CI and release workflows install pinned PyYAML and Go, but
+Go extractor/fixture tests, Go-backed snapshots, generated Go compile/runtime tests, example
+regeneration, and therefore the complete `make check` gate cannot be represented as green locally.
+Skipped or filtered tests are not counted as execution evidence.
 
 ## Release gate
 

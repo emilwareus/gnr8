@@ -13,12 +13,13 @@ use crate::analyze::facts::{
     Constraints, FieldFact, FieldMeta, LiteralValue, Prim, Type, WellKnown,
 };
 use crate::graph::{
-    ApiGraph, Diagnostic, Operation, Param, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
+    ApiGraph, Diagnostic, DiagnosticCategory, MediaExample, Operation, OperationDocsPolicy, Param,
+    Response, ResponseDocsPolicy, Schema, SchemaRef, SecurityScheme, SourceSpan,
 };
 use crate::CoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecVersion {
+pub(crate) enum SpecVersion {
     Swagger2,
     OpenApi30,
     OpenApi31,
@@ -55,7 +56,10 @@ struct Importer {
     used_schema_names: BTreeSet<String>,
     diagnostics: Vec<Diagnostic>,
     external_docs: BTreeMap<PathBuf, Value>,
+    external_schema_ids: BTreeMap<String, String>,
     used_operation_ids: BTreeSet<String>,
+    operation_security: Vec<crate::graph::OperationSecurityPolicy>,
+    operation_docs: Vec<OperationDocsPolicy>,
 }
 
 /// Load an OpenAPI/Swagger document from `input`, resolved against `project_root`.
@@ -94,7 +98,7 @@ fn read_text(path: &Path) -> Result<String, CoreError> {
     })
 }
 
-fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
+pub(crate) fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
     match serde_json::from_str::<Value>(text) {
         Ok(value) => Ok(value),
         Err(json_err) => noyalib::from_str::<Value>(text).map_err(|yaml_err| CoreError::Config {
@@ -106,7 +110,7 @@ fn parse_json_or_yaml(text: &str, path: &Path) -> Result<Value, CoreError> {
     }
 }
 
-fn detect_version(root: &Value, path: &Path) -> Result<SpecVersion, CoreError> {
+pub(crate) fn detect_version(root: &Value, path: &Path) -> Result<SpecVersion, CoreError> {
     if root.get("swagger").and_then(Value::as_str) == Some("2.0") {
         return Ok(SpecVersion::Swagger2);
     }
@@ -258,7 +262,10 @@ impl Importer {
             used_schema_names: BTreeSet::new(),
             diagnostics: Vec::new(),
             external_docs: BTreeMap::new(),
+            external_schema_ids: BTreeMap::new(),
             used_operation_ids: BTreeSet::new(),
+            operation_security: Vec::new(),
+            operation_docs: Vec::new(),
         }
     }
 
@@ -267,11 +274,17 @@ impl Importer {
         self.validate_representable_responses()?;
         self.collect_root_schemas();
         let security = self.import_security_schemes();
+        let security_requirements = import_security_requirements(self.root.get("security"));
+        let openapi_metadata = self.import_metadata();
         let mut operations = self.import_operations();
         let mut schemas = self.import_schemas();
 
         operations.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
         schemas.sort_by(|a, b| a.id.cmp(&b.id));
+        self.operation_security
+            .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
+        self.operation_docs
+            .sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
         self.diagnostics
             .sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
 
@@ -293,28 +306,30 @@ impl Importer {
                 .and_then(Value::as_str)
                 .unwrap_or("API")
                 .to_string(),
+            openapi_metadata,
             security,
+            security_requirements,
+            operation_security: std::mem::take(&mut self.operation_security),
             runtime: crate::graph::RuntimePolicy::default(),
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
-            operation_docs: Vec::new(),
+            operation_docs: std::mem::take(&mut self.operation_docs),
         })
     }
 
     fn validate_representable_security(&self) -> Result<(), CoreError> {
         let root_security = self.root.get("security").and_then(Value::as_array);
         let raw_schemes = self.raw_security_schemes();
-        if root_security.is_some_and(|requirements| requirements.len() > 1) {
-            return Err(CoreError::Config {
-                message: "OpenAPI source uses alternative top-level security requirements; gnr8 currently supports one AND requirement object, not OR alternatives".to_string(),
-            });
-        }
-        if let Some(requirement) = root_security
-            .and_then(|requirements| requirements.first())
-            .and_then(Value::as_object)
-        {
-            for id in requirement.keys() {
-                Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
+        if let Some(requirements) = root_security {
+            for requirement in requirements {
+                let Some(requirement) = requirement.as_object() else {
+                    return Err(CoreError::Config {
+                        message: "top-level security requirement is not an object".to_string(),
+                    });
+                };
+                for id in requirement.keys() {
+                    Self::validate_security_scheme_ref(&raw_schemes, id, "top-level security")?;
+                }
             }
         }
         let Some(paths) = self.root.get("paths").and_then(Value::as_object) else {
@@ -325,7 +340,7 @@ impl Importer {
                 continue;
             };
             for (method, operation) in path_item {
-                if !is_http_method(method) || !is_lowerable_method(method) {
+                if !is_http_method(method) {
                     continue;
                 }
                 let Some(operation_object) = operation.as_object() else {
@@ -344,14 +359,14 @@ impl Importer {
                         || format!("{} {}", method.to_ascii_uppercase(), path),
                         str::to_string,
                     );
-                if requirements.len() > 1 {
-                    return Err(CoreError::Config {
-                        message: format!(
-                            "operation '{op_label}' uses alternative security requirements; gnr8 currently supports one AND requirement object, not OR alternatives"
-                        ),
-                    });
-                }
-                if let Some(requirement) = requirements.first().and_then(Value::as_object) {
+                for requirement in requirements {
+                    let Some(requirement) = requirement.as_object() else {
+                        return Err(CoreError::Config {
+                            message: format!(
+                                "operation '{op_label}' has a security requirement that is not an object"
+                            ),
+                        });
+                    };
                     for id in requirement.keys() {
                         Self::validate_security_scheme_ref(
                             &raw_schemes,
@@ -425,7 +440,7 @@ impl Importer {
                 continue;
             };
             for (method, operation) in path_item {
-                if !is_http_method(method) || !is_lowerable_method(method) {
+                if !is_http_method(method) {
                     continue;
                 }
                 let Some(operation_object) = operation.as_object() else {
@@ -512,6 +527,97 @@ impl Importer {
         schemes
     }
 
+    fn import_metadata(&self) -> crate::graph::OpenApiMetadataPolicy {
+        let info = self.root.get("info").and_then(Value::as_object);
+        let contact = info
+            .and_then(|info| info.get("contact"))
+            .and_then(Value::as_object)
+            .map(|contact| crate::graph::OpenApiContact {
+                name: contact
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                url: contact
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                email: contact
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            });
+        let license = info
+            .and_then(|info| info.get("license"))
+            .and_then(Value::as_object)
+            .and_then(|license| {
+                Some(crate::graph::OpenApiLicense {
+                    name: license.get("name")?.as_str()?.to_string(),
+                    url: license
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                })
+            });
+        crate::graph::OpenApiMetadataPolicy {
+            version: info
+                .and_then(|info| info.get("version"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            description: info
+                .and_then(|info| info.get("description"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            terms_of_service: info
+                .and_then(|info| info.get("termsOfService"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            contact,
+            license,
+            servers: self.import_servers(),
+        }
+    }
+
+    fn import_servers(&self) -> Vec<crate::graph::OpenApiServer> {
+        if self.version != SpecVersion::Swagger2 {
+            return self
+                .root
+                .get("servers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|server| {
+                    let server = server.as_object()?;
+                    Some(crate::graph::OpenApiServer {
+                        url: server.get("url")?.as_str()?.to_string(),
+                        description: server
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    })
+                })
+                .collect();
+        }
+        let Some(host) = self.root.get("host").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let base_path = self
+            .root
+            .get("basePath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        self.root
+            .get("schemes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|scheme| crate::graph::OpenApiServer {
+                url: format!("{scheme}://{host}{base_path}"),
+                description: None,
+            })
+            .collect()
+    }
+
     fn collect_root_schemas(&mut self) {
         let raw: Vec<(String, Value)> = match self.version {
             SpecVersion::Swagger2 => self
@@ -592,15 +698,6 @@ impl Importer {
                 if !is_http_method(method) {
                     continue;
                 }
-                if !is_lowerable_method(method) {
-                    self.warn(format!(
-                        "operation {} {} uses HTTP method '{}', which gnr8 cannot lower yet",
-                        method.to_uppercase(),
-                        path,
-                        method.to_uppercase()
-                    ));
-                    continue;
-                }
                 let Some(operation_object) = operation.as_object() else {
                     self.warn(format!(
                         "operation {} {path} is not an object",
@@ -608,6 +705,10 @@ impl Importer {
                     ));
                     continue;
                 };
+                let source_operation_id = operation_object
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
                 let operation_id = self.operation_id(method, &path, operation);
                 let group = operation_object
                     .get("tags")
@@ -620,16 +721,18 @@ impl Importer {
                 let mut request_body = None;
                 let mut request_body_required = false;
                 let mut request_body_content_type = None;
+                let mut request_body_content_types = Vec::new();
 
-                let mut all_parameters = path_parameters.clone();
-                if let Some(operation_parameters) =
-                    operation_object.get("parameters").and_then(Value::as_array)
-                {
-                    all_parameters.extend(operation_parameters.iter().cloned());
-                }
+                let all_parameters = self.merge_parameters(
+                    &path_parameters,
+                    operation_object
+                        .get("parameters")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
 
                 for parameter in all_parameters {
-                    let parameter = self.resolve_parameter(parameter);
                     let Some(parameter_object) = parameter.as_object() else {
                         self.warn(format!(
                             "parameter on {} {path} is not an object",
@@ -638,8 +741,8 @@ impl Importer {
                         continue;
                     };
                     match parameter_object.get("in").and_then(Value::as_str) {
-                        Some("path" | "query") => {
-                            if let Some(param) = self.import_param(&parameter) {
+                        Some("path" | "query" | "header" | "cookie") => {
+                            if let Some(param) = self.import_param(&parameter, &operation_id) {
                                 params.push(param);
                             }
                         }
@@ -671,22 +774,35 @@ impl Importer {
                     }
                 }
 
+                if self.version == SpecVersion::Swagger2 && request_body.is_some() {
+                    request_body_content_types = self.swagger_request_media_types(operation);
+                    request_body_content_type =
+                        preferred_request_media_type(&request_body_content_types)
+                            .map(str::to_string);
+                }
+
                 if request_body.is_none() {
                     request_body = match self.version {
                         SpecVersion::Swagger2 => {
                             if form_fields.is_empty() {
                                 None
                             } else {
-                                request_body_content_type = Some(
-                                    if form_fields
-                                        .iter()
-                                        .any(|field| type_contains_bytes(&field.schema))
-                                    {
-                                        "multipart/form-data".to_string()
-                                    } else {
-                                        "application/x-www-form-urlencoded".to_string()
-                                    },
-                                );
+                                let fallback = if form_fields
+                                    .iter()
+                                    .any(|field| type_contains_bytes(&field.schema))
+                                {
+                                    "multipart/form-data"
+                                } else {
+                                    "application/x-www-form-urlencoded"
+                                };
+                                request_body_content_types =
+                                    self.swagger_declared_request_media_types(operation);
+                                if request_body_content_types.is_empty() {
+                                    request_body_content_types.push(fallback.to_string());
+                                }
+                                request_body_content_type =
+                                    preferred_request_media_type(&request_body_content_types)
+                                        .map(str::to_string);
                                 Some(self.insert_synthetic_schema(
                                     &format!("{operation_id}FormRequest"),
                                     Type::Object(form_fields),
@@ -695,15 +811,10 @@ impl Importer {
                         }
                         SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
                             .request_body_schema_ref(operation, &operation_id)
-                            .map(|(schema_ref, media_type)| {
-                                request_body_required = operation
-                                    .get("requestBody")
-                                    .and_then(|body| body.get("required"))
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                if media_type != "application/json" {
-                                    request_body_content_type = Some(media_type);
-                                }
+                            .map(|(schema_ref, media_type, media_types, required)| {
+                                request_body_required = required;
+                                request_body_content_types = media_types;
+                                request_body_content_type = Some(media_type);
                                 schema_ref
                             }),
                     };
@@ -714,10 +825,48 @@ impl Importer {
                         .cmp(&b.name)
                         .then_with(|| a.location.cmp(&b.location))
                 });
-                let mut responses = self.import_responses(operation, &operation_id);
+                let (mut responses, response_docs) =
+                    self.import_responses(operation, &operation_id);
                 responses.sort_by_key(|response| response.status);
-                let security = self.operation_security(operation_object, &operation_id);
+                let request_examples = self.import_request_examples(operation);
+                self.operation_docs.push(OperationDocsPolicy {
+                    operation_id: operation_id.clone(),
+                    openapi_operation_id: source_operation_id
+                        .filter(|source_id| source_id != &operation_id),
+                    summary: operation_object
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    description: operation_object
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    deprecated: operation_object
+                        .get("deprecated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    tags: operation_object
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect(),
+                    request_examples,
+                    request_content_types: request_body_content_types,
+                    responses: response_docs,
+                });
+                let (security, security_alternatives) =
+                    self.import_operation_security(operation_object, &operation_id);
                 let security_overrides_global = operation_object.contains_key("security");
+                if security_overrides_global {
+                    self.operation_security
+                        .push(crate::graph::OperationSecurityPolicy {
+                            operation_id: operation_id.clone(),
+                            alternatives: security_alternatives,
+                        });
+                }
 
                 operations.push(Operation {
                     id: operation_id.clone(),
@@ -740,29 +889,25 @@ impl Importer {
         operations
     }
 
-    fn operation_security(
+    fn import_operation_security(
         &mut self,
         operation_object: &serde_json::Map<String, Value>,
         operation_id: &str,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<crate::graph::SecurityRequirementGroup>) {
         let Some(security) = operation_object.get("security") else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let Some(requirements) = security.as_array() else {
             self.warn(format!(
                 "security on operation '{operation_id}' is not an array and was not imported"
             ));
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if requirements.is_empty() {
-            return Vec::new();
-        }
-        if requirements.len() > 1 {
-            self.warn(format!(
-                "operation '{operation_id}' has alternative security requirements; importing merged scheme ids"
-            ));
+            return (Vec::new(), Vec::new());
         }
         let mut ids = Vec::new();
+        let mut alternatives = Vec::new();
         for requirement in requirements {
             let Some(object) = requirement.as_object() else {
                 self.warn(format!(
@@ -770,11 +915,14 @@ impl Importer {
                 ));
                 continue;
             };
-            ids.extend(object.keys().cloned());
+            let mut schemes: Vec<String> = object.keys().cloned().collect();
+            schemes.sort();
+            ids.extend(schemes.iter().cloned());
+            alternatives.push(crate::graph::SecurityRequirementGroup { schemes });
         }
         ids.sort();
         ids.dedup();
-        ids
+        (ids, alternatives)
     }
 
     fn operation_id(&mut self, method: &str, path: &str, operation: &Value) -> String {
@@ -789,8 +937,8 @@ impl Importer {
         let Some(ref_value) = parameter.get("$ref").and_then(Value::as_str) else {
             return parameter;
         };
-        if let Some((_, schema)) = self.resolve_ref_schema(ref_value) {
-            return schema;
+        if let Some(resolved) = self.resolve_ref_value(ref_value) {
+            return resolved;
         }
         self.warn(format!(
             "parameter reference '{ref_value}' could not be resolved"
@@ -798,24 +946,214 @@ impl Importer {
         parameter
     }
 
-    fn import_param(&mut self, parameter: &Value) -> Option<Param> {
+    fn merge_parameters(&mut self, path: &[Value], operation: &[Value]) -> Vec<Value> {
+        let mut merged = Vec::with_capacity(path.len() + operation.len());
+        for parameter in path.iter().chain(operation) {
+            let parameter = self.resolve_parameter(parameter.clone());
+            let identity = parameter_identity(&parameter);
+            if let Some((name, location)) = identity {
+                if let Some(existing) = merged.iter_mut().find(|existing| {
+                    parameter_identity(existing)
+                        .is_some_and(|candidate| candidate == (name.clone(), location.clone()))
+                }) {
+                    *existing = parameter;
+                    continue;
+                }
+            }
+            merged.push(parameter);
+        }
+        merged
+    }
+
+    fn import_param(&mut self, parameter: &Value, operation_id: &str) -> Option<Param> {
         let name = parameter.get("name").and_then(Value::as_str)?.to_string();
         let location = parameter.get("in").and_then(Value::as_str)?.to_string();
         let required = parameter
             .get("required")
             .and_then(Value::as_bool)
             .unwrap_or(location == "path");
-        let schema = parameter.get("schema").unwrap_or(parameter);
+        let (schema, openapi_content) = self.parameter_schema(parameter, operation_id, &name);
+        let openapi_fields = self.parameter_openapi_fields(parameter);
         let default = schema.get("default").and_then(literal_value);
         let imported = self.type_from_schema(schema);
+        let (style, explode) =
+            self.import_parameter_serialization(parameter, &location, &imported.ty, operation_id);
         Some(Param {
             name,
             location,
             required,
             schema: imported.ty,
             default,
+            style,
+            explode,
+            allow_reserved: parameter
+                .get("allowReserved")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            openapi_content,
+            openapi_fields,
             provenance: self.span(),
         })
+    }
+
+    fn parameter_openapi_fields(&self, parameter: &Value) -> Vec<(String, Value)> {
+        let Some(parameter) = parameter.as_object() else {
+            return Vec::new();
+        };
+        let mut fields = BTreeMap::new();
+        for name in [
+            "description",
+            "deprecated",
+            "allowEmptyValue",
+            "example",
+            "examples",
+        ] {
+            if let Some(value) = parameter.get(name) {
+                fields.insert(name.to_string(), value.clone());
+            }
+        }
+        for (name, value) in parameter {
+            if name.starts_with("x-") {
+                fields.insert(name.clone(), value.clone());
+            }
+        }
+
+        if self.version == SpecVersion::Swagger2 {
+            let mut schema = serde_json::Map::new();
+            for name in [
+                "type",
+                "format",
+                "items",
+                "enum",
+                "default",
+                "minimum",
+                "maximum",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "minLength",
+                "maxLength",
+                "pattern",
+                "minItems",
+                "maxItems",
+                "uniqueItems",
+                "nullable",
+                "x-nullable",
+            ] {
+                if let Some(value) = parameter.get(name) {
+                    schema.insert(name.to_string(), value.clone());
+                }
+            }
+            if !schema.is_empty() {
+                fields.insert("schema".to_string(), Value::Object(schema));
+            }
+        } else if let Some(schema) = parameter.get("schema") {
+            fields.insert("schema".to_string(), schema.clone());
+        }
+
+        fields.into_iter().collect()
+    }
+
+    fn parameter_schema<'a>(
+        &mut self,
+        parameter: &'a Value,
+        operation_id: &str,
+        name: &str,
+    ) -> (&'a Value, Option<Value>) {
+        if let Some(schema) = parameter.get("schema") {
+            if self.version != SpecVersion::Swagger2 && parameter.get("content").is_some() {
+                self.warn_request_parameter(
+                    operation_id,
+                    name,
+                    "the parameter defines both schema and content",
+                );
+            }
+            return (schema, None);
+        }
+        if self.version == SpecVersion::Swagger2 {
+            return (parameter, None);
+        }
+        let Some(content) = parameter.get("content") else {
+            return (parameter, None);
+        };
+        let Some(content_object) = content.as_object() else {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                "the parameter content value is not an object",
+            );
+            return (parameter, Some(content.clone()));
+        };
+        if content_object.len() != 1 {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                "the parameter content object must contain exactly one media type",
+            );
+        }
+        let Some((media_type, media)) = content_object.iter().next() else {
+            return (parameter, Some(content.clone()));
+        };
+        let Some(schema) = media.get("schema") else {
+            self.warn_request_parameter(
+                operation_id,
+                name,
+                &format!("parameter media type '{media_type}' has no schema"),
+            );
+            return (parameter, Some(content.clone()));
+        };
+        (schema, Some(content.clone()))
+    }
+
+    fn import_parameter_serialization(
+        &mut self,
+        parameter: &Value,
+        location: &str,
+        schema: &Type,
+        operation_id: &str,
+    ) -> (Option<String>, Option<bool>) {
+        if self.version != SpecVersion::Swagger2 {
+            return (
+                parameter
+                    .get("style")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                parameter.get("explode").and_then(Value::as_bool),
+            );
+        }
+        if !matches!(schema, Type::Array(_)) {
+            return (None, None);
+        }
+
+        let collection = parameter
+            .get("collectionFormat")
+            .and_then(Value::as_str)
+            .unwrap_or("csv");
+        let serialization = match (location, collection) {
+            ("query", "multi") => ("form", true),
+            ("query", "ssv") => ("spaceDelimited", false),
+            ("query", "pipes") => ("pipeDelimited", false),
+            ("query" | "path" | "header", "csv") => ("form", false),
+            _ => {
+                let name = parameter
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("parameter");
+                self.warn_request_parameter(
+                    operation_id,
+                    name,
+                    &format!(
+                        "Swagger collectionFormat '{collection}' at location '{location}' has no representable OpenAPI 3 serialization"
+                    ),
+                );
+                ("form", false)
+            }
+        };
+        let style = if matches!(location, "path" | "header") {
+            "simple"
+        } else {
+            serialization.0
+        };
+        (Some(style.to_string()), Some(serialization.1))
     }
 
     fn field_from_parameter(&mut self, parameter: &Value) -> Option<FieldFact> {
@@ -847,24 +1185,33 @@ impl Importer {
         &mut self,
         operation: &Value,
         operation_id: &str,
-    ) -> Option<(SchemaRef, String)> {
-        let request_body = operation.get("requestBody")?;
-        if request_body.get("$ref").is_some() {
-            self.warn(format!(
-                "requestBody $ref on operation '{operation_id}' is not imported yet"
-            ));
-            return None;
+    ) -> Option<(SchemaRef, String, Vec<String>, bool)> {
+        let mut request_body = operation.get("requestBody")?.clone();
+        if let Some(ref_value) = request_body.get("$ref").and_then(Value::as_str) {
+            let Some(resolved) = self.resolve_ref_value(ref_value) else {
+                self.warn_request_body(
+                    operation_id,
+                    ref_value,
+                    "the requestBody reference could not be resolved",
+                );
+                return None;
+            };
+            request_body = resolved;
         }
         let Some(content) = request_body.get("content").and_then(Value::as_object) else {
-            self.warn(format!(
-                "requestBody on operation '{operation_id}' has no content object"
-            ));
+            self.warn_request_body(
+                operation_id,
+                "requestBody",
+                "the requestBody has no content object",
+            );
             return None;
         };
         let Some((media_type, media)) = choose_content(content) else {
-            self.warn(format!(
-                "requestBody on operation '{operation_id}' has no supported media type"
-            ));
+            self.warn_request_body(
+                operation_id,
+                "requestBody",
+                "the requestBody has no supported media type",
+            );
             return None;
         };
         if !is_supported_request_media(media_type) {
@@ -873,118 +1220,343 @@ impl Importer {
             ));
         }
         let Some(schema) = media.get("schema") else {
-            self.warn(format!(
-                "requestBody media type '{media_type}' on operation '{operation_id}' has no schema"
-            ));
+            self.warn_request_body(
+                operation_id,
+                media_type,
+                "the selected request media type has no schema",
+            );
             return None;
         };
+        let content_types =
+            self.request_content_types_for_schema(content, media_type, schema, operation_id);
         Some((
             self.schema_ref_for(schema, &format!("{operation_id}Request")),
             media_type.to_string(),
+            content_types,
+            request_body
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ))
     }
 
-    fn import_responses(&mut self, operation: &Value, operation_id: &str) -> Vec<Response> {
-        let mut responses = Vec::new();
-        let Some(response_map) = operation.get("responses").and_then(Value::as_object) else {
-            return responses;
+    fn request_content_types_for_schema(
+        &mut self,
+        content: &serde_json::Map<String, Value>,
+        selected_media_type: &str,
+        selected_schema: &Value,
+        operation_id: &str,
+    ) -> Vec<String> {
+        let mut content_types = vec![selected_media_type.to_string()];
+        for (media_type, media) in content {
+            if media_type == selected_media_type {
+                continue;
+            }
+            let Some(schema) = media.get("schema") else {
+                self.warn_request_body(operation_id, media_type, "the media type has no schema");
+                continue;
+            };
+            if schema == selected_schema {
+                content_types.push(media_type.clone());
+            } else {
+                self.warn_request_body(
+                    operation_id,
+                    media_type,
+                    "the media type has a different request schema",
+                );
+            }
+        }
+        content_types
+    }
+
+    fn import_request_examples(&mut self, operation: &Value) -> Vec<MediaExample> {
+        if self.version == SpecVersion::Swagger2 {
+            return Vec::new();
+        }
+        let Some(raw_body) = operation.get("requestBody") else {
+            return Vec::new();
         };
-        for (status, response) in response_map {
+        let body = raw_body
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|ref_value| self.resolve_ref_value(ref_value))
+            .unwrap_or_else(|| raw_body.clone());
+        body.get("content")
+            .and_then(Value::as_object)
+            .map_or_else(Vec::new, |content| self.import_content_examples(content))
+    }
+
+    fn import_response_examples(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+    ) -> Vec<MediaExample> {
+        if self.version != SpecVersion::Swagger2 {
+            return response
+                .get("content")
+                .and_then(Value::as_object)
+                .map_or_else(Vec::new, |content| self.import_content_examples(content));
+        }
+        let Some(examples) = response.get("examples").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let accepted = self.swagger_response_media_types(operation);
+        examples
+            .iter()
+            .filter(|(content_type, _)| accepted.contains(content_type))
+            .map(|(content_type, value)| MediaExample {
+                name: "default".to_string(),
+                content_type: content_type.clone(),
+                summary: None,
+                description: None,
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    fn import_content_examples(
+        &mut self,
+        content: &serde_json::Map<String, Value>,
+    ) -> Vec<MediaExample> {
+        let mut imported = Vec::new();
+        for (content_type, media) in content {
+            if let Some(value) = media.get("example") {
+                imported.push(MediaExample {
+                    name: "default".to_string(),
+                    content_type: content_type.clone(),
+                    summary: None,
+                    description: None,
+                    value: value.clone(),
+                });
+            }
+            let Some(examples) = media.get("examples").and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, raw_example) in examples {
+                let example = raw_example
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|ref_value| self.resolve_ref_value(ref_value))
+                    .unwrap_or_else(|| raw_example.clone());
+                let (summary, description, value) = example.as_object().map_or_else(
+                    || (None, None, Some(example.clone())),
+                    |example| {
+                        (
+                            example
+                                .get("summary")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            example
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            example.get("value").cloned(),
+                        )
+                    },
+                );
+                let Some(value) = value else {
+                    self.warn(format!(
+                        "example '{name}' for media type '{content_type}' has no inline value and was not imported"
+                    ));
+                    continue;
+                };
+                imported.push(MediaExample {
+                    name: name.clone(),
+                    content_type: content_type.clone(),
+                    summary,
+                    description,
+                    value,
+                });
+            }
+        }
+        imported.sort_by(|a, b| {
+            a.content_type
+                .cmp(&b.content_type)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        imported
+    }
+
+    fn import_responses(
+        &mut self,
+        operation: &Value,
+        operation_id: &str,
+    ) -> (Vec<Response>, Vec<ResponseDocsPolicy>) {
+        let mut responses = Vec::new();
+        let mut docs = Vec::new();
+        let Some(response_map) = operation.get("responses").and_then(Value::as_object) else {
+            return (responses, docs);
+        };
+        for (status, raw_response) in response_map {
             let Ok(status_code) = status.parse::<u16>() else {
                 continue;
             };
-            if matches!(
-                self.version,
-                SpecVersion::OpenApi30 | SpecVersion::OpenApi31
-            ) {
-                if let Some(media) = response
-                    .get("content")
-                    .and_then(Value::as_object)
-                    .and_then(|content| content.get("text/event-stream"))
-                {
-                    responses.push(Response {
-                        status: status_code,
-                        body: media.get("schema").map(|schema| {
-                            self.schema_ref_for(
-                                schema,
-                                &format!("{operation_id}{status_code}Event"),
-                            )
-                        }),
-                        body_kind: "sse".to_string(),
-                        content_type: Some("text/event-stream".to_string()),
-                        content_types: vec!["text/event-stream".to_string()],
-                    });
-                    continue;
-                }
-            }
-            let selected: Option<(String, &Value)> = match self.version {
-                SpecVersion::Swagger2 => response
-                    .get("schema")
-                    .map(|schema| (self.swagger_response_media_type(operation), schema)),
-                SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => response
-                    .get("content")
-                    .and_then(Value::as_object)
-                    .and_then(choose_content)
-                    .and_then(|(media_type, media)| {
-                        media
-                            .get("schema")
-                            .map(|schema| (media_type.to_string(), schema))
+            let response = self.resolve_response(raw_response, operation_id, status_code);
+            docs.push(ResponseDocsPolicy {
+                status: status_code,
+                description: response
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                examples: self.import_response_examples(operation, &response),
+            });
+            responses.push(self.import_response(operation, &response, operation_id, status_code));
+        }
+        (responses, docs)
+    }
+
+    fn import_response(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+        operation_id: &str,
+        status: u16,
+    ) -> Response {
+        if matches!(
+            self.version,
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31
+        ) {
+            if let Some(media) = response
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(|content| content.get("text/event-stream"))
+            {
+                return Response {
+                    status,
+                    body: media.get("schema").map(|schema| {
+                        self.schema_ref_for(schema, &format!("{operation_id}{status}Event"))
                     }),
+                    body_kind: "sse".to_string(),
+                    content_type: Some("text/event-stream".to_string()),
+                    content_types: vec!["text/event-stream".to_string()],
+                };
+            }
+        }
+        let selected: Option<(String, &Value)> = match self.version {
+            SpecVersion::Swagger2 => response
+                .get("schema")
+                .map(|schema| (self.swagger_response_media_type(operation), schema)),
+            SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => response
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(choose_content)
+                .and_then(|(media_type, media)| {
+                    media
+                        .get("schema")
+                        .map(|schema| (media_type.to_string(), schema))
+                }),
+        };
+        let Some((media_type, schema)) = selected else {
+            return Response {
+                status,
+                body: None,
+                body_kind: "empty".to_string(),
+                content_type: None,
+                content_types: Vec::new(),
             };
-            let Some((media_type, schema)) = selected else {
-                responses.push(Response {
-                    status: status_code,
-                    body: None,
-                    body_kind: "empty".to_string(),
-                    content_type: None,
-                    content_types: Vec::new(),
-                });
-                continue;
+        };
+        self.import_schema_response(
+            operation,
+            response,
+            operation_id,
+            status,
+            media_type,
+            schema,
+        )
+    }
+
+    fn import_schema_response(
+        &mut self,
+        operation: &Value,
+        response: &Value,
+        operation_id: &str,
+        status: u16,
+        media_type: String,
+        schema: &Value,
+    ) -> Response {
+        if self.response_schema_is_binary(schema) {
+            let swagger_declared = if self.version == SpecVersion::Swagger2 {
+                self.swagger_declared_response_media_types(operation)
+            } else {
+                Vec::new()
             };
-            if self.response_schema_is_binary(schema) {
-                let content_type =
-                    if self.version == SpecVersion::Swagger2 && media_type == "application/json" {
-                        "application/octet-stream".to_string()
-                    } else {
-                        media_type
-                    };
-                let content_types = self.response_content_types_for_kind(
+            let content_type = if self.version == SpecVersion::Swagger2
+                && swagger_declared.is_empty()
+                && media_type == "application/json"
+            {
+                "application/octet-stream".to_string()
+            } else {
+                media_type
+            };
+            let content_types = if self.version == SpecVersion::Swagger2 {
+                if swagger_declared.is_empty() {
+                    vec![content_type.clone()]
+                } else {
+                    swagger_declared
+                }
+            } else {
+                self.response_content_types_for_kind(
                     response,
                     &content_type,
+                    schema,
                     ImportedResponseKind::Binary,
-                );
-                responses.push(Response {
-                    status: status_code,
-                    body: None,
-                    body_kind: "binary".to_string(),
-                    content_type: Some(content_type.clone()),
-                    content_types,
-                });
-                continue;
-            }
-            let content_types = self.response_content_types_for_kind(
+                    operation_id,
+                    status,
+                )
+            };
+            return Response {
+                status,
+                body: None,
+                body_kind: "binary".to_string(),
+                content_type: Some(content_type),
+                content_types,
+            };
+        }
+        let content_types = if self.version == SpecVersion::Swagger2 {
+            self.swagger_response_media_types(operation)
+        } else {
+            self.response_content_types_for_kind(
                 response,
                 &media_type,
+                schema,
                 ImportedResponseKind::Json,
-            );
-            responses.push(Response {
-                status: status_code,
-                body: Some(
-                    self.schema_ref_for(schema, &format!("{operation_id}{status_code}Response")),
-                ),
-                body_kind: "json".to_string(),
-                content_type: (media_type != "application/json").then_some(media_type.clone()),
-                content_types,
-            });
+                operation_id,
+                status,
+            )
+        };
+        Response {
+            status,
+            body: Some(self.schema_ref_for(schema, &format!("{operation_id}{status}Response"))),
+            body_kind: "json".to_string(),
+            content_type: (media_type != "application/json").then_some(media_type),
+            content_types,
         }
-        responses
+    }
+
+    fn resolve_response(&mut self, raw_response: &Value, operation_id: &str, status: u16) -> Value {
+        let Some(ref_value) = raw_response.get("$ref").and_then(Value::as_str) else {
+            return raw_response.clone();
+        };
+        if let Some(resolved) = self.resolve_ref_value(ref_value) {
+            return resolved;
+        }
+        self.warn_response_schema(
+            operation_id,
+            status,
+            ref_value,
+            "the response reference could not be resolved",
+        );
+        raw_response.clone()
     }
 
     fn response_content_types_for_kind(
         &mut self,
         response: &Value,
         selected_media_type: &str,
+        selected_schema: &Value,
         kind: ImportedResponseKind,
+        operation_id: &str,
+        status: u16,
     ) -> Vec<String> {
         let mut content_types = vec![selected_media_type.to_string()];
         let Some(content) = response.get("content").and_then(Value::as_object) else {
@@ -995,33 +1567,89 @@ impl Importer {
                 continue;
             }
             let Some(schema) = media.get("schema") else {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has no schema",
+                );
                 continue;
             };
             let is_binary = self.response_schema_is_binary(schema);
-            if (kind == ImportedResponseKind::Binary && is_binary)
-                || (kind == ImportedResponseKind::Json && !is_binary)
-            {
+            let same_kind = (kind == ImportedResponseKind::Binary && is_binary)
+                || (kind == ImportedResponseKind::Json && !is_binary);
+            if !same_kind {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has a different response body kind",
+                );
+                continue;
+            }
+            if schema == selected_schema {
                 content_types.push(media_type.clone());
+            } else {
+                self.warn_response_schema(
+                    operation_id,
+                    status,
+                    media_type,
+                    "the media type has a different response schema",
+                );
             }
         }
         content_types
     }
 
     fn swagger_response_media_type(&self, operation: &Value) -> String {
+        self.swagger_response_media_types(operation)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "application/json".to_string())
+    }
+
+    fn swagger_request_media_types(&self, operation: &Value) -> Vec<String> {
+        let declared = self.swagger_declared_request_media_types(operation);
+        if declared.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            declared
+        }
+    }
+
+    fn swagger_declared_request_media_types(&self, operation: &Value) -> Vec<String> {
+        operation
+            .get("consumes")
+            .and_then(Value::as_array)
+            .filter(|values| !values.is_empty())
+            .or_else(|| self.root.get("consumes").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn swagger_response_media_types(&self, operation: &Value) -> Vec<String> {
+        let declared = self.swagger_declared_response_media_types(operation);
+        if declared.is_empty() {
+            vec!["application/json".to_string()]
+        } else {
+            declared
+        }
+    }
+
+    fn swagger_declared_response_media_types(&self, operation: &Value) -> Vec<String> {
         operation
             .get("produces")
             .and_then(Value::as_array)
-            .and_then(|values| values.first())
-            .and_then(Value::as_str)
-            .or_else(|| {
-                self.root
-                    .get("produces")
-                    .and_then(Value::as_array)
-                    .and_then(|values| values.first())
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("application/json")
-            .to_string()
+            .filter(|values| !values.is_empty())
+            .or_else(|| self.root.get("produces").and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
     }
 
     fn response_schema_is_binary(&mut self, schema: &Value) -> bool {
@@ -1358,8 +1986,9 @@ impl Importer {
 
     fn resolve_ref_schema(&mut self, ref_value: &str) -> Option<(String, Value)> {
         let (file_part, pointer) = split_ref(ref_value);
-        let id = schema_id_from_pointer(pointer).unwrap_or_else(|| sanitize_identifier(ref_value));
         if file_part.is_empty() {
+            let id =
+                schema_id_from_pointer(pointer).unwrap_or_else(|| sanitize_identifier(ref_value));
             if let Some(schema) = self.raw_schemas.get(&id).cloned() {
                 return Some((id, schema));
             }
@@ -1368,12 +1997,36 @@ impl Importer {
             return Some((id, resolved));
         }
 
-        let external_doc = self.external_doc(file_part)?;
-        let resolved = resolve_pointer(&external_doc, pointer)?;
-        self.raw_schemas
-            .entry(id.clone())
-            .or_insert_with(|| resolved.clone());
+        let normalized_file = normalize_ref_file(file_part);
+        let key = format!("{normalized_file}#{pointer}");
+        if let Some(id) = self.external_schema_ids.get(&key) {
+            return self
+                .raw_schemas
+                .get(id)
+                .cloned()
+                .map(|schema| (id.clone(), schema));
+        }
+        let external_doc = self.external_doc(&normalized_file)?;
+        let mut resolved = resolve_pointer(&external_doc, pointer)?;
+        rebase_external_refs(&mut resolved, &normalized_file);
+        let base_id = schema_id_from_pointer(pointer)
+            .unwrap_or_else(|| sanitize_identifier(&normalized_file));
+        let id = unique_schema_id(&base_id, &self.raw_schemas);
+        self.external_schema_ids.insert(key, id.clone());
+        self.raw_schemas.insert(id.clone(), resolved.clone());
         Some((id, resolved))
+    }
+
+    fn resolve_ref_value(&mut self, ref_value: &str) -> Option<Value> {
+        let (file_part, pointer) = split_ref(ref_value);
+        if file_part.is_empty() {
+            return resolve_pointer(&self.root, pointer);
+        }
+        let normalized_file = normalize_ref_file(file_part);
+        let external_doc = self.external_doc(&normalized_file)?;
+        let mut resolved = resolve_pointer(&external_doc, pointer)?;
+        rebase_external_refs(&mut resolved, &normalized_file);
+        Some(resolved)
     }
 
     fn external_doc(&mut self, file_part: &str) -> Option<Value> {
@@ -1382,22 +2035,42 @@ impl Importer {
             .parent()
             .unwrap_or(self.project_root.as_path());
         let path = base_dir.join(file_part);
-        if let Some(doc) = self.external_docs.get(&path) {
-            return Some(doc.clone());
-        }
-        let text = match read_text(&path) {
-            Ok(text) => text,
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
             Err(err) => {
                 self.warn(format!(
-                    "failed to read external OpenAPI ref '{}': {err}",
+                    "failed to resolve external OpenAPI ref '{}': {err}",
                     path.display()
                 ));
                 return None;
             }
         };
-        match parse_json_or_yaml(&text, &path) {
+        let project_root =
+            std::fs::canonicalize(&self.project_root).unwrap_or_else(|_| self.project_root.clone());
+        if !canonical.starts_with(&project_root) {
+            self.warn(format!(
+                "external OpenAPI ref '{}' escapes project root '{}' and was rejected",
+                canonical.display(),
+                project_root.display()
+            ));
+            return None;
+        }
+        if let Some(doc) = self.external_docs.get(&canonical) {
+            return Some(doc.clone());
+        }
+        let text = match read_text(&canonical) {
+            Ok(text) => text,
+            Err(err) => {
+                self.warn(format!(
+                    "failed to read external OpenAPI ref '{}': {err}",
+                    canonical.display()
+                ));
+                return None;
+            }
+        };
+        match parse_json_or_yaml(&text, &canonical) {
             Ok(doc) => {
-                self.external_docs.insert(path, doc.clone());
+                self.external_docs.insert(canonical, doc.clone());
                 Some(doc)
             }
             Err(err) => {
@@ -1416,12 +2089,71 @@ impl Importer {
     }
 
     fn warn(&mut self, message: String) {
-        self.diagnostics.push(Diagnostic {
-            severity: "WARN".to_string(),
+        self.diagnostics.push(Diagnostic::new(
+            "source.openapi.unrepresentable",
+            DiagnosticCategory::Source,
+            "WARN",
             message,
-            file: self.display_file(),
-            line: 1,
-        });
+            SourceSpan {
+                file: self.display_file(),
+                start_line: 1,
+                end_line: 1,
+            },
+        ));
+    }
+
+    fn warn_response_schema(
+        &mut self,
+        operation_id: &str,
+        status: u16,
+        media_type: &str,
+        reason: &str,
+    ) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "response.schema.unresolved",
+                DiagnosticCategory::Response,
+                "WARN",
+                format!(
+                    "response {status} on operation '{operation_id}' cannot preserve media type \
+                     '{media_type}': {reason}; the graph supports one response schema per status"
+                ),
+                span,
+            )
+            .operation(operation_id)
+            .subject(format!("{status} {media_type}")),
+        );
+    }
+
+    fn warn_request_body(&mut self, operation_id: &str, subject: &str, reason: &str) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "request.body.unresolved",
+                DiagnosticCategory::RequestBody,
+                "WARN",
+                format!("request body on operation '{operation_id}' is unresolved: {reason}"),
+                span,
+            )
+            .operation(operation_id)
+            .subject(subject),
+        );
+    }
+
+    fn warn_request_parameter(&mut self, operation_id: &str, subject: &str, reason: &str) {
+        let span = self.span();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "request.parameter.unresolved",
+                DiagnosticCategory::RequestParameter,
+                "WARN",
+                format!("request parameter on operation '{operation_id}' is unresolved: {reason}"),
+                span,
+            )
+            .operation(operation_id)
+            .subject(subject),
+        );
     }
 
     fn display_file(&self) -> String {
@@ -1438,8 +2170,74 @@ fn split_ref(ref_value: &str) -> (&str, &str) {
             let pointer = if pointer.is_empty() { "/" } else { pointer };
             (file, pointer)
         }
-        None => ("", ref_value),
+        None => (ref_value, "/"),
     }
+}
+
+fn normalize_ref_file(file: &str) -> String {
+    let absolute = file.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in file.split('/') {
+        if matches!(part, "" | ".") {
+            continue;
+        }
+        if part == ".." && parts.last().is_some_and(|last| *last != "..") {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+    let normalized = parts.join("/");
+    if absolute {
+        format!("/{normalized}")
+    } else {
+        normalized
+    }
+}
+
+fn rebase_external_refs(value: &mut Value, current_file: &str) {
+    match value {
+        Value::Object(object) => {
+            if let Some(ref_value) = object.get_mut("$ref") {
+                if let Some(original) = ref_value.as_str().map(str::to_string) {
+                    let (file_part, pointer) = split_ref(&original);
+                    if !file_part.contains("://") {
+                        let rebased_file = if file_part.is_empty() {
+                            current_file.to_string()
+                        } else if file_part.starts_with('/') {
+                            normalize_ref_file(file_part)
+                        } else {
+                            let parent = current_file
+                                .rsplit_once('/')
+                                .map_or("", |(parent, _)| parent);
+                            if parent.is_empty() {
+                                normalize_ref_file(file_part)
+                            } else {
+                                normalize_ref_file(&format!("{parent}/{file_part}"))
+                            }
+                        };
+                        *ref_value = Value::String(format!("{rebased_file}#{pointer}"));
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                rebase_external_refs(child, current_file);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rebase_external_refs(item, current_file);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn parameter_identity(parameter: &Value) -> Option<(String, String)> {
+    Some((
+        parameter.get("name")?.as_str()?.to_string(),
+        parameter.get("in")?.as_str()?.to_string(),
+    ))
 }
 
 fn schema_id_from_pointer(pointer: &str) -> Option<String> {
@@ -1628,6 +2426,22 @@ fn security_requirement_scheme_ids(security: Option<&Value>) -> BTreeSet<String>
         .unwrap_or_default()
 }
 
+fn import_security_requirements(
+    security: Option<&Value>,
+) -> Vec<crate::graph::SecurityRequirementGroup> {
+    security
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .map(|requirement| {
+            let mut schemes: Vec<String> = requirement.keys().cloned().collect();
+            schemes.sort();
+            crate::graph::SecurityRequirementGroup { schemes }
+        })
+        .collect()
+}
+
 fn choose_content(content: &serde_json::Map<String, Value>) -> Option<(&str, &Value)> {
     for preferred in [
         "application/json",
@@ -1642,6 +2456,19 @@ fn choose_content(content: &serde_json::Map<String, Value>) -> Option<(&str, &Va
         .iter()
         .next()
         .map(|(media_type, media)| (media_type.as_str(), media))
+}
+
+fn preferred_request_media_type(content_types: &[String]) -> Option<&str> {
+    for preferred in [
+        "application/json",
+        "multipart/form-data",
+        "application/x-www-form-urlencoded",
+    ] {
+        if content_types.iter().any(|candidate| candidate == preferred) {
+            return Some(preferred);
+        }
+    }
+    content_types.first().map(String::as_str)
 }
 
 fn is_supported_request_media(media_type: &str) -> bool {
@@ -1671,10 +2498,6 @@ fn is_http_method(method: &str) -> bool {
         method,
         "get" | "put" | "post" | "delete" | "patch" | "options" | "head" | "trace"
     )
-}
-
-fn is_lowerable_method(method: &str) -> bool {
-    matches!(method, "get" | "put" | "post" | "patch" | "delete")
 }
 
 fn normalize_path(path: &str) -> String {
@@ -1793,6 +2616,20 @@ fn unique_synthetic_id(suggested: &str, raw_schemas: &BTreeMap<String, Value>) -
     }
 }
 
+fn unique_schema_id(base: &str, raw_schemas: &BTreeMap<String, Value>) -> String {
+    if !raw_schemas.contains_key(base) {
+        return base.to_string();
+    }
+    let mut index = 2_u32;
+    loop {
+        let candidate = format!("{base}{index}");
+        if !raw_schemas.contains_key(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -1805,6 +2642,7 @@ mod tests {
     use crate::sdk::builtins::{OpenApi, OpenApi31Json, TsSdk};
     use crate::sdk::profile::SdkProfile;
     use crate::sdk::{Cx, Pipeline};
+    use serde_json::Value;
 
     #[test]
     fn detects_supported_spec_versions() {
@@ -1954,6 +2792,636 @@ components:
     }
 
     #[test]
+    fn imports_header_and_cookie_parameters_without_losing_wire_metadata() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          schema: { type: string }
+        - name: session
+          in: cookie
+          required: false
+          style: form
+          explode: true
+          schema: { type: string }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let params = &graph.operations[0].params;
+        assert!(params.iter().any(|param| {
+            param.name == "X-Signature" && param.location == "header" && param.required
+        }));
+        assert!(params.iter().any(|param| {
+            param.name == "session"
+                && param.location == "cookie"
+                && !param.required
+                && param.style.as_deref() == Some("form")
+                && param.explode == Some(true)
+        }));
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let yaml = to_openapi(&graph, "Parameter API", "/", &graph.security).unwrap();
+        assert!(
+            yaml.contains("name: X-Signature\n        in: header"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("name: session\n        in: cookie"), "{yaml}");
+    }
+
+    #[test]
+    fn parameter_refs_do_not_alias_or_register_component_schemas() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      parameters:
+        - { $ref: '#/components/parameters/Trace' }
+        - { $ref: '#/components/parameters/Locale' }
+      responses: { '204': { description: ok } }
+components:
+  parameters:
+    Trace:
+      name: X-Trace-Id
+      in: header
+      required: true
+      schema: { type: string }
+    Locale:
+      name: locale
+      in: query
+      schema: { type: string }
+  schemas:
+    Trace:
+      type: object
+      properties:
+        id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert!(graph.operations[0]
+            .params
+            .iter()
+            .any(|param| param.name == "X-Trace-Id" && param.location == "header"));
+        assert!(graph.operations[0]
+            .params
+            .iter()
+            .any(|param| param.name == "locale" && param.location == "query"));
+        assert_eq!(
+            graph
+                .schemas
+                .iter()
+                .filter(|schema| schema.id == "Trace")
+                .count(),
+            1
+        );
+        assert!(!graph.schemas.iter().any(|schema| schema.id == "Locale"));
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+    }
+
+    #[test]
+    fn operation_parameters_override_matching_path_parameters() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Parameter API, version: 1.0.0 }
+paths:
+  /reports:
+    parameters:
+      - name: locale
+        in: query
+        schema: { type: string }
+      - name: X-Trace-Id
+        in: header
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getReport
+      parameters:
+        - name: locale
+          in: query
+          required: true
+          schema: { type: integer, format: int32 }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let params = &graph.operations[0].params;
+        assert_eq!(params.len(), 2, "{params:?}");
+        let locale = params.iter().find(|param| param.name == "locale").unwrap();
+        assert!(locale.required);
+        assert_eq!(
+            locale.schema,
+            Type::Primitive(Prim::Int {
+                bits: 32,
+                signed: true
+            })
+        );
+        assert!(params
+            .iter()
+            .any(|param| param.name == "X-Trace-Id" && param.location == "header"));
+    }
+
+    #[test]
+    fn imports_referenced_request_bodies_with_requiredness() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Upload API, version: 1.0.0 }
+paths:
+  /uploads:
+    post:
+      operationId: createUpload
+      requestBody: { $ref: '#/components/requestBodies/Upload' }
+      responses: { '204': { description: ok } }
+components:
+  requestBodies:
+    Upload:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Upload' }
+  schemas:
+    Upload:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let operation = &graph.operations[0];
+        assert!(operation.request_body_required);
+        assert_eq!(
+            operation
+                .request_body
+                .as_ref()
+                .map(|schema| schema.ref_id.as_str()),
+            Some("Upload")
+        );
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let unresolved = text.replace(
+            "#/components/requestBodies/Upload",
+            "#/components/requestBodies/Missing",
+        );
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            &unresolved,
+        )
+        .unwrap();
+        assert!(graph.operations[0].request_body.is_none());
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.body.unresolved"
+                && diagnostic.operation.as_deref() == Some("createUpload")
+                && diagnostic.subject.as_deref() == Some("#/components/requestBodies/Missing")
+        }));
+    }
+
+    #[test]
+    fn imports_referenced_responses_and_diagnoses_missing_refs() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      responses:
+        '200': { $ref: '#/components/responses/Report' }
+components:
+  responses:
+    Report:
+      description: report
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Report' }
+  schemas:
+    Report:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let response = &graph.operations[0].responses[0];
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_kind, "json");
+        assert_eq!(
+            response.body.as_ref().map(|schema| schema.ref_id.as_str()),
+            Some("Report")
+        );
+        assert!(graph.diagnostics.is_empty(), "{:?}", graph.diagnostics);
+
+        let unresolved = text.replace(
+            "#/components/responses/Report",
+            "#/components/responses/Missing",
+        );
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            &unresolved,
+        )
+        .unwrap();
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "response.schema.unresolved"
+                && diagnostic.operation.as_deref() == Some("getReport")
+                && diagnostic.subject.as_deref() == Some("200 #/components/responses/Missing")
+        }));
+    }
+
+    #[test]
+    fn imports_operation_documentation_and_named_media_examples() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      summary: Create a report
+      description: Creates an audited report.
+      tags: [Reports, Audited]
+      deprecated: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { name: { type: string } } }
+            examples:
+              primary:
+                summary: Main request
+                description: The normal request.
+                value: { name: quarterly }
+      responses:
+        '201':
+          description: Report created
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+              examples:
+                created:
+                  summary: Created response
+                  value: { id: report-1 }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let docs = &graph.operation_docs[0];
+        assert_eq!(docs.summary.as_deref(), Some("Create a report"));
+        assert_eq!(
+            docs.description.as_deref(),
+            Some("Creates an audited report.")
+        );
+        assert_eq!(docs.tags, vec!["Reports", "Audited"]);
+        assert!(docs.deprecated);
+        assert_eq!(docs.request_examples.len(), 1);
+        assert_eq!(
+            docs.responses[0].description.as_deref(),
+            Some("Report created")
+        );
+        assert_eq!(docs.responses[0].examples.len(), 1);
+
+        let yaml = to_openapi(&graph, "Report API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let operation = emitted.pointer("/paths/~1reports/post").unwrap();
+        assert_eq!(
+            operation.get("summary").and_then(Value::as_str),
+            Some("Create a report")
+        );
+        assert_eq!(
+            operation.get("tags").and_then(Value::as_array),
+            Some(&vec![
+                Value::String("Reports".to_string()),
+                Value::String("Audited".to_string())
+            ])
+        );
+        assert_eq!(
+            operation.pointer("/requestBody/content/application~1json/examples/primary/value/name"),
+            Some(&Value::String("quarterly".to_string()))
+        );
+        assert_eq!(
+            operation
+                .pointer("/responses/201/description")
+                .and_then(Value::as_str),
+            Some("Report created")
+        );
+        assert_eq!(
+            operation.pointer("/responses/201/content/application~1json/examples/created/value/id"),
+            Some(&Value::String("report-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn preserves_public_operation_id_separately_from_sdk_identity() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Reports API, version: 1.0.0 }
+paths:
+  /reports:
+    get:
+      operationId: reports.list-v1
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(graph.operations[0].id, "reportsListV1");
+        assert_eq!(graph.operations[0].handler, "reportsListV1");
+        assert_eq!(
+            graph.operation_docs[0].openapi_operation_id.as_deref(),
+            Some("reports.list-v1")
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        assert_eq!(
+            emitted
+                .pointer("/paths/~1reports/get/operationId")
+                .and_then(Value::as_str),
+            Some("reports.list-v1")
+        );
+    }
+
+    #[test]
+    fn preserves_parameter_content_while_extracting_its_sdk_type() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - name: filter
+          in: query
+          required: true
+          content:
+            application/json:
+              schema: { type: array, items: { type: integer, format: int64 } }
+              example: [1, 2]
+              x-codec: compact
+      responses: { '204': { description: ok } }
+";
+        let source = parse_json_or_yaml(text, std::path::Path::new("openapi.yaml")).unwrap();
+        let source_content = source
+            .pointer("/paths/~1search/get/parameters/0/content")
+            .unwrap();
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let parameter = &graph.operations[0].params[0];
+        assert!(matches!(parameter.schema, Type::Array(_)));
+        assert_eq!(parameter.openapi_content.as_ref(), Some(source_content));
+        assert!(graph
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "request.parameter.unresolved"));
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        assert_eq!(
+            emitted.pointer("/paths/~1search/get/parameters/0/content"),
+            Some(source_content)
+        );
+        assert!(emitted
+            .pointer("/paths/~1search/get/parameters/0/schema")
+            .is_none());
+    }
+
+    #[test]
+    fn preserves_parameter_schema_documentation_and_extensions() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - name: ids
+          in: query
+          description: Exact ids to include.
+          deprecated: true
+          allowEmptyValue: true
+          examples:
+            pair: { value: [1, 2] }
+          x-client-name: identifiers
+          schema:
+            type: array
+            minItems: 2
+            default: [1, 2]
+            items: { type: integer, format: int64 }
+            x-wire-type: csv-ids
+      responses: { '204': { description: ok } }
+";
+        let source = parse_json_or_yaml(text, std::path::Path::new("openapi.yaml")).unwrap();
+        let source_parameter = source.pointer("/paths/~1search/get/parameters/0").unwrap();
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let parameter = &graph.operations[0].params[0];
+        assert!(matches!(parameter.schema, Type::Array(_)));
+        assert_eq!(
+            parameter
+                .openapi_fields
+                .iter()
+                .find(|(name, _)| name == "schema")
+                .map(|(_, value)| value),
+            source_parameter.get("schema")
+        );
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let emitted_parameter = emitted.pointer("/paths/~1search/get/parameters/0").unwrap();
+        for field in [
+            "description",
+            "deprecated",
+            "allowEmptyValue",
+            "examples",
+            "x-client-name",
+            "schema",
+        ] {
+            assert_eq!(
+                emitted_parameter.get(field),
+                source_parameter.get(field),
+                "parameter field {field} drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_preserved_parameter_refs_to_emitted_component_names() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Books API, version: 1.0.0 }
+paths:
+  /books:
+    get:
+      operationId: listBooks
+      parameters:
+        - name: book
+          in: query
+          schema: { $ref: '#/components/schemas/legacy.Book' }
+        - name: filter
+          in: query
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/legacy.Book' }
+      responses: { '204': { description: ok } }
+components:
+  schemas:
+    legacy.Book:
+      type: object
+      properties: { id: { type: string } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        let component_name = &graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == "legacy.Book")
+            .unwrap()
+            .name;
+        let expected_ref = format!("#/components/schemas/{component_name}");
+
+        let yaml = to_openapi(&graph, "Books API", "/", &graph.security).unwrap();
+        validate_openapi_artifact(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let parameters = emitted
+            .pointer("/paths/~1books/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap();
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap()
+        };
+        assert_eq!(
+            parameter("book")
+                .pointer("/schema/$ref")
+                .and_then(Value::as_str),
+            Some(expected_ref.as_str())
+        );
+        assert_eq!(
+            parameter("filter")
+                .pointer("/content/application~1json/schema/$ref")
+                .and_then(Value::as_str),
+            Some(expected_ref.as_str())
+        );
+    }
+
+    #[test]
+    fn preserves_request_media_types_that_share_a_schema() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Report API, version: 1.0.0 }
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      requestBody:
+        content:
+          application/json:
+            schema: &report { type: object, properties: { name: { type: string } } }
+          application/vnd.acme.report+json:
+            schema: *report
+            examples:
+              vendor: { value: { name: annual } }
+          text/plain:
+            schema: { type: string }
+      responses:
+        '201': { description: created }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        let docs = &graph.operation_docs[0];
+        assert_eq!(
+            docs.request_content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.body.unresolved"
+                && diagnostic.subject.as_deref() == Some("text/plain")
+        }));
+
+        let yaml = to_openapi(&graph, "Report API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let operation = emitted.pointer("/paths/~1reports/post").unwrap();
+        assert_eq!(
+            operation.pointer(
+                "/requestBody/content/application~1vnd.acme.report+json/examples/vendor/value/name"
+            ),
+            Some(&Value::String("annual".to_string()))
+        );
+        assert!(operation
+            .pointer("/requestBody/content/text~1plain")
+            .is_none());
+    }
+
+    #[test]
     fn imports_openapi31_patch_and_binary_response() {
         let text = r"
 openapi: 3.1.0
@@ -2084,6 +3552,124 @@ paths:
                 "application/vnd.acme.report+json".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn diagnoses_response_media_types_with_distinct_schemas_or_body_kinds() {
+        let text = r"
+openapi: 3.1.0
+info: { title: Reports API, version: 1.0.0 }
+paths:
+  /reports/{id}:
+    get:
+      operationId: getReport
+      responses:
+        '200':
+          description: report
+          content:
+            application/json:
+              schema: { type: object, properties: { id: { type: string } } }
+            application/vnd.acme.report+json:
+              schema: { type: object, properties: { name: { type: string } } }
+            application/pdf:
+              schema: { type: string, format: binary }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operations[0].responses[0].content_types,
+            vec!["application/json".to_string()]
+        );
+        let diagnostics: Vec<_> = graph
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "response.schema.unresolved")
+            .collect();
+        assert_eq!(diagnostics.len(), 2, "{:?}", graph.diagnostics);
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.operation.as_deref() == Some("getReport")
+                && diagnostic
+                    .subject
+                    .as_deref()
+                    .is_some_and(|subject| subject.starts_with("200 "))
+        }));
+    }
+
+    #[test]
+    fn imports_swagger20_array_collection_formats() {
+        let text = r"
+swagger: '2.0'
+info: { title: Search API, version: 1.0.0 }
+paths:
+  /search:
+    get:
+      operationId: search
+      parameters:
+        - { name: ids, in: query, type: array, items: { type: string } }
+        - { name: tags, in: query, type: array, items: { type: string }, collectionFormat: multi }
+        - { name: spaces, in: query, type: array, items: { type: string }, collectionFormat: ssv }
+        - { name: pipes, in: query, type: array, items: { type: string }, collectionFormat: pipes }
+        - { name: X-Ids, in: header, type: array, items: { type: string } }
+        - { name: tabs, in: query, type: array, items: { type: string }, collectionFormat: tsv }
+      responses: { '204': { description: ok } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+        let param = |name: &str| {
+            graph.operations[0]
+                .params
+                .iter()
+                .find(|param| param.name == name)
+                .unwrap()
+        };
+
+        assert_eq!(
+            (param("ids").style.as_deref(), param("ids").explode),
+            (Some("form"), Some(false))
+        );
+        assert_eq!(
+            (param("tags").style.as_deref(), param("tags").explode),
+            (Some("form"), Some(true))
+        );
+        assert_eq!(
+            (param("spaces").style.as_deref(), param("spaces").explode),
+            (Some("spaceDelimited"), Some(false))
+        );
+        assert_eq!(
+            (param("pipes").style.as_deref(), param("pipes").explode),
+            (Some("pipeDelimited"), Some(false))
+        );
+        assert_eq!(
+            (param("X-Ids").style.as_deref(), param("X-Ids").explode),
+            (Some("simple"), Some(false))
+        );
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "request.parameter.unresolved"
+                && diagnostic.operation.as_deref() == Some("search")
+                && diagnostic.subject.as_deref() == Some("tabs")
+        }));
+
+        let yaml = to_openapi(&graph, "Search API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let parameters = emitted
+            .pointer("/paths/~1search/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap();
+        let ids = parameters
+            .iter()
+            .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some("ids"))
+            .unwrap();
+        assert_eq!(ids.get("style").and_then(Value::as_str), Some("form"));
+        assert_eq!(ids.get("explode").and_then(Value::as_bool), Some(false));
     }
 
     #[test]
@@ -2236,7 +3822,11 @@ components:
     }
 
     #[test]
-    fn rejects_openapi_security_shapes_that_graph_cannot_represent() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fixture covers top-level OR, operation-level AND, public, and unknown security cases"
+    )]
+    fn imports_security_alternatives_and_rejects_unknown_schemes() {
         let top_level_or = r"
 openapi: 3.1.0
 info: { title: Secure API, version: 1.0.0 }
@@ -2244,14 +3834,23 @@ security:
   - ApiKeyAuth: []
   - PartnerAuth: []
 paths: {}
+components:
+  securitySchemes:
+    ApiKeyAuth: { type: apiKey, in: header, name: X-API-Key }
+    PartnerAuth: { type: apiKey, in: header, name: X-Partner-Key }
 ";
-        let err = import_openapi_document(
+        let graph = import_openapi_document(
             std::path::Path::new("."),
             std::path::PathBuf::from("openapi.yaml"),
             top_level_or,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("alternative top-level security"));
+        .unwrap();
+        assert_eq!(graph.security_requirements.len(), 2);
+        let yaml = to_openapi(&graph, "Secure API", "/", &graph.security).unwrap();
+        assert!(
+            yaml.contains("- ApiKeyAuth: []\n  - PartnerAuth: []"),
+            "{yaml}"
+        );
 
         let security_removal = r"
 openapi: 3.1.0
@@ -2358,31 +3957,70 @@ paths:
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-numeric response key"));
+    }
 
-        let unsupported_method = r"
+    #[test]
+    fn imports_and_lowers_every_openapi_http_method() {
+        let text = r"
 openapi: 3.1.0
-info: { title: Default Response API, version: 1.0.0 }
+info: { title: Methods API, version: 1.0.0 }
 paths:
   /items:
-    options:
-      operationId: itemOptions
-      responses:
-        default:
-          description: fallback
     get:
-      operationId: listItems
-      responses:
-        '204':
-          description: ok
+      operationId: getItems
+      responses: { '204': { description: ok } }
+    put:
+      operationId: putItems
+      responses: { '204': { description: ok } }
+    post:
+      operationId: postItems
+      responses: { '204': { description: ok } }
+    delete:
+      operationId: deleteItems
+      responses: { '204': { description: ok } }
+    options:
+      operationId: optionsItems
+      responses: { '204': { description: ok } }
+    head:
+      operationId: headItems
+      responses: { '204': { description: ok } }
+    patch:
+      operationId: patchItems
+      responses: { '204': { description: ok } }
+    trace:
+      operationId: traceItems
+      responses: { '204': { description: ok } }
 ";
         let graph = import_openapi_document(
             std::path::Path::new("."),
             std::path::PathBuf::from("openapi.yaml"),
-            unsupported_method,
+            text,
         )
         .unwrap();
-        assert_eq!(graph.operations.len(), 1);
-        assert_eq!(graph.operations[0].id, "listItems");
+        let methods = graph
+            .operations
+            .iter()
+            .map(|operation| operation.method.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            methods,
+            std::collections::BTreeSet::from([
+                "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"
+            ])
+        );
+
+        let yaml = to_openapi(&graph, "Methods API", "/", &graph.security).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        for method in [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ] {
+            assert!(
+                emitted
+                    .pointer(&format!("/paths/~1items/{method}"))
+                    .is_some(),
+                "generated OpenAPI omitted {method}: {yaml}"
+            );
+        }
     }
 
     #[test]
@@ -2454,6 +4092,86 @@ paths:
     }
 
     #[test]
+    fn imports_all_swagger20_response_media_types() {
+        let text = r"
+swagger: '2.0'
+info: { title: Reports API, version: 1.0.0 }
+produces: [application/json, application/vnd.acme.report+json]
+paths:
+  /reports:
+    get:
+      operationId: getReport
+      responses:
+        '200':
+          description: report
+          schema: { $ref: '#/definitions/Report' }
+definitions:
+  Report:
+    type: object
+    properties:
+      id: { type: string }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operations[0].responses[0].content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        assert!(yaml.contains("application/json:"), "{yaml}");
+        assert!(yaml.contains("application/vnd.acme.report+json:"), "{yaml}");
+    }
+
+    #[test]
+    fn imports_all_swagger20_request_media_types() {
+        let text = r"
+swagger: '2.0'
+info: { title: Reports API, version: 1.0.0 }
+consumes: [application/json, application/vnd.acme.report+json]
+paths:
+  /reports:
+    post:
+      operationId: createReport
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema: { $ref: '#/definitions/Report' }
+      responses:
+        '201': { description: created }
+definitions:
+  Report:
+    type: object
+    properties: { id: { type: string } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("swagger.yaml"),
+            text,
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.operation_docs[0].request_content_types,
+            vec![
+                "application/json".to_string(),
+                "application/vnd.acme.report+json".to_string()
+            ]
+        );
+        let yaml = to_openapi(&graph, "Reports API", "/", &graph.security).unwrap();
+        assert!(yaml.contains("application/json:"), "{yaml}");
+        assert!(yaml.contains("application/vnd.acme.report+json:"), "{yaml}");
+    }
+
+    #[test]
     fn loads_brownfield_fixture_versions() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for input in [
@@ -2493,6 +4211,124 @@ paths:
                 .any(|schema| schema.id == "Shared.Error"),
             "OpenAPI 3.1 fixture should import a relative external $ref"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the complete external-ref fixture is easier to audit in one test"
+    )]
+    fn external_schema_refs_keep_file_identity_and_nested_ref_origin() {
+        let root = temp_project("external-ref-identity");
+        std::fs::write(
+            root.join("openapi.yaml"),
+            r"
+openapi: 3.1.0
+info: { title: External refs, version: 1.0.0 }
+paths:
+  /a:
+    get:
+      operationId: getA
+      responses:
+        '200':
+          description: A
+          content:
+            application/json:
+              schema: { $ref: './a.yaml#/components/schemas/Error' }
+  /b:
+    get:
+      operationId: getB
+      responses:
+        '200':
+          description: B
+          content:
+            application/json:
+              schema: { $ref: './b.yaml#/components/schemas/Error' }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("a.yaml"),
+            r"
+components:
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { $ref: '#/components/schemas/Detail' }
+    Detail:
+      type: object
+      properties: { fromA: { type: string } }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.yaml"),
+            r"
+components:
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { $ref: '#/components/schemas/Detail' }
+    Detail:
+      type: object
+      properties: { fromB: { type: integer } }
+",
+        )
+        .unwrap();
+
+        let graph = load_openapi(&root, "openapi.yaml").unwrap();
+        let response_ref = |path: &str| {
+            graph
+                .operations
+                .iter()
+                .find(|operation| operation.path == path)
+                .and_then(|operation| operation.responses.first())
+                .and_then(|response| response.body.as_ref())
+                .map(|body| body.ref_id.clone())
+                .unwrap()
+        };
+        let a_error = response_ref("/a");
+        let b_error = response_ref("/b");
+        assert_ne!(a_error, b_error, "external Error schemas must not collapse");
+
+        let detail_ref = |schema_id: &str| {
+            let schema = graph
+                .schemas
+                .iter()
+                .find(|schema| schema.id == schema_id)
+                .unwrap();
+            let Type::Object(fields) = &schema.body else {
+                panic!("expected object schema for {schema_id}");
+            };
+            let detail = fields
+                .iter()
+                .find(|field| field.json_name == "detail")
+                .unwrap();
+            let Type::Named(id) = &detail.schema else {
+                panic!("expected named detail ref for {schema_id}");
+            };
+            id.clone()
+        };
+        let a_detail = detail_ref(&a_error);
+        let b_detail = detail_ref(&b_error);
+        assert_ne!(
+            a_detail, b_detail,
+            "nested local refs must stay relative to their external document"
+        );
+        assert!(graph.schemas.iter().any(|schema| {
+            schema.id == a_detail
+                && matches!(&schema.body, Type::Object(fields) if fields.iter().any(|field| field.json_name == "fromA"))
+        }));
+        assert!(graph.schemas.iter().any(|schema| {
+            schema.id == b_detail
+                && matches!(&schema.body, Type::Object(fields) if fields.iter().any(|field| field.json_name == "fromB"))
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

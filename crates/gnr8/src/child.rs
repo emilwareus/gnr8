@@ -68,14 +68,33 @@ pub(crate) fn run_child(
     // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8`, so a
     // version skew (e.g. a pinned published `gnr8` vs a newer host) must fail with an actionable
     // message rather than a confusing parse error or silently-wrong output.
-    if bundle.version != gnr8::runner::BUNDLE_VERSION {
+    if bundle.protocol_version != gnr8::runner::PROTOCOL_VERSION {
         return Err(CoreError::ChildRun {
             message: format!(
-                "the .gnr8 generation crate emitted artifact-bundle schema version {}, but this gnr8 \
-                 supports version {}. Realign the gnr8 crate your .gnr8/ crate depends on with this \
-                 gnr8 binary (update .gnr8/Cargo.toml), then re-run.",
-                bundle.version,
-                gnr8::runner::BUNDLE_VERSION
+                "the .gnr8 generation crate emitted protocol version {}, but this gnr8 supports \
+                 version {}. Realign the installed CLI with .gnr8/Cargo.lock, then re-run.",
+                bundle.protocol_version,
+                gnr8::runner::PROTOCOL_VERSION
+            ),
+        });
+    }
+    let host_version = env!("CARGO_PKG_VERSION");
+    if bundle.cli_version != host_version || bundle.core_version != host_version {
+        return Err(CoreError::ChildRun {
+            message: format!(
+                "gnr8 version mismatch: host CLI {host_version}, bundle CLI {}, child gnr8-core {}. \
+                 Install the exact version pinned in .gnr8/Cargo.lock.",
+                bundle.cli_version, bundle.core_version
+            ),
+        });
+    }
+    let expected_fingerprint = gnr8::runner::capability_fingerprint();
+    if bundle.capability_fingerprint != expected_fingerprint {
+        return Err(CoreError::ChildRun {
+            message: format!(
+                "gnr8 capability mismatch: host {expected_fingerprint}, child {}. Rebuild the CLI \
+                 and generation crate at one exact version.",
+                bundle.capability_fingerprint
             ),
         });
     }
