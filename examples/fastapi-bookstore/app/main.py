@@ -6,9 +6,9 @@ models in `app.models`. Nothing here reads FastAPI's runtime `/openapi.json` and
 nothing depends on a third-party schema tool (CLAUDE.md rule 1). No app runs this
 phase (no `pip install`); this is the static source `pyextract` reads.
 
-The routes mount under an `APIRouter(prefix="/books")` -> the operation paths are
-group-relative (`/`, `/{book_id}`); the `/books` prefix is a lowering-time base
-path (rule 1: never folded into the code-derived path).
+The routes mount under an `APIRouter(prefix="/books")`; that static framework
+prefix is composed into every operation path (`/books/`, `/books/{book_id}`).
+An external service mount remains a separate code-configured base path.
 
 NOTE ON LINE LAYOUT (RESEARCH OQ2): the committed FastAPI graph snapshot pins
 each route span to the handler `def` line and each param span to the param's own

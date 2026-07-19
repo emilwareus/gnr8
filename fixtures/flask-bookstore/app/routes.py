@@ -1,9 +1,9 @@
 """Flask bookstore routes — STATIC fixture source (Phase 1).
 
 Routing uses Flask `Blueprint`s with a URL prefix (the blueprint-prefix shape):
-the operation paths in the neutral graph are group-relative (`/`, `/<int:order_id>`)
-and the `/orders` prefix is a lowering-time base path (rule 1: never folded into
-the code-derived path). Path params use Flask's `<int:order_id>` converter.
+the static `/orders` prefix is composed into each neutral operation path. Path
+params use Flask's `<int:order_id>` converter.
+
 
 The HONEST envelope (PYSRC-02): typed handlers -> facts; raw `request.json` /
 unannotated `request.args.get(...)` -> a DIAGNOSTIC, never a guess (rule 3).

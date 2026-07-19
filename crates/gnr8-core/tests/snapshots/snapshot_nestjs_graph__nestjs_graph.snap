@@ -6,7 +6,7 @@ module: nestjs-bookstore
 operations:
   - id: listBooks
     method: GET
-    path: /
+    path: /books/
     handler: listBooks
     params:
       - name: cursor
@@ -55,11 +55,12 @@ operations:
       end_line: 41
   - id: createBook
     method: POST
-    path: /
+    path: /books/
     handler: createBook
     params: []
     request_body:
       ref_id: src/books.dto.BookDto
+    request_body_content_type: application/json
     responses:
       - status: 201
         body:
@@ -72,7 +73,7 @@ operations:
       end_line: 51
   - id: getBook
     method: GET
-    path: "/{bookId}"
+    path: "/books/{bookId}"
     handler: getBook
     params:
       - name: bookId
@@ -110,7 +111,7 @@ operations:
       end_line: 57
   - id: updateBook
     method: PUT
-    path: "/{bookId}"
+    path: "/books/{bookId}"
     handler: updateBook
     params:
       - name: bookId
@@ -127,6 +128,7 @@ operations:
           end_line: 66
     request_body:
       ref_id: src/books.dto.BookFilters
+    request_body_content_type: application/json
     responses:
       - status: 200
         body:

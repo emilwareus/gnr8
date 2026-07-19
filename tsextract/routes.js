@@ -12,10 +12,8 @@
 // request/response/param SHAPES come from the TypeChecker over the method's typed
 // signature (via types.mapType), exactly like the DTO schemas do.
 //
-// The `@Controller('books')` prefix is recorded for provenance ONLY and is NEVER
-// folded into an operation path (rule 1): the neutral operation paths stay
-// group-relative (`/`, `/{bookId}`); the base path is supplied later by the host
-// (rule 4). NestJS `'/:bookId'` is converted to neutral `'/{bookId}'`.
+// A static `@Controller('books')` prefix is composed with every method path. A
+// dynamic controller prefix is diagnosed and the affected controller is omitted.
 //
 // A RouteFact has EXACTLY the keys the host `RouteFact` DTO (deny_unknown_fields)
 // requires: method, path, handler, operation_id, params, request_body, responses,
@@ -110,7 +108,7 @@ function _controllerDecorator(classDecl) {
 }
 
 // Convert a NestJS route path to the neutral path: `:name` -> `{name}`. A bare
-// `/` stays `/`. The `@Controller` prefix is NEVER prepended here (rule 1).
+// `/` stays `/`.
 function _neutralPath(raw) {
   const out = [];
   let i = 0;
@@ -130,6 +128,18 @@ function _neutralPath(raw) {
     }
   }
   return out.join("");
+}
+
+function _joinStaticPaths(prefix, path) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  const normalizedPath = String(path || "").trim();
+  if (!normalizedPrefix) {
+    return normalizedPath.startsWith("/") ? normalizedPath : "/" + normalizedPath;
+  }
+  if (!normalizedPath || normalizedPath === "/") {
+    return "/" + normalizedPrefix + "/";
+  }
+  return "/" + normalizedPrefix + "/" + normalizedPath.replace(/^\/+|\/+$/g, "");
 }
 
 // Find the HTTP-verb decorator on a method, returning {method, path} or null.
@@ -376,9 +386,22 @@ function recognizeNestController(loaded, diags, registry) {
       if (controller === null) {
         return; // not a routing controller
       }
-      // The @Controller(...) prefix is read for provenance only and NEVER folded
-      // into an operation path (rule 1). Capturing it documents the bright line.
-      const _controllerPrefix = _decoratorStringArg(controller);
+      const controllerCall = controller.expression;
+      let controllerPrefix = "";
+      if (controllerCall.arguments.length > 0) {
+        const prefixArg = controllerCall.arguments[0];
+        if (!ts.isStringLiteralLike(prefixArg)) {
+          const line =
+            sf.getLineAndCharacterOfPosition(controller.getStart(sf)).line + 1;
+          diags.warn(
+            "@Controller prefix is dynamic; routes for this controller are omitted",
+            rel,
+            line
+          );
+          return;
+        }
+        controllerPrefix = prefixArg.text;
+      }
 
       for (const member of node.members) {
         if (!ts.isMethodDeclaration(member) || !member.name) {
@@ -422,7 +445,7 @@ function recognizeNestController(loaded, diags, registry) {
 
         routes.push({
           method: verb.method,
-          path: verb.path,
+          path: _joinStaticPaths(controllerPrefix, verb.path),
           handler: handler,
           operation_id: handler,
           params: params,

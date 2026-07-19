@@ -73,7 +73,7 @@ class RouteRecognitionTests(unittest.TestCase):
     def test_list_books_methods_path_and_query_params(self):
         r = self.by["list_books"]
         self.assertEqual(r["method"], "GET")
-        self.assertEqual(r["path"], "/")
+        self.assertEqual(r["path"], "/books/")
         self.assertIsNone(r["request_body"])
         # genre: required (no default); sort/cursor: not required (have defaults).
         self.assertTrue(self._param(r, "genre")["required"])
@@ -95,7 +95,7 @@ class RouteRecognitionTests(unittest.TestCase):
     def test_create_book_body_and_201_status(self):
         r = self.by["create_book"]
         self.assertEqual(r["method"], "POST")
-        self.assertEqual(r["path"], "/")
+        self.assertEqual(r["path"], "/books/")
         self.assertEqual(r["request_body"], {"ref_id": "app.models.Book"})
         self.assertEqual(
             r["responses"],
@@ -111,7 +111,7 @@ class RouteRecognitionTests(unittest.TestCase):
     def test_get_book_path_param_named_ref_query_and_union_response(self):
         r = self.by["get_book"]
         self.assertEqual(r["method"], "GET")
-        self.assertEqual(r["path"], "/{book_id}")
+        self.assertEqual(r["path"], "/books/{book_id}")
         book_id = self._param(r, "book_id")
         self.assertEqual(book_id["location"], "path")
         self.assertTrue(book_id["required"])
@@ -136,7 +136,7 @@ class RouteRecognitionTests(unittest.TestCase):
     def test_update_book_path_param_and_body(self):
         r = self.by["update_book"]
         self.assertEqual(r["method"], "PUT")
-        self.assertEqual(r["path"], "/{book_id}")
+        self.assertEqual(r["path"], "/books/{book_id}")
         self.assertEqual(self._param(r, "book_id")["location"], "path")
         self.assertEqual(r["request_body"], {"ref_id": "app.models.BookFilters"})
         self.assertEqual(
@@ -150,11 +150,17 @@ class RouteRecognitionTests(unittest.TestCase):
             ],
         )
 
-    def test_router_prefix_never_folded_into_path(self):
-        # APIRouter(prefix="/books") must NOT be folded into any code-derived path
-        # (rule 1): every emitted path is "/" or "/{book_id}", never "/books...".
-        for route in self.doc["routes"]:
-            self.assertIn(route["path"], ("/", "/{book_id}"), route["operation_id"])
+    def test_router_prefix_is_folded_into_path(self):
+        expected = {
+            "list_books": "/books/",
+            "create_book": "/books/",
+            "get_book": "/books/{book_id}",
+            "update_book": "/books/{book_id}",
+        }
+        self.assertEqual(
+            {route["operation_id"]: route["path"] for route in self.doc["routes"]},
+            expected,
+        )
 
     def test_static_only_gate(self):
         # The recognizer must never exec/eval/compile/import the target (PYSRC-03).

@@ -6,8 +6,8 @@
 // DTO classes in `books.dto.ts`; nothing reads a third-party schema-annotation
 // decorator or a runtime schema export (CLAUDE.md rule 1).
 //
-// The @Controller('books') prefix is a lowering-time base path (rule 1): the
-// neutral graph operation paths stay group-relative (`/`, `/{bookId}`). No app
+// The static @Controller('books') prefix is composed into the neutral graph
+// operation paths (`/books/`, `/books/{bookId}`). No app
 // runs this phase; this is the static source tsextract reads.
 //
 // PROVENANCE NOTE (non-fact prose only — rule 1): blank lines / comments below

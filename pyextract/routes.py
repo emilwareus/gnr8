@@ -6,9 +6,8 @@ module-level binding to a ``FastAPI()`` / ``APIRouter(...)`` instance. Nothing h
 FastAPI's runtime ``/openapi.json`` or any third-party schema dialect — the method, path,
 params, body and response are all read off the decorator Call + the typed handler signature.
 
-The ``APIRouter(prefix="/books")`` prefix is recorded SEPARATELY and NEVER folded into the
-code-derived path (rule 1): the snapshot's operation paths stay group-relative (``/`` /
-``/{book_id}``) and ``/books`` is a lowering-time base path supplied by the host.
+Static router/blueprint prefixes are code-derived route facts and are composed with decorator paths.
+Dynamic prefixes are diagnosed and the affected binding is omitted.
 
 A RouteFact has EXACTLY the keys the host ``RouteFact`` DTO (``deny_unknown_fields``)
 requires: ``method, path, handler, operation_id, params, request_body, responses, span``.
@@ -56,12 +55,122 @@ def _const_kwarg(call, key):
     return None
 
 
-def _router_bindings(module):
-    """Map each module-level router/app variable name -> its recorded prefix string.
+def _static_prefix(call, key, diags, abs_path, line, label):
+    """Return a declared static string prefix, or ``None`` after diagnosing a dynamic one."""
+    for kw in call.keywords:
+        if kw.arg != key:
+            continue
+        if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            return kw.value.value
+        diags.warn(
+            "{} has dynamic {}=; routes for this binding are omitted".format(label, key),
+            abs_path,
+            line,
+        )
+        return None
+    return ""
+
+
+def _join_static_paths(prefix, path):
+    """Compose a static framework prefix and method path with one slash at the seam."""
+    prefix = prefix.strip()
+    path = path.strip()
+    if not prefix:
+        return path if path.startswith("/") else "/" + path
+    normalized_prefix = "/" + prefix.strip("/")
+    if path in ("", "/"):
+        return normalized_prefix + "/"
+    return normalized_prefix + "/" + path.strip("/")
+
+
+def _registration_prefixes(module, method_name, keyword, bindings, diags):
+    """Fold static include/register prefixes into bindings declared in the same module."""
+    for stmt in module.tree.body:
+        value = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+            continue
+        if value.func.attr != method_name or not value.args:
+            continue
+        binding = value.args[0]
+        if not isinstance(binding, ast.Name) or binding.id not in bindings:
+            continue
+        prefix = _static_prefix(
+            value,
+            keyword,
+            diags,
+            module.abs_path,
+            getattr(stmt, "lineno", 0),
+            method_name,
+        )
+        if prefix is None:
+            del bindings[binding.id]
+            continue
+        bindings[binding.id] = _join_static_paths(prefix, bindings[binding.id])
+
+
+def _import_targets(module):
+    """Map local imported names to ``(dotted module, exported name)``."""
+    targets = {}
+    package = module.dotted.split(".")[:-1]
+    for stmt in module.tree.body:
+        if not isinstance(stmt, ast.ImportFrom):
+            continue
+        base_parts = list(package)
+        if stmt.level:
+            keep = max(0, len(package) - (stmt.level - 1))
+            base_parts = base_parts[:keep]
+        else:
+            base_parts = []
+        if stmt.module:
+            base_parts.extend(stmt.module.split("."))
+        dotted = ".".join(base_parts)
+        for alias in stmt.names:
+            local = alias.asname or alias.name
+            targets[local] = (dotted, alias.name)
+    return targets
+
+
+def _external_registration_prefixes(modules, method_name, keyword, diags):
+    """Resolve static include/register prefixes applied to imported router bindings."""
+    prefixes = {}
+    for module in sorted(modules, key=lambda item: item.dotted):
+        imports = _import_targets(module)
+        calls = [node for node in ast.walk(module.tree) if isinstance(node, ast.Call)]
+        calls.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
+        for call in calls:
+            if not isinstance(call.func, ast.Attribute) or call.func.attr != method_name:
+                continue
+            if not call.args or not isinstance(call.args[0], ast.Name):
+                continue
+            target = imports.get(call.args[0].id)
+            if target is None:
+                continue
+            prefix = _static_prefix(
+                call,
+                keyword,
+                diags,
+                module.abs_path,
+                getattr(call, "lineno", 0),
+                method_name,
+            )
+            if target in prefixes:
+                diags.warn(
+                    "{} registers imported binding {} more than once; routes are omitted"
+                    .format(method_name, call.args[0].id),
+                    module.abs_path,
+                    getattr(call, "lineno", 0),
+                )
+                prefixes[target] = None
+            else:
+                prefixes[target] = prefix
+    return prefixes
+
+
+def _router_bindings(module, diags, external_prefixes):
+    """Map each module-level router/app variable name -> its composed static prefix.
 
     ``app = FastAPI(title=..)`` -> ``{"app": ""}``;
     ``router = APIRouter(prefix="/books")`` -> ``{"router": "/books"}``.
-    The prefix is captured for provenance ONLY — it is never folded into a path (rule 1).
     """
     bindings = {}
     for stmt in module.tree.body:
@@ -71,8 +180,26 @@ def _router_bindings(module):
             continue
         ctor = _ctor_name(stmt.value)
         if ctor in _ROUTER_CTORS:
-            prefix = _const_kwarg(stmt.value, "prefix") or ""
-            bindings[stmt.targets[0].id] = prefix
+            prefix = _static_prefix(
+                stmt.value,
+                "prefix",
+                diags,
+                module.abs_path,
+                getattr(stmt, "lineno", 0),
+                ctor,
+            )
+            if prefix is not None:
+                bindings[stmt.targets[0].id] = prefix
+    _registration_prefixes(module, "include_router", "prefix", bindings, diags)
+    for name in list(bindings):
+        key = (module.dotted, name)
+        if key not in external_prefixes:
+            continue
+        external = external_prefixes[key]
+        if external is None:
+            del bindings[name]
+        else:
+            bindings[name] = _join_static_paths(external, bindings[name])
     return bindings
 
 
@@ -303,8 +430,11 @@ def recognize_fastapi(modules, table, diags):
     re-sorts the routes; the sidecar stays internally deterministic.
     """
     routes = []
+    external_prefixes = _external_registration_prefixes(
+        modules, "include_router", "prefix", diags
+    )
     for module in sorted(modules, key=lambda m: m.dotted):
-        bindings = _router_bindings(module)
+        bindings = _router_bindings(module, diags, external_prefixes)
         if not bindings:
             continue
         abs_path = module.abs_path
@@ -314,8 +444,8 @@ def recognize_fastapi(modules, table, diags):
             decorator = _route_decorator(stmt, bindings)
             if decorator is None:
                 continue
-            path = _route_path(decorator)
-            if path is None:
+            route_path = _route_path(decorator)
+            if route_path is None:
                 diags.warn(
                     "FastAPI route decorator has no constant path; route omitted "
                     "(no fallback)",
@@ -323,6 +453,8 @@ def recognize_fastapi(modules, table, diags):
                     getattr(stmt, "lineno", 0),
                 )
                 continue
+            binding_name = decorator.func.value.id
+            path = _join_static_paths(bindings[binding_name], route_path)
             method = decorator.func.attr.upper()
             params, request_body = _build_params(
                 stmt, path, method, module.dotted, abs_path, table, diags
@@ -367,16 +499,15 @@ def recognize_fastapi(modules, table, diags):
 #   * a local annotated ``status: str = request.args.get(...)`` -> a typed query param.
 #   * an UNTYPED ``request.json`` read / unannotated ``request.args.get(...)`` /
 #     missing return annotation -> a diagnostic, no fact.
-# The Flask ``url_prefix`` is recorded SEPARATELY and NEVER folded into the path (rule 1).
+# Static Flask ``url_prefix`` values are composed into the route path.
 # ---------------------------------------------------------------------------
 
 
-def _flask_bindings(module):
-    """Map each module-level Flask/Blueprint variable name -> its ``url_prefix`` string.
+def _flask_bindings(module, diags, external_prefixes):
+    """Map each module-level Flask/Blueprint variable name -> its static ``url_prefix``.
 
     ``bp = Blueprint("orders", __name__, url_prefix="/orders")`` -> ``{"bp": "/orders"}``;
-    ``app = Flask(__name__)`` -> ``{"app": ""}``. The prefix is recorded for provenance
-    ONLY — it is never folded into a route path (rule 1; the snapshot base_path is ``/``).
+    ``app = Flask(__name__)`` -> ``{"app": ""}``.
     """
     bindings = {}
     for stmt in module.tree.body:
@@ -386,8 +517,26 @@ def _flask_bindings(module):
             continue
         ctor = _ctor_name(stmt.value)
         if ctor in _FLASK_CTORS:
-            prefix = _const_kwarg(stmt.value, "url_prefix") or ""
-            bindings[stmt.targets[0].id] = prefix
+            prefix = _static_prefix(
+                stmt.value,
+                "url_prefix",
+                diags,
+                module.abs_path,
+                getattr(stmt, "lineno", 0),
+                ctor,
+            )
+            if prefix is not None:
+                bindings[stmt.targets[0].id] = prefix
+    _registration_prefixes(module, "register_blueprint", "url_prefix", bindings, diags)
+    for name in list(bindings):
+        key = (module.dotted, name)
+        if key not in external_prefixes:
+            continue
+        external = external_prefixes[key]
+        if external is None:
+            del bindings[name]
+        else:
+            bindings[name] = _join_static_paths(external, bindings[name])
     return bindings
 
 
@@ -429,7 +578,7 @@ def _flask_methods(call):
 
 
 def _flask_path(raw):
-    """Convert a Flask route path to the neutral group-relative path + path-param types.
+    """Convert a Flask decorator path to a neutral relative path + path-param types.
 
     ``"/<int:order_id>"`` -> ``("/{order_id}", {"order_id": <int64 schema>})`` (strip the
     converter, brace the name, the ``int`` converter drives the param schema). ``"/<name>"``
@@ -604,8 +753,11 @@ def recognize_flask(modules, table, diags):
     handler (no resolvable return annotation) emits ``responses: []`` + a diagnostic.
     """
     routes = []
+    external_prefixes = _external_registration_prefixes(
+        modules, "register_blueprint", "url_prefix", diags
+    )
     for module in sorted(modules, key=lambda m: m.dotted):
-        bindings = _flask_bindings(module)
+        bindings = _flask_bindings(module, diags, external_prefixes)
         if not bindings:
             continue
         abs_path = module.abs_path
@@ -624,7 +776,9 @@ def recognize_flask(modules, table, diags):
                     getattr(stmt, "lineno", 0),
                 )
                 continue
-            path, path_converters = _flask_path(raw_path)
+            relative_path, path_converters = _flask_path(raw_path)
+            binding_name = decorator.func.value.id
+            path = _join_static_paths(bindings[binding_name], relative_path)
             methods = _flask_methods(decorator)
 
             # Path params (from the converters), independent of the method split.

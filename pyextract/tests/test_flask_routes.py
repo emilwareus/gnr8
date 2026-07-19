@@ -18,12 +18,12 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 FIXTURE = os.path.join(REPO_ROOT, "fixtures", "flask-bookstore")
 
 EXPECTED_DIAGS = [
-    "untyped query param 'q' on GET /: read via request.args.get with no "
+    "untyped query param 'q' on GET /orders/: read via request.args.get with no "
     "annotation; param type/required-ness under-specified, type inferred as "
     "string only",
-    "untyped response on POST /raw: handler has no return annotation; response "
+    "untyped response on POST /orders/raw: handler has no return annotation; response "
     "shape under-specified, no schema inferred",
-    "untyped request body on POST /raw: read via request.json with no typed DTO; "
+    "untyped request body on POST /orders/raw: read via request.json with no typed DTO; "
     "body shape under-specified, no schema inferred",
 ]
 
@@ -51,12 +51,11 @@ class FlaskRouteTests(unittest.TestCase):
             {"list_orders", "create_order", "create_order_raw", "get_order"},
         )
 
-    def test_blueprint_prefix_never_folded_into_path(self):
-        # url_prefix="/orders" is recorded separately; paths stay group-relative.
-        self.assertEqual(self.routes["list_orders"]["path"], "/")
-        self.assertEqual(self.routes["create_order"]["path"], "/")
-        self.assertEqual(self.routes["create_order_raw"]["path"], "/raw")
-        self.assertEqual(self.routes["get_order"]["path"], "/{order_id}")
+    def test_blueprint_prefix_is_folded_into_path(self):
+        self.assertEqual(self.routes["list_orders"]["path"], "/orders/")
+        self.assertEqual(self.routes["create_order"]["path"], "/orders/")
+        self.assertEqual(self.routes["create_order_raw"]["path"], "/orders/raw")
+        self.assertEqual(self.routes["get_order"]["path"], "/orders/{order_id}")
 
     def test_methods_and_per_method_split(self):
         self.assertEqual(self.routes["list_orders"]["method"], "GET")
@@ -67,7 +66,7 @@ class FlaskRouteTests(unittest.TestCase):
         slash_ops = sorted(
             r["operation_id"]
             for r in self.routes.values()
-            if r["path"] == "/"
+            if r["path"] == "/orders/"
         )
         self.assertEqual(slash_ops, ["create_order", "list_orders"])
 

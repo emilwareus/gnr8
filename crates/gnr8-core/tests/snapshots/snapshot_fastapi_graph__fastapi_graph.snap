@@ -6,7 +6,7 @@ module: fastapi-bookstore
 operations:
   - id: list_books
     method: GET
-    path: /
+    path: /books/
     handler: list_books
     params:
       - name: cursor
@@ -55,11 +55,12 @@ operations:
       end_line: 38
   - id: create_book
     method: POST
-    path: /
+    path: /books/
     handler: create_book
     params: []
     request_body:
       ref_id: app.models.Book
+    request_body_content_type: application/json
     responses:
       - status: 201
         body:
@@ -72,7 +73,7 @@ operations:
       end_line: 57
   - id: get_book
     method: GET
-    path: "/{book_id}"
+    path: "/books/{book_id}"
     handler: get_book
     params:
       - name: book_id
@@ -111,7 +112,7 @@ operations:
       end_line: 65
   - id: update_book
     method: PUT
-    path: "/{book_id}"
+    path: "/books/{book_id}"
     handler: update_book
     params:
       - name: book_id
@@ -129,6 +130,7 @@ operations:
           end_line: 76
     request_body:
       ref_id: app.models.BookFilters
+    request_body_content_type: application/json
     responses:
       - status: 200
         body:

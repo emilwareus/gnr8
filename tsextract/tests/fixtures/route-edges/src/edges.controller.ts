@@ -56,3 +56,13 @@ export class EdgesController {
   @HttpCode(700)
   bad(@Body() a: Thing, @Body() b: Thing): void {}
 }
+
+const DYNAMIC_PREFIX = "dynamic";
+
+@Controller(DYNAMIC_PREFIX)
+export class DynamicPrefixController {
+  @Get("/")
+  omitted(): Thing {
+    return new Thing();
+  }
+}

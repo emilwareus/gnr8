@@ -335,7 +335,7 @@ export class Client {
       undefined,
       {
         operationId: "listBooks",
-        pathTemplate: "/",
+        pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
       },
@@ -378,7 +378,7 @@ export class Client {
       body,
       {
         operationId: "createBook",
-        pathTemplate: "/",
+        pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
       },
@@ -429,7 +429,7 @@ export class Client {
       undefined,
       {
         operationId: "getBook",
-        pathTemplate: "/{bookId}",
+        pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
       },
@@ -473,7 +473,7 @@ export class Client {
       body,
       {
         operationId: "updateBook",
-        pathTemplate: "/{bookId}",
+        pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
       },

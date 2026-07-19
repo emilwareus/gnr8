@@ -34,7 +34,7 @@ fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
 fn incomplete_flask_response_blocks_openapi() {
     let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
-    let error = gnr8::lower::to_openapi(&graph, "bookstore", "/orders", &fixture_security())
+    let error = gnr8::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
         .expect_err("an incomplete route must block lowering");
     let message = error.to_string();
     assert!(message.contains("create_order_raw"), "{message}");

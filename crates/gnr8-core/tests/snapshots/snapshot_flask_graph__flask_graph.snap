@@ -6,7 +6,7 @@ module: flask-bookstore
 operations:
   - id: list_orders
     method: GET
-    path: /
+    path: /orders/
     handler: list_orders
     params:
       - name: status
@@ -33,11 +33,12 @@ operations:
       end_line: 31
   - id: create_order
     method: POST
-    path: /
+    path: /orders/
     handler: create_order
     params: []
     request_body:
       ref_id: app.dto.OrderInput
+    request_body_content_type: application/json
     responses:
       - status: 201
         body:
@@ -50,7 +51,7 @@ operations:
       end_line: 48
   - id: create_order_raw
     method: POST
-    path: /raw
+    path: /orders/raw
     handler: create_order_raw
     params: []
     request_body: ~
@@ -61,7 +62,7 @@ operations:
       end_line: 69
   - id: get_order
     method: GET
-    path: "/{order_id}"
+    path: "/orders/{order_id}"
     handler: get_order
     params:
       - name: order_id
@@ -279,15 +280,15 @@ schemas:
       end_line: 49
 diagnostics:
   - severity: WARN
-    message: "untyped query param 'q' on GET /: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
+    message: "untyped query param 'q' on GET /orders/: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
     file: app/routes.py
     line: 42
   - severity: WARN
-    message: "untyped response on POST /raw: handler has no return annotation; response shape under-specified, no schema inferred"
+    message: "untyped response on POST /orders/raw: handler has no return annotation; response shape under-specified, no schema inferred"
     file: app/routes.py
     line: 69
   - severity: WARN
-    message: "untyped request body on POST /raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
+    message: "untyped request body on POST /orders/raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
     file: app/routes.py
     line: 78
 base_path: /

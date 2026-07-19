@@ -29,6 +29,14 @@ function hasDiag(substr) {
   return diags.items().some((d) => d.message.includes(substr));
 }
 
+(function dynamic_controller_prefix_is_diagnosed_and_omitted() {
+  assert.ok(!byHandler.omitted, "dynamic-prefix route must not be emitted");
+  assert.ok(
+    hasDiag("@Controller prefix is dynamic"),
+    "dynamic controller prefix must record a diagnostic"
+  );
+})();
+
 // WR-01 happy path: a plain named return still resolves to its ref_id (the dual
 // `t.aliasSymbol` discriminator is replaced by the single mapType path).
 (function named_return_resolves_via_single_path() {
