@@ -90,7 +90,8 @@ input directory and Gin-oriented patterns; dynamic route paths are skipped with 
 group prefixes are omitted with diagnostics rather than guessed.
 
 FastAPI is static: it reads Python AST and never imports/runs the app. It recognizes typed params,
-Pydantic/dataclass models, `response_model`, `status_code`, `Literal`, `Enum`, and unions.
+Pydantic/dataclass models, `response_model` or typed returns (including collections), `status_code`,
+`Literal`, `Enum`, and unions; `Depends`/`Annotated[..., Depends()]` injection is not emitted as HTTP input.
 
 Flask is intentionally typed-envelope only. Untyped `request.json`, unannotated query reads, and
 missing return annotations become diagnostics instead of guesses.

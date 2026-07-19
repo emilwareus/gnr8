@@ -268,6 +268,35 @@ def _has_default(args, index):
     return index >= total - num_defaults
 
 
+def _positional_default(args, index):
+    """Return the default AST node for a positional argument, or ``None``."""
+    total = len(_positional_args(args))
+    first_default = total - len(args.defaults)
+    if index < first_default:
+        return None
+    return args.defaults[index - first_default]
+
+
+def _is_depends_call(node):
+    if not isinstance(node, ast.Call):
+        return False
+    name = types._name_of(node.func)
+    return bool(name) and name.split(".")[-1] == "Depends"
+
+
+def _is_dependency_parameter(annotation, default):
+    """Recognize FastAPI's native ``Depends`` and ``Annotated[..., Depends()]`` forms."""
+    if _is_depends_call(default):
+        return True
+    if not isinstance(annotation, ast.Subscript):
+        return False
+    base = types._subscript_value(annotation)
+    if not base or base.split(".")[-1] != "Annotated":
+        return False
+    args = types._subscript_args(annotation)
+    return any(_is_depends_call(metadata) for metadata in args[1:])
+
+
 def _is_union_alias(node):
     """Whether an alias value node is a ``Union[...]`` / ``A | B`` (a standalone schema)."""
     if isinstance(node, ast.Subscript):
@@ -335,6 +364,10 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         annotation = arg.annotation
         if annotation is None:
             continue
+        if _is_dependency_parameter(
+            annotation, _positional_default(func.args, index)
+        ):
+            continue
         # A parameter typed by a model/@dataclass class is the request body, not a param.
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
@@ -372,6 +405,9 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         annotation = arg.annotation
         if annotation is None:
             continue
+        default = kw_defaults[index] if index < len(kw_defaults) else None
+        if _is_dependency_parameter(annotation, default):
+            continue
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
             if allows_body and request_body is None:
@@ -401,11 +437,10 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
 
 
 def _build_response(call):
-    """Build the single response fact from ``response_model=`` / ``status_code=``.
+    """Build the response status from ``status_code=``.
 
-    ``status_code=`` Constant -> status (default 200 when absent); ``response_model=``
-    a class Name -> the response body $ref. The id is resolved by the caller's symtab
-    pass via the annotation name; here we capture the raw name node.
+    ``status_code=`` Constant -> status (default 200 when absent). Response schema selection is
+    handled separately from an explicit ``response_model=`` or the handler return annotation.
     """
     status = _const_kwarg(call, "status_code")
     if not isinstance(status, int):
@@ -413,23 +448,74 @@ def _build_response(call):
     return status
 
 
-def _response_model_ref(call, in_module, table):
-    """Resolve a ``response_model=ClassName`` keyword to a schema $ref id, or None."""
+def _response_annotation(call, func):
+    """Select the explicit response model, otherwise the handler return annotation."""
     for kw in call.keywords:
         if kw.arg == "response_model":
-            return _resolves_to_schema_ref(kw.value, in_module, table)
-    return None
+            if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                return None
+            return kw.value
+    return func.returns
 
 
-def recognize_fastapi(modules, table, diags):
+def _pascal_case(name):
+    return "".join(part[:1].upper() + part[1:] for part in name.split("_") if part)
+
+
+def _response_schema_ref(
+    annotation,
+    func,
+    in_module,
+    abs_path,
+    table,
+    diags,
+    synthetic_schemas,
+):
+    if annotation is None:
+        return None
+    direct = _resolves_to_schema_ref(annotation, in_module, table)
+    if direct is not None:
+        return direct
+    mapped = types.map_annotation(annotation, in_module, table, diags)
+    if mapped is None:
+        return None
+    if mapped.get("type") == "named":
+        return mapped.get("of")
+
+    name = _pascal_case(func.name) + "Response"
+    ref_id = "{}.{}".format(in_module, name)
+    if any(schema["id"] == ref_id for schema in synthetic_schemas):
+        diags.warn(
+            "synthetic response schema '{}' collides with another schema; response omitted"
+            .format(ref_id),
+            abs_path,
+            getattr(func, "lineno", 0),
+        )
+        return None
+    synthetic_schemas.append(
+        {
+            "id": ref_id,
+            "name": name,
+            "body": mapped,
+            "span": _span(abs_path, func),
+        }
+    )
+    return ref_id
+
+
+def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
     """Recognize FastAPI routes across ``modules`` -> a list of RouteFact dicts.
 
     For each module: index its router/app bindings (with their separately-recorded
     prefix), then walk every ``def``/``async def`` carrying an ``@<router>.<verb>(...)``
-    decorator and assemble its method/path/params/body/response facts. The host
+    decorator and assemble its method/path/params/body/response facts. Typed return annotations are
+    used when ``response_model=`` is absent, collection responses receive a deterministic synthetic
+    schema, and framework dependency parameters are omitted from the HTTP contract. The host
     re-sorts the routes; the sidecar stays internally deterministic.
     """
     routes = []
+    if synthetic_schemas is None:
+        synthetic_schemas = []
     external_prefixes = _external_registration_prefixes(
         modules, "include_router", "prefix", diags
     )
@@ -460,7 +546,16 @@ def recognize_fastapi(modules, table, diags):
                 stmt, path, method, module.dotted, abs_path, table, diags
             )
             status = _build_response(decorator)
-            body_ref = _response_model_ref(decorator, module.dotted, table)
+            response_annotation = _response_annotation(decorator, stmt)
+            body_ref = _response_schema_ref(
+                response_annotation,
+                stmt,
+                module.dotted,
+                abs_path,
+                table,
+                diags,
+                synthetic_schemas,
+            )
             response = {
                 "status": status,
                 "body": {"ref_id": body_ref} if body_ref is not None else None,

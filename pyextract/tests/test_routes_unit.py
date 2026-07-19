@@ -310,5 +310,81 @@ class StaticPrefixCompositionTests(unittest.TestCase):
         self.assertEqual(found[0]["path"], "/v1/books/")
 
 
+class FastAPIResponseAndDependencyTests(unittest.TestCase):
+    MODEL_SOURCE = "class Book(BaseModel):\n    title: str\n"
+
+    def _recognize(self, handler_source):
+        modules = [
+            _FakeModule("app.main", "app = FastAPI()\n" + handler_source),
+            _FakeModule("app.models", self.MODEL_SOURCE),
+        ]
+        diags = Diagnostics()
+        synthetic = []
+        found = routes.recognize_fastapi(
+            modules, SymbolTable(modules), diags, synthetic
+        )
+        return found, synthetic, diags
+
+    def test_async_return_annotation_supplies_response_model(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/book')\n"
+            "async def get_book() -> Book:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            found[0]["responses"][0]["body"], {"ref_id": "app.models.Book"}
+        )
+        self.assertEqual(synthetic, [])
+
+    def test_list_return_annotation_synthesizes_array_response_schema(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/books')\n"
+            "async def list_books() -> list[Book]:\n"
+            "    pass\n"
+        )
+        response_ref = found[0]["responses"][0]["body"]["ref_id"]
+        self.assertEqual(len(synthetic), 1)
+        self.assertEqual(synthetic[0]["id"], response_ref)
+        self.assertEqual(
+            synthetic[0]["body"],
+            {"type": "array", "of": {"type": "named", "of": "app.models.Book"}},
+        )
+
+    def test_list_response_model_synthesizes_array_response_schema(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/books', response_model=list[Book])\n"
+            "async def list_books():\n"
+            "    pass\n"
+        )
+        self.assertEqual(len(synthetic), 1)
+        self.assertEqual(
+            found[0]["responses"][0]["body"], {"ref_id": synthetic[0]["id"]}
+        )
+        self.assertEqual(synthetic[0]["body"]["type"], "array")
+
+    def test_depends_default_is_not_a_request_body_or_query_param(self):
+        found, _synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.post('/books')\n"
+            "async def create_book(service: Book = Depends()):\n"
+            "    pass\n"
+        )
+        self.assertIsNone(found[0]["request_body"])
+        self.assertEqual(found[0]["params"], [])
+
+    def test_annotated_depends_is_not_a_request_body_or_query_param(self):
+        found, _synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.post('/books')\n"
+            "async def create_book(service: Annotated[Book, Depends()]):\n"
+            "    pass\n"
+        )
+        self.assertIsNone(found[0]["request_body"])
+        self.assertEqual(found[0]["params"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
