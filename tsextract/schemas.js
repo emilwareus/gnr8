@@ -42,10 +42,11 @@ class Registry {
 
   add(id, entry) {
     if (this._byId.has(id)) {
-      return;
+      return false;
     }
     this._byId.set(id, entry);
     this._pending.push(Object.assign({ id: id }, entry));
+    return true;
   }
 
   hasPending() {
@@ -238,6 +239,14 @@ function _buildSchema(loaded, entry, diags, registry) {
   }
   if (entry.kind === "alias") {
     return _buildAliasSchema(loaded, entry, diags, registry);
+  }
+  if (entry.kind === "synthetic") {
+    return {
+      id: entry.id,
+      name: entry.name,
+      body: entry.body,
+      span: entry.span,
+    };
   }
   return null;
 }

@@ -97,8 +97,8 @@ Flask is intentionally typed-envelope only. Untyped `request.json`, unannotated 
 missing return annotations become diagnostics instead of guesses.
 
 NestJS reads TypeScript through the target project's own `typescript` package. It recognizes controller
-methods, params/query/body decorators, DTO classes, enums, and unions. It does not read swagger, zod, or
-class-validator metadata.
+methods, params/query/body decorators, DTO classes, enums, unions, `Promise<T>`, and collection
+responses. It does not read swagger, zod, or class-validator metadata.
 
 OpenAPI/Swagger source reads JSON or YAML Swagger 2.0, OpenAPI 3.0, and OpenAPI 3.1 artifacts into
 the same API graph used by code-first sources. Import a specification directly, then target

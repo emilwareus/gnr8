@@ -31,10 +31,19 @@ export class EdgesController {
     return null;
   }
 
-  // WR-02: an array return is representable as a type but not as a TypeRef ->
-  // a DISTINCT "array/not-a-named-ref" diagnostic + body omitted.
+  // Array returns are wrapped in a deterministic synthetic response schema.
   @Get("/array")
   getArray(): Thing[] {
+    return [];
+  }
+
+  @Get("/promise")
+  async getPromise(): Promise<Thing> {
+    return new Thing();
+  }
+
+  @Get("/promise-array")
+  async getPromiseArray(): Promise<Thing[]> {
     return [];
   }
 

@@ -226,18 +226,16 @@ function _paramKind(paramDecl) {
   return null;
 }
 
-// Resolve a method's return type to a schema ref id, registering the referenced
-// declaration for transitive collection. Returns the id or null (with a
-// diagnostic recorded) when the return type is not a named schema-bearing type.
+// Resolve a method's return type to a schema ref id, registering referenced
+// declarations for transitive collection. Inline representable response shapes
+// receive a deterministic synthetic component so ResponseFact stays ref-only.
 //
 // The return type is mapped through the SAME `types.mapType` discriminator every
 // field/param uses (WR-01, rule 3 — ONE named-vs-inline path): the method's
 // `type` annotation node carries the syntactic info `mapType` reads, so a
 // nullable named return (`getX(): BookOrError | null`) resolves identically to a
 // nullable named field, instead of the divergent `t.aliasSymbol` read that TS
-// drops on `| null`. `ResponseFact.body` is a `TypeRef` (a bare ref_id), so ONLY
-// a `named` result is representable; an array/union/map/primitive return is
-// diagnosed distinctly (WR-02) and the body omitted — never a guessed ref.
+// drops on `| null`.
 function _responseRef(loaded, methodDecl, diags, registry) {
   if (!methodDecl.type) {
     return null;
@@ -250,21 +248,67 @@ function _responseRef(loaded, methodDecl, diags, registry) {
   if (mapped.schema === null) {
     return null; // unresolvable type (mapReturnType already recorded the diagnostic)
   }
+  if (mapped.optional || mapped.nullable) {
+    diags.warn(
+      "response type is optional/nullable at the top level, which the response contract cannot represent; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
   if (mapped.schema.type === "named") {
     return mapped.schema.of;
   }
 
-  // A representable-but-not-as-a-TypeRef return shape (array/union/map/enum/
-  // primitive). `ResponseFact.body` can only carry a named ref_id, so distinguish
-  // this from a wholly unresolvable type (WR-02) and omit the body (rule 3).
-  diags.warn(
-    "response type is a '" +
-      mapped.schema.type +
-      "', not a named schema; a response body can only be a named ref (TypeRef), so the body is omitted (no fallback)",
-    file,
-    line
+  if (!registry) {
+    diags.warn(
+      "response type requires a synthetic schema but no schema registry was supplied; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  const handler = methodDecl.name ? methodDecl.name.getText(sf) : "response";
+  const name =
+    handler
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join("") + "Response";
+  const refId = load.schemaId(loaded.targetDir, sf.fileName, name);
+  const collidesWithSource = sf.statements.some(
+    (statement) =>
+      (ts.isClassDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) &&
+      statement.name &&
+      statement.name.text === name
   );
-  return null;
+  if (collidesWithSource) {
+    diags.warn(
+      "synthetic response schema '" +
+        refId +
+        "' collides with a source declaration; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  const added = registry.add(refId, {
+    kind: "synthetic",
+    name: name,
+    body: mapped.schema,
+    span: load.span(sf, methodDecl, loaded.targetDir),
+  });
+  if (!added) {
+    diags.warn(
+      "synthetic response schema '" +
+        refId +
+        "' collides with another response; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  return refId;
 }
 
 // Build the params + request_body from a method's typed signature.

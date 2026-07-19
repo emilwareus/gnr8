@@ -34,7 +34,8 @@ fn main() -> std::process::ExitCode {
 - Ensure the project has `typescript` installed where the NestJS app already builds. gnr8 uses the
   project's TypeScript compiler API for extraction.
 - Keep controller and DTO code under `src` unless you intentionally change `inputs(["src"])`.
-- Prefer DTO classes, enums, unions, and explicit controller method return types.
+- Prefer DTO classes, enums, unions, and explicit controller method return types. Synchronous,
+  `Promise<T>`, and array response annotations are supported.
 - gnr8 does not read Swagger decorators, zod schemas, or class-validator metadata as the source of
   truth. Put API shape in TypeScript types.
 - Keep SDK output under a generated directory and consume the generated README/reference before writing

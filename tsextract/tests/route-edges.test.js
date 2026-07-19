@@ -14,7 +14,7 @@ const path = require("path");
 
 const load = require("../load");
 const { recognizeNestController, } = require("../routes");
-const { Registry } = require("../schemas");
+const { buildSchemas, Registry } = require("../schemas");
 const { Diagnostics } = require("../diagnostics");
 
 const FIXTURE = path.resolve(__dirname, "fixtures/route-edges");
@@ -23,7 +23,9 @@ const diags = new Diagnostics();
 const loaded = load.load(FIXTURE, diags);
 const registry = new Registry();
 const routes = recognizeNestController(loaded, diags, registry);
+const schemas = buildSchemas(loaded, diags, registry);
 const byHandler = Object.fromEntries(routes.map((r) => [r.handler, r]));
+const schemasById = Object.fromEntries(schemas.map((schema) => [schema.id, schema]));
 
 function hasDiag(substr) {
   return diags.items().some((d) => d.message.includes(substr));
@@ -56,16 +58,31 @@ function hasDiag(substr) {
   assert.strictEqual(r.responses[0].body, null, "non-TypeRef body must be omitted");
 })();
 
-// WR-02: an array return gets a DISTINCT diagnostic (not collapsed into the
-// generic "unresolvable type" message) and the body is omitted.
-(function array_return_distinct_diagnostic() {
+// Array returns receive deterministic named component schemas so ResponseFact
+// can keep its reference-only contract.
+(function array_return_has_synthetic_schema() {
   const r = byHandler.getArray;
   assert.ok(r, "getArray route missing");
-  assert.strictEqual(r.responses[0].body, null);
-  assert.ok(
-    hasDiag("response type is a 'array'"),
-    "array response must record a distinct 'array' diagnostic (WR-02)"
+  const ref = r.responses[0].body.ref_id;
+  assert.deepStrictEqual(
+    schemasById[ref].body,
+    { type: "array", of: { type: "named", of: "src/edges.controller.Thing" } }
   );
+})();
+
+(function promise_named_return_is_unwrapped() {
+  assert.deepStrictEqual(byHandler.getPromise.responses[0].body, {
+    ref_id: "src/edges.controller.Thing",
+  });
+})();
+
+(function promise_array_return_is_unwrapped_and_synthesized() {
+  const ref = byHandler.getPromiseArray.responses[0].body.ref_id;
+  assert.strictEqual(schemasById[ref].body.type, "array");
+  assert.deepStrictEqual(schemasById[ref].body.of, {
+    type: "named",
+    of: "src/edges.controller.Thing",
+  });
 })();
 
 // WR-03: a second HTTP-verb decorator is diagnosed and only one route emitted.
