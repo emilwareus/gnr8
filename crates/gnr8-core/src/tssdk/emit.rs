@@ -1366,7 +1366,7 @@ fn emit_operation(
     emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
     emit_op_query(
         out,
-        &query_params,
+        graph,
         &required_query,
         &required_query_idents,
         &optional_query,
@@ -1828,33 +1828,23 @@ fn emit_op_path(
 /// The wire key stays the ORIGINAL `p.name`.
 fn emit_op_query(
     out: &mut String,
-    query_params: &[&Param],
+    graph: &ApiGraph,
     required_query: &[&Param],
     required_query_idents: &[String],
     optional_query: &[&Param],
     optional_query_idents: &[String],
     auth_queries: &[String],
 ) -> Result<(), CoreError> {
-    if query_params.is_empty() && auth_queries.is_empty() {
+    if required_query.is_empty() && optional_query.is_empty() && auth_queries.is_empty() {
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        writeln!(
-            out,
-            "    searchParams.set(\"{}\", String({ident}));",
-            p.name
-        )
-        .map_err(sink)?;
+        emit_query_param_value(out, graph, p, ident, 4)?;
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        writeln!(
-            out,
-            "      searchParams.set(\"{}\", String({ident}));",
-            p.name
-        )
-        .map_err(sink)?;
+        emit_query_param_value(out, graph, p, ident, 6)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     for (idx, query) in auth_queries.iter().enumerate() {
@@ -1879,6 +1869,89 @@ fn emit_op_query(
     writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
     writeln!(out, "    }}").map_err(sink)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TsQueryShape {
+    Scalar,
+    Array,
+}
+
+fn emit_query_param_value(
+    out: &mut String,
+    graph: &ApiGraph,
+    param: &Param,
+    ident: &str,
+    indent_width: usize,
+) -> Result<(), CoreError> {
+    let spaces = " ".repeat(indent_width);
+    let key = quoted_string_literal(&param.name);
+    match ts_query_shape(&param.schema, graph, &param.name)? {
+        TsQueryShape::Scalar => {
+            writeln!(out, "{spaces}searchParams.set({key}, String({ident}));").map_err(sink)?;
+        }
+        TsQueryShape::Array => {
+            writeln!(out, "{spaces}for (const value of {ident}) {{").map_err(sink)?;
+            writeln!(out, "{spaces}  searchParams.append({key}, String(value));").map_err(sink)?;
+            writeln!(out, "{spaces}}}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn ts_query_shape(
+    schema: &Type,
+    graph: &ApiGraph,
+    param_name: &str,
+) -> Result<TsQueryShape, CoreError> {
+    ts_query_shape_inner(schema, graph, param_name, &mut BTreeSet::new())
+}
+
+fn ts_query_shape_inner(
+    schema: &Type,
+    graph: &ApiGraph,
+    param_name: &str,
+    seen_refs: &mut BTreeSet<String>,
+) -> Result<TsQueryShape, CoreError> {
+    match schema {
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) => Ok(TsQueryShape::Scalar),
+        Type::Array(item) => match ts_query_shape_inner(item, graph, param_name, seen_refs)? {
+            TsQueryShape::Scalar => Ok(TsQueryShape::Array),
+            TsQueryShape::Array => Err(unsupported_ts_query_shape(param_name, "nested array")),
+        },
+        Type::Named(ref_id) => {
+            if !seen_refs.insert(ref_id.clone()) {
+                return Err(unsupported_ts_query_shape(
+                    param_name,
+                    "cyclic named-schema",
+                ));
+            }
+            let target = graph
+                .schemas
+                .iter()
+                .find(|schema| &schema.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "query parameter '{param_name}' references missing schema '{ref_id}'"
+                    ),
+                })?;
+            let shape = ts_query_shape_inner(&target.body, graph, param_name, seen_refs);
+            seen_refs.remove(ref_id);
+            shape
+        }
+        Type::Object(_) => Err(unsupported_ts_query_shape(param_name, "object")),
+        Type::Map { .. } => Err(unsupported_ts_query_shape(param_name, "map")),
+        Type::Union(_) => Err(unsupported_ts_query_shape(param_name, "union")),
+        Type::Any {} => Err(unsupported_ts_query_shape(param_name, "any")),
+    }
+}
+
+fn unsupported_ts_query_shape(param_name: &str, shape: &str) -> CoreError {
+    CoreError::SdkGen {
+        message: format!(
+            "TypeScript query parameter '{param_name}' has unsupported {shape} shape; only scalars and one-dimensional scalar arrays have a defined wire encoding"
+        ),
+    }
 }
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
@@ -3142,6 +3215,76 @@ mod tests {
             assert!(
                 !out.contains("JSON.stringify(body)"),
                 "query op has no body:\n{out}"
+            );
+        }
+
+        #[test]
+        fn array_query_params_use_repeated_keys() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params.push(crate::graph::Param {
+                name: "tag".to_string(),
+                location: "query".to_string(),
+                required: false,
+                schema: crate::graph::Type::Array(Box::new(crate::graph::Type::Primitive(
+                    crate::graph::Prim::String,
+                ))),
+                default: None,
+                provenance: crate::graph::SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 8,
+                    end_line: 8,
+                },
+            });
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(out.contains("if (tag !== undefined) {"), "{out}");
+            assert!(out.contains("for (const value of tag) {"), "{out}");
+            assert!(
+                out.contains("searchParams.append(\"tag\", String(value));"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("searchParams.set(\"tag\", String(tag));"),
+                "array query values must not be implicitly comma-joined:\n{out}"
+            );
+        }
+
+        #[test]
+        fn map_query_params_are_rejected_before_emission() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params.push(crate::graph::Param {
+                name: "filter".to_string(),
+                location: "query".to_string(),
+                required: true,
+                schema: crate::graph::Type::Map {
+                    key: Box::new(crate::graph::Type::Primitive(crate::graph::Prim::String)),
+                    value: Box::new(crate::graph::Type::Primitive(crate::graph::Prim::String)),
+                },
+                default: None,
+                provenance: crate::graph::SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 9,
+                    end_line: 9,
+                },
+            });
+
+            let error =
+                emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("query parameter 'filter' has unsupported map shape"),
+                "{error}"
             );
         }
 

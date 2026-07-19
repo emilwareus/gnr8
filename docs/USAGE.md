@@ -224,6 +224,10 @@ stdlib-only (Go `go/types`, Python `ast`), and `gnr8-core` itself keeps a small 
 The CLI's focused open-source dependencies support bounded commodity concerns; the source-to-SDK
 pipeline remains gnr8-owned end to end.
 
+TsSdk query serialization is explicit: scalar parameters use one key and one-dimensional scalar
+arrays use repeated keys (`?tag=a&tag=b`). Object, map, union, nested-array, and unconstrained query
+shapes fail generation because the graph does not declare a wire encoding for them.
+
 Graph-level field requiredness overrides are available for source quirks and legacy migration patches:
 
 ```rust
