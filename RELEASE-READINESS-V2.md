@@ -1,10 +1,10 @@
 # gnr8 release-readiness assessment v2
 
-**Assessed:** 2026-07-19  
-**Branch:** `release-readiness`  
-**Pull request:** https://github.com/emilwareus/gnr8/pull/41  
-**Verdict:** ready for a constrained early-access release only after the PR's complete release gate is
-green; not yet ready for broad or drop-in migration marketing.
+**Assessed:** 2026-07-23
+**Branch:** `release-readiness`
+**Pull request:** https://github.com/emilwareus/gnr8/pull/41
+**Verdict:** locally ready to merge and ship as a constrained early-access release; the hosted PR
+checks must still be green before merge. Not yet ready for broad or drop-in migration marketing.
 
 ## Executive assessment
 
@@ -19,12 +19,15 @@ Python/FastAPI or Flask, and TypeScript/NestJS services. It is not enough to pro
 understanding, arbitrary OpenAPI migration, behavioral parity with mature generators, or a
 self-contained/runtime-free install.
 
-The release decision remains conditional because this workspace has no Go toolchain and lacks
-PyYAML/pip for one independent-parser test. After reconciling current `main`, formatting, clippy, 41
-CLI tests, 108 Python extractor tests, all TypeScript extractor tests, and 403 Rust library tests
-passed. The Rust diagnostic run explicitly filtered four Go-dependent tests and the PyYAML-dependent
-test, then the next Go-backed integration test stopped with `GoToolchainMissing`. CI installs both
-prerequisites; its complete result, not these filtered local runs, must decide the release.
+The complete local release gate is green. `make check` passed formatting, strict clippy, 410 Rust
+library tests, 41 CLI tests, all Rust integration and snapshot tests, the Go fixture and extractor
+build/vet/test suites, 108 Python extractor tests, all TypeScript extractor tests, action-version
+tests, and forced drift checks for every example. The only ignored test is the intentionally opt-in,
+timing-dependent watch smoke; deterministic watch tests remain blocking. `release-local-check.sh`
+then repeated that gate, built and unpacked the macOS arm64 archive, passed
+`init` → `generate` → `doctor` → `check` in an unrelated project, and completed
+`cargo publish --dry-run`. Hosted CI remains the final merge authority because it exercises the
+repository's declared runner matrix and release workflow.
 
 ## What is now release credible
 
@@ -39,8 +42,12 @@ prerequisites; its complete result, not these filtered local runs, must decide t
 - Common FastAPI async/list return signatures and dependency injection, plus NestJS Promise/list
   responses, have regression coverage.
 - Go SDK generation preserves `float64` and nullable string JSON semantics in committed runtime tests.
+- Empty Go operation sets emit compilable packages without unused imports, and generated examples
+  carry the corrected nullable pointer types.
 - `doctor` treats extraction errors as failures and unknown Go handlers or missing response facts emit
   actionable diagnostics.
+- Forced generation cannot be hidden by the verified no-op cache, and Go extractor source changes
+  invalidate both host and source-graph caches.
 - TypeScript scalar-array query parameters use repeated keys; unsupported structured query encodings
   fail before emitting a misleading client.
 - The release workflow validates the release commit before atomically pushing `main` and its tag, and
@@ -65,12 +72,12 @@ release and a broad market launch.
 4. **TypeScript response decoding (P1.4).** Unify success/error body reading so empty or malformed JSON
    and content-type mismatches produce stable SDK errors with raw response context instead of leaking
    transport-specific exceptions.
-5. **Clean-machine release proof (remaining P1.5).** The archive now contains a valid staged workspace
-   and has a host smoke test, but every release platform still needs an unpacked, low-cache test plus a
-   generated consumer compile/run and a clear prerequisite preflight.
-6. **Behavioral parity tests (remaining P1.6).** The new regressions cover the audited shapes, but the
-   three SDKs still need live HTTP tests for arrays, auth, retries, hooks, empty/malformed bodies,
-   errors, and media types. Release reporting must distinguish executed from toolchain-skipped tests.
+5. **Clean-machine release proof (remaining P1.5).** The macOS arm64 archive has a local unpacked host
+   smoke test, but every release platform still needs an unpacked, low-cache test plus a generated
+   consumer compile/run and a clear prerequisite preflight.
+6. **Behavioral parity tests (remaining P1.6).** Live HTTP tests now cover core auth, retries, hooks,
+   pagination, media requests, and Go/Python round trips. Broader cross-SDK coverage for arrays,
+   malformed or empty bodies, typed errors, and content-type mismatches remains before parity claims.
 7. **Issue-tracker reconciliation (P1.7).** Audit issues #16, #17, #18, and #23 against current tests;
    close fixed portions and split or reprioritize residual gaps so public issue state matches the code.
 
@@ -93,8 +100,9 @@ arbitrary framework code, or safely migrates arbitrary OpenAPI documents.
 
 ## Release decision
 
-1. Require PR #41's complete release dry-run and every Go-backed test to pass without skips.
-2. Review the produced archives and published prerequisite wording once more.
-3. If those checks pass, ship as an early-access release with the constrained positioning above.
+1. Keep PR #41 blocked until its hosted checks reproduce the green local release gate.
+2. Review the hosted release artifacts and published prerequisite wording once more.
+3. When those checks pass, merge and ship as an early-access release with the constrained positioning
+   above.
 4. Keep broad launch and migration claims blocked on P1.1–P1.6 evidence, with P1.7 completed before
    actively directing prospective users to the public repository.

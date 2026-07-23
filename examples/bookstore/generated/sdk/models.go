@@ -10,7 +10,7 @@ type Book struct {
 	Price       float64   `json:"price"`
 	PublishedAt time.Time `json:"publishedAt"`
 	Publisher   Publisher `json:"publisher"`
-	Subtitle    string    `json:"subtitle,omitempty"`
+	Subtitle    *string   `json:"subtitle,omitempty"`
 	Tags        []string  `json:"tags"`
 	Title       string    `json:"title"`
 }
@@ -24,7 +24,7 @@ type CreateBookRequest struct {
 	Genre     Genre     `json:"genre"`
 	Price     float64   `json:"price"`
 	Publisher Publisher `json:"publisher"`
-	Subtitle  string    `json:"subtitle,omitempty"`
+	Subtitle  *string   `json:"subtitle,omitempty"`
 	Tags      []string  `json:"tags"`
 	Title     string    `json:"title"`
 }
@@ -58,10 +58,10 @@ type Publisher struct {
 }
 
 type UpdateBookRequest struct {
-	Author   string   `json:"author,omitempty"`
+	Author   *string  `json:"author,omitempty"`
 	Genre    *Genre   `json:"genre,omitempty"`
 	Price    *float64 `json:"price,omitempty"`
-	Subtitle string   `json:"subtitle,omitempty"`
+	Subtitle *string  `json:"subtitle,omitempty"`
 	Tags     []string `json:"tags,omitempty"`
-	Title    string   `json:"title,omitempty"`
+	Title    *string  `json:"title,omitempty"`
 }

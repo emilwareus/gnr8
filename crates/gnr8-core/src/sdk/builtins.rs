@@ -143,10 +143,13 @@ impl Source for GoGin {
         // process cwd (an absolute input is left as-is by `Path::join`). This matches the lifecycle's
         // input-resolution and keeps span provenance relative to the same root.
         let resolved = cx.project_root.join(input);
+        let helper_root = crate::analyze::helper::goextract_dir()?;
+        let helper_source_hash = crate::analyze::helper::goextract_source_hash(&helper_root)?;
         let cache_key = go_gin_cache_key(
             &resolved,
             &self.route_package_patterns,
             &self.schema_package_patterns,
+            &helper_source_hash,
             cx,
         );
         if let Some(cached) = load_go_gin_cache(cx, &cache_key) {
@@ -181,13 +184,17 @@ fn go_gin_cache_key(
     input: &Path,
     route_package_patterns: &[String],
     schema_package_patterns: &[String],
+    helper_source_hash: &str,
     cx: &Cx,
 ) -> String {
     let mut files = Vec::new();
     collect_cache_input_files(input, &mut files);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-go-gin-source-cache-v3\n");
+    hasher.update(b"gnr8-go-gin-source-cache-v4\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(b"helper\n");
+    hasher.update(helper_source_hash.as_bytes());
     hasher.update(b"\n");
     hasher.update(b"routes\n");
     for pattern in route_package_patterns {
@@ -6238,7 +6245,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        create_unique_postprocess_dir, sdk_package, ApiOverrides, ApplySecurity,
+        create_unique_postprocess_dir, go_gin_cache_key, sdk_package, ApiOverrides, ApplySecurity,
         ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask,
         FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
         OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaAliases,
@@ -6262,6 +6269,19 @@ mod tests {
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
+    }
+
+    #[test]
+    fn go_gin_cache_key_changes_with_extractor_source() {
+        let cx = cx();
+        let input = cx.project_root.join("gnr8-cache-key-missing-input");
+        let routes = vec!["./routes".to_string()];
+        let schemas = vec!["./schemas".to_string()];
+
+        let first = go_gin_cache_key(&input, &routes, &schemas, "helper-a", &cx);
+        let second = go_gin_cache_key(&input, &routes, &schemas, "helper-b", &cx);
+
+        assert_ne!(first, second);
     }
 
     fn span() -> SourceSpan {

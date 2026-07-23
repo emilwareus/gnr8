@@ -3340,10 +3340,13 @@ fn emit_operations_inner(
     if needs_wire_helpers {
         emit_wire_parameter_helpers(&mut body);
     }
-    // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
-    // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
-    // need strconv/time. This stays correct when split layout emits one operation per file.
-    let mut imports: Vec<&str> = vec!["context", "encoding/json", "io", "net/http"];
+    // A non-empty operations file always touches the request-plumbing imports. An empty graph still
+    // emits operations.go for a stable SDK layout, but that package-only file needs no imports.
+    let mut imports: Vec<&str> = if ops.is_empty() {
+        Vec::new()
+    } else {
+        vec!["context", "encoding/json", "io", "net/http"]
+    };
     if body_encodings.iter().any(|encoding| {
         matches!(
             encoding,
@@ -5595,6 +5598,14 @@ mod tests {
 
     mod operations {
         use super::{emit_operations, sample_graph};
+
+        #[test]
+        fn empty_operation_set_emits_no_unused_imports() {
+            let graph = sample_graph();
+            let out = emit_operations(&graph, "goalservice", "/goal", &[]).unwrap();
+
+            assert_eq!(out, "package goalservice\n\n");
+        }
 
         #[test]
         fn method_signature_is_ctx_first_with_body_and_return_model() {

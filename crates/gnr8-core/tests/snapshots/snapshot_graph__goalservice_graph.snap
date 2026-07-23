@@ -571,7 +571,9 @@ schemas:
       start_line: 39
       end_line: 39
 diagnostics:
-  - severity: WARN
+  - code: schema.free_form_map
+    severity: WARN
+    category: schema
     message: "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true; downstream generators may mishandle untyped maps (TARGET-API.md §5.1)"
     file: internal/common/dto/goal.go
     line: 62

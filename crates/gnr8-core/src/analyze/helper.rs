@@ -198,7 +198,7 @@ fn checked_sidecar_dir(label: &str, path: PathBuf) -> Result<PathBuf, CoreError>
     })
 }
 
-fn goextract_source_hash(root: &std::path::Path) -> Result<String, CoreError> {
+pub(crate) fn goextract_source_hash(root: &std::path::Path) -> Result<String, CoreError> {
     let mut files = Vec::new();
     collect_goextract_source_files(root, &mut files)?;
     let mut hasher = blake3::Hasher::new();

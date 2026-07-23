@@ -1151,6 +1151,23 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	if hasBodyBind {
 		cf.RequestBodyRequired = !allBodyBindsOptional
 	}
+	if diags != nil {
+		reported := map[string]bool{}
+		for _, read := range untypedQueryReads {
+			key := "query/" + read.name
+			if resolvedParam[key] || reported[key] {
+				continue
+			}
+			reported[key] = true
+			diags.UntypedQueryParam(
+				read.name,
+				route.Method,
+				untypedRouteLabel(route),
+				read.file,
+				read.line,
+			)
+		}
+	}
 	if len(cf.Responses) == 0 && diags != nil {
 		diags.MissingResponses(
 			route.Handler,

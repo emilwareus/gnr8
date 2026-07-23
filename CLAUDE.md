@@ -20,23 +20,29 @@ comments, or formats.
 There must be **zero code anywhere in the repo that reads or understands another tool's convention.**
 We are a *replacement* for those tools, not a consumer of them.
 
-## 2. No third-party / OSS dependencies
+## 2. Own the product chain; bound commodity dependencies
 
-We stand entirely on our own. The **only** thing we may use is the language's **standard library**
-(Rust `std`; Go stdlib such as `go/ast`, `go/types`, `go/parser`, `go/token`, `net/http`,
-`encoding/json`). **No external crates or modules** — none. Not for convenience, not for serialization,
-not for parsing, not for hashing, not for CLI, not for file watching.
+gnr8 owns every product-defining stage from typed source extraction through the neutral graph to
+OpenAPI and generated SDKs. Focused open-source libraries are allowed for commodity concerns such as
+serialization, CLI parsing, hashing, file watching, and access to a language's reference compiler.
+They must not define gnr8's API model, generation behavior, configuration surface, or public contract.
 
-**STRONGLY PREFER hand-rolled, in-repo code over even the standard library** wherever it is reasonable
-to own it. When in doubt, write it ourselves and keep it in this codebase.
+Keep dependencies narrow and reviewable:
 
-Before adding ANY dependency: the answer is no. There is no approval path that adds an OSS dependency.
+- prefer the standard library or existing focused dependencies when either is sufficient;
+- do not add overlapping frameworks or a second implementation path for the same concern;
+- do not use dependencies to read another generator's annotations, configuration, or output;
+- keep `gnr8-core`'s product behavior deterministic and covered by repository-owned tests; and
+- keep generated Go, Python, and TypeScript SDKs standard-library-only.
+
+Before adding a dependency, document the bounded commodity concern it serves and verify that it does
+not weaken rules 1, 3, or 4.
 
 ### TypeScript toolchain (required, not shipped)
 
-This is **not an exception to rule 2** — rule 2 holds literally: **gnr8 ships ZERO OSS.** `gnr8-core`
-takes zero crates, and **no `typescript` is vendored or bundled.** What this subsection records is a
-*toolchain prerequisite*, the same class of fact as "a Go service needs `go` on PATH."
+No `typescript` compiler is vendored or bundled. The TypeScript extractor borrows the target project's
+own compiler as a *toolchain prerequisite*, the same class of fact as "a Go service needs `go` on
+PATH."
 
 The `tsextract` Node sidecar reads TypeScript types via the language's own reference Compiler API. It
 gets that compiler the same way every sidecar gets its toolchain: it **borrows the USER's own
@@ -46,13 +52,13 @@ gets that compiler the same way every sidecar gets its toolchain: it **borrows t
 OSS dependency.** (A gitignored `devDependency`, restored via `npm ci` / `make tsextract-deps`, backs
 gnr8's OWN test suite only — it is never shipped to users and never committed.)
 
-The bright line (this records a prerequisite; it does **not** loosen rule 2 anywhere):
+The bright line:
 
 - `tsextract` derives facts ONLY from the source's own TypeScript types via that toolchain — it NEVER
   reads `@nestjs/swagger`, `zod`, `class-validator`, or any third-party schema/annotation tool (rule 1
   forbids those absolutely).
-- Every other sidecar stays stdlib-only (Go `go/types`/`go/ast`; Python `ast`). gnr8 ships no OSS.
-- `gnr8-core` and every generated SDK (GoSdk, PySdk, TsSdk) remain dependency-free.
+- Every other sidecar uses its source language's own typed or standard-library facilities.
+- Every generated SDK (GoSdk, PySdk, TsSdk) remains dependency-free.
 - A future hand-rolled stdlib-pure TypeScript parser (FUT-04) could remove even the toolchain
   requirement.
 
@@ -87,21 +93,15 @@ dynamic plugin runtime, FFI, or macro-heavy config DSL.
 
 ---
 
-## Known debt — current violations of the above (retire these; do not add more)
+## Dependency review boundary
 
-This codebase was bootstrapped before these rules were locked. The following **violate rule 2** and are
-**debt to be removed**, not precedent to copy:
+Existing Go and Rust dependencies serve bounded implementation concerns. They are not precedent for
+outsourcing extraction semantics, the neutral graph, SDK behavior, or code-as-config. Replacing one
+with owned code is worthwhile only when it measurably improves correctness, security, distribution,
+or maintenance; dependency removal is not a product goal by itself.
 
-- **Go (`goextract/`):** `golang.org/x/tools/go/packages` (+ `golang.org/x/mod`, `golang.org/x/sync`).
-  Target: load/typecheck Go using **stdlib only** (`go/parser`, `go/types`, `go/token`, `go/importer`,
-  `go/build`) — own the package/module resolution ourselves.
-- **Rust (`crates/`):** `serde`, `serde_json`, `clap`, `thiserror`, `anyhow`, `blake3`,
-  `notify-debouncer-full`, `ctrlc`, `insta` (dev). Target: hand-rolled JSON/YAML, arg parsing, error
-  types, hashing, file-watching, and snapshot testing — in-repo. (`toml` is already gone — config is
-  code now, not a data file; see rule 4.)
-
-When you touch a file that uses one of these, prefer replacing the usage with owned code over extending
-it. Never add a new one.
+When touching dependency integration, prefer the standard library or an existing focused dependency
+over broadening the dependency surface, and keep product semantics in repository-owned code.
 
 ---
 

@@ -246,11 +246,16 @@ func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string
 // would make extraction coverage look complete when it is not.
 func (a *Accumulator) UnknownHandler(handler, method, route, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.handler.unresolved",
 		Severity: severityError,
+		Category: categorySource,
 		Message: "unknown handler '" + handler + "' for " + method + " " + route +
 			"; route extraction is incomplete and generation must not be treated as healthy (GO-06)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   handler,
 	})
 }
 
@@ -259,11 +264,16 @@ func (a *Accumulator) UnknownHandler(handler, method, route, file string, line u
 // means extraction coverage is incomplete rather than intentionally bodyless.
 func (a *Accumulator) MissingResponses(handler, method, route, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "response.missing",
 		Severity: severityError,
+		Category: categoryResponse,
 		Message: "missing response facts for handler '" + handler + "' on " + method + " " + route +
 			"; add a statically recognizable response or explicit code configuration (GO-06)",
-		File: file,
-		Line: line,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   handler,
 	})
 }
 
@@ -271,10 +281,13 @@ func (a *Accumulator) MissingResponses(handler, method, route, file string, line
 // return its partial facts solely for diagnostics and review.
 func (a *Accumulator) Error(message, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.load.failed",
 		Severity: severityError,
+		Category: categorySource,
 		Message:  message,
 		File:     file,
 		Line:     line,
+		EndLine:  line,
 	})
 }
 

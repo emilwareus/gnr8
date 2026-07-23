@@ -334,7 +334,11 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
     let root = project_root()?;
     let total_start = Instant::now();
     let hot_start = Instant::now();
-    let hot_noop = pre_child_verified_noop(&root);
+    let hot_noop = if force || accept_generated_baseline {
+        None
+    } else {
+        pre_child_verified_noop(&root)
+    };
     let hot_elapsed = hot_start.elapsed();
     let mut pipeline_elapsed = None;
     let mut write_elapsed = None;
@@ -961,6 +965,10 @@ fn collect_host_config_fast_stamps(
     }
     if let Ok(exe) = std::env::current_exe() {
         push_fast_file_stamp(root, &exe, out)?;
+    }
+    let resource_root = gnr8::resource::resource_dir().ok()?;
+    for sidecar in ["goextract", "pyextract", "tsextract"] {
+        collect_hot_input_file_stamps(root, &resource_root.join(sidecar), out)?;
     }
     Some(())
 }
