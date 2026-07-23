@@ -130,7 +130,7 @@ Layout written by `gnr8 init`:
 
 ```
 .gnr8/
-  Cargo.toml        # empty [workspace] table; gnr8 = "x.y.z"; edition 2024; name "gnr8-gen"
+  Cargo.toml        # empty [workspace]; exact resource-selected gnr8-core path; edition 2024
   src/main.rs       # THE generation lifecycle (the scaffolded default; user edits this)
   .gitignore        # target/  cache/
   cache/            # parsed-facts cache (git-ignored)
@@ -145,7 +145,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 [dependencies]
-gnr8 = "0.2"          # crates.io; auto path-substituted when building inside the gnr8 repo (dev)
+gnr8 = { path = "/selected/gnr8/resources/crates/gnr8-core" }
 [workspace]            # empty => its own workspace, built standalone via --manifest-path
 ```
 
@@ -214,14 +214,12 @@ rustc / compile error) into actionable messages (`cli/rules_host_error.rs`).
 - **Byte-identical output** preserved: the graph is deterministic; emitters sort; the host writes
   deterministically. Same invariant as today.
 
-### 5. The dev-vs-published `gnr8` dependency
+### 5. The resource-selected `gnr8` dependency
 
-The `.gnr8` crate depends on `gnr8` (the SDK). Two cases, exactly as polint handles it:
-- **User repo:** `gnr8 = "x.y.z"` from crates.io.
-- **Inside this repo (examples/tests/dev):** auto-substitute a `path = "…/crates/gnr8-core"` dep by
-  walking up for the workspace (polint `polint_deps_path_prefix`). Until we publish, the path form is
-  the only one that works — so the example + tests use it, and the scaffolder emits the crates.io form
-  with a TODO until the first publish.
+The `.gnr8` crate depends on the exact `gnr8-core` shipped with the running host. The selected resource
+root must contain `crates/gnr8-core`, either in a source checkout or a complete release archive, and the
+scaffolder writes its canonical path into `.gnr8/Cargo.toml`. Missing resources are an explicit error:
+there is no crates.io fallback and no ancestor-directory search.
 
 ---
 
@@ -254,9 +252,9 @@ The `.gnr8` crate depends on `gnr8` (the SDK). Two cases, exactly as polint hand
   dep (tens of seconds once). Mitigate: warm the build during `gnr8 init`; cache `target/`; clear
   "compiling your generation lifecycle…" messaging; keep the dep tree tiny (stdlib-leaning per the
   invariants). After the first build, incremental rebuilds are sub-second.
-- **Publishing `gnr8`.** The crates.io dep requires publishing the SDK crate (name `gnr8`). Until then,
-  path deps only (works for the in-repo example + tests; blocks real external users). Sequencing: build
-  the framework, dogfood via path dep, publish, flip the scaffolder default.
+- **Distributing `gnr8-core`.** A complete release archive must retain the resource-selected
+  `crates/gnr8-core` source used by generated `.gnr8/Cargo.toml` files. Publishing the public Rust API
+  remains useful for direct library consumers, but scaffolding never switches to a registry fallback.
 - **ArtifactSet wire schema + host write protocol** — define precisely (paths are project-relative,
   bytes base64, provenance for diagnostics/ownership). Versioned, like polint's `PolintReport`.
 - **Toolchain pinning.** Scaffold a repo-root `rust-toolchain.toml` so the child cargo uses a

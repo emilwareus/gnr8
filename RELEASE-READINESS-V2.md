@@ -19,9 +19,9 @@ Python/FastAPI or Flask, and TypeScript/NestJS services. It is not enough to pro
 understanding, arbitrary OpenAPI migration, behavioral parity with mature generators, or a
 self-contained/runtime-free install.
 
-The complete local release gate is green. `make check` passed formatting, strict clippy, 410 Rust
-library tests, 41 CLI tests, all Rust integration and snapshot tests, the Go fixture and extractor
-build/vet/test suites, 108 Python extractor tests, all TypeScript extractor tests, action-version
+The complete local release gate is green. `make check` passed formatting, strict clippy, 413 Rust
+library tests, 42 CLI tests, all Rust integration and snapshot tests, the Go fixture and extractor
+build/vet/test suites, 109 Python extractor tests, all TypeScript extractor tests, action-version
 tests, and forced drift checks for every example. The only ignored test is the intentionally opt-in,
 timing-dependent watch smoke; deterministic watch tests remain blocking. `release-local-check.sh`
 then repeated that gate, built and unpacked the macOS arm64 archive, passed
@@ -39,8 +39,8 @@ repository's declared runner matrix and release workflow.
   fail with diagnostics instead of entering environment-dependent recovery chains.
 - Static FastAPI router, Flask blueprint, and NestJS controller/registration prefixes are preserved;
   dynamic ambiguity is diagnosed.
-- Common FastAPI async/list return signatures and dependency injection, plus NestJS Promise/list
-  responses, have regression coverage.
+- Common FastAPI async/list return signatures, intentional `-> None` responses, and dependency
+  injection, plus NestJS Promise/list responses, have regression coverage.
 - Go SDK generation preserves `float64` and nullable string JSON semantics in committed runtime tests.
 - Empty Go operation sets emit compilable packages without unused imports, and generated examples
   carry the corrected nullable pointer types.
@@ -48,8 +48,13 @@ repository's declared runner matrix and release workflow.
   actionable diagnostics.
 - Forced generation cannot be hidden by the verified no-op cache, and Go extractor source changes
   invalidate both host and source-graph caches.
-- TypeScript scalar-array query parameters use repeated keys; unsupported structured query encodings
-  fail before emitting a misleading client.
+- TypeScript scalar-array query parameters use repeated keys, required headers/cookies stay out of the
+  URL, and `allowReserved` behavior has a generated-client runtime test. Unsupported structured query
+  encodings fail before emitting a misleading client.
+- The host supplies a complete compatibility handshake before the child begins extraction or
+  generation.
+- Release version commits contain refreshed example lockfiles, and the full gate must leave the tested
+  commit clean before packaging, tagging, or pushing.
 - The release workflow validates the release commit before atomically pushing `main` and its tag, and
   an unpacked archive smoke covers `init` → `generate` → `doctor` → `check` in an unrelated project.
 

@@ -655,20 +655,31 @@ def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
             )
             status = _build_response(decorator, operation, abs_path, diags)
             response_annotation = _response_annotation(decorator, stmt)
-            intentional_empty = any(
-                kw.arg == "response_model"
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is None
-                for kw in decorator.keywords
+            response_model = next(
+                (kw for kw in decorator.keywords if kw.arg == "response_model"),
+                None,
             )
-            body_ref = _response_schema_ref(
-                response_annotation,
-                stmt,
-                module.dotted,
-                abs_path,
-                table,
-                diags,
-                synthetic_schemas,
+            intentional_empty = (
+                response_model is not None
+                and isinstance(response_model.value, ast.Constant)
+                and response_model.value.value is None
+            ) or (
+                response_model is None
+                and isinstance(stmt.returns, ast.Constant)
+                and stmt.returns.value is None
+            )
+            body_ref = (
+                None
+                if intentional_empty
+                else _response_schema_ref(
+                    response_annotation,
+                    stmt,
+                    module.dotted,
+                    abs_path,
+                    table,
+                    diags,
+                    synthetic_schemas,
+                )
             )
             if body_ref is None and not intentional_empty:
                 diags.warn(

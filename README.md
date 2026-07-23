@@ -163,9 +163,9 @@ Install the CLI from the GitHub release archive:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the Rust API that `.gnr8/Cargo.toml` depends on; it is not the
-primary CLI install path yet. The release archive includes the `gnr8` binary plus the extractor
-resources needed by `gnr8 init`/`gnr8 generate`.
+The crates.io package named `gnr8` exposes the public Rust API; it is not the primary CLI install path.
+Generated `.gnr8/Cargo.toml` files use the matching `gnr8-core` source bundled in the complete release
+archive, alongside the extractor resources needed by `gnr8 init`/`gnr8 generate`.
 
 For local development from this checkout:
 

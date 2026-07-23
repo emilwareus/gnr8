@@ -1,6 +1,6 @@
 # Release-candidate evidence
 
-**Captured:** 2026-07-19
+**Captured:** 2026-07-23
 
 **Scope:** release-readiness remediation branch
 
@@ -20,14 +20,17 @@ The release-readiness work added or strengthened these executable contracts:
 - Resource, workspace, helper, and OpenAPI-lowering recovery chains now return explicit diagnostics.
 - Static FastAPI router/Flask blueprint and NestJS controller prefixes are preserved; dynamic or
   ambiguous prefixes are diagnosed instead of guessed.
-- FastAPI async return annotations, collection responses, and dependency injection are covered by
-  extractor tests.
+- FastAPI async return annotations, collection responses, intentional `-> None` responses, and
+  dependency injection are covered by extractor tests.
 - NestJS `Promise<T>`, `Promise<T[]>`, and direct array responses are covered by extractor tests.
 - Go SDK `float64` width and nullable string JSON behavior have regression coverage.
 - Doctor treats error-severity extraction diagnostics as actionable and retains the detailed child
   error. Unknown handlers, missing response facts, and Go package-load errors emit `ERROR` diagnostics.
-- TypeScript scalar-array query parameters use repeated keys; structured query shapes without an
-  explicit wire encoding fail generation.
+- TypeScript scalar-array query parameters use repeated keys; required headers/cookies stay out of
+  the URL, and `allowReserved` is verified by a generated-client runtime test. Structured query
+  shapes without an explicit wire encoding fail generation.
+- The host supplies the complete protocol/version/capability handshake before the child begins
+  extraction or generation.
 
 ## Checks run in this workspace
 
@@ -35,30 +38,30 @@ These checks passed during the remediation session:
 
 | Check | Result |
 |---|---|
-| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| CLI unit tests, including doctor health policy | 41 PASS |
-| Python extractor suite after FastAPI changes and current-main reconciliation | 108 PASS |
-| TypeScript extractor suites after NestJS changes | PASS |
-| TypeScript emitter tests | 50 PASS |
-| Generated TypeScript SDK compile gates | 5 PASS |
-| Focused route-prefix snapshots and sidecar tests | PASS |
-| Post-rebase Rust diagnostic run | 403 library tests PASS with 5 environment-dependent tests filtered; next Go-backed integration stopped on missing `go` |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | PASS |
+| Rust library unit tests | 413 PASS |
+| CLI unit tests, including handshake and doctor health policy | 42 PASS |
+| Rust integration, runtime, compile, and snapshot tests | PASS |
+| Python extractor suite | 109 PASS |
+| TypeScript extractor suites | PASS |
+| Go fixture and extractor build/vet/test suites | PASS |
+| Composite-action version tests | PASS |
+| Forced generation plus drift checks for all five examples | PASS |
+| Complete `make check` gate | PASS |
 
-The local environment does not contain `go`, `gofmt`, Python `pip`, or PyYAML. After rebasing onto the
-current `main`, formatting, clippy, 41 CLI tests, 108 Python extractor tests, all TypeScript extractor
-tests, and 403 Rust library tests passed. That Rust diagnostic run explicitly filtered four tests that
-require Go and one independent-parser test that requires PyYAML; the next Go-backed integration test
-then stopped with `GoToolchainMissing`. The CI and release workflows install pinned PyYAML and Go, but
-Go extractor/fixture tests, Go-backed snapshots, generated Go compile/runtime tests, example
-regeneration, and therefore the complete `make check` gate cannot be represented as green locally.
-Skipped or filtered tests are not counted as execution evidence.
+All required toolchains were available for this run. No blocking test was skipped or filtered. The
+single ignored test is the intentionally opt-in, timing-dependent filesystem watch smoke;
+deterministic watch-loop tests remain part of the blocking CLI suite.
 
 ## Release gate
 
-The release workflow prepares the version commit locally, runs `make check`, packages and unpacks a
-host archive, exercises `init` → `generate` → `doctor` → `check` in an unrelated FastAPI project, and
-performs a crates.io dry run. Only after all of those steps pass does it atomically push `main` and the
-version tag. The branch/PR dry-run workflow exercises the same local release check without publishing.
+The release workflow refreshes the root and independent example lockfiles before creating the version
+commit, runs `make check`, and verifies that the tested commit remains clean. It then packages and
+unpacks a host archive, exercises `init` → `generate` → `doctor` → `check` in an unrelated FastAPI
+project, and performs a crates.io dry run. Only after all of those steps pass does it atomically push
+`main` and the version tag. The branch/PR dry-run workflow exercises the same local release check
+without publishing.
 
 The final market-readiness verdict and remaining gaps belong in `RELEASE-READINESS-V2.md`; this page
 records what was actually tested and where the current environment could not provide evidence.

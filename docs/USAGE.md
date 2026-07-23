@@ -38,8 +38,10 @@ The CLI install path is the GitHub release archive:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the Rust API used by generated `.gnr8/Cargo.toml` files. The
-generated project-local crate depends on `gnr8 = "0.1"` when no release-archive resource copy is found.
+The crates.io package named `gnr8` is the public Rust API. Generated `.gnr8/Cargo.toml` files use the
+exact `crates/gnr8-core` path from the selected source tree or complete release archive. `gnr8 init`
+fails with an actionable error when that resource is missing; it never silently switches to a
+registry version.
 
 ## Canonical workflow
 ```
@@ -93,8 +95,8 @@ ordinary Rust (a custom `Source`/`Transform`/`Target`/`PostProcess`).
   .gitignore      # /target/  /cache/
   cache/          # ownership manifest (git-ignored)
 ```
-The `gnr8` dep is a `path = "…"` dep when `.gnr8/` is inside the gnr8 repo or release archive, and a
-version dep (`gnr8 = "0.1"`) otherwise.
+The `gnr8` dependency is always a canonical `path = "…"` dependency to `crates/gnr8-core` in the
+selected source tree or complete release archive.
 
 ### The SDK surface (`gnr8::sdk`, re-exported as `gnr8::sdk::prelude`)
 A pipeline composes four kinds of stage, decoupling **N sources** from **M targets** through one IR

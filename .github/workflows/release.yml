@@ -65,6 +65,19 @@ jobs:
       - name: Refresh Cargo.lock
         run: cargo build --workspace
 
+      - name: Refresh committed example lockfiles
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          find examples -path '*/.gnr8/Cargo.toml' -print0 |
+            while IFS= read -r -d '' manifest; do
+              cargo update \
+                --manifest-path "$manifest" \
+                -p gnr8 \
+                --precise "$NEW_VERSION"
+            done
+
       - name: Create version commit locally
         env:
           NEW_VERSION: ${{ steps.bump.outputs.version }}
@@ -81,6 +94,9 @@ jobs:
 
       - name: Full release gate on versioned commit
         run: make check
+
+      - name: Verify release gate left the versioned commit clean
+        run: git diff --exit-code
 
       - name: Package and smoke host archive
         env:

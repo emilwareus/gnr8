@@ -2021,27 +2021,34 @@ fn emit_op_query(
     optional_query_idents: &[String],
     auth_queries: &[String],
 ) -> Result<(), CoreError> {
-    if required_query.is_empty() && optional_query.is_empty() && auth_queries.is_empty() {
+    let has_query_params = required_query
+        .iter()
+        .chain(optional_query.iter())
+        .any(|param| param.location == "query");
+    if !has_query_params && auth_queries.is_empty() {
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
     let has_allow_reserved = required_query
         .iter()
         .chain(optional_query.iter())
-        .any(|param| param.allow_reserved);
+        .any(|param| param.location == "query" && param.allow_reserved);
     if has_allow_reserved {
         writeln!(out, "    const allowReserved = new Set<number>();").map_err(sink)?;
         writeln!(out, "    let queryPairIndex = 0;").map_err(sink)?;
     }
     for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        emit_query_param_value(out, graph, p, ident, 4)?;
+        if p.location != "query" {
+            continue;
+        }
+        emit_query_param_value(out, graph, p, ident, 4, has_allow_reserved)?;
     }
     for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         if p.location != "query" {
             continue;
         }
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        emit_query_param_value(out, graph, p, ident, 6)?;
+        emit_query_param_value(out, graph, p, ident, 6, has_allow_reserved)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     for (idx, query) in auth_queries.iter().enumerate() {
@@ -2091,16 +2098,29 @@ fn emit_query_param_value(
     param: &Param,
     ident: &str,
     indent_width: usize,
+    track_pair_index: bool,
 ) -> Result<(), CoreError> {
     let spaces = " ".repeat(indent_width);
     let key = quoted_string_literal(&param.name);
     match ts_query_shape(&param.schema, graph, &param.name)? {
         TsQueryShape::Scalar => {
             writeln!(out, "{spaces}searchParams.set({key}, String({ident}));").map_err(sink)?;
+            if param.allow_reserved {
+                writeln!(out, "{spaces}allowReserved.add(queryPairIndex);").map_err(sink)?;
+            }
+            if track_pair_index {
+                writeln!(out, "{spaces}queryPairIndex += 1;").map_err(sink)?;
+            }
         }
         TsQueryShape::Array => {
             writeln!(out, "{spaces}for (const value of {ident}) {{").map_err(sink)?;
             writeln!(out, "{spaces}  searchParams.append({key}, String(value));").map_err(sink)?;
+            if param.allow_reserved {
+                writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
+            }
+            if track_pair_index {
+                writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
+            }
             writeln!(out, "{spaces}}}").map_err(sink)?;
         }
     }
@@ -2607,7 +2627,7 @@ mod tests {
         camel, emit_client, emit_client_with_models, emit_errors, emit_index, emit_models,
         emit_operations, ts_type,
     };
-    use crate::graph::{ApiGraph, Operation, Prim, Type};
+    use crate::graph::{ApiGraph, Operation, Param, Prim, SourceSpan, Type};
 
     /// A facts document covering the bookstore shapes that diverge from the Go target: a named enum
     /// (`BookFormat`), a named union (`BookOrError`), an inline union field (`Book.rating: number |
@@ -3088,7 +3108,9 @@ mod tests {
     }
 
     mod operations {
-        use super::{emit_operations, ops_graph, ApiGraph, Operation};
+        use super::{
+            emit_operations, ops_graph, ApiGraph, Operation, Param, Prim, SourceSpan, Type,
+        };
 
         fn ops_for<'g>(graph: &'g ApiGraph, handler: &str) -> Vec<&'g Operation> {
             graph
@@ -3096,6 +3118,26 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == handler)
                 .collect()
+        }
+
+        fn string_param(name: &str, location: &str, required: bool, allow_reserved: bool) -> Param {
+            Param {
+                name: name.to_string(),
+                location: location.to_string(),
+                required,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 4,
+                    end_line: 4,
+                },
+            }
         }
 
         #[test]
@@ -3345,6 +3387,68 @@ mod tests {
             assert!(
                 out.contains("searchParams.set(\"tenant\", String(tenant));"),
                 "{out}"
+            );
+        }
+
+        #[test]
+        fn required_headers_and_cookies_are_not_serialized_as_query_params() {
+            let mut g = ops_graph();
+            g.operations[0]
+                .params
+                .push(string_param("X-Signature", "header", true, false));
+            g.operations[0]
+                .params
+                .push(string_param("session", "cookie", true, false));
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("headers[\"X-Signature\"] = String(xSignature);")
+                    && out.contains(
+                        "cookieParts.push(encodeURIComponent(\"session\") + \"=\" + encodeURIComponent(String(session)));"
+                    )
+                    && !out.contains("const searchParams = new URLSearchParams();"),
+                "header and cookie parameters must stay out of the URL:\n{out}"
+            );
+        }
+
+        #[test]
+        fn scalar_allow_reserved_query_marks_its_wire_pair() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params
+                .push(string_param("redirect", "query", true, true));
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("searchParams.set(\"redirect\", String(redirect));")
+                    && out.contains("allowReserved.add(queryPairIndex);")
+                    && out.contains("queryPairIndex += 1;"),
+                "allowReserved scalar query parameter must mark and advance its pair index:\n{out}"
+            );
+        }
+
+        #[test]
+        fn array_allow_reserved_query_marks_every_repeated_pair() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            let mut tag = string_param("tag", "query", false, true);
+            tag.schema = Type::Array(Box::new(Type::Primitive(Prim::String)));
+            op.params.push(tag);
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains(
+                    "for (const value of tag) {\n        searchParams.append(\"tag\", String(value));\n        allowReserved.add(queryPairIndex);\n        queryPairIndex += 1;\n      }"
+                ),
+                "every repeated allowReserved value must mark and advance its pair index:\n{out}"
             );
         }
 

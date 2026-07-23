@@ -243,6 +243,15 @@ class FastAPIDiagnosticCompletenessTests(unittest.TestCase):
         self.assertIsNone(recognized[0]["responses"][0]["body"])
         self.assertEqual(diagnostics, [])
 
+    def test_none_return_annotation_is_intentionally_bodyless(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/health')\n"
+            "def health() -> None:\n"
+            "    pass\n"
+        )
+        self.assertIsNone(recognized[0]["responses"][0]["body"])
+        self.assertEqual(diagnostics, [])
+
 
 class FastAPIBodylessMethodTests(unittest.TestCase):
     """A FastAPI model-typed handler param is a request body only on a body-bearing
