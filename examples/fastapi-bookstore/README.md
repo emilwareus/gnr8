@@ -47,8 +47,9 @@ Typed DTOs — every field maps to a schema, every `$ref` resolves; a string-lit
 
 ## The config is code: `.gnr8/src/main.rs`
 
-There is no `config.toml`. The base path, title, and output paths are all method
-calls in a small Rust `Pipeline` that gnr8 compiles + runs:
+There is no `config.toml`. The external mount path, title, and output paths are
+method calls in a small Rust `Pipeline` that gnr8 compiles + runs; framework route
+prefixes come from static source:
 
 ```rust
 use gnr8::sdk::prelude::*;
@@ -57,7 +58,6 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))              // analyze this project (the app/ package)
-            .transform(SetBasePath::new("/books"))             // mount path (the APIRouter prefix)
             .transform(SetTitle::new("Bookstore API"))         // OpenAPI info.title
             .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(PySdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))
@@ -114,9 +114,9 @@ the schemas.
 - **Code-defined `BookFormat` enum + `BookOrError` union.** gnr8 reads the
   string-literal enum and the `A | B` union straight from the types and emits an
   OpenAPI string enum and a `oneOf`.
-- **Base path from config (code).** The `APIRouter(prefix="/books")` prefix is a
-  runtime value, so `SetBasePath::new("/books")` declares it in code, and it is
-  joined to every path in both the spec and the SDK.
+- **Router prefix from source.** The static `APIRouter(prefix="/books")` value is
+  composed into every operation path. `SetBasePath` remains available for a
+  distinct service-wide external mount.
 - **Static, never executed.** pyextract reads the `ast`; the app is never imported
   or run, so there is no `pip install` and no runtime dependency.
 - **No TOML.** `.gnr8/src/main.rs` is the entire configuration surface — built-in

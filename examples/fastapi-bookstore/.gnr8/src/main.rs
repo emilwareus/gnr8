@@ -15,7 +15,7 @@
 //! This reproduces the committed `examples/fastapi-bookstore/generated/` output (same routes/schemas/
 //! title/base path). Every setting is a method call below — there is no `config.toml`:
 //!   inputs            → FastApi::new().inputs(["."])     (the static `app/` package; never executed)
-//!   base_path         → SetBasePath::new("/books")       (the APIRouter prefix — a runtime value)
+//!   route prefix      → extracted from APIRouter(prefix="/books")
 //!   title             → SetTitle::new("Bookstore API")
 //!   output.openapi    → OpenApi31::new().to("generated/openapi.yaml")
 //!   output.sdk + module → PySdk::new().module("example.com/bookstore/sdk").to("generated/sdk")
@@ -30,7 +30,6 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
-            .transform(SetBasePath::new("/books"))
             .transform(SetTitle::new("Bookstore API"))
             .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(PySdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))

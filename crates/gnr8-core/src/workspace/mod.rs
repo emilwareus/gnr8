@@ -17,14 +17,11 @@
 //! The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at the paths the pipeline's targets
 //! declare (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
 //!
-//! ## The `gnr8` dependency: path (in-repo) vs version (published)
+//! ## The `gnr8` dependency: one selected resource source
 //!
-//! When `init` runs INSIDE the gnr8 repo (detected by walking up for
-//! `crates/gnr8-core`), it emits a `path = "…/crates/gnr8-core"` dependency so the example + integration
-//! tests build against the in-repo crate. Outside the repo, an installed release archive can provide
-//! `share/gnr8/crates/gnr8-core`; `init` then emits a `path = "…"` dependency to that installed source
-//! so the generated `.gnr8` crate builds without network access. If neither source exists it emits the
-//! published `gnr8 = "0.1"` dependency.
+//! `init` emits a path dependency to `crates/gnr8-core` under the single resource root selected for
+//! this build. Development builds select the repository root fixed at compile time; release builds
+//! select the archive's `share/gnr8` root. A missing source is an error, not a registry substitution.
 //!
 //! Idempotency (D-01): every workspace file is written *only if absent*, via
 //! `OpenOptions::create_new(true)` — atomically failing with [`std::io::ErrorKind::AlreadyExists`] if
@@ -143,8 +140,7 @@ impl SdkPreset {
 /// (files recorded in [`InitOutcome::skipped`]), never an error and never an overwrite (D-01).
 ///
 /// The crate name is `<dirname>-gnr8-gen` where `<dirname>` is `root`'s final component sanitized to a
-/// valid Cargo package name; the `gnr8` dependency is a path dep when `root` is inside the gnr8
-/// repo and a version dep otherwise (see the module docs).
+/// valid Cargo package name; the `gnr8` dependency is a path dep into the selected resource root.
 ///
 /// # Errors
 ///
@@ -173,7 +169,7 @@ pub fn init_with_presets(
     })?;
 
     let crate_name = crate_name_for(root);
-    let core_dep = core_dependency_line(root);
+    let core_dep = core_dependency_line()?;
     let cargo_toml = cargo_toml_body(&crate_name, &core_dep);
     let main_rs = main_rs_body(source, sdk);
     let readme = readme_body(source, sdk);
@@ -286,85 +282,36 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
 
 /// The `gnr8` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
 ///
-/// In-repo (a `crates/gnr8-core` exists at or above `root`) ⇒ a `path` dep pointing at it.
-/// Otherwise ⇒ the published public crate.
-/// This is a single presence check, not a dual-source fallback (CLAUDE.md rule 3): the path is computed
-/// from one fact (the located in-repo crate), and when that fact is absent the published form is used.
-fn core_dependency_line(root: &Path) -> String {
-    match locate_in_repo_core(root) {
-        Some(rel) => format!("gnr8 = {{ path = {rel:?} }}"),
-        None => match locate_installed_core(root) {
-            Some(path) => format!("gnr8 = {{ path = {path:?} }}"),
-            None => "gnr8 = \"0.1\"".to_string(),
-        },
-    }
+/// The resource root selected by [`crate::resource::resource_dir`] is the only dependency source. The
+/// scaffold fails when it does not contain `crates/gnr8-core`; it never switches to a registry
+/// dependency or searches ancestor directories.
+fn core_dependency_line() -> Result<String, CoreError> {
+    let resource_root = crate::resource::resource_dir()?;
+    core_dependency_line_from(Some(resource_root.as_path()))
 }
 
-fn locate_installed_core(_root: &Path) -> Option<String> {
-    let candidate = crate::resource::resource_dir()?
-        .join("crates")
-        .join("gnr8-core");
+fn core_dependency_line_from(resource_root: Option<&Path>) -> Result<String, CoreError> {
+    let resource_root = resource_root.ok_or_else(|| CoreError::Workspace {
+        message:
+            "no gnr8-core dependency source was declared; install the complete release archive"
+                .to_string(),
+    })?;
+    let candidate = resource_root.join("crates").join("gnr8-core");
     if !candidate.join("Cargo.toml").is_file() {
-        return None;
+        return Err(CoreError::Workspace {
+            message: format!(
+                "declared gnr8-core dependency source is missing at {}",
+                candidate.display()
+            ),
+        });
     }
-    let path = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-    Some(path.to_string_lossy().into_owned())
-}
-
-/// Locate an in-repo `crates/gnr8-core` directory at or above `root`, returning the path RELATIVE to
-/// `<root>/.gnr8/` (where the scaffolded Cargo.toml lives) so the emitted `path = "…"` resolves
-/// correctly from the generation crate. Returns `None` when `root` is not inside the gnr8 repo.
-///
-/// Walks up from `root` checking each ancestor for `crates/gnr8-core`; on a hit, computes the relative
-/// path from `<root>/.gnr8/` to that crate. A relativization failure (e.g. different drive prefixes on
-/// Windows) degrades to `None` (⇒ the version dep), never a panic.
-fn locate_in_repo_core(root: &Path) -> Option<String> {
-    let manifest_anchor = root.join(".gnr8");
-    let mut current: Option<&Path> = Some(root);
-    while let Some(dir) = current {
-        let candidate = dir.join("crates").join("gnr8-core");
-        if candidate.join("Cargo.toml").is_file() {
-            return relative_path_str(&manifest_anchor, &candidate);
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-/// Compute a relative path string FROM `from` TO `to` using `..` segments, so the emitted Cargo `path`
-/// dep is portable (not an absolute machine path). Returns `None` if no relative path can be formed.
-///
-/// Both inputs are treated as directories. The implementation finds the common prefix, emits one `..`
-/// per remaining `from` component, then appends the remaining `to` components — all with forward slashes
-/// (Cargo accepts `/` on every platform). No filesystem access, no canonicalization (the anchor `.gnr8`
-/// may not exist yet at scaffold time), so it is pure and deterministic.
-fn relative_path_str(from: &Path, to: &Path) -> Option<String> {
-    let from_components: Vec<_> = from.components().collect();
-    let to_components: Vec<_> = to.components().collect();
-
-    // The common leading prefix length.
-    let common = from_components
-        .iter()
-        .zip(to_components.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    // If there is no shared root component at all, a relative path is meaningless (e.g. different
-    // Windows prefixes) → signal None so the caller falls back to the version dep.
-    if common == 0 {
-        return None;
-    }
-
-    let ups = from_components.len() - common;
-    let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), ups).collect();
-    for component in &to_components[common..] {
-        parts.push(component.as_os_str().to_string_lossy().into_owned());
-    }
-    if parts.is_empty() {
-        // `to` is `from` itself — represent as the current dir.
-        return Some(".".to_string());
-    }
-    Some(parts.join("/"))
+    let path = std::fs::canonicalize(&candidate).map_err(|source| CoreError::Workspace {
+        message: format!(
+            "failed to resolve declared gnr8-core dependency source {}: {source}",
+            candidate.display()
+        ),
+    })?;
+    Ok(format!("gnr8 = {{ path = {:?} }}", path.to_string_lossy()))
 }
 
 /// Derive the scaffolded crate name `<dirname>-gnr8-gen` from `root`'s final path component, sanitized
@@ -459,7 +406,7 @@ mod tests {
     // test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{crate_name_for, relative_path_str};
+    use super::{core_dependency_line_from, crate_name_for};
     use std::path::Path;
 
     #[test]
@@ -480,20 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn relative_path_str_emits_dotdot_segments() {
-        // From `<root>/.gnr8` up to a sibling `crates/gnr8-core` two levels above root.
-        let from = Path::new("/repo/examples/bookstore/.gnr8");
-        let to = Path::new("/repo/crates/gnr8-core");
-        assert_eq!(
-            relative_path_str(from, to).unwrap(),
-            "../../../crates/gnr8-core"
+    fn missing_declared_core_dependency_is_an_explicit_error() {
+        let error = core_dependency_line_from(None).unwrap_err();
+        assert!(
+            error.to_string().contains("gnr8-core dependency source"),
+            "unexpected diagnostic: {error}"
         );
-    }
-
-    #[test]
-    fn relative_path_str_handles_no_common_root() {
-        // No shared prefix (different absolute roots) → None (caller falls back to the version dep).
-        // On unix every absolute path shares the RootDir component, so use clearly-disjoint relatives.
-        assert!(relative_path_str(Path::new("a/b"), Path::new("c/d")).is_none());
     }
 }

@@ -18,16 +18,31 @@ permissions:
   contents: read
 
 jobs:
-  crates-publish-dry-run:
-    name: crates.io publish --dry-run
+  full-release-gate:
+    name: Full gate + host archive smoke + publish dry-run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo publish --dry-run
-        run: DRY_RUN=1 ./scripts/publish-crates.sh
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: goextract/go.mod
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install Python test dependencies
+        run: python -m pip install PyYAML==6.0.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Run release-local-check
+        run: ./scripts/release-local-check.sh
 
   build-cli:
     name: CLI ${{ matrix.asset_os }}-${{ matrix.asset_arch }}
@@ -62,9 +77,20 @@ jobs:
 
       - name: Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install -y gcc-aarch64-linux-gnu
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,4 +109,3 @@ jobs:
           name: gnr8-${{ matrix.asset_os }}-${{ matrix.asset_arch }}
           path: target/release-local-dist/dist/*
           if-no-files-found: error
-

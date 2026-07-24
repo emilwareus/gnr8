@@ -13,7 +13,7 @@
 //! This reproduces the committed `examples/nestjs-bookstore/generated/` output (same routes/schemas/
 //! title/base path). Every setting is a method call below — there is no `config.toml`:
 //!   inputs            → NestJs::new().inputs(["src"])     (the static `src/` tree; never executed)
-//!   base_path         → SetBasePath::new("/books")        (the @Controller('books') prefix)
+//!   route prefix      → extracted from @Controller('books')
 //!   title             → SetTitle::new("Bookstore API")
 //!   output.openapi    → OpenApi31::new().to("generated/openapi.yaml")
 //!   output.sdk + module → TsSdk::new().module("example.com/bookstore/sdk").to("generated/sdk")
@@ -30,7 +30,6 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))
-            .transform(SetBasePath::new("/books"))
             .transform(SetTitle::new("Bookstore API"))
             .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(TsSdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))

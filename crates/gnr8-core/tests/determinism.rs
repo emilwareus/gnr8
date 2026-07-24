@@ -192,7 +192,7 @@ fn flask_build_graph_is_byte_identical_across_two_runs() {
 }
 
 #[test]
-fn flask_to_openapi_is_byte_identical_across_two_runs() {
+fn flask_openapi_failure_is_deterministic_across_two_runs() {
     // Skip gracefully if the python3 toolchain is absent.
     let Ok(first) = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR) else {
         eprintln!(
@@ -203,18 +203,20 @@ fn flask_to_openapi_is_byte_identical_across_two_runs() {
     let second = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR)
         .expect("second Flask build_graph run must also succeed");
 
-    // Build twice AND lower twice — proving both the upstream graph and the reused lowering are
-    // deterministic end-to-end for the Flask path (idempotent OpenAPI generation).
+    // The typed-envelope fixture intentionally contains one untyped raw handler. Lowering must reject
+    // the missing response facts consistently rather than fabricate a response on either run.
     let security = fixture_security();
     let a = gnr8::lower::to_openapi(&first, "bookstore", "/orders", &security)
-        .expect("first Flask to_openapi must succeed");
+        .expect_err("first Flask to_openapi must reject incomplete response facts");
     let b = gnr8::lower::to_openapi(&second, "bookstore", "/orders", &security)
-        .expect("second Flask to_openapi must succeed");
+        .expect_err("second Flask to_openapi must reject incomplete response facts");
 
     assert_eq!(
-        a, b,
-        "two Flask to_openapi runs over unchanged source must be byte-identical (idempotent lowering)"
+        a.to_string(),
+        b.to_string(),
+        "two Flask lowering failures over unchanged source must be byte-identical"
     );
+    assert!(a.to_string().contains("create_order_raw"), "{a}");
 }
 
 #[test]

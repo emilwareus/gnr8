@@ -104,7 +104,7 @@ function mapType(loaded, node, diags, registry) {
 // which would resolve to the method's function/signature type. Returns the same
 // `{ schema, optional, nullable }` shape as `mapType`.
 function mapReturnType(loaded, methodDecl, diags, registry) {
-  let anno = methodDecl.type;
+  const anno = _unwrapPromiseAnnotation(methodDecl.type);
   if (!anno) {
     return { schema: null, optional: false, nullable: false };
   }
@@ -123,6 +123,19 @@ function mapReturnType(loaded, methodDecl, diags, registry) {
   }
   const full = loaded.checker.getTypeAtLocation(anno);
   return _mapAnnotated(loaded, full, anno, anno, diags, registry);
+}
+
+// `Promise<T>` is an execution wrapper, not the wire response. Map its one
+// static type argument through the same path used for synchronous returns.
+function _unwrapPromiseAnnotation(anno) {
+  if (!anno || !ts.isTypeReferenceNode(anno)) {
+    return anno;
+  }
+  const name = anno.typeName.getText().split(".").pop();
+  if (name !== "Promise" || !anno.typeArguments || anno.typeArguments.length !== 1) {
+    return anno;
+  }
+  return anno.typeArguments[0];
 }
 
 // The shared core (rule 3 — ONE mapping path for fields, params, AND returns):

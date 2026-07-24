@@ -16,7 +16,7 @@ type CreateGoalInput struct {
 	Description      string             `json:"description"`
 	Name             string             `json:"name"`
 	TargetDirection  *TargetDirection   `json:"targetDirection,omitempty"`
-	TargetValue      *float32           `json:"targetValue,omitempty"`
+	TargetValue      *float64           `json:"targetValue,omitempty"`
 	WorkflowChainIDs []string           `json:"workflowChainIds,omitempty"`
 }
 
@@ -33,7 +33,7 @@ type GoalResponse struct {
 	Metadata        map[string]any     `json:"metadata,omitempty"`
 	Name            string             `json:"name"`
 	TargetDirection *TargetDirection   `json:"targetDirection,omitempty"`
-	TargetValue     *float32           `json:"targetValue,omitempty"`
+	TargetValue     *float64           `json:"targetValue,omitempty"`
 	UUID            string             `json:"uuid"`
 }
 
@@ -62,6 +62,6 @@ type UpdateGoalInput struct {
 	Description      string              `json:"description,omitempty"`
 	Name             string              `json:"name,omitempty"`
 	TargetDirection  *TargetDirection    `json:"targetDirection,omitempty"`
-	TargetValue      *float32            `json:"targetValue,omitempty"`
+	TargetValue      *float64            `json:"targetValue,omitempty"`
 	WorkflowChainIDs []string            `json:"workflowChainIds,omitempty"`
 }

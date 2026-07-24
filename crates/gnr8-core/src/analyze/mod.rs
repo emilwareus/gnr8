@@ -174,7 +174,13 @@ pub fn source_toolchain(dir: &str) -> Result<SourceToolchain, crate::CoreError> 
 /// (non-zero exit) both yield `false`. Never panics — the caller renders the result as a doctor finding.
 #[must_use]
 pub fn typescript_toolchain_present(target_dir: &str) -> bool {
-    helper::typescript_toolchain_present(target_dir)
+    match helper::typescript_toolchain_present(target_dir) {
+        Ok(present) => present,
+        Err(error) => {
+            eprintln!("TypeScript toolchain probe failed: {error}");
+            false
+        }
+    }
 }
 
 /// Recursively record Go (`go.mod`/`*.go`), Python (`*.py`), and TypeScript (`tsconfig.json`/`*.ts`)
@@ -249,7 +255,7 @@ fn scan_markers(
 pub fn build_graph(fixture_dir: &str) -> Result<crate::graph::ApiGraph, crate::CoreError> {
     // Resolve to an absolute target so a relative `fixture_dir` works (the helper runs from the
     // sidecar dir) AND the graph relativizes span file paths against the same root the helper saw.
-    let target = helper::resolve_target(fixture_dir);
+    let target = helper::resolve_target(fixture_dir)?;
     build_graph_for_lang(&target, detect_language(&target)?)
 }
 
@@ -263,7 +269,7 @@ pub(crate) fn build_graph_for_lang(
     fixture_dir: &str,
     lang: Lang,
 ) -> Result<crate::graph::ApiGraph, crate::CoreError> {
-    let target = helper::resolve_target(fixture_dir);
+    let target = helper::resolve_target(fixture_dir)?;
     let facts = match lang {
         Lang::Python => helper::run_pyextract(&target)?,
         Lang::Go => helper::run_goextract(&target)?,
@@ -278,7 +284,7 @@ pub(crate) fn build_go_graph_with_package_scopes(
     route_patterns: &[String],
     schema_patterns: &[String],
 ) -> Result<crate::graph::ApiGraph, crate::CoreError> {
-    let target = helper::resolve_target(fixture_dir);
+    let target = helper::resolve_target(fixture_dir)?;
     let facts = helper::run_goextract_package_scopes(&target, route_patterns, schema_patterns)?;
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }

@@ -37,8 +37,15 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	if err := json.NewDecoder(tmp).Decode(&doc); err != nil {
 		t.Fatalf("decode facts: %v", err)
 	}
-	if len(doc.Diagnostics) != 0 {
-		t.Fatalf("gin contract fixture should not emit diagnostics, got %+v", doc.Diagnostics)
+	if len(doc.Diagnostics) != 1 {
+		t.Fatalf("gin contract fixture should emit one raw-stream diagnostic, got %+v", doc.Diagnostics)
+	}
+	rawStreamDiagnostic := doc.Diagnostics[0]
+	if rawStreamDiagnostic.Code != "response.missing" ||
+		rawStreamDiagnostic.Severity != "ERROR" ||
+		rawStreamDiagnostic.Operation != "GET /v1/items/raw-stream" ||
+		rawStreamDiagnostic.Subject != "rawStream" {
+		t.Fatalf("raw stream must be diagnosed as a missing response contract, got %+v", rawStreamDiagnostic)
 	}
 
 	login := routeByHandler(t, doc, "login")

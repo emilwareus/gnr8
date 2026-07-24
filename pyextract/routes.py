@@ -6,9 +6,8 @@ module-level binding to a ``FastAPI()`` / ``APIRouter(...)`` instance. Nothing h
 FastAPI's runtime ``/openapi.json`` or any third-party schema dialect — the method, path,
 params, body and response are all read off the decorator Call + the typed handler signature.
 
-The ``APIRouter(prefix="/books")`` prefix is recorded SEPARATELY and NEVER folded into the
-code-derived path (rule 1): the snapshot's operation paths stay group-relative (``/`` /
-``/{book_id}``) and ``/books`` is a lowering-time base path supplied by the host.
+Static router/blueprint prefixes are code-derived route facts and are composed with decorator paths.
+Dynamic prefixes are diagnosed and the affected binding is omitted.
 
 A RouteFact has EXACTLY the keys the host ``RouteFact`` DTO (``deny_unknown_fields``)
 requires: ``method, path, handler, operation_id, params, request_body, responses, span``.
@@ -69,12 +68,122 @@ def _const_kwarg(call, key):
     return None
 
 
-def _router_bindings(module):
-    """Map each module-level router/app variable name -> its recorded prefix string.
+def _static_prefix(call, key, diags, abs_path, line, label):
+    """Return a declared static string prefix, or ``None`` after diagnosing a dynamic one."""
+    for kw in call.keywords:
+        if kw.arg != key:
+            continue
+        if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            return kw.value.value
+        diags.warn(
+            "{} has dynamic {}=; routes for this binding are omitted".format(label, key),
+            abs_path,
+            line,
+        )
+        return None
+    return ""
+
+
+def _join_static_paths(prefix, path):
+    """Compose a static framework prefix and method path with one slash at the seam."""
+    prefix = prefix.strip()
+    path = path.strip()
+    if not prefix:
+        return path if path.startswith("/") else "/" + path
+    normalized_prefix = "/" + prefix.strip("/")
+    if path in ("", "/"):
+        return normalized_prefix + "/"
+    return normalized_prefix + "/" + path.strip("/")
+
+
+def _registration_prefixes(module, method_name, keyword, bindings, diags):
+    """Fold static include/register prefixes into bindings declared in the same module."""
+    for stmt in module.tree.body:
+        value = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+            continue
+        if value.func.attr != method_name or not value.args:
+            continue
+        binding = value.args[0]
+        if not isinstance(binding, ast.Name) or binding.id not in bindings:
+            continue
+        prefix = _static_prefix(
+            value,
+            keyword,
+            diags,
+            module.abs_path,
+            getattr(stmt, "lineno", 0),
+            method_name,
+        )
+        if prefix is None:
+            del bindings[binding.id]
+            continue
+        bindings[binding.id] = _join_static_paths(prefix, bindings[binding.id])
+
+
+def _import_targets(module):
+    """Map local imported names to ``(dotted module, exported name)``."""
+    targets = {}
+    package = module.dotted.split(".")[:-1]
+    for stmt in module.tree.body:
+        if not isinstance(stmt, ast.ImportFrom):
+            continue
+        base_parts = list(package)
+        if stmt.level:
+            keep = max(0, len(package) - (stmt.level - 1))
+            base_parts = base_parts[:keep]
+        else:
+            base_parts = []
+        if stmt.module:
+            base_parts.extend(stmt.module.split("."))
+        dotted = ".".join(base_parts)
+        for alias in stmt.names:
+            local = alias.asname or alias.name
+            targets[local] = (dotted, alias.name)
+    return targets
+
+
+def _external_registration_prefixes(modules, method_name, keyword, diags):
+    """Resolve static include/register prefixes applied to imported router bindings."""
+    prefixes = {}
+    for module in sorted(modules, key=lambda item: item.dotted):
+        imports = _import_targets(module)
+        calls = [node for node in ast.walk(module.tree) if isinstance(node, ast.Call)]
+        calls.sort(key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)))
+        for call in calls:
+            if not isinstance(call.func, ast.Attribute) or call.func.attr != method_name:
+                continue
+            if not call.args or not isinstance(call.args[0], ast.Name):
+                continue
+            target = imports.get(call.args[0].id)
+            if target is None:
+                continue
+            prefix = _static_prefix(
+                call,
+                keyword,
+                diags,
+                module.abs_path,
+                getattr(call, "lineno", 0),
+                method_name,
+            )
+            if target in prefixes:
+                diags.warn(
+                    "{} registers imported binding {} more than once; routes are omitted"
+                    .format(method_name, call.args[0].id),
+                    module.abs_path,
+                    getattr(call, "lineno", 0),
+                )
+                prefixes[target] = None
+            else:
+                prefixes[target] = prefix
+    return prefixes
+
+
+def _router_bindings(module, diags, external_prefixes):
+    """Map each module-level router/app variable name -> its composed static prefix.
 
     ``app = FastAPI(title=..)`` -> ``{"app": ""}``;
     ``router = APIRouter(prefix="/books")`` -> ``{"router": "/books"}``.
-    The prefix is captured for provenance ONLY — it is never folded into a path (rule 1).
     """
     bindings = {}
     for stmt in module.tree.body:
@@ -84,8 +193,26 @@ def _router_bindings(module):
             continue
         ctor = _ctor_name(stmt.value)
         if ctor in _ROUTER_CTORS:
-            prefix = _const_kwarg(stmt.value, "prefix") or ""
-            bindings[stmt.targets[0].id] = prefix
+            prefix = _static_prefix(
+                stmt.value,
+                "prefix",
+                diags,
+                module.abs_path,
+                getattr(stmt, "lineno", 0),
+                ctor,
+            )
+            if prefix is not None:
+                bindings[stmt.targets[0].id] = prefix
+    _registration_prefixes(module, "include_router", "prefix", bindings, diags)
+    for name in list(bindings):
+        key = (module.dotted, name)
+        if key not in external_prefixes:
+            continue
+        external = external_prefixes[key]
+        if external is None:
+            del bindings[name]
+        else:
+            bindings[name] = _join_static_paths(external, bindings[name])
     return bindings
 
 
@@ -168,6 +295,35 @@ def _warn_untyped_param(arg, path, method, abs_path, diags):
     )
 
 
+def _positional_default(args, index):
+    """Return the default AST node for a positional argument, or ``None``."""
+    total = len(_positional_args(args))
+    first_default = total - len(args.defaults)
+    if index < first_default:
+        return None
+    return args.defaults[index - first_default]
+
+
+def _is_depends_call(node):
+    if not isinstance(node, ast.Call):
+        return False
+    name = types._name_of(node.func)
+    return bool(name) and name.split(".")[-1] == "Depends"
+
+
+def _is_dependency_parameter(annotation, default):
+    """Recognize FastAPI's native ``Depends`` and ``Annotated[..., Depends()]`` forms."""
+    if _is_depends_call(default):
+        return True
+    if not isinstance(annotation, ast.Subscript):
+        return False
+    base = types._subscript_value(annotation)
+    if not base or base.split(".")[-1] != "Annotated":
+        return False
+    args = types._subscript_args(annotation)
+    return any(_is_depends_call(metadata) for metadata in args[1:])
+
+
 def _is_union_alias(node):
     """Whether an alias value node is a ``Union[...]`` / ``A | B`` (a standalone schema)."""
     if isinstance(node, ast.Subscript):
@@ -235,6 +391,10 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         annotation = arg.annotation
         if annotation is None:
             _warn_untyped_param(arg, path, method, abs_path, diags)
+            continue
+        if _is_dependency_parameter(
+            annotation, _positional_default(func.args, index)
+        ):
             continue
         # A parameter typed by a model/@dataclass class is the request body, not a param.
         body_ref = _resolves_to_class(annotation, in_module, table)
@@ -305,6 +465,9 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
         if annotation is None:
             _warn_untyped_param(arg, path, method, abs_path, diags)
             continue
+        default = kw_defaults[index] if index < len(kw_defaults) else None
+        if _is_dependency_parameter(annotation, default):
+            continue
         body_ref = _resolves_to_class(annotation, in_module, table)
         if body_ref is not None and arg.arg not in path_names:
             if allows_body and request_body is None:
@@ -365,11 +528,10 @@ def _build_params(func, path, method, in_module, abs_path, table, diags):
 
 
 def _build_response(call, operation, abs_path, diags):
-    """Build a safe status from ``status_code=`` and diagnose dynamic overrides.
+    """Build the response status from ``status_code=``.
 
-    An absent override uses FastAPI's 200 default. A present override must be an
-    integer HTTP status in 100..599; anything else is incomplete source analysis
-    and retains the deterministic default with a denyable diagnostic.
+    ``status_code=`` Constant -> status (default 200 when absent). Response schema selection is
+    handled separately from an explicit ``response_model=`` or the handler return annotation.
     """
     keyword = next((kw for kw in call.keywords if kw.arg == "status_code"), None)
     if keyword is None:
@@ -390,33 +552,79 @@ def _build_response(call, operation, abs_path, diags):
     return 200
 
 
-def _response_model(call, func, in_module, table):
-    """Return ``(ref, source, intentional_empty)`` for a FastAPI response body."""
-    keyword = next((kw for kw in call.keywords if kw.arg == "response_model"), None)
-    if keyword is not None:
-        if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
-            return None, keyword.value, True
-        return _resolves_to_schema_ref(keyword.value, in_module, table), keyword.value, False
-    if func.returns is None:
-        return None, func, False
-    if (
-        isinstance(func.returns, ast.Constant) and func.returns.value is None
-    ) or (isinstance(func.returns, ast.Name) and func.returns.id == "None"):
-        return None, func.returns, True
-    return _resolves_to_schema_ref(func.returns, in_module, table), func.returns, False
+def _response_annotation(call, func):
+    """Select the explicit response model, otherwise the handler return annotation."""
+    for kw in call.keywords:
+        if kw.arg == "response_model":
+            if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                return None
+            return kw.value
+    return func.returns
 
 
-def recognize_fastapi(modules, table, diags):
+def _pascal_case(name):
+    return "".join(part[:1].upper() + part[1:] for part in name.split("_") if part)
+
+
+def _response_schema_ref(
+    annotation,
+    func,
+    in_module,
+    abs_path,
+    table,
+    diags,
+    synthetic_schemas,
+):
+    if annotation is None:
+        return None
+    direct = _resolves_to_schema_ref(annotation, in_module, table)
+    if direct is not None:
+        return direct
+    mapped = types.map_annotation(annotation, in_module, table, diags)
+    if mapped is None:
+        return None
+    if mapped.get("type") == "named":
+        return mapped.get("of")
+
+    name = _pascal_case(func.name) + "Response"
+    ref_id = "{}.{}".format(in_module, name)
+    if any(schema["id"] == ref_id for schema in synthetic_schemas):
+        diags.warn(
+            "synthetic response schema '{}' collides with another schema; response omitted"
+            .format(ref_id),
+            abs_path,
+            getattr(func, "lineno", 0),
+        )
+        return None
+    synthetic_schemas.append(
+        {
+            "id": ref_id,
+            "name": name,
+            "body": mapped,
+            "span": _span(abs_path, func),
+        }
+    )
+    return ref_id
+
+
+def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
     """Recognize FastAPI routes across ``modules`` -> a list of RouteFact dicts.
 
     For each module: index its router/app bindings (with their separately-recorded
     prefix), then walk every ``def``/``async def`` carrying an ``@<router>.<verb>(...)``
-    decorator and assemble its method/path/params/body/response facts. The host
+    decorator and assemble its method/path/params/body/response facts. Typed return annotations are
+    used when ``response_model=`` is absent, collection responses receive a deterministic synthetic
+    schema, and framework dependency parameters are omitted from the HTTP contract. The host
     re-sorts the routes; the sidecar stays internally deterministic.
     """
     routes = []
+    if synthetic_schemas is None:
+        synthetic_schemas = []
+    external_prefixes = _external_registration_prefixes(
+        modules, "include_router", "prefix", diags
+    )
     for module in sorted(modules, key=lambda m: m.dotted):
-        bindings = _router_bindings(module)
+        bindings = _router_bindings(module, diags, external_prefixes)
         if not bindings:
             continue
         abs_path = module.abs_path
@@ -426,8 +634,8 @@ def recognize_fastapi(modules, table, diags):
             decorator = _route_decorator(stmt, bindings)
             if decorator is None:
                 continue
-            path = _route_path(decorator)
-            if path is None:
+            route_path = _route_path(decorator)
+            if route_path is None:
                 diags.warn(
                     "FastAPI route decorator has no constant path; route omitted "
                     "(no fallback)",
@@ -438,14 +646,40 @@ def recognize_fastapi(modules, table, diags):
                     subject=stmt.name,
                 )
                 continue
+            binding_name = decorator.func.value.id
+            path = _join_static_paths(bindings[binding_name], route_path)
             method = decorator.func.attr.upper()
             operation = "{} {}".format(method, path)
             params, request_body = _build_params(
                 stmt, path, method, module.dotted, abs_path, table, diags
             )
             status = _build_response(decorator, operation, abs_path, diags)
-            body_ref, response_source, intentional_empty = _response_model(
-                decorator, stmt, module.dotted, table
+            response_annotation = _response_annotation(decorator, stmt)
+            response_model = next(
+                (kw for kw in decorator.keywords if kw.arg == "response_model"),
+                None,
+            )
+            intentional_empty = (
+                response_model is not None
+                and isinstance(response_model.value, ast.Constant)
+                and response_model.value.value is None
+            ) or (
+                response_model is None
+                and isinstance(stmt.returns, ast.Constant)
+                and stmt.returns.value is None
+            )
+            body_ref = (
+                None
+                if intentional_empty
+                else _response_schema_ref(
+                    response_annotation,
+                    stmt,
+                    module.dotted,
+                    abs_path,
+                    table,
+                    diags,
+                    synthetic_schemas,
+                )
             )
             if body_ref is None and not intentional_empty:
                 diags.warn(
@@ -453,7 +687,7 @@ def recognize_fastapi(modules, table, diags):
                     "response_model or the return annotation; response body omitted "
                     "(no fallback)".format(operation),
                     abs_path,
-                    getattr(response_source, "lineno", 0),
+                    getattr(response_annotation or stmt, "lineno", 0),
                     code="response.schema.unresolved",
                     category="response",
                     operation=operation,
@@ -472,6 +706,9 @@ def recognize_fastapi(modules, table, diags):
                     "operation_id": stmt.name,
                     "params": params,
                     "request_body": request_body,
+                    "request_body_content_type": (
+                        "application/json" if request_body is not None else None
+                    ),
                     "responses": [response],
                     "span": _span(abs_path, stmt),
                 }
@@ -494,16 +731,15 @@ def recognize_fastapi(modules, table, diags):
 #   * a local annotated ``status: str = request.args.get(...)`` -> a typed query param.
 #   * an UNTYPED ``request.json`` read / unannotated ``request.args.get(...)`` /
 #     missing return annotation -> a diagnostic, no fact.
-# The Flask ``url_prefix`` is recorded SEPARATELY and NEVER folded into the path (rule 1).
+# Static Flask ``url_prefix`` values are composed into the route path.
 # ---------------------------------------------------------------------------
 
 
-def _flask_bindings(module):
-    """Map each module-level Flask/Blueprint variable name -> its ``url_prefix`` string.
+def _flask_bindings(module, diags, external_prefixes):
+    """Map each module-level Flask/Blueprint variable name -> its static ``url_prefix``.
 
     ``bp = Blueprint("orders", __name__, url_prefix="/orders")`` -> ``{"bp": "/orders"}``;
-    ``app = Flask(__name__)`` -> ``{"app": ""}``. The prefix is recorded for provenance
-    ONLY — it is never folded into a route path (rule 1; the snapshot base_path is ``/``).
+    ``app = Flask(__name__)`` -> ``{"app": ""}``.
     """
     bindings = {}
     for stmt in module.tree.body:
@@ -513,8 +749,26 @@ def _flask_bindings(module):
             continue
         ctor = _ctor_name(stmt.value)
         if ctor in _FLASK_CTORS:
-            prefix = _const_kwarg(stmt.value, "url_prefix") or ""
-            bindings[stmt.targets[0].id] = prefix
+            prefix = _static_prefix(
+                stmt.value,
+                "url_prefix",
+                diags,
+                module.abs_path,
+                getattr(stmt, "lineno", 0),
+                ctor,
+            )
+            if prefix is not None:
+                bindings[stmt.targets[0].id] = prefix
+    _registration_prefixes(module, "register_blueprint", "url_prefix", bindings, diags)
+    for name in list(bindings):
+        key = (module.dotted, name)
+        if key not in external_prefixes:
+            continue
+        external = external_prefixes[key]
+        if external is None:
+            del bindings[name]
+        else:
+            bindings[name] = _join_static_paths(external, bindings[name])
     return bindings
 
 
@@ -556,7 +810,7 @@ def _flask_methods(call):
 
 
 def _flask_path(raw):
-    """Convert a Flask route path to the neutral group-relative path + path-param types.
+    """Convert a Flask decorator path to a neutral relative path + path-param types.
 
     ``"/<int:order_id>"`` -> ``("/{order_id}", {"order_id": <int64 schema>})`` (strip the
     converter, brace the name, the ``int`` converter drives the param schema). ``"/<name>"``
@@ -786,8 +1040,11 @@ def recognize_flask(modules, table, diags):
     handler (no resolvable return annotation) emits ``responses: []`` + a diagnostic.
     """
     routes = []
+    external_prefixes = _external_registration_prefixes(
+        modules, "register_blueprint", "url_prefix", diags
+    )
     for module in sorted(modules, key=lambda m: m.dotted):
-        bindings = _flask_bindings(module)
+        bindings = _flask_bindings(module, diags, external_prefixes)
         if not bindings:
             continue
         abs_path = module.abs_path
@@ -809,7 +1066,9 @@ def recognize_flask(modules, table, diags):
                     subject=stmt.name,
                 )
                 continue
-            path, path_converters = _flask_path(raw_path)
+            relative_path, path_converters = _flask_path(raw_path)
+            binding_name = decorator.func.value.id
+            path = _join_static_paths(bindings[binding_name], relative_path)
             methods = _flask_methods(decorator)
 
             # Path params (from the converters), independent of the method split.
@@ -879,6 +1138,9 @@ def recognize_flask(modules, table, diags):
                         "operation_id": stmt.name,
                         "params": path_params + query_params,
                         "request_body": request_body,
+                        "request_body_content_type": (
+                            "application/json" if request_body is not None else None
+                        ),
                         "responses": responses,
                         "span": _span(abs_path, stmt),
                     }

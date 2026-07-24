@@ -12,6 +12,7 @@ package diag
 import "github.com/gnr8/goextract/internal/facts"
 
 const severityWarn = "WARN"
+const severityError = "ERROR"
 
 const (
 	categorySource           = "source"
@@ -29,24 +30,6 @@ type Accumulator struct {
 // New returns an empty accumulator.
 func New() *Accumulator {
 	return &Accumulator{items: []facts.DiagnosticFact{}}
-}
-
-// Floatf records the float64 -> float32 narrowing warning for a struct field
-// (TARGET-API.md §5.2). goType is the rendered Go type (e.g. "*float64").
-func (a *Accumulator) Floatf(structName, fieldName, goType, file string, line uint32) {
-	a.items = append(a.items, facts.DiagnosticFact{
-		Code:     "schema.numeric.narrowing",
-		Severity: severityWarn,
-		Category: categorySchema,
-		Message: "float64 -> float32 narrowing: field " + structName + "." + fieldName +
-			" (" + goType + ") loses precision in the generated Go SDK; map to float64 or " +
-			"surface a compatibility diagnostic (TARGET-API.md §5.2)",
-		File:    file,
-		Line:    line,
-		EndLine: line,
-		Schema:  structName,
-		Subject: fieldName,
-	})
 }
 
 // FreeFormMap records the free-form map warning for a struct field
@@ -255,6 +238,56 @@ func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string
 		EndLine: line,
 		Schema:  structName,
 		Subject: fieldName,
+	})
+}
+
+// UnknownHandler records a recognized route whose handler declaration/body is
+// unavailable. This is an error because emitting empty request/response facts
+// would make extraction coverage look complete when it is not.
+func (a *Accumulator) UnknownHandler(handler, method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.handler.unresolved",
+		Severity: severityError,
+		Category: categorySource,
+		Message: "unknown handler '" + handler + "' for " + method + " " + route +
+			"; route extraction is incomplete and generation must not be treated as healthy (GO-06)",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   handler,
+	})
+}
+
+// MissingResponses records a handler that was analyzed but supplied no static
+// response evidence. Bodyless responses still have a status fact, so zero facts
+// means extraction coverage is incomplete rather than intentionally bodyless.
+func (a *Accumulator) MissingResponses(handler, method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "response.missing",
+		Severity: severityError,
+		Category: categoryResponse,
+		Message: "missing response facts for handler '" + handler + "' on " + method + " " + route +
+			"; add a statically recognizable response or explicit code configuration (GO-06)",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   handler,
+	})
+}
+
+// Error records an actionable extraction failure that permits the helper to
+// return its partial facts solely for diagnostics and review.
+func (a *Accumulator) Error(message, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "source.load.failed",
+		Severity: severityError,
+		Category: categorySource,
+		Message:  message,
+		File:     file,
+		Line:     line,
+		EndLine:  line,
 	})
 }
 

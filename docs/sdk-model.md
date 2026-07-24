@@ -30,7 +30,7 @@ as an SDK package.
 provenance, title, and base path.
 
 `SdkModel` owns SDK planning facts: package surface, service grouping, per-operation auth/error/success
-classification, file layout, compatibility aliases/profile, docs metadata, and runtime-policy defaults.
+classification, file layout, optional aliases, docs metadata, and runtime-policy defaults.
 
 Language emitters own syntax and idioms only: type spelling, imports, file contents, runtime code, and
 language-specific package metadata. New SDK adoption features should be added to `SdkModel` first when

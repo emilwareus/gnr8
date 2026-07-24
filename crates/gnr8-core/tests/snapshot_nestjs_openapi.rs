@@ -48,7 +48,7 @@ fn openapi_matches_expected_for_nestjs() {
     // security are TEST-supplied (rule 4, Pitfall 9) — the sidecar never emits them.
     let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires node + the vendored typescript)");
-    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "/books", &fixture_security())
+    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
         .expect("lower::to_openapi must succeed");
     insta::assert_snapshot!("nestjs_openapi", openapi);
 }

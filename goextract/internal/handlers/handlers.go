@@ -866,12 +866,21 @@ func requestHeaderGetInFrame(frame helperFrame, call *ast.CallExpr) (string, boo
 
 // Analyze infers the request/response/param facts for one route's handler. The
 // route carries the method + normalized path so untyped-query diagnostics can name
-// the operation. Unknown handlers (no matching decl) yield empty facts, not a
-// panic (defensive — GO-06). The module prefix used to qualify schema refs is read
+// the operation. Unknown handlers (no matching decl) yield empty facts plus an
+// ERROR diagnostic, not a panic or a false-complete contract (GO-06). The module prefix used to qualify schema refs is read
 // from the Analyzer's per-invocation context (WR-03), not a package global.
 func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFacts {
 	h, ok := a.handlerForRoute(route)
 	if !ok || h.decl == nil || h.decl.Body == nil {
+		if diags != nil {
+			diags.UnknownHandler(
+				route.Handler,
+				route.Method,
+				route.Path,
+				route.Span.File,
+				route.Span.StartLine,
+			)
+		}
 		return CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
 	}
 
@@ -1150,8 +1159,23 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				continue
 			}
 			reported[key] = true
-			diags.UntypedQueryParam(read.name, route.Method, untypedRouteLabel(route), read.file, read.line)
+			diags.UntypedQueryParam(
+				read.name,
+				route.Method,
+				untypedRouteLabel(route),
+				read.file,
+				read.line,
+			)
 		}
+	}
+	if len(cf.Responses) == 0 && diags != nil {
+		diags.MissingResponses(
+			route.Handler,
+			route.Method,
+			route.Path,
+			route.Span.File,
+			route.Span.StartLine,
+		)
 	}
 	return cf
 }

@@ -339,58 +339,6 @@ pub(crate) fn emit_models_with_aliases_and_policies(
     Ok(out)
 }
 
-/// Emit OpenAPI-generator-compatible `models.ts`, including runtime enum const objects plus matching
-/// type aliases.
-pub(crate) fn emit_models_openapi_generator_compat(
-    graph: &ApiGraph,
-    _package: &str,
-    aliases: &[ResolvedTypeAlias],
-    model_property_policy: TsModelPropertyPolicy,
-    nullable_policy: TsNullablePolicy,
-) -> Result<String, CoreError> {
-    let mut out = String::new();
-
-    check_unique_schema_names(graph, "TypeScript SDK")?;
-
-    for (i, schema) in graph.schemas.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        match &schema.body {
-            Type::Enum(members) => emit_runtime_enum_alias(&mut out, &schema.name, members)?,
-            Type::Object(fields) => emit_interface_with_policies(
-                &mut out,
-                &schema.name,
-                fields,
-                graph,
-                "",
-                model_property_policy,
-                nullable_policy,
-            )?,
-            Type::Primitive(_)
-            | Type::WellKnown(_)
-            | Type::Array(_)
-            | Type::Map { .. }
-            | Type::Named(_)
-            | Type::Union(_)
-            | Type::Any {} => {
-                let alias = ts_type(&schema.body, false, graph, "")?;
-                writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
-            }
-        }
-    }
-    for alias in aliases {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
-    }
-    if out.is_empty() {
-        out.push_str("export {};\n");
-    }
-    Ok(out)
-}
-
 /// Emit one model schema into its own TypeScript file.
 pub(crate) fn emit_model_schema_with_policies(
     graph: &ApiGraph,
@@ -452,54 +400,6 @@ fn emit_enum_alias(out: &mut String, name: &str, members: &[String]) -> Result<(
     let lits: Vec<String> = members.iter().map(|m| ts_string_literal(m)).collect();
     writeln!(out, "export type {name} = {};", lits.join(" | ")).map_err(sink)?;
     Ok(())
-}
-
-fn emit_runtime_enum_alias(
-    out: &mut String,
-    name: &str,
-    members: &[String],
-) -> Result<(), CoreError> {
-    if members.is_empty() {
-        writeln!(out, "export const {name} = {{}} as const;").map_err(sink)?;
-        writeln!(out, "export type {name} = never;").map_err(sink)?;
-        return Ok(());
-    }
-    writeln!(out, "export const {name} = {{").map_err(sink)?;
-    let keys = enum_member_keys(members);
-    for (key, value) in keys.iter().zip(members.iter()) {
-        writeln!(out, "  {key}: {},", ts_string_literal(value)).map_err(sink)?;
-    }
-    writeln!(out, "}} as const;").map_err(sink)?;
-    writeln!(
-        out,
-        "export type {name} = typeof {name}[keyof typeof {name}];"
-    )
-    .map_err(sink)?;
-    Ok(())
-}
-
-fn enum_member_keys(members: &[String]) -> Vec<String> {
-    let mut used = Vec::new();
-    members
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let mut candidate = pascal_identifier(value);
-            if candidate.is_empty() {
-                candidate = format!("Value{index}");
-            }
-            if used.contains(&candidate) {
-                let base = candidate.clone();
-                let mut suffix = 2;
-                while used.contains(&candidate) {
-                    candidate = format!("{base}{suffix}");
-                    suffix += 1;
-                }
-            }
-            used.push(candidate.clone());
-            candidate
-        })
-        .collect()
 }
 
 fn pascal_identifier(value: &str) -> String {
@@ -1369,7 +1269,6 @@ fn emit_operation(
     let tokens = path_tokens(&abs);
 
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let query_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "query").collect();
     let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
 
     // The templated path tokens must be exactly the declared path params (order-independent set
@@ -1476,7 +1375,7 @@ fn emit_operation(
     emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
     emit_op_query(
         out,
-        &query_params,
+        graph,
         &required_query,
         &required_query_idents,
         &optional_query,
@@ -1867,188 +1766,7 @@ fn ts_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError>
     ts_query_param(op, param_name).map(|param| camel(&param.name))
 }
 
-fn validate_ts_pagination_params(
-    op: &Operation,
-    policy: &PaginationPolicy,
-) -> Result<(), CoreError> {
-    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        let param = ts_query_param(op, param_name)?;
-        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
-                    op.id, param_name
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> String {
-    let mut out = format!("export const {name} = async function (\n");
-    out.push_str("  this: Client,\n");
-    for arg in args {
-        let _ = writeln!(out, "  {arg},");
-    }
-    let _ = write!(out, "): {ret_promise} {{");
-    out
-}
-
-fn ts_async_generator_prototype_signature(name: &str, args: &[String], ret: &str) -> String {
-    let mut out = format!("export const {name} = async function* (\n");
-    out.push_str("  this: Client,\n");
-    for arg in args {
-        let _ = writeln!(out, "  {arg},");
-    }
-    let _ = write!(out, "): {ret} {{");
-    out
-}
-
-/// Emit the `let path = …` line for one operation: a template literal with each path param
-/// percent-escaped (V5). TS template literals have no backslash restriction, so no Python-style `safe=''`
-/// workaround is needed (Pitfall 6).
-fn emit_op_path(
-    out: &mut String,
-    abs: &str,
-    tokens: &[String],
-    path_params: &[&Param],
-    path_idents: &[String],
-) -> Result<(), CoreError> {
-    if tokens.is_empty() {
-        writeln!(out, "    let path = `{abs}`;").map_err(sink)?;
-        return Ok(());
-    }
-    let mut tmpl = abs.to_string();
-    for token in tokens {
-        let ident = path_params
-            .iter()
-            .zip(path_idents.iter())
-            .find(|(pp, _)| &pp.name == token)
-            .map_or_else(|| camel(token), |(_, id)| id.clone());
-        let placeholder = format!("{{{token}}}");
-        let interp = format!("${{encodeURIComponent(String({ident}))}}");
-        tmpl = tmpl.replace(&placeholder, &interp);
-    }
-    writeln!(out, "    let path = `{tmpl}`;").map_err(sink)?;
-    Ok(())
-}
-
-/// Emit the `URLSearchParams` query-building block for one operation (WR-01 analog): a REQUIRED query
-/// param is always appended (positional arg, no guard); an OPTIONAL one is appended only when defined.
-/// The wire key stays the ORIGINAL `p.name`.
-fn emit_op_query(
-    out: &mut String,
-    query_params: &[&Param],
-    required_query: &[&Param],
-    required_query_idents: &[String],
-    optional_query: &[&Param],
-    optional_query_idents: &[String],
-    auth_queries: &[String],
-) -> Result<(), CoreError> {
-    if query_params.is_empty() && auth_queries.is_empty() {
-        return Ok(());
-    }
-    writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
-    let has_allow_reserved = query_params.iter().any(|param| param.allow_reserved);
-    if has_allow_reserved {
-        writeln!(out, "    const allowReserved = new Set<number>();").map_err(sink)?;
-        writeln!(out, "    let queryPairIndex = 0;").map_err(sink)?;
-    }
-    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        if p.location != "query" {
-            continue;
-        }
-        emit_ts_query_parameter(out, p, ident, "    ", has_allow_reserved)?;
-    }
-    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-        if p.location != "query" {
-            continue;
-        }
-        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        emit_ts_query_parameter(out, p, ident, "      ", has_allow_reserved)?;
-        writeln!(out, "    }}").map_err(sink)?;
-    }
-    for (idx, query) in auth_queries.iter().enumerate() {
-        let local = format!("apiKeyQuery{idx}");
-        writeln!(
-            out,
-            "    const {local} = this._apiKey({});",
-            quoted_string_literal(query)
-        )
-        .map_err(sink)?;
-        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
-        writeln!(
-            out,
-            "      searchParams.append({}, {local});",
-            quoted_string_literal(query)
-        )
-        .map_err(sink)?;
-        if has_allow_reserved {
-            writeln!(out, "      queryPairIndex += 1;").map_err(sink)?;
-        }
-        writeln!(out, "    }}").map_err(sink)?;
-    }
-    if has_allow_reserved {
-        writeln!(
-            out,
-            "    const qs = wireQueryString(searchParams, allowReserved);"
-        )
-        .map_err(sink)?;
-    } else {
-        writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
-    }
-    writeln!(out, "    if (qs) {{").map_err(sink)?;
-    writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
-    writeln!(out, "    }}").map_err(sink)?;
-    Ok(())
-}
-
-fn emit_ts_query_parameter(
-    out: &mut String,
-    param: &Param,
-    ident: &str,
-    padding: &str,
-    track_pair_index: bool,
-) -> Result<(), CoreError> {
-    if ts_parameter_needs_pairs(param) {
-        writeln!(
-            out,
-            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, {ident}, {}, {})) {{",
-            quoted_string_literal(&param.name),
-            quoted_string_literal(ts_parameter_style(param)),
-            ts_parameter_explode(param)
-        )
-        .map_err(sink)?;
-        writeln!(out, "{padding}  searchParams.append(wireName, wireValue);").map_err(sink)?;
-        if param.allow_reserved {
-            writeln!(out, "{padding}  allowReserved.add(queryPairIndex);").map_err(sink)?;
-        }
-        if track_pair_index {
-            writeln!(out, "{padding}  queryPairIndex += 1;").map_err(sink)?;
-        }
-        writeln!(out, "{padding}}}").map_err(sink)?;
-    } else {
-        writeln!(
-            out,
-            "{padding}searchParams.append({}, String({ident}));",
-            quoted_string_literal(&param.name)
-        )
-        .map_err(sink)?;
-        if param.allow_reserved {
-            writeln!(out, "{padding}allowReserved.add(queryPairIndex);").map_err(sink)?;
-        }
-        if track_pair_index {
-            writeln!(out, "{padding}queryPairIndex += 1;").map_err(sink)?;
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn ts_parameter_style(param: &Param) -> &str {
+fn ts_parameter_style(param: &Param) -> &str {
     param
         .style
         .as_deref()
@@ -2058,13 +1776,13 @@ pub(super) fn ts_parameter_style(param: &Param) -> &str {
         })
 }
 
-pub(super) fn ts_parameter_explode(param: &Param) -> bool {
+fn ts_parameter_explode(param: &Param) -> bool {
     param
         .explode
         .unwrap_or_else(|| ts_parameter_style(param) == "form")
 }
 
-pub(super) fn ts_parameter_needs_pairs(param: &Param) -> bool {
+fn ts_parameter_needs_pairs(param: &Param) -> bool {
     matches!(
         param.schema,
         Type::Array(_) | Type::Map { .. } | Type::Any {}
@@ -2073,9 +1791,11 @@ pub(super) fn ts_parameter_needs_pairs(param: &Param) -> bool {
 
 fn ts_operations_need_wire_helpers(ops: &[&Operation]) -> bool {
     ops.iter().any(|op| {
-        op.params
-            .iter()
-            .any(|param| param.allow_reserved || ts_parameter_needs_pairs(param))
+        op.params.iter().any(|param| {
+            param.allow_reserved
+                || ((param.location == "header" || param.location == "cookie")
+                    && ts_parameter_needs_pairs(param))
+        })
     })
 }
 
@@ -2161,7 +1881,7 @@ fn emit_ts_header_cookie_parameter(
     Ok(())
 }
 
-pub(super) fn emit_ts_wire_helpers(out: &mut String) {
+fn emit_ts_wire_helpers(out: &mut String) {
     out.push_str(
         r#"
 
@@ -2217,6 +1937,249 @@ function wireQueryString(values: URLSearchParams, allowReserved: Set<number>): s
 }
 "#,
     );
+}
+
+fn validate_ts_pagination_params(
+    op: &Operation,
+    policy: &PaginationPolicy,
+) -> Result<(), CoreError> {
+    for param_name in [policy.page_param.as_deref(), policy.offset_param.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let param = ts_query_param(op, param_name)?;
+        if !matches!(param.schema, Type::Primitive(Prim::Int { .. })) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' requires numeric query parameter '{}'",
+                    op.id, param_name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ts_prototype_signature(name: &str, args: &[String], ret_promise: &str) -> String {
+    let mut out = format!("export const {name} = async function (\n");
+    out.push_str("  this: Client,\n");
+    for arg in args {
+        let _ = writeln!(out, "  {arg},");
+    }
+    let _ = write!(out, "): {ret_promise} {{");
+    out
+}
+
+fn ts_async_generator_prototype_signature(name: &str, args: &[String], ret: &str) -> String {
+    let mut out = format!("export const {name} = async function* (\n");
+    out.push_str("  this: Client,\n");
+    for arg in args {
+        let _ = writeln!(out, "  {arg},");
+    }
+    let _ = write!(out, "): {ret} {{");
+    out
+}
+
+/// Emit the `let path = …` line for one operation: a template literal with each path param
+/// percent-escaped (V5). TS template literals have no backslash restriction, so no Python-style `safe=''`
+/// workaround is needed (Pitfall 6).
+fn emit_op_path(
+    out: &mut String,
+    abs: &str,
+    tokens: &[String],
+    path_params: &[&Param],
+    path_idents: &[String],
+) -> Result<(), CoreError> {
+    if tokens.is_empty() {
+        writeln!(out, "    let path = `{abs}`;").map_err(sink)?;
+        return Ok(());
+    }
+    let mut tmpl = abs.to_string();
+    for token in tokens {
+        let ident = path_params
+            .iter()
+            .zip(path_idents.iter())
+            .find(|(pp, _)| &pp.name == token)
+            .map_or_else(|| camel(token), |(_, id)| id.clone());
+        let placeholder = format!("{{{token}}}");
+        let interp = format!("${{encodeURIComponent(String({ident}))}}");
+        tmpl = tmpl.replace(&placeholder, &interp);
+    }
+    writeln!(out, "    let path = `{tmpl}`;").map_err(sink)?;
+    Ok(())
+}
+
+/// Emit the `URLSearchParams` query-building block for one operation (WR-01 analog): a REQUIRED query
+/// param is always appended (positional arg, no guard); an OPTIONAL one is appended only when defined.
+/// The wire key stays the ORIGINAL `p.name`.
+fn emit_op_query(
+    out: &mut String,
+    graph: &ApiGraph,
+    required_query: &[&Param],
+    required_query_idents: &[String],
+    optional_query: &[&Param],
+    optional_query_idents: &[String],
+    auth_queries: &[String],
+) -> Result<(), CoreError> {
+    let has_query_params = required_query
+        .iter()
+        .chain(optional_query.iter())
+        .any(|param| param.location == "query");
+    if !has_query_params && auth_queries.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
+    let has_allow_reserved = required_query
+        .iter()
+        .chain(optional_query.iter())
+        .any(|param| param.location == "query" && param.allow_reserved);
+    if has_allow_reserved {
+        writeln!(out, "    const allowReserved = new Set<number>();").map_err(sink)?;
+        writeln!(out, "    let queryPairIndex = 0;").map_err(sink)?;
+    }
+    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
+        if p.location != "query" {
+            continue;
+        }
+        emit_query_param_value(out, graph, p, ident, 4, has_allow_reserved)?;
+    }
+    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
+        if p.location != "query" {
+            continue;
+        }
+        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
+        emit_query_param_value(out, graph, p, ident, 6, has_allow_reserved)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    for (idx, query) in auth_queries.iter().enumerate() {
+        let local = format!("apiKeyQuery{idx}");
+        writeln!(
+            out,
+            "    const {local} = this._apiKey({});",
+            quoted_string_literal(query)
+        )
+        .map_err(sink)?;
+        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "      searchParams.append({}, {local});",
+            quoted_string_literal(query)
+        )
+        .map_err(sink)?;
+        if has_allow_reserved {
+            writeln!(out, "      queryPairIndex += 1;").map_err(sink)?;
+        }
+        writeln!(out, "    }}").map_err(sink)?;
+    }
+    if has_allow_reserved {
+        writeln!(
+            out,
+            "    const qs = wireQueryString(searchParams, allowReserved);"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(out, "    const qs = searchParams.toString();").map_err(sink)?;
+    }
+    writeln!(out, "    if (qs) {{").map_err(sink)?;
+    writeln!(out, "      path = path + \"?\" + qs;").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TsQueryShape {
+    Scalar,
+    Array,
+}
+
+fn emit_query_param_value(
+    out: &mut String,
+    graph: &ApiGraph,
+    param: &Param,
+    ident: &str,
+    indent_width: usize,
+    track_pair_index: bool,
+) -> Result<(), CoreError> {
+    let spaces = " ".repeat(indent_width);
+    let key = quoted_string_literal(&param.name);
+    match ts_query_shape(&param.schema, graph, &param.name)? {
+        TsQueryShape::Scalar => {
+            writeln!(out, "{spaces}searchParams.set({key}, String({ident}));").map_err(sink)?;
+            if param.allow_reserved {
+                writeln!(out, "{spaces}allowReserved.add(queryPairIndex);").map_err(sink)?;
+            }
+            if track_pair_index {
+                writeln!(out, "{spaces}queryPairIndex += 1;").map_err(sink)?;
+            }
+        }
+        TsQueryShape::Array => {
+            writeln!(out, "{spaces}for (const value of {ident}) {{").map_err(sink)?;
+            writeln!(out, "{spaces}  searchParams.append({key}, String(value));").map_err(sink)?;
+            if param.allow_reserved {
+                writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
+            }
+            if track_pair_index {
+                writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
+            }
+            writeln!(out, "{spaces}}}").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
+fn ts_query_shape(
+    schema: &Type,
+    graph: &ApiGraph,
+    param_name: &str,
+) -> Result<TsQueryShape, CoreError> {
+    ts_query_shape_inner(schema, graph, param_name, &mut BTreeSet::new())
+}
+
+fn ts_query_shape_inner(
+    schema: &Type,
+    graph: &ApiGraph,
+    param_name: &str,
+    seen_refs: &mut BTreeSet<String>,
+) -> Result<TsQueryShape, CoreError> {
+    match schema {
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) => Ok(TsQueryShape::Scalar),
+        Type::Array(item) => match ts_query_shape_inner(item, graph, param_name, seen_refs)? {
+            TsQueryShape::Scalar => Ok(TsQueryShape::Array),
+            TsQueryShape::Array => Err(unsupported_ts_query_shape(param_name, "nested array")),
+        },
+        Type::Named(ref_id) => {
+            if !seen_refs.insert(ref_id.clone()) {
+                return Err(unsupported_ts_query_shape(
+                    param_name,
+                    "cyclic named-schema",
+                ));
+            }
+            let target = graph
+                .schemas
+                .iter()
+                .find(|schema| &schema.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!(
+                        "query parameter '{param_name}' references missing schema '{ref_id}'"
+                    ),
+                })?;
+            let shape = ts_query_shape_inner(&target.body, graph, param_name, seen_refs);
+            seen_refs.remove(ref_id);
+            shape
+        }
+        Type::Object(_) => Err(unsupported_ts_query_shape(param_name, "object")),
+        Type::Map { .. } => Err(unsupported_ts_query_shape(param_name, "map")),
+        Type::Union(_) => Err(unsupported_ts_query_shape(param_name, "union")),
+        Type::Any {} => Err(unsupported_ts_query_shape(param_name, "any")),
+    }
+}
+
+fn unsupported_ts_query_shape(param_name: &str, shape: &str) -> CoreError {
+    CoreError::SdkGen {
+        message: format!(
+            "TypeScript query parameter '{param_name}' has unsupported {shape} shape; only scalars and one-dimensional scalar arrays have a defined wire encoding"
+        ),
+    }
 }
 
 /// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
@@ -2664,7 +2627,7 @@ mod tests {
         camel, emit_client, emit_client_with_models, emit_errors, emit_index, emit_models,
         emit_operations, ts_type,
     };
-    use crate::graph::{ApiGraph, Operation, Prim, Type};
+    use crate::graph::{ApiGraph, Operation, Param, Prim, SourceSpan, Type};
 
     /// A facts document covering the bookstore shapes that diverge from the Go target: a named enum
     /// (`BookFormat`), a named union (`BookOrError`), an inline union field (`Book.rating: number |
@@ -3041,7 +3004,7 @@ mod tests {
             let out = emit_models_with_aliases_and_policies(
                 &graph,
                 &[],
-                TsModelPropertyPolicy::OpenApiRequired,
+                TsModelPropertyPolicy::SchemaRequired,
                 TsNullablePolicy::ExplicitNull,
             )
             .unwrap();
@@ -3145,7 +3108,9 @@ mod tests {
     }
 
     mod operations {
-        use super::{emit_operations, ops_graph, ApiGraph, Operation};
+        use super::{
+            emit_operations, ops_graph, ApiGraph, Operation, Param, Prim, SourceSpan, Type,
+        };
 
         fn ops_for<'g>(graph: &'g ApiGraph, handler: &str) -> Vec<&'g Operation> {
             graph
@@ -3153,6 +3118,26 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == handler)
                 .collect()
+        }
+
+        fn string_param(name: &str, location: &str, required: bool, allow_reserved: bool) -> Param {
+            Param {
+                name: name.to_string(),
+                location: location.to_string(),
+                required,
+                schema: Type::Primitive(Prim::String),
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 4,
+                    end_line: 4,
+                },
+            }
         }
 
         #[test]
@@ -3400,8 +3385,70 @@ mod tests {
                 "required body must stay before required query params:\n{out}"
             );
             assert!(
-                out.contains("searchParams.append(\"tenant\", String(tenant));"),
+                out.contains("searchParams.set(\"tenant\", String(tenant));"),
                 "{out}"
+            );
+        }
+
+        #[test]
+        fn required_headers_and_cookies_are_not_serialized_as_query_params() {
+            let mut g = ops_graph();
+            g.operations[0]
+                .params
+                .push(string_param("X-Signature", "header", true, false));
+            g.operations[0]
+                .params
+                .push(string_param("session", "cookie", true, false));
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
+            assert!(
+                out.contains("headers[\"X-Signature\"] = String(xSignature);")
+                    && out.contains(
+                        "cookieParts.push(encodeURIComponent(\"session\") + \"=\" + encodeURIComponent(String(session)));"
+                    )
+                    && !out.contains("const searchParams = new URLSearchParams();"),
+                "header and cookie parameters must stay out of the URL:\n{out}"
+            );
+        }
+
+        #[test]
+        fn scalar_allow_reserved_query_marks_its_wire_pair() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params
+                .push(string_param("redirect", "query", true, true));
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("searchParams.set(\"redirect\", String(redirect));")
+                    && out.contains("allowReserved.add(queryPairIndex);")
+                    && out.contains("queryPairIndex += 1;"),
+                "allowReserved scalar query parameter must mark and advance its pair index:\n{out}"
+            );
+        }
+
+        #[test]
+        fn array_allow_reserved_query_marks_every_repeated_pair() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            let mut tag = string_param("tag", "query", false, true);
+            tag.schema = Type::Array(Box::new(Type::Primitive(Prim::String)));
+            op.params.push(tag);
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains(
+                    "for (const value of tag) {\n        searchParams.append(\"tag\", String(value));\n        allowReserved.add(queryPairIndex);\n        queryPairIndex += 1;\n      }"
+                ),
+                "every repeated allowReserved value must mark and advance its pair index:\n{out}"
             );
         }
 
@@ -3488,7 +3535,7 @@ mod tests {
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("searchParams.append(\"cursor\", String(cursor));"),
+                out.contains("searchParams.set(\"cursor\", String(cursor));"),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -3496,6 +3543,86 @@ mod tests {
             assert!(
                 !out.contains("JSON.stringify(body)"),
                 "query op has no body:\n{out}"
+            );
+        }
+
+        #[test]
+        fn array_query_params_use_repeated_keys() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params.push(crate::graph::Param {
+                name: "tag".to_string(),
+                location: "query".to_string(),
+                required: false,
+                schema: crate::graph::Type::Array(Box::new(crate::graph::Type::Primitive(
+                    crate::graph::Prim::String,
+                ))),
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: crate::graph::SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 8,
+                    end_line: 8,
+                },
+            });
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(out.contains("if (tag !== undefined) {"), "{out}");
+            assert!(out.contains("for (const value of tag) {"), "{out}");
+            assert!(
+                out.contains("searchParams.append(\"tag\", String(value));"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("searchParams.set(\"tag\", String(tag));"),
+                "array query values must not be implicitly comma-joined:\n{out}"
+            );
+        }
+
+        #[test]
+        fn map_query_params_are_rejected_before_emission() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params.push(crate::graph::Param {
+                name: "filter".to_string(),
+                location: "query".to_string(),
+                required: true,
+                schema: crate::graph::Type::Map {
+                    key: Box::new(crate::graph::Type::Primitive(crate::graph::Prim::String)),
+                    value: Box::new(crate::graph::Type::Primitive(crate::graph::Prim::String)),
+                },
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: crate::graph::SourceSpan {
+                    file: "main.ts".to_string(),
+                    start_line: 9,
+                    end_line: 9,
+                },
+            });
+
+            let error =
+                emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("query parameter 'filter' has unsupported map shape"),
+                "{error}"
             );
         }
 
@@ -3751,10 +3878,7 @@ mod tests {
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(
-                out.contains("searchParams.append(\"q\", String(q));"),
-                "{out}"
-            );
+            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 

@@ -11,8 +11,9 @@ Install the CLI from GitHub release assets:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the Rust dependency used by generated `.gnr8/Cargo.toml` files.
-The CLI release archive also includes resources required by source extractors.
+The crates.io package named `gnr8` exposes the public Rust API. Generated `.gnr8/Cargo.toml` files use
+the matching `gnr8-core` source in the complete CLI release archive, which also includes resources
+required by source extractors.
 
 ## Core Workflow
 
@@ -102,8 +103,8 @@ Prefer one focused Markdown page instead of loading every document:
 - CLI: `docs/cli/commands.md`
 - Pipeline and transforms: `docs/pipeline/configuration.md`, `docs/pipeline/transforms.md`
 - Sources: `docs/extraction/sources.md`
-- OpenAPI generation/compatibility: `docs/openapi/generation.md`, `docs/openapi/compatibility.md`
-- SDK generation/compatibility: `docs/sdk/generation.md`, `docs/sdk/compatibility.md`
+- OpenAPI generation: `docs/openapi/generation.md`
+- SDK generation: `docs/sdk/generation.md`
 - Diagnostics: `docs/diagnostics/reference.md`
 - Artifacts and CI: `docs/operations/artifacts-and-ci.md`
 - Public Rust API: `docs/reference/public-api.md`

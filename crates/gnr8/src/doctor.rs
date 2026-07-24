@@ -14,9 +14,8 @@
 //! [`DoctorReport::has_actionable_problem`] is `true` iff a lifecycle/staleness problem exists:
 //! `.gnr8/` missing, the source-language toolchain absent, the pipeline failed to run, or any output is stale
 //! (`Write`) / drifted (`UserEdited`). The pipeline's analysis `diagnostics` (e.g. the fixture's known
-//! unsupported-pattern WARNs) are INFORMATIONAL and are deliberately EXCLUDED — they explain "what I
-//! can't represent and why" and must never make `doctor` permanently red. This mirrors `run_check`,
-//! which exits non-zero only on `has_drift()`, not on clean-but-present outputs.
+//! unsupported-pattern WARNs) are INFORMATIONAL, while error-severity diagnostics are actionable.
+//! This prevents a partially extracted contract from being reported healthy.
 
 // User-facing prose dense with proper nouns/acronyms (OpenAPI, PoC, `.gnr8/`, ...); backticking them
 // would hurt readability. Allow `doc_markdown` module-wide (skill ch.2.4; mirrors the scoped allow in
@@ -51,6 +50,8 @@ pub(crate) struct LifecycleHealth {
     /// Whether the user's `.gnr8/` pipeline RAN (compiled + emitted a bundle). False ⇒ a compile error
     /// in the pipeline, a missing toolchain it needs, or a missing `.gnr8/` — all actionable.
     pub(crate) pipeline_runs: bool,
+    /// Detailed child-process error when the pipeline did not run; absent after a successful run.
+    pub(crate) pipeline_error: Option<String>,
 }
 
 /// The stale/drifted/clean partition of the dry-run [`WritePlan`] (mirrors `run_check`'s partition).
@@ -81,7 +82,7 @@ pub(crate) struct DoctorDiagnostic {
     pub(crate) file: String,
     /// The 1-based source line.
     pub(crate) line: u32,
-    /// A short explanation of why this pattern is an expected PoC limitation.
+    /// A short explanation of why this pattern matters.
     pub(crate) why: String,
     /// A short suggestion for how to address (or live with) the pattern.
     pub(crate) fix: String,
@@ -93,7 +94,9 @@ pub(crate) struct DoctorDiagnostic {
 pub(crate) struct DoctorSummary {
     /// How many ACTIONABLE problems exist (the count `has_actionable_problem` is non-zero for).
     pub(crate) actionable_problems: usize,
-    /// How many INFORMATIONAL analysis diagnostics exist (expected PoC limitations).
+    /// How many error-severity extraction diagnostics exist.
+    pub(crate) error_diagnostics: usize,
+    /// How many INFORMATIONAL analysis diagnostics exist.
     pub(crate) informational_diagnostics: usize,
 }
 
@@ -179,7 +182,7 @@ pub(crate) struct DoctorReport {
     pub(crate) lifecycle: LifecycleHealth,
     /// The stale/drifted/clean output partition (empty when the pipeline did not run).
     pub(crate) outputs: OutputHealth,
-    /// The informational analysis diagnostics (the unsupported patterns the pipeline reported).
+    /// Analysis diagnostics; ERROR entries are actionable and WARN entries informational.
     pub(crate) diagnostics: Vec<DoctorDiagnostic>,
     /// Per generated SDK/OpenAPI target readiness checks.
     pub(crate) sdk_readiness: Vec<SdkReadiness>,
@@ -192,7 +195,7 @@ pub(crate) struct DoctorReport {
 }
 
 /// Map a structured analysis [`Diagnostic`] to a short (why, fix) explanation by matching the message
-/// kind (free-form map, float64 narrowing, untyped query param). Defaults to a generic explanation so
+/// kind (free-form map, untyped query param, unresolved handler). Defaults to a generic explanation so
 /// an unrecognized future diagnostic still renders sensibly. PURE string classification — no I/O.
 fn explain(message: &str) -> (String, String) {
     if message.contains("map[string]any") || message.contains("free-form map") {
@@ -202,10 +205,11 @@ fn explain(message: &str) -> (String, String) {
             "model the map as a typed struct if the keys/values are known, or accept the open shape"
                 .to_string(),
         )
-    } else if message.contains("narrowing") || message.contains("float64") {
+    } else if message.contains("unknown handler") || message.contains("unresolved handler") {
         (
-            "Go `float64` is narrowed in the generated SDK and loses precision".to_string(),
-            "keep the field as `float64` end-to-end, or accept the documented precision trade-off"
+            "the route was recognized but its handler body could not be analyzed, so its contract is incomplete"
+                .to_string(),
+            "make the handler declaration visible to the configured source scope before generating"
                 .to_string(),
         )
     } else if message.contains("query param") {
@@ -256,6 +260,7 @@ impl DoctorReport {
             source_toolchain: source_present,
             language: language.to_string(),
             pipeline_runs: pipeline_ran,
+            pipeline_error: None,
         };
 
         // Partition the dry-run plan exactly as `run_check` does (stale / drifted / clean). When the
@@ -272,7 +277,7 @@ impl DoctorReport {
             }
         }
 
-        // Enrich each informational analysis diagnostic with a short why/fix (D-02 — explain, not
+        // Enrich each analysis diagnostic with a short why/fix (D-02 — explain, not
         // re-analyze). `None` (pipeline did not run) yields an empty list, not an error.
         let diagnostics: Vec<DoctorDiagnostic> = diagnostics
             .unwrap_or_default()
@@ -302,15 +307,18 @@ impl DoctorReport {
             sdk_readiness: Vec::new(),
             summary: DoctorSummary {
                 actionable_problems: 0,
+                error_diagnostics: 0,
                 informational_diagnostics: 0,
             },
             runtime: DoctorRuntime::default(),
             timings_ms: DoctorTimings::default(),
         };
         let actionable = report.actionable_problem_count();
+        let error_diagnostics = report.error_diagnostic_count();
         report.summary = DoctorSummary {
             actionable_problems: actionable,
-            informational_diagnostics: report.diagnostics.len(),
+            error_diagnostics,
+            informational_diagnostics: report.diagnostics.len() - error_diagnostics,
         };
         report.healthy = !report.has_actionable_problem();
         report
@@ -322,6 +330,15 @@ impl DoctorReport {
         self.sdk_readiness = sdk_readiness;
         let actionable = self.actionable_problem_count();
         self.summary.actionable_problems = actionable;
+        self.healthy = !self.has_actionable_problem();
+        self
+    }
+
+    /// Attach the exact pipeline child error retained by the impure doctor shell.
+    #[must_use]
+    pub(crate) fn with_pipeline_error(mut self, pipeline_error: Option<String>) -> Self {
+        self.lifecycle.pipeline_error = pipeline_error;
+        self.summary.actionable_problems = self.actionable_problem_count();
         self.healthy = !self.has_actionable_problem();
         self
     }
@@ -339,8 +356,7 @@ impl DoctorReport {
     }
 
     /// The number of ACTIONABLE problems (each contributing lifecycle/staleness issue counts once;
-    /// every stale and every drifted output counts individually). Analysis diagnostics are EXCLUDED
-    /// (Pitfall 1).
+    /// every stale/drifted output and error-severity diagnostic counts individually).
     fn actionable_problem_count(&self) -> usize {
         let mut count = 0;
         if !self.lifecycle.initialized {
@@ -349,11 +365,12 @@ impl DoctorReport {
         if !self.lifecycle.source_toolchain {
             count += 1;
         }
-        if !self.lifecycle.pipeline_runs {
+        if !self.lifecycle.pipeline_runs || self.lifecycle.pipeline_error.is_some() {
             count += 1;
         }
         count += self.outputs.stale.len();
         count += self.outputs.drifted.len();
+        count += self.error_diagnostic_count();
         count += self
             .sdk_readiness
             .iter()
@@ -362,17 +379,24 @@ impl DoctorReport {
         count
     }
 
+    fn error_diagnostic_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("ERROR"))
+            .count()
+    }
+
     /// Whether `doctor` should exit non-zero: `true` iff an ACTIONABLE lifecycle/staleness problem
-    /// exists. The informational analysis `diagnostics` are EXCLUDED so the expected unsupported-pattern
-    /// WARNs never make `doctor` permanently red (Pitfall 1 / the exit-code contract in RESEARCH).
-    /// Mirrors `run_check`'s `has_drift()`-only exit policy.
+    /// exists. Informational WARN diagnostics are excluded; ERROR diagnostics make doctor red.
     #[must_use]
     pub(crate) fn has_actionable_problem(&self) -> bool {
         !self.lifecycle.initialized
             || !self.lifecycle.source_toolchain
             || !self.lifecycle.pipeline_runs
+            || self.lifecycle.pipeline_error.is_some()
             || !self.outputs.stale.is_empty()
             || !self.outputs.drifted.is_empty()
+            || self.error_diagnostic_count() != 0
             || self
                 .sdk_readiness
                 .iter()
@@ -411,6 +435,9 @@ impl DoctorReport {
                 "FAILED — `gnr8 generate` for the compile/run error"
             )
         );
+        if let Some(error) = &self.lifecycle.pipeline_error {
+            let _ = writeln!(out, "  pipeline error:      {error}");
+        }
 
         // OUTPUTS group — the stale/drifted/clean partition.
         let _ = writeln!(
@@ -441,12 +468,11 @@ impl DoctorReport {
 
         render_sdk_readiness(&mut out, &self.sdk_readiness);
 
-        // DIAGNOSTICS group — explicitly labeled informational so the expected PoC WARNs are not
-        // mistaken for failures.
+        // DIAGNOSTICS group — ERROR entries are actionable; WARN entries are informational.
         let _ = writeln!(
             out,
-            "\nDIAGNOSTICS ({} informational — expected PoC limitations)",
-            self.diagnostics.len()
+            "\nDIAGNOSTICS ({} error, {} informational)",
+            self.summary.error_diagnostics, self.summary.informational_diagnostics
         );
         if self.diagnostics.is_empty() {
             let _ = writeln!(out, "  (none)");
@@ -538,6 +564,20 @@ mod tests {
         )
     }
 
+    fn error_diag(message: &str) -> Diagnostic {
+        Diagnostic::new(
+            "source.test",
+            DiagnosticCategory::Source,
+            "ERROR",
+            message,
+            SourceSpan {
+                file: "internal/goal/ports/http.go".to_string(),
+                start_line: 41,
+                end_line: 41,
+            },
+        )
+    }
+
     /// A WritePlan whose every file has the given action (a one-file plan is enough to exercise the
     /// partition + exit policy).
     fn plan_with(action: WriteAction) -> WritePlan {
@@ -581,6 +621,26 @@ mod tests {
         assert!(report.healthy, "healthy must be the inverse of actionable");
         assert_eq!(report.summary.actionable_problems, 0);
         assert_eq!(report.summary.informational_diagnostics, 3);
+    }
+
+    #[test]
+    fn error_diagnostics_are_actionable() {
+        let report = DoctorReport::assemble(
+            true,
+            true,
+            "go",
+            true,
+            Some(vec![error_diag(
+                "unknown handler 'createGoal': route extraction is incomplete",
+            )]),
+            Some(&clean_plan()),
+        );
+
+        assert!(report.has_actionable_problem());
+        assert!(!report.healthy);
+        assert_eq!(report.summary.actionable_problems, 1);
+        assert_eq!(report.summary.informational_diagnostics, 0);
+        assert!(report.render_human().contains("1 error"));
     }
 
     /// Exit-policy: `.gnr8/` missing (initialized=false) is actionable.
@@ -640,6 +700,20 @@ mod tests {
             text.contains("drift: UNKNOWN"),
             "a failed pipeline must render a distinct drift-unknown finding:\n{text}"
         );
+    }
+
+    #[test]
+    fn pipeline_failure_retains_the_child_error() {
+        let report = DoctorReport::assemble(true, true, "go", false, None, None)
+            .with_pipeline_error(Some("cargo run failed: unresolved import".to_string()));
+
+        assert_eq!(
+            report.lifecycle.pipeline_error.as_deref(),
+            Some("cargo run failed: unresolved import")
+        );
+        assert!(report
+            .render_human()
+            .contains("cargo run failed: unresolved import"));
     }
 
     /// Exit-policy: any stale (`Write`) output is actionable; all-Unchanged is clean.
@@ -730,6 +804,7 @@ mod tests {
             "source_toolchain",
             "language",
             "pipeline_runs",
+            "pipeline_error",
         ]
         .into_iter()
         .collect();

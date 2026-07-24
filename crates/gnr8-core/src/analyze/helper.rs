@@ -25,8 +25,8 @@ use crate::CoreError;
 /// The directory of the `goextract` Go module, resolved relative to this crate's
 /// manifest dir (single source of truth for the path). Mirrors how the contract
 /// tests resolve `FIXTURE_DIR` (see `crates/gnr8-core/tests/snapshot_graph.rs`).
-pub(crate) fn goextract_dir() -> PathBuf {
-    sidecar_root().join("goextract")
+pub(crate) fn goextract_dir() -> Result<PathBuf, CoreError> {
+    Ok(sidecar_root()?.join("goextract"))
 }
 
 /// The repo root that HOLDS the `pyextract/` Python package, resolved relative to this crate's
@@ -34,7 +34,7 @@ pub(crate) fn goextract_dir() -> PathBuf {
 /// the subprocess runs from the dir that CONTAINS `pyextract/` (the repo root), not from inside it —
 /// this is the deliberate analog of [`goextract_dir`] one level up. Carries the v1 compile-time-path
 /// debt forward without deepening it (CONTEXT decision; RESEARCH A6).
-pub(crate) fn pyextract_dir() -> PathBuf {
+pub(crate) fn pyextract_dir() -> Result<PathBuf, CoreError> {
     sidecar_root()
 }
 
@@ -44,13 +44,12 @@ pub(crate) fn pyextract_dir() -> PathBuf {
 /// goextract analog one level down (`<root>/tsextract`), NOT the repo root used by [`pyextract_dir`]
 /// (which runs `python3 -m pyextract`). Carries the v1 compile-time-path debt forward without
 /// deepening it (CONTEXT decision; RESEARCH A6).
-pub(crate) fn tsextract_dir() -> PathBuf {
-    sidecar_root().join("tsextract")
+pub(crate) fn tsextract_dir() -> Result<PathBuf, CoreError> {
+    Ok(sidecar_root()?.join("tsextract"))
 }
 
-fn sidecar_root() -> PathBuf {
+fn sidecar_root() -> Result<PathBuf, CoreError> {
     crate::resource::resource_dir()
-        .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")))
 }
 
 /// Resolve `target_dir` to a CANONICAL absolute path.
@@ -64,21 +63,22 @@ fn sidecar_root() -> PathBuf {
 ///    canonical too — otherwise a root like `<manifest>/../../fixtures/goalservice` (the contract
 ///    tests') would not prefix-match and the machine-absolute path would leak into the snapshot.
 ///
-/// Falls back to the lexical join (or the raw input) if canonicalization fails — e.g. a non-existent
-/// target, which the helper then reports as a typed error rather than this function panicking
-/// (RUST-04). Canonicalizing a path that exists is the common case (the fixture + any real target).
-pub(crate) fn resolve_target(target_dir: &str) -> String {
+/// A missing or unreadable target is rejected here with the original path in the diagnostic. It is
+/// never reinterpreted relative to a helper working directory.
+pub(crate) fn resolve_target(target_dir: &str) -> Result<String, CoreError> {
     let path = std::path::Path::new(target_dir);
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical.to_string_lossy().into_owned();
+    let canonical = std::fs::canonicalize(path).map_err(|source| CoreError::Config {
+        message: format!(
+            "target directory '{}' is missing or unreadable: {source}",
+            path.display()
+        ),
+    })?;
+    if !canonical.is_dir() {
+        return Err(CoreError::Config {
+            message: format!("target directory '{}' is not a directory", path.display()),
+        });
     }
-    if path.is_absolute() {
-        return target_dir.to_string();
-    }
-    match std::env::current_dir() {
-        Ok(cwd) => cwd.join(path).to_string_lossy().into_owned(),
-        Err(_) => target_dir.to_string(),
-    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 /// Run the `goextract` helper against `target_dir` and return the parsed facts.
@@ -118,7 +118,7 @@ fn run_goextract_with(
         cmd.args(["run", "."]);
         cmd
     };
-    let dir = checked_sidecar_dir("goextract", goextract_dir())?;
+    let dir = checked_sidecar_dir("goextract", goextract_dir()?)?;
     cmd.arg(target_dir);
     if route_patterns == schema_patterns {
         cmd.args(route_patterns);
@@ -149,8 +149,8 @@ fn run_goextract_with(
 }
 
 fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
-    let root = checked_sidecar_dir("goextract", goextract_dir())?;
-    let source_hash = goextract_source_hash(&root);
+    let root = checked_sidecar_dir("goextract", goextract_dir()?)?;
+    let source_hash = goextract_source_hash(&root)?;
     let dir = std::env::temp_dir()
         .join("gnr8-goextract")
         .join(source_hash);
@@ -198,28 +198,50 @@ fn checked_sidecar_dir(label: &str, path: PathBuf) -> Result<PathBuf, CoreError>
     })
 }
 
-fn goextract_source_hash(root: &std::path::Path) -> String {
+pub(crate) fn goextract_source_hash(root: &std::path::Path) -> Result<String, CoreError> {
     let mut files = Vec::new();
-    collect_goextract_source_files(root, &mut files);
+    collect_goextract_source_files(root, &mut files)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-goextract-binary-cache-v1\n");
     for path in files {
-        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel = path.strip_prefix(root).map_err(|source| CoreError::Io {
+            message: format!(
+                "goextract source {} is outside declared helper root {}: {source}",
+                path.display(),
+                root.display()
+            ),
+        })?;
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        if let Ok(bytes) = std::fs::read(path) {
-            hasher.update(blake3_hex(&bytes).as_bytes());
-        }
+        let bytes = std::fs::read(&path).map_err(|source| CoreError::Io {
+            message: format!(
+                "failed to read goextract source {} for helper cache key: {source}",
+                path.display()
+            ),
+        })?;
+        hasher.update(blake3_hex(&bytes).as_bytes());
         hasher.update(b"\0");
     }
-    hasher.finalize().to_hex().to_string()
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn collect_goextract_source_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn collect_goextract_source_files(
+    dir: &std::path::Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), CoreError> {
+    let entries = std::fs::read_dir(dir).map_err(|source| CoreError::Io {
+        message: format!(
+            "failed to read declared goextract source directory {}: {source}",
+            dir.display()
+        ),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CoreError::Io {
+            message: format!(
+                "failed to enumerate declared goextract source directory {}: {source}",
+                dir.display()
+            ),
+        })?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -228,7 +250,7 @@ fn collect_goextract_source_files(dir: &std::path::Path, out: &mut Vec<PathBuf>)
             if matches!(name, ".git" | "target" | "vendor") {
                 continue;
             }
-            collect_goextract_source_files(&path, out);
+            collect_goextract_source_files(&path, out)?;
             continue;
         }
         if name == "go.mod"
@@ -239,6 +261,7 @@ fn collect_goextract_source_files(dir: &std::path::Path, out: &mut Vec<PathBuf>)
         }
     }
     out.sort();
+    Ok(())
 }
 
 /// Run the `pyextract` Python helper against `target_dir` and return the parsed facts.
@@ -261,11 +284,12 @@ pub(crate) fn run_pyextract(target_dir: &str) -> Result<facts::GoFacts, CoreErro
 /// Inner driver parameterized on the Python binary name so tests can force a missing binary
 /// (toolchain-missing path) without mutating the process `PATH` — mirrors [`run_goextract_with`].
 fn run_pyextract_with(py_bin: &str, target_dir: &str) -> Result<facts::GoFacts, CoreError> {
+    let dir = checked_sidecar_dir("pyextract", pyextract_dir()?)?;
     let output = Command::new(py_bin)
         // `-m`, `pyextract`, and the target dir are DISCRETE args (no shell, no interpolation of
         // `target_dir` into a single string) — threat T-02-01-py, mirroring the goextract control.
         .args(["-m", "pyextract", target_dir])
-        .current_dir(pyextract_dir())
+        .current_dir(dir)
         .output()
         .map_err(|source| CoreError::PythonToolchainMissing { source })?;
 
@@ -302,11 +326,12 @@ pub(crate) fn run_tsextract(target_dir: &str) -> Result<facts::GoFacts, CoreErro
 /// Inner driver parameterized on the Node binary name so tests can force a missing binary
 /// (toolchain-missing path) without mutating the process `PATH` — mirrors [`run_pyextract_with`].
 fn run_tsextract_with(node_bin: &str, target_dir: &str) -> Result<facts::GoFacts, CoreError> {
+    let dir = checked_sidecar_dir("tsextract", tsextract_dir()?)?;
     let output = Command::new(node_bin)
         // `index.js` and the target dir are DISCRETE args (no shell, no interpolation of
         // `target_dir` into a single string) — threat T-04-01, mirroring the goextract control.
         .args(["index.js", target_dir])
-        .current_dir(tsextract_dir())
+        .current_dir(dir)
         .output()
         .map_err(|source| CoreError::TypeScriptToolchainMissing { source })?;
 
@@ -333,12 +358,13 @@ fn run_tsextract_with(node_bin: &str, target_dir: &str) -> Result<facts::GoFacts
 /// rather than passing doctor and failing at `generate`. A spawn error (no `node`) or a non-zero exit
 /// (typescript absent) both mean "not ready" → `false`; never a panic (the doctor renders it as a
 /// finding). Spawned with DISCRETE args from `tsextract_dir`, never `sh -c` (T-06-01).
-pub(crate) fn typescript_toolchain_present(target_dir: &str) -> bool {
-    Command::new("node")
+pub(crate) fn typescript_toolchain_present(target_dir: &str) -> Result<bool, CoreError> {
+    let dir = checked_sidecar_dir("tsextract", tsextract_dir()?)?;
+    Ok(Command::new("node")
         .args(["probe.js", target_dir])
-        .current_dir(tsextract_dir())
+        .current_dir(dir)
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success()))
 }
 
 #[cfg(test)]
@@ -348,17 +374,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        goextract_dir, pyextract_dir, run_goextract_with, run_pyextract_with, run_tsextract_with,
-        tsextract_dir, typescript_toolchain_present,
+        goextract_dir, pyextract_dir, resolve_target, run_goextract_with, run_pyextract_with,
+        run_tsextract_with, tsextract_dir, typescript_toolchain_present,
     };
     use crate::CoreError;
+
+    #[test]
+    fn missing_target_is_an_explicit_error() {
+        let missing =
+            std::env::temp_dir().join(format!("gnr8-missing-target-{}", std::process::id()));
+        let error = resolve_target(&missing.to_string_lossy()).unwrap_err();
+        assert!(
+            error.to_string().contains("target directory"),
+            "unexpected diagnostic: {error}"
+        );
+    }
 
     mod goextract_dir {
         use super::goextract_dir;
 
         #[test]
         fn resolves_a_path_ending_in_goextract() {
-            let dir = goextract_dir();
+            let dir = goextract_dir().unwrap();
             assert!(
                 dir.ends_with("goextract"),
                 "expected the resolved dir to end in 'goextract', got {dir:?}"
@@ -375,9 +412,9 @@ mod tests {
             // `python3 -m pyextract`). It is exactly the parent of `goextract_dir` (which points
             // one level deeper, at `<root>/goextract`). Canonicalize both so the `/../..` lexical
             // segments resolve, then assert the parent relationship holds.
-            let py_root = std::fs::canonicalize(pyextract_dir())
+            let py_root = std::fs::canonicalize(pyextract_dir().unwrap())
                 .expect("pyextract_dir should resolve to an existing repo root");
-            let go_dir = std::fs::canonicalize(goextract_dir())
+            let go_dir = std::fs::canonicalize(goextract_dir().unwrap())
                 .expect("goextract_dir should resolve to an existing dir");
             assert_eq!(
                 go_dir.parent(),
@@ -401,14 +438,14 @@ mod tests {
             // `tsextract_dir` points one level down at `<root>/tsextract` (the dir holding
             // `index.js` + `node_modules`), exactly like `goextract_dir` points at `<root>/goextract`
             // — they are siblings. Compare lexically (the dir need not exist yet for this assertion).
-            let ts_dir = tsextract_dir();
+            let ts_dir = tsextract_dir().unwrap();
             assert!(
                 ts_dir.ends_with("tsextract"),
                 "expected the resolved dir to end in 'tsextract', got {ts_dir:?}"
             );
             assert_eq!(
                 ts_dir.parent(),
-                goextract_dir().parent(),
+                goextract_dir().unwrap().parent(),
                 "tsextract_dir and goextract_dir must be siblings under the repo root"
             );
         }
@@ -444,6 +481,7 @@ mod tests {
         #[test]
         fn reports_present_when_typescript_resolves_from_the_sidecar() {
             if !tsextract_dir()
+                .unwrap()
                 .join("node_modules")
                 .join("typescript")
                 .is_dir()
@@ -458,7 +496,7 @@ mod tests {
                 "/../../fixtures/nestjs-bookstore"
             );
             assert!(
-                typescript_toolchain_present(nestjs),
+                typescript_toolchain_present(nestjs).unwrap(),
                 "with the sidecar's dev typescript installed, the TS toolchain probe must report present"
             );
         }
@@ -482,7 +520,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             // Just assert it returns without panic; the value depends on whether the sidecar has the
             // dev typescript installed (resolvable) or not (absent) — both are valid environments.
-            let _present: bool = typescript_toolchain_present(&dir.to_string_lossy());
+            let _present: bool = typescript_toolchain_present(&dir.to_string_lossy()).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

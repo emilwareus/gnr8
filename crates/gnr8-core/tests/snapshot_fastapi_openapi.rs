@@ -38,7 +38,7 @@ fn openapi_matches_expected_for_fastapi() {
     // committed .snap locks (byte-identical against the reconciled fixture).
     let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
-    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "/books", &fixture_security())
+    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
         .expect("lower::to_openapi must succeed");
     insta::assert_snapshot!("fastapi_openapi", openapi);
 }

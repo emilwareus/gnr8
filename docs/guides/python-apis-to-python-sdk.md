@@ -42,7 +42,7 @@ For Flask, change the source line:
 ## Agent Checklist
 
 - FastAPI extraction is static. Do not rely on importing or running the app during generation.
-- Prefer typed parameters, Pydantic models, dataclasses, `response_model`, `status_code`, `Literal`,
+- Prefer typed parameters, Pydantic models, dataclasses, typed returns or `response_model`, `status_code`, `Literal`,
   `Enum`, and explicit unions.
 - For Flask, avoid untyped `request.json` and unannotated query reads. Add typed envelopes when
   diagnostics say gnr8 cannot infer a request or response shape.

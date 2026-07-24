@@ -20,8 +20,8 @@ type GoalAnalyticsQuery struct {
 //   - Name             required string with a description tag
 //   - Description       plain string
 //   - AnalyticsQuery    nested struct ($ref), required
-//   - TargetValue       *float64 + omitempty -> optional, AND the float64->float32
-//     precision-loss diagnostic trigger (TARGET-API.md §5.2)
+//   - TargetValue       *float64 + omitempty -> optional and nullable with
+//     floating-point width preserved end-to-end
 //   - TargetDirection   *TargetDirection -> optional enum
 //   - WorkflowChainIDs  []uuid.UUID -> array of a well-known type; note the json
 //     name (workflowChainIds) differs from the Go field name (WorkflowChainIDs)

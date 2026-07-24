@@ -56,8 +56,9 @@ the types.
 
 ## The config is code: `.gnr8/src/main.rs`
 
-There is no `config.toml`. The base path, title, and output paths are all method
-calls in a small Rust `Pipeline` that gnr8 compiles + runs:
+There is no `config.toml`. The external mount path, title, and output paths are
+method calls in a small Rust `Pipeline` that gnr8 compiles + runs; framework route
+prefixes come from static source:
 
 ```rust
 use gnr8::sdk::prelude::*;
@@ -66,7 +67,6 @@ fn main() -> std::process::ExitCode {
     gnr8::runner::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))             // analyze the src/ tree
-            .transform(SetBasePath::new("/books"))             // mount path (the @Controller prefix)
             .transform(SetTitle::new("Bookstore API"))         // OpenAPI info.title
             .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(TsSdk::new().module("example.com/bookstore/sdk").to("generated/sdk"))
@@ -120,9 +120,9 @@ with a method per operation and typed interfaces that mirror the schemas.
 - **Code-defined `BookFormat` enum + `BookOrError` union.** gnr8 reads the
   string-literal-union enum and the `A | B` union straight from the types and
   emits an OpenAPI string enum and a `oneOf`.
-- **Base path from config (code).** The `@Controller('books')` prefix is a base
-  path declared in code via `SetBasePath::new("/books")` (rule 1: never folded
-  into the code-derived operation path), joined to every path in spec + SDK.
+- **Controller prefix from source.** The static `@Controller('books')` value is
+  composed into every operation path. `SetBasePath` remains available for a
+  distinct service-wide external mount.
 - **Static, never executed, no `node_modules`.** tsextract reads source types via
   the Compiler API; the app is never imported or run.
 - **No TOML.** `.gnr8/src/main.rs` is the entire configuration surface — built-in

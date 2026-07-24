@@ -42,7 +42,7 @@ def run(target_dir):
     # only on a tree with FastAPI()/APIRouter() bindings, the Flask recognizer only on
     # Flask()/Blueprint() bindings. A tree of one shape yields an empty list from the
     # other — detection by source shape, NOT a try-A-then-fall-back-to-B path (rule 3).
-    routes = routes_mod.recognize_fastapi(modules, symtab, diags)
+    routes = routes_mod.recognize_fastapi(modules, symtab, diags, schemas)
     routes += routes_mod.recognize_flask(modules, symtab, diags)
 
     doc = facts.build_doc(module, routes, schemas, diags.items())

@@ -13,9 +13,7 @@ Start here when using gnr8 from an AI coding agent:
 - [Transforms](docs/pipeline/transforms.md): selectors, overrides, security, runtime, pagination, docs.
 - [Sources](docs/extraction/sources.md): Go/Gin, FastAPI, Flask, NestJS, and OpenAPI extraction.
 - [OpenAPI](docs/openapi/generation.md): generation, metadata, aliases, and patches.
-- [OpenAPI Compatibility](docs/openapi/compatibility.md): exact semantic comparison.
 - [SDK Generation](docs/sdk/generation.md): Go, Python, and TypeScript targets/profiles/layouts.
-- [SDK Compatibility](docs/sdk/compatibility.md): public-surface comparisons and contracts.
 - [Diagnostics](docs/diagnostics/reference.md): stable codes, categories, gates, and remediation.
 - [Artifacts and CI](docs/operations/artifacts-and-ci.md): ownership, caches, Action, and write safety.
 - [Public API Map](docs/reference/public-api.md): all SDK prelude symbols.

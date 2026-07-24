@@ -50,10 +50,12 @@ fi
 
 cp README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml "$stage/share/gnr8/"
 cp -R crates/gnr8-core "$stage/share/gnr8/crates/"
+cp -R crates/gnr8 "$stage/share/gnr8/crates/"
 cp -R goextract pyextract tsextract "$stage/share/gnr8/"
 
 rm -rf \
   "$stage/share/gnr8/crates/gnr8-core/target" \
+  "$stage/share/gnr8/crates/gnr8/target" \
   "$stage/share/gnr8/tsextract/node_modules" \
   "$stage/share/gnr8/pyextract/__pycache__"
 find "$stage/share/gnr8" -name '__pycache__' -type d -prune -exec rm -rf {} +

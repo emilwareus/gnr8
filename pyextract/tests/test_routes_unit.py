@@ -243,6 +243,15 @@ class FastAPIDiagnosticCompletenessTests(unittest.TestCase):
         self.assertIsNone(recognized[0]["responses"][0]["body"])
         self.assertEqual(diagnostics, [])
 
+    def test_none_return_annotation_is_intentionally_bodyless(self):
+        recognized, diagnostics = self._recognize(
+            "@app.get('/health')\n"
+            "def health() -> None:\n"
+            "    pass\n"
+        )
+        self.assertIsNone(recognized[0]["responses"][0]["body"])
+        self.assertEqual(diagnostics, [])
+
 
 class FastAPIBodylessMethodTests(unittest.TestCase):
     """A FastAPI model-typed handler param is a request body only on a body-bearing
@@ -284,6 +293,188 @@ class FastAPIBodylessMethodTests(unittest.TestCase):
         self.assertIsNone(body)
         self.assertEqual(diagnostics[0]["code"], "request.body.unresolved")
         self.assertEqual(diagnostics[0]["operation"], "DELETE /")
+
+
+class StaticPrefixCompositionTests(unittest.TestCase):
+    def _recognize_fastapi(self, source):
+        module = _FakeModule("app.main", source)
+        diags = Diagnostics()
+        found = routes.recognize_fastapi([module], SymbolTable([module]), diags)
+        return found, diags
+
+    def _recognize_flask(self, source):
+        module = _FakeModule("app.routes", source)
+        diags = Diagnostics()
+        found = routes.recognize_flask([module], SymbolTable([module]), diags)
+        return found, diags
+
+    def test_fastapi_constructor_and_include_prefixes_compose(self):
+        found, diags = self._recognize_fastapi(
+            "app = FastAPI()\n"
+            "router = APIRouter(prefix='/books')\n"
+            "app.include_router(router, prefix='/v1')\n"
+            "@router.get('/', response_model=None)\n"
+            "def list_books():\n"
+            "    pass\n"
+        )
+        self.assertEqual(found[0]["path"], "/v1/books/")
+        self.assertEqual(diags.items(), [])
+
+    def test_multiple_fastapi_routers_keep_distinct_prefixes(self):
+        found, diags = self._recognize_fastapi(
+            "books = APIRouter(prefix='/books')\n"
+            "users = APIRouter(prefix='/users')\n"
+            "@books.get('/{item_id}', response_model=None)\n"
+            "def get_book(item_id: str):\n"
+            "    pass\n"
+            "@users.get('/{item_id}', response_model=None)\n"
+            "def get_user(item_id: str):\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            {route["operation_id"]: route["path"] for route in found},
+            {"get_book": "/books/{item_id}", "get_user": "/users/{item_id}"},
+        )
+        self.assertEqual(diags.items(), [])
+
+    def test_flask_constructor_and_registration_prefixes_compose(self):
+        found, diags = self._recognize_flask(
+            "app = Flask(__name__)\n"
+            "bp = Blueprint('books', __name__, url_prefix='/books')\n"
+            "app.register_blueprint(bp, url_prefix='/v1')\n"
+            "@bp.route('/')\n"
+            "def list_books():\n"
+            "    pass\n"
+        )
+        self.assertEqual(found[0]["path"], "/v1/books/")
+        self.assertEqual(len(diags.items()), 1)  # untyped response only
+
+    def test_dynamic_fastapi_prefix_is_diagnosed_and_omitted(self):
+        found, diags = self._recognize_fastapi(
+            "PREFIX = '/books'\n"
+            "router = APIRouter(prefix=PREFIX)\n"
+            "@router.get('/')\n"
+            "def list_books():\n"
+            "    pass\n"
+        )
+        self.assertEqual(found, [])
+        self.assertTrue(any("dynamic prefix=" in d["message"] for d in diags.items()))
+
+    def test_cross_module_fastapi_include_prefix_composes(self):
+        modules = [
+            _FakeModule(
+                "app.main",
+                "from app.books import router\n"
+                "app = FastAPI()\n"
+                "app.include_router(router, prefix='/v1')\n",
+            ),
+            _FakeModule(
+                "app.books",
+                "router = APIRouter(prefix='/books')\n"
+                "@router.get('/')\n"
+                "def list_books():\n"
+                "    pass\n",
+            ),
+        ]
+        diags = Diagnostics()
+        found = routes.recognize_fastapi(modules, SymbolTable(modules), diags)
+        self.assertEqual(found[0]["path"], "/v1/books/")
+
+    def test_cross_module_flask_registration_prefix_composes(self):
+        modules = [
+            _FakeModule(
+                "app.main",
+                "from app.books import bp\n"
+                "app = Flask(__name__)\n"
+                "app.register_blueprint(bp, url_prefix='/v1')\n",
+            ),
+            _FakeModule(
+                "app.books",
+                "bp = Blueprint('books', __name__, url_prefix='/books')\n"
+                "@bp.route('/')\n"
+                "def list_books():\n"
+                "    pass\n",
+            ),
+        ]
+        diags = Diagnostics()
+        found = routes.recognize_flask(modules, SymbolTable(modules), diags)
+        self.assertEqual(found[0]["path"], "/v1/books/")
+
+
+class FastAPIResponseAndDependencyTests(unittest.TestCase):
+    MODEL_SOURCE = "class Book(BaseModel):\n    title: str\n"
+
+    def _recognize(self, handler_source):
+        modules = [
+            _FakeModule("app.main", "app = FastAPI()\n" + handler_source),
+            _FakeModule("app.models", self.MODEL_SOURCE),
+        ]
+        diags = Diagnostics()
+        synthetic = []
+        found = routes.recognize_fastapi(
+            modules, SymbolTable(modules), diags, synthetic
+        )
+        return found, synthetic, diags
+
+    def test_async_return_annotation_supplies_response_model(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/book')\n"
+            "async def get_book() -> Book:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            found[0]["responses"][0]["body"], {"ref_id": "app.models.Book"}
+        )
+        self.assertEqual(synthetic, [])
+
+    def test_list_return_annotation_synthesizes_array_response_schema(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/books')\n"
+            "async def list_books() -> list[Book]:\n"
+            "    pass\n"
+        )
+        response_ref = found[0]["responses"][0]["body"]["ref_id"]
+        self.assertEqual(len(synthetic), 1)
+        self.assertEqual(synthetic[0]["id"], response_ref)
+        self.assertEqual(
+            synthetic[0]["body"],
+            {"type": "array", "of": {"type": "named", "of": "app.models.Book"}},
+        )
+
+    def test_list_response_model_synthesizes_array_response_schema(self):
+        found, synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.get('/books', response_model=list[Book])\n"
+            "async def list_books():\n"
+            "    pass\n"
+        )
+        self.assertEqual(len(synthetic), 1)
+        self.assertEqual(
+            found[0]["responses"][0]["body"], {"ref_id": synthetic[0]["id"]}
+        )
+        self.assertEqual(synthetic[0]["body"]["type"], "array")
+
+    def test_depends_default_is_not_a_request_body_or_query_param(self):
+        found, _synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.post('/books')\n"
+            "async def create_book(service: Book = Depends()):\n"
+            "    pass\n"
+        )
+        self.assertIsNone(found[0]["request_body"])
+        self.assertEqual(found[0]["params"], [])
+
+    def test_annotated_depends_is_not_a_request_body_or_query_param(self):
+        found, _synthetic, _diags = self._recognize(
+            "from app.models import Book\n"
+            "@app.post('/books')\n"
+            "async def create_book(service: Annotated[Book, Depends()]):\n"
+            "    pass\n"
+        )
+        self.assertIsNone(found[0]["request_body"])
+        self.assertEqual(found[0]["params"], [])
 
 
 if __name__ == "__main__":

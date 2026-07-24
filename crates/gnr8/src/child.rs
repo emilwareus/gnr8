@@ -119,7 +119,7 @@ fn run_child_stdout(project_root: &Path, subcommand: &str) -> Result<(String, Ve
     }
 
     let invocation = child_invocation(project_root, &manifest, subcommand);
-    let output = invocation.command().output().map_err(|err| {
+    let output = invocation.command()?.output().map_err(|err| {
         let cargo = cargo_binary();
         CoreError::ChildRun {
             message: format!(
@@ -216,7 +216,7 @@ enum ChildInvocation {
 }
 
 impl ChildInvocation {
-    fn command(&self) -> Command {
+    fn command(&self) -> Result<Command, CoreError> {
         let mut command = match self {
             Self::Direct {
                 binary,
@@ -245,20 +245,9 @@ impl ChildInvocation {
                 command
             }
         };
-        if let Some(resource_dir) = gnr8::resource::resource_dir() {
-            command.env(gnr8::resource::GNR8_RESOURCE_DIR_ENV, resource_dir);
-        }
-        command
-            .env(
-                gnr8::runner::HOST_PROTOCOL_ENV,
-                gnr8::runner::PROTOCOL_VERSION.to_string(),
-            )
-            .env(gnr8::runner::HOST_VERSION_ENV, env!("CARGO_PKG_VERSION"))
-            .env(
-                gnr8::runner::HOST_CAPABILITY_ENV,
-                gnr8::runner::capability_fingerprint(),
-            );
-        command
+        let resource_dir = gnr8::resource::resource_dir()?;
+        configure_child_environment(&mut command, &resource_dir);
+        Ok(command)
     }
 
     fn description(&self, fallback_cargo: &str) -> String {
@@ -280,6 +269,20 @@ impl ChildInvocation {
             ),
         }
     }
+}
+
+fn configure_child_environment(command: &mut Command, resource_dir: &Path) {
+    command
+        .env(gnr8::resource::GNR8_RESOURCE_DIR_ENV, resource_dir)
+        .env(
+            gnr8::runner::HOST_PROTOCOL_ENV,
+            gnr8::runner::PROTOCOL_VERSION.to_string(),
+        )
+        .env(gnr8::runner::HOST_VERSION_ENV, env!("CARGO_PKG_VERSION"))
+        .env(
+            gnr8::runner::HOST_CAPABILITY_ENV,
+            gnr8::runner::capability_fingerprint(),
+        );
 }
 
 fn child_invocation(project_root: &Path, manifest: &Path, subcommand: &str) -> ChildInvocation {
@@ -378,7 +381,16 @@ fn describe_status(status: std::process::ExitStatus) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::package_name;
+    use super::{configure_child_environment, package_name};
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    fn env_value<'a>(command: &'a Command, key: &str) -> Option<&'a OsStr> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(key))
+            .and_then(|(_, value)| value)
+    }
 
     fn temp_manifest(body: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -406,5 +418,24 @@ version = "0.1.0"
         );
 
         assert_eq!(package_name(&manifest), Some("quoted-child".to_string()));
+    }
+
+    #[test]
+    fn child_environment_includes_complete_compatibility_handshake() {
+        let mut command = Command::new("child");
+        configure_child_environment(&mut command, std::path::Path::new("/resources"));
+
+        assert_eq!(
+            env_value(&command, gnr8::runner::HOST_PROTOCOL_ENV),
+            Some(OsStr::new(&gnr8::runner::PROTOCOL_VERSION.to_string()))
+        );
+        assert_eq!(
+            env_value(&command, gnr8::runner::HOST_VERSION_ENV),
+            Some(OsStr::new(env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(
+            env_value(&command, gnr8::runner::HOST_CAPABILITY_ENV),
+            Some(OsStr::new(&gnr8::runner::capability_fingerprint()))
+        );
     }
 }

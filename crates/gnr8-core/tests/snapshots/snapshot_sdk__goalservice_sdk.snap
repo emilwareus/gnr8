@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_sdk.rs
-assertion_line: 27
 expression: sdk
 ---
 // ==== gnr8:file client.go ====
@@ -373,7 +372,7 @@ type CreateGoalInput struct {
 	Description      string             `json:"description"`
 	Name             string             `json:"name"`
 	TargetDirection  *TargetDirection   `json:"targetDirection,omitempty"`
-	TargetValue      *float32           `json:"targetValue,omitempty"`
+	TargetValue      *float64           `json:"targetValue,omitempty"`
 	WorkflowChainIDs []string           `json:"workflowChainIds,omitempty"`
 }
 
@@ -390,7 +389,7 @@ type GoalResponse struct {
 	Metadata        any                `json:"metadata,omitempty"`
 	Name            string             `json:"name"`
 	TargetDirection *TargetDirection   `json:"targetDirection,omitempty"`
-	TargetValue     *float32           `json:"targetValue,omitempty"`
+	TargetValue     *float64           `json:"targetValue,omitempty"`
 	UUID            string             `json:"uuid"`
 }
 
@@ -402,7 +401,7 @@ type HttpError struct {
 
 type ListGoalsOutput struct {
 	Goals      []GoalResponse `json:"goals"`
-	NextCursor string         `json:"nextCursor,omitempty"`
+	NextCursor *string        `json:"nextCursor,omitempty"`
 	PageSize   int64          `json:"pageSize"`
 	Total      int64          `json:"total"`
 }
@@ -424,7 +423,7 @@ type UpdateGoalInput struct {
 	Description      string              `json:"description,omitempty"`
 	Name             string              `json:"name,omitempty"`
 	TargetDirection  *TargetDirection    `json:"targetDirection,omitempty"`
-	TargetValue      *float32            `json:"targetValue,omitempty"`
+	TargetValue      *float64            `json:"targetValue,omitempty"`
 	WorkflowChainIDs []string            `json:"workflowChainIds,omitempty"`
 }
 // ==== gnr8:file operations.go ====

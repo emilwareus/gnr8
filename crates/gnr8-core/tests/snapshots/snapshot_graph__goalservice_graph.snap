@@ -249,7 +249,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: workflowChainIds
@@ -377,7 +377,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: uuid
@@ -552,7 +552,7 @@ schemas:
             type: primitive
             of:
               prim: float
-              bits: 32
+              bits: 64
           description: ~
           example: ~
         - json_name: workflowChainIds
@@ -571,42 +571,6 @@ schemas:
       start_line: 39
       end_line: 39
 diagnostics:
-  - code: schema.numeric.narrowing
-    severity: WARN
-    category: schema
-    message: "float64 -> float32 narrowing: field CreateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 32
-    span:
-      file: internal/common/dto/goal.go
-      start_line: 32
-      end_line: 32
-    schema: CreateGoalInput
-    subject: TargetValue
-  - code: schema.numeric.narrowing
-    severity: WARN
-    category: schema
-    message: "float64 -> float32 narrowing: field UpdateGoalInput.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 43
-    span:
-      file: internal/common/dto/goal.go
-      start_line: 43
-      end_line: 43
-    schema: UpdateGoalInput
-    subject: TargetValue
-  - code: schema.numeric.narrowing
-    severity: WARN
-    category: schema
-    message: "float64 -> float32 narrowing: field GoalResponse.TargetValue (*float64) loses precision in the generated Go SDK; map to float64 or surface a compatibility diagnostic (TARGET-API.md §5.2)"
-    file: internal/common/dto/goal.go
-    line: 57
-    span:
-      file: internal/common/dto/goal.go
-      start_line: 57
-      end_line: 57
-    schema: GoalResponse
-    subject: TargetValue
   - code: schema.free_form_map
     severity: WARN
     category: schema

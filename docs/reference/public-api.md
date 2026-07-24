@@ -112,10 +112,10 @@ See [OpenAPI generation](../openapi/generation.md).
 | `GoSdk` | Go client/model/docs/package target |
 | `PySdk` | Python client/model/docs/package target |
 | `TsSdk` | TypeScript client/model/docs/package target |
-| `SdkProfile` | minimal and generator-compatibility surface presets |
+| `SdkProfile` | native minimal generated surface preset |
 | `SdkFileLayout` | compact/split files, directories, and templates |
 | `OperationFileSplit` | compact/per-tag/per-endpoint operation layout enum |
-| `SdkDocs` | none/reference/OpenAPI-Generator-compatible/both docs policy |
+| `SdkDocs` | none/reference generated docs policy |
 | `SdkPackageMetadata` | registry name, version, description, URLs, license, keywords |
 | `SdkTypeAliases` | explicit and source-prefix public type aliases |
 | `SdkModel` | normalized target-facing SDK model built from the graph |
@@ -124,7 +124,7 @@ See [OpenAPI generation](../openapi/generation.md).
 
 See [SDK generation](../sdk/generation.md).
 
-## Go SDK compatibility controls
+## Go SDK surface controls
 
 | Symbol | Use |
 |---|---|
@@ -136,14 +136,13 @@ See [SDK generation](../sdk/generation.md).
 | `GoQuerySetterArgumentPolicy` | typed, `any`, or selectively widened setters |
 | `GoExecuteCompatibility` | preserve selected legacy `Execute` signatures |
 
-## TypeScript SDK compatibility controls
+## TypeScript SDK surface controls
 
 | Symbol | Use |
 |---|---|
-| `TsCompatibility` | concise OpenAPI Generator compatibility selection |
 | `TsModelPropertyPolicy` | strict/OpenAPI-required/legacy-loose optional properties |
 | `TsNullablePolicy` | explicit or omitted nullable unions |
-| `TsResponsePolicy` | data-only or Axios response-wrapper return shape |
+| `TsResponsePolicy` | generated response return-shape policy |
 | `TsBarrelExports` | star or collision-aware compatibility barrel |
 
 ## Post-processors

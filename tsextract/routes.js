@@ -12,10 +12,8 @@
 // request/response/param SHAPES come from the TypeChecker over the method's typed
 // signature (via types.mapType), exactly like the DTO schemas do.
 //
-// The `@Controller('books')` prefix is recorded for provenance ONLY and is NEVER
-// folded into an operation path (rule 1): the neutral operation paths stay
-// group-relative (`/`, `/{bookId}`); the base path is supplied later by the host
-// (rule 4). NestJS `'/:bookId'` is converted to neutral `'/{bookId}'`.
+// A static `@Controller('books')` prefix is composed with every method path. A
+// dynamic controller prefix is diagnosed and the affected controller is omitted.
 //
 // A RouteFact has EXACTLY the keys the host `RouteFact` DTO (deny_unknown_fields)
 // requires: method, path, handler, operation_id, params, request_body, responses,
@@ -114,7 +112,7 @@ function _controllerDecorator(classDecl) {
 }
 
 // Convert a NestJS route path to the neutral path: `:name` -> `{name}`. A bare
-// `/` stays `/`. The `@Controller` prefix is NEVER prepended here (rule 1).
+// `/` stays `/`.
 function _neutralPath(raw) {
   const out = [];
   let i = 0;
@@ -134,6 +132,18 @@ function _neutralPath(raw) {
     }
   }
   return out.join("");
+}
+
+function _joinStaticPaths(prefix, path) {
+  const normalizedPrefix = String(prefix || "").trim().replace(/^\/+|\/+$/g, "");
+  const normalizedPath = String(path || "").trim();
+  if (!normalizedPrefix) {
+    return normalizedPath.startsWith("/") ? normalizedPath : "/" + normalizedPath;
+  }
+  if (!normalizedPath || normalizedPath === "/") {
+    return "/" + normalizedPrefix + "/";
+  }
+  return "/" + normalizedPrefix + "/" + normalizedPath.replace(/^\/+|\/+$/g, "");
 }
 
 // Find the HTTP-verb decorator on a method, returning {method, path} or null.
@@ -263,18 +273,16 @@ function _paramKind(paramDecl) {
   return null;
 }
 
-// Resolve a method's return type to a schema ref id, registering the referenced
-// declaration for transitive collection. Returns the id or null (with a
-// diagnostic recorded) when the return type is not a named schema-bearing type.
+// Resolve a method's return type to a schema ref id, registering referenced
+// declarations for transitive collection. Inline representable response shapes
+// receive a deterministic synthetic component so ResponseFact stays ref-only.
 //
 // The return type is mapped through the SAME `types.mapType` discriminator every
 // field/param uses (WR-01, rule 3 — ONE named-vs-inline path): the method's
 // `type` annotation node carries the syntactic info `mapType` reads, so a
 // nullable named return (`getX(): BookOrError | null`) resolves identically to a
 // nullable named field, instead of the divergent `t.aliasSymbol` read that TS
-// drops on `| null`. `ResponseFact.body` is a `TypeRef` (a bare ref_id), so ONLY
-// a `named` result is representable; an array/union/map/primitive return is
-// diagnosed distinctly (WR-02) and the body omitted — never a guessed ref.
+// drops on `| null`.
 function _responseRef(loaded, methodDecl, diags, registry, operation) {
   if (!methodDecl.type) {
     const sf = methodDecl.getSourceFile();
@@ -310,27 +318,67 @@ function _responseRef(loaded, methodDecl, diags, registry, operation) {
   if (mapped.schema === null) {
     return null; // unresolvable type (mapReturnType already recorded the diagnostic)
   }
+  if (mapped.optional || mapped.nullable) {
+    diags.warn(
+      "response type is optional/nullable at the top level, which the response contract cannot represent; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
   if (mapped.schema.type === "named") {
     return mapped.schema.of;
   }
 
-  // A representable-but-not-as-a-TypeRef return shape (array/union/map/enum/
-  // primitive). `ResponseFact.body` can only carry a named ref_id, so distinguish
-  // this from a wholly unresolvable type (WR-02) and omit the body (rule 3).
-  diags.warn(
-    "response type is a '" +
-      mapped.schema.type +
-      "', not a named schema; a response body can only be a named ref (TypeRef), so the body is omitted (no fallback)",
-    file,
-    line,
-    {
-      code: "response.schema.unresolved",
-      category: "response",
-      operation: operation,
-      subject: methodDecl.name.getText(sf),
-    }
+  if (!registry) {
+    diags.warn(
+      "response type requires a synthetic schema but no schema registry was supplied; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  const handler = methodDecl.name ? methodDecl.name.getText(sf) : "response";
+  const name =
+    handler
+      .split(/[^A-Za-z0-9]+/)
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join("") + "Response";
+  const refId = load.schemaId(loaded.targetDir, sf.fileName, name);
+  const collidesWithSource = sf.statements.some(
+    (statement) =>
+      (ts.isClassDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) &&
+      statement.name &&
+      statement.name.text === name
   );
-  return null;
+  if (collidesWithSource) {
+    diags.warn(
+      "synthetic response schema '" +
+        refId +
+        "' collides with a source declaration; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  const added = registry.add(refId, {
+    kind: "synthetic",
+    name: name,
+    body: mapped.schema,
+    span: load.span(sf, methodDecl, loaded.targetDir),
+  });
+  if (!added) {
+    diags.warn(
+      "synthetic response schema '" +
+        refId +
+        "' collides with another response; body omitted",
+      file,
+      line
+    );
+    return null;
+  }
+  return refId;
 }
 
 // Build the params + request_body from a method's typed signature.
@@ -490,9 +538,22 @@ function recognizeNestController(loaded, diags, registry) {
       if (controller === null) {
         return; // not a routing controller
       }
-      // The @Controller(...) prefix is read for provenance only and NEVER folded
-      // into an operation path (rule 1). Capturing it documents the bright line.
-      const _controllerPrefix = _decoratorStringArg(controller);
+      const controllerCall = controller.expression;
+      let controllerPrefix = "";
+      if (controllerCall.arguments.length > 0) {
+        const prefixArg = controllerCall.arguments[0];
+        if (!ts.isStringLiteralLike(prefixArg)) {
+          const line =
+            sf.getLineAndCharacterOfPosition(controller.getStart(sf)).line + 1;
+          diags.warn(
+            "@Controller prefix is dynamic; routes for this controller are omitted",
+            rel,
+            line
+          );
+          return;
+        }
+        controllerPrefix = prefixArg.text;
+      }
 
       for (const member of node.members) {
         if (!ts.isMethodDeclaration(member) || !member.name) {
@@ -544,11 +605,13 @@ function recognizeNestController(loaded, diags, registry) {
 
         routes.push({
           method: verb.method,
-          path: verb.path,
+          path: _joinStaticPaths(controllerPrefix, verb.path),
           handler: handler,
           operation_id: handler,
           params: params,
           request_body: requestBody,
+          request_body_content_type:
+            requestBody === null ? null : "application/json",
           responses: responses,
           span: {
             file: rel,

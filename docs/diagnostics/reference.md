@@ -124,6 +124,5 @@ gnr8 --json doctor > doctor.json
 `doctor` labels analysis diagnostics informational and excludes them from its actionable-problem
 count. Lifecycle failure, stale output, or protected edits are actionable.
 
-Compatibility commands return their own sorted diff records; OpenAPI difference codes are described
-in [OpenAPI compatibility](../openapi/compatibility.md), and SDK diff fields in
-[SDK compatibility](../sdk/compatibility.md).
+Custom gates should group diagnostics by their stable code and source context rather than matching
+human-readable messages.

@@ -13,7 +13,7 @@ type CreateTaskRequest struct {
 	Assignee Assignee  `json:"assignee"`
 	DueAt    time.Time `json:"dueAt"`
 	Labels   []string  `json:"labels"`
-	Notes    string    `json:"notes,omitempty"`
+	Notes    *string   `json:"notes,omitempty"`
 	Priority int64     `json:"priority"`
 	Status   Status    `json:"status"`
 	Title    string    `json:"title"`
@@ -43,7 +43,7 @@ type Task struct {
 	DueAt    time.Time `json:"dueAt"`
 	ID       string    `json:"id"`
 	Labels   []string  `json:"labels"`
-	Notes    string    `json:"notes,omitempty"`
+	Notes    *string   `json:"notes,omitempty"`
 	Priority int64     `json:"priority"`
 	Status   Status    `json:"status"`
 	Title    string    `json:"title"`
@@ -55,8 +55,8 @@ type TaskList struct {
 
 type UpdateTaskRequest struct {
 	Labels   []string `json:"labels,omitempty"`
-	Notes    string   `json:"notes,omitempty"`
+	Notes    *string  `json:"notes,omitempty"`
 	Priority *int64   `json:"priority,omitempty"`
 	Status   *Status  `json:"status,omitempty"`
-	Title    string   `json:"title,omitempty"`
+	Title    *string  `json:"title,omitempty"`
 }

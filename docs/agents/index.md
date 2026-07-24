@@ -13,9 +13,7 @@ current task; each page includes runnable examples, invariants, and failure beha
 | Correct, enrich, or select API facts | [Transforms and overrides](../pipeline/transforms.md) |
 | Extract from Go, Python, NestJS, or OpenAPI | [Sources and extraction](../extraction/sources.md) |
 | Emit or patch OpenAPI 3.1 | [OpenAPI generation](../openapi/generation.md) |
-| Compare two OpenAPI documents exactly | [OpenAPI compatibility](../openapi/compatibility.md) |
 | Generate Go, Python, or TypeScript SDKs | [SDK generation](../sdk/generation.md) |
-| Compare old and new SDK public surfaces | [SDK compatibility](../sdk/compatibility.md) |
 | Interpret or gate diagnostics | [Diagnostics reference](../diagnostics/reference.md) |
 | Understand writes, caches, CI, or the Action | [Artifacts and CI](../operations/artifacts-and-ci.md) |
 | Find a public prelude symbol | [Public API map](../reference/public-api.md) |

@@ -1,6 +1,5 @@
-# One-shot release, intentionally shaped like exlint:
-# bump workspace patch version, push main, create tag vX.Y.Z, optionally publish crates.io, and
-# attach CLI archives + sha256 files to that tag's GitHub Release.
+# One-shot release: prepare the version commit locally, gate and smoke that exact revision, then
+# atomically push main + vX.Y.Z before optional publication and release assets.
 
 name: Release
 
@@ -25,7 +24,7 @@ concurrency:
 
 jobs:
   bump-and-tag:
-    name: Bump version, push main, create tag
+    name: Prepare, gate, smoke, then tag
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     outputs:
@@ -38,6 +37,21 @@ jobs:
           token: ${{ secrets.WORKFLOW_PUSH_TOKEN != '' && secrets.WORKFLOW_PUSH_TOKEN || github.token }}
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: goextract/go.mod
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Install Python test dependencies
+        run: python -m pip install PyYAML==6.0.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
       - name: Sync main
         run: git pull --rebase origin main
@@ -64,7 +78,7 @@ jobs:
                 --precise "$NEW_VERSION"
             done
 
-      - name: Commit and push to main
+      - name: Create version commit locally
         env:
           NEW_VERSION: ${{ steps.bump.outputs.version }}
         run: |
@@ -77,9 +91,28 @@ jobs:
             exit 1
           fi
           git commit -m "chore(release): bump crate version to ${NEW_VERSION}"
-          git push origin main
 
-      - name: Create and push tag
+      - name: Full release gate on versioned commit
+        run: make check
+
+      - name: Verify release gate left the versioned commit clean
+        run: git diff --exit-code
+
+      - name: Package and smoke host archive
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          ASSET_OS: linux
+          ASSET_ARCH: x86_64
+        run: |
+          set -euo pipefail
+          scripts/package-release.sh
+          scripts/smoke-release-archive.sh \
+            target/release-local-dist/dist/gnr8-linux-x86_64.tar.gz
+
+      - name: Verify crates.io package
+        run: DRY_RUN=1 ./scripts/publish-crates.sh
+
+      - name: Atomically push gated commit and tag
         id: metadata
         env:
           NEW_VERSION: ${{ steps.bump.outputs.version }}
@@ -87,7 +120,7 @@ jobs:
           set -euo pipefail
           TAG="v${NEW_VERSION}"
           git tag -a "${TAG}" -m "gnr8 ${NEW_VERSION}"
-          git push origin "${TAG}"
+          git push --atomic origin HEAD:main "refs/tags/${TAG}"
           echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
@@ -151,9 +184,20 @@ jobs:
 
       - name: Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            update
+          sudo apt-get \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            install -y gcc-aarch64-linux-gnu
 
       - uses: dtolnay/rust-toolchain@stable
         with:

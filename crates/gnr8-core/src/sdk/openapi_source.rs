@@ -778,7 +778,6 @@ impl Importer {
                     request_body_content_types = self.swagger_request_media_types(operation);
                     request_body_content_type =
                         preferred_request_media_type(&request_body_content_types)
-                            .filter(|media_type| *media_type != "application/json")
                             .map(str::to_string);
                 }
 
@@ -803,7 +802,6 @@ impl Importer {
                                 }
                                 request_body_content_type =
                                     preferred_request_media_type(&request_body_content_types)
-                                        .filter(|media_type| *media_type != "application/json")
                                         .map(str::to_string);
                                 Some(self.insert_synthetic_schema(
                                     &format!("{operation_id}FormRequest"),
@@ -816,9 +814,7 @@ impl Importer {
                             .map(|(schema_ref, media_type, media_types, required)| {
                                 request_body_required = required;
                                 request_body_content_types = media_types;
-                                if media_type != "application/json" {
-                                    request_body_content_type = Some(media_type);
-                                }
+                                request_body_content_type = Some(media_type);
                                 schema_ref
                             }),
                     };
@@ -4352,7 +4348,7 @@ components:
                 TsSdk::new()
                     .module("@acme/books")
                     .to("generated/ts")
-                    .profile(SdkProfile::typescript_fetch_compat()),
+                    .profile(SdkProfile::minimal()),
             )
             .run(&Cx::new(&root))
             .unwrap();
@@ -4364,10 +4360,10 @@ components:
             .map(|artifact| artifact.path.as_str())
             .collect::<Vec<_>>();
         assert!(paths.contains(&"generated/openapi.json"));
+        assert!(paths.contains(&"generated/ts/client.ts"));
+        assert!(paths.contains(&"generated/ts/errors.ts"));
         assert!(paths.contains(&"generated/ts/index.ts"));
-        assert!(paths.contains(&"generated/ts/runtime.ts"));
-        assert!(paths.contains(&"generated/ts/apis/index.ts"));
-        assert!(paths.contains(&"generated/ts/models/index.ts"));
+        assert!(paths.contains(&"generated/ts/models.ts"));
 
         let _ = std::fs::remove_dir_all(root);
     }

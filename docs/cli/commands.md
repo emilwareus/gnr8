@@ -136,55 +136,12 @@ Checks workspace setup, child protocol compatibility, pipeline execution, output
 edits, and generated OpenAPI readiness. Analysis warnings are informational by themselves. Exit `1`
 means at least one actionable lifecycle or output problem exists.
 
-## `compat openapi`
-
-```bash
-gnr8 compat openapi --old baseline.yaml --new generated/openapi.yaml
-gnr8 --json compat openapi --old old.json --new new.yaml --policy exact
-```
-
-`exact` is the only policy. Compatible means zero semantic differences after canonicalizing supported
-Swagger 2.0/OpenAPI 3.x representation differences. Any addition, removal, or change exits `1`.
-See [OpenAPI compatibility](../openapi/compatibility.md).
-
-## `compat typescript`
-
-```bash
-gnr8 compat typescript --old old-sdk --new generated/sdk-ts
-gnr8 compat typescript --old old-sdk --new generated/sdk-ts \
-  --contract sdk-compat.toml --suggest
-```
-
-Compares public TypeScript/package/docs surface. `--contract` applies explicit requirements and
-allowances. `--suggest` adds high-confidence contract snippets to text and JSON output.
-
-## `compat go`
-
-```bash
-gnr8 compat go --old old-sdk --new generated/sdk-go
-gnr8 compat go --old old-sdk --new generated/sdk-go \
-  --contract sdk-compat.toml --suggest
-```
-
-Compares exported declarations, functions, methods, docs, and package metadata. Contract and suggestion
-behavior matches TypeScript.
-
-## `compat python`
-
-```bash
-gnr8 compat python --old old-sdk --new generated/sdk-python
-gnr8 --json compat python --old old-sdk --new generated/sdk-python
-```
-
-Compares importable modules, package exports, model shapes, helpers, exceptions, aliases, and package
-entry points. Python compatibility currently has no contract or suggestion flags.
-
 ## Exit behavior
 
 | Status | Meaning |
 |---:|---|
 | `0` | command completed and its gate passed |
-| `1` | drift, incompatibility, or actionable doctor finding |
+| `1` | generated drift or an actionable doctor finding |
 | other nonzero | invalid invocation or execution/configuration failure |
 
 Do not infer success from parseable JSON alone; always inspect the process status.

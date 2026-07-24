@@ -161,6 +161,48 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
     .expect("optional body graph json")
 }
 
+fn precision_and_nullable_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "github.com/acme/svc",
+          "operations": [],
+          "schemas": [
+            {
+              "id": "dto.Measurement",
+              "name": "Measurement",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "amount",
+                  "required": true,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "float", "bits": 64 } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "label",
+                  "required": true,
+                  "optional": false,
+                  "nullable": true,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "enum_source_order": [],
+              "provenance": { "file": "models.go", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "API",
+          "security": []
+        }"#,
+    )
+    .expect("precision and nullable graph json")
+}
+
 fn query_api_key_graph() -> gnr8::graph::ApiGraph {
     serde_json::from_str(
         r#"{
@@ -871,6 +913,72 @@ func TestOptionalBodyNilDoesNotSendJSON(t *testing.T) {{
 "#
     );
     std::fs::write(dir.join("optional_body_test.go"), smoke).expect("write optional smoke");
+    let test = run_go(&["test", "./..."], &dir);
+    assert!(test.is_ok(), "go test ./... must succeed: {test:?}");
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+#[test]
+fn generated_sdk_preserves_float64_and_nullable_string_json() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile precision/nullability smoke: go toolchain unavailable");
+        return;
+    }
+    let graph = precision_and_nullable_graph();
+    let dir = materialize_sdk_from_graph("precision-nullability", &graph, "/");
+    let pkg = package_clause(&dir);
+    let smoke = format!(
+        r#"package {pkg}
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestFloat64AndNullableStringRoundTrip(t *testing.T) {{
+	const raw = `{{"amount":1.23456789012345,"label":null}}`
+	var got Measurement
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {{
+		t.Fatalf("unmarshal: %v", err)
+	}}
+	if got.Amount != 1.23456789012345 {{
+		t.Fatalf("amount = %.15g, want full float64 precision", got.Amount)
+	}}
+	if got.Label != nil {{
+		t.Fatalf("label = %q, want nil for JSON null", *got.Label)
+	}}
+
+	encoded, err := json.Marshal(got)
+	if err != nil {{
+		t.Fatalf("marshal null: %v", err)
+	}}
+	var document map[string]any
+	if err := json.Unmarshal(encoded, &document); err != nil {{
+		t.Fatalf("decode marshaled document: %v", err)
+	}}
+	if label, present := document["label"]; !present || label != nil {{
+		t.Fatalf("marshaled label = %#v, present=%v; want explicit null", label, present)
+	}}
+
+	empty := ""
+	got.Label = &empty
+	encoded, err = json.Marshal(got)
+	if err != nil {{
+		t.Fatalf("marshal empty string: %v", err)
+	}}
+	var roundTripped Measurement
+	if err := json.Unmarshal(encoded, &roundTripped); err != nil {{
+		t.Fatalf("unmarshal empty string: %v", err)
+	}}
+	if roundTripped.Label == nil || *roundTripped.Label != "" {{
+		t.Fatalf("empty string collapsed into null: %#v", roundTripped.Label)
+	}}
+}}
+"#
+    );
+    std::fs::write(dir.join("precision_nullable_test.go"), smoke)
+        .expect("write precision/nullability smoke");
     let test = run_go(&["test", "./..."], &dir);
     assert!(test.is_ok(), "go test ./... must succeed: {test:?}");
 

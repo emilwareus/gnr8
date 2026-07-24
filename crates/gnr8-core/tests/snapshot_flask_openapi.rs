@@ -1,11 +1,9 @@
-//! Contract test (IR-04): the OpenAPI 3.1 document lowered from the Flask bookstore fixture — GREEN.
+//! Contract test: incomplete Flask response extraction blocks OpenAPI lowering explicitly.
 //!
 //! Plan 02-04 landed Flask route recognition in `pyextract`, so `analyze::build_graph` produces the
-//! real graph and the reused lowering renders the OpenAPI document asserted against the COMMITTED
-//! `snapshots/snapshot_flask_openapi__flask_openapi.snap` (objects, arrays, string enums, `oneOf`
-//! unions, `type: [T, "null"]` nullability). The extractor + reconciled fixture reproduce it
-//! byte-for-byte with ZERO snapshot edits. `CI=true` keeps insta in `INSTA_UPDATE=no`, so a mismatch
-//! hard-fails — it never auto-accepts.
+//! real graph, including the recognized `create_order_raw` route whose untyped return cannot produce
+//! response facts. Lowering must reject that incomplete contract instead of fabricating an OpenAPI
+//! `default` response.
 //!
 //! Requires the python3 toolchain (the test invokes the helper via `python3 -m pyextract`).
 
@@ -33,12 +31,12 @@ fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
 }
 
 #[test]
-fn openapi_matches_expected_for_flask() {
-    // 02-04: build_graph runs pyextract and the reused lowering renders the OpenAPI; the committed
-    // .snap locks its reviewed shape (byte-identical against the reconciled fixture).
+fn incomplete_flask_response_blocks_openapi() {
     let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the python3 toolchain)");
-    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "/orders", &fixture_security())
-        .expect("lower::to_openapi must succeed");
-    insta::assert_snapshot!("flask_openapi", openapi);
+    let error = gnr8::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
+        .expect_err("an incomplete route must block lowering");
+    let message = error.to_string();
+    assert!(message.contains("create_order_raw"), "{message}");
+    assert!(message.contains("no response facts"), "{message}");
 }

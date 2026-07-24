@@ -2,8 +2,8 @@
 //!
 //! 02-03 implemented the `diagnostics::collect` seam, so the `.expect()` now succeeds and the test
 //! asserts the real diagnostics text against the reviewed
-//! `snapshots/snapshot_diagnostics__goalservice_diagnostics.snap`: 7 `WARN` lines reconciled with
-//! `fixtures/goalservice/expected/diagnostics.txt` — float64-narrowing ×3, free-form-map ×1,
+//! `snapshots/snapshot_diagnostics__goalservice_diagnostics.snap`: 4 `WARN` lines reconciled with
+//! `fixtures/goalservice/expected/diagnostics.txt` — free-form-map ×1,
 //! untyped-query ×3 — normalized to one canonical template per rule and sorted by `(file, line)`.
 //! Plain text → `assert_snapshot!`. The snapshot was authored from REAL output and reviewed. CI runs
 //! insta in `INSTA_UPDATE=no` (`CI=true`), so a mismatch hard-fails — it never auto-accepts (FIX-04).

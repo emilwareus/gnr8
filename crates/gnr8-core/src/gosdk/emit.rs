@@ -33,7 +33,7 @@ use crate::sdk::emit_common::{
     path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
     success_responses_of, ApiKeyLocation, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
-use crate::sdk::go::{GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy};
+use crate::sdk::go::{GoSdkOptions, RequiredPointerConstructorPolicy};
 use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
@@ -126,15 +126,15 @@ pub(crate) fn compat_exported(name: &str) -> String {
 /// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
 ///
 /// ALL Go-specific type mapping lives HERE — this is the correct home for per-target mapping (IR-03 /
-/// docs/extensibility.md §2a): `WellKnown::DateTime → time.Time`, `Int → int64`, `Float → float32`,
+/// docs/extensibility.md §2a): `WellKnown::DateTime → time.Time`, `Int → int64`, and each floating
+/// point width is preserved,
 /// `Map`/`Any → map[string]any`. The match over [`Type`] is exhaustive — no `_ =>` / `other =>` arm —
 /// so a future variant fails to compile here until handled (T-03).
 ///
-/// `nullable` controls pointer wrapping for value types (`*float32`, `*bool`, `*TargetDirection`, …):
-/// a NULLABLE value type becomes `*T`. Strings, slices, and maps are already nilable in Go so they are
-/// never pointer-wrapped (matches `expected/sdk/models.go`, where an optional string stays `string`
-/// with omitempty and only nullable value types like `NextCursor` become `*string`). The optional axis
-/// is NOT read here — it drives `,omitempty` in [`json_tag`], not the pointer (the two are distinct).
+/// `nullable` controls pointer wrapping for value types (`*float64`, `*string`, `*bool`,
+/// `*TargetDirection`, …): a NULLABLE value type becomes `*T`. Slices and maps are already nilable in
+/// Go and are not pointer-wrapped. The optional axis is NOT read here — it drives `,omitempty` in
+/// [`json_tag`], not the pointer (the two are distinct).
 ///
 /// # Errors
 ///
@@ -142,8 +142,8 @@ pub(crate) fn compat_exported(name: &str) -> String {
 /// represent (e.g. [`Type::Union`] — Go has no sum types).
 fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, CoreError> {
     let base = match schema {
-        // A base scalar maps to its Go type; the integer/float width is a target concern (TARGET-API
-        // §4: number → float32 — the generator narrows; the diagnostic is already in the graph).
+        // A base scalar maps to its Go type. Floating-point width is preserved so an OpenAPI number
+        // (64-bit by default) is never silently narrowed.
         Type::Primitive(prim) => go_primitive(prim).to_string(),
         // A well-known scalar maps to the Go type that carries it: a date-time is a `time.Time`, a
         // uuid is a string (Go-ism LOCAL to this target — never in lowering, IR-03).
@@ -198,20 +198,24 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
             });
         }
     };
-    // Strings/maps are nilable already; value types get a pointer when nullable.
-    let is_value = matches!(base.as_str(), "bool" | "int64" | "float32" | "time.Time");
+    // Strings are value types too: *string distinguishes JSON null from "". Slices/maps remain
+    // naturally nilable and do not need an additional pointer layer.
+    let is_value = matches!(
+        base.as_str(),
+        "string" | "bool" | "int64" | "float32" | "float64" | "time.Time"
+    );
     Ok(maybe_pointer(base, nullable, is_value))
 }
 
-/// Map a neutral [`Prim`] to its Go type (Go-ism LOCAL to this target — IR-03). Integer width is
-/// narrowed to `int64` and float to `float32` per TARGET-API §4 (the narrowing diagnostic is already
-/// in the graph); a byte string maps to Go `[]byte`.
+/// Map a neutral [`Prim`] to its Go type (Go-ism LOCAL to this target — IR-03). Integers carry as
+/// `int64`; floating-point width is preserved; a byte string maps to Go `[]byte`.
 fn go_primitive(prim: &Prim) -> &'static str {
     match prim {
         Prim::String => "string",
         Prim::Bool => "bool",
         Prim::Int { .. } => "int64",
-        Prim::Float { .. } => "float32",
+        Prim::Float { bits: 32 } => "float32",
+        Prim::Float { .. } => "float64",
         Prim::Bytes => "[]byte",
     }
 }
@@ -1449,571 +1453,10 @@ pub(crate) fn emit_compat_client_surface(
     ))
 }
 
-pub(crate) fn compat_operations_by_service(graph: &ApiGraph) -> BTreeMap<String, Vec<&Operation>> {
-    let mut grouped: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
-    for op in &graph.operations {
-        grouped.entry(compat_service_name(op)).or_default().push(op);
-    }
-    grouped
-}
-
-pub(crate) fn emit_compat_errors(package: &str, options: &GoEmitOptions) -> String {
-    let model_body = if let Some(error_model) = &options.sdk.error_model {
-        format!(
-            "\
-func (e GenericOpenAPIError) Model() any {{
-if e.model != nil {{
-return e.model
-}}
-var model {error_model}
-if err := json.Unmarshal(e.body, &model); err == nil {{
-return model
-}}
-return nil
-}}
-"
-        )
-    } else {
-        "\
-func (e GenericOpenAPIError) Model() any {
-return e.model
-}
-"
-        .to_string()
-    };
-    let mut body = "\
-type GenericOpenAPIError struct {
-body []byte
-model any
-error string
-}
-
-func (e GenericOpenAPIError) Error() string {
-return e.error
-}
-
-func (e GenericOpenAPIError) Body() []byte {
-return e.body
-}
-
-"
-    .to_string();
-    body.push_str(&model_body);
-    let imports = if options.sdk.error_model.is_some() {
-        vec!["encoding/json"]
-    } else {
-        Vec::new()
-    };
-    file(package, &imports, &body)
-}
-
-pub(crate) fn emit_compat_configuration(package: &str) -> String {
-    let body = "\
-type APIKey struct {
-Key string
-Prefix string
-}
-
-type contextKey string
-
-const ContextAPIKeys contextKey = \"apiKeys\"
-
-func WithAPIKey(ctx context.Context, name string, key APIKey) context.Context {
-if ctx == nil {
-ctx = context.Background()
-}
-values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
-next := map[string]APIKey{}
-for k, v := range values {
-next[k] = v
-}
-next[name] = key
-return context.WithValue(ctx, ContextAPIKeys, next)
-}
-
-type ServerVariable struct {
-Description string
-DefaultValue string
-EnumValues []string
-}
-
-type ServerConfiguration struct {
-URL string
-Description string
-Variables map[string]ServerVariable
-}
-
-type ServerConfigurations []ServerConfiguration
-
-type Configuration struct {
-DefaultHeader map[string]string
-UserAgent string
-Servers ServerConfigurations
-HTTPClient *http.Client
-}
-
-func NewConfiguration() *Configuration {
-return &Configuration{
-DefaultHeader: map[string]string{},
-UserAgent: \"gnr8-compat/go\",
-Servers: ServerConfigurations{{URL: \"\"}},
-HTTPClient: http.DefaultClient,
-}
-}
-
-func (c *Configuration) AddDefaultHeader(key string, value string) {
-if c.DefaultHeader == nil {
-c.DefaultHeader = map[string]string{}
-}
-c.DefaultHeader[key] = value
-}
-
-func (c *Configuration) serverURL() string {
-if c != nil && len(c.Servers) > 0 {
-return c.Servers[0].URL
-}
-return \"\"
-}
-
-func (c *Configuration) ServerURLWithContext(_ context.Context, _ string) (string, error) {
-return c.serverURL(), nil
-}
-";
-    file(package, &["context", "net/http"], body)
-}
-
 #[expect(
     clippy::too_many_lines,
-    reason = "the OpenAPI Generator compatibility helpers are emitted as one generated support file"
+    reason = "the optional user-configured request-builder client is emitted as one Go declaration block"
 )]
-pub(crate) fn emit_compat_utils(package: &str, options: &GoEmitOptions) -> String {
-    let mut body = "\
-type compatNamedReader interface {
-io.Reader
-Name() string
-}
-
-func IsNil(value any) bool {
-if value == nil {
-return true
-}
-reflected := reflect.ValueOf(value)
-switch reflected.Kind() {
-case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
-return reflected.IsNil()
-default:
-return false
-}
-}
-
-func compatMultipartFileBody(fileField string, file any, fields map[string]any) (*bytes.Reader, string, error) {
-var buf bytes.Buffer
-writer := multipart.NewWriter(&buf)
-for key, value := range fields {
-if err := writer.WriteField(key, compatQueryValue(value)); err != nil {
-return nil, \"\", err
-}
-}
-if file != nil {
-reader, ok := file.(compatNamedReader)
-if !ok {
-return nil, \"\", fmt.Errorf(\"file must implement io.Reader and Name() string\")
-}
-if fileField == \"\" {
-fileField = \"file\"
-}
-part, err := writer.CreateFormFile(fileField, filepath.Base(reader.Name()))
-if err != nil {
-return nil, \"\", err
-}
-if _, err := io.Copy(part, reader); err != nil {
-return nil, \"\", err
-}
-if closer, ok := file.(io.Closer); ok {
-_ = closer.Close()
-}
-}
-if err := writer.Close(); err != nil {
-return nil, \"\", err
-}
-return bytes.NewReader(buf.Bytes()), writer.FormDataContentType(), nil
-}
-
-func reportError(format string, args ...any) error {
-return fmt.Errorf(format, args...)
-}
-
-func compatEncodeJSONBody(v any) (*bytes.Reader, error) {
-var buf bytes.Buffer
-if err := json.NewEncoder(&buf).Encode(v); err != nil {
-return nil, err
-}
-return bytes.NewReader(buf.Bytes()), nil
-}
-
-func compatSetBodyField(body any, key string, value any) any {
-switch typed := body.(type) {
-case nil:
-next := map[string]any{}
-next[key] = value
-return next
-case map[string]any:
-typed[key] = value
-return typed
-case map[string]string:
-typed[key] = compatQueryValue(value)
-return typed
-case url.Values:
-compatSetQueryValue(typed, key, value)
-return typed
-default:
-next := map[string]any{}
-next[key] = value
-return next
-}
-}
-
-func compatEncodeFormBody(v any) (*bytes.Reader, error) {
-values := url.Values{}
-if err := compatAddFormValues(values, v); err != nil {
-return nil, err
-}
-return bytes.NewReader([]byte(values.Encode())), nil
-}
-
-func compatAddFormValues(values url.Values, value any) error {
-if value == nil {
-return nil
-}
-switch typed := value.(type) {
-case url.Values:
-for key, items := range typed {
-for _, item := range items {
-values.Add(key, item)
-}
-}
-return nil
-case map[string]any:
-for key, item := range typed {
-compatSetQueryValue(values, key, item)
-}
-return nil
-case map[string]string:
-for key, item := range typed {
-values.Set(key, item)
-}
-return nil
-}
-
-reflected := reflect.ValueOf(value)
-for reflected.Kind() == reflect.Ptr || reflected.Kind() == reflect.Interface {
-if reflected.IsNil() {
-return nil
-}
-reflected = reflected.Elem()
-}
-switch reflected.Kind() {
-case reflect.Map:
-if reflected.Type().Key().Kind() != reflect.String {
-return fmt.Errorf(\"form body map keys must be strings\")
-}
-iter := reflected.MapRange()
-for iter.Next() {
-compatSetQueryValue(values, iter.Key().String(), iter.Value().Interface())
-}
-case reflect.Struct:
-typ := reflected.Type()
-for i := 0; i < reflected.NumField(); i++ {
-field := typ.Field(i)
-if field.PkgPath != \"\" {
-continue
-}
-name, omitempty := compatFormFieldName(field)
-if name == \"\" || name == \"-\" {
-continue
-}
-fieldValue := reflected.Field(i)
-if omitempty && fieldValue.IsZero() {
-continue
-}
-compatSetQueryValue(values, name, fieldValue.Interface())
-}
-default:
-return fmt.Errorf(\"form body must be a map, url.Values, or struct\")
-}
-return nil
-}
-
-func compatFormFieldName(field reflect.StructField) (string, bool) {
-tag := field.Tag.Get(\"form\")
-if tag == \"\" {
-tag = field.Tag.Get(\"json\")
-}
-if tag == \"-\" {
-return \"-\", false
-}
-omitempty := false
-if tag != \"\" {
-parts := strings.Split(tag, \",\")
-for _, option := range parts[1:] {
-if option == \"omitempty\" {
-omitempty = true
-}
-}
-if parts[0] != \"\" {
-return parts[0], omitempty
-}
-}
-return field.Name, omitempty
-}
-
-type compatParameterPair struct {
-Name string
-Value string
-}
-
-func compatParameterPairs(name string, input any, style string, explode bool) []compatParameterPair {
-value := reflect.ValueOf(input)
-for value.IsValid() && (value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface) {
-if value.IsNil() {
-return nil
-}
-value = value.Elem()
-}
-if !value.IsValid() {
-return nil
-}
-delimiter := \",\"
-if style == \"spaceDelimited\" {
-delimiter = \" \"
-} else if style == \"pipeDelimited\" {
-delimiter = \"|\"
-}
-switch value.Kind() {
-case reflect.Slice, reflect.Array:
-parts := make([]string, 0, value.Len())
-for index := 0; index < value.Len(); index++ {
-parts = append(parts, compatScalarQueryValue(value.Index(index).Interface()))
-}
-if explode && style == \"form\" {
-pairs := make([]compatParameterPair, 0, len(parts))
-for _, part := range parts {
-pairs = append(pairs, compatParameterPair{Name: name, Value: part})
-}
-return pairs
-}
-return []compatParameterPair{{Name: name, Value: strings.Join(parts, delimiter)}}
-case reflect.Map:
-keys := value.MapKeys()
-sort.Slice(keys, func(i, j int) bool {
-return fmt.Sprint(keys[i].Interface()) < fmt.Sprint(keys[j].Interface())
-})
-pairs := make([]compatParameterPair, 0, len(keys))
-parts := make([]string, 0, len(keys)*2)
-for _, keyValue := range keys {
-key := fmt.Sprint(keyValue.Interface())
-item := compatScalarQueryValue(value.MapIndex(keyValue).Interface())
-if style == \"deepObject\" {
-pairs = append(pairs, compatParameterPair{Name: name + \"[\" + key + \"]\", Value: item})
-} else if explode && style == \"form\" {
-pairs = append(pairs, compatParameterPair{Name: key, Value: item})
-} else if explode {
-parts = append(parts, key+\"=\"+item)
-} else {
-parts = append(parts, key, item)
-}
-}
-if len(pairs) > 0 {
-return pairs
-}
-return []compatParameterPair{{Name: name, Value: strings.Join(parts, delimiter)}}
-default:
-return []compatParameterPair{{Name: name, Value: compatScalarQueryValue(input)}}
-}
-}
-
-func compatEncodeQuery(values url.Values, allowReserved map[string]map[int]bool) string {
-keys := make([]string, 0, len(values))
-for key := range values {
-keys = append(keys, key)
-}
-sort.Strings(keys)
-parts := make([]string, 0)
-for _, key := range keys {
-for index, value := range values[key] {
-encoded := strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
-if allowReserved[key][index] {
-encoded = strings.NewReplacer(
-\"%3A\", \":\", \"%2F\", \"/\", \"%3F\", \"?\", \"%23\", \"#\", \"%5B\", \"[\", \"%5D\", \"]\",
-\"%40\", \"@\", \"%21\", \"!\", \"%24\", \"$\", \"%26\", \"&\", \"%27\", \"'\", \"%28\", \"(\",
-\"%29\", \")\", \"%2A\", \"*\", \"%2B\", \"+\", \"%2C\", \",\", \"%3B\", \";\", \"%3D\", \"=\",
-).Replace(encoded)
-}
-encodedKey := strings.ReplaceAll(url.QueryEscape(key), \"+\", \"%20\")
-parts = append(parts, encodedKey+\"=\"+encoded)
-}
-}
-return strings.Join(parts, \"&\")
-}
-
-func compatCookieEscape(value string) string {
-return strings.ReplaceAll(url.QueryEscape(value), \"+\", \"%20\")
-}
-
-func compatDefaultAuthHeader() string {
-return \"Authorization\"
-}
-
-func compatQueryValue(value any) string {
-v := reflect.ValueOf(value)
-if !v.IsValid() {
-return \"\"
-}
-if v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
-if v.IsNil() {
-return \"\"
-}
-return compatQueryValue(v.Elem().Interface())
-}
-if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-return compatScalarQueryValue(value)
-}
-parts := make([]string, 0, v.Len())
-for i := 0; i < v.Len(); i++ {
-parts = append(parts, compatQueryValue(v.Index(i).Interface()))
-}
-return strings.Join(parts, \",\")
-}
-
-func compatScalarQueryValue(value any) string {
-return fmt.Sprint(value)
-}
-
-func compatSetQueryValue(q url.Values, key string, value any) {
-q.Set(key, compatQueryValue(value))
-}
-
-func parameterAddToHeaderOrQuery(headerOrQueryParams any, key string, value any, _ string) {
-switch params := headerOrQueryParams.(type) {
-case url.Values:
-params.Set(key, compatQueryValue(value))
-case http.Header:
-params.Set(key, compatQueryValue(value))
-}
-}
-
-func compatAPIKeyValue(ctx context.Context, scheme string, name string) string {
-if ctx == nil {
-return \"\"
-}
-values, _ := ctx.Value(ContextAPIKeys).(map[string]APIKey)
-apiKey, ok := values[scheme]
-if !ok {
-apiKey, ok = values[name]
-}
-if !ok || apiKey.Key == \"\" {
-return \"\"
-}
-value := apiKey.Key
-if apiKey.Prefix != \"\" {
-value = apiKey.Prefix + \" \" + value
-}
-return value
-}
-
-func compatApplyAPIKey(req *http.Request, ctx context.Context, scheme string, header string) {
-if req.Header.Get(header) != \"\" {
-return
-}
-if value := compatAPIKeyValue(ctx, scheme, header); value != \"\" {
-req.Header.Set(header, value)
-}
-}
-"
-    .to_string();
-    if options.sdk.query_time_format == QueryTimeFormat::DateOnlyAtMidnightElseRfc3339 {
-        body = body.replace(
-            "func compatScalarQueryValue(value any) string {\nreturn fmt.Sprint(value)\n}",
-            "func compatScalarQueryValue(value any) string {\nif t, ok := value.(time.Time); ok {\nif t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {\nreturn t.Format(\"2006-01-02\")\n}\nreturn t.Format(time.RFC3339)\n}\nreturn fmt.Sprint(value)\n}",
-        );
-    }
-    let mut imports = vec![
-        "bytes",
-        "context",
-        "encoding/json",
-        "fmt",
-        "io",
-        "mime/multipart",
-        "net/http",
-        "net/url",
-        "path/filepath",
-        "reflect",
-        "sort",
-        "strings",
-    ];
-    if options.sdk.query_time_format.needs_time_import() {
-        imports.push("time");
-    }
-    imports.sort_unstable();
-    imports.dedup();
-    file(package, &imports, &body)
-}
-
-pub(crate) fn emit_compat_api_client_file(
-    graph: &ApiGraph,
-    package: &str,
-) -> Result<String, CoreError> {
-    let mut body = String::new();
-    let services = compat_services(graph);
-    for service in &services {
-        writeln!(body, "type {service}APIService service").map_err(sink)?;
-    }
-    writeln!(body).map_err(sink)?;
-    emit_compat_api_client(&mut body, &services)?;
-    Ok(file(package, &["net/http"], &body))
-}
-
-pub(crate) fn emit_compat_api_file(
-    graph: &ApiGraph,
-    package: &str,
-    base_path: &str,
-    _service: &str,
-    ops: &[&Operation],
-    options: &GoEmitOptions,
-) -> Result<String, CoreError> {
-    let mut body = String::new();
-    let query_setters = if options.sdk.request_builder_scope.is_global() {
-        compat_query_setters(graph)
-    } else {
-        Vec::new()
-    };
-    let mut imports = vec!["bytes", "context", "io", "net/http", "net/url"];
-    if ops
-        .iter()
-        .any(|op| !path_tokens(&join_path(base_path, &op.path)).is_empty())
-    {
-        imports.push("fmt");
-    }
-    let mut needs_json = false;
-    for op in ops {
-        let return_model = compat_success_return_model(op, graph)?;
-        if return_model != "struct{}" && !success_responses_of(op, graph)?.has_binary_body() {
-            needs_json = true;
-        }
-        emit_compat_request(&mut body, op, graph, base_path, &query_setters, options)?;
-    }
-    if needs_json {
-        imports.push("encoding/json");
-    }
-    if ops.iter().any(|op| compat_operation_needs_time(op, graph)) {
-        imports.push("time");
-    }
-    imports.sort_unstable();
-    imports.dedup();
-    Ok(file(package, &imports, &body))
-}
-
-#[allow(clippy::too_many_lines)]
 fn emit_compat_client_prelude(body: &mut String) {
     let default_auth_header = "Authorization";
     let _ = writeln!(
@@ -2527,46 +1970,10 @@ fn compat_param_type(param: &crate::graph::Param, graph: &ApiGraph) -> Result<St
     go_type(&param.schema, false, graph)
 }
 
-fn compat_operation_needs_time(op: &Operation, graph: &ApiGraph) -> bool {
-    if op
-        .params
-        .iter()
-        .any(|param| type_needs_time(&param.schema, graph))
-    {
-        return true;
-    }
-    if !op
-        .request_body_content_type
-        .as_deref()
-        .is_some_and(|content_type| content_type.eq_ignore_ascii_case("multipart/form-data"))
-    {
-        return false;
-    }
-    request_body_model_of(op, graph)
-        .ok()
-        .flatten()
-        .and_then(|body| {
-            graph
-                .schemas
-                .iter()
-                .find(|schema| schema.name == body.model)
-        })
-        .is_some_and(|schema| match &schema.body {
-            Type::Object(fields) => fields.iter().any(|field| {
-                !is_multipart_file_field(field) && type_needs_time(&field.schema, graph)
-            }),
-            Type::Primitive(_)
-            | Type::WellKnown(_)
-            | Type::Array(_)
-            | Type::Map { .. }
-            | Type::Named(_)
-            | Type::Enum(_)
-            | Type::Union(_)
-            | Type::Any {} => false,
-        })
-}
-
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one request-builder operation is emitted in a single deterministic pass"
+)]
 fn emit_compat_request(
     body: &mut String,
     op: &Operation,
@@ -3933,10 +3340,13 @@ fn emit_operations_inner(
     if needs_wire_helpers {
         emit_wire_parameter_helpers(&mut body);
     }
-    // Operation methods always touch context/net-http/encoding-json (request build + decode). Body
-    // operations additionally need bytes; templated paths need fmt + net/url; non-string query params
-    // need strconv/time. This stays correct when split layout emits one operation per file.
-    let mut imports: Vec<&str> = vec!["context", "encoding/json", "io", "net/http"];
+    // A non-empty operations file always touches the request-plumbing imports. An empty graph still
+    // emits operations.go for a stable SDK layout, but that package-only file needs no imports.
+    let mut imports: Vec<&str> = if ops.is_empty() {
+        Vec::new()
+    } else {
+        vec!["context", "encoding/json", "io", "net/http"]
+    };
     if body_encodings.iter().any(|encoding| {
         matches!(
             encoding,
@@ -5012,11 +4422,12 @@ fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError
         "string" => Ok(accessor.to_string()),
         "int64" => Ok(format!("strconv.FormatInt({accessor}, 10)")),
         "float32" => Ok(format!("strconv.FormatFloat(float64({accessor}), 'g', -1, 32)")),
+        "float64" => Ok(format!("strconv.FormatFloat({accessor}, 'g', -1, 64)")),
         "bool" => Ok(format!("strconv.FormatBool({accessor})")),
         "time.Time" => Ok(format!("{accessor}.Format(time.RFC3339)")),
         other => Err(CoreError::SdkGen {
             message: format!(
-                "unsupported query-param Go type '{other}': only string/int64/float32/bool/time.Time \
+                "unsupported query-param Go type '{other}': only string/int64/float32/float64/bool/time.Time \
                  query parameters can be URL-encoded"
             ),
         }),
@@ -5030,7 +4441,7 @@ fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError
 /// [`query_string_expr`] during emission, so this stays infallible for the import pre-scan).
 fn query_extra_import(value_ty: &str) -> Option<&'static str> {
     match value_ty {
-        "int64" | "float32" | "bool" => Some("strconv"),
+        "int64" | "float32" | "float64" | "bool" => Some("strconv"),
         "time.Time" => Some("time"),
         _ => None,
     }
@@ -6189,6 +5600,14 @@ mod tests {
         use super::{emit_operations, sample_graph};
 
         #[test]
+        fn empty_operation_set_emits_no_unused_imports() {
+            let graph = sample_graph();
+            let out = emit_operations(&graph, "goalservice", "/goal", &[]).unwrap();
+
+            assert_eq!(out, "package goalservice\n\n");
+        }
+
+        #[test]
         fn method_signature_is_ctx_first_with_body_and_return_model() {
             let graph = sample_graph();
             let ops: Vec<&crate::graph::Operation> = graph
@@ -6617,6 +6036,20 @@ mod tests {
         use crate::graph::{Prim, Type, WellKnown};
 
         #[test]
+        fn openapi_number_preserves_float64_precision() {
+            let graph = sample_graph();
+            let number = Type::Primitive(Prim::Float { bits: 64 });
+            assert_eq!(go_type(&number, false, &graph).unwrap(), "float64");
+        }
+
+        #[test]
+        fn nullable_string_uses_pointer_representation() {
+            let graph = sample_graph();
+            let string = Type::Primitive(Prim::String);
+            assert_eq!(go_type(&string, true, &graph).unwrap(), "*string");
+        }
+
+        #[test]
         fn value_types_get_a_pointer_only_when_nullable() {
             // Pointer-wrapping reads the NULLABLE axis (RESEARCH Pitfall 4): a nullable value type is
             // `*T`, a non-nullable value type is `T`.
@@ -6634,9 +6067,9 @@ mod tests {
             });
             assert_eq!(go_type(&integer, false, &graph).unwrap(), "int64");
 
-            // strings are nilable already → never pointer-wrapped, even when nullable.
+            // A nullable string must distinguish JSON null from the empty string.
             let string = Type::Primitive(Prim::String);
-            assert_eq!(go_type(&string, true, &graph).unwrap(), "string");
+            assert_eq!(go_type(&string, true, &graph).unwrap(), "*string");
 
             let date_time = Type::WellKnown(WellKnown::DateTime);
             assert_eq!(go_type(&date_time, false, &graph).unwrap(), "time.Time");

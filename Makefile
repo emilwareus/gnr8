@@ -67,7 +67,11 @@ pyextract-test:
 	python3 -m unittest discover pyextract/tests
 
 tsextract-test: tsextract-deps
-	@command -v node >/dev/null 2>&1 && (cd tsextract && for test in tests/*.test.js; do node "$$test"; done) || echo "node absent — TS sidecar tests skipped"
+	@if command -v node >/dev/null 2>&1; then \
+		set -e; cd tsextract; for test in tests/*.test.js; do node "$$test"; done; \
+	else \
+		echo "node absent — TS sidecar tests skipped"; \
+	fi
 
 # Exercise the composite action's exact direct-dependency version resolver against real and
 # adversarial lock graphs (including a conflicting transitive gnr8 version).
@@ -112,6 +116,7 @@ examples-check: tsextract-deps
 	trap 'rm -rf "$$tmp"' EXIT; \
 	mkdir -p "$$tmp/examples"; \
 	for dir in examples/*/generated; do mkdir -p "$$tmp/$$dir"; cp -R "$$dir"/. "$$tmp/$$dir"/; done; \
+	export GNR8_RESOURCE_DIR="$(CURDIR)"; \
 	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/bookstore         && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
 	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/taskflow          && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
 	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/fastapi-bookstore && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \

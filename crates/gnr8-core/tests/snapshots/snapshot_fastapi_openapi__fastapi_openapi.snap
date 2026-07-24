@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_fastapi_openapi.rs
-assertion_line: 43
 expression: openapi
 ---
 openapi: 3.1.0

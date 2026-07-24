@@ -20,7 +20,7 @@
 //! ## Diagnostics (OAPI-03)
 //!
 //! Lowering does NOT re-derive diagnostics. The graph already carries the byte-locked Phase-2
-//! diagnostics (float64 narrowing, free-form maps, untyped query params); they are surfaced through
+//! diagnostics (free-form maps, untyped query params, unsupported dynamic patterns); they are surfaced through
 //! the existing `diagnostics::collect` path (the green `snapshot_diagnostics`). `to_openapi` is
 //! non-fatal on diagnostics — a graph with a non-empty `diagnostics` vector still lowers successfully
 //! — and it never drops or recomputes them. The representational decision the diagnostics describe
@@ -398,17 +398,20 @@ fn lower_operation(
 
     let request_body = match &op.request_body {
         Some(body) => {
-            let content_type = op
-                .request_body_content_type
-                .clone()
-                .unwrap_or_else(|| "application/json".to_string());
+            let content_type =
+                op.request_body_content_type
+                    .clone()
+                    .ok_or_else(|| crate::CoreError::Lowering {
+                        message: format!(
+                            "operation '{}' has a request body but no request body content type",
+                            op.id
+                        ),
+                    })?;
             let mut content_types = docs
                 .map(|policy| policy.request_content_types.clone())
                 .unwrap_or_default();
-            if content_types.is_empty() {
-                content_types.push(content_type.clone());
-            } else if !content_types.contains(&content_type) {
-                content_types.insert(0, content_type.clone());
+            if !content_types.contains(&content_type) {
+                content_types.push(content_type);
             }
             content_types.sort();
             content_types.dedup();
@@ -554,13 +557,18 @@ fn lower_responses(
     docs: Option<&OperationDocsPolicy>,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<Vec<(String, ResponseObj)>, crate::CoreError> {
-    let mut responses = op
+    let responses = op
         .responses
         .iter()
         .map(|resp| lower_response(op, resp, docs, ref_to_name))
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
     if responses.is_empty() {
-        responses.push(default_response());
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "operation '{}' has no response facts; extraction or code configuration must declare at least one response",
+                op.id
+            ),
+        });
     }
     Ok(responses)
 }
@@ -584,7 +592,7 @@ fn lower_response(
                     Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
                     None => None,
                 };
-                let content_types = response_content_types(resp, "application/json");
+                let content_types = response_content_types(op, resp)?;
                 (
                     schema_ref,
                     content_types.first().cloned(),
@@ -599,7 +607,7 @@ fn lower_response(
             }
             "binary" => {
                 ensure_response_has_no_schema(op, resp, "binary")?;
-                let content_types = response_content_types(resp, "application/octet-stream");
+                let content_types = response_content_types(op, resp)?;
                 (
                     None,
                     content_types.first().cloned(),
@@ -613,7 +621,7 @@ fn lower_response(
                     Some(body) => Some(resolve_ref(&body.ref_id, ref_to_name)?),
                     None => None,
                 };
-                let content_types = response_content_types(resp, "text/event-stream");
+                let content_types = response_content_types(op, resp)?;
                 (
                     schema_ref,
                     content_types.first().cloned(),
@@ -651,14 +659,22 @@ fn lower_response(
     ))
 }
 
-fn response_content_types(resp: &crate::graph::Response, fallback: &str) -> Vec<String> {
-    if !resp.content_types.is_empty() {
-        return resp.content_types.clone();
+fn response_content_types(
+    op: &GraphOp,
+    resp: &crate::graph::Response,
+) -> Result<Vec<String>, crate::CoreError> {
+    if resp.content_types.is_empty() {
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "operation '{}' response {} has a body but no response content type",
+                op.id, resp.status
+            ),
+        });
     }
-    vec![resp
-        .content_type
-        .clone()
-        .unwrap_or_else(|| fallback.to_string())]
+    let mut content_types = resp.content_types.clone();
+    content_types.sort();
+    content_types.dedup();
+    Ok(content_types)
 }
 
 fn ensure_response_has_no_schema(
@@ -675,21 +691,6 @@ fn ensure_response_has_no_schema(
         });
     }
     Ok(())
-}
-
-fn default_response() -> (String, ResponseObj) {
-    (
-        "default".to_string(),
-        ResponseObj {
-            description: "Default response".to_string(),
-            schema_ref: None,
-            content_type: None,
-            content_types: Vec::new(),
-            binary: false,
-            event_stream: false,
-            examples: Vec::new(),
-        },
-    )
 }
 
 fn operation_docs_policy<'a>(
@@ -1112,8 +1113,9 @@ mod tests {
           "method": "POST", "path": "/", "handler": "createGoal",
           "operation_id": "createGoal", "params": [],
           "request_body": { "ref_id": "internal/dto.CreateGoalInput" },
+          "request_body_content_type": "application/json",
           "responses": [
-            { "status": 201, "body": { "ref_id": "internal/dto.CommandMessage" } }
+            { "status": 201, "body": { "ref_id": "internal/dto.CommandMessage" }, "content_types": ["application/json"] }
           ],
           "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
         },
@@ -1129,7 +1131,7 @@ mod tests {
           ],
           "request_body": null,
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.GoalResponse" } }
+            { "status": 200, "body": { "ref_id": "internal/dto.GoalResponse" }, "content_types": ["application/json"] }
           ],
           "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 }
         },
@@ -1145,7 +1147,7 @@ mod tests {
           ],
           "request_body": null,
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" } }
+            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" }, "content_types": ["application/json"] }
           ],
           "span": { "file": "/root/http.go", "start_line": 3, "end_line": 3 }
         },
@@ -1160,8 +1162,9 @@ mod tests {
             }
           ],
           "request_body": { "ref_id": "internal/dto.CreateGoalInput" },
+          "request_body_content_type": "application/json",
           "responses": [
-            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" } }
+            { "status": 200, "body": { "ref_id": "internal/dto.CommandMessage" }, "content_types": ["application/json"] }
           ],
           "span": { "file": "/root/http.go", "start_line": 4, "end_line": 4 }
         }
@@ -1588,20 +1591,50 @@ mod tests {
     }
 
     #[test]
-    fn response_less_operation_renders_default_response() {
+    fn response_less_operation_is_an_explicit_error() {
         use crate::graph::Operation;
-        // An operation with NO responses still renders a non-empty OpenAPI responses object.
         let mut graph = sample_graph();
         let op: &mut Operation = &mut graph.operations[0];
+        let operation_id = op.id.clone();
         op.responses.clear();
-        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        let error = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
+        let message = error.to_string();
         assert!(
-            yaml.contains("'default':\n          description: Default response"),
-            "a response-less operation must render a default response:\n{yaml}"
+            message.contains(&operation_id) && message.contains("no response facts"),
+            "unexpected diagnostic: {message}"
         );
+    }
+
+    #[test]
+    fn missing_request_content_type_is_an_explicit_error() {
+        let mut graph = sample_graph();
+        let create = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "createGoal")
+            .unwrap();
+        create.request_body_content_type = None;
+        let error = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
         assert!(
-            !yaml.contains("responses: {}"),
-            "must not emit an empty responses object:\n{yaml}"
+            error.to_string().contains("request body content type"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn missing_response_content_type_is_an_explicit_error() {
+        let mut graph = sample_graph();
+        let create = graph
+            .operations
+            .iter_mut()
+            .find(|op| op.id == "createGoal")
+            .unwrap();
+        create.responses[0].content_type = None;
+        create.responses[0].content_types.clear();
+        let error = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap_err();
+        assert!(
+            error.to_string().contains("response content type"),
+            "unexpected diagnostic: {error}"
         );
     }
 

@@ -109,9 +109,8 @@ into the same graph used by code sources:
 - Local references and relative external-file references contained within the project root.
 
 The graph is deliberately smaller than the full OpenAPI vocabulary. Unrepresentable source facts
-emit `source.openapi.unrepresentable`; escaping external references are rejected. Use
-`gnr8 compat openapi`—not a graph round trip—when exact preservation of the entire document is the
-gate.
+emit `source.openapi.unrepresentable`; escaping external references are rejected. Treat those
+diagnostics as blocking when exact preservation is required.
 
 ## Source-to-target example
 
@@ -123,8 +122,7 @@ Pipeline::new()
     .target(
         TsSdk::new()
             .module("@acme/books")
-            .to("generated/typescript")
-            .profile(SdkProfile::typescript_fetch_compat()),
+            .to("generated/typescript"),
     );
 ```
 

@@ -34,10 +34,10 @@ assert.deepStrictEqual(
   "expected the 4 named operations"
 );
 
-// --- listBooks: GET / with cursor/genre/sort query params, no body, 200 ----
+// --- listBooks: GET /books/ with query params, no body, 200 ----------------
 const list = byId.listBooks;
 assert.strictEqual(list.method, "GET");
-assert.strictEqual(list.path, "/", "listBooks path is group-relative '/'");
+assert.strictEqual(list.path, "/books/");
 assert.strictEqual(list.handler, "listBooks");
 assert.strictEqual(list.request_body, null, "listBooks has no request body");
 assert.strictEqual(list.responses.length, 1);
@@ -62,10 +62,10 @@ assert.strictEqual(sort.required, false, "sort (has default) is optional");
 const cursor = list.params.find((p) => p.name === "cursor");
 assert.strictEqual(cursor.required, false, "cursor (?) is optional");
 
-// --- createBook: POST / with a request body, no params, 201 ---------------
+// --- createBook: POST /books/ with a request body, no params, 201 ----------
 const create = byId.createBook;
 assert.strictEqual(create.method, "POST");
-assert.strictEqual(create.path, "/", "createBook path is group-relative '/'");
+assert.strictEqual(create.path, "/books/");
 assert.deepStrictEqual(create.params, [], "createBook has no params (body only)");
 assert.notStrictEqual(create.request_body, null, "createBook has a request body");
 assert.strictEqual(create.request_body.ref_id, "src/books.dto.BookDto");
@@ -78,7 +78,7 @@ assert.strictEqual(
 // --- getBook: GET /{bookId} with a path param + an enum query, union resp --
 const get = byId.getBook;
 assert.strictEqual(get.method, "GET");
-assert.strictEqual(get.path, "/{bookId}", "getBook ':bookId' -> '{bookId}'");
+assert.strictEqual(get.path, "/books/{bookId}", "controller and method paths compose");
 const getBookId = get.params.find((p) => p.name === "bookId");
 assert.strictEqual(getBookId.location, "path", "bookId is a path param");
 assert.strictEqual(getBookId.required, true, "path param is required");
@@ -92,7 +92,7 @@ assert.strictEqual(get.request_body, null);
 // --- updateBook: PUT /{bookId} with a path param + a body, 200 ------------
 const update = byId.updateBook;
 assert.strictEqual(update.method, "PUT");
-assert.strictEqual(update.path, "/{bookId}");
+assert.strictEqual(update.path, "/books/{bookId}");
 const updBookId = update.params.find((p) => p.name === "bookId");
 assert.strictEqual(updBookId.location, "path");
 assert.strictEqual(updBookId.required, true);
@@ -103,12 +103,8 @@ assert.strictEqual(
   "src/books.dto.CreatedMessage"
 );
 
-// --- the @Controller('books') prefix is NEVER folded (rule 1) -------------
-for (const r of routes) {
-  assert.ok(
-    !r.path.startsWith("/books"),
-    "operation path '" + r.path + "' must not carry the @Controller prefix"
-  );
-}
+// --- the @Controller('books') prefix composes with every method path -------
+assert.strictEqual(byId.listBooks.path, "/books/");
+assert.strictEqual(byId.createBook.path, "/books/");
 
-console.log("routes.test.js: OK (4 routes, group-relative paths, method-derived status)");
+console.log("routes.test.js: OK (4 routes, composed controller paths, method-derived status)");

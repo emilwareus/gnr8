@@ -1,10 +1,12 @@
 # gnr8
 
-**One tool for the whole loop between your API code and OpenAPI + client SDKs, end to end, as a single native binary.**
+**One tool for the whole loop between your API code and OpenAPI + client SDKs, end to end.**
 
 `gnr8` reads your service code, builds a language- and router-agnostic model of its API, and generates
 an **OpenAPI 3.1** document and a client **SDK** from it. The generation lifecycle is **configured in
 code**, so you, or an AI agent, can adapt exactly how it parses and generates for your project.
+gnr8 owns this pipeline end to end while using focused open-source libraries for commodity concerns;
+the generated Go, Python, and TypeScript SDKs use only their standard libraries.
 
 > Status: **early release candidate.** Supported frontends are **Go + Gin**, **Python FastAPI**,
 > **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**, with OpenAPI 3.1 plus
@@ -25,7 +27,8 @@ code**, so you, or an AI agent, can adapt exactly how it parses and generates fo
 - **Fast.** A native binary with no warm-up.
 - **Incremental.** It regenerates only what actually changed; built for a save-and-see loop, not full
   rebuilds.
-- **No runtime.** A single binary. No Docker, no JVM, nothing to stand up.
+- **Local and inspectable.** The CLI and project-local Rust pipeline run on your machine or CI; there
+  is no hosted control plane to operate.
 - **Configured by code, not YAML, and built for AI agents.** The customization surface is *code*, not a
   config file with a handful of human-friendly flags. The point isn't minimal-config "ease of use" for
   humans; it's that an AI agent can write code to adapt the entire parse-and-generate lifecycle to your
@@ -141,15 +144,28 @@ side-by-side.
 
 ## Try the example
 
+### Prerequisites
+
+The release archive provides the `gnr8` CLI and extractor source resources, but generation is not a
+standalone-binary workflow. You need:
+
+- Rust and Cargo, because `gnr8 generate` compiles the project-local `.gnr8` configuration crate.
+- The analyzed service's toolchain: Go for Gin, Python 3 for FastAPI/Flask, or Node plus that project's
+  own `typescript` package for NestJS.
+- Access to Cargo's registry on the first build unless the required Rust crates are already cached.
+
+gnr8 statically recognizes the documented framework patterns; dynamic or unresolved code produces a
+diagnostic or an explicit failure. Review the exact envelope in [docs/USAGE.md](docs/USAGE.md).
+
 Install the CLI from the GitHub release archive:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the Rust API that `.gnr8/Cargo.toml` depends on; it is not the
-primary CLI install path yet. The release archive includes the `gnr8` binary plus the extractor
-resources needed by `gnr8 init`/`gnr8 generate`.
+The crates.io package named `gnr8` exposes the public Rust API; it is not the primary CLI install path.
+Generated `.gnr8/Cargo.toml` files use the matching `gnr8-core` source bundled in the complete release
+archive, alongside the extractor resources needed by `gnr8 init`/`gnr8 generate`.
 
 For local development from this checkout:
 
@@ -217,7 +233,8 @@ implements one trait and composes into the same pipeline.
 ## Principles (see [`CLAUDE.md`](CLAUDE.md))
 
 1. Everything is derived from **your code and your config**: one deterministic source per fact.
-2. **Self-contained:** a single native binary, no runtime to install.
+2. **Explicit prerequisites:** required compiler/toolchain and static-analysis limits are reported,
+   never hidden behind a silent recovery path.
 3. **Deterministic:** identical input → byte-identical output.
 4. **Extensible in code:** adapt the lifecycle by extending the framework, not by toggling flags.
 

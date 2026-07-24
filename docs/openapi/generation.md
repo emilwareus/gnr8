@@ -125,12 +125,5 @@ gnr8 doctor
 gnr8 check
 ```
 
-For a migration with a reference specification:
-
-```bash
-gnr8 compat openapi \
-  --old legacy/openapi.yaml \
-  --new generated/openapi.yaml
-```
-
-See [OpenAPI compatibility](compatibility.md) for exact semantics.
+For a migration with a reference specification, review the generated document with the same
+repository-level schema and consumer checks used for the existing contract.
