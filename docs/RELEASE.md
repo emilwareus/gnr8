@@ -49,8 +49,15 @@ Each archive contains:
 - `share/gnr8/tsextract`
 
 The `share/gnr8` tree is required because source extraction shells out to the Go/Python/TypeScript
-sidecars, and archive installs can scaffold `.gnr8` with a local path dependency for offline use.
-`gnr8` discovers this tree automatically from the archive layout; `GNR8_RESOURCE_DIR` can override it.
+sidecars. `gnr8` discovers this tree from the archive layout — `share/gnr8` beside the real
+executable, resolved through any install symlink — or from `GNR8_RESOURCE_DIR`. Exactly one location
+is selected and then validated; an incomplete tree is an error naming that location, never a silent
+search elsewhere.
+
+A packaged `gnr8 init` scaffolds `.gnr8` with a `gnr8 = "=<version>"` pin so the generated
+`Cargo.toml` is portable across machines, which is why `publish_crates` must succeed for a version
+before users of that archive can build their generator crate. Only in-repo builds scaffold a path
+dependency.
 
 The CLI and engine use focused open-source dependencies for commodity concerns such as serialization,
 CLI parsing, and file watching. gnr8 owns the source-to-OpenAPI-to-SDK pipeline itself; generated SDKs

@@ -27,7 +27,9 @@ case "$target" in
   *windows*) binary_name="${BINARY_NAME:-gnr8.exe}" ;;
 esac
 
-cargo build --locked --release -p gnr8-cli --target "$target"
+# Marks this build as one that ships to other machines, so `gnr8 init` scaffolds a portable
+# `gnr8 = "=<version>"` pin instead of a path dependency into this builder's checkout.
+GNR8_PACKAGED_RELEASE=1 cargo build --locked --release -p gnr8-cli --target "$target"
 
 binary_path="target/$target/release/$binary_name"
 if [[ ! -f "$binary_path" ]]; then

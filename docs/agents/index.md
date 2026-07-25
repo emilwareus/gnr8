@@ -8,6 +8,7 @@ current task; each page includes runnable examples, invariants, and failure beha
 
 | Task | Read |
 |---|---|
+| Install the packaged CLI or set up resources | [Installing gnr8](../install.md) |
 | Discover or run a CLI command | [CLI command reference](../cli/commands.md) |
 | Create or edit `.gnr8/src/main.rs` | [Pipeline configuration](../pipeline/configuration.md) |
 | Correct, enrich, or select API facts | [Transforms and overrides](../pipeline/transforms.md) |

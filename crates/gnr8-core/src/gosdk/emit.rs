@@ -3305,7 +3305,7 @@ pub(crate) fn emit_operations(
     base_path: &str,
     ops: &[&Operation],
 ) -> Result<String, CoreError> {
-    emit_operations_inner(graph, package, base_path, ops, true)
+    emit_operations_inner(graph, package, base_path, ops, true, true)
 }
 
 pub(crate) fn emit_operations_without_facades(
@@ -3313,8 +3313,94 @@ pub(crate) fn emit_operations_without_facades(
     package: &str,
     base_path: &str,
     ops: &[&Operation],
+    include_shared_helpers: bool,
 ) -> Result<String, CoreError> {
-    emit_operations_inner(graph, package, base_path, ops, false)
+    emit_operations_inner(
+        graph,
+        package,
+        base_path,
+        ops,
+        false,
+        include_shared_helpers,
+    )
+}
+
+/// Emit package-level request helpers once for split Go layouts.
+///
+/// Returns `None` when no operation needs wire or form/multipart helpers.
+pub(crate) fn emit_shared_request_helpers(
+    graph: &ApiGraph,
+    package: &str,
+    ops: &[&Operation],
+) -> Result<Option<String>, CoreError> {
+    let body_encodings = request_body_encodings(ops, graph)?;
+    let needs_wire_helpers = ops.iter().any(|op| operation_needs_wire_helpers(op));
+    let needs_body_helpers = body_encodings.iter().any(|encoding| {
+        matches!(
+            encoding,
+            RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart
+        )
+    });
+    if !needs_wire_helpers && !needs_body_helpers {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    emit_request_body_helpers(&mut body, &body_encodings)?;
+    if needs_wire_helpers {
+        emit_wire_parameter_helpers(&mut body);
+    }
+    let mut imports: Vec<&str> = request_body_helper_imports(&body_encodings);
+    if needs_wire_helpers {
+        imports.extend(WIRE_HELPER_IMPORTS);
+    }
+    Ok(Some(file(package, &imports, &body)))
+}
+
+/// Packages referenced by [`emit_wire_parameter_helpers`]'s emitted source.
+const WIRE_HELPER_IMPORTS: [&str; 6] = ["fmt", "net/url", "reflect", "sort", "strings", "time"];
+
+/// Packages referenced by [`emit_request_body_helpers`]'s emitted source, for the given encodings.
+///
+/// This is the single source of truth for the helper file's imports: the same set is declared by
+/// whichever file carries the helpers — the combined `operations.go` in monolithic layouts, or the
+/// dedicated `wire_helpers.go` in split layouts. Go rejects an unused import, so this must describe
+/// the helper source exactly, not a superset.
+fn request_body_helper_imports(encodings: &[RequestBodyEncoding]) -> Vec<&'static str> {
+    let needs_form = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::FormUrlEncoded));
+    let needs_multipart = encodings
+        .iter()
+        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart));
+    let mut imports = Vec::new();
+    if needs_form || needs_multipart {
+        // `addFormValues`/`addFormField`/`formFieldName`/`formValue` are shared by both encodings.
+        imports.extend(["fmt", "net/url", "reflect", "strings"]);
+    }
+    if needs_multipart {
+        // `encodeMultipartBody` buffers through `bytes`; `addMultipartValues` writes via `multipart`.
+        imports.extend(["bytes", "mime/multipart"]);
+    }
+    imports
+}
+
+/// Packages referenced by an operation's own request-body emission, excluding the shared helpers.
+///
+/// Form and multipart bodies delegate entirely to `encodeFormBody`/`encodeMultipartBody`, so the
+/// operation itself names none of those helpers' packages — except that the optional-multipart path
+/// declares `var reader *bytes.Reader` before the call.
+fn request_body_operation_imports(
+    op: &Operation,
+    encoding: RequestBodyEncoding,
+) -> &'static [&'static str] {
+    match encoding {
+        RequestBodyEncoding::Json | RequestBodyEncoding::Binary => &["bytes"],
+        RequestBodyEncoding::Text => &["fmt", "strings"],
+        // The optional path declares `var reader *bytes.Reader` before calling the helper; the
+        // required path assigns the helper's return value directly and names nothing.
+        RequestBodyEncoding::Multipart if !op.request_body_required => &["bytes"],
+        RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart => &[],
+    }
 }
 
 fn emit_operations_inner(
@@ -3323,6 +3409,7 @@ fn emit_operations_inner(
     base_path: &str,
     ops: &[&Operation],
     include_facades: bool,
+    include_shared_helpers: bool,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     let body_encodings = request_body_encodings(ops, graph)?;
@@ -3335,10 +3422,12 @@ fn emit_operations_inner(
         emit_operation(&mut body, op, graph, base_path)?;
         emit_pagination_helpers(&mut body, op, graph)?;
     }
-    emit_request_body_helpers(&mut body, &body_encodings)?;
     let needs_wire_helpers = ops.iter().any(|op| operation_needs_wire_helpers(op));
-    if needs_wire_helpers {
-        emit_wire_parameter_helpers(&mut body);
+    if include_shared_helpers {
+        emit_request_body_helpers(&mut body, &body_encodings)?;
+        if needs_wire_helpers {
+            emit_wire_parameter_helpers(&mut body);
+        }
     }
     // A non-empty operations file always touches the request-plumbing imports. An empty graph still
     // emits operations.go for a stable SDK layout, but that package-only file needs no imports.
@@ -3347,43 +3436,16 @@ fn emit_operations_inner(
     } else {
         vec!["context", "encoding/json", "io", "net/http"]
     };
-    if body_encodings.iter().any(|encoding| {
-        matches!(
-            encoding,
-            RequestBodyEncoding::Json
-                | RequestBodyEncoding::Multipart
-                | RequestBodyEncoding::Binary
-        )
-    }) {
-        imports.push("bytes");
+    // Imports the operation bodies themselves name, derived per operation so an encoding whose
+    // plumbing lives entirely in the shared helpers contributes nothing here.
+    for op in ops {
+        if let Some(model) = request_body_model_of(op, graph)? {
+            imports.extend(request_body_operation_imports(op, model.encoding));
+        }
     }
-    if body_encodings.iter().any(|encoding| {
-        matches!(
-            encoding,
-            RequestBodyEncoding::Text | RequestBodyEncoding::FormUrlEncoded
-        )
-    }) {
-        imports.push("strings");
-    }
-    if body_encodings
-        .iter()
-        .any(|encoding| matches!(encoding, RequestBodyEncoding::Text))
-    {
-        imports.push("fmt");
-    }
-    if body_encodings.iter().any(|encoding| {
-        matches!(
-            encoding,
-            RequestBodyEncoding::FormUrlEncoded | RequestBodyEncoding::Multipart
-        )
-    }) {
-        imports.extend(["fmt", "net/url", "reflect", "strings"]);
-    }
-    if body_encodings
-        .iter()
-        .any(|encoding| matches!(encoding, RequestBodyEncoding::Multipart))
-    {
-        imports.push("mime/multipart");
+    // Imports for the helper source, declared only by the file that actually carries it.
+    if include_shared_helpers {
+        imports.extend(request_body_helper_imports(&body_encodings));
     }
     let mut needs_io = ops
         .iter()
@@ -3398,8 +3460,8 @@ fn emit_operations_inner(
         imports.push("io");
     }
     imports.extend(query_imports(ops, graph)?);
-    if needs_wire_helpers {
-        imports.extend(["fmt", "net/url", "reflect", "sort", "strings", "time"]);
+    if include_shared_helpers && needs_wire_helpers {
+        imports.extend(WIRE_HELPER_IMPORTS);
     }
     // WR-04: any op with a templated path interpolates `url.PathEscape(...)`, which needs `net/url`.
     if ops

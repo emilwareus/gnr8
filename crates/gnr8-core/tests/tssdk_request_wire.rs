@@ -40,9 +40,16 @@ fn parameter_graph() -> gnr8::graph::ApiGraph {
             {
               "id": "sendWire",
               "method": "GET",
-              "path": "/wire",
+              "path": "/wire/{catalogId}/items",
               "handler": "sendWire",
               "params": [
+                {
+                  "name": "catalogId",
+                  "location": "path",
+                  "required": true,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "provenance": { "file": "wire.ts", "start_line": 1, "end_line": 1 }
+                },
                 {
                   "name": "statuses",
                   "location": "query",
@@ -113,6 +120,9 @@ const DRIVER: &str = r#"import { Client } from "./client";
 const transport: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
   const headers = new Headers(init?.headers);
+  if (url.pathname !== "/api/wire/catalog%2Falpha/items") {
+    throw new Error(`path was not encoded: ${url.pathname}`);
+  }
   const statuses = url.searchParams.getAll("statuses");
   if (statuses.join(",") !== "active,pending") throw new Error(`statuses=${statuses}`);
   if (url.searchParams.has("X-Signature")) throw new Error(`signature leaked: ${url.search}`);
@@ -133,6 +143,7 @@ const transport: typeof fetch = async (input, init) => {
 async function main(): Promise<void> {
   const client = new Client({ baseUrl: "https://api.test", fetch: transport });
   await client.sendWire(
+    "catalog/alpha",
     ["active", "pending"],
     "https://example.test/a b+c?x=1",
     "sig",

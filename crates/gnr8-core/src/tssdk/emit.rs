@@ -964,7 +964,7 @@ pub(crate) fn emit_operations(
     out.push_str("}\n");
     emit_group_facades(&mut out, ops)?;
     if ts_operations_need_wire_helpers(ops) {
-        emit_ts_wire_helpers(&mut out);
+        emit_ts_wire_helpers(&mut out, ts_operations_need_query_string_helper(ops));
     }
     Ok(out)
 }
@@ -999,7 +999,7 @@ pub(crate) fn emit_operation_module(
         emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::PrototypeFunction)?;
     }
     if ts_operations_need_wire_helpers(ops) {
-        emit_ts_wire_helpers(&mut out);
+        emit_ts_wire_helpers(&mut out, ts_operations_need_query_string_helper(ops));
     }
     Ok(out)
 }
@@ -1789,14 +1789,28 @@ fn ts_parameter_needs_pairs(param: &Param) -> bool {
     )
 }
 
+/// Whether any operation in this file serializes a parameter through `wireParameterPairs`.
+///
+/// Every query parameter does, plus header/cookie parameters whose shape expands to several pairs.
 fn ts_operations_need_wire_helpers(ops: &[&Operation]) -> bool {
     ops.iter().any(|op| {
         op.params.iter().any(|param| {
             param.allow_reserved
+                || param.location == "query"
                 || ((param.location == "header" || param.location == "cookie")
                     && ts_parameter_needs_pairs(param))
         })
     })
+}
+
+/// Whether any operation in this file builds its query string with `wireQueryString`.
+///
+/// Only `allowReserved` parameters need it — everything else uses `URLSearchParams.toString()`.
+/// Emitting it unconditionally would leave an unused function in most generated SDKs, which trips
+/// consumers compiling with `noUnusedLocals` or linting the generated output.
+fn ts_operations_need_query_string_helper(ops: &[&Operation]) -> bool {
+    ops.iter()
+        .any(|op| op.params.iter().any(|param| param.allow_reserved))
 }
 
 fn emit_ts_header_cookie_parameters(
@@ -1881,17 +1895,25 @@ fn emit_ts_header_cookie_parameter(
     Ok(())
 }
 
-fn emit_ts_wire_helpers(out: &mut String) {
+/// Emit only the wire helpers this file's operations actually call.
+fn emit_ts_wire_helpers(out: &mut String, needs_query_string: bool) {
+    emit_ts_wire_parameter_pairs(out);
+    if needs_query_string {
+        emit_ts_wire_query_string(out);
+    }
+}
+
+fn emit_ts_wire_parameter_pairs(out: &mut String) {
     out.push_str(
         r#"
-
 function wireParameterPairs(
   name: string,
   value: unknown,
   style: string,
   explode: boolean,
 ): Array<[string, string]> {
-  const delimiter = style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
+  const delimiter =
+    style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
   if (Array.isArray(value)) {
     const parts = value.map((item) => String(item));
     return explode && style === "form"
@@ -1899,11 +1921,14 @@ function wireParameterPairs(
       : [[name, parts.join(delimiter)]];
   }
   if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
-      a.localeCompare(b),
+    const entries = Object.entries(value as Record<string, unknown>).sort(
+      ([a], [b]) => a.localeCompare(b),
     );
     if (style === "deepObject") {
-      return entries.map(([key, item]) => [name + "[" + key + "]", String(item)]);
+      return entries.map(([key, item]) => [
+        name + "[" + key + "]",
+        String(item),
+      ]);
     }
     if (explode && style === "form") {
       return entries.map(([key, item]) => [key, String(item)]);
@@ -1915,8 +1940,17 @@ function wireParameterPairs(
   }
   return [[name, String(value)]];
 }
+"#,
+    );
+}
 
-function wireQueryString(values: URLSearchParams, allowReserved: Set<number>): string {
+fn emit_ts_wire_query_string(out: &mut String) {
+    out.push_str(
+        r#"
+function wireQueryString(
+  values: URLSearchParams,
+  allowReserved: Set<number>,
+): string {
   const restoreReserved = (value: string): string =>
     value.replace(
       /%3A|%2F|%3F|%23|%5B|%5D|%40|%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D/gi,
@@ -2100,30 +2134,34 @@ fn emit_query_param_value(
     indent_width: usize,
     track_pair_index: bool,
 ) -> Result<(), CoreError> {
+    // Reject unsupported query shapes early (nested arrays, objects, maps) before emission.
+    let _ = ts_query_shape(&param.schema, graph, &param.name)?;
     let spaces = " ".repeat(indent_width);
-    let key = quoted_string_literal(&param.name);
-    match ts_query_shape(&param.schema, graph, &param.name)? {
-        TsQueryShape::Scalar => {
-            writeln!(out, "{spaces}searchParams.set({key}, String({ident}));").map_err(sink)?;
-            if param.allow_reserved {
-                writeln!(out, "{spaces}allowReserved.add(queryPairIndex);").map_err(sink)?;
-            }
-            if track_pair_index {
-                writeln!(out, "{spaces}queryPairIndex += 1;").map_err(sink)?;
-            }
-        }
-        TsQueryShape::Array => {
-            writeln!(out, "{spaces}for (const value of {ident}) {{").map_err(sink)?;
-            writeln!(out, "{spaces}  searchParams.append({key}, String(value));").map_err(sink)?;
-            if param.allow_reserved {
-                writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
-            }
-            if track_pair_index {
-                writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
-            }
-            writeln!(out, "{spaces}}}").map_err(sink)?;
-        }
+    let inner = format!("{spaces}  ");
+    // Always wrap the call so generated TS stays under Prettier's 80-col printWidth.
+    writeln!(
+        out,
+        "{spaces}for (const [wireName, wireValue] of wireParameterPairs("
+    )
+    .map_err(sink)?;
+    writeln!(out, "{inner}{},", quoted_string_literal(&param.name)).map_err(sink)?;
+    writeln!(out, "{inner}{ident},").map_err(sink)?;
+    writeln!(
+        out,
+        "{inner}{},",
+        quoted_string_literal(ts_parameter_style(param))
+    )
+    .map_err(sink)?;
+    writeln!(out, "{inner}{},", ts_parameter_explode(param)).map_err(sink)?;
+    writeln!(out, "{spaces})) {{").map_err(sink)?;
+    writeln!(out, "{spaces}  searchParams.append(wireName, wireValue);").map_err(sink)?;
+    if param.allow_reserved {
+        writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
     }
+    if track_pair_index {
+        writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
+    }
+    writeln!(out, "{spaces}}}").map_err(sink)?;
     Ok(())
 }
 
@@ -3120,6 +3158,32 @@ mod tests {
                 .collect()
         }
 
+        /// The exact query-serialization block the emitter produces at `indent` spaces.
+        ///
+        /// Query parameters always route through `wireParameterPairs`, and the call always wraps one
+        /// argument per line to stay inside Prettier's 80-col printWidth. Asserting the whole block
+        /// keeps these tests honest about the emitted shape, including indentation.
+        fn wire_pairs_block(
+            indent: usize,
+            name: &str,
+            argument: &str,
+            style: &str,
+            explode: bool,
+        ) -> String {
+            let spaces = " ".repeat(indent);
+            let inner = format!("{spaces}  ");
+            [
+                format!("{spaces}for (const [wireName, wireValue] of wireParameterPairs("),
+                format!("{inner}\"{name}\","),
+                format!("{inner}{argument},"),
+                format!("{inner}\"{style}\","),
+                format!("{inner}{explode},"),
+                format!("{spaces})) {{"),
+                format!("{spaces}  searchParams.append(wireName, wireValue);"),
+            ]
+            .join("\n")
+        }
+
         fn string_param(name: &str, location: &str, required: bool, allow_reserved: bool) -> Param {
             Param {
                 name: name.to_string(),
@@ -3385,7 +3449,7 @@ mod tests {
                 "required body must stay before required query params:\n{out}"
             );
             assert!(
-                out.contains("searchParams.set(\"tenant\", String(tenant));"),
+                out.contains(&wire_pairs_block(4, "tenant", "tenant", "form", true)),
                 "{out}"
             );
         }
@@ -3424,11 +3488,70 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("searchParams.set(\"redirect\", String(redirect));")
+                out.contains(&wire_pairs_block(4, "redirect", "redirect", "form", true))
                     && out.contains("allowReserved.add(queryPairIndex);")
                     && out.contains("queryPairIndex += 1;"),
                 "allowReserved scalar query parameter must mark and advance its pair index:\n{out}"
             );
+        }
+
+        /// Every helper the emitter writes must be called by the file that carries it.
+        ///
+        /// `wireQueryString` is only reachable from an `allowReserved` parameter, but query
+        /// parameters in general now route through `wireParameterPairs` — emitting both together
+        /// would leave a dead function in most generated SDKs, breaking consumers that compile the
+        /// output with `noUnusedLocals` or lint it.
+        fn assert_no_unreferenced_helpers(out: &str) {
+            for line in out.lines() {
+                let Some(name) = line
+                    .strip_prefix("function ")
+                    .and_then(|rest| rest.split('(').next())
+                else {
+                    continue;
+                };
+                let calls = out.matches(&format!("{name}(")).count();
+                assert!(
+                    calls > 1,
+                    "generated helper `{name}` is declared but never called:\n{out}"
+                );
+            }
+        }
+
+        #[test]
+        fn plain_query_params_do_not_emit_an_unused_query_string_helper() {
+            let g = ops_graph();
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+
+            assert!(
+                out.contains("function wireParameterPairs("),
+                "query params serialize through wireParameterPairs:\n{out}"
+            );
+            assert!(
+                !out.contains("wireQueryString"),
+                "wireQueryString must not be emitted when no parameter sets allowReserved:\n{out}"
+            );
+            assert_no_unreferenced_helpers(&out);
+        }
+
+        #[test]
+        fn allow_reserved_query_emits_the_query_string_helper_it_calls() {
+            let mut g = ops_graph();
+            let op = g
+                .operations
+                .iter_mut()
+                .find(|operation| operation.id == "listBooks")
+                .unwrap();
+            op.params
+                .push(string_param("redirect", "query", true, true));
+
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+
+            assert!(
+                out.contains("function wireQueryString(")
+                    && out.contains("wireQueryString(searchParams, allowReserved)"),
+                "an allowReserved parameter must both define and call wireQueryString:\n{out}"
+            );
+            assert_no_unreferenced_helpers(&out);
         }
 
         #[test]
@@ -3445,9 +3568,9 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains(
-                    "for (const value of tag) {\n        searchParams.append(\"tag\", String(value));\n        allowReserved.add(queryPairIndex);\n        queryPairIndex += 1;\n      }"
-                ),
+                out.contains(&wire_pairs_block(6, "tag", "tag", "form", true))
+                    && out.contains("allowReserved.add(queryPairIndex);")
+                    && out.contains("queryPairIndex += 1;"),
                 "every repeated allowReserved value must mark and advance its pair index:\n{out}"
             );
         }
@@ -3535,7 +3658,7 @@ mod tests {
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("searchParams.set(\"cursor\", String(cursor));"),
+                out.contains(&wire_pairs_block(6, "cursor", "cursor", "form", true)),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -3576,9 +3699,12 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(out.contains("if (tag !== undefined) {"), "{out}");
-            assert!(out.contains("for (const value of tag) {"), "{out}");
             assert!(
-                out.contains("searchParams.append(\"tag\", String(value));"),
+                out.contains(&wire_pairs_block(6, "tag", "tag", "form", true)),
+                "array query values must go through wireParameterPairs:\n{out}"
+            );
+            assert!(
+                out.contains("searchParams.append(wireName, wireValue);"),
                 "{out}"
             );
             assert!(
@@ -3878,7 +4004,10 @@ mod tests {
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
+            assert!(
+                out.contains(&wire_pairs_block(4, "q", "q", "form", true)),
+                "{out}"
+            );
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 

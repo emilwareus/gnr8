@@ -17,11 +17,13 @@
 //! The generated SDK/OpenAPI *outputs* live OUTSIDE `.gnr8/` at the paths the pipeline's targets
 //! declare (D-02) and are intentionally committed by the user — they are NOT scaffolded here.
 //!
-//! ## The `gnr8` dependency: one selected resource source
+//! ## The `gnr8` dependency: one compile-time choice
 //!
-//! `init` emits a path dependency to `crates/gnr8-core` under the single resource root selected for
-//! this build. Development builds select the repository root fixed at compile time; release builds
-//! select the archive's `share/gnr8` root. A missing source is an error, not a registry substitution.
+//! A packaged build emits `gnr8 = "=<version>"` — the exact published crate — so the scaffolded
+//! `Cargo.toml` is portable and can be committed. A build from this repository emits a path
+//! dependency on the local `crates/gnr8-core` instead, so developing gnr8 itself stays offline.
+//! `scripts/package-release.sh` fixes the choice at compile time via `GNR8_PACKAGED_RELEASE`; it is
+//! never inferred from the runtime filesystem. See [`core_dependency_line`].
 //!
 //! Idempotency (D-01): every workspace file is written *only if absent*, via
 //! `OpenOptions::create_new(true)` — atomically failing with [`std::io::ErrorKind::AlreadyExists`] if
@@ -169,7 +171,7 @@ pub fn init_with_presets(
     })?;
 
     let crate_name = crate_name_for(root);
-    let core_dep = core_dependency_line()?;
+    let core_dep = core_dependency_line();
     let cargo_toml = cargo_toml_body(&crate_name, &core_dep);
     let main_rs = main_rs_body(source, sdk);
     let readme = readme_body(source, sdk);
@@ -280,38 +282,34 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
     )
 }
 
-/// The `gnr8` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
+/// The `gnr8` dependency line for a scaffolded `.gnr8/Cargo.toml`.
 ///
-/// The resource root selected by [`crate::resource::resource_dir`] is the only dependency source. The
-/// scaffold fails when it does not contain `crates/gnr8-core`; it never switches to a registry
-/// dependency or searches ancestor directories.
-fn core_dependency_line() -> Result<String, CoreError> {
-    let resource_root = crate::resource::resource_dir()?;
-    core_dependency_line_from(Some(resource_root.as_path()))
+/// A packaged build pins the published crate version, so the generated `Cargo.toml` is portable:
+/// committing it does not tie teammates to one machine's install prefix. Sidecar resources still
+/// come from the CLI install (see [`crate::resource`]); crates.io supplies the Rust API only.
+///
+/// A build from this repository instead points at the local workspace, so developing gnr8 itself
+/// stays offline and tracks uncommitted changes to `gnr8-core`.
+///
+/// Which of the two applies is fixed **at compile time** by `GNR8_PACKAGED_RELEASE`, which
+/// `scripts/package-release.sh` sets when it builds an archive. It is deliberately not inferred from
+/// the runtime filesystem: probing for a `.git` next to the compile-time manifest directory makes a
+/// released binary emit a path dependency whenever it happens to run on the machine that built it,
+/// so the artifact shipped to users could never be validated by running it locally.
+fn core_dependency_line() -> String {
+    match option_env!("GNR8_PACKAGED_RELEASE") {
+        Some(_) => version_dependency_line(env!("CARGO_PKG_VERSION")),
+        None => path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR"))),
+    }
 }
 
-fn core_dependency_line_from(resource_root: Option<&Path>) -> Result<String, CoreError> {
-    let resource_root = resource_root.ok_or_else(|| CoreError::Workspace {
-        message:
-            "no gnr8-core dependency source was declared; install the complete release archive"
-                .to_string(),
-    })?;
-    let candidate = resource_root.join("crates").join("gnr8-core");
-    if !candidate.join("Cargo.toml").is_file() {
-        return Err(CoreError::Workspace {
-            message: format!(
-                "declared gnr8-core dependency source is missing at {}",
-                candidate.display()
-            ),
-        });
-    }
-    let path = std::fs::canonicalize(&candidate).map_err(|source| CoreError::Workspace {
-        message: format!(
-            "failed to resolve declared gnr8-core dependency source {}: {source}",
-            candidate.display()
-        ),
-    })?;
-    Ok(format!("gnr8 = {{ path = {:?} }}", path.to_string_lossy()))
+fn version_dependency_line(version: &str) -> String {
+    format!("gnr8 = \"={version}\"")
+}
+
+fn path_dependency_line(core_dir: &Path) -> String {
+    let resolved = std::fs::canonicalize(core_dir).unwrap_or_else(|_| core_dir.to_path_buf());
+    format!("gnr8 = {{ path = {:?} }}", resolved.to_string_lossy())
 }
 
 /// Derive the scaffolded crate name `<dirname>-gnr8-gen` from `root`'s final path component, sanitized
@@ -406,7 +404,9 @@ mod tests {
     // test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{core_dependency_line_from, crate_name_for};
+    use super::{
+        core_dependency_line, crate_name_for, path_dependency_line, version_dependency_line,
+    };
     use std::path::Path;
 
     #[test]
@@ -427,11 +427,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_declared_core_dependency_is_an_explicit_error() {
-        let error = core_dependency_line_from(None).unwrap_err();
+    fn packaged_init_emits_exact_crates_io_version_pin() {
+        assert_eq!(version_dependency_line("0.1.22"), "gnr8 = \"=0.1.22\"");
+    }
+
+    #[test]
+    fn in_repo_init_points_at_the_local_gnr8_core_crate() {
+        let line = path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR")));
         assert!(
-            error.to_string().contains("gnr8-core dependency source"),
-            "unexpected diagnostic: {error}"
+            line.starts_with("gnr8 = { path = \"") && line.ends_with("gnr8-core\" }"),
+            "expected a path dependency on the local crate, got: {line}"
+        );
+    }
+
+    /// The packaged/in-repo choice is compile-time, so a test binary — which is never built with
+    /// `GNR8_PACKAGED_RELEASE` — must always take the path branch, regardless of ambient state such
+    /// as whether a `.git` directory happens to exist beside the compile-time manifest dir.
+    #[test]
+    fn dependency_choice_is_fixed_at_compile_time_not_probed() {
+        assert_eq!(
+            core_dependency_line(),
+            path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            "a non-packaged build must always emit the local path dependency"
         );
     }
 }

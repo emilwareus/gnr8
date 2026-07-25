@@ -16,7 +16,7 @@ mod watch;
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -1208,10 +1208,23 @@ fn collect_sdk_readiness(
     }
 
     let groups = artifact_groups_by_anchor(bundle);
-    groups
+    let mut readiness = groups
         .into_iter()
         .filter_map(|(anchor, artifacts)| readiness_for_artifact_group(&anchor, &artifacts))
-        .collect()
+        .collect::<Vec<_>>();
+    // Nested StaticFiles anchors can share one Python package root — keep a single readiness entry.
+    dedupe_python_readiness(&mut readiness);
+    readiness
+}
+
+fn dedupe_python_readiness(readiness: &mut Vec<doctor::SdkReadiness>) {
+    let mut seen_roots = BTreeSet::new();
+    readiness.retain(|entry| {
+        if entry.language != "python" {
+            return true;
+        }
+        seen_roots.insert(entry.output_path.clone())
+    });
 }
 
 fn artifact_groups_by_anchor(
@@ -1350,6 +1363,7 @@ fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> do
             "failed to materialize generated Python SDK for readiness",
         );
     };
+    let package_dir = python_package_root(&materialized.target_dir, &materialized.root);
     let py_files = artifacts
         .iter()
         .filter(|artifact| path_extension_is(&artifact.path, "py"))
@@ -1366,10 +1380,54 @@ fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> do
     if let Err(reason) = python_compile(&py_files) {
         return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
     }
-    if let Err(reason) = python_import_package(&materialized.target_dir) {
-        return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
+    match python_import_package_result(&package_dir) {
+        Ok(warnings) if warnings.is_empty() => doctor::SdkReadiness::ready(
+            "python",
+            package_dir_display(anchor, &package_dir, &materialized),
+            TOOLCHAIN,
+        ),
+        Ok(warnings) => doctor::SdkReadiness::ready_with_warnings(
+            "python",
+            package_dir_display(anchor, &package_dir, &materialized),
+            TOOLCHAIN,
+            warnings,
+        ),
+        Err(reason) => doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason),
     }
-    doctor::SdkReadiness::ready("python", anchor, TOOLCHAIN)
+}
+
+fn package_dir_display(
+    anchor: &str,
+    package_dir: &Path,
+    materialized: &MaterializedTarget,
+) -> String {
+    package_dir.strip_prefix(&materialized.root).map_or_else(
+        |_| anchor.to_string(),
+        |rel| rel.to_string_lossy().replace('\\', "/"),
+    )
+}
+
+/// Prefer the package root (directory with `__init__.py` or `pyproject.toml`) over a nested anchor.
+///
+/// The walk is bounded by `root` — the materialized tree — so it can never escape into the ambient
+/// filesystem and adopt an unrelated `__init__.py` as the package root.
+fn python_package_root(target_dir: &Path, root: &Path) -> PathBuf {
+    let is_package =
+        |dir: &Path| dir.join("pyproject.toml").is_file() || dir.join("__init__.py").is_file();
+    if is_package(target_dir) {
+        return target_dir.to_path_buf();
+    }
+    let mut current = target_dir;
+    while let Some(parent) = current.parent() {
+        if !parent.starts_with(root) {
+            break;
+        }
+        if is_package(parent) {
+            return parent.to_path_buf();
+        }
+        current = parent;
+    }
+    target_dir.to_path_buf()
 }
 
 fn validate_typescript_target(
@@ -1422,9 +1480,6 @@ fn validate_typescript_target(
             "generated TypeScript SDK contains no .ts files",
         );
     }
-    if let Err(reason) = typescript_typecheck(&tsc, &ts_files, &materialized.target_dir) {
-        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
-    }
     if materialized.target_dir.join("package.json").is_file() {
         if !materialized.target_dir.join("tsconfig.json").is_file() {
             return doctor::SdkReadiness::not_ready(
@@ -1434,6 +1489,7 @@ fn validate_typescript_target(
                 "generated TypeScript package is missing tsconfig.json",
             );
         }
+        // Prefer the package project build so doctor honors tsconfig paths/rootDir.
         if let Err(reason) = typescript_build(&tsc, &materialized.target_dir) {
             return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
         }
@@ -1450,6 +1506,10 @@ fn validate_typescript_target(
                 return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
             }
         }
+        return doctor::SdkReadiness::ready("typescript", anchor, TOOLCHAIN);
+    }
+    if let Err(reason) = typescript_typecheck(&tsc, &ts_files, &materialized.target_dir) {
+        return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
     }
     doctor::SdkReadiness::ready("typescript", anchor, TOOLCHAIN)
 }
@@ -1594,7 +1654,7 @@ fn python_compile(files: &[PathBuf]) -> Result<(), String> {
     command_success_in("python3", &arg_refs, Path::new("."), &[])
 }
 
-fn python_import_package(package_dir: &Path) -> Result<(), String> {
+fn python_import_package_result(package_dir: &Path) -> Result<Vec<String>, String> {
     let init = package_dir.join("__init__.py");
     if !init.is_file() {
         return Err("generated Python SDK is missing __init__.py".to_string());
@@ -1602,25 +1662,58 @@ fn python_import_package(package_dir: &Path) -> Result<(), String> {
     let code = "\
 import importlib.util
 import sys
+import warnings
 init_path = sys.argv[1]
 package_dir = sys.argv[2]
-spec = importlib.util.spec_from_file_location(
-    'gnr8_sdk_check',
-    init_path,
-    submodule_search_locations=[package_dir],
-)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter('always')
+    spec = importlib.util.spec_from_file_location(
+        'gnr8_sdk_check',
+        init_path,
+        submodule_search_locations=[package_dir],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    for item in caught:
+        print(f'WARNING:{item.category.__name__}:{item.message}', file=sys.stderr)
 ";
     let init_arg = init.to_string_lossy().into_owned();
     let dir_arg = package_dir.to_string_lossy().into_owned();
-    command_success_in(
-        "python3",
-        &["-c", code, &init_arg, &dir_arg],
-        package_dir.parent().unwrap_or_else(|| Path::new(".")),
-        &[],
-    )
+    let mut command = Command::new("python3");
+    command
+        .args(["-c", code, &init_arg, &dir_arg])
+        .env("PYTHONWARNINGS", "default")
+        .current_dir(package_dir.parent().unwrap_or_else(|| Path::new(".")));
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to import generated Python SDK: {err}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "importing generated Python SDK failed: {}",
+            command_output_excerpt(&output)
+        ));
+    }
+    let warnings = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("WARNING:"))
+        .map(|line| {
+            if line.contains("allow_population_by_field_name") {
+                "Pydantic emitted configuration deprecation warnings".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut unique = Vec::new();
+    for warning in warnings {
+        if !unique.contains(&warning) {
+            unique.push(warning);
+        }
+    }
+    Ok(unique)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -316,12 +316,33 @@ export class Client {
   ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
     const searchParams = new URLSearchParams();
-    searchParams.set("genre", String(genre));
+    for (const [wireName, wireValue] of wireParameterPairs(
+      "genre",
+      genre,
+      "form",
+      true,
+    )) {
+      searchParams.append(wireName, wireValue);
+    }
     if (cursor !== undefined) {
-      searchParams.set("cursor", String(cursor));
+      for (const [wireName, wireValue] of wireParameterPairs(
+        "cursor",
+        cursor,
+        "form",
+        true,
+      )) {
+        searchParams.append(wireName, wireValue);
+      }
     }
     if (sort !== undefined) {
-      searchParams.set("sort", String(sort));
+      for (const [wireName, wireValue] of wireParameterPairs(
+        "sort",
+        sort,
+        "form",
+        true,
+      )) {
+        searchParams.append(wireName, wireValue);
+      }
     }
     const qs = searchParams.toString();
     if (qs) {
@@ -415,7 +436,14 @@ export class Client {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
-      searchParams.set("fmt", String(fmt));
+      for (const [wireName, wireValue] of wireParameterPairs(
+        "fmt",
+        fmt,
+        "form",
+        true,
+      )) {
+        searchParams.append(wireName, wireValue);
+      }
     }
     const qs = searchParams.toString();
     if (qs) {
@@ -501,4 +529,39 @@ export class Client {
     }
     throw new ApiError(res.status);
   }
+}
+
+function wireParameterPairs(
+  name: string,
+  value: unknown,
+  style: string,
+  explode: boolean,
+): Array<[string, string]> {
+  const delimiter =
+    style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => String(item));
+    return explode && style === "form"
+      ? parts.map((item) => [name, item])
+      : [[name, parts.join(delimiter)]];
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(
+      ([a], [b]) => a.localeCompare(b),
+    );
+    if (style === "deepObject") {
+      return entries.map(([key, item]) => [
+        name + "[" + key + "]",
+        String(item),
+      ]);
+    }
+    if (explode && style === "form") {
+      return entries.map(([key, item]) => [key, String(item)]);
+    }
+    const parts = entries.flatMap(([key, item]) =>
+      explode ? [key + "=" + String(item)] : [key, String(item)],
+    );
+    return [[name, parts.join(delimiter)]];
+  }
+  return [[name, String(value)]];
 }

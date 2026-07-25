@@ -95,8 +95,9 @@ ordinary Rust (a custom `Source`/`Transform`/`Target`/`PostProcess`).
   .gitignore      # /target/  /cache/
   cache/          # ownership manifest (git-ignored)
 ```
-The `gnr8` dependency is always a canonical `path = "…"` dependency to `crates/gnr8-core` in the
-selected source tree or complete release archive.
+The `gnr8` dependency is a version pin (`gnr8 = "=x.y.z"`) when you install from a release
+archive. Sidecar extractors still come from the packaged CLI (`share/gnr8` next to the real
+executable, or `$GNR8_RESOURCE_DIR`). In-repo development scaffolds keep a local path dependency.
 
 ### The SDK surface (`gnr8::sdk`, re-exported as `gnr8::sdk::prelude`)
 A pipeline composes four kinds of stage, decoupling **N sources** from **M targets** through one IR
