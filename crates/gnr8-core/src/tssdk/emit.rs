@@ -1793,6 +1793,7 @@ fn ts_operations_need_wire_helpers(ops: &[&Operation]) -> bool {
     ops.iter().any(|op| {
         op.params.iter().any(|param| {
             param.allow_reserved
+                || param.location == "query"
                 || ((param.location == "header" || param.location == "cookie")
                     && ts_parameter_needs_pairs(param))
         })
@@ -1884,14 +1885,14 @@ fn emit_ts_header_cookie_parameter(
 fn emit_ts_wire_helpers(out: &mut String) {
     out.push_str(
         r#"
-
 function wireParameterPairs(
   name: string,
   value: unknown,
   style: string,
   explode: boolean,
 ): Array<[string, string]> {
-  const delimiter = style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
+  const delimiter =
+    style === "spaceDelimited" ? " " : style === "pipeDelimited" ? "|" : ",";
   if (Array.isArray(value)) {
     const parts = value.map((item) => String(item));
     return explode && style === "form"
@@ -1899,11 +1900,14 @@ function wireParameterPairs(
       : [[name, parts.join(delimiter)]];
   }
   if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
-      a.localeCompare(b),
+    const entries = Object.entries(value as Record<string, unknown>).sort(
+      ([a], [b]) => a.localeCompare(b),
     );
     if (style === "deepObject") {
-      return entries.map(([key, item]) => [name + "[" + key + "]", String(item)]);
+      return entries.map(([key, item]) => [
+        name + "[" + key + "]",
+        String(item),
+      ]);
     }
     if (explode && style === "form") {
       return entries.map(([key, item]) => [key, String(item)]);
@@ -1916,7 +1920,10 @@ function wireParameterPairs(
   return [[name, String(value)]];
 }
 
-function wireQueryString(values: URLSearchParams, allowReserved: Set<number>): string {
+function wireQueryString(
+  values: URLSearchParams,
+  allowReserved: Set<number>,
+): string {
   const restoreReserved = (value: string): string =>
     value.replace(
       /%3A|%2F|%3F|%23|%5B|%5D|%40|%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D/gi,
@@ -2100,30 +2107,34 @@ fn emit_query_param_value(
     indent_width: usize,
     track_pair_index: bool,
 ) -> Result<(), CoreError> {
+    // Reject unsupported query shapes early (nested arrays, objects, maps) before emission.
+    let _ = ts_query_shape(&param.schema, graph, &param.name)?;
     let spaces = " ".repeat(indent_width);
-    let key = quoted_string_literal(&param.name);
-    match ts_query_shape(&param.schema, graph, &param.name)? {
-        TsQueryShape::Scalar => {
-            writeln!(out, "{spaces}searchParams.set({key}, String({ident}));").map_err(sink)?;
-            if param.allow_reserved {
-                writeln!(out, "{spaces}allowReserved.add(queryPairIndex);").map_err(sink)?;
-            }
-            if track_pair_index {
-                writeln!(out, "{spaces}queryPairIndex += 1;").map_err(sink)?;
-            }
-        }
-        TsQueryShape::Array => {
-            writeln!(out, "{spaces}for (const value of {ident}) {{").map_err(sink)?;
-            writeln!(out, "{spaces}  searchParams.append({key}, String(value));").map_err(sink)?;
-            if param.allow_reserved {
-                writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
-            }
-            if track_pair_index {
-                writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
-            }
-            writeln!(out, "{spaces}}}").map_err(sink)?;
-        }
+    let inner = format!("{spaces}  ");
+    // Always wrap the call so generated TS stays under Prettier's 80-col printWidth.
+    writeln!(
+        out,
+        "{spaces}for (const [wireName, wireValue] of wireParameterPairs("
+    )
+    .map_err(sink)?;
+    writeln!(out, "{inner}{},", quoted_string_literal(&param.name)).map_err(sink)?;
+    writeln!(out, "{inner}{ident},").map_err(sink)?;
+    writeln!(
+        out,
+        "{inner}{},",
+        quoted_string_literal(ts_parameter_style(param))
+    )
+    .map_err(sink)?;
+    writeln!(out, "{inner}{},", ts_parameter_explode(param)).map_err(sink)?;
+    writeln!(out, "{spaces})) {{").map_err(sink)?;
+    writeln!(out, "{spaces}  searchParams.append(wireName, wireValue);").map_err(sink)?;
+    if param.allow_reserved {
+        writeln!(out, "{spaces}  allowReserved.add(queryPairIndex);").map_err(sink)?;
     }
+    if track_pair_index {
+        writeln!(out, "{spaces}  queryPairIndex += 1;").map_err(sink)?;
+    }
+    writeln!(out, "{spaces}}}").map_err(sink)?;
     Ok(())
 }
 
@@ -3385,7 +3396,8 @@ mod tests {
                 "required body must stay before required query params:\n{out}"
             );
             assert!(
-                out.contains("searchParams.set(\"tenant\", String(tenant));"),
+                out.contains("wireParameterPairs(\"tenant\", tenant,")
+                    || out.contains("wireParameterPairs(\n      \"tenant\","),
                 "{out}"
             );
         }
@@ -3424,7 +3436,8 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("searchParams.set(\"redirect\", String(redirect));")
+                (out.contains("wireParameterPairs(\"redirect\", redirect,")
+                    || out.contains("wireParameterPairs(\n      \"redirect\","))
                     && out.contains("allowReserved.add(queryPairIndex);")
                     && out.contains("queryPairIndex += 1;"),
                 "allowReserved scalar query parameter must mark and advance its pair index:\n{out}"
@@ -3445,9 +3458,10 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains(
-                    "for (const value of tag) {\n        searchParams.append(\"tag\", String(value));\n        allowReserved.add(queryPairIndex);\n        queryPairIndex += 1;\n      }"
-                ),
+                (out.contains("wireParameterPairs(\"tag\", tag,")
+                    || out.contains("wireParameterPairs(\n        \"tag\","))
+                    && out.contains("allowReserved.add(queryPairIndex);")
+                    && out.contains("queryPairIndex += 1;"),
                 "every repeated allowReserved value must mark and advance its pair index:\n{out}"
             );
         }
@@ -3535,7 +3549,8 @@ mod tests {
             );
             assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains("searchParams.set(\"cursor\", String(cursor));"),
+                out.contains("wireParameterPairs(\"cursor\", cursor,")
+                    || out.contains("wireParameterPairs(\n        \"cursor\","),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -3576,9 +3591,13 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(out.contains("if (tag !== undefined) {"), "{out}");
-            assert!(out.contains("for (const value of tag) {"), "{out}");
             assert!(
-                out.contains("searchParams.append(\"tag\", String(value));"),
+                out.contains("wireParameterPairs(\"tag\", tag,")
+                    || out.contains("wireParameterPairs(\n        \"tag\","),
+                "array query values must go through wireParameterPairs:\n{out}"
+            );
+            assert!(
+                out.contains("searchParams.append(wireName, wireValue);"),
                 "{out}"
             );
             assert!(
@@ -3878,7 +3897,11 @@ mod tests {
                 "{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
-            assert!(out.contains("searchParams.set(\"q\", String(q));"), "{out}");
+            assert!(
+                out.contains("wireParameterPairs(\"q\", q,")
+                    || out.contains("wireParameterPairs(\n      \"q\","),
+                "{out}"
+            );
             assert!(out.contains("if (page !== undefined) {"), "{out}");
         }
 

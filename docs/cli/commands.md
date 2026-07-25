@@ -26,7 +26,6 @@ diagnostics.
 | `check` | Detect generated drift without writing | no |
 | `inspect` | Explain extracted routes, schemas, or graph | no |
 | `doctor` | Diagnose workspace, output, and pipeline health | no |
-| `compat` | Compare OpenAPI or SDK public surfaces | no |
 
 ## `init`
 

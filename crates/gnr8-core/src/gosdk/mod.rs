@@ -108,6 +108,10 @@ pub(crate) fn generate_files_with_profile(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Go SDK file planning keeps layout/helper emission in one deterministic pass"
+)]
 pub(crate) fn generate_files_with_profile_options(
     graph: &ApiGraph,
     package: &str,
@@ -161,17 +165,25 @@ pub(crate) fn generate_files_with_profile_options(
     }
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
+        if let Some(raw) = emit::emit_shared_request_helpers(graph, package, &ops)? {
+            files.push(raw_go_file("wire_helpers.go", raw));
+        }
         match layout.operation_split() {
             OperationFileSplit::Compact => {
                 files.push(raw_go_file(
                     "operations.go",
-                    emit::emit_operations_without_facades(graph, package, base_path, &ops)?,
+                    emit::emit_operations_without_facades(graph, package, base_path, &ops, false)?,
                 ));
             }
             OperationFileSplit::PerEndpoint => {
                 for op in &ops {
-                    let raw =
-                        emit::emit_operations_without_facades(graph, package, base_path, &[*op])?;
+                    let raw = emit::emit_operations_without_facades(
+                        graph,
+                        package,
+                        base_path,
+                        &[*op],
+                        false,
+                    )?;
                     let name =
                         operation_file_name(layout, op, &format!("api_{}.go", file_stem(&op.id)))?;
                     files.push(raw_go_file(name, raw));
@@ -180,7 +192,7 @@ pub(crate) fn generate_files_with_profile_options(
             OperationFileSplit::PerTag => {
                 for (group, group_ops) in operation_groups(&ops) {
                     let raw = emit::emit_operations_without_facades(
-                        graph, package, base_path, &group_ops,
+                        graph, package, base_path, &group_ops, false,
                     )?;
                     let name = operation_group_file_name(
                         layout,

@@ -12,8 +12,9 @@ archive="$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")"
 smoke_root="$(mktemp -d)"
 trap 'rm -rf -- "$smoke_root"' EXIT
 install_root="$smoke_root/install"
+link_root="$smoke_root/local-bin"
 project_root="$smoke_root/project"
-mkdir -p "$install_root" "$project_root"
+mkdir -p "$install_root" "$link_root" "$project_root"
 tar -xzf "$archive" -C "$install_root"
 
 binary="$install_root/bin/gnr8"
@@ -31,6 +32,11 @@ for required in \
     exit 1
   fi
 done
+
+# Mimic the official installer: expose gnr8 through a PATH symlink, not the real binary path.
+ln -sf "$binary" "$link_root/gnr8"
+export PATH="$link_root:$PATH"
+unset GNR8_RESOURCE_DIR || true
 
 cat > "$project_root/app.py" <<'PY'
 from fastapi import FastAPI
@@ -50,7 +56,28 @@ PY
 
 (
   cd "$project_root"
-  "$binary" init --source fastapi --sdk python
+  # Invocation must go through the symlink with GNR8_RESOURCE_DIR unset.
+  gnr8 --version
+  gnr8 init --source fastapi --sdk python
+
+  python3 - "$install_root/share/gnr8/crates/gnr8-core" .gnr8/Cargo.toml <<'PY'
+from pathlib import Path
+import sys
+
+core = Path(sys.argv[1]).resolve()
+manifest = Path(sys.argv[2])
+text = manifest.read_text(encoding="utf-8")
+# Packaged init pins crates.io. Until that version is published, smoke remaps to the archive path
+# so the lifecycle can still be exercised offline.
+idx = text.find("gnr8 =")
+if idx >= 0:
+    end = text.find("\n", idx)
+    if end < 0:
+        end = len(text)
+    text = text[:idx] + f'gnr8 = {{ path = "{core}" }}' + text[end:]
+    manifest.write_text(text, encoding="utf-8")
+PY
+
   python3 - .gnr8/src/main.rs <<'PY'
 from pathlib import Path
 import sys
@@ -62,13 +89,13 @@ if needle not in source:
     raise SystemExit("FastAPI/Python scaffold did not contain the expected PySdk target")
 path.write_text(source.replace(needle, 'PySdk::new().dataclasses().module(', 1), encoding="utf-8")
 PY
-  "$binary" generate
-  if ! "$binary" --json doctor > doctor.json; then
+  gnr8 generate
+  if ! gnr8 --json doctor > doctor.json; then
     echo "archive doctor failed:" >&2
     cat doctor.json >&2
     exit 1
   fi
-  "$binary" check
+  gnr8 check
 )
 
 python3 - "$project_root/doctor.json" <<'PY'
@@ -81,4 +108,4 @@ if not report.get("healthy"):
     raise SystemExit(f"archive doctor reported unhealthy: {report}")
 PY
 
-echo "archive smoke passed: init, generate, doctor, check"
+echo "archive smoke passed: symlink install, init, generate, doctor, check"

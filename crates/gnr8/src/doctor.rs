@@ -109,10 +109,13 @@ pub(crate) struct SdkReadiness {
     pub(crate) output_path: String,
     /// Required target toolchain/check runner.
     pub(crate) toolchain: String,
-    /// Stable status string: `"ready"` or `"not_ready"`.
+    /// Stable status string: `"ready"`, `"ready_with_warnings"`, or `"not_ready"`.
     pub(crate) status: String,
     /// Empty when ready; actionable failure reason when not ready.
     pub(crate) reason: String,
+    /// Non-fatal toolchain diagnostics observed while the check still passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<String>,
 }
 
 impl SdkReadiness {
@@ -129,6 +132,25 @@ impl SdkReadiness {
             toolchain: toolchain.into(),
             status: "ready".to_string(),
             reason: String::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Build a ready target entry that still surfaced non-fatal warnings.
+    #[must_use]
+    pub(crate) fn ready_with_warnings(
+        language: impl Into<String>,
+        output_path: impl Into<String>,
+        toolchain: impl Into<String>,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            language: language.into(),
+            output_path: output_path.into(),
+            toolchain: toolchain.into(),
+            status: "ready_with_warnings".to_string(),
+            reason: String::new(),
+            warnings,
         }
     }
 
@@ -146,11 +168,12 @@ impl SdkReadiness {
             toolchain: toolchain.into(),
             status: "not_ready".to_string(),
             reason: reason.into(),
+            warnings: Vec::new(),
         }
     }
 
     fn is_ready(&self) -> bool {
-        self.status == "ready"
+        self.status == "ready" || self.status == "ready_with_warnings"
     }
 }
 
@@ -512,7 +535,16 @@ fn render_sdk_readiness(out: &mut String, readiness: &[SdkReadiness]) {
         let _ = writeln!(out, "  (none)");
     }
     for entry in readiness {
-        if entry.is_ready() {
+        if entry.status == "ready_with_warnings" {
+            let _ = writeln!(
+                out,
+                "  {} {}: ready with warnings ({})",
+                entry.language, entry.output_path, entry.toolchain
+            );
+            for warning in &entry.warnings {
+                let _ = writeln!(out, "    warning: {warning}");
+            }
+        } else if entry.is_ready() {
             let _ = writeln!(
                 out,
                 "  {} {}: ready ({})",

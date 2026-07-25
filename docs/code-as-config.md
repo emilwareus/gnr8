@@ -145,7 +145,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 [dependencies]
-gnr8 = { path = "/selected/gnr8/resources/crates/gnr8-core" }
+gnr8 = "=0.1.22"
 [workspace]            # empty => its own workspace, built standalone via --manifest-path
 ```
 

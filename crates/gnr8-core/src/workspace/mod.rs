@@ -169,7 +169,7 @@ pub fn init_with_presets(
     })?;
 
     let crate_name = crate_name_for(root);
-    let core_dep = core_dependency_line()?;
+    let core_dep = core_dependency_line();
     let cargo_toml = cargo_toml_body(&crate_name, &core_dep);
     let main_rs = main_rs_body(source, sdk);
     let readme = readme_body(source, sdk);
@@ -282,36 +282,40 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
 
 /// The `gnr8` dependency line for a `.gnr8/Cargo.toml` scaffolded under `root`.
 ///
-/// The resource root selected by [`crate::resource::resource_dir`] is the only dependency source. The
-/// scaffold fails when it does not contain `crates/gnr8-core`; it never switches to a registry
-/// dependency or searches ancestor directories.
-fn core_dependency_line() -> Result<String, CoreError> {
-    let resource_root = crate::resource::resource_dir()?;
-    core_dependency_line_from(Some(resource_root.as_path()))
+/// Production scaffolds pin the published crate version so the same `Cargo.toml` works on every
+/// machine. Sidecar resources still come from the packaged CLI install (via `GNR8_RESOURCE_DIR` or
+/// executable-relative discovery); the crates.io package supplies the Rust API only.
+///
+/// When developing gnr8 itself inside this repository, prefer a path dependency so `init` stays
+/// offline and tracks the local workspace.
+fn core_dependency_line() -> String {
+    core_dependency_line_for(env!("CARGO_PKG_VERSION"), in_repo_checkout().as_deref())
 }
 
-fn core_dependency_line_from(resource_root: Option<&Path>) -> Result<String, CoreError> {
-    let resource_root = resource_root.ok_or_else(|| CoreError::Workspace {
-        message:
-            "no gnr8-core dependency source was declared; install the complete release archive"
-                .to_string(),
-    })?;
-    let candidate = resource_root.join("crates").join("gnr8-core");
-    if !candidate.join("Cargo.toml").is_file() {
-        return Err(CoreError::Workspace {
-            message: format!(
-                "declared gnr8-core dependency source is missing at {}",
-                candidate.display()
-            ),
-        });
+fn core_dependency_line_for(version: &str, prefer_path: Option<&Path>) -> String {
+    if let Some(resource_root) = prefer_path {
+        let candidate = resource_root.join("crates").join("gnr8-core");
+        if candidate.join("Cargo.toml").is_file() {
+            if let Ok(path) = std::fs::canonicalize(&candidate) {
+                return format!("gnr8 = {{ path = {:?} }}", path.to_string_lossy());
+            }
+        }
     }
-    let path = std::fs::canonicalize(&candidate).map_err(|source| CoreError::Workspace {
-        message: format!(
-            "failed to resolve declared gnr8-core dependency source {}: {source}",
-            candidate.display()
-        ),
-    })?;
-    Ok(format!("gnr8 = {{ path = {:?} }}", path.to_string_lossy()))
+    format!("gnr8 = \"={version}\"")
+}
+
+/// True only when this binary was built from the gnr8 git checkout (not a packaged archive).
+///
+/// Packaged archives also contain `crates/gnr8-core`, so presence of that crate alone is not enough.
+fn in_repo_checkout() -> Option<PathBuf> {
+    let root = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let marker = root.join("crates").join("gnr8-core").join("Cargo.toml");
+    let git = root.join(".git");
+    if marker.is_file() && git.exists() {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 /// Derive the scaffolded crate name `<dirname>-gnr8-gen` from `root`'s final path component, sanitized
@@ -406,7 +410,7 @@ mod tests {
     // test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{core_dependency_line_from, crate_name_for};
+    use super::{core_dependency_line_for, crate_name_for};
     use std::path::Path;
 
     #[test]
@@ -427,11 +431,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_declared_core_dependency_is_an_explicit_error() {
-        let error = core_dependency_line_from(None).unwrap_err();
+    fn packaged_init_emits_exact_crates_io_version_pin() {
+        let line = core_dependency_line_for("0.1.22", None);
+        assert_eq!(line, "gnr8 = \"=0.1.22\"");
+    }
+
+    #[test]
+    fn in_repo_init_prefers_path_dependency_when_resources_exist() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let line = core_dependency_line_for("0.1.22", Some(root.as_path()));
         assert!(
-            error.to_string().contains("gnr8-core dependency source"),
-            "unexpected diagnostic: {error}"
+            line.contains("path ="),
+            "expected path dependency in-repo, got: {line}"
         );
     }
 }
