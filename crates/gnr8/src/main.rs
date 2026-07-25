@@ -1363,7 +1363,7 @@ fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> do
             "failed to materialize generated Python SDK for readiness",
         );
     };
-    let package_dir = python_package_root(&materialized.target_dir);
+    let package_dir = python_package_root(&materialized.target_dir, &materialized.root);
     let py_files = artifacts
         .iter()
         .filter(|artifact| path_extension_is(&artifact.path, "py"))
@@ -1407,24 +1407,25 @@ fn package_dir_display(
     )
 }
 
-/// Prefer the package root (directory with `__init__.py` or `pyproject.toml`) over a nested file anchor.
-fn python_package_root(target_dir: &Path) -> PathBuf {
-    if target_dir.join("pyproject.toml").is_file() || target_dir.join("__init__.py").is_file() {
+/// Prefer the package root (directory with `__init__.py` or `pyproject.toml`) over a nested anchor.
+///
+/// The walk is bounded by `root` — the materialized tree — so it can never escape into the ambient
+/// filesystem and adopt an unrelated `__init__.py` as the package root.
+fn python_package_root(target_dir: &Path, root: &Path) -> PathBuf {
+    let is_package =
+        |dir: &Path| dir.join("pyproject.toml").is_file() || dir.join("__init__.py").is_file();
+    if is_package(target_dir) {
         return target_dir.to_path_buf();
     }
-    let mut current = target_dir.to_path_buf();
+    let mut current = target_dir;
     while let Some(parent) = current.parent() {
-        if parent.join("pyproject.toml").is_file() || parent.join("__init__.py").is_file() {
-            return parent.to_path_buf();
-        }
-        // Stop once we leave the materialized tree root-ish (temp dirs are deep).
-        if parent
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("gnr8-doctor-"))
-        {
+        if !parent.starts_with(root) {
             break;
         }
-        current = parent.to_path_buf();
+        if is_package(parent) {
+            return parent.to_path_buf();
+        }
+        current = parent;
     }
     target_dir.to_path_buf()
 }

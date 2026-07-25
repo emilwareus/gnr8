@@ -307,3 +307,141 @@ fn split_per_tag_go_sdk_emits_wire_helpers_once_and_compiles() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A two-tag graph where the first tag carries a request body of `content_type`.
+///
+/// The second tag has a wire-helper-requiring query param but no body, so the shared helper file is
+/// always emitted — the combination that previously mis-declared imports.
+fn body_encoding_graph(content_type: &str, required: bool) -> gnr8::graph::ApiGraph {
+    let schema = if content_type == "application/octet-stream" {
+        r#"{"type":"primitive","of":{"prim":"bytes"}}"#
+    } else if content_type == "text/plain" {
+        r#"{"type":"primitive","of":{"prim":"string"}}"#
+    } else {
+        r#"{"type":"object","of":[
+             {"json_name":"name","required":true,"optional":false,"nullable":false,
+              "schema":{"type":"primitive","of":{"prim":"string"}},
+              "description":null,"example":null}
+           ]}"#
+    };
+    let source = format!(
+        r#"{{
+          "module": "body.test",
+          "operations": [
+            {{
+              "id": "createThing",
+              "method": "POST",
+              "path": "/things",
+              "handler": "createThing",
+              "group": "Things",
+              "params": [
+                {{
+                  "name": "tags", "location": "query", "required": true,
+                  "schema": {{"type":"array","of":{{"type":"primitive","of":{{"prim":"string"}}}}}},
+                  "style": "form", "explode": true,
+                  "provenance": {{"file":"a.go","start_line":1,"end_line":1}}
+                }}
+              ],
+              "request_body": {{"ref_id": "Thing"}},
+              "request_body_required": {required},
+              "request_body_content_type": "{content_type}",
+              "responses": [{{"status": 204, "body": null}}],
+              "provenance": {{"file":"a.go","start_line":1,"end_line":2}}
+            }},
+            {{
+              "id": "listOther",
+              "method": "GET",
+              "path": "/other",
+              "handler": "listOther",
+              "group": "Other",
+              "params": [
+                {{
+                  "name": "states", "location": "query", "required": true,
+                  "schema": {{"type":"array","of":{{"type":"primitive","of":{{"prim":"string"}}}}}},
+                  "style": "form", "explode": true,
+                  "provenance": {{"file":"a.go","start_line":3,"end_line":3}}
+                }}
+              ],
+              "request_body": null,
+              "responses": [{{"status": 204, "body": null}}],
+              "provenance": {{"file":"a.go","start_line":3,"end_line":3}}
+            }}
+          ],
+          "schemas": [
+            {{"id":"Thing","name":"Thing","body":{schema},
+             "provenance":{{"file":"a.go","start_line":10,"end_line":12}}}}
+          ],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "Body Encodings",
+          "security": []
+        }}"#
+    );
+    serde_json::from_str(&source).expect("body-encoding graph must deserialize")
+}
+
+/// Every request-body encoding must compile in every split layout.
+///
+/// Split layouts move the form/multipart encode helpers into `wire_helpers.go`. Go rejects an
+/// unused import, so both that file and the per-tag operation files must declare exactly the
+/// packages their own source names — a form-only API must not import `bytes`/`mime/multipart`, and
+/// an operation delegating to `encodeFormBody` must not import `strings`.
+#[test]
+fn split_layouts_compile_for_every_request_body_encoding() {
+    if Command::new("go")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipping: go toolchain unavailable");
+        return;
+    }
+
+    for content_type in [
+        "application/json",
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+        "application/octet-stream",
+    ] {
+        for required in [true, false] {
+            for (label, layout) in [
+                ("per-tag", SdkFileLayout::split().operations_per_tag()),
+                ("compact", SdkFileLayout::split()),
+                (
+                    "per-endpoint",
+                    SdkFileLayout::split().operations_per_endpoint(),
+                ),
+            ] {
+                let ir = body_encoding_graph(content_type, required);
+                let root = temp_dir("body");
+                let sdk_dir = root.join("go-sdk");
+                std::fs::create_dir_all(&sdk_dir).unwrap();
+
+                let mut out = Artifacts::new();
+                GoSdk::new()
+                    .module("example.com/generated/sdk")
+                    .to("go-sdk")
+                    .layout(layout)
+                    .generate(&ir, &mut out, &Cx::new(&root))
+                    .expect("generate Go SDK");
+                write_artifacts(&out, &root);
+
+                let built = Command::new("go")
+                    .args(["build", "./..."])
+                    .current_dir(&sdk_dir)
+                    .output()
+                    .expect("spawn go build");
+                assert!(
+                    built.status.success(),
+                    "go build failed for {content_type} (required={required}, layout={label}):\n{}\n{}",
+                    String::from_utf8_lossy(&built.stdout),
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+}

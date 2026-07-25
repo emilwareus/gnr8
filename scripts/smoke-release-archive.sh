@@ -62,20 +62,26 @@ PY
 
   python3 - "$install_root/share/gnr8/crates/gnr8-core" .gnr8/Cargo.toml <<'PY'
 from pathlib import Path
+import re
 import sys
 
 core = Path(sys.argv[1]).resolve()
 manifest = Path(sys.argv[2])
 text = manifest.read_text(encoding="utf-8")
-# Packaged init pins crates.io. Until that version is published, smoke remaps to the archive path
-# so the lifecycle can still be exercised offline.
-idx = text.find("gnr8 =")
-if idx >= 0:
-    end = text.find("\n", idx)
-    if end < 0:
-        end = len(text)
-    text = text[:idx] + f'gnr8 = {{ path = "{core}" }}' + text[end:]
-    manifest.write_text(text, encoding="utf-8")
+
+# Assert the shipped pin before rewriting it: a packaged `init` must emit an exact crates.io
+# version pin, never a machine-local path. This is the contract the smoke test is here to check.
+pin = re.search(r'^gnr8 = "=(\d+\.\d+\.\d+)"$', text, re.MULTILINE)
+if not pin:
+    raise SystemExit(
+        f"packaged init must pin an exact crates.io version, got:\n{text}"
+    )
+print(f"packaged init pinned gnr8 =\"={pin.group(1)}\"")
+
+# Remap to the archive's own crate so the rest of the lifecycle runs offline and against the
+# binary under test, rather than whatever that version resolves to on crates.io.
+text = text[: pin.start()] + f'gnr8 = {{ path = "{core}" }}' + text[pin.end() :]
+manifest.write_text(text, encoding="utf-8")
 PY
 
   python3 - .gnr8/src/main.rs <<'PY'

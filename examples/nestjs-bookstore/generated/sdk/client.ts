@@ -565,26 +565,3 @@ function wireParameterPairs(
   }
   return [[name, String(value)]];
 }
-
-function wireQueryString(
-  values: URLSearchParams,
-  allowReserved: Set<number>,
-): string {
-  const restoreReserved = (value: string): string =>
-    value.replace(
-      /%3A|%2F|%3F|%23|%5B|%5D|%40|%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D/gi,
-      (token) => decodeURIComponent(token),
-    );
-  const parts: string[] = [];
-  let index = 0;
-  values.forEach((value, key) => {
-    const encoded = encodeURIComponent(value);
-    parts.push(
-      encodeURIComponent(key) +
-        "=" +
-        (allowReserved.has(index) ? restoreReserved(encoded) : encoded),
-    );
-    index += 1;
-  });
-  return parts.join("&");
-}

@@ -35,6 +35,11 @@ Override only when needed:
 export GNR8_RESOURCE_DIR="$HOME/.local/gnr8/share/gnr8"
 ```
 
+Exactly one location is selected, then validated — `$GNR8_RESOURCE_DIR` when set, otherwise
+`share/gnr8` beside the real executable. No other location is searched. If the selected directory is
+incomplete, `gnr8` fails and names that directory rather than quietly falling back to another
+install, so a stale copy can never feed sidecars to a binary that did not ship it.
+
 ## Portable `.gnr8` Cargo dependency
 
 Packaged `gnr8 init` writes:

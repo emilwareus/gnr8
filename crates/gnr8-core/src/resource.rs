@@ -4,12 +4,17 @@
 //! `gnr8` binary runs from an install/archive layout. Release archives place the source resources under
 //! `share/gnr8/`, and the host passes that location to the `.gnr8` child via `GNR8_RESOURCE_DIR`.
 //!
-//! Discovery order (first complete match wins):
-//! 1. `$GNR8_RESOURCE_DIR` when set
-//! 2. `../share/gnr8` relative to the canonicalized executable (symlink-safe)
-//! 3. `../share/gnr8` relative to `gnr8` found on `$PATH`
-//! 4. `$HOME/.local/gnr8/share/gnr8` (default installer layout)
-//! 5. Compile-time repository root (`CARGO_MANIFEST_DIR/../..`) for in-tree development builds
+//! Exactly one root is *selected* per process, then validated. Nothing is probed: when the selected
+//! root is incomplete the call fails with the path that was selected and why, rather than silently
+//! continuing to a second location. A stale install can therefore never supply sidecars to a binary
+//! that did not ship it.
+//!
+//! The selection:
+//! - `$GNR8_RESOURCE_DIR` when set — the host's explicit declaration to the `.gnr8` child, and the
+//!   user's escape hatch. Always wins, in every build kind.
+//! - otherwise, in debug builds, the compile-time repository root (`CARGO_MANIFEST_DIR/../..`).
+//! - otherwise, `../share/gnr8` relative to the **canonicalized** executable, so invoking the
+//!   installer's `~/.local/bin/gnr8` symlink resolves against the real `~/.local/gnr8/bin/gnr8`.
 
 use std::path::{Path, PathBuf};
 
@@ -20,130 +25,68 @@ pub const GNR8_RESOURCE_DIR_ENV: &str = "GNR8_RESOURCE_DIR";
 ///
 /// The expected root contains `goextract/`, `pyextract/`, `tsextract/`, and `crates/gnr8-core/`.
 ///
-/// Discovery order (first complete match wins):
-/// 1. `$GNR8_RESOURCE_DIR` when set
-/// 2. Compile-time repository root in debug builds (`cargo test` / `cargo run` from source)
-/// 3. `../share/gnr8` relative to the canonicalized executable (symlink-safe)
-/// 4. `../share/gnr8` relative to `gnr8` found on `$PATH`
-/// 5. `$HOME/.local/gnr8/share/gnr8` (default installer layout)
+/// `$GNR8_RESOURCE_DIR` selects the root when set — this is how the host hands its own resolved
+/// root to the `.gnr8` child, so the child agrees with the host by construction instead of
+/// re-deriving it. With the variable unset, debug builds select the compile-time repository root and
+/// release builds select `../share/gnr8` beside the canonicalized executable.
+///
+/// The selected root is validated and a failure is reported against that one path; no alternate
+/// location is probed.
 ///
 /// # Errors
 ///
-/// Returns [`crate::CoreError::Io`] when no candidate contains the complete resource set.
+/// Returns [`crate::CoreError::Io`] when the selected root cannot be derived or does not contain the
+/// complete resource set.
 pub fn resource_dir() -> Result<PathBuf, crate::CoreError> {
-    let mut attempted = Vec::new();
-
-    match std::env::var(GNR8_RESOURCE_DIR_ENV) {
-        Ok(value) => {
-            let candidate = PathBuf::from(value);
-            if let Some(valid) = try_resource_dir(&candidate) {
-                return Ok(valid);
-            }
-            attempted.push(candidate);
-        }
-        Err(std::env::VarError::NotPresent) => {}
+    let selected = match std::env::var(GNR8_RESOURCE_DIR_ENV) {
+        Ok(value) => PathBuf::from(value),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(crate::CoreError::Io {
                 message: format!("{GNR8_RESOURCE_DIR_ENV} is not valid Unicode"),
             });
         }
-    }
+        Err(std::env::VarError::NotPresent) => default_resource_dir()?,
+    };
+    validate_resource_dir(normalize(&selected))
+}
 
-    // Prefer the in-tree checkout for debug builds so `cargo test` is not hijacked by a stale
-    // packaged install under ~/.local/gnr8.
-    #[cfg(debug_assertions)]
-    {
-        let compile_time = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
-        if let Some(valid) = try_resource_dir(&compile_time) {
-            return Ok(valid);
-        }
-        attempted.push(compile_time);
-    }
+/// The root selected when `$GNR8_RESOURCE_DIR` is unset.
+///
+/// An in-tree build always knows its own repository root, so this cannot fail — but it shares the
+/// release variant's signature so [`resource_dir`] has one call site rather than two cfg'd ones.
+#[cfg(debug_assertions)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "signature parity with the release variant of this function"
+)]
+fn default_resource_dir() -> Result<PathBuf, crate::CoreError> {
+    Ok(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")))
+}
 
-    if let Some(exe) = current_exe_canonical() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("../share/gnr8");
-            if let Some(valid) = try_resource_dir(&candidate) {
-                return Ok(valid);
-            }
-            attempted.push(candidate);
-        }
-    }
-
-    if let Some(path_exe) = gnr8_on_path() {
-        if let Some(parent) = path_exe.parent() {
-            let candidate = parent.join("../share/gnr8");
-            if let Some(valid) = try_resource_dir(&candidate) {
-                return Ok(valid);
-            }
-            attempted.push(candidate);
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let candidate = home.join(".local/gnr8/share/gnr8");
-        if let Some(valid) = try_resource_dir(&candidate) {
-            return Ok(valid);
-        }
-        attempted.push(candidate);
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let compile_time = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
-        if let Some(valid) = try_resource_dir(&compile_time) {
-            return Ok(valid);
-        }
-        attempted.push(compile_time);
-    }
-
-    let tried = attempted
-        .into_iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(crate::CoreError::Io {
+/// The root selected when `$GNR8_RESOURCE_DIR` is unset.
+///
+/// Canonicalizing the executable is what makes the packaged install work through its PATH symlink:
+/// `~/.local/bin/gnr8 -> ~/.local/gnr8/bin/gnr8` must resolve `share/gnr8` beside the *real* binary,
+/// not beside the link.
+#[cfg(not(debug_assertions))]
+fn default_resource_dir() -> Result<PathBuf, crate::CoreError> {
+    let exe = std::env::current_exe().map_err(|source| crate::CoreError::Io {
+        message: format!("failed to resolve the gnr8 executable for resource lookup: {source}"),
+    })?;
+    let real = normalize(&exe);
+    let parent = real.parent().ok_or_else(|| crate::CoreError::Io {
         message: format!(
-            "gnr8 resource directory is missing or incomplete (tried: {tried}) — reinstall gnr8 or set {GNR8_RESOURCE_DIR_ENV} to the archive's share/gnr8 directory"
+            "gnr8 executable has no parent directory: {}",
+            real.display()
         ),
-    })
+    })?;
+    Ok(parent.join("../share/gnr8"))
 }
 
-fn try_resource_dir(path: &Path) -> Option<PathBuf> {
-    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if looks_like_resource_dir(&normalized) {
-        Some(normalized)
-    } else {
-        None
-    }
-}
-
-fn current_exe_canonical() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
-}
-
-fn gnr8_on_path() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("gnr8");
-        if !candidate.is_file() {
-            continue;
-        }
-        // Skip the current process when it is already on PATH — prefer a distinct install binary.
-        if let Ok(current) = std::env::current_exe() {
-            if let (Ok(a), Ok(b)) = (
-                std::fs::canonicalize(&candidate),
-                std::fs::canonicalize(&current),
-            ) {
-                if a == b {
-                    continue;
-                }
-            }
-        }
-        return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
-    }
-    None
+/// Resolve `.`/`..`/symlink components when the path exists, leaving it untouched when it does not
+/// (so the diagnostic reports the path as selected rather than an empty string).
+fn normalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn looks_like_resource_dir(path: &Path) -> bool {
@@ -157,12 +100,7 @@ fn looks_like_resource_dir(path: &Path) -> bool {
             .is_file()
 }
 
-/// Validate that `path` looks like a complete gnr8 resource root.
-///
-/// # Errors
-///
-/// Returns [`crate::CoreError::Io`] when the directory is incomplete.
-pub fn validate_resource_dir(path: PathBuf) -> Result<PathBuf, crate::CoreError> {
+fn validate_resource_dir(path: PathBuf) -> Result<PathBuf, crate::CoreError> {
     if looks_like_resource_dir(&path) {
         return Ok(path);
     }
@@ -178,7 +116,7 @@ pub fn validate_resource_dir(path: PathBuf) -> Result<PathBuf, crate::CoreError>
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{looks_like_resource_dir, try_resource_dir, validate_resource_dir};
+    use super::{looks_like_resource_dir, normalize, validate_resource_dir};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -223,14 +161,41 @@ mod tests {
         write_complete_resources(&root);
         assert!(looks_like_resource_dir(&root));
         assert_eq!(
-            try_resource_dir(&root).unwrap(),
+            validate_resource_dir(normalize(&root)).unwrap(),
             fs::canonicalize(&root).unwrap()
         );
         let _ = fs::remove_dir_all(root);
     }
 
+    /// An incomplete root is reported against itself — never silently replaced by another location.
+    ///
+    /// This is the invariant that keeps a stale `~/.local/gnr8` from feeding sidecars to a binary
+    /// that did not ship it: there is no second candidate to fall through to.
+    #[test]
+    fn an_incomplete_root_names_itself_and_is_not_replaced() {
+        let partial = unique_temp("partial");
+        fs::create_dir_all(partial.join("goextract")).unwrap();
+        fs::write(partial.join("goextract/go.mod"), "module example\n").unwrap();
+
+        let error = validate_resource_dir(normalize(&partial)).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains(&partial.display().to_string())
+                || text.contains(&fs::canonicalize(&partial).unwrap().display().to_string()),
+            "diagnostic must name the selected root: {text}"
+        );
+        let _ = fs::remove_dir_all(partial);
+    }
+
+    /// The installer exposes `~/.local/bin/gnr8` as a symlink to `~/.local/gnr8/bin/gnr8`.
+    ///
+    /// `share/gnr8` must resolve beside the *real* binary, so the release selection canonicalizes
+    /// the executable before taking its parent.
+    #[cfg(unix)]
     #[test]
     fn symlink_invocation_resolves_share_relative_to_real_executable() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
         let install = unique_temp("install");
         let bin = install.join("bin");
         let share = install.join("share/gnr8");
@@ -241,19 +206,20 @@ mod tests {
 
         let real_exe = bin.join("gnr8");
         fs::write(&real_exe, b"#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{symlink, PermissionsExt};
-            fs::set_permissions(&real_exe, fs::Permissions::from_mode(0o755)).unwrap();
-            let link = link_dir.join("gnr8");
-            symlink(&real_exe, &link).unwrap();
+        fs::set_permissions(&real_exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = link_dir.join("gnr8");
+        symlink(&real_exe, &link).unwrap();
 
-            // Simulate the installer layout: discovery uses the real executable directory.
-            let from_link = fs::canonicalize(&link).unwrap();
-            let candidate = from_link.parent().unwrap().join("../share/gnr8");
-            let resolved = try_resource_dir(&candidate).unwrap();
-            assert_eq!(resolved, fs::canonicalize(&share).unwrap());
-        }
+        // The release selection: canonicalize the invoked path, then take `../share/gnr8`.
+        let candidate = normalize(&link).parent().unwrap().join("../share/gnr8");
+        let resolved = validate_resource_dir(normalize(&candidate)).unwrap();
+        assert_eq!(resolved, fs::canonicalize(&share).unwrap());
+
+        // Without canonicalization the link's own directory has no sibling `share/`, which is the
+        // failure this selection exists to prevent.
+        let naive = link.parent().unwrap().join("../share/gnr8");
+        assert!(validate_resource_dir(normalize(&naive)).is_err());
+
         let _ = fs::remove_dir_all(install);
         let _ = fs::remove_dir_all(link_dir);
     }
