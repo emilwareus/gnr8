@@ -15,8 +15,8 @@ The release process is intentionally shaped like `exlint`:
 ```
 
 This runs `make check`, builds a host archive, writes a `.sha256`, unpacks it outside the checkout,
-and exercises `init`, `generate`, `doctor`, and `check` against a static FastAPI fixture. It then runs
-`DRY_RUN=1 ./scripts/publish-crates.sh`.
+and exercises `init`, clean Go/Python/TypeScript generation, SDK compilation, `doctor`, and `check`
+against a static FastAPI fixture. It then runs `DRY_RUN=1 ./scripts/publish-crates.sh`.
 
 Build one archive directly:
 

@@ -68,7 +68,7 @@ Important invariants:
 ## Retrieval rules for agents
 
 - Start at the task table, not by loading every document.
-- Prefer exact operation routes, schema IDs, diagnostic codes, and compatibility diff keys.
+- Prefer exact operation routes, schema IDs, diagnostic codes, and diagnostic subject keys.
 - Treat `--force` and `--accept-generated-baseline` as explicit migration decisions.
 - Change source or `.gnr8/src/main.rs`, never hand-edit generated output as the durable fix.
 - Verify with `gnr8 check`; use `--json` when another agent or program consumes the result.

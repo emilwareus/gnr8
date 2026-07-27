@@ -34,13 +34,17 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
             continue;
         }
         let next_is_lower = chars.get(idx + 1).is_some_and(char::is_ascii_lowercase);
+        let next_is_plural_s = chars.get(idx + 1).is_some_and(|next| *next == 's')
+            && chars
+                .get(idx + 2)
+                .is_none_or(|after| !after.is_ascii_alphanumeric());
         let prev_is_upper = current
             .chars()
             .last()
             .is_some_and(|prev| prev.is_ascii_uppercase());
         if ch.is_ascii_uppercase()
             && !current.is_empty()
-            && (prev_lower || (prev_is_upper && next_is_lower))
+            && (prev_lower || (prev_is_upper && next_is_lower && !next_is_plural_s))
         {
             words.push(std::mem::take(&mut current));
         }
@@ -108,40 +112,6 @@ pub(crate) fn api_key_credential_names(graph: &ApiGraph) -> Result<Vec<String>, 
     Ok(names)
 }
 
-/// Resolve the API-key headers required by one operation, including global schemes.
-pub(crate) fn operation_api_key_headers(
-    graph: &ApiGraph,
-    op: &Operation,
-) -> Result<Vec<String>, CoreError> {
-    let mut headers: Vec<String> = operation_api_key_schemes(graph, op)?
-        .into_iter()
-        .filter_map(|scheme| match scheme.location {
-            ApiKeyLocation::Header => Some(scheme.name),
-            ApiKeyLocation::Query => None,
-        })
-        .collect();
-    headers.sort();
-    headers.dedup();
-    Ok(headers)
-}
-
-/// Resolve the API-key query parameter names required by one operation, including global schemes.
-pub(crate) fn operation_api_key_queries(
-    graph: &ApiGraph,
-    op: &Operation,
-) -> Result<Vec<String>, CoreError> {
-    let mut queries: Vec<String> = operation_api_key_schemes(graph, op)?
-        .into_iter()
-        .filter_map(|scheme| match scheme.location {
-            ApiKeyLocation::Header => None,
-            ApiKeyLocation::Query => Some(scheme.name),
-        })
-        .collect();
-    queries.sort();
-    queries.dedup();
-    Ok(queries)
-}
-
 /// One operation-scoped API-key scheme after global inheritance and id/header validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OperationApiKeyScheme {
@@ -162,37 +132,6 @@ pub(crate) enum ApiKeyLocation {
     Query,
 }
 
-/// Resolve the API-key schemes required by one operation, including global schemes.
-pub(crate) fn operation_api_key_schemes(
-    graph: &ApiGraph,
-    op: &Operation,
-) -> Result<Vec<OperationApiKeyScheme>, CoreError> {
-    let schemes = supported_security_schemes(graph)?;
-    let scheme_ids = operation_security_ids(graph, op);
-
-    let mut out = Vec::new();
-    for scheme_id in scheme_ids {
-        let Some(scheme) = schemes.get(&scheme_id) else {
-            return Err(unknown_security_scheme_error(op, &scheme_id));
-        };
-        if let SupportedAuthScheme::ApiKey(scheme) = scheme {
-            out.push(OperationApiKeyScheme {
-                id: scheme_id,
-                name: scheme.name.clone(),
-                location: scheme.location,
-            });
-        }
-    }
-    out.sort_by(|a, b| {
-        location_sort_key(a.location)
-            .cmp(&location_sort_key(b.location))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    out.dedup();
-    Ok(out)
-}
-
 /// Supported HTTP security scheme variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HttpAuthScheme {
@@ -200,6 +139,55 @@ pub(crate) enum HttpAuthScheme {
     Bearer,
     /// HTTP basic auth.
     Basic,
+}
+
+/// One concrete credential inside an operation security alternative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OperationAuthScheme {
+    /// An API key written to a named header or query parameter.
+    ApiKey(OperationApiKeyScheme),
+    /// An HTTP Authorization credential.
+    Http {
+        /// The graph security scheme id.
+        id: String,
+        /// The supported HTTP authentication kind.
+        scheme: HttpAuthScheme,
+    },
+}
+
+/// Exact operation authentication: outer vector is OR, inner vector is AND.
+pub(crate) fn operation_auth_alternatives(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Result<Vec<Vec<OperationAuthScheme>>, CoreError> {
+    let schemes = supported_security_schemes(graph)?;
+    validate_operation_auth_slots(graph, op, &schemes)?;
+    operation_security_alternatives(graph, op)
+        .into_iter()
+        .map(|alternative| {
+            alternative
+                .into_iter()
+                .map(|id| {
+                    let scheme = schemes
+                        .get(&id)
+                        .ok_or_else(|| unknown_security_scheme_error(op, &id))?;
+                    Ok(match scheme {
+                        SupportedAuthScheme::ApiKey(scheme) => {
+                            OperationAuthScheme::ApiKey(OperationApiKeyScheme {
+                                id,
+                                name: scheme.name.clone(),
+                                location: scheme.location,
+                            })
+                        }
+                        SupportedAuthScheme::Http(scheme) => OperationAuthScheme::Http {
+                            id,
+                            scheme: *scheme,
+                        },
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// SDK-wide HTTP auth features required by a graph.
@@ -228,56 +216,36 @@ pub(crate) fn http_auth_features(graph: &ApiGraph) -> Result<HttpAuthFeatures, C
     Ok(features)
 }
 
-/// Resolve the HTTP auth schemes required by one operation, including global schemes.
-pub(crate) fn operation_http_auth_schemes(
-    graph: &ApiGraph,
-    op: &Operation,
-) -> Result<Vec<HttpAuthScheme>, CoreError> {
-    let schemes = supported_security_schemes(graph)?;
-    validate_operation_auth_slots(graph, op, &schemes)?;
-    let scheme_ids = operation_security_ids(graph, op);
-    let mut out = Vec::new();
-    for scheme_id in scheme_ids {
-        let Some(scheme) = schemes.get(&scheme_id) else {
-            return Err(unknown_security_scheme_error(op, &scheme_id));
-        };
-        if let SupportedAuthScheme::Http(scheme) = scheme {
-            out.push(*scheme);
-        }
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
-}
-
 fn validate_operation_auth_slots(
     graph: &ApiGraph,
     op: &Operation,
     schemes: &BTreeMap<String, SupportedAuthScheme>,
 ) -> Result<(), CoreError> {
-    let mut slots = BTreeMap::new();
-    for scheme_id in operation_security_ids(graph, op) {
-        let Some(scheme) = schemes.get(&scheme_id) else {
-            return Err(unknown_security_scheme_error(op, &scheme_id));
-        };
-        let slot = match scheme {
-            SupportedAuthScheme::ApiKey(ApiKeyScheme {
-                name,
-                location: ApiKeyLocation::Header,
-            }) => format!("header:{}", name.to_ascii_lowercase()),
-            SupportedAuthScheme::ApiKey(ApiKeyScheme {
-                name,
-                location: ApiKeyLocation::Query,
-            }) => format!("query:{name}"),
-            SupportedAuthScheme::Http(_) => "header:authorization".to_string(),
-        };
-        if let Some(existing) = slots.insert(slot.clone(), scheme_id.clone()) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "operation '{}' requires security schemes '{}' and '{}' that both write {slot}",
-                    op.id, existing, scheme_id
-                ),
-            });
+    for alternative in operation_security_alternatives(graph, op) {
+        let mut slots = BTreeMap::new();
+        for scheme_id in alternative {
+            let Some(scheme) = schemes.get(&scheme_id) else {
+                return Err(unknown_security_scheme_error(op, &scheme_id));
+            };
+            let slot = match scheme {
+                SupportedAuthScheme::ApiKey(ApiKeyScheme {
+                    name,
+                    location: ApiKeyLocation::Header,
+                }) => format!("header:{}", name.to_ascii_lowercase()),
+                SupportedAuthScheme::ApiKey(ApiKeyScheme {
+                    name,
+                    location: ApiKeyLocation::Query,
+                }) => format!("query:{name}"),
+                SupportedAuthScheme::Http(_) => "header:authorization".to_string(),
+            };
+            if let Some(existing) = slots.insert(slot.clone(), scheme_id.clone()) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' has a security alternative requiring schemes '{}' and '{}' that both write {slot}",
+                        op.id, existing, scheme_id
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -339,21 +307,78 @@ fn supported_security_schemes(
     Ok(schemes)
 }
 
-fn operation_security_ids(graph: &ApiGraph, op: &Operation) -> Vec<String> {
-    let mut scheme_ids: Vec<String> = if op.security_overrides_global {
-        op.security.clone()
-    } else {
-        graph
+/// Resolve exact operation security as OR alternatives of AND groups.
+///
+/// An explicit operation policy wins. Otherwise exact document-level alternatives are inherited;
+/// source/transform operation schemes are ANDed into each inherited alternative. Graphs without
+/// exact alternatives retain the native single-AND-group behavior.
+pub(crate) fn operation_security_alternatives(
+    graph: &ApiGraph,
+    op: &Operation,
+) -> Vec<Vec<String>> {
+    if let Some(policy) = graph
+        .operation_security
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+    {
+        return normalized_security_groups(
+            policy
+                .alternatives
+                .iter()
+                .map(|group| group.schemes.clone())
+                .collect(),
+        );
+    }
+
+    if op.security_overrides_global {
+        return if op.security.is_empty() {
+            Vec::new()
+        } else {
+            normalized_security_groups(vec![op.security.clone()])
+        };
+    }
+
+    let mut inherited: Vec<Vec<String>> = if graph.security_requirements.is_empty() {
+        let global: Vec<String> = graph
             .security
             .iter()
             .filter(|scheme| scheme.global)
             .map(|scheme| scheme.id.clone())
-            .chain(op.security.iter().cloned())
+            .collect();
+        if global.is_empty() {
+            Vec::new()
+        } else {
+            vec![global]
+        }
+    } else {
+        graph
+            .security_requirements
+            .iter()
+            .map(|group| group.schemes.clone())
             .collect()
     };
-    scheme_ids.sort();
-    scheme_ids.dedup();
-    scheme_ids
+
+    if op.security.is_empty() {
+        return normalized_security_groups(inherited);
+    }
+    if inherited.is_empty() {
+        inherited.push(op.security.clone());
+    } else {
+        for alternative in &mut inherited {
+            alternative.extend(op.security.iter().cloned());
+        }
+    }
+    normalized_security_groups(inherited)
+}
+
+fn normalized_security_groups(mut groups: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for group in &mut groups {
+        group.sort();
+        group.dedup();
+    }
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 fn unsupported_security_scheme_error(scheme: &crate::graph::SecurityScheme) -> CoreError {
@@ -371,13 +396,6 @@ fn unknown_security_scheme_error(op: &Operation, scheme_id: &str) -> CoreError {
             "operation '{}' references unknown security scheme '{}'",
             op.id, scheme_id
         ),
-    }
-}
-
-fn location_sort_key(location: ApiKeyLocation) -> u8 {
-    match location {
-        ApiKeyLocation::Header => 0,
-        ApiKeyLocation::Query => 1,
     }
 }
 
@@ -716,6 +734,12 @@ pub(crate) fn success_responses_of(
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
             statuses.push(resp.status);
+            // HTTP 204 responses never carry a message body. Treat a contradictory source
+            // annotation or imported contract as bodyless so generated clients do not attempt a
+            // JSON decode that can only return EOF.
+            if resp.status == 204 {
+                continue;
+            }
             match resp.body_kind.as_str() {
                 "json" => {
                     if let Some(body) = &resp.body {
@@ -893,10 +917,13 @@ fn validate_request_body_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_stem, http_auth_features, operation_api_key_headers, operation_api_key_queries,
-        operation_http_auth_schemes, success_responses_of, HttpAuthScheme,
+        file_stem, http_auth_features, operation_auth_alternatives, success_responses_of,
+        ApiKeyLocation, HttpAuthScheme, OperationAuthScheme,
     };
-    use crate::graph::{ApiGraph, Operation, Response, SecurityScheme, SourceSpan};
+    use crate::graph::{
+        ApiGraph, Operation, OperationSecurityPolicy, Response, SecurityRequirementGroup,
+        SecurityScheme, SourceSpan, Type,
+    };
 
     #[test]
     fn file_stem_splits_acronym_before_capitalized_word() {
@@ -908,6 +935,8 @@ mod tests {
             file_stem("SupabaseCreateSignedURLOutput"),
             "supabase_create_signed_url_output"
         );
+        assert_eq!(file_stem("integrationUUIDs"), "integration_uuids");
+        assert_eq!(file_stem("userIDs"), "user_ids");
     }
 
     #[test]
@@ -960,8 +989,62 @@ mod tests {
     }
 
     #[test]
-    fn operation_api_key_headers_honor_override_security() -> Result<(), crate::CoreError> {
+    fn success_response_204_is_bodyless_even_when_input_declares_a_schema(
+    ) -> Result<(), crate::CoreError> {
         let graph = ApiGraph {
+            schemas: vec![crate::graph::Schema {
+                id: "message".to_string(),
+                name: "Message".to_string(),
+                body: Type::Object(Vec::new()),
+                enum_source_order: Vec::new(),
+                provenance: SourceSpan {
+                    file: "http.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            }],
+            ..ApiGraph::default()
+        };
+        let op = Operation {
+            id: "deleteItem".to_string(),
+            method: "DELETE".to_string(),
+            path: "/items/{id}".to_string(),
+            handler: "deleteItem".to_string(),
+            group: None,
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![Response {
+                status: 204,
+                body: Some(crate::graph::SchemaRef {
+                    ref_id: "message".to_string(),
+                }),
+                body_kind: "json".to_string(),
+                content_type: Some("application/json".to_string()),
+                content_types: vec!["application/json".to_string()],
+            }],
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+
+        let success = success_responses_of(&op, &graph)?;
+        assert_eq!(success.statuses, vec![204]);
+        assert!(success.body_model.is_none());
+        assert!(success.body_statuses.is_empty());
+        assert!(!success.has_bodyless_alternative());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_auth_honors_exact_override_security() -> Result<(), crate::CoreError> {
+        let mut graph = ApiGraph {
             security: vec![
                 SecurityScheme {
                     id: "ApiKeyAuth".to_string(),
@@ -1000,16 +1083,26 @@ mod tests {
                 end_line: 1,
             },
         };
-        assert_eq!(
-            operation_api_key_headers(&graph, &op)?,
-            vec!["X-CSRF-Token"]
-        );
+        graph.operation_security = vec![OperationSecurityPolicy {
+            operation_id: "write".to_string(),
+            alternatives: vec![SecurityRequirementGroup {
+                schemes: vec!["CSRFAuth".to_string()],
+            }],
+        }];
+        let alternatives = operation_auth_alternatives(&graph, &op)?;
+        assert_eq!(alternatives.len(), 1);
+        assert!(matches!(
+            alternatives[0].as_slice(),
+            [OperationAuthScheme::ApiKey(scheme)]
+                if scheme.id == "CSRFAuth"
+                    && scheme.name == "X-CSRF-Token"
+                    && scheme.location == ApiKeyLocation::Header
+        ));
         Ok(())
     }
 
     #[test]
-    fn operation_api_key_queries_honor_global_and_public_override() -> Result<(), crate::CoreError>
-    {
+    fn operation_auth_honors_global_and_public_override() -> Result<(), crate::CoreError> {
         let graph = ApiGraph {
             security: vec![SecurityScheme {
                 id: "QueryAuth".to_string(),
@@ -1040,15 +1133,22 @@ mod tests {
                 end_line: 1,
             },
         };
-        assert_eq!(operation_api_key_queries(&graph, &op)?, vec!["api_key"]);
+        let inherited = operation_auth_alternatives(&graph, &op)?;
+        assert!(matches!(
+            inherited[0].as_slice(),
+            [OperationAuthScheme::ApiKey(scheme)]
+                if scheme.id == "QueryAuth"
+                    && scheme.location == ApiKeyLocation::Query
+        ));
         op.security_overrides_global = true;
-        assert!(operation_api_key_queries(&graph, &op)?.is_empty());
+        assert!(operation_auth_alternatives(&graph, &op)?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn operation_http_auth_schemes_honor_global_and_override() -> Result<(), crate::CoreError> {
-        let graph = ApiGraph {
+    fn operation_auth_preserves_or_and_rejects_conflicting_and_group(
+    ) -> Result<(), crate::CoreError> {
+        let mut graph = ApiGraph {
             security: vec![
                 SecurityScheme {
                     id: "BearerAuth".to_string(),
@@ -1078,7 +1178,7 @@ mod tests {
         assert!(features.bearer);
         assert!(features.basic);
 
-        let mut op = Operation {
+        let op = Operation {
             id: "write".to_string(),
             method: "POST".to_string(),
             path: "/write".to_string(),
@@ -1098,22 +1198,38 @@ mod tests {
                 end_line: 1,
             },
         };
-        assert_eq!(
-            operation_http_auth_schemes(&graph, &op)?,
-            vec![HttpAuthScheme::Bearer]
-        );
-        assert_eq!(operation_api_key_headers(&graph, &op)?, vec!["X-API-Key"]);
+        graph.operation_security = vec![OperationSecurityPolicy {
+            operation_id: "write".to_string(),
+            alternatives: vec![
+                SecurityRequirementGroup {
+                    schemes: vec!["BearerAuth".to_string()],
+                },
+                SecurityRequirementGroup {
+                    schemes: vec!["BasicAuth".to_string()],
+                },
+            ],
+        }];
+        let alternatives = operation_auth_alternatives(&graph, &op)?;
+        assert_eq!(alternatives.len(), 2);
+        assert!(matches!(
+            alternatives[0].as_slice(),
+            [OperationAuthScheme::Http {
+                scheme: HttpAuthScheme::Basic,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            alternatives[1].as_slice(),
+            [OperationAuthScheme::Http {
+                scheme: HttpAuthScheme::Bearer,
+                ..
+            }]
+        ));
 
-        op.security = vec!["BasicAuth".to_string()];
-        op.security_overrides_global = true;
-        assert_eq!(
-            operation_http_auth_schemes(&graph, &op)?,
-            vec![HttpAuthScheme::Basic]
-        );
-        assert!(operation_api_key_headers(&graph, &op)?.is_empty());
-
-        op.security = vec!["BearerAuth".to_string(), "BasicAuth".to_string()];
-        let result = operation_http_auth_schemes(&graph, &op);
+        graph.operation_security[0].alternatives = vec![SecurityRequirementGroup {
+            schemes: vec!["BearerAuth".to_string(), "BasicAuth".to_string()],
+        }];
+        let result = operation_auth_alternatives(&graph, &op);
         assert!(
             result.is_err(),
             "conflicting Authorization schemes must fail"

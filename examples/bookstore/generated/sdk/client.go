@@ -3,6 +3,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ type Client struct {
 	requestHooks       []RequestHook
 	responseHooks      []ResponseHook
 	errorHooks         []ErrorHook
+	defaultHeaders     http.Header
 	apiKey             string
 	apiKeys            map[string]string
 }
@@ -29,9 +31,46 @@ type Client struct {
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
 
+// Ptr returns a pointer to value for optional request fields.
+func Ptr[T any](value T) *T {
+	return &value
+}
+
+// MapFrom converts a typed value into its JSON object representation.
+// It is useful when an API models a discriminated configuration body as
+// map[string]any while callers construct one of its typed variants.
+func MapFrom(value any) (map[string]any, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithHeader sets a default header on requests that do not already define it.
+func WithHeader(name, value string) Option {
+	return func(c *Client) { c.defaultHeaders.Set(name, value) }
+}
+
+// SetHeader replaces a default header used by subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) SetHeader(name, value string) {
+	c.defaultHeaders.Set(name, value)
+}
+
+// DeleteHeader removes a default header from subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) DeleteHeader(name string) {
+	c.defaultHeaders.Del(name)
 }
 
 // WithTimeout sets the client-level default request timeout.
@@ -114,6 +153,17 @@ type runtimeRequestOptions struct {
 	Options              RequestOptions
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *cancelOnCloseReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.cancel()
+	return err
+}
+
 // WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
@@ -129,6 +179,21 @@ func WithAPIKeyHeader(header, key string) Option {
 	}
 }
 
+// SetAPIKey replaces the fallback API key used by subsequent requests.
+// Configure credentials before sharing a Client between goroutines.
+func (c *Client) SetAPIKey(key string) {
+	c.apiKey = key
+}
+
+// SetAPIKeyHeader replaces the API key for one auth header on subsequent requests.
+// Configure credentials before sharing a Client between goroutines.
+func (c *Client) SetAPIKeyHeader(header, key string) {
+	if c.apiKeys == nil {
+		c.apiKeys = map[string]string{}
+	}
+	c.apiKeys[header] = key
+}
+
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
 func NewClient(baseURL string, opts ...Option) *Client {
@@ -139,6 +204,7 @@ func NewClient(baseURL string, opts ...Option) *Client {
 		maxRetries:         0,
 		retryStatuses:      map[int]bool{408: true, 429: true},
 		retryUnsafeMethods: false,
+		defaultHeaders:     make(http.Header),
 		apiKeys:            map[string]string{},
 	}
 	for _, opt := range opts {
@@ -156,6 +222,14 @@ func newRequestOptions(opts ...RequestOption) RequestOptions {
 }
 
 func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {
+	for name, values := range c.defaultHeaders {
+		if len(req.Header.Values(name)) != 0 {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	timeout := c.timeout
 	if runtime.Options.Timeout > 0 {
 		timeout = runtime.Options.Timeout
@@ -164,9 +238,13 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 	var cancel context.CancelFunc
 	if timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 		req = req.Clone(ctx)
 	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	if runtime.Idempotent && runtime.Options.IdempotencyKey != "" {
 		header := runtime.IdempotencyKeyHeader
 		if header == "" {
@@ -224,6 +302,10 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			c.callErrorHooks(attemptReq.Context(), ctx, &APIError{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get("X-Request-ID")})
+		}
+		if cancel != nil {
+			resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
+			cancel = nil
 		}
 		return resp, nil
 	}

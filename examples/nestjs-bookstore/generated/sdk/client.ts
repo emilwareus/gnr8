@@ -1,11 +1,17 @@
-import { ApiError } from "./errors";
+import {
+  ApiError,
+  AuthConfigurationError,
+  ResponseDecodeError,
+} from "./errors";
 import * as models from "./models";
 
 export interface RequestOptions {
   timeoutMs?: number;
   maxRetries?: number;
   idempotencyKey?: string;
+  headers?: Record<string, string>;
   metadata?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export interface HookContext {
@@ -41,6 +47,7 @@ export interface ClientHooks {
 export interface ClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
+  authMode?: "credentials" | "transport";
   apiKey?: string;
   apiKeys?: Record<string, string>;
   timeoutMs?: number;
@@ -55,9 +62,16 @@ interface RuntimeRequestContext {
   idempotencyKeyHeader?: string;
 }
 
+interface AuthRequirement {
+  schemeId: string;
+  kind: "apiKey" | "bearer" | "basic";
+  name?: string;
+}
+
 export class Client {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly authMode: "credentials" | "transport";
   private readonly apiKey?: string;
   private readonly apiKeys: Record<string, string>;
   private readonly timeoutMs?: number;
@@ -65,10 +79,13 @@ export class Client {
   private readonly retryStatuses: Set<number>;
   private readonly retryUnsafeMethods: boolean;
   private readonly hooks: Required<ClientHooks>;
+  private readonly bearerToken?: string;
+  private readonly basicAuth?: { username: string; password: string };
 
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchFn = opts.fetch ?? fetch;
+    this.authMode = opts.authMode ?? "credentials";
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {};
     this.timeoutMs = opts.timeoutMs ?? 30000;
@@ -92,6 +109,99 @@ export class Client {
     return this.apiKey;
   }
 
+  _selectAuthAlternative(
+    operationId: string,
+    alternatives: readonly (readonly AuthRequirement[])[],
+  ): Set<string> {
+    if (alternatives.length === 0) {
+      return new Set<string>();
+    }
+    if (this.authMode === "transport") {
+      return new Set<string>();
+    }
+    for (const alternative of alternatives) {
+      const satisfied = alternative.every((requirement) => {
+        if (requirement.kind === "apiKey") {
+          return (
+            this._apiKey(requirement.schemeId, requirement.name ?? "") !==
+            undefined
+          );
+        }
+        if (requirement.kind === "bearer") {
+          return this.bearerToken !== undefined;
+        }
+        return this.basicAuth !== undefined;
+      });
+      if (satisfied) {
+        return new Set(alternative.map((requirement) => requirement.schemeId));
+      }
+    }
+    throw new AuthConfigurationError(
+      operationId,
+      alternatives.map((alternative) =>
+        alternative.map((requirement) => requirement.schemeId),
+      ),
+    );
+  }
+
+  async _decodeJson<T>(response: Response): Promise<T> {
+    const rawBody = await response.text();
+    const actualContentType = response.headers.get("content-type") ?? undefined;
+    const mediaType =
+      actualContentType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    const errorInit = {
+      headers: response.headers,
+      requestId: response.headers.get("x-request-id") ?? undefined,
+      rawBody,
+      expectedContentType: "application/json",
+      actualContentType,
+    };
+    if (rawBody.length === 0) {
+      throw new ResponseDecodeError("empty_body", response.status, errorInit);
+    }
+    if (mediaType !== "application/json" && !mediaType.endsWith("+json")) {
+      throw new ResponseDecodeError(
+        "unexpected_content_type",
+        response.status,
+        errorInit,
+      );
+    }
+    try {
+      return JSON.parse(rawBody) as T;
+    } catch (cause) {
+      throw new ResponseDecodeError("invalid_json", response.status, {
+        ...errorInit,
+        cause,
+      });
+    }
+  }
+
+  async _readErrorBody(
+    response: Response,
+  ): Promise<{ rawBody: string; jsonBody: unknown }> {
+    const rawBody = await response.text();
+    if (rawBody.length === 0) {
+      return { rawBody, jsonBody: null };
+    }
+    const actualContentType =
+      response.headers
+        .get("content-type")
+        ?.split(";", 1)[0]
+        ?.trim()
+        .toLowerCase() ?? "";
+    if (
+      actualContentType !== "application/json" &&
+      !actualContentType.endsWith("+json")
+    ) {
+      return { rawBody, jsonBody: null };
+    }
+    try {
+      return { rawBody, jsonBody: JSON.parse(rawBody) as unknown };
+    } catch {
+      return { rawBody, jsonBody: null };
+    }
+  }
+
   private _encodeBody(body: unknown): BodyInit | undefined {
     if (body === undefined) {
       return undefined;
@@ -111,7 +221,7 @@ export class Client {
     return JSON.stringify(body);
   }
 
-  private _formBody(body: unknown): URLSearchParams {
+  _formBody(body: unknown): URLSearchParams {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -130,7 +240,7 @@ export class Client {
     return params;
   }
 
-  private _multipartBody(body: unknown): FormData {
+  _multipartBody(body: unknown): FormData {
     const form = new FormData();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -177,6 +287,7 @@ export class Client {
     const context = requestContext ?? { operationId: "", pathTemplate: path };
     const url = `${this.baseUrl}${path}`;
     const requestMetadata = options.metadata ?? {};
+    Object.assign(headers, options.headers ?? {});
     if (context.idempotent === true && options.idempotencyKey !== undefined) {
       headers[context.idempotencyKeyHeader ?? "Idempotency-Key"] =
         options.idempotencyKey;
@@ -200,11 +311,14 @@ export class Client {
         controller === undefined
           ? undefined
           : setTimeout(() => controller.abort(), timeoutMs);
+      const signals = [options.signal, controller?.signal].filter(
+        (signal): signal is AbortSignal => signal !== undefined,
+      );
       const init: RequestInit = {
         method,
         headers,
         body: bodyPayload,
-        signal: controller?.signal,
+        signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
       };
       const hookContext: HookContext = {
         operationId: context.operationId,
@@ -315,6 +429,7 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
+    const selectedAuth = this._selectAuthAlternative("listBooks", []);
     const searchParams = new URLSearchParams();
     for (const [wireName, wireValue] of wireParameterPairs(
       "genre",
@@ -363,13 +478,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -380,7 +489,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.ListBooksResponse;
+      return await this._decodeJson<models.ListBooksResponse>(res);
     }
     throw new ApiError(res.status);
   }
@@ -390,6 +499,7 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.CreatedMessage> {
     let path = `/books/`;
+    const selectedAuth = this._selectAuthAlternative("createBook", []);
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
     const res = await this._request(
@@ -406,13 +516,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -423,7 +527,7 @@ export class Client {
       });
     }
     if (res.status === 201) {
-      return (await res.json()) as models.CreatedMessage;
+      return await this._decodeJson<models.CreatedMessage>(res);
     }
     throw new ApiError(res.status);
   }
@@ -434,6 +538,7 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.BookOrError> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
+    const selectedAuth = this._selectAuthAlternative("getBook", []);
     const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
       for (const [wireName, wireValue] of wireParameterPairs(
@@ -464,13 +569,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -481,7 +580,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.BookOrError;
+      return await this._decodeJson<models.BookOrError>(res);
     }
     throw new ApiError(res.status);
   }
@@ -492,6 +591,7 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.CreatedMessage> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
+    const selectedAuth = this._selectAuthAlternative("updateBook", []);
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
     const res = await this._request(
@@ -508,13 +608,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -525,7 +619,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.CreatedMessage;
+      return await this._decodeJson<models.CreatedMessage>(res);
     }
     throw new ApiError(res.status);
   }

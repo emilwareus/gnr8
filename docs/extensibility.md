@@ -180,7 +180,7 @@ impl Target for PostmanCollection {
     fn capabilities(&self) -> Capabilities { Capabilities::http_only() }
     fn generate(&self, ir: &Service, out: &mut Artifacts, _cx: &TargetCx) -> Result<(), Error> {
         let json = build_postman(ir);                 // your logic
-        out.write(&self.out, json.into_bytes(), Provenance::whole(ir));
+        out.create(&self.out, json)?;
         Ok(())
     }
 }
@@ -237,7 +237,7 @@ represent, say so with provenance — never silently drop.
   points at the source node.
 - `doctor` aggregates these per target; `check` can fail on them if configured in code.
 
-This is the generalization of today's OAPI-03 "report compatibility gaps as diagnostics," made N×M.
+This generalizes OAPI-03 representability diagnostics across every source and target.
 
 ---
 

@@ -168,7 +168,7 @@ Preferred implementation direction:
 
 - Use official Go semantics where needed.
 - Rust owns the pipeline and graph.
-- Do not wrap Go OpenAPI generators.
+- Own source analysis, graph construction, and emission directly.
 
 Open implementation question:
 

@@ -1,6 +1,6 @@
-openapi: 3.1.0
+openapi: 3.0.3
 info:
-  title: Brownfield Books API
+  title: Imported Books API
   version: 1.0.0
 servers:
   - url: /v1
@@ -16,37 +16,9 @@ paths:
           schema:
             type: string
             format: uuid
-        - name: include
-          in: query
-          schema:
-            type: string
-            enum: [author, reviews]
       responses:
         '200':
           description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/legacy.Book'
-        '404':
-          description: Missing
-          content:
-            application/json:
-              schema:
-                $ref: './common.yaml#/components/schemas/Shared.Error'
-  /books:
-    post:
-      tags: [Books]
-      operationId: createBook
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateBookRequest'
-      responses:
-        '201':
-          description: Created
           content:
             application/json:
               schema:
@@ -67,7 +39,8 @@ paths:
                   type: string
                   format: binary
                 note:
-                  type: [string, 'null']
+                  type: string
+                  nullable: true
       responses:
         '200':
           description: Uploaded
@@ -96,7 +69,8 @@ components:
               type: string
               format: uuid
             note:
-              type: [string, 'null']
+              type: string
+              nullable: true
             metadata:
               type: object
               additionalProperties:
@@ -110,19 +84,6 @@ components:
       properties:
         collision:
           type: string
-    CreateBookRequest:
-      type: object
-      required: [title]
-      properties:
-        title:
-          type: string
-        authorId:
-          type: string
-          format: uuid
-        metadata:
-          type: object
-          additionalProperties:
-            type: string
     UploadResult:
       type: object
       required: [id]

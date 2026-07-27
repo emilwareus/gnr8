@@ -39,7 +39,6 @@ keys; message is explanatory text. Results are deterministically sorted.
 | `security` | `Security` | incomplete or contradictory security fact |
 | `override` | `Override` | explicit override replaced an extracted fact |
 | `artifact` | `Artifact` | artifact ownership violation |
-| `compatibility` | `Compatibility` | contract drift |
 
 ## Extraction codes
 

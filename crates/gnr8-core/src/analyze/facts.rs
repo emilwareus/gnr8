@@ -501,7 +501,6 @@ pub(crate) enum DiagnosticCategoryFact {
     Security,
     Override,
     Artifact,
-    Compatibility,
 }
 
 fn default_diagnostic_code() -> String {

@@ -34,7 +34,6 @@ Required shape:
 - Transforms run in declaration order against one mutable `ApiGraph`.
 - Every target reads the same final graph and adds artifacts.
 - Post-processors run in declaration order after all targets.
-- `.post_write(stage)` is a compatibility alias for `.post(stage)`.
 - All configured paths are project-relative unless an API explicitly states otherwise.
 
 ## Stage traits
@@ -90,7 +89,7 @@ Pipeline::new()
 ```
 
 Do not duplicate the same correction in individual targets. Put API meaning in transforms; keep
-target-specific file layout and compatibility policy on targets.
+target-specific file layout and package policy on targets.
 
 ## Custom stages
 
@@ -143,8 +142,7 @@ For direct library tooling, `Pipeline::build_ir(&cx)` runs source plus transform
 `gnr8::runner::run`, which implements the versioned host/child boundary.
 
 `Artifacts::files` borrows sorted files, `into_files` consumes the set, and `from_files` restores a
-sorted set. Deprecated `Artifacts::write` is a create-only compatibility alias; use `create`,
-`overlay`, or `rewrite` so ownership intent is explicit.
+sorted set. Use `create`, `overlay`, or `rewrite` so ownership intent is explicit.
 
 ## Dependency and lockfile policy
 

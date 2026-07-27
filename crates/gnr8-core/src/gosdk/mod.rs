@@ -23,10 +23,7 @@ use crate::sdk::emit_common::{
     model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
     validate_sdk_base_path,
 };
-use crate::sdk::go::GoSdkOptions;
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
-use crate::sdk::profile::SdkProfile;
-use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Go SDK as a deterministic, `gofmt`-clean multi-file bundle String (D-06, SDK-01..04).
 ///
@@ -66,8 +63,7 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let aliases = SdkTypeAliases::default();
-    let files = generate_files_with_layout(graph, package, base_path, layout, &aliases)?;
+    let files = generate_files_with_layout(graph, package, base_path, layout)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -77,61 +73,12 @@ pub(crate) fn generate_files_with_layout(
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-) -> Result<Vec<SdkFile>, crate::CoreError> {
-    generate_files_with_profile(
-        graph,
-        package,
-        base_path,
-        layout,
-        aliases,
-        &SdkProfile::minimal(),
-    )
-}
-
-pub(crate) fn generate_files_with_profile(
-    graph: &ApiGraph,
-    package: &str,
-    base_path: &str,
-    layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-    profile: &SdkProfile,
-) -> Result<Vec<SdkFile>, crate::CoreError> {
-    generate_files_with_profile_options(
-        graph,
-        package,
-        base_path,
-        layout,
-        aliases,
-        profile,
-        GoSdkOptions::for_profile(profile),
-    )
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "Go SDK file planning keeps layout/helper emission in one deterministic pass"
-)]
-pub(crate) fn generate_files_with_profile_options(
-    graph: &ApiGraph,
-    package: &str,
-    base_path: &str,
-    layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-    _profile: &SdkProfile,
-    options: GoSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;
-    let resolved_aliases = aliases.resolve(graph)?;
-    let emit_compat_surface = aliases.has_source_prefix_aliases();
-    let compat_options = emit::GoEmitOptions {
-        compat_model_helpers: emit_compat_surface,
-        sdk: options,
-    };
 
     // Fixed leading files (sorted: client.go before errors.go).
     let http_auth = http_auth_features(graph)?;
@@ -147,22 +94,6 @@ pub(crate) fn generate_files_with_profile_options(
         ),
     ));
     files.push(raw_go_file("errors.go", emit::emit_errors(package)));
-    if emit_compat_surface {
-        files.push(raw_go_file(
-            "compat_helpers.go",
-            emit::emit_compat_helpers(package),
-        ));
-        files.push(raw_go_file(
-            "compat_client.go",
-            emit::emit_compat_client_surface(graph, package, base_path)?,
-        ));
-    }
-    if !resolved_aliases.is_empty() {
-        files.push(raw_go_file(
-            "aliases.go",
-            emit::emit_type_aliases(graph, package, &resolved_aliases, &compat_options)?,
-        ));
-    }
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     if layout.is_split() {
         if let Some(raw) = emit::emit_shared_request_helpers(graph, package, &ops)? {
@@ -207,8 +138,7 @@ pub(crate) fn generate_files_with_profile_options(
             files.push(raw_go_file("facades.go", raw));
         }
         for schema in &graph.schemas {
-            let raw =
-                emit::emit_model_schema_with_options(graph, package, schema, &compat_options)?;
+            let raw = emit::emit_model_schema(graph, package, schema)?;
             let name = model_file_name(
                 layout,
                 schema,
@@ -224,10 +154,7 @@ pub(crate) fn generate_files_with_profile_options(
         files.push(raw_go_file("operations.go", raw));
 
         // Trailing models.go.
-        files.push(raw_go_file(
-            "models.go",
-            emit::emit_models_with_options(graph, package, &compat_options)?,
-        ));
+        files.push(raw_go_file("models.go", emit::emit_models(graph, package)?));
     }
 
     check_unique_file_names(&files, "Go SDK")?;
@@ -262,13 +189,11 @@ mod tests {
     // toolchain (generate runs gofmt) and skip gracefully if it is absent.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{generate, generate_files_with_layout, generate_with_layout};
+    use super::{generate, generate_with_layout};
 
     use crate::graph::ApiGraph;
 
     use crate::sdk::layout::SdkFileLayout;
-
-    use crate::sdk::surface::SdkTypeAliases;
 
     /// A facts document (code-first shape — no annotation facts) covering three operations plus the
     /// fixture request/response models + the code-defined `TargetDirection` enum — enough to assert the
@@ -581,44 +506,6 @@ mod tests {
             "// ==== gnr8:file types/model_create_goal_input.go ====",
         ] {
             assert!(out.contains(marker), "missing {marker}:\n{out}");
-        }
-    }
-
-    #[test]
-    fn source_prefix_aliases_emit_grouped_go_compat_client_surface() {
-        if !gofmt_available() {
-            eprintln!("skipping compat client test: gofmt unavailable");
-            return;
-        }
-        let mut graph = sample_graph();
-        for op in &mut graph.operations {
-            op.group = Some("Goals".to_string());
-        }
-        let aliases = SdkTypeAliases::new().source_prefix_alias("dto.", "Dto");
-        let files = generate_files_with_layout(
-            &graph,
-            "goalservice",
-            "/goal",
-            &SdkFileLayout::split(),
-            &aliases,
-        )
-        .unwrap();
-        let compat = files
-            .iter()
-            .find(|file| file.name == "compat_client.go")
-            .map(|file| file.contents.as_str())
-            .expect("compat_client.go should be emitted");
-
-        for snippet in [
-            "func NewConfiguration() *Configuration",
-            "func NewAPIClient(cfg *Configuration) *APIClient",
-            "GoalsAPI   *GoalsAPIService",
-            "func (a *GoalsAPIService) ListGoals(ctx context.Context) ApiListGoalsRequest",
-            "func (r ApiListGoalsRequest) Aggregation(aggregation string) ApiListGoalsRequest",
-            "func (r ApiCreateGoalRequest) GoalInput(goalInput any) ApiCreateGoalRequest",
-            "func (r ApiListGoalsRequest) Execute() (*ListGoalsOutput, *http.Response, error)",
-        ] {
-            assert!(compat.contains(snippet), "missing {snippet}:\n{compat}");
         }
     }
 }

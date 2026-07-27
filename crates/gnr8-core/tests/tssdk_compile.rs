@@ -292,9 +292,14 @@ fn media_graph() -> gnr8::graph::ApiGraph {
 }
 
 fn materialize_media_sdk() -> PathBuf {
+    use gnr8::sdk::prelude::SdkFileLayout;
+
     let graph = media_graph();
-    let bundle = gnr8::tssdk::generate(&graph, PACKAGE, &graph.base_path)
-        .expect("media tssdk::generate must succeed");
+    let layout = SdkFileLayout::split()
+        .operation_file_template("apis/api_{service_snake}.ts")
+        .model_file_template("models/{schema_snake}.ts");
+    let bundle = gnr8::tssdk::generate_with_layout(&graph, PACKAGE, &graph.base_path, &layout)
+        .expect("split media tssdk::generate_with_layout must succeed");
     let dir = unique_temp_dir("media");
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the media SDK");

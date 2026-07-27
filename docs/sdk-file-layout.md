@@ -1,7 +1,7 @@
 # SDK File Layout
 
-gnr8 SDK targets support compact output for small APIs and split output for larger or compatibility
-focused SDKs. File layout is configured on each SDK target with `SdkFileLayout`.
+gnr8 SDK targets support compact output for small APIs and split output for larger or customized
+SDKs. File layout is configured on each SDK target with `SdkFileLayout`.
 
 The same layout policy is available for Go, Python, and TypeScript:
 

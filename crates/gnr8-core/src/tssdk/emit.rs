@@ -6,8 +6,8 @@
 //! reformat; `prettier` is third-party — CLAUDE.md rule 2): every emitter produces already-correct
 //! TypeScript directly.
 //!
-//! - [`emit_models`]   — one `export interface X` per object [`Schema`], one
-//!   `export type X = "a" | "b"` per named enum [`Schema`], and one `export type X = …` per named
+//! - [`emit_models`]   — one `export interface X` per object [`Schema`], one runtime value object plus
+//!   matching value-union type per named enum [`Schema`], and one `export type X = …` per named
 //!   union/alias [`Schema`]; TypeScript types follow [`ts_type`].
 //! - [`emit_client`]   — the injectable platform-`fetch`-backed `Client` (Task 2).
 //! - [`emit_errors`]   — the typed `ApiError extends Error` (Task 2).
@@ -35,12 +35,11 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
-    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, ErrorResponseBody, HttpAuthScheme, RequestBodyEncoding, SuccessResponses,
+    operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, ErrorResponseBody,
+    HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
+    SuccessResponses,
 };
-use crate::sdk::surface::ResolvedTypeAlias;
-use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -88,7 +87,7 @@ fn upper_camel_first(name: &str) -> String {
 /// included).
 ///
 /// This is the SINGLE deterministic helper used everywhere a wire value is emitted as a TS string
-/// literal — inline string-literal-union members ([`ts_type`]), named-enum alias members
+/// literal — inline string-literal-union members ([`ts_type`]), named-enum value members
 /// ([`emit_enum_alias`]), and quoted non-identifier interface property names ([`emit_interface`]).
 /// One path, no fallback (rule 3).
 ///
@@ -179,9 +178,14 @@ pub(crate) fn ts_type(
                     ),
                 });
             }
-            format!("Record<string, {}>", ts_type(value, false, graph, ns)?)
+            let value_type = if matches!(value.as_ref(), Type::Any {}) {
+                "unknown".to_string()
+            } else {
+                ts_type(value, false, graph, ns)?
+            };
+            format!("Record<string, {value_type}>")
         }
-        Type::Any {} => "unknown".to_string(),
+        Type::Any {} => "Record<string, unknown>".to_string(),
         Type::Named(ref_id) => {
             let target = graph
                 .schemas
@@ -195,8 +199,8 @@ pub(crate) fn ts_type(
             format!("{ns}{}", target.name)
         }
         // An inline enum stays inline as a string-literal union (members in graph-sorted order) — the
-        // case the Go target rejects. A named enum (a top-level Schema body) is instead a `type` alias;
-        // see emit_models.
+        // case the Go target rejects. A named enum (a top-level Schema body) has a runtime value object
+        // and matching value-union type; see emit_models.
         Type::Enum(members) => members
             .iter()
             .map(|m| ts_string_literal(m))
@@ -247,12 +251,13 @@ fn ts_primitive(prim: &Prim) -> &'static str {
     }
 }
 
-/// Emit `models.ts`: one `export interface X` per object schema, one `export type X = "a" | "b"` per
-/// named enum, one `export type X = …` per named union/scalar/array alias.
+/// Emit `models.ts`: one `export interface X` per object schema, one runtime constant plus derived
+/// union type per named enum, and one `export type X = …` per named union/scalar/array alias.
 ///
 /// Schemas are consumed in the graph's id-sorted order (determinism). A schema whose body is
-/// [`Type::Enum`] becomes a string-literal-union `type` alias; a [`Type::Object`] becomes an
-/// `interface`; every other named body (`Union`/`Array`/scalar/`Named`) becomes a plain `type` alias.
+/// [`Type::Enum`] becomes an `as const` object and a union derived from its values; a
+/// [`Type::Object`] becomes an `interface`; every other named body
+/// (`Union`/`Array`/scalar/`Named`) becomes a plain `type` alias.
 /// Unlike the Python twin, TypeScript `type` aliases are order-independent, so there is NO forward-ref
 /// hack and NO fixed import header.
 ///
@@ -262,31 +267,8 @@ fn ts_primitive(prim: &Prim) -> &'static str {
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if a field's schema cannot be mapped or two schemas collide on a name.
-#[cfg(test)]
 pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
-    emit_models_with_aliases(graph, package, &[])
-}
-
-#[cfg(test)]
-pub(crate) fn emit_models_with_aliases(
-    graph: &ApiGraph,
-    _package: &str,
-    aliases: &[ResolvedTypeAlias],
-) -> Result<String, CoreError> {
-    emit_models_with_aliases_and_policies(
-        graph,
-        aliases,
-        TsModelPropertyPolicy::Strict,
-        TsNullablePolicy::ExplicitNull,
-    )
-}
-
-pub(crate) fn emit_models_with_aliases_and_policies(
-    graph: &ApiGraph,
-    aliases: &[ResolvedTypeAlias],
-    model_property_policy: TsModelPropertyPolicy,
-    nullable_policy: TsNullablePolicy,
-) -> Result<String, CoreError> {
+    let _ = package;
     let mut out = String::new();
 
     check_unique_schema_names(graph, "TypeScript SDK")?;
@@ -296,19 +278,10 @@ pub(crate) fn emit_models_with_aliases_and_policies(
             out.push('\n');
         }
         match &schema.body {
-            // A named enum (top-level Schema body) → a string-literal-union `type` alias. The twin of
-            // Python's `class X(str, enum.Enum)` and Go's `type X string`.
+            // A named enum exposes both runtime values and its exact wire-value union.
             Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
             // A named object → an `interface`.
-            Type::Object(fields) => emit_interface_with_policies(
-                &mut out,
-                &schema.name,
-                fields,
-                graph,
-                "",
-                model_property_policy,
-                nullable_policy,
-            )?,
+            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
             // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
             // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
@@ -327,12 +300,6 @@ pub(crate) fn emit_models_with_aliases_and_policies(
             }
         }
     }
-    for alias in aliases {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        writeln!(out, "export type {} = {};", alias.alias, alias.canonical).map_err(sink)?;
-    }
     if out.is_empty() {
         out.push_str("export {};\n");
     }
@@ -340,29 +307,16 @@ pub(crate) fn emit_models_with_aliases_and_policies(
 }
 
 /// Emit one model schema into its own TypeScript file.
-pub(crate) fn emit_model_schema_with_policies(
+pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
     models_module: &str,
-    model_property_policy: TsModelPropertyPolicy,
-    nullable_policy: TsNullablePolicy,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
-    let mut out = String::new();
-    let models_module = quoted_string_literal(models_module);
-    writeln!(out, "import type * as models from {models_module};").map_err(sink)?;
-    writeln!(out).map_err(sink)?;
+    let mut body = String::new();
     match &schema.body {
-        Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
-        Type::Object(fields) => emit_interface_with_policies(
-            &mut out,
-            &schema.name,
-            fields,
-            graph,
-            "models.",
-            model_property_policy,
-            nullable_policy,
-        )?,
+        Type::Enum(members) => emit_enum_alias(&mut body, &schema.name, members)?,
+        Type::Object(fields) => emit_interface(&mut body, &schema.name, fields, graph, "models.")?,
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
@@ -371,34 +325,56 @@ pub(crate) fn emit_model_schema_with_policies(
         | Type::Union(_)
         | Type::Any {} => {
             let alias = ts_type(&schema.body, false, graph, "models.")?;
-            writeln!(out, "export type {} = {alias};", schema.name).map_err(sink)?;
+            writeln!(body, "export type {} = {alias};", schema.name).map_err(sink)?;
         }
     }
-    Ok(out)
+    if !body.contains("models.") {
+        return Ok(body);
+    }
+    let models_module = quoted_string_literal(models_module);
+    Ok(format!(
+        "import type * as models from {models_module};\n\n{body}"
+    ))
 }
 
-/// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
-    let canonical_module = quoted_string_literal(canonical_module);
-    format!(
-        "import type {{ {} }} from {canonical_module};\n\nexport type {} = {};\n",
-        alias.canonical, alias.alias, alias.canonical
-    )
-}
-
-/// Emit a named enum alias: `export type {name} = "a" | "b";` (members in graph order). The wire string
-/// IS the literal — a string-literal union has no member *identifier* to sanitize (so the Python
-/// `SCREAMING_SNAKE`/keyword machinery has no analog here; RESEARCH Pitfall 6) — but the literal VALUE
-/// still must be escaped for a TS double-quoted string literal so an embedded `"`/`\`/control char does
-/// not break `tsc` or silently corrupt the literal type (CR-01); [`ts_string_literal`] does both.
+/// Emit a named enum as a runtime constant and an exact union derived from its values.
+///
+/// Member identifiers are deterministic `PascalCase` projections of wire values. Empty or
+/// punctuation-only values use `Value`; normalized collisions receive a stable numeric suffix.
+/// Wire values always pass through [`ts_string_literal`].
 fn emit_enum_alias(out: &mut String, name: &str, members: &[String]) -> Result<(), CoreError> {
     if members.is_empty() {
         // An empty closed set has no inhabitants — `never` is the precise TS type.
         writeln!(out, "export type {name} = never;").map_err(sink)?;
         return Ok(());
     }
-    let lits: Vec<String> = members.iter().map(|m| ts_string_literal(m)).collect();
-    writeln!(out, "export type {name} = {};", lits.join(" | ")).map_err(sink)?;
+
+    let mut used = BTreeMap::<String, usize>::new();
+    writeln!(out, "export const {name} = {{").map_err(sink)?;
+    for member in members {
+        let base = {
+            let projected = pascal_identifier(member);
+            if projected.is_empty() {
+                "Value".to_string()
+            } else {
+                projected
+            }
+        };
+        let count = used.entry(base.clone()).or_default();
+        *count += 1;
+        let identifier = if *count == 1 {
+            base
+        } else {
+            format!("{base}{count}")
+        };
+        writeln!(out, "  {identifier}: {},", ts_string_literal(member)).map_err(sink)?;
+    }
+    writeln!(out, "}} as const;").map_err(sink)?;
+    writeln!(
+        out,
+        "export type {name} = (typeof {name})[keyof typeof {name}];"
+    )
+    .map_err(sink)?;
     Ok(())
 }
 
@@ -420,17 +396,15 @@ fn pascal_identifier(value: &str) -> String {
 /// Emit an `export interface` for an object schema, one field line per field in GRAPH ORDER.
 ///
 /// Unlike the Python `@dataclass` twin there is NO required-first partition (TS `?:` is order-free —
-/// RESEARCH Pitfall 6) and NO runtime decoder: an `interface` is zero-runtime and `await res.json() as X`
-/// suffices (Assumption A1). The two independent axes are: `optional` → `?:` at the field site;
+/// RESEARCH Pitfall 6). The runtime response decoder validates media type, presence, and JSON syntax
+/// before casting into these zero-runtime interfaces. The two independent axes are: `optional` → `?:` at the field site;
 /// `nullable` → `| null` inside [`ts_type`]. All four combinations are representable.
-fn emit_interface_with_policies(
+fn emit_interface(
     out: &mut String,
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
     ns: &str,
-    model_property_policy: TsModelPropertyPolicy,
-    nullable_policy: TsNullablePolicy,
 ) -> Result<(), CoreError> {
     if fields.is_empty() {
         // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
@@ -450,15 +424,32 @@ fn emit_interface_with_policies(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let effective_optional =
-            model_property_policy.field_optional(field.required, field.optional);
-        let effective_nullable = nullable_policy.field_nullable(effective_optional, field.nullable);
-        let hint = ts_type(&field.schema, effective_nullable, graph, ns)?;
-        let opt = if effective_optional { "?" } else { "" };
+        let hint = ts_field_type(field, graph, ns)?;
+        let opt = if field.optional { "?" } else { "" };
         writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
     writeln!(out, "}}").map_err(sink)?;
     Ok(())
+}
+
+fn ts_field_type(field: &Field, graph: &ApiGraph, ns: &str) -> Result<String, CoreError> {
+    if matches!(field.schema, Type::Primitive(Prim::String))
+        && !field.meta.constraints.enum_values.is_empty()
+    {
+        let mut hint = field
+            .meta
+            .constraints
+            .enum_values
+            .iter()
+            .map(|value| ts_string_literal(value))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if field.nullable {
+            hint.push_str(" | null");
+        }
+        return Ok(hint);
+    }
+    ts_type(&field.schema, field.nullable, graph, ns)
 }
 
 /// Emit `errors.ts`: the typed `ApiError extends Error` carrying status, response metadata, and body.
@@ -494,6 +485,52 @@ export class ApiError extends Error {
 
   isNotFound(): boolean {
     return this.status === 404;
+  }
+}
+
+export class AuthConfigurationError extends Error {
+  constructor(
+    public readonly operationId: string,
+    public readonly alternatives: readonly (readonly string[])[],
+  ) {
+    super(`No configured credentials satisfy operation ${operationId}`);
+    this.name = \"AuthConfigurationError\";
+  }
+}
+
+export type ResponseDecodeFailure =
+  \"empty_body\" | \"unexpected_content_type\" | \"invalid_json\";
+
+export interface ResponseDecodeErrorInit {
+  headers?: Headers;
+  requestId?: string;
+  rawBody?: string;
+  expectedContentType?: string;
+  actualContentType?: string;
+  cause?: unknown;
+}
+
+export class ResponseDecodeError extends Error {
+  public readonly headers: Headers;
+  public readonly requestId?: string;
+  public readonly rawBody: string;
+  public readonly expectedContentType: string;
+  public readonly actualContentType?: string;
+  public readonly cause?: unknown;
+
+  constructor(
+    public readonly failure: ResponseDecodeFailure,
+    public readonly status: number,
+    init: ResponseDecodeErrorInit = {},
+  ) {
+    super(`HTTP ${status}: response decode failed (${failure})`);
+    this.name = \"ResponseDecodeError\";
+    this.headers = init.headers ?? new Headers();
+    this.requestId = init.requestId;
+    this.rawBody = init.rawBody ?? \"\";
+    this.expectedContentType = init.expectedContentType ?? \"application/json\";
+    this.actualContentType = init.actualContentType;
+    this.cause = init.cause;
   }
 }
 "
@@ -542,16 +579,8 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
-    let bearer_field = if has_bearer_auth {
-        "  private readonly bearerToken?: string;\n"
-    } else {
-        ""
-    };
-    let basic_field = if has_basic_auth {
-        "  private readonly basicAuth?: { username: string; password: string };\n"
-    } else {
-        ""
-    };
+    let bearer_field = "  private readonly bearerToken?: string;\n";
+    let basic_field = "  private readonly basicAuth?: { username: string; password: string };\n";
     let bearer_init = if has_bearer_auth {
         "    this.bearerToken = opts.bearerToken;\n"
     } else {
@@ -578,14 +607,20 @@ pub(crate) fn emit_client_with_models(
     let retry_unsafe_methods = runtime.retry_unsafe_methods;
     format!(
         "\
-import {{ ApiError }} from \"./errors\";
+import {{
+  ApiError,
+  AuthConfigurationError,
+  ResponseDecodeError,
+}} from \"./errors\";
 import * as models from \"./{model_module}\";
 
 export interface RequestOptions {{
   timeoutMs?: number;
   maxRetries?: number;
   idempotencyKey?: string;
+  headers?: Record<string, string>;
   metadata?: Record<string, string>;
+  signal?: AbortSignal;
 }}
 
 export interface HookContext {{
@@ -621,6 +656,7 @@ export interface ClientHooks {{
 export interface ClientOptions {{
   baseUrl: string;
   fetch?: typeof fetch;
+  authMode?: \"credentials\" | \"transport\";
   apiKey?: string;
   apiKeys?: Record<string, string>;
   timeoutMs?: number;
@@ -635,9 +671,16 @@ interface RuntimeRequestContext {{
   idempotencyKeyHeader?: string;
 }}
 
+interface AuthRequirement {{
+  schemeId: string;
+  kind: \"apiKey\" | \"bearer\" | \"basic\";
+  name?: string;
+}}
+
 export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
+  private readonly authMode: \"credentials\" | \"transport\";
   private readonly apiKey?: string;
   private readonly apiKeys: Record<string, string>;
   private readonly timeoutMs?: number;
@@ -649,6 +692,7 @@ export class Client {{
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
     this.fetchFn = opts.fetch ?? fetch;
+    this.authMode = opts.authMode ?? \"credentials\";
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {{}};
     this.timeoutMs = opts.timeoutMs ?? {default_timeout};
@@ -672,6 +716,99 @@ export class Client {{
     return this.apiKey;
   }}
 {bearer_helper}{basic_helper}
+  _selectAuthAlternative(
+    operationId: string,
+    alternatives: readonly (readonly AuthRequirement[])[],
+  ): Set<string> {{
+    if (alternatives.length === 0) {{
+      return new Set<string>();
+    }}
+    if (this.authMode === \"transport\") {{
+      return new Set<string>();
+    }}
+    for (const alternative of alternatives) {{
+      const satisfied = alternative.every((requirement) => {{
+        if (requirement.kind === \"apiKey\") {{
+          return (
+            this._apiKey(requirement.schemeId, requirement.name ?? \"\") !==
+            undefined
+          );
+        }}
+        if (requirement.kind === \"bearer\") {{
+          return this.bearerToken !== undefined;
+        }}
+        return this.basicAuth !== undefined;
+      }});
+      if (satisfied) {{
+        return new Set(alternative.map((requirement) => requirement.schemeId));
+      }}
+    }}
+    throw new AuthConfigurationError(
+      operationId,
+      alternatives.map((alternative) =>
+        alternative.map((requirement) => requirement.schemeId),
+      ),
+    );
+  }}
+
+  async _decodeJson<T>(response: Response): Promise<T> {{
+    const rawBody = await response.text();
+    const actualContentType = response.headers.get(\"content-type\") ?? undefined;
+    const mediaType =
+      actualContentType?.split(\";\", 1)[0]?.trim().toLowerCase() ?? \"\";
+    const errorInit = {{
+      headers: response.headers,
+      requestId: response.headers.get(\"x-request-id\") ?? undefined,
+      rawBody,
+      expectedContentType: \"application/json\",
+      actualContentType,
+    }};
+    if (rawBody.length === 0) {{
+      throw new ResponseDecodeError(\"empty_body\", response.status, errorInit);
+    }}
+    if (mediaType !== \"application/json\" && !mediaType.endsWith(\"+json\")) {{
+      throw new ResponseDecodeError(
+        \"unexpected_content_type\",
+        response.status,
+        errorInit,
+      );
+    }}
+    try {{
+      return JSON.parse(rawBody) as T;
+    }} catch (cause) {{
+      throw new ResponseDecodeError(\"invalid_json\", response.status, {{
+        ...errorInit,
+        cause,
+      }});
+    }}
+  }}
+
+  async _readErrorBody(
+    response: Response,
+  ): Promise<{{ rawBody: string; jsonBody: unknown }}> {{
+    const rawBody = await response.text();
+    if (rawBody.length === 0) {{
+      return {{ rawBody, jsonBody: null }};
+    }}
+    const actualContentType =
+      response.headers
+        .get(\"content-type\")
+        ?.split(\";\", 1)[0]
+        ?.trim()
+        .toLowerCase() ?? \"\";
+    if (
+      actualContentType !== \"application/json\" &&
+      !actualContentType.endsWith(\"+json\")
+    ) {{
+      return {{ rawBody, jsonBody: null }};
+    }}
+    try {{
+      return {{ rawBody, jsonBody: JSON.parse(rawBody) as unknown }};
+    }} catch {{
+      return {{ rawBody, jsonBody: null }};
+    }}
+  }}
+
   private _encodeBody(body: unknown): BodyInit | undefined {{
     if (body === undefined) {{
       return undefined;
@@ -691,7 +828,7 @@ export class Client {{
     return JSON.stringify(body);
   }}
 
-  private _formBody(body: unknown): URLSearchParams {{
+  _formBody(body: unknown): URLSearchParams {{
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -710,7 +847,7 @@ export class Client {{
     return params;
   }}
 
-  private _multipartBody(body: unknown): FormData {{
+  _multipartBody(body: unknown): FormData {{
     const form = new FormData();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -757,6 +894,7 @@ export class Client {{
     const context = requestContext ?? {{ operationId: \"\", pathTemplate: path }};
     const url = `${{this.baseUrl}}${{path}}`;
     const requestMetadata = options.metadata ?? {{}};
+    Object.assign(headers, options.headers ?? {{}});
     if (context.idempotent === true && options.idempotencyKey !== undefined) {{
       headers[context.idempotencyKeyHeader ?? \"Idempotency-Key\"] =
         options.idempotencyKey;
@@ -780,11 +918,14 @@ export class Client {{
         controller === undefined
           ? undefined
           : setTimeout(() => controller.abort(), timeoutMs);
+      const signals = [options.signal, controller?.signal].filter(
+        (signal): signal is AbortSignal => signal !== undefined,
+      );
       const init: RequestInit = {{
         method,
         headers,
         body: bodyPayload,
-        signal: controller?.signal,
+        signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
       }};
       const hookContext: HookContext = {{
         operationId: context.operationId,
@@ -985,22 +1126,28 @@ pub(crate) fn emit_operation_module(
     errors_module: &str,
     models_module: &str,
 ) -> Result<String, CoreError> {
-    let mut out = format!(
-        "import type {{ Client, RequestOptions }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\nimport * as models from \"{models_module}\";\n\n",
-    );
+    let mut body = String::new();
     for op in ops {
         emit_operation(
-            &mut out,
+            &mut body,
             op,
             graph,
             base_path,
             OperationEmitStyle::PrototypeFunction,
         )?;
-        emit_pagination_helpers(&mut out, op, graph, OperationEmitStyle::PrototypeFunction)?;
+        emit_pagination_helpers(&mut body, op, graph, OperationEmitStyle::PrototypeFunction)?;
     }
     if ts_operations_need_wire_helpers(ops) {
-        emit_ts_wire_helpers(&mut out, ts_operations_need_query_string_helper(ops));
+        emit_ts_wire_helpers(&mut body, ts_operations_need_query_string_helper(ops));
     }
+    let model_import = if body.contains("models.") {
+        format!("import * as models from \"{models_module}\";\n")
+    } else {
+        String::new()
+    };
+    let out = format!(
+        "import type {{ Client, RequestOptions }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\n{model_import}\n{body}",
+    );
     Ok(out)
 }
 
@@ -1229,6 +1376,71 @@ fn ts_async_generator_method_signature(name: &str, args: &[String], ret: &str) -
     out
 }
 
+fn emit_ts_auth_selection(
+    out: &mut String,
+    operation_id: &str,
+    alternatives: &[Vec<OperationAuthScheme>],
+) -> Result<(), CoreError> {
+    if alternatives.is_empty() {
+        writeln!(
+            out,
+            "    const selectedAuth = this._selectAuthAlternative({}, []);",
+            quoted_string_literal(operation_id)
+        )
+        .map_err(sink)?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "    const selectedAuth = this._selectAuthAlternative({}, [",
+        quoted_string_literal(operation_id)
+    )
+    .map_err(sink)?;
+    for alternative in alternatives {
+        writeln!(out, "      [").map_err(sink)?;
+        for scheme in alternative {
+            match scheme {
+                OperationAuthScheme::ApiKey(scheme) => {
+                    writeln!(
+                        out,
+                        "        {{ schemeId: {}, kind: \"apiKey\", name: {} }},",
+                        quoted_string_literal(&scheme.id),
+                        quoted_string_literal(&scheme.name)
+                    )
+                    .map_err(sink)?;
+                }
+                OperationAuthScheme::Http { id, scheme } => {
+                    let kind = match scheme {
+                        HttpAuthScheme::Bearer => "bearer",
+                        HttpAuthScheme::Basic => "basic",
+                    };
+                    writeln!(
+                        out,
+                        "        {{ schemeId: {}, kind: \"{kind}\" }},",
+                        quoted_string_literal(id)
+                    )
+                    .map_err(sink)?;
+                }
+            }
+        }
+        writeln!(out, "      ],").map_err(sink)?;
+    }
+    writeln!(out, "    ]);").map_err(sink)?;
+    Ok(())
+}
+
+fn flattened_auth_schemes(alternatives: &[Vec<OperationAuthScheme>]) -> Vec<OperationAuthScheme> {
+    let mut by_id = BTreeMap::new();
+    for scheme in alternatives.iter().flatten() {
+        let id = match scheme {
+            OperationAuthScheme::ApiKey(scheme) => &scheme.id,
+            OperationAuthScheme::Http { id, .. } => id,
+        };
+        by_id.entry(id.clone()).or_insert_with(|| scheme.clone());
+    }
+    by_id.into_values().collect()
+}
+
 /// Emit a group facade's delegator signature (`{method}(...args: Parameters<...>): ReturnType<...> {`),
 /// wrapping to multi-line when the single-line form exceeds Prettier's 80-col `printWidth` — the parallel
 /// of [`ts_method_signature`] for the facade path. A rest parameter (`...args`) takes NO trailing comma
@@ -1253,6 +1465,40 @@ enum OperationEmitStyle {
     PrototypeFunction,
 }
 
+fn fetch_transport_owns_parameter(param: &Param) -> bool {
+    if param.location == "cookie" {
+        return true;
+    }
+    if param.location != "header" {
+        return false;
+    }
+
+    matches!(
+        param.name.to_ascii_lowercase().as_str(),
+        "accept-charset"
+            | "accept-encoding"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+            | "connection"
+            | "content-length"
+            | "cookie"
+            | "date"
+            | "dnt"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "origin"
+            | "permissions-policy"
+            | "referer"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "user-agent"
+            | "via"
+    )
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one operation emitter keeps signature, path, query, dispatch, and split-mode wrappers in one deterministic pass"
@@ -1269,7 +1515,13 @@ fn emit_operation(
     let tokens = path_tokens(&abs);
 
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
+    // Fetch owns cookies and forbidden browser headers through its transport. They are not
+    // required operation arguments in the TypeScript SDK.
+    let request_params: Vec<&Param> = op
+        .params
+        .iter()
+        .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
+        .collect();
 
     // The templated path tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token nor an unused arg can slip through (twin of WR-03).
@@ -1288,9 +1540,33 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let error_bodies = error_response_bodies_of(op, graph)?;
-    let auth_headers = operation_api_key_headers(graph, op)?;
-    let auth_queries = operation_api_key_queries(graph, op)?;
-    let auth_http = operation_http_auth_schemes(graph, op)?;
+    let auth_alternatives = operation_auth_alternatives(graph, op)?;
+    let auth_schemes = flattened_auth_schemes(&auth_alternatives);
+    let auth_headers: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Header => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_queries: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Query => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_http: Vec<(String, HttpAuthScheme)> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::Http { id, scheme } => Some((id.clone(), *scheme)),
+            OperationAuthScheme::ApiKey(_) => None,
+        })
+        .collect();
     let return_model = success.body_model.clone();
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
@@ -1373,6 +1649,7 @@ fn emit_operation(
     }
 
     emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
+    emit_ts_auth_selection(out, &op.id, &auth_alternatives)?;
     emit_op_query(
         out,
         graph,
@@ -1625,7 +1902,11 @@ struct TsPaginationArgs {
 
 fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationArgs, CoreError> {
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
+    let request_params: Vec<&Param> = op
+        .params
+        .iter()
+        .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
+        .collect();
     let body_model = request_body_model_of(op, graph)?;
     let ResolvedArgs {
         path_idents,
@@ -1791,14 +2072,13 @@ fn ts_parameter_needs_pairs(param: &Param) -> bool {
 
 /// Whether any operation in this file serializes a parameter through `wireParameterPairs`.
 ///
-/// Every query parameter does, plus header/cookie parameters whose shape expands to several pairs.
+/// Every query parameter does, plus header parameters whose shape expands to several pairs.
 fn ts_operations_need_wire_helpers(ops: &[&Operation]) -> bool {
     ops.iter().any(|op| {
         op.params.iter().any(|param| {
             param.allow_reserved
                 || param.location == "query"
-                || ((param.location == "header" || param.location == "cookie")
-                    && ts_parameter_needs_pairs(param))
+                || (param.location == "header" && ts_parameter_needs_pairs(param))
         })
     })
 }
@@ -1813,42 +2093,30 @@ fn ts_operations_need_query_string_helper(ops: &[&Operation]) -> bool {
         .any(|op| op.params.iter().any(|param| param.allow_reserved))
 }
 
-fn emit_ts_header_cookie_parameters(
+fn emit_ts_header_parameters(
     out: &mut String,
     required_params: &[&Param],
     required_idents: &[String],
     optional_params: &[&Param],
     optional_idents: &[String],
 ) -> Result<(), CoreError> {
-    let has_cookie = required_params
-        .iter()
-        .chain(optional_params.iter())
-        .any(|param| param.location == "cookie");
-    if has_cookie {
-        writeln!(out, "    const cookieParts: string[] = [];").map_err(sink)?;
-    }
     for (param, ident) in required_params.iter().zip(required_idents.iter()) {
-        if param.location == "header" || param.location == "cookie" {
-            emit_ts_header_cookie_parameter(out, param, ident, "    ")?;
+        if param.location == "header" {
+            emit_ts_header_parameter(out, param, ident, "    ")?;
         }
     }
     for (param, ident) in optional_params.iter().zip(optional_idents.iter()) {
-        if param.location != "header" && param.location != "cookie" {
+        if param.location != "header" {
             continue;
         }
         writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        emit_ts_header_cookie_parameter(out, param, ident, "      ")?;
-        writeln!(out, "    }}").map_err(sink)?;
-    }
-    if has_cookie {
-        writeln!(out, "    if (cookieParts.length > 0) {{").map_err(sink)?;
-        writeln!(out, "      headers[\"Cookie\"] = cookieParts.join(\"; \");").map_err(sink)?;
+        emit_ts_header_parameter(out, param, ident, "      ")?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     Ok(())
 }
 
-fn emit_ts_header_cookie_parameter(
+fn emit_ts_header_parameter(
     out: &mut String,
     param: &Param,
     ident: &str,
@@ -1863,31 +2131,16 @@ fn emit_ts_header_cookie_parameter(
             ts_parameter_explode(param)
         )
         .map_err(sink)?;
-        if param.location == "header" {
-            writeln!(
-                out,
-                "{padding}  headers[wireName] = headers[wireName] === undefined ? wireValue : headers[wireName] + \",\" + wireValue;"
-            )
-            .map_err(sink)?;
-        } else {
-            writeln!(
-                out,
-                "{padding}  cookieParts.push(encodeURIComponent(wireName) + \"=\" + encodeURIComponent(wireValue));"
-            )
-            .map_err(sink)?;
-        }
-        writeln!(out, "{padding}}}").map_err(sink)?;
-    } else if param.location == "header" {
         writeln!(
             out,
-            "{padding}headers[{}] = String({ident});",
-            quoted_string_literal(&param.name)
+            "{padding}  headers[wireName] = headers[wireName] === undefined ? wireValue : headers[wireName] + \",\" + wireValue;"
         )
         .map_err(sink)?;
+        writeln!(out, "{padding}}}").map_err(sink)?;
     } else {
         writeln!(
             out,
-            "{padding}cookieParts.push(encodeURIComponent({}) + \"=\" + encodeURIComponent(String({ident})));",
+            "{padding}headers[{}] = String({ident});",
             quoted_string_literal(&param.name)
         )
         .map_err(sink)?;
@@ -2053,7 +2306,7 @@ fn emit_op_query(
     required_query_idents: &[String],
     optional_query: &[&Param],
     optional_query_idents: &[String],
-    auth_queries: &[String],
+    auth_queries: &[OperationApiKeyScheme],
 ) -> Result<(), CoreError> {
     let has_query_params = required_query
         .iter()
@@ -2089,20 +2342,28 @@ fn emit_op_query(
         let local = format!("apiKeyQuery{idx}");
         writeln!(
             out,
-            "    const {local} = this._apiKey({});",
-            quoted_string_literal(query)
+            "    if (selectedAuth.has({})) {{",
+            quoted_string_literal(&query.id)
         )
         .map_err(sink)?;
-        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
         writeln!(
             out,
-            "      searchParams.append({}, {local});",
-            quoted_string_literal(query)
+            "      const {local} = this._apiKey({}, {});",
+            quoted_string_literal(&query.id),
+            quoted_string_literal(&query.name)
+        )
+        .map_err(sink)?;
+        writeln!(out, "      if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "        searchParams.append({}, {local});",
+            quoted_string_literal(&query.name)
         )
         .map_err(sink)?;
         if has_allow_reserved {
-            writeln!(out, "      queryPairIndex += 1;").map_err(sink)?;
+            writeln!(out, "        queryPairIndex += 1;").map_err(sink)?;
         }
+        writeln!(out, "      }}").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
     if has_allow_reserved {
@@ -2369,17 +2630,11 @@ fn emit_error_throw_branch(
     error_bodies: &[ErrorResponseBody],
 ) -> Result<(), CoreError> {
     writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
-    writeln!(out, "      const rawBody = await res.text();").map_err(sink)?;
-    writeln!(out, "      let jsonBody: unknown = null;").map_err(sink)?;
-    writeln!(out, "      try {{").map_err(sink)?;
     writeln!(
         out,
-        "        jsonBody = rawBody ? JSON.parse(rawBody) : null;"
+        "      const {{ rawBody, jsonBody }} = await this._readErrorBody(res);"
     )
     .map_err(sink)?;
-    writeln!(out, "      }} catch {{").map_err(sink)?;
-    writeln!(out, "        jsonBody = null;").map_err(sink)?;
-    writeln!(out, "      }}").map_err(sink)?;
     writeln!(out, "      let errorBody: unknown = jsonBody;").map_err(sink)?;
     for error_body in error_bodies {
         writeln!(out, "      if (res.status === {}) {{", error_body.status).map_err(sink)?;
@@ -2458,8 +2713,8 @@ fn emit_op_dispatch(
     method: &str,
     success: &SuccessResponses,
     request_body: TsRequestBody,
-    auth_headers: &[String],
-    auth_http: &[HttpAuthScheme],
+    auth_headers: &[OperationApiKeyScheme],
+    auth_http: &[(String, HttpAuthScheme)],
     error_bodies: &[ErrorResponseBody],
     op: &Operation,
     graph: &ApiGraph,
@@ -2469,7 +2724,7 @@ fn emit_op_dispatch(
     optional_param_idents: &[String],
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
-    emit_ts_header_cookie_parameters(
+    emit_ts_header_parameters(
         out,
         required_params,
         required_param_idents,
@@ -2480,29 +2735,45 @@ fn emit_op_dispatch(
         let local = format!("apiKey{idx}");
         writeln!(
             out,
-            "    const {local} = this._apiKey({});",
-            quoted_string_literal(header)
+            "    if (selectedAuth.has({})) {{",
+            quoted_string_literal(&header.id)
         )
         .map_err(sink)?;
-        writeln!(out, "    if ({local} !== undefined) {{").map_err(sink)?;
         writeln!(
             out,
-            "      headers[{}] = {local};",
-            quoted_string_literal(header)
+            "      const {local} = this._apiKey({}, {});",
+            quoted_string_literal(&header.id),
+            quoted_string_literal(&header.name)
         )
         .map_err(sink)?;
+        writeln!(out, "      if ({local} !== undefined) {{").map_err(sink)?;
+        writeln!(
+            out,
+            "        headers[{}] = {local};",
+            quoted_string_literal(&header.name)
+        )
+        .map_err(sink)?;
+        writeln!(out, "      }}").map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
     }
-    if auth_http.contains(&HttpAuthScheme::Bearer) {
-        writeln!(out, "    const bearerAuth = this._bearerAuth();").map_err(sink)?;
-        writeln!(out, "    if (bearerAuth !== undefined) {{").map_err(sink)?;
-        writeln!(out, "      headers[\"Authorization\"] = bearerAuth;").map_err(sink)?;
-        writeln!(out, "    }}").map_err(sink)?;
-    }
-    if auth_http.contains(&HttpAuthScheme::Basic) {
-        writeln!(out, "    const basicAuth = this._basicAuth();").map_err(sink)?;
-        writeln!(out, "    if (basicAuth !== undefined) {{").map_err(sink)?;
-        writeln!(out, "      headers[\"Authorization\"] = basicAuth;").map_err(sink)?;
+    for (scheme_id, scheme) in auth_http {
+        writeln!(
+            out,
+            "    if (selectedAuth.has({})) {{",
+            quoted_string_literal(scheme_id)
+        )
+        .map_err(sink)?;
+        if *scheme == HttpAuthScheme::Bearer {
+            writeln!(out, "      const bearerAuth = this._bearerAuth();").map_err(sink)?;
+            writeln!(out, "      if (bearerAuth !== undefined) {{").map_err(sink)?;
+            writeln!(out, "        headers[\"Authorization\"] = bearerAuth;").map_err(sink)?;
+            writeln!(out, "      }}").map_err(sink)?;
+        } else {
+            writeln!(out, "      const basicAuth = this._basicAuth();").map_err(sink)?;
+            writeln!(out, "      if (basicAuth !== undefined) {{").map_err(sink)?;
+            writeln!(out, "        headers[\"Authorization\"] = basicAuth;").map_err(sink)?;
+            writeln!(out, "      }}").map_err(sink)?;
+        }
         writeln!(out, "    }}").map_err(sink)?;
     }
     if request_body.is_required() {
@@ -2584,7 +2855,11 @@ fn emit_op_dispatch(
             ts_status_match("res.status", &success.body_statuses)
         )
         .map_err(sink)?;
-        writeln!(out, "      return (await res.json()) as models.{model};").map_err(sink)?;
+        writeln!(
+            out,
+            "      return await this._decodeJson<models.{model}>(res);"
+        )
+        .map_err(sink)?;
         writeln!(out, "    }}").map_err(sink)?;
         if !success.has_bodyless_alternative() {
             writeln!(out, "    throw new ApiError(res.status);").map_err(sink)?;
@@ -2615,7 +2890,7 @@ fn ts_status_match(expr: &str, statuses: &[u16]) -> String {
 /// Returns [`CoreError::SdkGen`] when two schemas map to the same TypeScript symbol name.
 #[cfg(test)]
 pub(crate) fn emit_index(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
-    emit_index_with_models(graph, package, "models", &[])
+    emit_index_with_models(graph, package, "models")
 }
 
 /// Emit `index.ts` with a configurable model-barrel export path.
@@ -2623,7 +2898,6 @@ pub(crate) fn emit_index_with_models(
     graph: &ApiGraph,
     _package: &str,
     model_module: &str,
-    aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
@@ -2638,19 +2912,52 @@ pub(crate) fn emit_index_with_models(
     out.push_str("  RequestOptions,\n");
     out.push_str("  ResponseHook,\n");
     out.push_str("} from \"./client\";\n");
-    out.push_str("export { ApiError } from \"./errors\";\n");
-    out.push_str("export type { ApiErrorInit } from \"./errors\";\n");
+    out.push_str("export {\n");
+    out.push_str("  ApiError,\n");
+    out.push_str("  AuthConfigurationError,\n");
+    out.push_str("  ResponseDecodeError,\n");
+    out.push_str("} from \"./errors\";\n");
+    out.push_str("export type {\n");
+    out.push_str("  ApiErrorInit,\n");
+    out.push_str("  ResponseDecodeErrorInit,\n");
+    out.push_str("  ResponseDecodeFailure,\n");
+    out.push_str("} from \"./errors\";\n");
 
-    // Every named schema becomes a top-level symbol in models.ts (interface or type) — re-export them
-    // all as types (interfaces and `type` aliases are type-only re-exports).
-    let mut names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
-    names.extend(aliases.iter().map(|alias| alias.alias.as_str()));
+    // Every named schema becomes a top-level type. Named enums additionally expose runtime values.
+    let names = graph
+        .schemas
+        .iter()
+        .filter_map(|schema| {
+            (!matches!(schema.body, Type::Enum(_))).then_some(schema.name.as_str())
+        })
+        .collect::<Vec<_>>();
     if !names.is_empty() {
         out.push_str("export type {\n");
         for name in &names {
             writeln!(out, "  {name},").map_err(sink)?;
         }
         writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
+    }
+    let enum_names = graph
+        .schemas
+        .iter()
+        .filter_map(|schema| matches!(schema.body, Type::Enum(_)).then_some(schema.name.as_str()))
+        .collect::<Vec<_>>();
+    if !enum_names.is_empty() {
+        if enum_names.len() == 1 {
+            writeln!(
+                out,
+                "export {{ {} }} from \"./{model_module}\";",
+                enum_names[0]
+            )
+            .map_err(sink)?;
+        } else {
+            out.push_str("export {\n");
+            for name in enum_names {
+                writeln!(out, "  {name},").map_err(sink)?;
+            }
+            writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
+        }
     }
     Ok(out)
 }
@@ -2760,6 +3067,8 @@ mod tests {
             assert_eq!(camel("list_books"), "listBooks");
             assert_eq!(camel("get-book"), "getBook");
             assert_eq!(camel("HTTPServer"), "httpServer");
+            assert_eq!(camel("integrationUUIDs"), "integrationUuids");
+            assert_eq!(camel("getUserIDs"), "getUserIds");
         }
     }
 
@@ -2904,7 +3213,18 @@ mod tests {
                 ts_type(&map, false, &g, "").unwrap(),
                 "Record<string, number>"
             );
-            assert_eq!(ts_type(&Type::Any {}, false, &g, "").unwrap(), "unknown");
+            assert_eq!(
+                ts_type(&Type::Any {}, false, &g, "").unwrap(),
+                "Record<string, unknown>"
+            );
+            let free_form_map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::String)),
+                value: Box::new(Type::Any {}),
+            };
+            assert_eq!(
+                ts_type(&free_form_map, false, &g, "").unwrap(),
+                "Record<string, unknown>"
+            );
         }
 
         #[test]
@@ -2946,17 +3266,34 @@ mod tests {
     }
 
     mod models {
-        use super::{emit_models, sample_graph, Type};
-        use crate::sdk::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
-        use crate::tssdk::emit::emit_models_with_aliases_and_policies;
+        use super::{emit_models, sample_graph};
 
         #[test]
-        fn named_enum_emits_string_literal_union_type_alias_in_graph_order() {
+        fn named_enum_emits_runtime_values_and_derived_union_in_graph_order() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(
-                out.contains("export type BookFormat = \"hardcover\" | \"paperback\";"),
-                "named enum must be a string-literal-union type alias in graph order:\n{out}"
+                out.contains(
+                    "export const BookFormat = {\n  Hardcover: \"hardcover\",\n  Paperback: \"paperback\",\n} as const;\nexport type BookFormat = (typeof BookFormat)[keyof typeof BookFormat];"
+                ),
+                "named enum must expose runtime values and an exact derived union:\n{out}"
             );
+        }
+
+        #[test]
+        fn string_field_oneof_constraint_emits_literal_union() {
+            let mut graph = sample_graph();
+            let schema = graph
+                .schemas
+                .iter_mut()
+                .find(|schema| schema.name == "OutOfStock")
+                .unwrap();
+            let super::Type::Object(fields) = &mut schema.body else {
+                panic!("OutOfStock must be an object");
+            };
+            fields[0].meta.constraints.enum_values = vec!["lost".to_string(), "sold".to_string()];
+
+            let out = emit_models(&graph, "bookstore").unwrap();
+            assert!(out.contains("reason: \"lost\" | \"sold\";"), "{out}");
         }
 
         #[test]
@@ -3023,33 +3360,6 @@ mod tests {
             assert!(
                 out.contains("  rating?: number | number | null;"),
                 "inline union field optional+nullable:\n{out}"
-            );
-        }
-
-        #[test]
-        fn openapi_required_policy_uses_schema_required_not_source_optional_axis() {
-            let mut graph = sample_graph();
-            let Type::Object(fields) = &mut graph.schemas[1].body else {
-                panic!("Book must be an object");
-            };
-            let title = fields
-                .iter_mut()
-                .find(|field| field.json_name == "title")
-                .expect("Book.title field");
-            title.required = false;
-            title.optional = false;
-
-            let out = emit_models_with_aliases_and_policies(
-                &graph,
-                &[],
-                TsModelPropertyPolicy::SchemaRequired,
-                TsNullablePolicy::ExplicitNull,
-            )
-            .unwrap();
-
-            assert!(
-                out.contains("  title?: string;"),
-                "schema-non-required field should emit `?` even when source optional axis is false:\n{out}"
             );
         }
 
@@ -3219,7 +3529,7 @@ mod tests {
                 "rejects only non-2xx statuses:\n{out}"
             );
             assert!(
-                out.contains("const rawBody = await res.text();")
+                out.contains("const { rawBody, jsonBody } = await this._readErrorBody(res);")
                     && out.contains("throw new ApiError(res.status, {"),
                 "{out}"
             );
@@ -3230,7 +3540,7 @@ mod tests {
             );
             // typed return casts the decoded JSON to the response interface.
             assert!(
-                out.contains("return (await res.json()) as models.CreatedMessage;"),
+                out.contains("return await this._decodeJson<models.CreatedMessage>(res);"),
                 "{out}"
             );
             assert!(
@@ -3455,7 +3765,7 @@ mod tests {
         }
 
         #[test]
-        fn required_headers_and_cookies_are_not_serialized_as_query_params() {
+        fn required_headers_are_emitted_and_cookies_belong_to_the_fetch_transport() {
             let mut g = ops_graph();
             g.operations[0]
                 .params
@@ -3463,15 +3773,19 @@ mod tests {
             g.operations[0]
                 .params
                 .push(string_param("session", "cookie", true, false));
+            g.operations[0]
+                .params
+                .push(string_param("User-Agent", "header", true, false));
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
                 out.contains("headers[\"X-Signature\"] = String(xSignature);")
-                    && out.contains(
-                        "cookieParts.push(encodeURIComponent(\"session\") + \"=\" + encodeURIComponent(String(session)));"
-                    )
+                    && !out.contains("session: string")
+                    && !out.contains("headers[\"Cookie\"]")
+                    && !out.contains("userAgent: string")
+                    && !out.contains("headers[\"User-Agent\"]")
                     && !out.contains("const searchParams = new URLSearchParams();"),
-                "header and cookie parameters must stay out of the URL:\n{out}"
+                "application headers must be emitted and transport-owned headers omitted:\n{out}"
             );
         }
 
@@ -3641,7 +3955,7 @@ mod tests {
             );
             assert!(out.contains("return await res.blob();"), "{out}");
             assert!(
-                !out.contains("return (await res.json()) as models.Book;"),
+                !out.contains("this._decodeJson<models.Book>(res)"),
                 "binary success must not decode JSON:\n{out}"
             );
         }
@@ -3764,7 +4078,7 @@ mod tests {
             }];
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains("const apiKeyQuery0 = this._apiKey(\"api_key\");"),
+                out.contains("const apiKeyQuery0 = this._apiKey(\"QueryAuth\", \"api_key\");"),
                 "{out}"
             );
             assert!(
@@ -3843,11 +4157,11 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("const apiKey0 = this._apiKey(\"X-API-Key\");"),
+                out.contains("const apiKey0 = this._apiKey(\"DashAuth\", \"X-API-Key\");"),
                 "{out}"
             );
             assert!(
-                out.contains("const apiKey1 = this._apiKey(\"X_API_Key\");"),
+                out.contains("const apiKey1 = this._apiKey(\"UnderscoreAuth\", \"X_API_Key\");"),
                 "{out}"
             );
             assert!(
@@ -3879,9 +4193,12 @@ mod tests {
             g.operations[0].security_overrides_global = true;
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
-            assert!(out.contains("this._apiKey(\"X-CSRF-Token\")"), "{out}");
             assert!(
-                !out.contains("this._apiKey(\"X-API-Key\")"),
+                out.contains("this._apiKey(\"CSRFAuth\", \"X-CSRF-Token\")"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("\"ApiKeyAuth\", \"X-API-Key\""),
                 "imported operation security override must not inherit global auth:\n{out}"
             );
         }
@@ -4081,7 +4398,9 @@ mod tests {
             assert!(out.contains("fetch?: typeof fetch;"), "{out}");
             assert!(out.contains("this.fetchFn = opts.fetch ?? fetch;"), "{out}");
             assert!(
-                out.contains("import { ApiError } from \"./errors\";"),
+                out.contains("  AuthConfigurationError,")
+                    && out.contains("  ResponseDecodeError,")
+                    && out.contains("} from \"./errors\";"),
                 "{out}"
             );
             // no third-party HTTP libs (TSSDK-01/02).
@@ -4116,6 +4435,18 @@ mod tests {
                 "{out}"
             );
             assert!(out.contains("return `Basic ${btoa(raw)}`;"), "{out}");
+            assert!(
+                out.contains("authMode?: \"credentials\" | \"transport\";"),
+                "{out}"
+            );
+            assert!(
+                out.contains("this.authMode = opts.authMode ?? \"credentials\";"),
+                "{out}"
+            );
+            assert!(
+                out.contains("if (this.authMode === \"transport\") {"),
+                "{out}"
+            );
         }
 
         #[test]
@@ -4132,6 +4463,12 @@ mod tests {
             assert!(out.contains("timeoutMs?: number;"), "{out}");
             assert!(out.contains("maxRetries?: number;"), "{out}");
             assert!(out.contains("idempotencyKey?: string;"), "{out}");
+            assert!(out.contains("headers?: Record<string, string>;"), "{out}");
+            assert!(out.contains("signal?: AbortSignal;"), "{out}");
+            assert!(
+                out.contains("Object.assign(headers, options.headers ?? {});"),
+                "{out}"
+            );
             assert!(out.contains("export interface HookContext {"), "{out}");
             assert!(out.contains("operationId: string;"), "{out}");
             assert!(out.contains("pathTemplate: string;"), "{out}");
@@ -4215,6 +4552,14 @@ mod tests {
             assert!(out.contains("public readonly body: unknown;"), "{out}");
             assert!(out.contains("isNotFound(): boolean {"), "{out}");
             assert!(out.contains("return this.status === 404;"), "{out}");
+            assert!(
+                out.contains("export class ResponseDecodeError extends Error {"),
+                "{out}"
+            );
+            assert!(
+                out.contains("public readonly failure: ResponseDecodeFailure,"),
+                "{out}"
+            );
         }
 
         #[test]
@@ -4225,11 +4570,15 @@ mod tests {
                 "{out}"
             );
             assert!(
-                out.contains("export { ApiError } from \"./errors\";"),
+                out.contains(
+                    "export {\n  ApiError,\n  AuthConfigurationError,\n  ResponseDecodeError,\n} from \"./errors\";"
+                ),
                 "{out}"
             );
             assert!(
-                out.contains("export type { ApiErrorInit } from \"./errors\";"),
+                out.contains(
+                    "export type {\n  ApiErrorInit,\n  ResponseDecodeErrorInit,\n  ResponseDecodeFailure,\n} from \"./errors\";"
+                ),
                 "{out}"
             );
             assert!(out.contains("  Book,"), "{out}");

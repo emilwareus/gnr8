@@ -5,7 +5,7 @@
 //! dependency-free TypeScript SDK bundle String (D-06): an `index.ts` re-export surface, a `client.ts`
 //! (an injectable platform-`fetch`-backed `Client` plus one method per operation), a typed `errors.ts`
 //! (`ApiError extends Error`), and a `models.ts` (`export interface` request/response models +
-//! string-literal-union named enums + `export type` aliases).
+//! runtime named-enum values with matching value-union types + `export type` aliases).
 //!
 //! This is the structural twin of [`crate::pysdk`], MINUS the Python-only workarounds (required-first
 //! field ordering, the `from __future__` header, PEP-484 forward-ref aliases, the f-string `safe=''`
@@ -24,9 +24,6 @@ use crate::sdk::emit_common::{
     operation_group_name, quoted_string_literal, validate_sdk_base_path,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
-use crate::sdk::profile::SdkProfile;
-use crate::sdk::surface::SdkTypeAliases;
-use crate::sdk::typescript::TsSdkOptions;
 use std::collections::BTreeMap;
 
 /// Generate the TypeScript SDK as a deterministic, dependency-free multi-file bundle String (D-06,
@@ -67,8 +64,7 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let aliases = SdkTypeAliases::default();
-    let files = generate_files_with_layout(graph, package, base_path, layout, &aliases)?;
+    let files = generate_files_with_layout(graph, package, base_path, layout)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -78,30 +74,12 @@ pub(crate) fn generate_files_with_layout(
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-) -> Result<Vec<SdkFile>, crate::CoreError> {
-    let options = TsSdkOptions::strict();
-    generate_files_with_layout_options(graph, package, base_path, layout, aliases, &options)
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "SDK generation orchestration keeps file ordering, split layout, and profile options in one deterministic pass"
-)]
-fn generate_files_with_layout_options(
-    graph: &ApiGraph,
-    package: &str,
-    base_path: &str,
-    layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-    options: &TsSdkOptions,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;
-    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed alpha push order: client.ts, errors.ts, index.ts, models.ts — the D-06 frame order the
     // bundle locks. client.ts is the client skeleton followed by the operation methods.
@@ -124,6 +102,15 @@ fn generate_files_with_layout_options(
     } else {
         client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
     }
+    if !client.contains("models.") {
+        client = client.replace(
+            &format!(
+                "import * as models from \"./{}\";\n",
+                model_dir.trim_matches('/')
+            ),
+            "",
+        );
+    }
     files.push(SdkFile {
         name: "client.ts".to_string(),
         contents: client,
@@ -136,12 +123,7 @@ fn generate_files_with_layout_options(
 
     files.push(SdkFile {
         name: "index.ts".to_string(),
-        contents: emit::emit_index_with_models(
-            graph,
-            package,
-            model_dir.trim_matches('/'),
-            &resolved_aliases,
-        )?,
+        contents: emit::emit_index_with_models(graph, package, model_dir.trim_matches('/'))?,
     });
 
     if split_operations {
@@ -168,11 +150,6 @@ fn generate_files_with_layout_options(
             model_exports.push(ts_relative_module(&model_index_name, &name));
             schema_file_names.insert(schema.name.clone(), name);
         }
-        for alias in &resolved_aliases {
-            let name = file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias)));
-            validate_ts_file_name(&name)?;
-            model_exports.push(ts_relative_module(&model_index_name, &name));
-        }
         files.push(SdkFile {
             name: model_index_name.clone(),
             contents: emit_ts_models_index(&model_exports),
@@ -190,41 +167,13 @@ fn generate_files_with_layout_options(
             let models_module = ts_relative_module(&name, &model_index_name);
             files.push(SdkFile {
                 name,
-                contents: emit::emit_model_schema_with_policies(
-                    graph,
-                    schema,
-                    &models_module,
-                    options.model_properties,
-                    options.nullable,
-                )?,
-            });
-        }
-        for alias in &resolved_aliases {
-            let name = file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&alias.alias)));
-            validate_ts_file_name(&name)?;
-            let canonical = schema_file_names.get(&alias.canonical).ok_or_else(|| {
-                crate::CoreError::SdkGen {
-                    message: format!(
-                        "type alias {} references unknown canonical model {}",
-                        alias.alias, alias.canonical
-                    ),
-                }
-            })?;
-            let canonical_module = ts_relative_module(&name, canonical);
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_alias(alias, &canonical_module),
+                contents: emit::emit_model_schema(graph, schema, &models_module)?,
             });
         }
     } else {
         files.push(SdkFile {
             name: "models.ts".to_string(),
-            contents: emit::emit_models_with_aliases_and_policies(
-                graph,
-                &resolved_aliases,
-                options.model_properties,
-                options.nullable,
-            )?,
+            contents: emit::emit_models(graph, package)?,
         });
     }
 
@@ -497,18 +446,6 @@ fn ts_barrel_files<'a>(file_names: impl Iterator<Item = &'a str>) -> Vec<String>
         }
     }
     indexes
-}
-
-pub(crate) fn generate_files_with_profile_options(
-    graph: &ApiGraph,
-    package: &str,
-    base_path: &str,
-    layout: &SdkFileLayout,
-    aliases: &SdkTypeAliases,
-    _profile: &SdkProfile,
-    options: &TsSdkOptions,
-) -> Result<Vec<SdkFile>, crate::CoreError> {
-    generate_files_with_layout_options(graph, package, base_path, layout, aliases, options)
 }
 
 pub(crate) fn emit_package_tsconfig() -> String {

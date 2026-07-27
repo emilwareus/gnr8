@@ -11,13 +11,13 @@ Explicit non-goals for this research:
 
 - Do not generate server stubs.
 - Do not prioritize older OpenAPI output profiles.
-- Do not chase edge-case parity with OpenAPI Generator, Speakeasy, Stainless, Fern, or Kiota.
+- Do not chase another tool's edge-case surface.
 
 ## Position
 
-The adoption target is not "replace every OpenAPI Generator feature." The credible product claim is:
+The adoption target is a complete native source-to-SDK workflow. The credible product claim is:
 
-> gnr8 replaces the fragile chain of framework Swagger generation, OpenAPI Generator, and SDK patches
+> gnr8 replaces a fragile multi-tool generation chain and downstream SDK patches
 > for teams that want server source to drive OpenAPI 3.1 and production-ready SDKs.
 
 The previous parity list was too flat. The updated list separates hard adoption blockers from features
@@ -283,7 +283,7 @@ AI, event, log, or export APIs.
 Small hand-written helpers are common. `StaticFiles` is the right lower-risk path before template
 overrides. Keep improving cache invalidation, readiness checks, and import-safe extension docs.
 
-### `compat` Beyond OpenAPI Generator
+### Contract evolution
 
 Public SDK diffing is valuable, but broader adoption is better served first by stable naming, package
 metadata, and runtime behavior. Let `compat` consume those facts over time rather than making it a

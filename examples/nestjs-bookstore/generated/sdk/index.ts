@@ -8,15 +8,23 @@ export type {
   RequestOptions,
   ResponseHook,
 } from "./client";
-export { ApiError } from "./errors";
-export type { ApiErrorInit } from "./errors";
+export {
+  ApiError,
+  AuthConfigurationError,
+  ResponseDecodeError,
+} from "./errors";
+export type {
+  ApiErrorInit,
+  ResponseDecodeErrorInit,
+  ResponseDecodeFailure,
+} from "./errors";
 export type {
   AuthorDto,
   BookDto,
   BookFilters,
-  BookFormat,
   BookOrError,
   CreatedMessage,
   ListBooksResponse,
   OutOfStockDto,
 } from "./models";
+export { BookFormat } from "./models";

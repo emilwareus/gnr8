@@ -19,6 +19,15 @@ The official installer extracts under `~/.local/gnr8` and creates:
 ~/.local/bin/gnr8 -> ~/.local/gnr8/bin/gnr8
 ```
 
+To install the current checkout with the same packaged layout, run:
+
+```bash
+make install
+```
+
+This builds the host release archive, verifies its checksum, installs the complete binary and
+`share/gnr8` resource tree, and updates the same `~/.local/bin/gnr8` symlink.
+
 Resource discovery resolves through the **real** executable path, so invoking the symlink works with
 `GNR8_RESOURCE_DIR` unset:
 
@@ -46,7 +55,7 @@ Packaged `gnr8 init` writes:
 
 ```toml
 [dependencies]
-gnr8 = "=0.1.22"   # exact published crate version
+gnr8 = "=0.1.23"   # exact published crate version
 ```
 
 The crates.io package provides the Rust API. Sidecars (`goextract`, `pyextract`, `tsextract`) come

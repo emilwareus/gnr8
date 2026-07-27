@@ -1,6 +1,6 @@
 swagger: '2.0'
 info:
-  title: Brownfield Books API
+  title: Imported Books API
   version: 1.0.0
 basePath: /v1
 consumes:

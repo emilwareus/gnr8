@@ -2,7 +2,7 @@
 
 ## Research Question
 
-How can `gnr8` generate OpenAPI from Go application code natively, without wrapping Swaggo, oapi-codegen, OpenAPI Generator, or another external generator?
+How can `gnr8` generate OpenAPI from Go application code through its own source analysis and graph?
 
 ## Position
 
@@ -30,7 +30,7 @@ Native means:
 - Own OpenAPI serialization.
 - Own diagnostics and source provenance.
 - Own SDK backend inputs.
-- Do not shell out to Swaggo, oapi-codegen, OpenAPI Generator, or similar generators as the core workflow.
+- Own the source analysis, graph, lowering, and SDK emission workflow end to end.
 
 Native does not necessarily mean ignoring official language tooling. Go's parser, AST, type checker, `go/packages`, or gopls-compatible package loading may be appropriate because they provide language truth rather than API-generation behavior.
 
@@ -149,11 +149,8 @@ This may require explicit code configuration or annotations.
 
 ## OpenAPI Lowering
 
-The API graph should lower into OpenAPI with explicit version targets:
-
-- 3.2 for latest semantics.
-- 3.1 for broad modern JSON Schema compatibility.
-- 3.0 for downstream generator compatibility.
+The API graph lowers into the native OpenAPI 3.1 target. Additional document versions would require
+separate explicit targets with their own lowering rules.
 
 OpenAPI 3.2.0 is the newest version listed by the official OpenAPI spec site as of June 24, 2026.
 

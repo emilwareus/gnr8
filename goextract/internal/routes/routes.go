@@ -75,28 +75,26 @@ func Recognize(res *load.Result) []Route {
 
 // RecognizeWithDiagnostics is Recognize plus diagnostics for unsupported route
 // registration patterns. Existing callers that only need routes can use
-// Recognize; the CLI sidecar passes the accumulator so dynamic route paths are
-// visible during brownfield migration.
+// Recognize; the CLI sidecar passes the accumulator so unsupported dynamic
+// route paths are visible to the user.
 func RecognizeWithDiagnostics(res *load.Result, diags *diag.Accumulator) []Route {
 	var out []Route
 	for _, pkg := range res.Packages {
 		if pkg.TypesInfo == nil {
 			continue
 		}
+		inheritedMiddleware := inferRouterGroupParameterMiddleware(pkg.Syntax, pkg.TypesInfo)
 		for _, file := range pkg.Syntax {
-			out = append(out, recognizeFile(file, pkg.TypesInfo, res.Fset, diags)...)
+			out = append(out, recognizeFile(file, pkg.TypesInfo, res.Fset, diags, inheritedMiddleware)...)
 		}
 	}
 	return out
 }
 
-// groupInfo tracks, per receiver object (the `api` group variable), the static
-// prefix and middleware accumulated from Group(...middleware) and Use(...). Routes
-// registered on that group inherit both.
+// groupInfo tracks the resolved static prefix for a group receiver. Middleware is
+// resolved separately at each route's source position.
 type groupInfo struct {
-	secured    bool
-	prefix     string
-	middleware []string
+	prefix string
 }
 
 type rawGroup struct {
@@ -105,17 +103,30 @@ type rawGroup struct {
 	parentMiddleware []string
 	prefix           string
 	middleware       []string
+	createdAt        token.Pos
 	static           bool
 	span             facts.SourceSpan
 }
 
-// recognizeFile collects routes from a single file. It performs two passes over the
-// receiver objects so that a Use(...) appearing on the same group object (in any
-// order) marks every route on that object secured (D-14): pass 1 records which
-// group objects are secured; pass 2 emits routes with the resolved security.
-func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diags *diag.Accumulator) []Route {
+type middlewareUse struct {
+	pos     token.Pos
+	symbols []string
+}
+
+// recognizeFile collects routes from a single file. It performs two passes so group
+// declarations and middleware calls can be resolved before routes are emitted. Middleware
+// follows Gin's statement-order semantics: Use only affects routes registered after it,
+// and child groups snapshot their parent's middleware when the child is created.
+func recognizeFile(
+	file *ast.File,
+	info *gotypes.Info,
+	fset *token.FileSet,
+	diags *diag.Accumulator,
+	inheritedMiddleware map[gotypes.Object][]string,
+) []Route {
 	groups := map[gotypes.Object]*groupInfo{}
 	rawGroups := map[gotypes.Object]rawGroup{}
+	middlewareUses := map[gotypes.Object][]middlewareUse{}
 
 	// Pass 1: find Group(...) assignments and Use(...) calls. Group prefix
 	// resolution happens after the walk so nested groups are order-independent.
@@ -130,12 +141,22 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 			return true
 		}
 		if obj := receiverObject(info, call); obj != nil {
-			group := groupOf(groups, obj)
-			group.secured = true
-			group.middleware = appendUniqueStrings(group.middleware, middlewareSymbols(info, call.Args)...)
+			middlewareUses[obj] = append(middlewareUses[obj], middlewareUse{
+				pos:     call.Pos(),
+				symbols: middlewareSymbols(info, call.Args),
+			})
 		}
 		return true
 	})
+	for obj, symbols := range inheritedMiddleware {
+		if len(symbols) == 0 {
+			continue
+		}
+		middlewareUses[obj] = append(middlewareUses[obj], middlewareUse{
+			pos:     token.NoPos,
+			symbols: symbols,
+		})
+	}
 	for obj := range rawGroups {
 		raw := rawGroups[obj]
 		if diags != nil && !raw.static {
@@ -143,10 +164,6 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		}
 		g := groupOf(groups, obj)
 		g.prefix = resolveGroupPrefix(obj, rawGroups, map[gotypes.Object]bool{})
-		g.middleware = resolveGroupMiddleware(obj, rawGroups, groups, map[gotypes.Object]bool{})
-		if len(g.middleware) > 0 {
-			g.secured = true
-		}
 	}
 
 	// Pass 2: emit one Route per recognized METHOD(path, handler) call.
@@ -182,15 +199,13 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		handlerFn := HandlerFunc(info, call.Args[len(call.Args)-1])
 
 		prefix := receiverPrefix(info, groups, call)
-		middleware := receiverMiddleware(info, groups, call)
+		middleware := receiverMiddlewareAt(info, rawGroups, middlewareUses, call, call.Pos())
 		if len(call.Args) > 2 {
 			middleware = appendUniqueStrings(middleware, middlewareSymbols(info, call.Args[1:len(call.Args)-1])...)
 		}
 		secured := len(middleware) > 0
 		if obj := receiverObject(info, call); obj != nil {
-			if g, seen := groups[obj]; seen {
-				secured = secured || g.secured
-			} else if prefix == "" && receiverIsGinRouterGroup(info, call) && diags != nil {
+			if _, seen := groups[obj]; !seen && prefix == "" && receiverIsGinRouterGroup(info, call) && diags != nil {
 				span := spanOf(fset, call.Pos(), call.End())
 				diags.SourceRouteUnresolved("unsupported Gin route pattern: route registered on router group parameter; prefix cannot be inferred across helper calls, so the route is emitted relative (GO-04)", span.File, span.StartLine)
 			}
@@ -210,6 +225,119 @@ func recognizeFile(file *ast.File, info *gotypes.Info, fset *token.FileSet, diag
 		return true
 	})
 	return out
+}
+
+// inferRouterGroupParameterMiddleware follows router-group arguments through
+// package-local helper calls. Gin services commonly split route registration
+// across helpers:
+//
+//	api.Use(h.AuthMiddleware)
+//	h.registerJobs(api)
+//
+// The callee's `api *gin.RouterGroup` parameter is a different go/types object
+// from the caller's local variable, so a file-local scan cannot otherwise see
+// the middleware already attached at the call site. The fixed point also
+// handles helpers that delegate to more helpers. Middleware is still derived
+// exclusively from executable route setup; no documentation annotations are
+// consulted.
+func inferRouterGroupParameterMiddleware(files []*ast.File, info *gotypes.Info) map[gotypes.Object][]string {
+	rawGroups := map[gotypes.Object]rawGroup{}
+	middlewareUses := map[gotypes.Object][]middlewareUse{}
+
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			recordGroupAssignment(info, rawGroups, nil, n)
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			name, recvPkg, ok := ginMethod(info, call)
+			if !ok || recvPkg != ginPkgPath || name != "Use" {
+				return true
+			}
+			if obj := receiverObject(info, call); obj != nil {
+				middlewareUses[obj] = append(middlewareUses[obj], middlewareUse{
+					pos:     call.Pos(),
+					symbols: middlewareSymbols(info, call.Args),
+				})
+			}
+			return true
+		})
+	}
+
+	inherited := map[gotypes.Object][]string{}
+	for {
+		changed := false
+		for _, file := range files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				fn := calledFunc(info, call.Fun)
+				if fn == nil {
+					return true
+				}
+				signature, ok := gotypes.Unalias(fn.Type()).(*gotypes.Signature)
+				if !ok {
+					return true
+				}
+				limit := min(len(call.Args), signature.Params().Len())
+				for i := 0; i < limit; i++ {
+					param := signature.Params().At(i)
+					if !isGinRouterGroupType(param.Type()) {
+						continue
+					}
+					middleware := middlewareFromExprAt(
+						info,
+						rawGroups,
+						middlewareUses,
+						call.Args[i],
+						call.Pos(),
+					)
+					before := len(inherited[param])
+					inherited[param] = appendUniqueStrings(inherited[param], middleware...)
+					if len(inherited[param]) == before {
+						continue
+					}
+					changed = true
+					middlewareUses[param] = append(middlewareUses[param], middlewareUse{
+						pos:     token.NoPos,
+						symbols: inherited[param],
+					})
+				}
+				return true
+			})
+		}
+		if !changed {
+			return inherited
+		}
+	}
+}
+
+func calledFunc(info *gotypes.Info, expr ast.Expr) *gotypes.Func {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		fn, _ := info.ObjectOf(e).(*gotypes.Func)
+		return fn
+	case *ast.SelectorExpr:
+		return selectedFunc(info, e)
+	default:
+		return nil
+	}
+}
+
+func isGinRouterGroupType(t gotypes.Type) bool {
+	t = gotypes.Unalias(t)
+	if ptr, ok := t.(*gotypes.Pointer); ok {
+		t = gotypes.Unalias(ptr.Elem())
+	}
+	named, ok := t.(*gotypes.Named)
+	return ok &&
+		named.Obj() != nil &&
+		named.Obj().Pkg() != nil &&
+		named.Obj().Pkg().Path() == ginPkgPath &&
+		named.Obj().Name() == "RouterGroup"
 }
 
 func recordGroupAssignment(info *gotypes.Info, rawGroups map[gotypes.Object]rawGroup, fset *token.FileSet, n ast.Node) {
@@ -283,6 +411,7 @@ func groupFromExpr(info *gotypes.Info, expr ast.Expr, fset *token.FileSet) (rawG
 		parentMiddleware: parentMiddleware,
 		prefix:           normalizePath(prefix),
 		middleware:       middlewareSymbols(info, call.Args[1:]),
+		createdAt:        call.Pos(),
 		static:           static,
 		span:             span,
 	}, true
@@ -302,10 +431,11 @@ func resolveGroupPrefix(obj gotypes.Object, rawGroups map[gotypes.Object]rawGrou
 	return joinPaths(parent, resolvedRawGroupPrefix(group, nil))
 }
 
-func resolveGroupMiddleware(
+func resolveGroupMiddlewareAt(
 	obj gotypes.Object,
 	rawGroups map[gotypes.Object]rawGroup,
-	groups map[gotypes.Object]*groupInfo,
+	middlewareUses map[gotypes.Object][]middlewareUse,
+	at token.Pos,
 	visiting map[gotypes.Object]bool,
 ) []string {
 	if obj == nil || visiting[obj] {
@@ -313,18 +443,23 @@ func resolveGroupMiddleware(
 	}
 	raw, ok := rawGroups[obj]
 	if !ok {
-		if g, seen := groups[obj]; seen {
-			return appendUniqueStrings(nil, g.middleware...)
+		var out []string
+		for _, use := range middlewareUses[obj] {
+			if use.pos < at {
+				out = appendUniqueStrings(out, use.symbols...)
+			}
 		}
-		return nil
+		return out
 	}
 	visiting[obj] = true
 	var out []string
-	out = appendUniqueStrings(out, resolveGroupMiddleware(raw.parent, rawGroups, groups, visiting)...)
+	out = appendUniqueStrings(out, resolveGroupMiddlewareAt(raw.parent, rawGroups, middlewareUses, raw.createdAt, visiting)...)
 	out = appendUniqueStrings(out, raw.parentMiddleware...)
 	out = appendUniqueStrings(out, raw.middleware...)
-	if g, seen := groups[obj]; seen {
-		out = appendUniqueStrings(out, g.middleware...)
+	for _, use := range middlewareUses[obj] {
+		if use.pos < at {
+			out = appendUniqueStrings(out, use.symbols...)
+		}
 	}
 	delete(visiting, obj)
 	return out
@@ -367,26 +502,34 @@ func prefixFromExpr(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, ex
 	return ""
 }
 
-func receiverMiddleware(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, call *ast.CallExpr) []string {
+func receiverMiddlewareAt(
+	info *gotypes.Info,
+	rawGroups map[gotypes.Object]rawGroup,
+	middlewareUses map[gotypes.Object][]middlewareUse,
+	call *ast.CallExpr,
+	at token.Pos,
+) []string {
 	if obj := receiverObject(info, call); obj != nil {
-		if g, ok := groups[obj]; ok {
-			return appendUniqueStrings(nil, g.middleware...)
-		}
+		return resolveGroupMiddlewareAt(obj, rawGroups, middlewareUses, at, map[gotypes.Object]bool{})
 	}
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return nil
 	}
-	return middlewareFromExpr(info, groups, sel.X)
+	return middlewareFromExprAt(info, rawGroups, middlewareUses, sel.X, at)
 }
 
-func middlewareFromExpr(info *gotypes.Info, groups map[gotypes.Object]*groupInfo, expr ast.Expr) []string {
+func middlewareFromExprAt(
+	info *gotypes.Info,
+	rawGroups map[gotypes.Object]rawGroup,
+	middlewareUses map[gotypes.Object][]middlewareUse,
+	expr ast.Expr,
+	at token.Pos,
+) []string {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		if obj := info.ObjectOf(e); obj != nil {
-			if g, ok := groups[obj]; ok {
-				return appendUniqueStrings(nil, g.middleware...)
-			}
+			return resolveGroupMiddlewareAt(obj, rawGroups, middlewareUses, at, map[gotypes.Object]bool{})
 		}
 	case *ast.CallExpr:
 		group, ok := groupFromExpr(info, e, nil)
@@ -395,9 +538,7 @@ func middlewareFromExpr(info *gotypes.Info, groups map[gotypes.Object]*groupInfo
 		}
 		var out []string
 		if group.parent != nil {
-			if g, ok := groups[group.parent]; ok {
-				out = appendUniqueStrings(out, g.middleware...)
-			}
+			out = appendUniqueStrings(out, resolveGroupMiddlewareAt(group.parent, rawGroups, middlewareUses, e.Pos(), map[gotypes.Object]bool{})...)
 		}
 		out = appendUniqueStrings(out, group.parentMiddleware...)
 		return appendUniqueStrings(out, group.middleware...)

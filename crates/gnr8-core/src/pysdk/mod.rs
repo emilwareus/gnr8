@@ -25,7 +25,6 @@ use crate::sdk::emit_common::{
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
-use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Python SDK as a deterministic multi-file bundle String (D-06, PYSDK-01).
 ///
@@ -56,7 +55,6 @@ pub fn generate(
         base_path,
         &SdkFileLayout::compact(),
         PyModelStyle::default(),
-        &SdkTypeAliases::default(),
     )
 }
 
@@ -71,32 +69,22 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    generate_with_options(
-        graph,
-        package,
-        base_path,
-        layout,
-        PyModelStyle::default(),
-        &SdkTypeAliases::default(),
-    )
+    generate_with_options(graph, package, base_path, layout, PyModelStyle::default())
 }
 
 /// Generate the Python SDK with configurable file layout and model style.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`generate`], plus configuration errors for invalid compatibility
-/// aliases.
+/// Returns the same errors as [`generate`].
 pub fn generate_with_options(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: &SdkTypeAliases,
 ) -> Result<String, crate::CoreError> {
-    let files =
-        generate_files_with_options(graph, package, base_path, layout, model_style, aliases)?;
+    let files = generate_files_with_options(graph, package, base_path, layout, model_style)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -111,14 +99,12 @@ pub(crate) fn generate_files_with_options(
     base_path: &str,
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Python SDK")?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;
-    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
     // order the bundle locks. client.py is the client skeleton followed by the operation methods.
@@ -204,24 +190,7 @@ pub(crate) fn generate_files_with_options(
             ));
             schema_file_names.insert(schema.name.clone(), name);
         }
-        let mut alias_file_names = BTreeMap::new();
-        for alias in &resolved_aliases {
-            let name = crate::sdk::emit_common::file_in_dir(
-                Some(model_dir),
-                &format!("{}.py", file_stem(&alias.alias)),
-            );
-            validate_python_module_file_name(&name)?;
-            model_imports.push((
-                python_relative_module(&model_init_name, &name),
-                alias.alias.clone(),
-            ));
-            alias_file_names.insert(alias.alias.clone(), name);
-        }
-        let model_package_files: Vec<String> = schema_file_names
-            .values()
-            .chain(alias_file_names.values())
-            .cloned()
-            .collect();
+        let model_package_files: Vec<String> = schema_file_names.values().cloned().collect();
         for init in package_init_files(model_package_files.iter().map(String::as_str)) {
             if init != model_init_name {
                 files.push(SdkFile {
@@ -253,39 +222,10 @@ pub(crate) fn generate_files_with_options(
                 contents: emit::emit_model_schema(graph, schema, model_style, &dep_modules)?,
             });
         }
-        for alias in &resolved_aliases {
-            let name = alias_file_names
-                .get(&alias.alias)
-                .ok_or_else(|| crate::CoreError::SdkGen {
-                    message: format!(
-                        "alias {} did not have a precomputed Python file",
-                        alias.alias
-                    ),
-                })?
-                .clone();
-            let canonical = schema_file_names.get(&alias.canonical).ok_or_else(|| {
-                crate::CoreError::SdkGen {
-                    message: format!(
-                        "type alias {} references unknown canonical model {}",
-                        alias.alias, alias.canonical
-                    ),
-                }
-            })?;
-            let canonical_module = python_relative_module(&name, canonical);
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_alias(alias, &canonical_module),
-            });
-        }
     } else {
         files.push(SdkFile {
             name: "models.py".to_string(),
-            contents: emit::emit_models_with_style_and_aliases(
-                graph,
-                package,
-                model_style,
-                &resolved_aliases,
-            )?,
+            contents: emit::emit_models_with_style(graph, package, model_style)?,
         });
     }
 

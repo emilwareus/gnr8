@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_sdk.rs
+assertion_line: 27
 expression: sdk
 ---
 // ==== gnr8:file client.go ====
@@ -7,6 +8,7 @@ package goalservice
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -26,14 +28,52 @@ type Client struct {
 	requestHooks       []RequestHook
 	responseHooks      []ResponseHook
 	errorHooks         []ErrorHook
+	defaultHeaders     http.Header
 }
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
 
+// Ptr returns a pointer to value for optional request fields.
+func Ptr[T any](value T) *T {
+	return &value
+}
+
+// MapFrom converts a typed value into its JSON object representation.
+// It is useful when an API models a discriminated configuration body as
+// map[string]any while callers construct one of its typed variants.
+func MapFrom(value any) (map[string]any, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithHeader sets a default header on requests that do not already define it.
+func WithHeader(name, value string) Option {
+	return func(c *Client) { c.defaultHeaders.Set(name, value) }
+}
+
+// SetHeader replaces a default header used by subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) SetHeader(name, value string) {
+	c.defaultHeaders.Set(name, value)
+}
+
+// DeleteHeader removes a default header from subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) DeleteHeader(name string) {
+	c.defaultHeaders.Del(name)
 }
 
 // WithTimeout sets the client-level default request timeout.
@@ -116,6 +156,17 @@ type runtimeRequestOptions struct {
 	Options              RequestOptions
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *cancelOnCloseReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.cancel()
+	return err
+}
+
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
 func NewClient(baseURL string, opts ...Option) *Client {
@@ -126,6 +177,7 @@ func NewClient(baseURL string, opts ...Option) *Client {
 		maxRetries:         0,
 		retryStatuses:      map[int]bool{408: true, 429: true},
 		retryUnsafeMethods: false,
+		defaultHeaders:     make(http.Header),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -142,6 +194,14 @@ func newRequestOptions(opts ...RequestOption) RequestOptions {
 }
 
 func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {
+	for name, values := range c.defaultHeaders {
+		if len(req.Header.Values(name)) != 0 {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	timeout := c.timeout
 	if runtime.Options.Timeout > 0 {
 		timeout = runtime.Options.Timeout
@@ -150,9 +210,13 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 	var cancel context.CancelFunc
 	if timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 		req = req.Clone(ctx)
 	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	if runtime.Idempotent && runtime.Options.IdempotencyKey != "" {
 		header := runtime.IdempotencyKeyHeader
 		if header == "" {
@@ -210,6 +274,10 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			c.callErrorHooks(attemptReq.Context(), ctx, &APIError{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get("X-Request-ID")})
+		}
+		if cancel != nil {
+			resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
+			cancel = nil
 		}
 		return resp, nil
 	}
@@ -280,6 +348,7 @@ func sleepRetryAfter(resp *http.Response) {
 package goalservice
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -306,6 +375,36 @@ func (e *APIError) Error() string {
 // IsNotFound reports whether the error is a 404.
 func (e *APIError) IsNotFound() bool {
 	return e.StatusCode == 404
+}
+
+// ErrorStatusCode returns the HTTP status carried by an APIError, or zero for
+// non-HTTP errors.
+func ErrorStatusCode(err error) int {
+	var apiError *APIError
+	if errors.As(err, &apiError) {
+		return apiError.StatusCode
+	}
+	return 0
+}
+
+// ErrorRawBody returns the response body carried by an APIError, or nil for
+// non-HTTP errors. The returned bytes are a copy and may be modified by the caller.
+func ErrorRawBody(err error) []byte {
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
+		return nil
+	}
+	return append([]byte(nil), apiError.RawBody...)
+}
+
+// AuthConfigurationError reports that no configured credential set satisfies an operation.
+type AuthConfigurationError struct {
+	OperationID string
+}
+
+// Error implements the error interface.
+func (e *AuthConfigurationError) Error() string {
+	return fmt.Sprintf("goalservice: no configured credentials satisfy operation %s", e.OperationID)
 }
 
 func apiErrorObject(body any) map[string]any {
@@ -386,7 +485,7 @@ type GoalResponse struct {
 	AnalyticsQuery  GoalAnalyticsQuery `json:"analyticsQuery"`
 	CreatedAt       time.Time          `json:"createdAt"`
 	Description     string             `json:"description,omitempty"`
-	Metadata        any                `json:"metadata,omitempty"`
+	Metadata        map[string]any     `json:"metadata,omitempty"`
 	Name            string             `json:"name"`
 	TargetDirection *TargetDirection   `json:"targetDirection,omitempty"`
 	TargetValue     *float64           `json:"targetValue,omitempty"`
@@ -411,11 +510,6 @@ type TargetDirection string
 const (
 	TargetDirectionGte TargetDirection = "gte"
 	TargetDirectionLte TargetDirection = "lte"
-)
-
-const (
-	GteTargetDirection TargetDirection = "gte"
-	LteTargetDirection TargetDirection = "lte"
 )
 
 type UpdateGoalInput struct {
@@ -574,7 +668,7 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...
 // DeleteGoal -> DELETE /goal/{uuid}
 func (c *Client) DeleteGoal(ctx context.Context, uuid string, opts ...RequestOption) (CommandMessage, error) {
 	var out CommandMessage
-	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(fmt.Sprint(uuid)))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
 		return out, err
@@ -637,7 +731,7 @@ func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(uuid))
+	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(fmt.Sprint(uuid)))
 	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {
 		return out, err

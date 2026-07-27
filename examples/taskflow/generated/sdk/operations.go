@@ -20,6 +20,12 @@ type ListTasksParams struct {
 func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...RequestOption) (TaskList, error) {
 	var out TaskList
 	reqURL := c.baseURL + "/tasks"
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "listTasks"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
@@ -29,10 +35,14 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...
 		q.Set("status", *params.Status)
 	}
 	req.URL.RawQuery = q.Encode()
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "listTasks",
@@ -85,15 +95,25 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 	}
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + "/tasks"
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "createTask"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "createTask",
@@ -148,15 +168,25 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 // DeleteTask -> DELETE /tasks/{id}
 func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOption) (ErrorResponse, error) {
 	var out ErrorResponse
-	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "deleteTask"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "deleteTask",
@@ -203,15 +233,25 @@ func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOptio
 // GetTask -> GET /tasks/{id}
 func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) (Task, error) {
 	var out Task
-	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "getTask"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "getTask",
@@ -271,16 +311,26 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "updateTask"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "updateTask",

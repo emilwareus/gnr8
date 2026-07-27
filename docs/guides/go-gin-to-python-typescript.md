@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
   are omitted with diagnostics.
 - Use `SetBasePath` for router mount prefixes such as `/api` or `/v1`.
 - Use `ApplySecurity::api_key(...)` when handlers expect a shared auth header.
-- Use `RenameOperation` only for public SDK compatibility or awkward generated names.
+- Use `RenameOperation` only when the intended public SDK name differs from the extracted name.
 - Put generated outputs under one stable directory, usually `generated/`.
 - Do not edit generated SDK files. Edit Go source or `.gnr8/src/main.rs`, then regenerate.
 

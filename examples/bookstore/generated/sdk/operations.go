@@ -20,6 +20,12 @@ type ListBooksParams struct {
 func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...RequestOption) (BookList, error) {
 	var out BookList
 	reqURL := c.baseURL + "/books"
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "listBooks"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
@@ -29,10 +35,14 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...
 		q.Set("genre", *params.Genre)
 	}
 	req.URL.RawQuery = q.Encode()
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "listBooks",
@@ -85,15 +95,25 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...R
 	}
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + "/books"
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "createBook"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "createBook",
@@ -148,15 +168,25 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...R
 // DeleteBook -> DELETE /books/{id}
 func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOption) (ErrorResponse, error) {
 	var out ErrorResponse
-	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "deleteBook"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "deleteBook",
@@ -203,15 +233,25 @@ func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOptio
 // GetBook -> GET /books/{id}
 func (c *Client) GetBook(ctx context.Context, id string, opts ...RequestOption) (Book, error) {
 	var out Book
-	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "getBook"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return out, err
 	}
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "getBook",
@@ -271,16 +311,26 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 		return out, err
 	}
 	reqBody := bytes.NewReader(payload)
-	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(id))
+	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
+	selectedAuth := map[string]bool{}
+	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+		selectedAuth["ApiKeyAuth"] = true
+	} else {
+		return out, &AuthConfigurationError{OperationID: "updateBook"}
+	}
 	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {
 		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := c.apiKeys["X-API-Key"]; key != "" {
-		req.Header.Set("X-API-Key", key)
-	} else if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
 	}
 	resp, err := c.do(req, runtimeRequestOptions{
 		OperationID:          "updateBook",

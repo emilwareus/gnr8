@@ -2640,7 +2640,6 @@ mod tests {
     use crate::analyze::facts::{Prim, Type};
     use crate::lower::to_openapi;
     use crate::sdk::builtins::{OpenApi, OpenApi31Json, TsSdk};
-    use crate::sdk::profile::SdkProfile;
     use crate::sdk::{Cx, Pipeline};
     use serde_json::Value;
 
@@ -2726,7 +2725,7 @@ mod tests {
     fn imports_openapi31_all_of_nullable_maps_and_tags() {
         let text = r"
 openapi: 3.1.0
-info: { title: Brownfield API, version: 1.0.0 }
+info: { title: Imported API, version: 1.0.0 }
 servers: [{ url: /v1 }]
 paths:
   /books/{id}:
@@ -4172,12 +4171,12 @@ definitions:
     }
 
     #[test]
-    fn loads_brownfield_fixture_versions() {
+    fn loads_openapi_import_fixture_versions() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for input in [
-            "fixtures/brownfield-openapi/swagger20.yaml",
-            "fixtures/brownfield-openapi/openapi30.yaml",
-            "fixtures/brownfield-openapi/openapi31.yaml",
+            "fixtures/openapi-import/swagger20.yaml",
+            "fixtures/openapi-import/openapi30.yaml",
+            "fixtures/openapi-import/openapi31.yaml",
         ] {
             let graph = load_openapi(&root, input).unwrap();
             assert!(
@@ -4203,7 +4202,7 @@ definitions:
             );
         }
 
-        let graph = load_openapi(&root, "fixtures/brownfield-openapi/openapi31.yaml").unwrap();
+        let graph = load_openapi(&root, "fixtures/openapi-import/openapi31.yaml").unwrap();
         assert!(
             graph
                 .schemas
@@ -4336,7 +4335,7 @@ components:
         let root = temp_project("pipeline");
         std::fs::copy(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures/brownfield-openapi/openapi30.yaml"),
+                .join("../../fixtures/openapi-import/openapi30.yaml"),
             root.join("openapi.yaml"),
         )
         .unwrap();
@@ -4344,12 +4343,7 @@ components:
         let outcome = Pipeline::new()
             .source(OpenApi::new().input("openapi.yaml"))
             .target(OpenApi31Json::new().to("generated/openapi.json"))
-            .target(
-                TsSdk::new()
-                    .module("@acme/books")
-                    .to("generated/ts")
-                    .profile(SdkProfile::minimal()),
-            )
+            .target(TsSdk::new().module("@acme/books").to("generated/ts"))
             .run(&Cx::new(&root))
             .unwrap();
 

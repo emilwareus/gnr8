@@ -24,18 +24,10 @@ OpenAPI 3.2 adds or clarifies areas that matter for modern APIs:
 
 Source: <https://www.openapis.org/blog/2025/09/23/announcing-openapi-v3-2>
 
-## Compatibility Concern
+## Version Target
 
-The product should probably model OpenAPI 3.2-level semantics internally, but output compatibility profiles:
-
-- OpenAPI 3.2 for forward-looking users.
-- OpenAPI 3.1 for JSON Schema alignment and broader near-term compatibility.
-- OpenAPI 3.0.x if downstream generators or gateways require it.
-
-Reasoning:
-
-- Many Go tools and SDK generators still center on OpenAPI 3.0 or earlier.
-- Some production pipelines prefer tool compatibility over latest-spec fidelity.
+gnr8 models API semantics in its own graph and emits OpenAPI 3.1 as the native document target.
+Any additional document version would be a separate explicit target with its own lowering rules.
 - A graph-first architecture can preserve richer meaning and lower to older profiles with explicit loss warnings.
 
 ## Internal Model Rule

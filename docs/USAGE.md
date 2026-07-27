@@ -111,8 +111,8 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 | `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
 - `Pipeline::new().source(..).transform(..).target(..).post(..)` — builder, stages kept in call order.
-- `Cx { project_root }` — the root relative paths resolve against. `Artifacts::write(path, text)` — add
-  a generated file (kept sorted by path → deterministic; same path twice = last-write-wins).
+- `Cx { project_root }` — the root relative paths resolve against. `Artifacts::create(path, text)` adds
+  a generated file with explicit ownership and rejects collisions.
 - `gnr8::runner::run(pipeline) -> ExitCode` — the entry point `main()` returns. It parses argv
   (`__emit` → print the artifact bundle JSON; `__inspect` → print the frozen IR JSON) and never panics.
 
@@ -178,19 +178,18 @@ impl Target for ApiMarkdown {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         let mut md = format!("# {}\n\n", ir.title);
         for op in &ir.operations { md.push_str(&format!("- {} {} ({})\n", op.method, op.path, op.id)); }
-        out.write(self.path.clone(), md);
-        Ok(())
+        out.create(self.path.clone(), md)
     }
     fn output_anchors(&self) -> Vec<String> { vec![self.path.clone()] } // loop-safety: don't re-ingest
 }
 // …then: .transform(DropInternalRoutes).target(ApiMarkdown { path: "generated/API.md".into() })
 ```
 
-Production migration patches should stay at the graph/profile layer. Common examples:
-`GroupOperations::new().by_path_prefix("/billing", "Billing")` to preserve API service grouping,
-`RenameOperation::new("legacyOp", "LegacyApi_legacyOp")` for SDK public method names, and
+Public contract changes should stay at the graph layer. Common examples:
+`GroupOperations::new().by_path_prefix("/billing", "Billing")` to define API service grouping,
+`RenameOperation::new("listInternal", "listAccounts")` for SDK public method names, and
 `StaticFiles::new().from("sdk-static").to("generated/typescript").include(["README.md", "docs/**"])`
-for hand-authored compatibility docs that must stay lifecycle-owned.
+for hand-authored docs that must stay lifecycle-owned.
 A `Source` shells out / parses to produce an `ApiGraph`; a `PostProcess` rewrites the in-memory
 `Artifacts` (license header, import rewrite). The full runnable Go example: `examples/taskflow/`. The
 cross-language example lifecycles (real committed output) live at `examples/fastapi-bookstore/` (Python →
@@ -231,7 +230,7 @@ TsSdk query serialization is explicit: scalar parameters use one key and one-dim
 arrays use repeated keys (`?tag=a&tag=b`). Object, map, union, nested-array, and unconstrained query
 shapes fail generation because the graph does not declare a wire encoding for them.
 
-Graph-level field requiredness overrides are available for source quirks and legacy migration patches:
+Graph-level field requiredness overrides are available for explicit source corrections:
 
 ```rust
 ApiOverrides::new()
@@ -240,7 +239,7 @@ ApiOverrides::new()
 ```
 
 Request-body overrides can also create or replace an operation body when the source graph lacks the
-legacy shape. Typed helpers default to required; `.optional()` applies to the most recently configured
+required fact. Typed helpers default to required; `.optional()` applies to the most recently configured
 body. Plain `.request_body(method, path).optional()` keeps its existing meaning: requiredness-only, and
 it errors if no body already exists.
 
@@ -254,23 +253,16 @@ ApiOverrides::new()
 
 These overrides mutate the graph before OpenAPI or SDK targets render, so all generated surfaces agree.
 
-OpenAPI targets support narrow document patches for migration-only polish. `alias` emits a `$ref`
-component alias; `clone_alias` duplicates the canonical schema body for generators that require a
-distinct schema. `enum_values(...)` sorts values deterministically; `enum_values_in_order(...)`
-preserves caller order.
+OpenAPI targets support narrow document presentation patches. `enum_values(...)` sorts values
+deterministically; `enum_values_in_order(...)` preserves caller order.
 
 ```rust
 OpenApi31::new()
     .to("generated/openapi.yaml")
-    .schema_aliases(
-        OpenApiSchemaAliases::new()
-            .alias("CreateBookRequest", "BookCreateRequest")
-            .clone_alias("Book", "LegacyBook"),
-    )
     .schema_patch(
         OpenApiSchemaPatch::new("Book").field(
             OpenApiFieldPatch::new("status")
-                .description("Lifecycle status shown in the legacy SDK")
+                .description("Public lifecycle status")
                 .enum_values_in_order(["beta", "alpha"])
                 .example_string("beta")
                 .extension_string("x-gnr8-render", "input")

@@ -95,7 +95,7 @@ impl Target for ApiMarkdown {
             md.push_str(&format!("- `{}` ({})\n", schema.name, kind));
         }
 
-        out.write(self.path.clone(), md);
+        out.create(self.path.clone(), md)?;
         Ok(())
     }
 

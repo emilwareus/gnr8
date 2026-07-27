@@ -32,12 +32,11 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
-    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, HttpAuthScheme, RequestBodyEncoding,
+    operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme,
+    OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
 };
 use crate::sdk::model_style::PyModelStyle;
-use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -393,9 +392,14 @@ pub(crate) fn py_type(
                     ),
                 });
             }
-            format!("dict[str, {}]", py_type(value, false, graph)?)
+            let value_type = if matches!(value.as_ref(), Type::Any {}) {
+                "Any".to_string()
+            } else {
+                py_type(value, false, graph)?
+            };
+            format!("dict[str, {value_type}]")
         }
-        Type::Any {} => "Any".to_string(),
+        Type::Any {} => "dict[str, Any]".to_string(),
         Type::Named(ref_id) => {
             let target = graph
                 .schemas
@@ -467,20 +471,10 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     emit_models_with_style(graph, package, PyModelStyle::default())
 }
 
-#[cfg(test)]
 pub(crate) fn emit_models_with_style(
-    graph: &ApiGraph,
-    package: &str,
-    model_style: PyModelStyle,
-) -> Result<String, CoreError> {
-    emit_models_with_style_and_aliases(graph, package, model_style, &[])
-}
-
-pub(crate) fn emit_models_with_style_and_aliases(
     graph: &ApiGraph,
     _package: &str,
     model_style: PyModelStyle,
-    aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "Python SDK")?;
 
@@ -525,11 +519,6 @@ pub(crate) fn emit_models_with_style_and_aliases(
                 writeln!(out, "{} = \"{alias}\"", schema.name).map_err(sink)?;
             }
         }
-    }
-    for alias in aliases {
-        out.push_str(top_level_separator(first, false));
-        first = false;
-        writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
     }
     Ok(out)
 }
@@ -598,16 +587,6 @@ pub(crate) fn emit_model_schema(
         }
     }
     Ok(out)
-}
-
-/// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
-    format!(
-        "from __future__ import annotations\n\nfrom {canonical_module} import {} as {}\n\n__all__ = [\"{}\"]\n",
-        alias.canonical,
-        alias.alias,
-        alias.alias
-    )
 }
 
 /// Emit `models/__init__.py` for split-model layout.
@@ -947,6 +926,19 @@ class ApiError(Exception):
 
     def is_not_found(self) -> bool:
         return self.status_code == 404
+
+
+class AuthConfigurationError(Exception):
+    \"\"\"Raised when no configured credential set satisfies an operation.\"\"\"
+
+    def __init__(
+        self,
+        operation_id: str,
+        alternatives: list[list[str]],
+    ) -> None:
+        super().__init__(f\"No configured credentials satisfy operation {operation_id}\")
+        self.operation_id = operation_id
+        self.alternatives = alternatives
 "
     .to_string()
 }
@@ -1227,7 +1219,8 @@ pub(crate) fn emit_client_with_models(
         third_party.push("from pydantic import BaseModel".to_string());
     }
 
-    let mut first_party: Vec<String> = vec!["from .errors import ApiError".to_string()];
+    let mut first_party: Vec<String> =
+        vec!["from .errors import ApiError, AuthConfigurationError".to_string()];
     if !model_refs.is_empty() {
         // A parenthesized, one-name-per-line import with a trailing comma: the "magic trailing comma"
         // keeps `ruff format` from collapsing it and stays stable regardless of the name count.
@@ -1276,31 +1269,6 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
-    let auth_headers_arg = if has_api_key_auth {
-        "        auth_headers: Optional[tuple[str, ...]] = None,\n"
-    } else {
-        ""
-    };
-    let auth_bearer_arg = if has_bearer_auth {
-        "        auth_bearer: bool = False,\n"
-    } else {
-        ""
-    };
-    let auth_basic_arg = if has_basic_auth {
-        "        auth_basic: bool = False,\n"
-    } else {
-        ""
-    };
-    let mut auth_loop = String::new();
-    if has_api_key_auth {
-        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                headers[header] = key\n");
-    }
-    if has_bearer_auth {
-        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\"\n");
-    }
-    if has_basic_auth {
-        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            headers[\"Authorization\"] = \"Basic \" + base64.b64encode(raw).decode(\"ascii\")\n");
-    }
     let default_timeout = py_timeout_value(runtime.default_timeout_ms);
     let max_retries = runtime.max_retries;
     let retry_statuses = py_retry_status_tuple(runtime);
@@ -1392,6 +1360,40 @@ class Client:
 
     def _body_value(self, body: Any, body_encoding: str) -> Any:
 {body_value}
+    def _select_auth_alternative(
+        self,
+        operation_id: str,
+        alternatives: list[list[dict[str, str]]],
+    ) -> set[str]:
+        if not alternatives:
+            return set()
+        for alternative in alternatives:
+            satisfied = True
+            for requirement in alternative:
+                kind = requirement[\"kind\"]
+                if kind == \"apiKey\":
+                    credential = (
+                        self._api_keys.get(requirement[\"scheme_id\"])
+                        or self._api_keys.get(requirement[\"name\"])
+                        or self._api_key
+                    )
+                elif kind == \"bearer\":
+                    credential = self._bearer_token
+                else:
+                    credential = self._basic_auth
+                if not credential:
+                    satisfied = False
+                    break
+            if satisfied:
+                return {{requirement[\"scheme_id\"] for requirement in alternative}}
+        raise AuthConfigurationError(
+            operation_id,
+            [
+                [requirement[\"scheme_id\"] for requirement in alternative]
+                for alternative in alternatives
+            ],
+        )
+
     def _wire_value(self, value: Any) -> Any:
         if isinstance(value, enum.Enum):
             return self._wire_value(value.value)
@@ -1532,7 +1534,7 @@ class Client:
         *,
         body: Optional[Any] = None,
         request_headers: Optional[dict[str, str]] = None,
-{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}        operation_id: str,
+        operation_id: str,
         path_template: str,
         content_type: str = \"application/json\",
         body_encoding: str = \"json\",
@@ -1558,7 +1560,7 @@ class Client:
         headers: dict[str, str] = dict(request_headers or {{}})
         if data is not None:
             headers[\"Content-Type\"] = content_type
-{auth_loop}        if idempotent and options.idempotency_key:
+        if idempotent and options.idempotency_key:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
         last_error: Optional[BaseException] = None
@@ -1813,6 +1815,73 @@ fn method_def(name: &str, args: &[String], ret: &str) -> String {
     out
 }
 
+fn flattened_py_auth_schemes(
+    alternatives: &[Vec<OperationAuthScheme>],
+) -> Vec<OperationAuthScheme> {
+    let mut by_id = BTreeMap::new();
+    for scheme in alternatives.iter().flatten() {
+        let id = match scheme {
+            OperationAuthScheme::ApiKey(scheme) => &scheme.id,
+            OperationAuthScheme::Http { id, .. } => id,
+        };
+        by_id.entry(id.clone()).or_insert_with(|| scheme.clone());
+    }
+    by_id.into_values().collect()
+}
+
+fn emit_py_auth_selection(
+    out: &mut String,
+    operation_id: &str,
+    alternatives: &[Vec<OperationAuthScheme>],
+) -> Result<(), CoreError> {
+    if alternatives.is_empty() {
+        writeln!(
+            out,
+            "        _selected_auth = self._select_auth_alternative({}, [])",
+            quoted_string_literal(operation_id)
+        )
+        .map_err(sink)?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "        _selected_auth = self._select_auth_alternative({}, [",
+        quoted_string_literal(operation_id)
+    )
+    .map_err(sink)?;
+    for alternative in alternatives {
+        writeln!(out, "            [").map_err(sink)?;
+        for scheme in alternative {
+            match scheme {
+                OperationAuthScheme::ApiKey(scheme) => {
+                    writeln!(
+                        out,
+                        "                {{\"scheme_id\": {}, \"kind\": \"apiKey\", \"name\": {}}},",
+                        quoted_string_literal(&scheme.id),
+                        quoted_string_literal(&scheme.name)
+                    )
+                    .map_err(sink)?;
+                }
+                OperationAuthScheme::Http { id, scheme } => {
+                    let kind = match scheme {
+                        HttpAuthScheme::Bearer => "bearer",
+                        HttpAuthScheme::Basic => "basic",
+                    };
+                    writeln!(
+                        out,
+                        "                {{\"scheme_id\": {}, \"kind\": \"{kind}\"}},",
+                        quoted_string_literal(id)
+                    )
+                    .map_err(sink)?;
+                }
+            }
+        }
+        writeln!(out, "            ],").map_err(sink)?;
+    }
+    writeln!(out, "        ])").map_err(sink)?;
+    Ok(())
+}
+
 /// Emit a single operation method (4-space indented as a `Client` method body).
 #[allow(clippy::too_many_lines)]
 fn emit_operation(
@@ -1847,9 +1916,33 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let error_bodies = error_response_bodies_of(op, graph)?;
-    let auth_headers = operation_api_key_headers(graph, op)?;
-    let auth_queries = operation_api_key_queries(graph, op)?;
-    let auth_http = operation_http_auth_schemes(graph, op)?;
+    let auth_alternatives = operation_auth_alternatives(graph, op)?;
+    let auth_schemes = flattened_py_auth_schemes(&auth_alternatives);
+    let auth_headers: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Header => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_queries: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Query => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_http: Vec<(String, HttpAuthScheme)> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::Http { id, scheme } => Some((id.clone(), *scheme)),
+            OperationAuthScheme::ApiKey(_) => None,
+        })
+        .collect();
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1933,6 +2026,7 @@ fn emit_operation(
         }
         writeln!(out, "        path = f\"{fstring}\"").map_err(sink)?;
     }
+    emit_py_auth_selection(out, &op.id, &auth_alternatives)?;
 
     // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
     // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
@@ -1957,17 +2051,23 @@ fn emit_operation(
         for query in &auth_queries {
             writeln!(
                 out,
-                "        _auth_query_{} = self._api_keys.get({}) or self._api_key",
-                safe_ident(&snake(query)),
-                quoted_string_literal(query)
+                "        if {} in _selected_auth:",
+                quoted_string_literal(&query.id)
             )
             .map_err(sink)?;
-            writeln!(out, "        if _auth_query_{}:", safe_ident(&snake(query))).map_err(sink)?;
+            writeln!(
+                out,
+                "            _auth_query_{} = self._api_keys.get({}) or self._api_keys.get({}) or self._api_key",
+                safe_ident(&snake(&query.name)),
+                quoted_string_literal(&query.id),
+                quoted_string_literal(&query.name)
+            )
+            .map_err(sink)?;
             writeln!(
                 out,
                 "            _query.append(({}, _auth_query_{}))",
-                quoted_string_literal(query),
-                safe_ident(&snake(query))
+                quoted_string_literal(&query.name),
+                safe_ident(&snake(&query.name))
             )
             .map_err(sink)?;
         }
@@ -1982,6 +2082,7 @@ fn emit_operation(
     let has_request_headers = request_params
         .iter()
         .any(|param| param.location == "header" || param.location == "cookie");
+    let has_auth_headers = !auth_headers.is_empty() || !auth_http.is_empty();
     if has_request_headers {
         emit_py_header_cookie_parameters(
             out,
@@ -1990,6 +2091,53 @@ fn emit_operation(
             &optional_query,
             &optional_query_idents,
         )?;
+    } else if has_auth_headers {
+        writeln!(out, "        _request_headers: dict[str, str] = {{}}").map_err(sink)?;
+    }
+    for header in &auth_headers {
+        writeln!(
+            out,
+            "        if {} in _selected_auth:",
+            quoted_string_literal(&header.id)
+        )
+        .map_err(sink)?;
+        writeln!(
+            out,
+            "            _request_headers[{}] = self._api_keys.get({}) or self._api_keys.get({}) or self._api_key",
+            quoted_string_literal(&header.name),
+            quoted_string_literal(&header.id),
+            quoted_string_literal(&header.name)
+        )
+        .map_err(sink)?;
+    }
+    for (scheme_id, scheme) in &auth_http {
+        writeln!(
+            out,
+            "        if {} in _selected_auth:",
+            quoted_string_literal(scheme_id)
+        )
+        .map_err(sink)?;
+        match scheme {
+            HttpAuthScheme::Bearer => {
+                writeln!(
+                    out,
+                    "            _request_headers[\"Authorization\"] = f\"Bearer {{self._bearer_token}}\""
+                )
+                .map_err(sink)?;
+            }
+            HttpAuthScheme::Basic => {
+                writeln!(
+                    out,
+                    "            _auth_raw = f\"{{self._basic_auth[0]}}:{{self._basic_auth[1]}}\".encode(\"utf-8\")"
+                )
+                .map_err(sink)?;
+                writeln!(
+                    out,
+                    "            _request_headers[\"Authorization\"] = \"Basic \" + base64.b64encode(_auth_raw).decode(\"ascii\")"
+                )
+                .map_err(sink)?;
+            }
+        }
     }
 
     // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
@@ -2005,17 +2153,8 @@ fn emit_operation(
             quoted_string_literal(py_body_encoding(body.encoding))
         ));
     }
-    if has_request_headers {
+    if has_request_headers || has_auth_headers {
         do_args.push("request_headers=_request_headers".to_string());
-    }
-    if !auth_headers.is_empty() {
-        do_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
-    }
-    if auth_http.contains(&HttpAuthScheme::Bearer) {
-        do_args.push("auth_bearer=True".to_string());
-    }
-    if auth_http.contains(&HttpAuthScheme::Basic) {
-        do_args.push("auth_basic=True".to_string());
     }
     let runtime = py_operation_runtime(graph, op);
     do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
@@ -2548,21 +2687,6 @@ fn py_status_tuple(statuses: &[u16]) -> String {
     }
 }
 
-fn py_string_tuple(values: &[String]) -> String {
-    match values {
-        [] => "()".to_string(),
-        [single] => format!("({},)", quoted_string_literal(single)),
-        many => {
-            let joined = many
-                .iter()
-                .map(|value| quoted_string_literal(value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({joined})")
-        }
-    }
-}
-
 /// Emit `__init__.py`: re-export `Client`, `ApiError`, and every model/enum class so `import <pkg>`
 /// exposes the whole surface. Class names are emitted in graph order (deterministic). Twin of the Go
 /// twin's single-package surface (Go has no `__init__`, so this is Python-specific but deterministic).
@@ -2824,7 +2948,15 @@ mod tests {
                 value: Box::new(Type::Primitive(Prim::String)),
             };
             assert_eq!(py_type(&map, false, &g).unwrap(), "dict[str, str]");
-            assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "Any");
+            assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "dict[str, Any]");
+            let free_form_map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::String)),
+                value: Box::new(Type::Any {}),
+            };
+            assert_eq!(
+                py_type(&free_form_map, false, &g).unwrap(),
+                "dict[str, Any]"
+            );
         }
 
         #[test]
@@ -2973,16 +3105,16 @@ mod tests {
         }
 
         #[test]
-        fn pydantic_models_keep_from_dict_and_to_dict_compat_methods() {
+        fn pydantic_models_expose_native_dict_serialization() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(
                 out.contains("def from_dict(cls, _data: dict[str, Any]) -> Book:"),
-                "Pydantic models should keep legacy decode compatibility:\n{out}"
+                "Pydantic models should expose typed dictionary decoding:\n{out}"
             );
             assert!(out.contains("return cls.model_validate(_data)"), "{out}");
             assert!(
                 out.contains("def to_dict(self) -> dict[str, Any]:"),
-                "Pydantic models should keep legacy encode compatibility:\n{out}"
+                "Pydantic models should expose typed dictionary encoding:\n{out}"
             );
             assert!(
                 out.contains(
@@ -3265,7 +3397,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains(
-                    "_auth_query_api_key = self._api_keys.get(\"api_key\") or self._api_key"
+                    "_auth_query_api_key = self._api_keys.get(\"QueryAuth\") or self._api_keys.get(\"api_key\") or self._api_key"
                 ),
                 "{out}"
             );
@@ -3302,7 +3434,9 @@ mod tests {
             assert!(
                 out.contains("_status, _headers, _raw = self._do(")
                     && out.contains("\"GET\",")
-                    && out.contains("auth_bearer=True,")
+                    && out.contains(
+                        "_request_headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""
+                    )
                     && out.contains("operation_id=\"listBooks\","),
                 "{out}"
             );
@@ -3314,7 +3448,12 @@ mod tests {
             op.security = vec!["BasicAuth".to_string()];
             op.security_overrides_global = true;
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
-            assert!(out.contains("auth_basic=True,"), "{out}");
+            assert!(
+                out.contains(
+                    "_request_headers[\"Authorization\"] = \"Basic \" + base64.b64encode(_auth_raw).decode(\"ascii\")"
+                ),
+                "{out}"
+            );
         }
 
         #[test]
@@ -3443,14 +3582,8 @@ mod tests {
                 out.contains("basic_auth: Optional[tuple[str, str]] = None"),
                 "{out}"
             );
-            assert!(
-                out.contains("headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""),
-                "{out}"
-            );
-            assert!(
-                out.contains("base64.b64encode(raw).decode(\"ascii\")"),
-                "{out}"
-            );
+            assert!(out.contains("credential = self._bearer_token"), "{out}");
+            assert!(out.contains("credential = self._basic_auth"), "{out}");
         }
 
         #[test]

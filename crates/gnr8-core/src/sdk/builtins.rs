@@ -25,20 +25,11 @@ use crate::graph::{
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
 use crate::sdk::emit_common::quoted_string_literal;
-use crate::sdk::go::{
-    GoExecuteCompatibility, GoQuerySetterArgumentPolicy, GoRequestBuilderAliases,
-    GoRequestBuilderScope, GoSdkOptions, QueryTimeFormat, RequiredPointerConstructorPolicy,
-};
 use crate::sdk::layout::SdkFileLayout;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
-use crate::sdk::profile::SdkProfile;
-use crate::sdk::surface::SdkTypeAliases;
-use crate::sdk::typescript::{
-    TsBarrelExports, TsModelPropertyPolicy, TsNullablePolicy, TsResponsePolicy, TsSdkOptions,
-};
 use crate::CoreError;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -958,7 +949,6 @@ impl Transform for SetSchemaFieldType {
 #[derive(Debug, Clone, Default)]
 pub struct ApiOverrides {
     field_presence: Vec<FieldPresenceOverride>,
-    query_params: Vec<QueryParamOverride>,
     parameters: Vec<(OperationSelector, ParameterOverride)>,
     security_overrides: Vec<(OperationSelector, SecurityOverride)>,
     request_bodies: Vec<RequestBodyOverride>,
@@ -972,12 +962,6 @@ struct FieldPresenceOverride {
     schema: String,
     field: String,
     required: bool,
-}
-
-#[derive(Debug, Clone)]
-struct QueryParamOverride {
-    matcher: OperationMatcher,
-    param: QueryParam,
 }
 
 #[derive(Debug, Clone)]
@@ -1080,15 +1064,6 @@ struct DefaultResponseOverride {
     content_type: Option<String>,
     content_types: Vec<String>,
     schema_ref: Option<String>,
-}
-
-/// Query parameter override builder.
-#[derive(Debug, Clone)]
-pub struct QueryParam {
-    name: String,
-    schema: Type,
-    required: bool,
-    default: Option<LiteralValue>,
 }
 
 /// A typed request parameter at any OpenAPI parameter location.
@@ -1298,78 +1273,6 @@ impl SecurityOverride {
     }
 }
 
-impl QueryParam {
-    /// Create a string, optional query parameter override.
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            schema: Type::Primitive(crate::graph::Prim::String),
-            required: false,
-            default: None,
-        }
-    }
-
-    /// Set the query parameter type to string.
-    #[must_use]
-    pub fn string(mut self) -> Self {
-        self.schema = Type::Primitive(crate::graph::Prim::String);
-        self
-    }
-
-    /// Set the query parameter type to integer.
-    #[must_use]
-    pub fn integer(mut self) -> Self {
-        self.schema = Type::Primitive(crate::graph::Prim::Int {
-            bits: 64,
-            signed: true,
-        });
-        self
-    }
-
-    /// Set the query parameter type to RFC-3339 date-time.
-    #[must_use]
-    pub fn date_time(mut self) -> Self {
-        self.schema = Type::WellKnown(crate::graph::WellKnown::DateTime);
-        self
-    }
-
-    /// Set the query parameter type to an RFC-3339 full-date (`OpenAPI` `format: date`).
-    #[must_use]
-    pub fn date(mut self) -> Self {
-        self.schema = Type::WellKnown(crate::graph::WellKnown::Date);
-        self
-    }
-
-    /// Mark the query parameter required.
-    #[must_use]
-    pub const fn required(mut self) -> Self {
-        self.required = true;
-        self
-    }
-
-    /// Mark the query parameter optional.
-    #[must_use]
-    pub const fn optional(mut self) -> Self {
-        self.required = false;
-        self
-    }
-
-    /// Set a numeric default.
-    #[must_use]
-    pub fn default_number(mut self, value: impl Into<String>) -> Self {
-        self.default = Some(LiteralValue::Number(value.into()));
-        self
-    }
-
-    /// Set a string default.
-    #[must_use]
-    pub fn default_string(mut self, value: impl Into<String>) -> Self {
-        self.default = Some(LiteralValue::String(value.into()));
-        self
-    }
-}
-
 impl ApiOverrides {
     /// Create an empty override set.
     #[must_use]
@@ -1395,24 +1298,6 @@ impl ApiOverrides {
             schema: schema.into(),
             field: field.into(),
             required: false,
-        });
-        self
-    }
-
-    /// Add or replace a query parameter on an operation matched by method and graph path.
-    #[must_use]
-    pub fn query_param(
-        mut self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        param: QueryParam,
-    ) -> Self {
-        self.query_params.push(QueryParamOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            param,
         });
         self
     }
@@ -1605,9 +1490,6 @@ impl Transform for ApiOverrides {
                 &override_.field,
                 override_.required,
             )?;
-        }
-        for override_ in &self.query_params {
-            apply_query_param_override(ir, &override_.matcher, &override_.param)?;
         }
         let mut touched = BTreeSet::new();
         for (selector, override_) in &self.parameters {
@@ -2014,39 +1896,6 @@ fn apply_field_presence_override(
     Ok(())
 }
 
-fn apply_query_param_override(
-    ir: &mut ApiGraph,
-    matcher: &OperationMatcher,
-    param: &QueryParam,
-) -> Result<(), CoreError> {
-    let op_index = find_operation_index(ir, matcher, "query parameter override")?;
-    let op_method = ir.operations[op_index].method.clone();
-    let op_path = ir.operations[op_index].path.clone();
-    let op = &mut ir.operations[op_index];
-    op.params
-        .retain(|existing| !(existing.location == "query" && existing.name == param.name));
-    op.params.push(crate::graph::Param {
-        name: param.name.clone(),
-        location: "query".to_string(),
-        required: param.required,
-        schema: param.schema.clone(),
-        default: param.default.clone(),
-        style: None,
-        explode: None,
-        allow_reserved: false,
-        openapi_content: None,
-        openapi_fields: Vec::new(),
-        provenance: op.provenance.clone(),
-    });
-    op.params.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then_with(|| a.location.cmp(&b.location))
-    });
-    remove_untyped_query_diagnostics(ir, &op_method, &op_path, &param.name);
-    Ok(())
-}
-
 fn apply_request_body_override(
     ir: &mut ApiGraph,
     matcher: &OperationMatcher,
@@ -2266,11 +2115,6 @@ fn find_operation_index(
             message: format!("{label} matched {} operations: {matcher:?}", many.len()),
         }),
     }
-}
-
-fn remove_untyped_query_diagnostics(ir: &mut ApiGraph, method: &str, path: &str, param_name: &str) {
-    let operation = format!("{method} {path}");
-    remove_unresolved_parameter_diagnostics(ir, &operation, param_name);
 }
 
 fn remove_unresolved_parameter_diagnostics(ir: &mut ApiGraph, operation: &str, param_name: &str) {
@@ -3826,153 +3670,9 @@ impl Transform for GroupOperations {
     }
 }
 
-/// Route-scoped SDK operation aliases for preserving an existing public SDK surface.
-///
-/// These aliases are user-supplied code-as-config metadata. They do not parse another generator's
-/// output; they match the neutral graph route and set the operation group/tag and generated operation
-/// name that SDK targets already consume.
-#[derive(Debug, Clone, Default)]
-pub struct SdkOperationAliases {
-    aliases: Vec<SdkOperationAlias>,
-    configuration_errors: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct SdkOperationAlias {
-    matcher: OperationMatcher,
-    tag: Option<String>,
-    name: Option<String>,
-}
-
-impl SdkOperationAliases {
-    /// Create an empty operation alias set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Start configuring an operation alias matched by method and graph path.
-    #[must_use]
-    pub fn operation(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
-        self.aliases.push(SdkOperationAlias {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            tag: None,
-            name: None,
-        });
-        self
-    }
-
-    /// Set the SDK group/tag for the most recently configured operation alias.
-    #[must_use]
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        if let Some(alias) = self.aliases.last_mut() {
-            alias.tag = Some(tag.into());
-        } else {
-            self.configuration_errors
-                .push("SdkOperationAliases::tag() requires a preceding operation()".to_string());
-        }
-        self
-    }
-
-    /// Set the SDK operation name for the most recently configured operation alias.
-    #[must_use]
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        if let Some(alias) = self.aliases.last_mut() {
-            alias.name = Some(name.into());
-        } else {
-            self.configuration_errors
-                .push("SdkOperationAliases::name() requires a preceding operation()".to_string());
-        }
-        self
-    }
-}
-
-impl Transform for SdkOperationAliases {
-    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
-        if let Some(message) = self.configuration_errors.first() {
-            return Err(CoreError::Config {
-                message: message.clone(),
-            });
-        }
-        for alias in &self.aliases {
-            if alias.tag.is_none() && alias.name.is_none() {
-                return Err(CoreError::Config {
-                    message: format!(
-                        "SDK operation alias has no tag or name: {:?}",
-                        alias.matcher
-                    ),
-                });
-            }
-            let op_index = find_operation_index(ir, &alias.matcher, "SDK operation alias")?;
-            let op = &mut ir.operations[op_index];
-            if let Some(tag) = &alias.tag {
-                op.group = Some(tag.clone());
-            }
-            if let Some(name) = &alias.name {
-                op.id.clone_from(name);
-                op.handler.clone_from(name);
-            }
-        }
-        ensure_unique_operation_ids(ir)?;
-        Ok(())
-    }
-}
-
-fn ensure_unique_operation_ids(ir: &ApiGraph) -> Result<(), CoreError> {
-    for (index, op) in ir.operations.iter().enumerate() {
-        if ir
-            .operations
-            .iter()
-            .skip(index + 1)
-            .any(|other| other.id == op.id)
-        {
-            return Err(CoreError::Config {
-                message: format!(
-                    "SDK operation alias produced duplicate operation id {:?}",
-                    op.id
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------------------------------
 // Targets
 // ---------------------------------------------------------------------------------------------------
-
-/// Typed OpenAPI component aliases. `$ref` aliases point at a canonical component, while clone aliases
-/// duplicate the canonical component body after schema patches have been applied.
-#[derive(Debug, Clone, Default)]
-pub struct OpenApiSchemaAliases {
-    aliases: Vec<(String, String)>,
-    clone_aliases: Vec<(String, String)>,
-}
-
-impl OpenApiSchemaAliases {
-    /// Create an empty alias set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add one component alias (`alias` points at `canonical`).
-    #[must_use]
-    pub fn alias(mut self, canonical: impl Into<String>, alias: impl Into<String>) -> Self {
-        self.aliases.push((canonical.into(), alias.into()));
-        self
-    }
-
-    /// Add one component alias by cloning the canonical schema body into a distinct component.
-    #[must_use]
-    pub fn clone_alias(mut self, canonical: impl Into<String>, alias: impl Into<String>) -> Self {
-        self.clone_aliases.push((canonical.into(), alias.into()));
-        self
-    }
-}
 
 /// Typed OpenAPI schema patch. Field patches mutate properties on the named object schema.
 #[derive(Debug, Clone)]
@@ -4178,69 +3878,11 @@ impl OpenApiFieldPatch {
 
 fn apply_openapi_customizations(
     doc: &mut OpenApiDoc,
-    aliases: &OpenApiSchemaAliases,
     patches: &[OpenApiSchemaPatch],
 ) -> Result<(), CoreError> {
-    for (canonical, alias) in &aliases.aliases {
-        if !doc
-            .components
-            .schemas
-            .iter()
-            .any(|(name, _)| name == canonical)
-        {
-            return Err(CoreError::Config {
-                message: format!("OpenAPI schema alias references unknown schema {canonical:?}"),
-            });
-        }
-        if doc.components.schemas.iter().any(|(name, _)| name == alias) {
-            return Err(CoreError::Config {
-                message: format!("OpenAPI schema alias {alias:?} collides with an existing schema"),
-            });
-        }
-        doc.components
-            .schemas
-            .push((alias.clone(), SchemaObject::reference(canonical.clone())));
-    }
-    let clone_alias_names: BTreeSet<&str> = aliases
-        .clone_aliases
-        .iter()
-        .map(|(_, alias)| alias.as_str())
-        .collect();
-    for patch in patches
-        .iter()
-        .filter(|patch| !clone_alias_names.contains(patch.schema.as_str()))
-    {
+    for patch in patches {
         apply_openapi_schema_patch(doc, patch)?;
     }
-    for (canonical, alias) in &aliases.clone_aliases {
-        let Some((_, canonical_schema)) = doc
-            .components
-            .schemas
-            .iter()
-            .find(|(name, _)| name == canonical)
-        else {
-            return Err(CoreError::Config {
-                message: format!(
-                    "OpenAPI schema clone alias references unknown schema {canonical:?}"
-                ),
-            });
-        };
-        if doc.components.schemas.iter().any(|(name, _)| name == alias) {
-            return Err(CoreError::Config {
-                message: format!("OpenAPI schema alias {alias:?} collides with an existing schema"),
-            });
-        }
-        doc.components
-            .schemas
-            .push((alias.clone(), canonical_schema.clone()));
-    }
-    for patch in patches
-        .iter()
-        .filter(|patch| clone_alias_names.contains(patch.schema.as_str()))
-    {
-        apply_openapi_schema_patch(doc, patch)?;
-    }
-    doc.components.schemas.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(())
 }
 
@@ -4341,7 +3983,6 @@ fn apply_openapi_field_patch(
 #[derive(Debug, Clone)]
 pub struct OpenApi31 {
     path: String,
-    schema_aliases: OpenApiSchemaAliases,
     schema_patches: Vec<OpenApiSchemaPatch>,
 }
 
@@ -4351,7 +3992,6 @@ impl OpenApi31 {
     pub fn new() -> Self {
         Self {
             path: String::new(),
-            schema_aliases: OpenApiSchemaAliases::default(),
             schema_patches: Vec::new(),
         }
     }
@@ -4360,16 +4000,6 @@ impl OpenApi31 {
     #[must_use]
     pub fn to(mut self, path: impl Into<String>) -> Self {
         self.path = path.into();
-        self
-    }
-
-    /// Add typed component aliases.
-    #[must_use]
-    pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
-        self.schema_aliases.aliases.extend(aliases.aliases);
-        self.schema_aliases
-            .clone_aliases
-            .extend(aliases.clone_aliases);
         self
     }
 
@@ -4398,7 +4028,7 @@ impl Target for OpenApi31 {
         // Pass the graph's security schemes straight to the existing lowering (the single source of
         // truth — an `ApplySecurity` transform set them); never a re-implementation (CLAUDE.md rule 3).
         let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
-        apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
+        apply_openapi_customizations(&mut doc, &self.schema_patches)?;
         out.create(self.path.clone(), crate::lower::write_openapi_yaml(&doc))?;
         Ok(())
     }
@@ -4418,7 +4048,6 @@ impl Target for OpenApi31 {
 #[derive(Debug, Clone)]
 pub struct OpenApi31Json {
     path: String,
-    schema_aliases: OpenApiSchemaAliases,
     schema_patches: Vec<OpenApiSchemaPatch>,
 }
 
@@ -4428,7 +4057,6 @@ impl OpenApi31Json {
     pub fn new() -> Self {
         Self {
             path: String::new(),
-            schema_aliases: OpenApiSchemaAliases::default(),
             schema_patches: Vec::new(),
         }
     }
@@ -4437,16 +4065,6 @@ impl OpenApi31Json {
     #[must_use]
     pub fn to(mut self, path: impl Into<String>) -> Self {
         self.path = path.into();
-        self
-    }
-
-    /// Add typed component aliases.
-    #[must_use]
-    pub fn schema_aliases(mut self, aliases: OpenApiSchemaAliases) -> Self {
-        self.schema_aliases.aliases.extend(aliases.aliases);
-        self.schema_aliases
-            .clone_aliases
-            .extend(aliases.clone_aliases);
         self
     }
 
@@ -4473,7 +4091,7 @@ impl Target for OpenApi31Json {
             });
         }
         let mut doc = crate::lower::build_openapi_doc(ir, &ir.title, &ir.base_path, &ir.security)?;
-        apply_openapi_customizations(&mut doc, &self.schema_aliases, &self.schema_patches)?;
+        apply_openapi_customizations(&mut doc, &self.schema_patches)?;
         out.create(self.path.clone(), crate::lower::write_openapi_json(&doc)?)?;
         Ok(())
     }
@@ -4604,18 +4222,9 @@ pub struct GoSdk {
     go_version: String,
     dir: String,
     layout: SdkFileLayout,
-    aliases: SdkTypeAliases,
-    profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: bool,
     package_info: SdkPackageMetadata,
-    error_model: Option<String>,
-    required_pointer_constructor_policy: Option<RequiredPointerConstructorPolicy>,
-    query_time_format: Option<QueryTimeFormat>,
-    request_builder_scope: Option<GoRequestBuilderScope>,
-    request_builder_aliases: Option<GoRequestBuilderAliases>,
-    query_setter_argument_policy: Option<GoQuerySetterArgumentPolicy>,
-    execute_compatibility: Option<GoExecuteCompatibility>,
 }
 
 impl GoSdk {
@@ -4627,18 +4236,9 @@ impl GoSdk {
             go_version: "1.23".to_string(),
             dir: String::new(),
             layout: SdkFileLayout::compact(),
-            aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: true,
             package_info: SdkPackageMetadata::default(),
-            error_model: None,
-            required_pointer_constructor_policy: None,
-            query_time_format: None,
-            request_builder_scope: None,
-            request_builder_aliases: None,
-            query_setter_argument_policy: None,
-            execute_compatibility: None,
         }
     }
 
@@ -4690,73 +4290,6 @@ impl GoSdk {
         )
     }
 
-    /// Add compatibility type aliases to the generated SDK surface.
-    #[must_use]
-    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
-        self.aliases = aliases;
-        self
-    }
-
-    /// Set the SDK profile. The minimal profile preserves the historical Go SDK output.
-    #[must_use]
-    pub fn profile(mut self, profile: SdkProfile) -> Self {
-        self.profile = profile;
-        self
-    }
-
-    /// Decode non-2xx response bodies into the named error model when `GenericOpenAPIError::Model`
-    /// is called and no explicit model was attached.
-    #[must_use]
-    pub fn error_model(mut self, model: impl Into<String>) -> Self {
-        self.error_model = Some(model.into());
-        self
-    }
-
-    /// Set how required pointer fields are represented in generated constructors.
-    #[must_use]
-    pub const fn required_pointer_constructor_policy(
-        mut self,
-        policy: RequiredPointerConstructorPolicy,
-    ) -> Self {
-        self.required_pointer_constructor_policy = Some(policy);
-        self
-    }
-
-    /// Set how `time.Time` query values are serialized in compatibility helpers.
-    #[must_use]
-    pub const fn query_time_format(mut self, format: QueryTimeFormat) -> Self {
-        self.query_time_format = Some(format);
-        self
-    }
-
-    /// Set whether request builders emit operation-local or legacy graph-wide setters.
-    #[must_use]
-    pub const fn request_builder_scope(mut self, scope: GoRequestBuilderScope) -> Self {
-        self.request_builder_scope = Some(scope);
-        self
-    }
-
-    /// Add user-configured request-builder body/query alias setters.
-    #[must_use]
-    pub fn request_builder_aliases(mut self, aliases: GoRequestBuilderAliases) -> Self {
-        self.request_builder_aliases = Some(aliases);
-        self
-    }
-
-    /// Set how generated query setter arguments are typed.
-    #[must_use]
-    pub fn query_setter_argument_policy(mut self, policy: GoQuerySetterArgumentPolicy) -> Self {
-        self.query_setter_argument_policy = Some(policy);
-        self
-    }
-
-    /// Configure legacy `Execute` wrappers for selected compatibility request builders.
-    #[must_use]
-    pub fn execute_compatibility(mut self, compatibility: GoExecuteCompatibility) -> Self {
-        self.execute_compatibility = Some(compatibility);
-        self
-    }
-
     /// Configure generated SDK documentation output.
     #[must_use]
     pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
@@ -4789,39 +4322,6 @@ impl GoSdk {
     pub fn source_only(self) -> Self {
         self.docs(false).package_metadata(false)
     }
-
-    /// Expose `alias` as an additional type name for a schema id or generated schema name.
-    #[must_use]
-    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
-        let aliases = self.aliases.clone().type_alias(schema, alias);
-        self.aliases(aliases)
-    }
-
-    fn effective_options(&self) -> GoSdkOptions {
-        let mut options = GoSdkOptions::for_profile(&self.profile);
-        if let Some(model) = &self.error_model {
-            options.error_model = Some(model.clone());
-        }
-        if let Some(policy) = self.required_pointer_constructor_policy {
-            options.required_pointer_constructor_policy = policy;
-        }
-        if let Some(format) = self.query_time_format {
-            options.query_time_format = format;
-        }
-        if let Some(scope) = self.request_builder_scope {
-            options.request_builder_scope = scope;
-        }
-        if let Some(aliases) = &self.request_builder_aliases {
-            options.request_builder_aliases = aliases.clone();
-        }
-        if let Some(policy) = &self.query_setter_argument_policy {
-            options.query_setter_argument_policy = policy.clone();
-        }
-        if let Some(compatibility) = &self.execute_compatibility {
-            options.execute_compatibility = compatibility.clone();
-        }
-        options
-    }
 }
 
 impl Default for GoSdk {
@@ -4852,22 +4352,12 @@ impl Target for GoSdk {
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
-        let model = SdkModel::build(
-            ir,
-            &package,
-            &ir.base_path,
-            &self.layout,
-            &self.aliases,
-            &self.profile,
-        )?;
-        let files = crate::gosdk::generate_files_with_profile_options(
+        let model = SdkModel::build(ir, &package, &ir.base_path, &self.layout)?;
+        let files = crate::gosdk::generate_files_with_layout(
             ir,
             &model.package,
             &model.base_path,
             &self.layout,
-            &self.aliases,
-            &self.profile,
-            self.effective_options(),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
@@ -4912,11 +4402,10 @@ pub struct PySdk {
     dir: String,
     layout: SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: SdkTypeAliases,
-    profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: bool,
     package_info: SdkPackageMetadata,
+    root_exports: Vec<(String, String)>,
 }
 
 impl PySdk {
@@ -4928,11 +4417,10 @@ impl PySdk {
             dir: String::new(),
             layout: SdkFileLayout::compact(),
             model_style: PyModelStyle::default(),
-            aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: true,
             package_info: SdkPackageMetadata::default(),
+            root_exports: Vec::new(),
         }
     }
 
@@ -4983,20 +4471,6 @@ impl PySdk {
         self
     }
 
-    /// Add compatibility type aliases to the generated SDK surface.
-    #[must_use]
-    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
-        self.aliases = aliases;
-        self
-    }
-
-    /// Set the SDK profile. The minimal profile preserves the historical Python SDK output.
-    #[must_use]
-    pub fn profile(mut self, profile: SdkProfile) -> Self {
-        self.profile = profile;
-        self
-    }
-
     /// Configure generated SDK documentation output.
     #[must_use]
     pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
@@ -5031,17 +4505,21 @@ impl PySdk {
         self
     }
 
+    /// Re-export a symbol from an additional module at the generated package root.
+    ///
+    /// This is intended for first-party handwritten modules shipped beside generated sources. For
+    /// example, `.root_export("exceptions_user", "CodeActionFailure")` emits
+    /// `from .exceptions_user import CodeActionFailure` and includes the symbol in `__all__`.
+    #[must_use]
+    pub fn root_export(mut self, module: impl Into<String>, symbol: impl Into<String>) -> Self {
+        self.root_exports.push((module.into(), symbol.into()));
+        self
+    }
+
     /// Emit source files only, without generated docs.
     #[must_use]
     pub fn source_only(self) -> Self {
         self.docs(false).package_metadata(false)
-    }
-
-    /// Expose `alias` as an additional type name for a schema id or generated schema name.
-    #[must_use]
-    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
-        let aliases = self.aliases.clone().type_alias(schema, alias);
-        self.aliases(aliases)
     }
 }
 
@@ -5069,22 +4547,15 @@ impl Target for PySdk {
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
         // OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let model = SdkModel::build(
-            ir,
-            &package,
-            &ir.base_path,
-            &self.layout,
-            &self.aliases,
-            &self.profile,
-        )?;
+        let model = SdkModel::build(ir, &package, &ir.base_path, &self.layout)?;
         let mut files = crate::pysdk::generate_files_with_options(
             ir,
             &model.package,
             &model.base_path,
             &self.layout,
             self.model_style,
-            &self.aliases,
         )?;
+        append_python_root_exports(&mut files, &self.root_exports)?;
         if self.package_metadata {
             let dist_name = self.package_info.resolved_name(&model.package)?;
             files.push(super::bundle::SdkFile {
@@ -5129,6 +4600,127 @@ impl Target for PySdk {
     }
 }
 
+fn append_python_root_exports(
+    files: &mut [super::bundle::SdkFile],
+    exports: &[(String, String)],
+) -> Result<(), CoreError> {
+    if exports.is_empty() {
+        return Ok(());
+    }
+
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (module, symbol) in exports {
+        if !is_python_module(module) {
+            return Err(CoreError::Config {
+                message: format!("Python SDK root export has invalid module {module:?}"),
+            });
+        }
+        if !is_python_identifier(symbol) {
+            return Err(CoreError::Config {
+                message: format!("Python SDK root export has invalid symbol {symbol:?}"),
+            });
+        }
+        grouped
+            .entry(module.clone())
+            .or_default()
+            .insert(symbol.clone());
+    }
+
+    let init = files
+        .iter_mut()
+        .find(|file| file.name == "__init__.py")
+        .ok_or_else(|| CoreError::SdkGen {
+            message: "Python SDK did not emit __init__.py".to_string(),
+        })?;
+    let mut symbols = BTreeSet::new();
+    for module_symbols in grouped.values() {
+        for symbol in module_symbols {
+            if !symbols.insert(symbol.clone()) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "Python SDK root export symbol {symbol:?} is configured from multiple modules"
+                    ),
+                });
+            }
+            if init.contents.contains(&format!("    \"{symbol}\",")) {
+                return Err(CoreError::Config {
+                    message: format!(
+                        "Python SDK root export symbol {symbol:?} collides with a generated export"
+                    ),
+                });
+            }
+        }
+    }
+
+    init.contents.push('\n');
+    for (module, module_symbols) in &grouped {
+        let _ = std::fmt::Write::write_fmt(
+            &mut init.contents,
+            format_args!("from .{module} import (\n"),
+        );
+        for symbol in module_symbols {
+            let _ = std::fmt::Write::write_fmt(&mut init.contents, format_args!("    {symbol},\n"));
+        }
+        init.contents.push_str(")\n");
+    }
+    init.contents.push_str("\n__all__.extend([\n");
+    for symbol in symbols {
+        let _ = std::fmt::Write::write_fmt(&mut init.contents, format_args!("    \"{symbol}\",\n"));
+    }
+    init.contents.push_str("])\n");
+    Ok(())
+}
+
+fn is_python_module(module: &str) -> bool {
+    !module.is_empty() && module.split('.').all(is_python_identifier)
+}
+
+fn is_python_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !matches!(
+            value,
+            "False"
+                | "None"
+                | "True"
+                | "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "nonlocal"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        )
+}
+
 /// The TypeScript SDK target: generates the multi-file TypeScript SDK bundle and writes each file
 /// under [`TsSdk::to`].
 ///
@@ -5143,17 +4735,9 @@ pub struct TsSdk {
     module: String,
     dir: String,
     layout: SdkFileLayout,
-    aliases: SdkTypeAliases,
-    profile: SdkProfile,
     docs: SdkDocs,
     package_metadata: Option<bool>,
     package_info: SdkPackageMetadata,
-    model_property_policy: Option<TsModelPropertyPolicy>,
-    nullable_policy: Option<TsNullablePolicy>,
-    response_policy: Option<TsResponsePolicy>,
-    request_body_param_name: Option<String>,
-    init_override_function: Option<bool>,
-    barrel_exports: Option<TsBarrelExports>,
 }
 
 impl TsSdk {
@@ -5164,17 +4748,9 @@ impl TsSdk {
             module: String::new(),
             dir: String::new(),
             layout: SdkFileLayout::compact(),
-            aliases: SdkTypeAliases::default(),
-            profile: SdkProfile::minimal(),
             docs: SdkDocs::default(),
             package_metadata: None,
             package_info: SdkPackageMetadata::default(),
-            model_property_policy: None,
-            nullable_policy: None,
-            response_policy: None,
-            request_body_param_name: None,
-            init_override_function: None,
-            barrel_exports: None,
         }
     }
 
@@ -5209,20 +4785,6 @@ impl TsSdk {
                 .operations_per_endpoint()
                 .model_dir("models"),
         )
-    }
-
-    /// Add compatibility type aliases to the generated SDK surface.
-    #[must_use]
-    pub fn aliases(mut self, aliases: SdkTypeAliases) -> Self {
-        self.aliases = aliases;
-        self
-    }
-
-    /// Set the SDK profile.
-    #[must_use]
-    pub fn profile(mut self, profile: SdkProfile) -> Self {
-        self.profile = profile;
-        self
     }
 
     /// Configure generated SDK documentation output.
@@ -5261,78 +4823,6 @@ impl TsSdk {
         self.docs(false).package_metadata(false)
     }
 
-    /// Set how model interface properties use `?:`.
-    #[must_use]
-    pub const fn model_property_policy(mut self, policy: TsModelPropertyPolicy) -> Self {
-        self.model_property_policy = Some(policy);
-        self
-    }
-
-    /// Set how model interface properties include `| null`.
-    #[must_use]
-    pub const fn nullable_policy(mut self, policy: TsNullablePolicy) -> Self {
-        self.nullable_policy = Some(policy);
-        self
-    }
-
-    /// Set how operation methods return response bodies.
-    #[must_use]
-    pub const fn response_policy(mut self, policy: TsResponsePolicy) -> Self {
-        self.response_policy = Some(policy);
-        self
-    }
-
-    /// Set the request object property name used for JSON request bodies.
-    #[must_use]
-    pub fn request_body_param_name(mut self, name: impl Into<String>) -> Self {
-        self.request_body_param_name = Some(name.into());
-        self
-    }
-
-    /// Enable or disable the generated `InitOverrideFunction` hook.
-    #[must_use]
-    pub const fn init_override_function(mut self, enabled: bool) -> Self {
-        self.init_override_function = Some(enabled);
-        self
-    }
-
-    /// Set how the TypeScript fetch profile emits the root barrel.
-    #[must_use]
-    pub const fn barrel_exports(mut self, exports: TsBarrelExports) -> Self {
-        self.barrel_exports = Some(exports);
-        self
-    }
-
-    /// Expose `alias` as an additional type name for a schema id or generated schema name.
-    #[must_use]
-    pub fn type_alias(self, schema: impl Into<String>, alias: impl Into<String>) -> Self {
-        let aliases = self.aliases.clone().type_alias(schema, alias);
-        self.aliases(aliases)
-    }
-
-    fn effective_options(&self) -> TsSdkOptions {
-        let mut options = TsSdkOptions::for_profile(&self.profile);
-        if let Some(policy) = self.model_property_policy {
-            options.model_properties = policy;
-        }
-        if let Some(policy) = self.nullable_policy {
-            options.nullable = policy;
-        }
-        if let Some(policy) = self.response_policy {
-            options.response = policy;
-        }
-        if let Some(name) = &self.request_body_param_name {
-            options.request_body_param_name.clone_from(name);
-        }
-        if let Some(enabled) = self.init_override_function {
-            options.init_override_function = enabled;
-        }
-        if let Some(exports) = self.barrel_exports {
-            options.barrel_exports = exports;
-        }
-        options
-    }
-
     fn effective_package_metadata(&self) -> bool {
         self.package_metadata.unwrap_or(false)
     }
@@ -5362,23 +4852,12 @@ impl Target for TsSdk {
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
         // the OpenAPI lowering reads (rule 3/4 — never re-derived).
         let package = sdk_package(&self.module)?;
-        let model = SdkModel::build(
-            ir,
-            &package,
-            &ir.base_path,
-            &self.layout,
-            &self.aliases,
-            &self.profile,
-        )?;
-        let options = self.effective_options();
-        let mut files = crate::tssdk::generate_files_with_profile_options(
+        let model = SdkModel::build(ir, &package, &ir.base_path, &self.layout)?;
+        let mut files = crate::tssdk::generate_files_with_layout(
             ir,
             &model.package,
             &model.base_path,
             &self.layout,
-            &self.aliases,
-            &self.profile,
-            &options,
         )?;
         if self.effective_package_metadata() {
             files.retain(|file| {
@@ -5813,7 +5292,7 @@ impl Header {
 impl PostProcess for Header {
     fn run(&self, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         // Collect the rewrites first (we can't mutate while iterating `files()`), then re-write each
-        // through `Artifacts::write` so the set stays sorted (a rewrite of an existing path replaces
+        // through explicit artifact ownership so the set stays sorted (a rewrite of an existing path replaces
         // it in place). Only `.go` files get the header; the prepend is idempotent.
         let rewrites: Vec<(String, String)> = out
             .files()
@@ -6248,13 +5727,13 @@ mod tests {
         create_unique_postprocess_dir, go_gin_cache_key, sdk_package, ApiOverrides, ApplySecurity,
         ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask,
         FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
-        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaAliases,
-        OpenApiSchemaPatch, OperationSelector, ParameterOverride, PostProcess, PySdk, QueryParam,
-        RequestParameter, ResponseOverride, SdkOperationAliases, SdkPackageMetadata,
-        SecurityOverride, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
-        SetSchemaFieldType, SetTitle, Source, StaticFiles, Target, Transform, TsSdk,
+        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
+        ParameterOverride, PostProcess, PySdk, RequestParameter, ResponseOverride,
+        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
+        Transform, TsSdk,
     };
-    use crate::analyze::facts::{Constraints, FieldMeta};
+    use crate::analyze::facts::{Constraints, FieldMeta, LiteralValue};
     use crate::graph::{
         ApiGraph, Diagnostic, DiagnosticCategory, Field, Operation, PaginationMode,
         PaginationTermination, Param, Prim, Response, RuntimeHookKind, Schema, SchemaRef,
@@ -6263,8 +5742,6 @@ mod tests {
 
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::model::SdkModel;
-    use crate::sdk::profile::SdkProfile;
-    use crate::sdk::surface::SdkTypeAliases;
     use crate::sdk::Artifacts;
 
     fn cx() -> Cx {
@@ -6762,13 +6239,13 @@ mod tests {
         };
 
         ApiOverrides::new()
-            .query_param(
-                "PATCH",
-                "/conversations/{conversationId}/read",
-                QueryParam::new("limit")
-                    .integer()
-                    .optional()
-                    .default_number("5"),
+            .parameter(
+                OperationSelector::patch("/conversations/{conversationId}/read"),
+                ParameterOverride::add_if_missing(
+                    RequestParameter::query("limit", Type::integer())
+                        .optional()
+                        .default(LiteralValue::Number("5".to_string())),
+                ),
             )
             .request_body("PATCH", "/conversations/{conversationId}/read")
             .optional()
@@ -7298,10 +6775,11 @@ mod tests {
         };
 
         ApiOverrides::new()
-            .query_param(
-                "GET",
-                "/schedule/week",
-                QueryParam::new("startDate").date().required(),
+            .parameter(
+                OperationSelector::get("/schedule/week"),
+                ParameterOverride::add_if_missing(
+                    RequestParameter::query("startDate", Type::date()).required(),
+                ),
             )
             .apply(&mut ir, &cx())
             .unwrap();
@@ -7367,64 +6845,6 @@ mod tests {
 
         assert_eq!(ir.diagnostics.len(), 1);
         assert!(ir.diagnostics[0].message.contains("/other"));
-    }
-
-    #[test]
-    fn sdk_operation_aliases_patch_group_and_sdk_operation_name() {
-        let mut ir = ApiGraph {
-            operations: vec![
-                Operation {
-                    id: "download".to_string(),
-                    method: "GET".to_string(),
-                    path: "/v1/files/{fileId}/download".to_string(),
-                    handler: "download".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "search".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/coursework/search".to_string(),
-                    handler: "search".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-            ],
-            ..ApiGraph::default()
-        };
-
-        SdkOperationAliases::new()
-            .operation("GET", "/v1/files/{fileId}/download")
-            .tag("files")
-            .name("downloadSchoolFile")
-            .operation("POST", "/v1/coursework/search")
-            .tag("coursework")
-            .name("searchCoursework")
-            .apply(&mut ir, &cx())
-            .unwrap();
-
-        assert_eq!(ir.operations[0].group.as_deref(), Some("files"));
-        assert_eq!(ir.operations[0].id, "downloadSchoolFile");
-        assert_eq!(ir.operations[0].handler, "downloadSchoolFile");
-        assert_eq!(ir.operations[1].group.as_deref(), Some("coursework"));
-        assert_eq!(ir.operations[1].id, "searchCoursework");
-        assert_eq!(ir.operations[1].handler, "searchCoursework");
     }
 
     #[test]
@@ -7758,15 +7178,7 @@ mod tests {
             PaginationTermination::NoNextCursor
         );
 
-        let model = SdkModel::build(
-            &ir,
-            "books",
-            "/",
-            &SdkFileLayout::compact(),
-            &SdkTypeAliases::default(),
-            &SdkProfile::minimal(),
-        )
-        .unwrap();
+        let model = SdkModel::build(&ir, "books", "/", &SdkFileLayout::compact()).unwrap();
         assert_eq!(model.runtime.default_timeout_ms, Some(2_000));
         assert_eq!(model.runtime.max_retries, 3);
         assert_eq!(model.runtime.retry_statuses, vec![408, 429]);
@@ -8106,9 +7518,6 @@ mod tests {
             ..ApiGraph::default()
         };
 
-        let aliases = OpenApiSchemaAliases::new()
-            .alias("CreateBookInput", "CreateBookRequest")
-            .clone_alias("CreateBookInput", "LegacyCreateBookInput");
         let patch = OpenApiSchemaPatch::new("CreateBookInput")
             .field(
                 OpenApiFieldPatch::new("title")
@@ -8123,15 +7532,10 @@ mod tests {
                     .extension_null("x-empty"),
             )
             .field(OpenApiFieldPatch::new("source").extension_bool("x-source", true));
-        let clone_patch = OpenApiSchemaPatch::new("LegacyCreateBookInput")
-            .field(OpenApiFieldPatch::new("source").description("Legacy source description"));
-
         let mut yaml_out = Artifacts::new();
         OpenApi31::new()
             .to("openapi.yaml")
-            .schema_aliases(aliases.clone())
             .schema_patch(patch.clone())
-            .schema_patch(clone_patch.clone())
             .generate(&ir, &mut yaml_out, &cx())
             .unwrap();
         let yaml = yaml_out
@@ -8141,12 +7545,6 @@ mod tests {
             .unwrap()
             .text
             .as_str();
-        assert!(yaml.contains("CreateBookRequest:"), "{yaml}");
-        assert!(yaml.contains("LegacyCreateBookInput:"), "{yaml}");
-        assert!(
-            yaml.contains("$ref: '#/components/schemas/CreateBookInput'"),
-            "{yaml}"
-        );
         assert!(yaml.contains("description: Display title"), "{yaml}");
         assert!(yaml.contains("enum: [beta, alpha]"), "{yaml}");
         assert!(yaml.contains("minLength: 3"), "{yaml}");
@@ -8161,9 +7559,7 @@ mod tests {
         let mut json_out = Artifacts::new();
         OpenApi31Json::new()
             .to("openapi.json")
-            .schema_aliases(aliases)
             .schema_patch(patch)
-            .schema_patch(clone_patch)
             .generate(&ir, &mut json_out, &cx())
             .unwrap();
         let json = json_out
@@ -8175,31 +7571,8 @@ mod tests {
             .as_str();
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(
-            value["components"]["schemas"]["CreateBookRequest"]["$ref"],
-            "#/components/schemas/CreateBookInput"
-        );
-        assert_eq!(
             value["components"]["schemas"]["CreateBookInput"]["properties"]["title"]["x-rank"],
             2
-        );
-        assert_eq!(
-            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]["type"],
-            "string"
-        );
-        assert_eq!(
-            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]
-                ["description"],
-            "Display title"
-        );
-        assert_eq!(
-            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["title"]
-                ["minLength"],
-            3
-        );
-        assert_eq!(
-            value["components"]["schemas"]["LegacyCreateBookInput"]["properties"]["source"]
-                ["description"],
-            "Legacy source description"
         );
         assert_eq!(
             value["components"]["schemas"]["CreateBookInput"]["properties"]["source"]
@@ -8544,6 +7917,49 @@ mod tests {
     }
 
     #[test]
+    fn pysdk_root_exports_extend_the_native_package_surface() {
+        let ir = ApiGraph::default();
+        let target = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .root_export("exceptions_user", "fail")
+            .root_export("exceptions_user", "CodeActionFailure")
+            .to("generated/sdk-py");
+
+        let mut out = Artifacts::new();
+        target.generate(&ir, &mut out, &cx()).unwrap();
+        let init = out
+            .files()
+            .iter()
+            .find(|file| file.path == "generated/sdk-py/__init__.py")
+            .expect("PySdk must emit __init__.py");
+        assert!(
+            init.text
+                .contains("from .exceptions_user import (\n    CodeActionFailure,\n    fail,\n)"),
+            "{}",
+            init.text
+        );
+        assert!(
+            init.text.contains("    \"CodeActionFailure\","),
+            "{}",
+            init.text
+        );
+        assert!(init.text.contains("    \"fail\","), "{}", init.text);
+    }
+
+    #[test]
+    fn pysdk_root_exports_reject_invalid_python_names() {
+        let ir = ApiGraph::default();
+        let mut out = Artifacts::new();
+        let error = PySdk::new()
+            .module("example.com/bookstore/sdk")
+            .root_export("exceptions-user", "fail")
+            .to("generated/sdk-py")
+            .generate(&ir, &mut out, &cx())
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid module"), "{error}");
+    }
+
+    #[test]
     fn pysdk_target_emits_pyproject_metadata() {
         let ir = ApiGraph::default();
         let target = PySdk::new()
@@ -8716,7 +8132,7 @@ mod tests {
     }
 
     #[test]
-    fn tssdk_package_configuration_enables_metadata_for_minimal_profile() {
+    fn tssdk_package_configuration_enables_metadata() {
         let ir = ApiGraph::default();
         let mut out = Artifacts::new();
         TsSdk::new()

@@ -15,6 +15,28 @@ import (
 	"github.com/gnr8/goextract/internal/routes"
 )
 
+func TestParseScopesRequiresNamedFlags(t *testing.T) {
+	scopes, err := parseScopes([]string{
+		"--route-package",
+		"./internal/http/...",
+		"--schema-package",
+		"./internal/dto/...",
+	})
+	if err != nil {
+		t.Fatalf("parse named scopes: %v", err)
+	}
+	if !reflect.DeepEqual(scopes.routePatterns, []string{"./internal/http/..."}) {
+		t.Fatalf("route patterns: %+v", scopes.routePatterns)
+	}
+	if !reflect.DeepEqual(scopes.schemaPatterns, []string{"./internal/dto/..."}) {
+		t.Fatalf("schema patterns: %+v", scopes.schemaPatterns)
+	}
+
+	if _, err := parseScopes([]string{"./internal/http/..."}); err == nil {
+		t.Fatal("positional package scope must be rejected")
+	}
+}
+
 func TestGinContractRegressionFacts(t *testing.T) {
 	dir, err := filepath.Abs("../fixtures/gin-contract-regression")
 	if err != nil {

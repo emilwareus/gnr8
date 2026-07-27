@@ -2,7 +2,7 @@
 
 This plan implements every P0 finding in `RELEASE-GAP-ANALYSIS.md` under the clarified invariants in
 `CLAUDE.md`. Commodity dependencies are allowed; generated SDKs remain standard-library-only. Named
-OpenAPI Generator compatibility is removed rather than preserved. Missing facts and resources fail
+The native gnr8 contract is singular. Missing facts and resources fail
 explicitly instead of entering recovery chains.
 
 ## Working rules
@@ -35,7 +35,7 @@ TDD / verification:
 3. Re-run the claim scan and review links/prerequisite language. No dependency removal is part of this
    item.
 
-## P0.2 — Remove all OpenAPI Generator coupling
+## P0.2 — Remove the retired generator coupling
 
 Implementation and tests to delete or simplify:
 
@@ -59,18 +59,17 @@ Active documentation to remove/update:
 
 - `docs/AGENT-USAGE.md`
 - `docs/USAGE.md`
-- `docs/guides/brownfield-openapi-generator-migration.md` (delete)
+- the retired migration guide (delete)
 - `docs/guides/nestjs-to-typescript-sdk.md`
 - `docs/sdk-shape-flexibility-research.md`
 
 TDD / verification:
 
-1. Inventory exact matches for `.openapi-generator-ignore`, `openapitools.json`, `@openapitools`,
-   `typescript-axios`, `antihax`, named compatibility profiles, scanners, and tests whose names contain
-   `openapi_generator_`.
-2. Remove the CLI scanner/TOML compatibility contract, named profiles, profile-specific emitters and
-   options, dependencies, tests, fixtures, snapshots, and migration guide. Keep only generic user-owned
-   surface/layout primitives that do not encode another tool's conventions.
+1. Inventory retired ignore files, tool manifests, package conventions, named profiles, scanners,
+   and their tests.
+2. Remove the retired scanner/config contract, named profiles, profile-specific emitters and options,
+   dependencies, tests, fixtures, snapshots, and migration guide. Keep only generic user-owned
+   surface/layout primitives.
 3. Run focused Rust CLI/core/SDK tests and compile checks.
 4. Repeat the inventory. Governance/audit source documents (`CLAUDE.md`, the supplied audit, and the
    supplied research note) are evidence rather than product coupling and remain unstaged unless the

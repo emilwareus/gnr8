@@ -626,8 +626,6 @@ pub enum DiagnosticCategory {
     Override,
     /// An artifact producer or rewrite violated ownership rules.
     Artifact,
-    /// A compatibility comparison found contract drift.
-    Compatibility,
 }
 
 impl From<DiagnosticCategoryFact> for DiagnosticCategory {
@@ -641,7 +639,6 @@ impl From<DiagnosticCategoryFact> for DiagnosticCategory {
             DiagnosticCategoryFact::Security => Self::Security,
             DiagnosticCategoryFact::Override => Self::Override,
             DiagnosticCategoryFact::Artifact => Self::Artifact,
-            DiagnosticCategoryFact::Compatibility => Self::Compatibility,
         }
     }
 }
@@ -1252,7 +1249,7 @@ mod tests {
         let json = serde_json::to_string(ok).unwrap();
         assert!(
             !json.contains("body_kind"),
-            "default json body kind should stay wire-compatible: {json}"
+            "default json body kind should stay wire-identical: {json}"
         );
         assert!(
             !json.contains("content_type"),

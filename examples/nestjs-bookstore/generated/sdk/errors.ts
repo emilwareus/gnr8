@@ -30,3 +30,49 @@ export class ApiError extends Error {
     return this.status === 404;
   }
 }
+
+export class AuthConfigurationError extends Error {
+  constructor(
+    public readonly operationId: string,
+    public readonly alternatives: readonly (readonly string[])[],
+  ) {
+    super(`No configured credentials satisfy operation ${operationId}`);
+    this.name = "AuthConfigurationError";
+  }
+}
+
+export type ResponseDecodeFailure =
+  "empty_body" | "unexpected_content_type" | "invalid_json";
+
+export interface ResponseDecodeErrorInit {
+  headers?: Headers;
+  requestId?: string;
+  rawBody?: string;
+  expectedContentType?: string;
+  actualContentType?: string;
+  cause?: unknown;
+}
+
+export class ResponseDecodeError extends Error {
+  public readonly headers: Headers;
+  public readonly requestId?: string;
+  public readonly rawBody: string;
+  public readonly expectedContentType: string;
+  public readonly actualContentType?: string;
+  public readonly cause?: unknown;
+
+  constructor(
+    public readonly failure: ResponseDecodeFailure,
+    public readonly status: number,
+    init: ResponseDecodeErrorInit = {},
+  ) {
+    super(`HTTP ${status}: response decode failed (${failure})`);
+    this.name = "ResponseDecodeError";
+    this.headers = init.headers ?? new Headers();
+    this.requestId = init.requestId;
+    this.rawBody = init.rawBody ?? "";
+    this.expectedContentType = init.expectedContentType ?? "application/json";
+    this.actualContentType = init.actualContentType;
+    this.cause = init.cause;
+  }
+}

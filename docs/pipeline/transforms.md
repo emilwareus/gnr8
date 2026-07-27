@@ -4,7 +4,7 @@
 [Agent docs index](../agents/index.md)
 
 Transforms change the shared `ApiGraph` before any target renders it. Use them for facts that static
-extraction cannot recover, public API policy, compatibility names, runtime behavior, and docs.
+extraction cannot recover, public API policy, public names, runtime behavior, and docs.
 
 ## Selection
 
@@ -92,7 +92,7 @@ requiredness only and therefore requires an existing body.
 
 ## Typed parameters
 
-Prefer `RequestParameter` and `ParameterOverride` over the legacy query-only builder:
+Use `RequestParameter` and `ParameterOverride` for every parameter correction:
 
 ```rust
 .transform(
@@ -134,8 +134,7 @@ Override modes are deliberately strict:
 | `replace` | zero or one same name/location | intentionally replaces and emits `override.parameter.replaced` when present |
 
 Path parameters are always required. Serialization style is validated by location, `allow_reserved`
-is query-only, and literal defaults must match the parameter type. The legacy
-`QueryParam::new("name")` plus `.query_param(method, path, param)` remains available for migrations.
+is query-only, and literal defaults must match the parameter type.
 
 ## Security
 
@@ -203,7 +202,7 @@ additional `media_type` values. Convenience methods on `ApiOverrides` are `json_
 `binary_response`, `sse_response`/`event_schema`, and `default_error_response`. Duplicate overrides
 for one operation/status are rejected.
 
-## Naming, grouping, and aliases
+## Naming and grouping
 
 ```rust
 .transform(RenameOperation::new("getBooks", "listBooks"))
@@ -215,17 +214,10 @@ for one operation/status are rejected.
         .by_tag("inventory", "Books")
         .by_operation("health", "System"),
 )
-.transform(
-    SdkOperationAliases::new()
-        .operation("GET", "/books")
-        .tag("BooksApi")
-        .name("getBooks"),
-)
 ```
 
 Type renames rewrite all references. Collisions and chained/collapsing renames fail. Grouping rules
-are evaluated in declaration order; the first match wins. SDK operation aliases change generated
-SDK names/groups for an exact route without changing source extraction.
+are evaluated in declaration order; the first match wins.
 
 ## Enum order
 

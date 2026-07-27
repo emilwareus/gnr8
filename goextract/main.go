@@ -5,8 +5,7 @@
 //
 // Usage:
 //
-//	goextract <target-dir> [package-pattern...]
-//	goextract <target-dir> --route-package <pattern> --schema-package <pattern>
+//	goextract <target-dir> [--route-package <pattern>] [--schema-package <pattern>]
 //
 // 02-01 extracts DTO struct/enum schemas + float64/free-form-map diagnostics.
 // Routes/handlers (02-02) and the Rust ApiGraph/inspect (02-03) build on this.
@@ -28,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: goextract <target-dir> [package-pattern...] [--route-package <pattern> --schema-package <pattern>]")
+		fmt.Fprintln(os.Stderr, "usage: goextract <target-dir> [--route-package <pattern>] [--schema-package <pattern>]")
 		os.Exit(1)
 	}
 	targetDir := os.Args[1]
@@ -51,37 +50,23 @@ type packageScopes struct {
 
 func parseScopes(args []string) (packageScopes, error) {
 	var scopes packageScopes
-	var legacy []string
-	usedFlag := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--route-package":
-			usedFlag = true
 			i++
 			if i >= len(args) {
 				return scopes, fmt.Errorf("--route-package requires a pattern")
 			}
 			scopes.routePatterns = append(scopes.routePatterns, args[i])
 		case "--schema-package":
-			usedFlag = true
 			i++
 			if i >= len(args) {
 				return scopes, fmt.Errorf("--schema-package requires a pattern")
 			}
 			scopes.schemaPatterns = append(scopes.schemaPatterns, args[i])
 		default:
-			if strings.HasPrefix(args[i], "--") {
-				return scopes, fmt.Errorf("unknown argument %q", args[i])
-			}
-			legacy = append(legacy, args[i])
+			return scopes, fmt.Errorf("unknown argument %q", args[i])
 		}
-	}
-	if usedFlag && len(legacy) > 0 {
-		return scopes, fmt.Errorf("package patterns must use either legacy positional args or --route-package/--schema-package flags, not both")
-	}
-	if !usedFlag {
-		scopes.routePatterns = legacy
-		scopes.schemaPatterns = legacy
 	}
 	return scopes, nil
 }

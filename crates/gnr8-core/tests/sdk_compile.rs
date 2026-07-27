@@ -779,12 +779,12 @@ func TestMediaRequestBodies(t *testing.T) {
 					t.Errorf("multipart Content-Type = %q, want multipart/form-data boundary", got)
 				}
 				text := string(body)
-				for _, want := range []string{`name="title"`, "Report", `name="file"; filename="file"`, "abc123", `name="files"; filename="files"`, "part-one", "part-two"} {
+				for _, want := range []string{`name="title"`, "Report", `name="file"; filename="report.txt"`, "abc123", `name="files"; filename="part-one.txt"`, `name="files"; filename="part-two.txt"`, "part-one", "part-two"} {
 					if !strings.Contains(text, want) {
 						t.Errorf("multipart body missing %q:\n%s", want, text)
 					}
 				}
-				if strings.Count(text, `name="files"; filename="files"`) != 2 {
+				if strings.Count(text, `name="files"; filename=`) != 2 {
 					t.Errorf("multipart repeated files field count mismatch:\n%s", text)
 				}
 		case "/binary":
@@ -809,7 +809,14 @@ func TestMediaRequestBodies(t *testing.T) {
 	if _, err := c.PostForm(ctx, FormBody{Name: "Ada", Count: 3, Tags: []string{"sdk", "media"}}); err != nil {
 		t.Fatalf("PostForm returned error: %v", err)
 	}
-	if _, err := c.PostMultipart(ctx, MultipartBody{Title: "Report", File: []byte("abc123"), Files: [][]byte{[]byte("part-one"), []byte("part-two")}}); err != nil {
+	if _, err := c.PostMultipart(ctx, MultipartBody{
+		Title: "Report",
+		File: NewMultipartFile("report.txt", []byte("abc123")),
+		Files: []MultipartFile{
+			NewMultipartFile("part-one.txt", []byte("part-one")),
+			NewMultipartFile("part-two.txt", []byte("part-two")),
+		},
+	}); err != nil {
 		t.Fatalf("PostMultipart returned error: %v", err)
 	}
 	if _, err := c.PostBinary(ctx, []byte("raw-bytes")); err != nil {
@@ -1015,11 +1022,14 @@ func TestQueryAPIKeyIsSent(t *testing.T) {{
 		if got := r.URL.Query().Get("api_key"); got != "secret" {{
 			t.Errorf("api_key query = %q, want secret", got)
 		}}
+		if got := r.Header.Get("X-Test-Header"); got != "native-default" {{
+			t.Errorf("X-Test-Header = %q, want native-default", got)
+		}}
 		w.WriteHeader(http.StatusNoContent)
 	}}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, WithAPIKey("secret"))
+	c := NewClient(srv.URL, WithAPIKey("secret"), WithHeader("X-Test-Header", "native-default"))
 	if _, err := c.ListItems(context.Background()); err != nil {{
 		t.Fatalf("ListItems returned error: %v", err)
 	}}
@@ -1287,6 +1297,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestPaginationHelpers(t *testing.T) {{
@@ -1298,6 +1309,11 @@ func TestPaginationHelpers(t *testing.T) {{
 		cursor := r.URL.Query().Get("cursor")
 		seen = append(seen, cursor)
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {{
+			flusher.Flush()
+		}}
+		time.Sleep(10 * time.Millisecond)
 		switch cursor {{
 		case "":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
