@@ -252,12 +252,12 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 			lastErr = err
 			if attempt < maxRetries {
 				// Back off before reconnecting: retrying a refused connection instantly just multiplies
-				// load on a service that is already restarting. If the wait is cancelled we surface the
-				// transport failure rather than waitErr: cancellation stopped the retry, it is not why the
-				// request failed, and ctx.Err() is already available to the caller.
+				// load on a service that is already restarting. A cancelled wait returns the context error,
+				// matching the status-retry path below, so errors.Is(err, context.Canceled) answers the same
+				// way wherever the cancellation lands.
 				if waitErr := sleepRetry(attemptReq.Context(), backoffDelay(attempt)); waitErr != nil {
-					c.callErrorHooks(attemptReq.Context(), ctx, err)
-					return nil, err
+					c.callErrorHooks(attemptReq.Context(), ctx, waitErr)
+					return nil, waitErr
 				}
 				continue
 			}

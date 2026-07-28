@@ -99,6 +99,8 @@ fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
         "--noEmit",
         "--strict",
         "--noUnusedLocals",
+        "--exactOptionalPropertyTypes",
+        "--noUncheckedIndexedAccess",
         "--target",
         "es2022",
         "--module",

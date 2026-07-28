@@ -22,6 +22,10 @@ scope=(
   llms-full.txt
   action.yml
   Makefile
+  # Adding a dependency is the most likely way foreign-generator coupling enters, so the
+  # manifests are in scope, not just the source.
+  Cargo.toml
+  Cargo.lock
   crates
   docs
   examples
@@ -82,8 +86,8 @@ check_rule() {
 # (CLAUDE.md 0.1), so disclaimer lines are subtracted. Anything that names one of these tools
 # WITHOUT disclaiming it is a coupling risk and fails.
 check_rule "foreign annotation/generator coupling" \
-  '(openapi-generator|openapitools|swagger-codegen|oapi-codegen|typescript-axios|typescript-fetch|antihax|swaggertype|swaggerignore|swaggo|drf-yasg|drf-spectacular|apispec|flasgger|springdoc|@nestjs/swagger|class-validator|class-transformer)' \
-  '(never |nor |, not |not read|does not|doesn.t|ignores |forbidden|instead of|rule [01]|categorically different|third-party convention)'
+  '(openapi[-_. ]?generator|openapitools|swagger[-_]?codegen|oapi[-_]codegen|typescript[-_]axios|typescript[-_]fetch|antihax|swaggertype|swaggerignore|swaggo|drf[-_]yasg|drf[-_]spectacular|apispec|flasgger|springdoc|@nestjs/swagger|class-validator|class-transformer)' \
+  '((never|Never|NEVER) |does not (read|consult|parse|treat|import)|doesn.t (read|consult|parse)|nor \*\*|, not erased|ignores (swagger|the)|forbidden by rule|third-party convention)'
 
 # 0.2 / 0.3 — brownfield and compatibility as PRODUCT surface.
 #
@@ -99,7 +103,7 @@ check_rule "brownfield/compatibility product surface" \
 # (types, functions, modules, methods, CLI flags) rather than prose, so that legitimate protocol
 # and wire compatibility discussion stays allowed.
 check_rule "compat/legacy/brownfield vocabulary in identifiers" \
-  '((pub )?(fn|mod|struct|enum|trait|const) [a-zA-Z_]*(compat|legacy|brownfield)|fn [a-zA-Z_]*_(compat|legacy)|--(compat|legacy|profile)\b|def [a-z_]*(compat|legacy)|(class|function) [a-zA-Z]*(Compat|Legacy|Brownfield))' \
+  '((pub )?(fn|mod|struct|enum|trait|const) [a-zA-Z_]*(compat|legacy|brownfield)|fn [a-zA-Z_]*_(compat|legacy)|--(compat|legacy)\b|--profile[= ](minimal|native|compat|legacy)|def [a-z_]*(compat|legacy)|(class|function) [a-zA-Z]*(Compat|Legacy|Brownfield))' \
   '(protocol|handshake|PROTOCOL_VERSION|forward-compat)'
 
 # 0.3 — the rules above grep file CONTENTS, so a forbidden name can hide in a path. An empty

@@ -102,9 +102,13 @@ fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
         "Go" => "`*APIError`",
         _ => "`ApiError`",
     };
+    let construct = match language {
+        "TypeScript" => "2. Construct the generated `Client` with `{ baseUrl }`.\n",
+        _ => "2. Construct the generated `Client` with the service base URL.\n",
+    };
+    text.push_str(construct);
     text.push_str(
-        "2. Construct the generated `Client` with the service base URL.\n\
-         3. Pass typed request models and path/query parameters according to the generated method signatures.\n",
+        "3. Pass typed request models and path/query parameters according to the generated method signatures.\n",
     );
     let _ = writeln!(
         text,

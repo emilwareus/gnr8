@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from .errors import ApiError, AuthConfigurationError
+from .errors import ApiError
 from .models import (
     OrderConfirmation,
     OrderInput,
@@ -108,42 +108,6 @@ class Client:
             mode = "python" if body_encoding == "multipart" else "json"
             body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)
         return self._wire_value(body)
-
-    def _select_auth_alternative(
-        self,
-        operation_id: str,
-        alternatives: list[list[dict[str, str]]],
-    ) -> set[str]:
-        if not alternatives:
-            return set()
-        if self._auth_transport:
-            return set()
-        for alternative in alternatives:
-            satisfied = True
-            for requirement in alternative:
-                kind = requirement["kind"]
-                if kind == "apiKey":
-                    credential = (
-                        self._api_keys.get(requirement["scheme_id"])
-                        or self._api_keys.get(requirement["name"])
-                        or self._api_key
-                    )
-                elif kind == "bearer":
-                    credential = self._bearer_token
-                else:
-                    credential = self._basic_auth
-                if not credential:
-                    satisfied = False
-                    break
-            if satisfied:
-                return {requirement["scheme_id"] for requirement in alternative}
-        raise AuthConfigurationError(
-            operation_id,
-            [
-                [requirement["scheme_id"] for requirement in alternative]
-                for alternative in alternatives
-            ],
-        )
 
     def _wire_value(self, value: Any) -> Any:
         if isinstance(value, enum.Enum):
@@ -376,6 +340,10 @@ class Client:
 
     @staticmethod
     def _backoff_delay(attempt: int) -> float:
+        # 2 ** attempt is an exact int, so a large attempt count overflows the float
+        # multiply; past the cap the answer is the cap anyway.
+        if attempt >= 32:
+            return MAX_RETRY_DELAY_SECONDS
         step = BASE_RETRY_DELAY_SECONDS * (2 ** max(attempt, 0))
         return min(step, MAX_RETRY_DELAY_SECONDS)
 

@@ -1219,8 +1219,14 @@ pub(crate) fn emit_client_with_models(
         third_party.push("from pydantic import BaseModel".to_string());
     }
 
+    // AuthConfigurationError is only raised by the auth selector, which an unsecured client does
+    // not emit — importing it there would be an unused import (ruff F401).
     let mut first_party: Vec<String> =
-        vec!["from .errors import ApiError, AuthConfigurationError".to_string()];
+        vec![if has_api_key_auth || has_bearer_auth || has_basic_auth {
+            "from .errors import ApiError, AuthConfigurationError".to_string()
+        } else {
+            "from .errors import ApiError".to_string()
+        }];
     if !model_refs.is_empty() {
         // A parenthesized, one-name-per-line import with a trailing comma: the "magic trailing comma"
         // keeps `ruff format` from collapsing it and stays stable regardless of the name count.
@@ -1254,18 +1260,28 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
+    // `_select_auth_alternative` reads all four credential attributes whenever ANY scheme exists,
+    // so they must all be assigned together. Gating each on its own scheme kind left a client with
+    // only, say, apiKey auth referencing `self._bearer_token` — unsound, and only masked because
+    // the helper early-returns when an operation declares no alternatives.
     let auth_field = if has_api_key_auth {
         "        self._api_keys = api_keys or {}\n"
+    } else if has_bearer_auth || has_basic_auth {
+        "        self._api_keys: dict[str, str] = {}\n"
     } else {
         ""
     };
     let bearer_field = if has_bearer_auth {
         "        self._bearer_token = bearer_token\n"
+    } else if has_api_key_auth || has_basic_auth {
+        "        self._bearer_token = None\n"
     } else {
         ""
     };
     let basic_field = if has_basic_auth {
         "        self._basic_auth = basic_auth\n"
+    } else if has_api_key_auth || has_bearer_auth {
+        "        self._basic_auth = None\n"
     } else {
         ""
     };
@@ -1280,6 +1296,50 @@ pub(crate) fn emit_client_with_models(
     };
     let transport_auth_field = if has_any_auth {
         "        self._auth_transport = auth_transport\n"
+    } else {
+        ""
+    };
+    // The helper reads _auth_transport/_api_keys/_bearer_token/_basic_auth, and those are only
+    // assigned when the graph declares a scheme. Emitting it for an unsecured client would
+    // reference four attributes that do not exist.
+    let auth_selector = if has_any_auth {
+        r#"    def _select_auth_alternative(
+        self,
+        operation_id: str,
+        alternatives: list[list[dict[str, str]]],
+    ) -> set[str]:
+        if not alternatives:
+            return set()
+        if self._auth_transport:
+            return set()
+        for alternative in alternatives:
+            satisfied = True
+            for requirement in alternative:
+                kind = requirement["kind"]
+                if kind == "apiKey":
+                    credential = (
+                        self._api_keys.get(requirement["scheme_id"])
+                        or self._api_keys.get(requirement["name"])
+                        or self._api_key
+                    )
+                elif kind == "bearer":
+                    credential = self._bearer_token
+                else:
+                    credential = self._basic_auth
+                if not credential:
+                    satisfied = False
+                    break
+            if satisfied:
+                return {requirement["scheme_id"] for requirement in alternative}
+        raise AuthConfigurationError(
+            operation_id,
+            [
+                [requirement["scheme_id"] for requirement in alternative]
+                for alternative in alternatives
+            ],
+        )
+
+"#
     } else {
         ""
     };
@@ -1379,43 +1439,7 @@ class Client:
 
     def _body_value(self, body: Any, body_encoding: str) -> Any:
 {body_value}
-    def _select_auth_alternative(
-        self,
-        operation_id: str,
-        alternatives: list[list[dict[str, str]]],
-    ) -> set[str]:
-        if not alternatives:
-            return set()
-        if self._auth_transport:
-            return set()
-        for alternative in alternatives:
-            satisfied = True
-            for requirement in alternative:
-                kind = requirement[\"kind\"]
-                if kind == \"apiKey\":
-                    credential = (
-                        self._api_keys.get(requirement[\"scheme_id\"])
-                        or self._api_keys.get(requirement[\"name\"])
-                        or self._api_key
-                    )
-                elif kind == \"bearer\":
-                    credential = self._bearer_token
-                else:
-                    credential = self._basic_auth
-                if not credential:
-                    satisfied = False
-                    break
-            if satisfied:
-                return {{requirement[\"scheme_id\"] for requirement in alternative}}
-        raise AuthConfigurationError(
-            operation_id,
-            [
-                [requirement[\"scheme_id\"] for requirement in alternative]
-                for alternative in alternatives
-            ],
-        )
-
-    def _wire_value(self, value: Any) -> Any:
+{auth_selector}    def _wire_value(self, value: Any) -> Any:
         if isinstance(value, enum.Enum):
             return self._wire_value(value.value)
         if isinstance(value, list):
@@ -1646,6 +1670,10 @@ class Client:
 
     @staticmethod
     def _backoff_delay(attempt: int) -> float:
+        # 2 ** attempt is an exact int, so a large attempt count overflows the float
+        # multiply; past the cap the answer is the cap anyway.
+        if attempt >= 32:
+            return MAX_RETRY_DELAY_SECONDS
         step = BASE_RETRY_DELAY_SECONDS * (2 ** max(attempt, 0))
         return min(step, MAX_RETRY_DELAY_SECONDS)
 
@@ -1710,7 +1738,7 @@ class Client:
 /// - interpolates each path param through `urllib.parse.quote(str(value), safe="")` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
 ///   present optional params; joins `base_path` + `op.path`;
-/// - calls `self._do`, raises `ApiError` via `self._raise` for non-2xx responses, and decodes JSON only
+/// - calls `self._do`, raises the `ApiError` built by `self._error` for non-2xx responses, and decodes JSON only
 ///   for success statuses that declare a body model.
 ///
 /// # Errors
