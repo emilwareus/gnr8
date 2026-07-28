@@ -417,6 +417,7 @@ export class Client {
       if (response.status < 200 || response.status >= 300) {
         const error = new ApiError(response.status, {
           headers: response.headers,
+          requestId: response.headers.get("x-request-id") ?? undefined,
         });
         for (const hook of this.hooks.error) {
           await hook(hookContext, error);

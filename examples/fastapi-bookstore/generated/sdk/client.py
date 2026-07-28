@@ -335,6 +335,8 @@ class Client:
                             "",
                             "",
                             headers=response_headers,
+                            request_id=response_headers.get("X-Request-ID")
+                            or response_headers.get("x-request-id", ""),
                             raw_body=raw,
                         ),
                     )

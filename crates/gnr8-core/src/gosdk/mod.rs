@@ -19,9 +19,9 @@ use std::collections::BTreeMap;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_names, file_stem, http_auth_features,
-    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
-    validate_sdk_base_path,
+    api_key_credential_names, check_unique_schema_file_stems, check_unique_schema_names, file_stem,
+    http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
+    operation_group_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 
@@ -76,6 +76,7 @@ pub(crate) fn generate_files_with_layout(
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
+    check_unique_schema_file_stems(graph, "Go SDK", layout)?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;

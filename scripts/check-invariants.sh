@@ -16,7 +16,6 @@ status=0
 # Paths searched. Everything else (.planning, thoughts, target, node_modules, .git) is out of scope.
 scope=(
   README.md
-  CHANGELOG.md
   PLAN.md
   RELEASE-READINESS-V2.md
   llms.txt

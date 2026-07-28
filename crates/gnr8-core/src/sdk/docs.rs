@@ -114,6 +114,32 @@ fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
         text,
         "4. Handle generated {error_type} values for non-2xx responses.\n"
     );
+    // The timeout knob does not bound the same span in every language, and a caller who assumes
+    // it does will size it wrong. Say so where they will read it.
+    let timeout_note = match language {
+        "Go" => concat!(
+            "## Retries and timeouts\n\n",
+            "`WithTimeout` bounds the whole call, including retries and the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Cancelling the context interrupts a retry wait.\n\n"
+        ),
+        "Python" => concat!(
+            "## Retries and timeouts\n\n",
+            "`timeout` bounds each individual attempt, not the whole call: with retries, total ",
+            "wall time can reach `timeout x (max_retries + 1)` plus the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Retry waits are not interruptible.\n\n"
+        ),
+        "TypeScript" => concat!(
+            "## Retries and timeouts\n\n",
+            "`timeoutMs` bounds each individual attempt, not the whole call: with retries, total ",
+            "wall time can reach `timeoutMs x (maxRetries + 1)` plus the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Pass `signal` to interrupt a retry wait.\n\n"
+        ),
+        _ => "",
+    };
+    text.push_str(timeout_note);
     match language {
         "Go" => text.push_str(
             "## Go quick start\n\n\
