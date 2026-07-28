@@ -1292,6 +1292,11 @@ pub(crate) fn emit_client_with_models(
     format!(
         "\
 {header}
+#: First transport-error backoff step; doubles per attempt up to the ceiling below.
+BASE_RETRY_DELAY_SECONDS = 0.1
+#: Ceiling for any retry wait, including a server-supplied Retry-After.
+MAX_RETRY_DELAY_SECONDS = 60.0
+
 
 class RequestOptions:
     \"\"\"Per-request SDK runtime overrides.\"\"\"
@@ -1609,7 +1614,7 @@ class Client:
                 for hook in self._hooks.response:
                     hook(context)
                 if self._should_retry_status(status) and attempt < max_retries:
-                    self._sleep_retry_after(response_headers)
+                    time.sleep(self._retry_delay(response_headers, attempt))
                     continue
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
@@ -1626,6 +1631,9 @@ class Client:
             except urllib.error.URLError as e:
                 last_error = e
                 if attempt < max_retries:
+                    # Back off before reconnecting: instant retries just
+                    # multiply load on a service that is already restarting.
+                    time.sleep(self._backoff_delay(attempt))
                     continue
                 self._call_error_hooks(context, e)
                 raise
@@ -1637,28 +1645,36 @@ class Client:
         return status in self._retry_statuses or status >= 500
 
     @staticmethod
-    def _sleep_retry_after(headers: dict[str, str]) -> None:
+    def _backoff_delay(attempt: int) -> float:
+        step = BASE_RETRY_DELAY_SECONDS * (2 ** max(attempt, 0))
+        return min(step, MAX_RETRY_DELAY_SECONDS)
+
+    @classmethod
+    def _retry_delay(cls, headers: dict[str, str], attempt: int) -> float:
         retry_after = headers.get(\"Retry-After\") or headers.get(\"retry-after\")
-        if not retry_after:
-            return
-        try:
-            seconds = int(retry_after)
-        except ValueError:
-            return
-        if seconds > 0:
-            time.sleep(seconds)
+        if retry_after:
+            try:
+                seconds = int(retry_after)
+            except ValueError:
+                seconds = 0
+            if seconds > 0:
+                # A server may ask for an arbitrarily long wait. Honour it
+                # only up to the ceiling, so a hostile or misconfigured origin
+                # cannot park the caller for hours.
+                return min(float(seconds), MAX_RETRY_DELAY_SECONDS)
+        return cls._backoff_delay(attempt)
 
     def _call_error_hooks(self, context: HookContext, error: BaseException) -> None:
         for hook in self._hooks.error:
             hook(context, error)
 
     @staticmethod
-    def _raise(
+    def _error(
         status: int,
         headers: dict[str, str],
         raw: bytes,
         error_model: Optional[type] = None,
-    ) -> None:
+    ) -> ApiError:
         try:
             json_body = json.loads(raw) if raw else None
         except ValueError:
@@ -1671,7 +1687,7 @@ class Client:
                 body = json_body
         decoded = json_body if isinstance(json_body, dict) else {{}}
         request_id = headers.get(\"X-Request-ID\") or headers.get(\"x-request-id\", \"\")
-        raise ApiError(
+        return ApiError(
             status,
             decoded.get(\"message\", \"\"),
             decoded.get(\"slug\", \"\"),
@@ -1989,7 +2005,14 @@ fn emit_operation(
     // (positional), optional body when present, then optional query params (= None). This preserves
     // the established required-body surface while keeping defaulted args after all required args.
     let mut args: Vec<String> = vec!["self".to_string()];
-    args.extend(path_idents.iter().cloned());
+    // Path params are always required, and they get the same type hint as query params — an
+    // unannotated `book_id` gives callers no completion and no mypy protection.
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        args.push(format!(
+            "{ident}: {}",
+            py_type(&param.schema, false, graph)?
+        ));
+    }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
         args.push(format!("body: {}", body.model));
     }
@@ -2187,12 +2210,16 @@ fn emit_operation(
         writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
         writeln!(
             out,
-            "                self._raise(_status, _headers, _raw, {})",
+            "                raise self._error(_status, _headers, _raw, {})",
             error_body.model
         )
         .map_err(sink)?;
     }
-    writeln!(out, "            self._raise(_status, _headers, _raw)").map_err(sink)?;
+    writeln!(
+        out,
+        "            raise self._error(_status, _headers, _raw)"
+    )
+    .map_err(sink)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -2204,7 +2231,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
+            writeln!(out, "        raise self._error(_status, _headers, _raw)").map_err(sink)?;
         }
     } else if let Some(model) = &return_model {
         writeln!(
@@ -2229,7 +2256,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
+            writeln!(out, "        raise self._error(_status, _headers, _raw)").map_err(sink)?;
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
@@ -2529,8 +2556,11 @@ fn py_pagination_args(
 
     let mut args: Vec<String> = vec!["self".to_string()];
     let mut call_args: Vec<String> = Vec::new();
-    for ident in &path_idents {
-        args.push(ident.clone());
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        args.push(format!(
+            "{ident}: {}",
+            py_type(&param.schema, false, graph)?
+        ));
         call_args.push(format!("{ident}={ident}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
@@ -3260,11 +3290,11 @@ mod tests {
             );
             assert!(out.contains("if _status == 409:"), "{out}");
             assert!(
-                out.contains("self._raise(_status, _headers, _raw, OutOfStock)"),
+                out.contains("raise self._error(_status, _headers, _raw, OutOfStock)"),
                 "{out}"
             );
             assert!(
-                out.contains("self._raise(_status, _headers, _raw)"),
+                out.contains("raise self._error(_status, _headers, _raw)"),
                 "{out}"
             );
             assert!(
@@ -3610,6 +3640,39 @@ mod tests {
                 out.contains("if self._auth_transport:\n            return set()"),
                 "{out}"
             );
+        }
+
+        #[test]
+        fn retry_waits_are_capped_and_error_helper_returns_for_the_caller_to_raise() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                false,
+                false,
+                &[],
+                &crate::graph::RuntimePolicy::default(),
+                false,
+                false,
+            );
+            // An unbounded sleep lets a hostile `Retry-After: 86400` park the caller for a day.
+            assert!(out.contains("MAX_RETRY_DELAY_SECONDS = 60.0"), "{out}");
+            assert!(
+                out.contains("min(float(seconds), MAX_RETRY_DELAY_SECONDS)"),
+                "{out}"
+            );
+            // Transport errors must back off rather than reconnect instantly.
+            assert!(
+                out.contains("time.sleep(self._backoff_delay(attempt))"),
+                "{out}"
+            );
+            // The helper RETURNS the error so each call site can end in an explicit `raise` (the
+            // call sites themselves are asserted in the operations tests). A helper that raised
+            // internally left every operation looking like it fell through, to mypy and to
+            // ruff's RET503.
+            assert!(out.contains(") -> ApiError:"), "{out}");
+            assert!(!out.contains("def _raise("), "{out}");
         }
 
         #[test]

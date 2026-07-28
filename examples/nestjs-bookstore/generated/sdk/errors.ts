@@ -1,14 +1,14 @@
 export interface ApiErrorInit {
-  headers?: Headers;
-  requestId?: string;
-  rawBody?: string;
+  headers?: Headers | undefined;
+  requestId?: string | undefined;
+  rawBody?: string | undefined;
   jsonBody?: unknown;
   body?: unknown;
 }
 
 export class ApiError extends Error {
   public readonly headers: Headers;
-  public readonly requestId?: string;
+  public readonly requestId?: string | undefined;
   public readonly rawBody: string;
   public readonly jsonBody: unknown;
   public readonly body: unknown;
@@ -45,20 +45,20 @@ export type ResponseDecodeFailure =
   "empty_body" | "unexpected_content_type" | "invalid_json";
 
 export interface ResponseDecodeErrorInit {
-  headers?: Headers;
-  requestId?: string;
-  rawBody?: string;
-  expectedContentType?: string;
-  actualContentType?: string;
+  headers?: Headers | undefined;
+  requestId?: string | undefined;
+  rawBody?: string | undefined;
+  expectedContentType?: string | undefined;
+  actualContentType?: string | undefined;
   cause?: unknown;
 }
 
 export class ResponseDecodeError extends Error {
   public readonly headers: Headers;
-  public readonly requestId?: string;
+  public readonly requestId?: string | undefined;
   public readonly rawBody: string;
   public readonly expectedContentType: string;
-  public readonly actualContentType?: string;
+  public readonly actualContentType?: string | undefined;
   public readonly cause?: unknown;
 
   constructor(

@@ -826,6 +826,12 @@ resp, err := c.httpClient.Do(attemptReq)
 if err != nil {{
 lastErr = err
 if attempt < maxRetries {{
+// Back off before reconnecting: retrying a refused connection instantly just multiplies
+// load on a service that is already restarting.
+if waitErr := sleepRetry(attemptReq.Context(), backoffDelay(attempt)); waitErr != nil {{
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
 continue
 }}
 c.callErrorHooks(attemptReq.Context(), ctx, err)
@@ -841,9 +847,12 @@ return nil, err
 }}
 }}
 if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {{
-sleepRetryAfter(resp)
 _, _ = io.Copy(io.Discard, resp.Body)
 _ = resp.Body.Close()
+if err := sleepRetry(attemptReq.Context(), retryDelay(resp, attempt)); err != nil {{
+c.callErrorHooks(attemptReq.Context(), ctx, err)
+return nil, err
+}}
 continue
 }}
 if resp.StatusCode < 200 || resp.StatusCode >= 300 {{
@@ -907,16 +916,57 @@ func shouldRetryStatus(status int, retryStatuses map[int]bool) bool {{
 return retryStatuses[status] || status >= 500
 }}
 
-func sleepRetryAfter(resp *http.Response) {{
-retryAfter := resp.Header.Get(\"Retry-After\")
-if retryAfter == \"\" {{
-return
-}}
+// baseRetryDelay is the first transport-error backoff step; it doubles per attempt up to maxRetryDelay.
+const baseRetryDelay = 100 * time.Millisecond
+
+// maxRetryDelay caps every retry wait, including a server-supplied Retry-After.
+const maxRetryDelay = 60 * time.Second
+
+func retryDelay(resp *http.Response, attempt int) time.Duration {{
+if resp != nil {{
+if retryAfter := resp.Header.Get(\"Retry-After\"); retryAfter != \"\" {{
 seconds, err := strconv.Atoi(retryAfter)
-if err != nil || seconds <= 0 {{
-return
+if err == nil && seconds > 0 {{
+// A server may ask for an arbitrarily long wait. Honour it only up to the ceiling, so a
+// hostile or misconfigured origin cannot park the caller for hours.
+return capRetryDelay(time.Duration(seconds) * time.Second)
 }}
-time.Sleep(time.Duration(seconds) * time.Second)
+}}
+}}
+return backoffDelay(attempt)
+}}
+
+func backoffDelay(attempt int) time.Duration {{
+if attempt < 0 {{
+attempt = 0
+}}
+if attempt > 32 {{
+return maxRetryDelay
+}}
+return capRetryDelay(baseRetryDelay << attempt)
+}}
+
+func capRetryDelay(d time.Duration) time.Duration {{
+if d > maxRetryDelay {{
+return maxRetryDelay
+}}
+return d
+}}
+
+// sleepRetry waits out a retry delay while remaining cancellable: without the ctx arm an aborted
+// or timed-out request still blocks for the full delay before anyone notices.
+func sleepRetry(ctx context.Context, d time.Duration) error {{
+if d <= 0 {{
+return ctx.Err()
+}}
+timer := time.NewTimer(d)
+defer timer.Stop()
+select {{
+case <-ctx.Done():
+return ctx.Err()
+case <-timer.C:
+return nil
+}}
 }}
 "
     );
@@ -4104,6 +4154,29 @@ mod tests {
             assert!(out.contains("\"encoding/json\""), "{out}");
             assert!(out.contains("\"net/http\""), "{out}");
             assert!(out.contains("\"time\""), "{out}");
+        }
+
+        #[test]
+        fn retry_waits_are_capped_and_cancellable() {
+            let out = emit_client(
+                "goalservice",
+                false,
+                false,
+                false,
+                &crate::graph::RuntimePolicy::default(),
+            );
+            // An unbounded time.Sleep lets a hostile `Retry-After: 86400` park the caller for a
+            // day, and a plain Sleep ignores a context that was cancelled 200ms in.
+            assert!(!out.contains("time.Sleep("), "{out}");
+            assert!(out.contains("case <-ctx.Done():"), "{out}");
+            assert!(
+                out.contains("const maxRetryDelay = 60 * time.Second"),
+                "{out}"
+            );
+            assert!(out.contains("func capRetryDelay(d time.Duration)"), "{out}");
+            // Transport errors must back off too; retrying a refused connection instantly just
+            // multiplies load on a service that is already restarting.
+            assert!(out.contains("backoffDelay(attempt)"), "{out}");
         }
 
         #[test]

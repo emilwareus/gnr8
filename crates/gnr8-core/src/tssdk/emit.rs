@@ -456,16 +456,16 @@ fn ts_field_type(field: &Field, graph: &ApiGraph, ns: &str) -> Result<String, Co
 pub(crate) fn emit_errors(_package: &str) -> String {
     "\
 export interface ApiErrorInit {
-  headers?: Headers;
-  requestId?: string;
-  rawBody?: string;
+  headers?: Headers | undefined;
+  requestId?: string | undefined;
+  rawBody?: string | undefined;
   jsonBody?: unknown;
   body?: unknown;
 }
 
 export class ApiError extends Error {
   public readonly headers: Headers;
-  public readonly requestId?: string;
+  public readonly requestId?: string | undefined;
   public readonly rawBody: string;
   public readonly jsonBody: unknown;
   public readonly body: unknown;
@@ -502,20 +502,20 @@ export type ResponseDecodeFailure =
   \"empty_body\" | \"unexpected_content_type\" | \"invalid_json\";
 
 export interface ResponseDecodeErrorInit {
-  headers?: Headers;
-  requestId?: string;
-  rawBody?: string;
-  expectedContentType?: string;
-  actualContentType?: string;
+  headers?: Headers | undefined;
+  requestId?: string | undefined;
+  rawBody?: string | undefined;
+  expectedContentType?: string | undefined;
+  actualContentType?: string | undefined;
   cause?: unknown;
 }
 
 export class ResponseDecodeError extends Error {
   public readonly headers: Headers;
-  public readonly requestId?: string;
+  public readonly requestId?: string | undefined;
   public readonly rawBody: string;
   public readonly expectedContentType: string;
-  public readonly actualContentType?: string;
+  public readonly actualContentType?: string | undefined;
   public readonly cause?: unknown;
 
   constructor(
@@ -677,11 +677,16 @@ interface AuthRequirement {{
   name?: string;
 }}
 
+/** First transport-error backoff step; doubles per attempt up to MAX_RETRY_DELAY_MS. */
+const BASE_RETRY_DELAY_MS = 100;
+/** Ceiling for any retry wait, including a server-supplied Retry-After. */
+const MAX_RETRY_DELAY_MS = 60000;
+
 export class Client {{
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
   private readonly authMode: \"credentials\" | \"transport\";
-  private readonly apiKey?: string;
+  private readonly apiKey?: string | undefined;
   private readonly apiKeys: Record<string, string>;
   private readonly timeoutMs?: number;
   private readonly maxRetries: number;
@@ -691,7 +696,11 @@ export class Client {{
 {bearer_field}{basic_field}
   constructor(opts: ClientOptions) {{
     this.baseUrl = opts.baseUrl.replace(/\\/+$/, \"\");
-    this.fetchFn = opts.fetch ?? fetch;
+    // The global fetch must stay bound to the global object. Stored unbound and then called as
+    // `this.fetchFn(...)`, its receiver becomes the Client and browsers reject it with
+    // \"TypeError: Illegal invocation\". A caller-supplied fetch is left alone — it may be a
+    // method that depends on its own receiver.
+    this.fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.authMode = opts.authMode ?? \"credentials\";
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {{}};
@@ -924,8 +933,9 @@ export class Client {{
       const init: RequestInit = {{
         method,
         headers,
-        body: bodyPayload,
-        signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
+        body: bodyPayload ?? null,
+        signal:
+          signals.length > 1 ? AbortSignal.any(signals) : (signals[0] ?? null),
       }};
       const hookContext: HookContext = {{
         operationId: context.operationId,
@@ -960,6 +970,9 @@ export class Client {{
         }}
         lastError = error;
         if (attempt < retryAttempts) {{
+          // Back off before reconnecting: retrying a refused connection instantly just
+          // multiplies load on a service that is already restarting.
+          await this._sleep(this._backoffDelayMs(attempt), options.signal);
           continue;
         }}
         for (const hook of this.hooks.error) {{
@@ -983,7 +996,13 @@ export class Client {{
         throw error;
       }}
       if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {{
-        await this._sleep(this._retryDelayMs(response));
+        // Release the connection before retrying. An unread body keeps its socket checked out
+        // of the pool until GC, so a retry storm can exhaust the pool.
+        await this._discardBody(response);
+        await this._sleep(
+          this._retryDelayMs(response, attempt),
+          options.signal,
+        );
         continue;
       }}
       if (response.status < 200 || response.status >= 300) {{
@@ -1013,20 +1032,51 @@ export class Client {{
     return this.retryStatuses.has(status) || status >= 500;
   }}
 
-  private _retryDelayMs(response: Response): number {{
-    const retryAfter = response.headers.get(\"Retry-After\");
-    if (retryAfter === null) {{
-      return 0;
+  private async _discardBody(response: Response): Promise<void> {{
+    try {{
+      await response.body?.cancel();
+    }} catch {{
+      // Already consumed or errored; the connection is being torn down either way.
     }}
-    const seconds = Number.parseInt(retryAfter, 10);
-    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
   }}
 
-  private async _sleep(ms: number): Promise<void> {{
+  private _retryDelayMs(response: Response, attempt: number): number {{
+    const retryAfter = response.headers.get(\"Retry-After\");
+    if (retryAfter !== null) {{
+      const seconds = Number.parseInt(retryAfter, 10);
+      if (Number.isFinite(seconds) && seconds > 0) {{
+        // A server may ask for an arbitrarily long wait. Honour it only up to the ceiling,
+        // so a hostile or misconfigured origin cannot park the caller for hours.
+        return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
+      }}
+    }}
+    return this._backoffDelayMs(attempt);
+  }}
+
+  private _backoffDelayMs(attempt: number): number {{
+    return Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  }}
+
+  private async _sleep(ms: number, signal?: AbortSignal): Promise<void> {{
     if (ms <= 0) {{
       return;
     }}
-    await new Promise((resolve) => setTimeout(resolve, ms));
+    if (signal?.aborted === true) {{
+      throw signal.reason ?? new Error(\"request aborted\");
+    }}
+    // The wait must observe cancellation: without this an aborted or timed-out request still
+    // blocks for the full retry delay before anyone notices.
+    await new Promise<void>((resolve, reject) => {{
+      const onAbort = () => {{
+        clearTimeout(timer);
+        reject(signal?.reason ?? new Error(\"request aborted\"));
+      }};
+      const timer = setTimeout(() => {{
+        signal?.removeEventListener(\"abort\", onAbort);
+        resolve();
+      }}, ms);
+      signal?.addEventListener(\"abort\", onAbort, {{ once: true }});
+    }});
   }}
 "
     )
@@ -4392,7 +4442,12 @@ mod tests {
         fn client_uses_fetch_with_an_injectable_transport_and_no_third_party_imports() {
             let out = emit_client("bookstore");
             assert!(out.contains("fetch?: typeof fetch;"), "{out}");
-            assert!(out.contains("this.fetchFn = opts.fetch ?? fetch;"), "{out}");
+            // The global fetch MUST stay bound to the global object: called as a method of Client
+            // an unbound global throws "Illegal invocation" in every browser.
+            assert!(
+                out.contains("this.fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);"),
+                "{out}"
+            );
             assert!(
                 out.contains("  AuthConfigurationError,")
                     && out.contains("  ResponseDecodeError,")
@@ -4403,6 +4458,23 @@ mod tests {
             assert!(!out.contains("axios"), "{out}");
             assert!(!out.contains("node-fetch"), "{out}");
             assert!(!out.contains("@types"), "{out}");
+        }
+
+        #[test]
+        fn retry_releases_the_body_and_waits_cancellably() {
+            let out = emit_client("bookstore");
+            // An unread body keeps its socket checked out of the undici pool until GC, so a
+            // retry storm against a 503 exhausts the pool.
+            assert!(out.contains("await this._discardBody(response);"), "{out}");
+            assert!(out.contains("await response.body?.cancel();"), "{out}");
+            // The wait must observe cancellation and must not honour an unbounded Retry-After.
+            assert!(out.contains("const MAX_RETRY_DELAY_MS = 60000;"), "{out}");
+            assert!(
+                out.contains("Math.min(seconds * 1000, MAX_RETRY_DELAY_MS)"),
+                "{out}"
+            );
+            assert!(out.contains("signal?.addEventListener(\"abort\""), "{out}");
+            assert!(out.contains("this._backoffDelayMs(attempt)"), "{out}");
         }
 
         #[test]
