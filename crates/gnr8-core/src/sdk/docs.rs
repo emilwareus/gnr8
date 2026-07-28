@@ -306,7 +306,7 @@ mod tests {
     use super::SdkDocs;
 
     #[test]
-    fn bool_conversion_preserves_legacy_docs_switch() {
+    fn bool_conversion_maps_true_to_reference_and_false_to_none() {
         assert!(!SdkDocs::from(true).is_none());
         assert!(SdkDocs::from(false).is_none());
     }

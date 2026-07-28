@@ -709,11 +709,11 @@ export class Client {{
   _apiKey(...names: string[]): string | undefined {{
     for (const name of names) {{
       const value = this.apiKeys[name];
-      if (value !== undefined) {{
+      if (value !== undefined && value !== \"\") {{
         return value;
       }}
     }}
-    return this.apiKey;
+    return this.apiKey === \"\" ? undefined : this.apiKey;
   }}
 {bearer_helper}{basic_helper}
   _selectAuthAlternative(
@@ -1381,13 +1381,9 @@ fn emit_ts_auth_selection(
     operation_id: &str,
     alternatives: &[Vec<OperationAuthScheme>],
 ) -> Result<(), CoreError> {
-    if alternatives.is_empty() {
-        writeln!(
-            out,
-            "    const selectedAuth = this._selectAuthAlternative({}, []);",
-            quoted_string_literal(operation_id)
-        )
-        .map_err(sink)?;
+    // An operation with no credentialed alternative reads no credentials, so declaring
+    // `selectedAuth` would leave an unread const that fails `tsc --noUnusedLocals`.
+    if alternatives.is_empty() || alternatives.iter().all(Vec::is_empty) {
         return Ok(());
     }
     writeln!(

@@ -372,12 +372,24 @@ pub(crate) fn operation_security_alternatives(
 }
 
 fn normalized_security_groups(mut groups: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    // Order within an AND group is not semantic — every scheme in it must be satisfied.
     for group in &mut groups {
         group.sort();
         group.dedup();
     }
-    groups.sort();
-    groups.dedup();
+
+    // Order BETWEEN OR alternatives is semantic: a client uses the first alternative it can
+    // satisfy, so declaration order is the author's preference order. Keep it, dropping only
+    // exact repeats. Input order is already deterministic, so sorting would trade the author's
+    // intent for nothing.
+    let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+    groups.retain(|group| seen.insert(group.clone()));
+
+    // The one exception: an empty AND group is the declared "anonymous access is also allowed"
+    // alternative, and every client satisfies it vacuously. Left in place it would shadow every
+    // credentialed alternative and configured credentials would silently never be sent, so it
+    // always sinks to last. `sort_by_key` is stable, so the rest keeps declaration order.
+    groups.sort_by_key(Vec::is_empty);
     groups
 }
 
@@ -1102,6 +1114,65 @@ mod tests {
     }
 
     #[test]
+    fn optional_security_orders_the_anonymous_alternative_last() -> Result<(), crate::CoreError> {
+        // `security: [{}, {ApiKeyAuth: []}]` declares "credentials preferred, anonymous allowed".
+        // The empty group is satisfied by every client, so emitting it first would shadow the
+        // credentialed alternative and a configured API key would never be sent.
+        let graph = ApiGraph {
+            security: vec![SecurityScheme {
+                id: "ApiKeyAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-API-Key".to_string(),
+                global: false,
+            }],
+            security_requirements: vec![
+                SecurityRequirementGroup { schemes: vec![] },
+                SecurityRequirementGroup {
+                    schemes: vec!["ApiKeyAuth".to_string()],
+                },
+            ],
+            ..ApiGraph::default()
+        };
+        let op = Operation {
+            id: "list".to_string(),
+            method: "GET".to_string(),
+            path: "/items".to_string(),
+            handler: "list".to_string(),
+            group: None,
+            middleware: Vec::new(),
+            params: vec![],
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![],
+            security: vec![],
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+
+        let alternatives = operation_auth_alternatives(&graph, &op)?;
+
+        assert_eq!(alternatives.len(), 2);
+        assert!(
+            matches!(
+                alternatives[0].as_slice(),
+                [OperationAuthScheme::ApiKey(scheme)] if scheme.id == "ApiKeyAuth"
+            ),
+            "credentialed alternative must be evaluated first: {alternatives:?}"
+        );
+        assert!(
+            alternatives[1].is_empty(),
+            "anonymous alternative must be last: {alternatives:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn operation_auth_honors_global_and_public_override() -> Result<(), crate::CoreError> {
         let graph = ApiGraph {
             security: vec![SecurityScheme {
@@ -1211,20 +1282,29 @@ mod tests {
         }];
         let alternatives = operation_auth_alternatives(&graph, &op)?;
         assert_eq!(alternatives.len(), 2);
-        assert!(matches!(
-            alternatives[0].as_slice(),
-            [OperationAuthScheme::Http {
-                scheme: HttpAuthScheme::Basic,
-                ..
-            }]
-        ));
-        assert!(matches!(
-            alternatives[1].as_slice(),
-            [OperationAuthScheme::Http {
-                scheme: HttpAuthScheme::Bearer,
-                ..
-            }]
-        ));
+        // Declared Bearer-then-Basic must stay Bearer-then-Basic: the runtime picks the first
+        // satisfiable alternative, so reordering here would silently downgrade a client that
+        // holds both credentials to the author's second choice.
+        assert!(
+            matches!(
+                alternatives[0].as_slice(),
+                [OperationAuthScheme::Http {
+                    scheme: HttpAuthScheme::Bearer,
+                    ..
+                }]
+            ),
+            "{alternatives:?}"
+        );
+        assert!(
+            matches!(
+                alternatives[1].as_slice(),
+                [OperationAuthScheme::Http {
+                    scheme: HttpAuthScheme::Basic,
+                    ..
+                }]
+            ),
+            "{alternatives:?}"
+        );
 
         graph.operation_security[0].alternatives = vec![SecurityRequirementGroup {
             schemes: vec!["BearerAuth".to_string(), "BasicAuth".to_string()],

@@ -26,6 +26,7 @@ type Client struct {
 	defaultHeaders     http.Header
 	apiKey             string
 	apiKeys            map[string]string
+	authTransport      bool
 }
 
 // Option mutates a Client during construction (functional-options pattern).
@@ -192,6 +193,13 @@ func (c *Client) SetAPIKeyHeader(header, key string) {
 		c.apiKeys = map[string]string{}
 	}
 	c.apiKeys[header] = key
+}
+
+// WithTransportAuth delegates authentication to the transport (a signing http.RoundTripper,
+// an authenticating proxy, or a request hook). The client then sends no credential of its own
+// and skips the credential check that would otherwise return *AuthConfigurationError.
+func WithTransportAuth() Option {
+	return func(c *Client) { c.authTransport = true }
 }
 
 // NewClient builds a Client for the given base URL, applying any options. A

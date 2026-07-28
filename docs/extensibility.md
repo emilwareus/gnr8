@@ -1,5 +1,11 @@
 # Research / design: extensibility — many sources, many targets, user-owned parsers & generators
 
+Status: design research. **The type and stage names below are exploratory and are not the shipped
+API** — several (`Service`, `SourceCx`/`TargetCx`, `Capabilities`, `OpenApiSource`, `TypeScriptSdk`,
+`gnr8 add-skill`) were never implemented or ship under different names. For the real public surface
+see [`reference/public-api.md`](reference/public-api.md); for the real trait signatures see
+[`USAGE.md`](USAGE.md).
+
 Companion to [`code-as-config.md`](code-as-config.md). That doc establishes *how* config is code (the
 `.gnr8/` Rust lifecycle crate + host/child model). This doc designs *what that code can compose*: the
 multi-source / multi-target architecture, the extension interfaces a user implements to add their own

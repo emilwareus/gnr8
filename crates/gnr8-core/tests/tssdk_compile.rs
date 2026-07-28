@@ -91,10 +91,14 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     // The `--lib es2022,dom` is LOAD-BEARING: lib.dom.d.ts declares the `fetch` global so the SDK needs
     // no `@types/node` (omit `,dom` → error TS2304: Cannot find name 'fetch', RESEARCH Pitfall 3).
+    // `--noUnusedLocals` is LOAD-BEARING: it is off under plain `--strict`, so without it the gate
+    // stays green while emitting dead locals that any consumer with `noUnusedLocals: true` (common,
+    // and what `tsc --init` scaffolds) cannot compile.
     let mut args: Vec<&str> = vec![
         TSC,
         "--noEmit",
         "--strict",
+        "--noUnusedLocals",
         "--target",
         "es2022",
         "--module",

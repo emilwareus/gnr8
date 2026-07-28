@@ -21,10 +21,12 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...
 	var out TaskList
 	reqURL := c.baseURL + "/tasks"
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "listTasks"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "listTasks"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -96,10 +98,12 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + "/tasks"
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "createTask"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "createTask"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
@@ -170,10 +174,12 @@ func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOptio
 	var out ErrorResponse
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "deleteTask"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "deleteTask"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
@@ -235,10 +241,12 @@ func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) 
 	var out Task
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "getTask"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "getTask"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -313,10 +321,12 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "updateTask"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "updateTask"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {

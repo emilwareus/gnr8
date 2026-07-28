@@ -35,44 +35,29 @@ TDD / verification:
 3. Re-run the claim scan and review links/prerequisite language. No dependency removal is part of this
    item.
 
-## P0.2 — Remove the retired generator coupling
+## P0.2 — Remove the retired generator coupling — DONE
 
-Implementation and tests to delete or simplify:
+The SDK pipeline now has one native configuration, graph, emitter, package structure, and test path.
+Deleted outright: the second Go emitter that produced a foreign-shaped client, the surface/type-alias
+and per-language policy modules, the named-preset module, the SDK-surface comparison oracle, and their
+CLI command, tests, fixtures, and migration guide. The `Compatibility` diagnostic category and the
+serialization back-compat shims went with them.
 
-- `crates/gnr8/src/main.rs`
-- `crates/gnr8/tests/compat_cli.rs`
-- `crates/gnr8-core/src/sdk/profile.rs`
-- `crates/gnr8-core/src/sdk/builtins.rs`
-- `crates/gnr8-core/src/sdk/compat.rs`
-- `crates/gnr8-core/src/sdk/docs.rs`
-- `crates/gnr8-core/src/sdk/go.rs`
-- `crates/gnr8-core/src/sdk/model.rs`
-- `crates/gnr8-core/src/sdk/typescript.rs`
-- `crates/gnr8-core/src/gosdk/mod.rs`
-- `crates/gnr8-core/src/gosdk/emit.rs`
-- `crates/gnr8-core/src/tssdk/mod.rs`
-- `crates/gnr8-core/src/tssdk/emit.rs`
-- `crates/gnr8-core/tests/tssdk_compile.rs`
-- generated examples and snapshots whose `.gnr8` code selects a removed profile
+What remains is the generic, user-owned primitive set: `SdkFileLayout`, `OperationFileSplit`,
+`SdkPackageMetadata`, `SdkDocs`, and the `RenameOperation`/`RenameType` transforms. Rule 0 in
+`CLAUDE.md` states the permanent prohibition, and `make invariants`
+(`scripts/check-invariants.sh`, wired into `make check` and CI) is the standing gate that keeps it
+from creeping back through code, docs, or path names.
 
-Active documentation to remove/update:
+Verification performed:
 
-- `docs/AGENT-USAGE.md`
-- `docs/USAGE.md`
-- the retired migration guide (delete)
-- `docs/guides/nestjs-to-typescript-sdk.md`
-- `docs/sdk-shape-flexibility-research.md`
-
-TDD / verification:
-
-1. Inventory retired ignore files, tool manifests, package conventions, named profiles, scanners,
+1. Inventoried retired ignore files, tool manifests, package conventions, named presets, scanners,
    and their tests.
-2. Remove the retired scanner/config contract, named profiles, profile-specific emitters and options,
-   dependencies, tests, fixtures, snapshots, and migration guide. Keep only generic user-owned
-   surface/layout primitives.
-3. Run focused Rust CLI/core/SDK tests and compile checks.
-4. Repeat the inventory. Governance/audit source documents (`CLAUDE.md`, the supplied audit, and the
-   supplied research note) are evidence rather than product coupling and remain unstaged unless the
+2. Removed them along with the dependent emitters, options, tests, fixtures, and snapshots.
+3. Ran the Rust CLI/core/SDK tests, the generated-SDK compile gates, and example regeneration.
+4. Repeated the inventory, now automated by `make invariants`. Governance/audit source documents
+   (`CLAUDE.md`, the supplied audit, and the supplied research note) are evidence rather than product
+   coupling and remain unstaged unless the
    user explicitly changes their scope; all product code, generated artifacts, tests, and active docs
    must be clean.
 
@@ -164,7 +149,7 @@ TDD / verification:
 Files:
 
 - `crates/gnr8-core/src/gosdk/emit.rs`
-- `crates/gnr8-core/src/gosdk/mod.rs` if shared profile removal changes call sites
+- `crates/gnr8-core/src/gosdk/mod.rs` if the P0.2 removals change call sites
 - `crates/gnr8-core/tests/sdk_compile.rs`
 - `crates/gnr8-core/tests/sdk_pipeline.rs`
 - SDK snapshots and generated Go example outputs

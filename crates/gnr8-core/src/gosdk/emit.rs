@@ -563,6 +563,20 @@ pub(crate) fn emit_client(
     } else {
         ""
     };
+    // Auth can legitimately live in the transport (a signing RoundTripper, an authenticating
+    // proxy, a request hook). Those clients configure no credential here, so the credential
+    // check must be opt-out or they could never issue a request.
+    let has_any_auth = has_api_key_auth || has_bearer_auth || has_basic_auth;
+    let transport_auth_field = if has_any_auth {
+        "authTransport bool\n"
+    } else {
+        ""
+    };
+    let transport_auth_option = if has_any_auth {
+        "\n// WithTransportAuth delegates authentication to the transport (a signing http.RoundTripper,\n// an authenticating proxy, or a request hook). The client then sends no credential of its own\n// and skips the credential check that would otherwise return *AuthConfigurationError.\nfunc WithTransportAuth() Option {\nreturn func(c *Client) { c.authTransport = true }\n}\n"
+    } else {
+        ""
+    };
     let default_timeout = runtime
         .default_timeout_ms
         .map_or_else(|| "30 * time.Second".to_string(), go_duration_ms);
@@ -584,7 +598,7 @@ requestHooks []RequestHook
 responseHooks []ResponseHook
 errorHooks []ErrorHook
 defaultHeaders http.Header
-{api_key_field}{bearer_field}{basic_field}}}
+{api_key_field}{bearer_field}{basic_field}{transport_auth_field}}}
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
@@ -724,6 +738,7 @@ return err
 {api_key_option}
 {bearer_option}
 {basic_option}
+{transport_auth_option}
 
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
@@ -1988,6 +2003,9 @@ fn emit_go_auth_selection(
         return Ok(());
     }
     writeln!(body, "selectedAuth := map[string]bool{{}}").map_err(sink)?;
+    // WithTransportAuth callers carry credentials outside the client, so no alternative is
+    // selected and no credential check runs.
+    writeln!(body, "if !c.authTransport {{").map_err(sink)?;
     for (index, alternative) in alternatives.iter().enumerate() {
         let condition = if alternative.is_empty() {
             "true".to_string()
@@ -2018,6 +2036,7 @@ fn emit_go_auth_selection(
         quoted_string_literal(operation_id)
     )
     .map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
 }
@@ -4074,6 +4093,13 @@ mod tests {
                 secured.contains("func WithBasicAuth(username, password string) Option"),
                 "{secured}"
             );
+            // Credentials can live in the transport; an unsecured client needs no opt-out.
+            assert!(
+                secured.contains("func WithTransportAuth() Option"),
+                "{secured}"
+            );
+            assert!(secured.contains("authTransport bool"), "{secured}");
+            assert!(!out.contains("WithTransportAuth"), "{out}");
             // computed imports.
             assert!(out.contains("\"encoding/json\""), "{out}");
             assert!(out.contains("\"net/http\""), "{out}");

@@ -1269,6 +1269,20 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
+    // Auth can legitimately live in the transport (an authenticating proxy, a custom opener, a
+    // request hook). Those clients configure no credential here, so the credential check must be
+    // opt-out or they could never issue a request.
+    let has_any_auth = has_api_key_auth || has_bearer_auth || has_basic_auth;
+    let transport_auth_init = if has_any_auth {
+        "        auth_transport: bool = False,\n"
+    } else {
+        ""
+    };
+    let transport_auth_field = if has_any_auth {
+        "        self._auth_transport = auth_transport\n"
+    } else {
+        ""
+    };
     let default_timeout = py_timeout_value(runtime.default_timeout_ms);
     let max_retries = runtime.max_retries;
     let retry_statuses = py_retry_status_tuple(runtime);
@@ -1344,14 +1358,14 @@ class Client:
         base_url: str,
         *,
         api_key: Optional[str] = None,
-{auth_init}{bearer_init}{basic_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+{auth_init}{bearer_init}{basic_init}{transport_auth_init}        opener: Optional[urllib.request.OpenerDirector] = None,
         timeout: Optional[float] = {default_timeout},
         max_retries: int = {max_retries},
         hooks: Optional[ClientHooks] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}{bearer_field}{basic_field}        self._opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = opener or urllib.request.build_opener()
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_statuses = {retry_statuses}
@@ -1366,6 +1380,8 @@ class Client:
         alternatives: list[list[dict[str, str]]],
     ) -> set[str]:
         if not alternatives:
+            return set()
+        if self._auth_transport:
             return set()
         for alternative in alternatives:
             satisfied = True
@@ -1834,13 +1850,9 @@ fn emit_py_auth_selection(
     operation_id: &str,
     alternatives: &[Vec<OperationAuthScheme>],
 ) -> Result<(), CoreError> {
-    if alternatives.is_empty() {
-        writeln!(
-            out,
-            "        _selected_auth = self._select_auth_alternative({}, [])",
-            quoted_string_literal(operation_id)
-        )
-        .map_err(sink)?;
+    // An operation with no credentialed alternative reads no credentials, so binding
+    // `_selected_auth` would leave dead scaffolding in every generated method.
+    if alternatives.is_empty() || alternatives.iter().all(Vec::is_empty) {
         return Ok(());
     }
     writeln!(
@@ -2704,7 +2716,8 @@ pub(crate) fn emit_init_with_models(
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
     out.push_str("from .client import Client, ClientHooks, HookContext, RequestOptions\n");
-    out.push_str("from .errors import ApiError\n");
+    // Both error types are raised by generated operations, so both belong in the package barrel.
+    out.push_str("from .errors import ApiError, AuthConfigurationError\n");
 
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
     let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
@@ -2722,6 +2735,7 @@ pub(crate) fn emit_init_with_models(
     out.push_str("    \"HookContext\",\n");
     out.push_str("    \"RequestOptions\",\n");
     out.push_str("    \"ApiError\",\n");
+    out.push_str("    \"AuthConfigurationError\",\n");
     for name in &names {
         let _ = writeln!(out, "    \"{name}\",");
     }
@@ -3584,6 +3598,18 @@ mod tests {
             );
             assert!(out.contains("credential = self._bearer_token"), "{out}");
             assert!(out.contains("credential = self._basic_auth"), "{out}");
+            // Credentials can live in the transport (authenticating proxy, custom opener, request
+            // hook), so the credential check must be opt-out or those clients could never issue a
+            // request.
+            assert!(out.contains("auth_transport: bool = False"), "{out}");
+            assert!(
+                out.contains("self._auth_transport = auth_transport"),
+                "{out}"
+            );
+            assert!(
+                out.contains("if self._auth_transport:\n            return set()"),
+                "{out}"
+            );
         }
 
         #[test]
@@ -3599,7 +3625,13 @@ mod tests {
         fn init_reexports_client_apierror_and_every_model() {
             let out = emit_init(&ops_graph(), "bookstore");
             assert!(out.contains("from .client import Client"), "{out}");
-            assert!(out.contains("from .errors import ApiError"), "{out}");
+            // Both error types are raised by generated operations, so both must be reachable
+            // from the package root rather than only from the private `errors` module.
+            assert!(
+                out.contains("from .errors import ApiError, AuthConfigurationError"),
+                "{out}"
+            );
+            assert!(out.contains("\"AuthConfigurationError\","), "{out}");
             assert!(out.contains("    Book,"), "{out}");
             assert!(out.contains("    CreatedMessage,"), "{out}");
             assert!(out.contains("\"Client\","), "{out}");

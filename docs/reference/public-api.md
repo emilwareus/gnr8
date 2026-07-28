@@ -135,7 +135,6 @@ See [SDK generation](../sdk/generation.md).
 | `gnr8::runner::PROTOCOL_VERSION` | current host/child protocol number |
 | `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph |
 | `gnr8::CoreError` | typed core error enum |
-| `gnr8::sdk::openapi_diff` | exact OpenAPI compare/report APIs |
 | `gnr8::sdk::validate_openapi_artifact` | generated OpenAPI readiness validation |
 
 Prefer the CLI for lifecycle operations. Direct module APIs are useful for custom tooling and tests.
@@ -148,7 +147,8 @@ Prefer the CLI for lifecycle operations. Direct module APIs are useful for custo
 | emit a new artifact format | custom `Target` |
 | normalize already-declared files | custom `PostProcess` or `FormatCommand` |
 | rename a public operation or type | `RenameOperation` or `RenameType` transform |
-| compare OpenAPI documents | `gnr8::sdk::openapi_diff` |
+| ingest an existing OpenAPI document as input | `OpenApi` source |
+| reproduce another generator's SDK surface | nothing — a non-goal (CLAUDE.md rule 0) |
 
 Keep custom stages deterministic, return `CoreError` instead of panicking, and use explicit artifact
 ownership transitions.

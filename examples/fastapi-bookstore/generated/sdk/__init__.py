@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .client import Client, ClientHooks, HookContext, RequestOptions
-from .errors import ApiError
+from .errors import ApiError, AuthConfigurationError
 from .models import (
     Author,
     Book,
@@ -19,6 +19,7 @@ __all__ = [
     "HookContext",
     "RequestOptions",
     "ApiError",
+    "AuthConfigurationError",
     "Author",
     "Book",
     "BookFilters",

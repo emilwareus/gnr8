@@ -5,11 +5,112 @@ it **owns its pipeline end-to-end and stands on its own legs**. Violating any ru
 no matter how convenient. If a task seems to require breaking one of these, STOP and surface it — do
 not work around it.
 
+## 0. gnr8 has exactly one native contract. No annotations. No brownfield. No compatibility modes. Ever.
+
+This rule is absolute and permanent. It is not a current-scope decision that a future milestone can
+revisit, and no amount of user demand, migration convenience, or adoption pressure justifies weakening
+it. **If a task appears to require any of the below, the task is wrong. STOP and surface it.**
+
+gnr8 is a **replacement** for annotation-driven and template-driven API tooling. A replacement that
+speaks its predecessor's dialect is not a replacement — it is a wrapper, and it inherits every
+constraint it was built to escape. The moment gnr8 can be configured to imitate another generator, the
+imitation becomes the contract we are held to, and every future design decision gets litigated against
+someone else's output. That is the failure mode this rule exists to prevent.
+
+### 0.1 Forbidden: reading another tool's annotations or conventions
+
+Never parse, detect, infer from, honor, or branch on any of the following — in any language, in any
+sidecar, in any transform, in any config surface, under any flag:
+
+- **Comment-directive dialects** — swaggo/swag (`// @Summary`, `// @Router`, `// @Param`, …), godoc
+  directive conventions that encode API facts, JSDoc/TSDoc `@openapi` blocks, Python docstring
+  YAML/OpenAPI fragments (apispec, flasgger, drf-yasg, drf-spectacular), Javadoc/springdoc annotations,
+  and any equivalent in any language we may add later.
+- **Third-party schema/validation/annotation libraries** — `@nestjs/swagger` decorators, `zod`,
+  `class-validator`, `class-transformer`, `io-ts`, `typebox`, `joi`, `yup`, `marshmallow`,
+  `attrs`/`cattrs` schema metadata, `go-playground/validator` beyond what the source type itself
+  states, `swaggertype`/`swaggerignore` struct tags, protobuf/gRPC annotation extensions.
+- **Another generator's config, ignore, or manifest files** — `.openapi-generator-ignore`,
+  `.openapi-generator/`, `openapitools.json`, `.swagger-codegen-ignore`, `swagger-codegen.config.json`,
+  oapi-codegen YAML, `.goreleaser`-style sidecars for API shape, or anything of that class.
+- **Another generator's emitted output** — its templates, mustache/handlebars partials, file layout,
+  naming scheme, marker comments, or generated packages (`typescript-axios`, `typescript-fetch`,
+  `go-experimental`, `antihax/optional`, `python-legacy`, …).
+
+The only annotations gnr8 reads are the source language's **own first-class type and routing
+constructs** — Go struct tags that the *language runtime itself* consumes (`json`, `form`, `uri`,
+`header`), Python type hints and native framework signatures, TypeScript types via the language's own
+Compiler API. If a marker exists only because a third-party generator invented it, gnr8 does not know
+it exists.
+
+### 0.2 Forbidden: brownfield / compatibility / migration product surface
+
+gnr8 does not, and will not, offer any feature whose purpose is to make generated output resemble
+something gnr8 did not generate. Concretely, do not implement or reintroduce:
+
+- **Compatibility profiles or presets** of any kind — `SdkProfile`, `--profile`, `.compat()`,
+  "legacy mode", "strict mode vs. loose mode", or per-target policy enums that exist to match another
+  generator's choices (`TsModelPropertyPolicy`, `TsNullablePolicy`, `GoExecuteCompatibility`,
+  `GoRequestBuilderAliases`, `GoQuerySetterArgumentPolicy`, `RequiredPointerConstructorPolicy`, and
+  anything shaped like them).
+- **Alias surfaces that preserve a foreign public name** — `SdkTypeAliases`, `SdkOperationAliases`,
+  `OpenApiSchemaAliases`, `clone_alias`, source-prefix aliasing, duplicate enum-constant spellings
+  emitted "for compatibility", or a second exported symbol for one canonical fact. Renaming is
+  supported (`RenameOperation`, `RenameType`) because it changes the one canonical name. Aliasing is
+  not, because it creates two.
+- **Compatibility oracles and drift reports** — a `compat` CLI command, an SDK-surface extractor/differ,
+  a `Compatibility` diagnostic category, or any comparison of gnr8 output against another tool's output.
+  (Comparing *two OpenAPI documents* is a legitimate, tool-neutral operation; comparing *gnr8's SDK to
+  someone else's SDK* is not.)
+- **Migration guides, fixtures, or examples framed as "drop gnr8 into your existing generator's
+  shoes."** We document how to adopt gnr8, never how to impersonate a predecessor.
+- **"Brownfield" as a product concept.** Importing an OpenAPI document as a `Source` is supported and
+  neutral — that is reading a *spec format*, not another tool's convention. Reshaping gnr8's output to
+  match what some previous tool produced from that document is not.
+
+### 0.3 Vocabulary discipline
+
+Do not introduce `compat`, `compatibility`, `legacy`, `brownfield`, `profile`, or `migration` as names
+for product surface — modules, types, builder methods, CLI flags, diagnostic categories, fixture
+directories, or doc sections. These words are permitted only for:
+
+- **wire/protocol compatibility** between gnr8's own host and child processes (`PROTOCOL_VERSION`,
+  the runner handshake);
+- **serialization stability** of gnr8's own formats; and
+- **historical records** under `.planning/` and `thoughts/`, which are evidence of past decisions and
+  are deliberately left unedited.
+
+If a new name would read as "we support their thing," pick a different name or a different design.
+
+### 0.4 What to do instead
+
+When a user needs a fact that typed source cannot express, or wants a specific public name, the answer
+is always the same single path:
+
+| They want | The answer |
+|---|---|
+| a fact the source cannot express (security schemes, cross-cutting metadata) | a `Transform` in their `.gnr8/` crate (rule 4) |
+| a specific operation or type name | `RenameOperation` / `RenameType` — one canonical name, changed |
+| a specific file layout or package shape | `SdkFileLayout`, `OperationFileSplit`, `SdkPackageMetadata` |
+| an artifact gnr8 does not emit | a custom `Target` |
+| output normalized after generation | a custom `PostProcess` / `FormatCommand` |
+| their old SDK's exact surface preserved | **nothing — that is a non-goal.** Say so plainly. |
+
+The last row is the important one. "We don't do that, and here is the one native way to express what
+you actually need" is the correct and complete answer.
+
+### 0.5 Enforcement
+
+`make invariants` (also run by `make check` and CI) greps active product code and documentation for the
+forbidden vocabulary and foreign-tool identifiers listed above. It is a hard gate, not a warning. If a
+legitimate use trips it, narrow the match or add a documented, justified exception in
+`scripts/check-invariants.sh` — never disable the check.
+
 ## 1. Never couple to another tool's conventions or output format
 
 gnr8 derives API facts from the **source language's own constructs** (Go code, `go/ast`, `go/types`)
 and from **the user's own configuration of our engine** — never from another tool's annotations,
-comments, or formats.
+comments, or formats. Rule 0 is the absolute statement of this; this rule is its day-to-day form.
 
 **FORBIDDEN — do not parse, infer from, detect, or depend on, in any way:**
 - any other tool's directive-style annotations embedded in code comments (e.g. `// @...`-style comment

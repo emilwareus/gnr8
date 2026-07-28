@@ -111,6 +111,8 @@ class Client:
     ) -> set[str]:
         if not alternatives:
             return set()
+        if self._auth_transport:
+            return set()
         for alternative in alternatives:
             satisfied = True
             for requirement in alternative:
@@ -417,7 +419,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
         path = "/orders/"
-        _selected_auth = self._select_auth_alternative("list_orders", [])
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
         if status is not None:
@@ -446,7 +447,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
         path = "/orders/"
-        _selected_auth = self._select_auth_alternative("create_order", [])
         _status, _headers, _raw = self._do(
             "POST",
             path,
@@ -468,7 +468,6 @@ class Client:
 
     def create_order_raw(self, request_options: Optional[RequestOptions] = None) -> Any:
         path = "/orders/raw"
-        _selected_auth = self._select_auth_alternative("create_order_raw", [])
         _status, _headers, _raw = self._do(
             "POST",
             path,
@@ -488,7 +487,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
         path = f"/orders/{urllib.parse.quote(str(order_id), safe='')}"
-        _selected_auth = self._select_auth_alternative("get_order", [])
         _status, _headers, _raw = self._do(
             "GET",
             path,

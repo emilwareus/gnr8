@@ -102,11 +102,11 @@ export class Client {
   _apiKey(...names: string[]): string | undefined {
     for (const name of names) {
       const value = this.apiKeys[name];
-      if (value !== undefined) {
+      if (value !== undefined && value !== "") {
         return value;
       }
     }
-    return this.apiKey;
+    return this.apiKey === "" ? undefined : this.apiKey;
   }
 
   _selectAuthAlternative(
@@ -429,7 +429,6 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
-    const selectedAuth = this._selectAuthAlternative("listBooks", []);
     const searchParams = new URLSearchParams();
     for (const [wireName, wireValue] of wireParameterPairs(
       "genre",
@@ -499,7 +498,6 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.CreatedMessage> {
     let path = `/books/`;
-    const selectedAuth = this._selectAuthAlternative("createBook", []);
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
     const res = await this._request(
@@ -538,7 +536,6 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.BookOrError> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
-    const selectedAuth = this._selectAuthAlternative("getBook", []);
     const searchParams = new URLSearchParams();
     if (fmt !== undefined) {
       for (const [wireName, wireValue] of wireParameterPairs(
@@ -591,7 +588,6 @@ export class Client {
     options?: RequestOptions,
   ): Promise<models.CreatedMessage> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
-    const selectedAuth = this._selectAuthAlternative("updateBook", []);
     const headers: Record<string, string> = {};
     headers["Content-Type"] = "application/json";
     const res = await this._request(

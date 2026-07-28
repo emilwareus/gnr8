@@ -115,6 +115,8 @@ class Client:
     ) -> set[str]:
         if not alternatives:
             return set()
+        if self._auth_transport:
+            return set()
         for alternative in alternatives:
             satisfied = True
             for requirement in alternative:
@@ -423,7 +425,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> ListBooksResponse:
         path = "/books/"
-        _selected_auth = self._select_auth_alternative("list_books", [])
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
         _query.extend(self._parameter_pairs("genre", genre, "form", True))
@@ -455,7 +456,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> CreatedMessage:
         path = "/books/"
-        _selected_auth = self._select_auth_alternative("create_book", [])
         _status, _headers, _raw = self._do(
             "POST",
             path,
@@ -482,7 +482,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> BookOrError:
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
-        _selected_auth = self._select_auth_alternative("get_book", [])
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
         if fmt is not None:
@@ -512,7 +511,6 @@ class Client:
         request_options: Optional[RequestOptions] = None,
     ) -> CreatedMessage:
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
-        _selected_auth = self._select_auth_alternative("update_book", [])
         _status, _headers, _raw = self._do(
             "PUT",
             path,

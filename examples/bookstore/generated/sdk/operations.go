@@ -21,10 +21,12 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...
 	var out BookList
 	reqURL := c.baseURL + "/books"
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "listBooks"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "listBooks"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -96,10 +98,12 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...R
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + "/books"
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "createBook"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "createBook"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, reqBody)
 	if err != nil {
@@ -170,10 +174,12 @@ func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOptio
 	var out ErrorResponse
 	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "deleteBook"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "deleteBook"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "DELETE", reqURL, nil)
 	if err != nil {
@@ -235,10 +241,12 @@ func (c *Client) GetBook(ctx context.Context, id string, opts ...RequestOption) 
 	var out Book
 	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "getBook"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "getBook"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
@@ -313,10 +321,12 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 	reqBody := bytes.NewReader(payload)
 	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
 	selectedAuth := map[string]bool{}
-	if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
-		selectedAuth["ApiKeyAuth"] = true
-	} else {
-		return out, &AuthConfigurationError{OperationID: "updateBook"}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "updateBook"}
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, reqBody)
 	if err != nil {

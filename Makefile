@@ -6,7 +6,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install invariants
 
 # Auto-format the workspace in place.
 fmt:
@@ -135,7 +135,11 @@ examples-check: tsextract-deps
 	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
 	for dir in examples/*/generated; do diff -ru "$$tmp/$$dir" "$$dir"; done
 
+# Enforce CLAUDE.md rule 0: one native contract, no foreign annotation/compatibility coupling.
+invariants:
+	scripts/check-invariants.sh
+
 # Full local gate, mirrors CI.
-check: fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
+check: invariants fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
 
 all: check
