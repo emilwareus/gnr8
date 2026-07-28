@@ -676,4 +676,28 @@ mod tests {
         assert!(security[0]["ApiKeyAuth"].is_array(), "{json}");
         assert!(security[0]["CSRFAuth"].is_array(), "{json}");
     }
+
+    #[test]
+    fn anonymous_security_alternative_emits_an_empty_object() {
+        // `security: [{ApiKeyAuth: []}, {}]` means "credentials preferred, anonymous allowed".
+        // The empty alternative contributes no scheme rows, so it must still survive as `{}` or
+        // the document would claim auth is mandatory while the generated SDKs treat it as
+        // optional.
+        let mut doc = sample_doc();
+        doc.security.push(SecurityRequirement {
+            scheme: None,
+            scopes: vec![],
+            alternative: 1,
+        });
+
+        let json = write(&doc);
+        let security = json["security"].as_array().unwrap();
+        assert_eq!(security.len(), 2, "{json}");
+        assert!(security[0]["ApiKeyAuth"].is_array(), "{json}");
+        assert_eq!(
+            security[1].as_object().map(serde_json::Map::len),
+            Some(0),
+            "{json}"
+        );
+    }
 }
