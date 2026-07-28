@@ -430,27 +430,29 @@ pub(crate) fn check_unique_schema_names(graph: &ApiGraph, target: &str) -> Resul
     Ok(())
 }
 
-/// Reject two schemas whose names collapse to one generated file stem.
+/// Reject two schemas whose per-schema model files would land on one path.
 ///
-/// `UserIDs` and `UserIds` are distinct symbols that both lower to `user_ids`. Only a layout that
-/// derives per-schema filenames from the stem can collide, so this runs there and not for a compact
-/// bundle or an explicit `model_file_template` — both of which name files by other means. Without
-/// it the clash surfaces later as an opaque artifact-ownership error instead of a schema-level one.
-pub(crate) fn check_unique_schema_file_stems(
+/// `UserIDs` and `UserIds` are distinct symbols that both lower to the stem `user_ids`. Checking the
+/// RENDERED file name rather than the stem also covers a `model_file_template`, whose placeholders
+/// (`{schema_snake}`, `{schema_kebab}`) are themselves stem-derived and collide the same way. Only a
+/// split layout writes per-schema files, so a compact bundle is exempt. Without this the clash
+/// surfaces later as a generic duplicate-artifact error instead of a schema-level one.
+pub(crate) fn check_unique_model_file_names(
     graph: &ApiGraph,
     target: &str,
     layout: &SdkFileLayout,
+    default_file_name: impl Fn(&Schema) -> String,
 ) -> Result<(), CoreError> {
-    if !layout.is_split() || layout.model_file_template_ref().is_some() {
+    if !layout.is_split() {
         return Ok(());
     }
-    let mut stems: BTreeMap<String, &str> = BTreeMap::new();
+    let mut names: BTreeMap<String, &str> = BTreeMap::new();
     for schema in &graph.schemas {
-        let stem = file_stem(&schema.name);
-        if let Some(previous) = stems.insert(stem.clone(), schema.name.as_str()) {
+        let file = model_file_name(layout, schema, &default_file_name(schema))?;
+        if let Some(previous) = names.insert(file.clone(), schema.name.as_str()) {
             return Err(CoreError::SdkGen {
                 message: format!(
-                    "{target} schemas '{previous}' and '{}' both map to the file stem '{stem}'; rename one with RenameType, or set model_file_template, so each gets its own file",
+                    "{target} schemas '{previous}' and '{}' both map to the file '{file}'; rename one with RenameType so each gets its own file",
                     schema.name
                 ),
             });
@@ -972,7 +974,7 @@ fn validate_request_body_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_unique_schema_file_stems, check_unique_schema_names, file_stem, http_auth_features,
+        check_unique_model_file_names, check_unique_schema_names, file_stem, http_auth_features,
         operation_auth_alternatives, success_responses_of, ApiKeyLocation, HttpAuthScheme,
         OperationAuthScheme,
     };
@@ -983,7 +985,7 @@ mod tests {
     use crate::sdk::layout::SdkFileLayout;
 
     #[test]
-    fn schemas_that_share_a_file_stem_are_rejected_with_both_names() {
+    fn schemas_that_share_a_model_file_name_are_rejected_with_both_names() {
         // `UserIDs` and `UserIds` are distinct symbols but both lower to `user_ids`. Under a split
         // layout that is two schemas writing one file, which would otherwise surface late as an
         // opaque artifact-ownership error rather than a schema-level one.
@@ -1003,36 +1005,54 @@ mod tests {
             ..ApiGraph::default()
         };
 
+        let go_default =
+            |schema: &crate::graph::Schema| format!("model_{}.go", file_stem(&schema.name));
         let split = SdkFileLayout::split();
-        let result = check_unique_schema_file_stems(&graph, "Go SDK", &split);
+        let result = check_unique_model_file_names(&graph, "Go SDK", &split, go_default);
 
-        assert!(result.is_err(), "colliding stems must be rejected");
+        assert!(result.is_err(), "colliding file names must be rejected");
         let message = result.err().map_or_else(String::new, |err| err.to_string());
         assert!(message.contains("UserIDs"), "{message}");
         assert!(message.contains("UserIds"), "{message}");
-        assert!(message.contains("user_ids"), "{message}");
+        assert!(message.contains("model_user_ids.go"), "{message}");
 
         // Distinct names remain distinct symbols, so the NAME check never rejects them.
         assert!(check_unique_schema_names(&graph, "Go SDK").is_ok());
 
-        // Only a layout that derives filenames from the stem can collide: a compact bundle puts
-        // every model in one file, and an explicit template names files by other means.
-        assert!(
-            check_unique_schema_file_stems(&graph, "Go SDK", &SdkFileLayout::compact()).is_ok()
-        );
-        assert!(check_unique_schema_file_stems(
+        // A compact bundle writes no per-schema file, so it cannot collide.
+        assert!(check_unique_model_file_names(
             &graph,
             "Go SDK",
-            &SdkFileLayout::split().model_file_template("m_{schema_snake}.go"),
+            &SdkFileLayout::compact(),
+            go_default
         )
         .is_ok());
 
-        // Distinct stems stay accepted under the split layout too.
+        // A template is NOT an escape hatch: `{schema_snake}` is the stem, so it collides the same
+        // way. Checking the RENDERED name rather than the stem is what catches this.
+        assert!(check_unique_model_file_names(
+            &graph,
+            "Go SDK",
+            &SdkFileLayout::split().model_file_template("m_{schema_snake}.go"),
+            go_default,
+        )
+        .is_err());
+
+        // A template that does not derive from the stem gives each schema its own file.
+        assert!(check_unique_model_file_names(
+            &graph,
+            "Go SDK",
+            &SdkFileLayout::split().model_file_template("m_{schema}.go"),
+            go_default,
+        )
+        .is_ok());
+
+        // Distinct names stay accepted under the split layout too.
         let ok = ApiGraph {
             schemas: vec![schema("User"), schema("Account")],
             ..ApiGraph::default()
         };
-        assert!(check_unique_schema_file_stems(&ok, "Go SDK", &split).is_ok());
+        assert!(check_unique_model_file_names(&ok, "Go SDK", &split, go_default).is_ok());
     }
 
     #[test]

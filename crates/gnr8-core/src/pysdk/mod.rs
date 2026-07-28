@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_file_stems, check_unique_schema_names, file_stem,
+    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names, file_stem,
     http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
     operation_group_name, validate_sdk_base_path,
 };
@@ -102,7 +102,9 @@ pub(crate) fn generate_files_with_options(
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Python SDK")?;
-    check_unique_schema_file_stems(graph, "Python SDK", layout)?;
+    check_unique_model_file_names(graph, "Python SDK", layout, |schema| {
+        format!("{}.py", file_stem(&schema.name))
+    })?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;
@@ -311,6 +313,19 @@ fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Op
     groups
 }
 
+/// Whether `body` uses `symbol` as a whole identifier (not as part of a longer one).
+fn mentions_symbol(body: &str, symbol: &str) -> bool {
+    let boundary = |ch: char| !ch.is_ascii_alphanumeric() && ch != '_';
+    body.match_indices(symbol).any(|(at, _)| {
+        let before_ok = at == 0 || body[..at].chars().next_back().is_some_and(boundary);
+        let after_ok = body[at + symbol.len()..]
+            .chars()
+            .next()
+            .is_none_or(boundary);
+        before_ok && after_ok
+    })
+}
+
 fn emit_operation_file(
     graph: &ApiGraph,
     package: &str,
@@ -320,6 +335,12 @@ fn emit_operation_file(
     model_module: &str,
     file_name: &str,
 ) -> Result<String, crate::CoreError> {
+    // Render the method bodies FIRST so the import line can follow what is actually emitted.
+    // Deriving it from a hand-maintained list of conditions is how `RequestOptions` came to be used
+    // but never imported, and `Any` to be imported but never used.
+    let methods = emit::emit_operations_with_style(graph, package, base_path, ops, model_style)?;
+    let body = unindent_python_methods(&methods);
+
     let mut out = String::from("from __future__ import annotations\n\n");
     out.push_str("import json\n");
     out.push_str("import urllib.parse\n");
@@ -332,18 +353,22 @@ fn emit_operation_file(
         out.push_str("from collections.abc import Iterator\n");
     }
     // Under a split layout the method signatures live here, not in client.py, so this file needs
-    // the same typing names the compact client would have imported.
-    let mut typing_names = vec!["Any"];
-    if emit::operations_need_parameter_literals(ops) {
-        typing_names.push("Literal");
+    // whichever typing names those signatures use — in ruff/isort order.
+    let typing_names: Vec<&str> = ["Any", "Literal", "Optional", "Union"]
+        .into_iter()
+        .filter(|name| mentions_symbol(&body, name))
+        .collect();
+    if !typing_names.is_empty() {
+        let _ = writeln!(out, "from typing import {}\n", typing_names.join(", "));
     }
-    typing_names.push("Optional");
-    if emit::operations_need_parameter_unions(ops) {
-        typing_names.push("Union");
-    }
-    let _ = writeln!(out, "from typing import {}\n", typing_names.join(", "));
     let prefix = py_relative_prefix(file_name);
-    let _ = writeln!(out, "from {prefix}client import Client");
+    // Every emitted method annotates `request_options: Optional[RequestOptions]`, so the split
+    // module needs the type as well as the client it hangs off.
+    if mentions_symbol(&body, "RequestOptions") {
+        let _ = writeln!(out, "from {prefix}client import Client, RequestOptions");
+    } else {
+        let _ = writeln!(out, "from {prefix}client import Client");
+    }
     let model_refs = emit::client_referenced_models(graph, ops)?;
     if !model_refs.is_empty() {
         let _ = writeln!(out, "from {prefix}{model_module} import (");
@@ -356,8 +381,7 @@ fn emit_operation_file(
     }
     out.push('\n');
 
-    let methods = emit::emit_operations_with_style(graph, package, base_path, ops, model_style)?;
-    out.push_str(&unindent_python_methods(&methods));
+    out.push_str(&body);
     out.push('\n');
     for op in ops {
         let mut methods = vec![emit::operation_method_name(op)];
@@ -410,13 +434,18 @@ fn emit_operation_module_imports(
 ) -> Result<String, crate::CoreError> {
     let files = operation_file_names(layout, graph)?;
     let mut out = String::new();
+    // These imports exist for their side effect: each operation module binds its methods onto
+    // Client. They sit at the bottom of client.py so the module is fully defined first, and the
+    // bound name is deliberately unused — both of which a consumer's linter would flag, so the
+    // generated code says why rather than leaving them to discover it.
+    let suppress = "  # noqa: E402, F401";
     for file in files {
         let module = file.trim_end_matches(".py").replace('/', ".");
         let alias = module.replace('.', "_");
         if let Some((package, leaf)) = module.rsplit_once('.') {
-            let _ = writeln!(out, "from .{package} import {leaf} as _{alias}");
+            let _ = writeln!(out, "from .{package} import {leaf} as _{alias}{suppress}");
         } else {
-            let _ = writeln!(out, "from . import {module} as _{alias}");
+            let _ = writeln!(out, "from . import {module} as _{alias}{suppress}");
         }
     }
     Ok(out)

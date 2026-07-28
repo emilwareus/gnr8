@@ -19,7 +19,7 @@ mod emit;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_file_stems, check_unique_schema_names,
+    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names,
     file_in_dir, file_stem, http_auth_features, model_file_name, operation_file_name,
     operation_group_file_name, operation_group_name, quoted_string_literal, validate_sdk_base_path,
 };
@@ -77,7 +77,9 @@ pub(crate) fn generate_files_with_layout(
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "TypeScript SDK")?;
-    check_unique_schema_file_stems(graph, "TypeScript SDK", layout)?;
+    check_unique_model_file_names(graph, "TypeScript SDK", layout, |schema| {
+        format!("{}.ts", file_stem(&schema.name))
+    })?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;

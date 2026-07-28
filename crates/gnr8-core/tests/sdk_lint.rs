@@ -180,6 +180,44 @@ fn python_sdk_is_ruff_clean() {
         "ruff format --check would reformat the generated Python SDK:\n{fmt_out}{fmt_err}"
     );
 
+    // The split layout moves every method signature out of client.py into api_*.py, which builds
+    // its own imports — so a name used there but imported only by the compact client (RequestOptions,
+    // Union, Literal) is invisible to the check above. Lint that layout too.
+    let split_bundle = gnr8::pysdk::generate_with_layout(
+        &graph,
+        "bookstore",
+        &graph.base_path,
+        &gnr8::sdk::layout::SdkFileLayout::split().operations_per_tag(),
+    )
+    .expect("pysdk::generate_with_layout must succeed");
+    let split_dir = unique_temp_dir("py-split");
+    let split_pkg = split_dir.join("bookstore");
+    std::fs::create_dir_all(&split_pkg).expect("create split package dir");
+    gnr8::sdk::bundle::write_to_dir(&split_bundle, &split_pkg)
+        .expect("materialize split Python SDK");
+    let split_str = split_pkg.to_str().expect("utf-8 path");
+
+    let (split_ok, split_out, split_err) = run(
+        "ruff",
+        &[
+            "check",
+            "--isolated",
+            "--no-cache",
+            "--select",
+            "F,I,UP,E",
+            "--ignore",
+            "UP007,UP045",
+            split_str,
+        ],
+        &split_dir,
+        &[],
+    );
+    assert!(
+        split_ok,
+        "ruff check flagged the split-layout Python SDK:\n{split_out}{split_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&split_dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
