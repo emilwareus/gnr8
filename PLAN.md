@@ -1,9 +1,9 @@
 # gnr8 release-readiness plan
 
 This plan implements every P0 finding in `RELEASE-GAP-ANALYSIS.md` under the clarified invariants in
-`CLAUDE.md`. Commodity dependencies are allowed; generated SDKs remain standard-library-only. Named
-The native gnr8 contract is singular. Missing facts and resources fail
-explicitly instead of entering recovery chains.
+`CLAUDE.md`. Commodity dependencies are allowed; generated SDKs remain standard-library-only. The
+native gnr8 contract is singular: there is one generated surface, and no preset reshapes it to match
+another generator. Missing facts and resources fail explicitly instead of entering recovery chains.
 
 ## Working rules
 

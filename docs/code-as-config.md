@@ -142,10 +142,10 @@ rust-toolchain.toml # (repo root) pin a channel new enough to compile the gnr8 d
 [package]
 name = "gnr8-gen"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 publish = false
 [dependencies]
-gnr8 = "=0.1.22"
+gnr8 = "=<the gnr8 version that scaffolded this>"   # `gnr8 init` writes the exact pin
 [workspace]            # empty => its own workspace, built standalone via --manifest-path
 ```
 
