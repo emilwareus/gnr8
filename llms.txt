@@ -12,8 +12,8 @@ Start here when using gnr8 from an AI coding agent:
 - [Pipeline Configuration](docs/pipeline/configuration.md): `.gnr8/src/main.rs` and custom stages.
 - [Transforms](docs/pipeline/transforms.md): selectors, overrides, security, runtime, pagination, docs.
 - [Sources](docs/extraction/sources.md): Go/Gin, FastAPI, Flask, NestJS, and OpenAPI extraction.
-- [OpenAPI](docs/openapi/generation.md): generation, metadata, aliases, and patches.
-- [SDK Generation](docs/sdk/generation.md): Go, Python, and TypeScript targets/profiles/layouts.
+- [OpenAPI](docs/openapi/generation.md): generation, metadata, and field patches.
+- [SDK Generation](docs/sdk/generation.md): Go, Python, and TypeScript targets and file layouts.
 - [Diagnostics](docs/diagnostics/reference.md): stable codes, categories, gates, and remediation.
 - [Artifacts and CI](docs/operations/artifacts-and-ci.md): ownership, caches, Action, and write safety.
 - [Public API Map](docs/reference/public-api.md): all SDK prelude symbols.

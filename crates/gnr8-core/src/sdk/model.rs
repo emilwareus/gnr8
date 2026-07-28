@@ -8,8 +8,6 @@ use std::collections::BTreeMap;
 use crate::graph::{ApiGraph, PaginationMode, PaginationTermination, RuntimeHookKind, Type};
 use crate::sdk::emit_common::{api_key_credential_names, api_key_header_names};
 use crate::sdk::layout::SdkFileLayout;
-use crate::sdk::profile::SdkProfile;
-use crate::sdk::surface::SdkTypeAliases;
 use crate::CoreError;
 
 /// SDK planning model derived from an [`ApiGraph`].
@@ -27,8 +25,6 @@ pub struct SdkModel {
     pub operations: Vec<SdkOperation>,
     /// Schema/model surface.
     pub schemas: Vec<SdkSchema>,
-    /// Additional compatibility aliases.
-    pub aliases: Vec<SdkAlias>,
     /// Error response plan shared by SDK targets.
     pub errors: SdkErrorPlan,
     /// Runtime behavior policy shared by SDK targets.
@@ -140,15 +136,6 @@ pub enum SdkSchemaKind {
     Union,
     /// Free-form alias.
     Any,
-}
-
-/// Compatibility alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SdkAlias {
-    /// Current canonical symbol.
-    pub canonical: String,
-    /// Additional public symbol.
-    pub alias: String,
 }
 
 /// Shared error response plan.
@@ -295,7 +282,7 @@ impl SdkModel {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Config`] for invalid alias configuration.
+    /// Returns [`CoreError`] when the graph contains SDK facts that cannot be represented.
     #[expect(
         clippy::too_many_lines,
         reason = "builder intentionally assembles the full SDK planning model in one deterministic pass"
@@ -305,8 +292,6 @@ impl SdkModel {
         package: impl Into<String>,
         base_path: impl Into<String>,
         layout: &SdkFileLayout,
-        aliases: &SdkTypeAliases,
-        _profile: &SdkProfile,
     ) -> Result<Self, CoreError> {
         let package = package.into();
         let base_path = base_path.into();
@@ -316,15 +301,6 @@ impl SdkModel {
             api_key_headers,
             api_key_queries,
         });
-        let resolved_aliases = aliases
-            .resolve(graph)?
-            .into_iter()
-            .map(|alias| SdkAlias {
-                canonical: alias.canonical,
-                alias: alias.alias,
-            })
-            .collect();
-
         let mut operations = Vec::with_capacity(graph.operations.len());
         let mut services: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut error_responses = Vec::new();
@@ -435,7 +411,6 @@ impl SdkModel {
                     kind: schema_kind(&schema.body),
                 })
                 .collect(),
-            aliases: resolved_aliases,
             errors: SdkErrorPlan {
                 base_error_type: "ApiError".to_string(),
                 responses: error_responses,
@@ -591,8 +566,6 @@ mod tests {
         Type,
     };
     use crate::sdk::layout::SdkFileLayout;
-    use crate::sdk::profile::SdkProfile;
-    use crate::sdk::surface::SdkTypeAliases;
 
     fn span() -> SourceSpan {
         SourceSpan {
@@ -682,18 +655,14 @@ mod tests {
 
     #[test]
     fn sdk_model_is_deterministic_and_carries_layout_metadata() {
-        let aliases = SdkTypeAliases::new().type_alias("Book", "BookPayload");
         let layout = SdkFileLayout::split().model_dir("models");
-        let profile = SdkProfile::minimal();
-
-        let a = SdkModel::build(&graph(), "books", "/api", &layout, &aliases, &profile).unwrap();
-        let b = SdkModel::build(&graph(), "books", "/api", &layout, &aliases, &profile).unwrap();
+        let a = SdkModel::build(&graph(), "books", "/api", &layout).unwrap();
+        let b = SdkModel::build(&graph(), "books", "/api", &layout).unwrap();
 
         assert_eq!(a, b);
         assert_eq!(a.services[0].name, "Books");
         assert_eq!(a.operations[0].request_schema.as_deref(), Some("Book"));
         assert_eq!(a.schemas[0].kind, SdkSchemaKind::Object);
-        assert_eq!(a.aliases[0].alias, "BookPayload");
         assert_eq!(a.file_plan.model_dir.as_deref(), Some("models"));
     }
 
@@ -704,15 +673,7 @@ mod tests {
             ref_id: "app.Missing".to_string(),
         });
 
-        let err = SdkModel::build(
-            &graph,
-            "books",
-            "/api",
-            &SdkFileLayout::compact(),
-            &SdkTypeAliases::default(),
-            &SdkProfile::minimal(),
-        )
-        .unwrap_err();
+        let err = SdkModel::build(&graph, "books", "/api", &SdkFileLayout::compact()).unwrap_err();
 
         assert!(err.to_string().contains("app.Missing"), "{err}");
     }
@@ -738,15 +699,7 @@ mod tests {
         ];
         graph.operations[0].security = vec!["CSRFAuth".to_string(), "SchoolAuth".to_string()];
 
-        let model = SdkModel::build(
-            &graph,
-            "books",
-            "/api",
-            &SdkFileLayout::compact(),
-            &SdkTypeAliases::default(),
-            &SdkProfile::minimal(),
-        )
-        .unwrap();
+        let model = SdkModel::build(&graph, "books", "/api", &SdkFileLayout::compact()).unwrap();
 
         assert_eq!(
             model.auth.unwrap().api_key_headers,
@@ -756,15 +709,7 @@ mod tests {
 
     #[test]
     fn sdk_model_carries_error_runtime_and_docs_boundaries() {
-        let model = SdkModel::build(
-            &graph(),
-            "books",
-            "/api",
-            &SdkFileLayout::compact(),
-            &SdkTypeAliases::default(),
-            &SdkProfile::minimal(),
-        )
-        .unwrap();
+        let model = SdkModel::build(&graph(), "books", "/api", &SdkFileLayout::compact()).unwrap();
 
         assert_eq!(model.errors.base_error_type, "ApiError");
         assert_eq!(model.errors.responses.len(), 1);

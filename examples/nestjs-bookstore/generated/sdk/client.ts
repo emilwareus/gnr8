@@ -1,11 +1,17 @@
-import { ApiError } from "./errors";
+import {
+  ApiError,
+  AuthConfigurationError,
+  ResponseDecodeError,
+} from "./errors";
 import * as models from "./models";
 
 export interface RequestOptions {
   timeoutMs?: number;
   maxRetries?: number;
   idempotencyKey?: string;
+  headers?: Record<string, string>;
   metadata?: Record<string, string>;
+  signal?: AbortSignal;
 }
 
 export interface HookContext {
@@ -41,6 +47,7 @@ export interface ClientHooks {
 export interface ClientOptions {
   baseUrl: string;
   fetch?: typeof fetch;
+  authMode?: "credentials" | "transport";
   apiKey?: string;
   apiKeys?: Record<string, string>;
   timeoutMs?: number;
@@ -55,20 +62,43 @@ interface RuntimeRequestContext {
   idempotencyKeyHeader?: string;
 }
 
+interface AuthRequirement {
+  schemeId: string;
+  kind: "apiKey" | "bearer" | "basic";
+  name?: string;
+}
+
+/** First transport-error backoff step; doubles per attempt up to MAX_RETRY_DELAY_MS. */
+const BASE_RETRY_DELAY_MS = 100;
+/**
+ * Ceiling for the TOTAL time spent waiting between retries, including any server-supplied
+ * Retry-After. A per-wait cap alone still lets maxRetries x cap accumulate, so the budget is
+ * spent down across the whole retry sequence and retrying stops once it is exhausted.
+ */
+const MAX_RETRY_DELAY_MS = 60000;
+
 export class Client {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
-  private readonly apiKey?: string;
+  private readonly authMode: "credentials" | "transport";
+  private readonly apiKey?: string | undefined;
   private readonly apiKeys: Record<string, string>;
   private readonly timeoutMs?: number;
   private readonly maxRetries: number;
   private readonly retryStatuses: Set<number>;
   private readonly retryUnsafeMethods: boolean;
   private readonly hooks: Required<ClientHooks>;
+  private readonly bearerToken?: string;
+  private readonly basicAuth?: { username: string; password: string };
 
   constructor(opts: ClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
-    this.fetchFn = opts.fetch ?? fetch;
+    // The global fetch must stay bound to the global object. Stored unbound and then called as
+    // `this.fetchFn(...)`, its receiver becomes the Client and browsers reject it with
+    // "TypeError: Illegal invocation". A caller-supplied fetch is left alone — it may be a
+    // method that depends on its own receiver.
+    this.fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
+    this.authMode = opts.authMode ?? "credentials";
     this.apiKey = opts.apiKey;
     this.apiKeys = opts.apiKeys ?? {};
     this.timeoutMs = opts.timeoutMs ?? 30000;
@@ -85,11 +115,104 @@ export class Client {
   _apiKey(...names: string[]): string | undefined {
     for (const name of names) {
       const value = this.apiKeys[name];
-      if (value !== undefined) {
+      if (value !== undefined && value !== "") {
         return value;
       }
     }
-    return this.apiKey;
+    return this.apiKey === "" ? undefined : this.apiKey;
+  }
+
+  _selectAuthAlternative(
+    operationId: string,
+    alternatives: readonly (readonly AuthRequirement[])[],
+  ): Set<string> {
+    if (alternatives.length === 0) {
+      return new Set<string>();
+    }
+    if (this.authMode === "transport") {
+      return new Set<string>();
+    }
+    for (const alternative of alternatives) {
+      const satisfied = alternative.every((requirement) => {
+        if (requirement.kind === "apiKey") {
+          return (
+            this._apiKey(requirement.schemeId, requirement.name ?? "") !==
+            undefined
+          );
+        }
+        if (requirement.kind === "bearer") {
+          return this.bearerToken !== undefined;
+        }
+        return this.basicAuth !== undefined;
+      });
+      if (satisfied) {
+        return new Set(alternative.map((requirement) => requirement.schemeId));
+      }
+    }
+    throw new AuthConfigurationError(
+      operationId,
+      alternatives.map((alternative) =>
+        alternative.map((requirement) => requirement.schemeId),
+      ),
+    );
+  }
+
+  async _decodeJson<T>(response: Response): Promise<T> {
+    const rawBody = await response.text();
+    const actualContentType = response.headers.get("content-type") ?? undefined;
+    const mediaType =
+      actualContentType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+    const errorInit = {
+      headers: response.headers,
+      requestId: response.headers.get("x-request-id") ?? undefined,
+      rawBody,
+      expectedContentType: "application/json",
+      actualContentType,
+    };
+    if (rawBody.length === 0) {
+      throw new ResponseDecodeError("empty_body", response.status, errorInit);
+    }
+    if (mediaType !== "application/json" && !mediaType.endsWith("+json")) {
+      throw new ResponseDecodeError(
+        "unexpected_content_type",
+        response.status,
+        errorInit,
+      );
+    }
+    try {
+      return JSON.parse(rawBody) as T;
+    } catch (cause) {
+      throw new ResponseDecodeError("invalid_json", response.status, {
+        ...errorInit,
+        cause,
+      });
+    }
+  }
+
+  async _readErrorBody(
+    response: Response,
+  ): Promise<{ rawBody: string; jsonBody: unknown }> {
+    const rawBody = await response.text();
+    if (rawBody.length === 0) {
+      return { rawBody, jsonBody: null };
+    }
+    const actualContentType =
+      response.headers
+        .get("content-type")
+        ?.split(";", 1)[0]
+        ?.trim()
+        .toLowerCase() ?? "";
+    if (
+      actualContentType !== "application/json" &&
+      !actualContentType.endsWith("+json")
+    ) {
+      return { rawBody, jsonBody: null };
+    }
+    try {
+      return { rawBody, jsonBody: JSON.parse(rawBody) as unknown };
+    } catch {
+      return { rawBody, jsonBody: null };
+    }
   }
 
   private _encodeBody(body: unknown): BodyInit | undefined {
@@ -111,7 +234,7 @@ export class Client {
     return JSON.stringify(body);
   }
 
-  private _formBody(body: unknown): URLSearchParams {
+  _formBody(body: unknown): URLSearchParams {
     const params = new URLSearchParams();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -130,7 +253,7 @@ export class Client {
     return params;
   }
 
-  private _multipartBody(body: unknown): FormData {
+  _multipartBody(body: unknown): FormData {
     const form = new FormData();
     for (const [key, value] of Object.entries(
       body as Record<string, unknown>,
@@ -177,6 +300,7 @@ export class Client {
     const context = requestContext ?? { operationId: "", pathTemplate: path };
     const url = `${this.baseUrl}${path}`;
     const requestMetadata = options.metadata ?? {};
+    Object.assign(headers, options.headers ?? {});
     if (context.idempotent === true && options.idempotencyKey !== undefined) {
       headers[context.idempotencyKeyHeader ?? "Idempotency-Key"] =
         options.idempotencyKey;
@@ -191,6 +315,7 @@ export class Client {
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
     const bodyPayload = this._encodeBody(body);
     let lastError: unknown = undefined;
+    let retryBudgetMs = MAX_RETRY_DELAY_MS;
     for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {
       const controller =
         timeoutMs !== undefined && timeoutMs > 0
@@ -200,11 +325,15 @@ export class Client {
         controller === undefined
           ? undefined
           : setTimeout(() => controller.abort(), timeoutMs);
+      const signals = [options.signal, controller?.signal].filter(
+        (signal): signal is AbortSignal => signal !== undefined,
+      );
       const init: RequestInit = {
         method,
         headers,
-        body: bodyPayload,
-        signal: controller?.signal,
+        body: bodyPayload ?? null,
+        signal:
+          signals.length > 1 ? AbortSignal.any(signals) : (signals[0] ?? null),
       };
       const hookContext: HookContext = {
         operationId: context.operationId,
@@ -238,7 +367,15 @@ export class Client {
           clearTimeout(timeoutId);
         }
         lastError = error;
-        if (attempt < retryAttempts) {
+        if (attempt < retryAttempts && retryBudgetMs > 0) {
+          // Back off before reconnecting: retrying a refused connection instantly just
+          // multiplies load on a service that is already restarting.
+          const delayMs = Math.min(
+            this._backoffDelayMs(attempt),
+            retryBudgetMs,
+          );
+          retryBudgetMs -= delayMs;
+          await this._waitBeforeRetry(delayMs, options.signal, hookContext);
           continue;
         }
         for (const hook of this.hooks.error) {
@@ -261,13 +398,26 @@ export class Client {
         }
         throw error;
       }
-      if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {
-        await this._sleep(this._retryDelayMs(response));
+      if (
+        this._shouldRetryStatus(response.status) &&
+        attempt < retryAttempts &&
+        retryBudgetMs > 0
+      ) {
+        // Release the connection before retrying. An unread body keeps its socket checked out
+        // of the pool until GC, so a retry storm can exhaust the pool.
+        await this._discardBody(response);
+        const delayMs = Math.min(
+          this._retryDelayMs(response, attempt),
+          retryBudgetMs,
+        );
+        retryBudgetMs -= delayMs;
+        await this._waitBeforeRetry(delayMs, options.signal, hookContext);
         continue;
       }
       if (response.status < 200 || response.status >= 300) {
         const error = new ApiError(response.status, {
           headers: response.headers,
+          requestId: response.headers.get("x-request-id") ?? undefined,
         });
         for (const hook of this.hooks.error) {
           await hook(hookContext, error);
@@ -292,20 +442,68 @@ export class Client {
     return this.retryStatuses.has(status) || status >= 500;
   }
 
-  private _retryDelayMs(response: Response): number {
-    const retryAfter = response.headers.get("Retry-After");
-    if (retryAfter === null) {
-      return 0;
+  private async _discardBody(response: Response): Promise<void> {
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Already consumed or errored; the connection is being torn down either way.
     }
-    const seconds = Number.parseInt(retryAfter, 10);
-    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
   }
 
-  private async _sleep(ms: number): Promise<void> {
+  private _retryDelayMs(response: Response, attempt: number): number {
+    const retryAfter = response.headers.get("Retry-After");
+    if (retryAfter !== null) {
+      const seconds = Number.parseInt(retryAfter, 10);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        // A server may ask for an arbitrarily long wait. Honour it only up to the ceiling,
+        // so a hostile or misconfigured origin cannot park the caller for hours.
+        return Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
+      }
+    }
+    return this._backoffDelayMs(attempt);
+  }
+
+  private _backoffDelayMs(attempt: number): number {
+    return Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  }
+
+  private async _waitBeforeRetry(
+    ms: number,
+    signal: AbortSignal | undefined,
+    hookContext: HookContext,
+  ): Promise<void> {
+    try {
+      await this._sleep(ms, signal);
+    } catch (error) {
+      // Every other failure path notifies the error hooks; an abort landing mid-wait must not
+      // be the one exception, or callers lose the event entirely.
+      for (const hook of this.hooks.error) {
+        await hook(hookContext, error);
+      }
+      throw error;
+    }
+  }
+
+  private async _sleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (ms <= 0) {
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, ms));
+    if (signal?.aborted === true) {
+      throw signal.reason ?? new Error("request aborted");
+    }
+    // The wait must observe cancellation: without this an aborted or timed-out request still
+    // blocks for the full retry delay before anyone notices.
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason ?? new Error("request aborted"));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   async listBooks(
@@ -363,13 +561,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -380,7 +572,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.ListBooksResponse;
+      return await this._decodeJson<models.ListBooksResponse>(res);
     }
     throw new ApiError(res.status);
   }
@@ -406,13 +598,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -423,7 +609,7 @@ export class Client {
       });
     }
     if (res.status === 201) {
-      return (await res.json()) as models.CreatedMessage;
+      return await this._decodeJson<models.CreatedMessage>(res);
     }
     throw new ApiError(res.status);
   }
@@ -464,13 +650,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -481,7 +661,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.BookOrError;
+      return await this._decodeJson<models.BookOrError>(res);
     }
     throw new ApiError(res.status);
   }
@@ -508,13 +688,7 @@ export class Client {
       options,
     );
     if (res.status < 200 || res.status >= 300) {
-      const rawBody = await res.text();
-      let jsonBody: unknown = null;
-      try {
-        jsonBody = rawBody ? JSON.parse(rawBody) : null;
-      } catch {
-        jsonBody = null;
-      }
+      const { rawBody, jsonBody } = await this._readErrorBody(res);
       let errorBody: unknown = jsonBody;
       throw new ApiError(res.status, {
         headers: res.headers,
@@ -525,7 +699,7 @@ export class Client {
       });
     }
     if (res.status === 200) {
-      return (await res.json()) as models.CreatedMessage;
+      return await this._decodeJson<models.CreatedMessage>(res);
     }
     throw new ApiError(res.status);
   }

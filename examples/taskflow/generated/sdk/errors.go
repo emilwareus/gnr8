@@ -2,6 +2,7 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -28,6 +29,36 @@ func (e *APIError) Error() string {
 // IsNotFound reports whether the error is a 404.
 func (e *APIError) IsNotFound() bool {
 	return e.StatusCode == 404
+}
+
+// ErrorStatusCode returns the HTTP status carried by an APIError, or zero for
+// non-HTTP errors.
+func ErrorStatusCode(err error) int {
+	var apiError *APIError
+	if errors.As(err, &apiError) {
+		return apiError.StatusCode
+	}
+	return 0
+}
+
+// ErrorRawBody returns the response body carried by an APIError, or nil for
+// non-HTTP errors. The returned bytes are a copy and may be modified by the caller.
+func ErrorRawBody(err error) []byte {
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
+		return nil
+	}
+	return append([]byte(nil), apiError.RawBody...)
+}
+
+// AuthConfigurationError reports that no configured credential set satisfies an operation.
+type AuthConfigurationError struct {
+	OperationID string
+}
+
+// Error implements the error interface.
+func (e *AuthConfigurationError) Error() string {
+	return fmt.Sprintf("sdk: no configured credentials satisfy operation %s", e.OperationID)
 }
 
 func apiErrorObject(body any) map[string]any {

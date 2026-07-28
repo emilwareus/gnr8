@@ -3,7 +3,7 @@
 This guide is for coding agents using gnr8 inside an application repository. It is not contributor
 guidance for the gnr8 repository.
 
-For task-scoped reference pages covering every command, source, transform, target, compatibility
+For task-scoped reference pages covering every command, source, transform, target, contract
 gate, diagnostic, and CI behavior, start at the [agent documentation index](agents/index.md).
 
 ## What gnr8 Does
@@ -80,9 +80,9 @@ Common changes:
 - Change `SetBasePath` when the API is mounted under a prefix.
 - Change `SetTitle` for OpenAPI `info.title`.
 - Add `ApplySecurity::api_key(...)` for header API-key auth.
-- Add `RenameOperation` or `RenameType` for compatibility.
+- Add `RenameOperation` or `RenameType` when the desired public contract needs a deliberate name.
 - Add `ApiOverrides::new().json_request_body(...)`, `.form_request_body(...)`, or
-  `.multipart_request_body(...)` when the source graph is missing a legacy request body shape.
+  `.multipart_request_body(...)` when the source graph is missing an explicit request body fact.
 - Change target output paths to keep generated files under `generated/` or `sdk/`.
 
 ## Source-Specific Notes
@@ -123,7 +123,7 @@ Pipeline::new()
 ```
 
 Request-body creation helpers create or replace `op.request_body`, set the content type, and default to
-required. Chain `.optional()` immediately after a typed body helper when the legacy body is optional.
+required. Chain `.optional()` immediately after a typed body helper when the body is optional.
 Plain `.request_body(method, path).optional()` remains requiredness-only for an existing body.
 
 ```rust
@@ -134,12 +134,11 @@ ApiOverrides::new()
     .multipart_request_body("POST", "/files/upload", "UploadFileRequest");
 ```
 
-OpenAPI target patch helpers are available when generator replacement needs small schema-level polish:
+OpenAPI target patch helpers are available for schema-level presentation:
 
 ```rust
 OpenApi31::new()
     .to("generated/openapi.yaml")
-    .schema_aliases(OpenApiSchemaAliases::new().clone_alias("Book", "LegacyBook"))
     .schema_patch(
         OpenApiSchemaPatch::new("Book").field(
             OpenApiFieldPatch::new("status")

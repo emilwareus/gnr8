@@ -33,11 +33,6 @@ Pipeline::new()
     .target(
         OpenApi31::new()
             .to("generated/openapi.yaml")
-            .schema_aliases(
-                OpenApiSchemaAliases::new()
-                    .alias("Book", "BookResponse")
-                    .clone_alias("Book", "LegacyBook"),
-            )
             .schema_patch(
                 OpenApiSchemaPatch::new("Book").field(
                     OpenApiFieldPatch::new("status")
@@ -82,21 +77,6 @@ OpenApiMetadata::new()
     .described_server("https://api.example.com", "production");
 ```
 
-## Schema aliases
-
-```rust
-OpenApiSchemaAliases::new()
-    .alias("CanonicalBook", "Book")
-    .clone_alias("CanonicalBook", "LegacyBook")
-```
-
-- `alias` emits an alias schema that points at the canonical schema with `$ref`.
-- `clone_alias` emits a separate copy of the canonical schema body for consumers that require an
-  independent component shape.
-
-`canonical` must be the exact emitted component key; graph schema IDs are not resolved here. Unknown
-canonical names, alias collisions, and duplicate aliases fail generation.
-
 ## Field patches
 
 Patches are target-specific presentation policy. They do not mutate the graph or other targets.
@@ -112,7 +92,7 @@ Patches are target-specific presentation policy. They do not mutate the graph or
 | Extensions | `extension_string`, `extension_number`, `extension_bool`, `extension_null` |
 
 Every extension name must be an `x-...` key. Use transforms for semantic corrections shared by SDKs;
-use target patches only for OpenAPI-only compatibility polish.
+use target patches only for OpenAPI-specific presentation.
 
 ## Generated artifact validation
 

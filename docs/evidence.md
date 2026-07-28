@@ -15,8 +15,7 @@ the first `.gnr8` build may require crates.io access.
 
 The release-readiness work added or strengthened these executable contracts:
 
-- Third-party generator compatibility profiles, scanners, CLI behavior, tests, and active
-  documentation were removed. gnr8 exposes only its owned native generation surface.
+- gnr8 exposes one owned native configuration, graph, emitter, package structure, and test path.
 - Resource, workspace, helper, and OpenAPI-lowering recovery chains now return explicit diagnostics.
 - Static FastAPI router/Flask blueprint and NestJS controller prefixes are preserved; dynamic or
   ambiguous prefixes are diagnosed instead of guessed.

@@ -57,7 +57,6 @@ See [Sources and extraction](../extraction/sources.md).
 | `SetEnumOrder` | choose one enum's member order |
 | `EnumOrder` | lexical, source, or explicit enum-order policy |
 | `GroupOperations` | assign SDK operation groups by ordered rules |
-| `SdkOperationAliases` | preserve route-scoped SDK operation name/tag |
 | `DiagnosticPolicy` | deny exact remaining diagnostic codes/categories |
 | `DiagnosticCategory` | stable diagnostic policy/reporting category enum |
 
@@ -69,7 +68,6 @@ See [Transforms and overrides](../pipeline/transforms.md).
 |---|---|
 | `OperationSelector` | reusable exact/prefix/method/middleware/boolean selector |
 | `ApiOverrides` | checked field, parameter, body, response, and security corrections |
-| `QueryParam` | legacy query-only override builder |
 | `RequestParameter` | typed query/header/path/cookie parameter builder |
 | `ParameterOverride` | add-if-missing, correct-existing, or replace semantics |
 | `ResponseOverride` | exact status/body/media response replacement |
@@ -99,7 +97,6 @@ See [Transforms and overrides](../pipeline/transforms.md).
 |---|---|
 | `OpenApi31` | deterministic OpenAPI 3.1 YAML target |
 | `OpenApi31Json` | deterministic pretty OpenAPI 3.1 JSON target |
-| `OpenApiSchemaAliases` | `$ref` or cloned component aliases |
 | `OpenApiSchemaPatch` | collect field patches for one schema |
 | `OpenApiFieldPatch` | constraints, enum order, docs, default/example/extensions for one field |
 
@@ -112,38 +109,15 @@ See [OpenAPI generation](../openapi/generation.md).
 | `GoSdk` | Go client/model/docs/package target |
 | `PySdk` | Python client/model/docs/package target |
 | `TsSdk` | TypeScript client/model/docs/package target |
-| `SdkProfile` | native minimal generated surface preset |
 | `SdkFileLayout` | compact/split files, directories, and templates |
 | `OperationFileSplit` | compact/per-tag/per-endpoint operation layout enum |
 | `SdkDocs` | none/reference generated docs policy |
 | `SdkPackageMetadata` | registry name, version, description, URLs, license, keywords |
-| `SdkTypeAliases` | explicit and source-prefix public type aliases |
 | `SdkModel` | normalized target-facing SDK model built from the graph |
 | `PyModelStyle` | Pydantic v2 or stdlib dataclass model policy |
 | `StaticFiles` | copy exact companion files or included directory trees |
 
 See [SDK generation](../sdk/generation.md).
-
-## Go SDK surface controls
-
-| Symbol | Use |
-|---|---|
-| `RequiredPointerConstructorPolicy` | pointer or value constructor arguments for required pointer fields |
-| `QueryTimeFormat` | default or date-at-midnight/RFC3339 query formatting |
-| `GoRequestBuilderScope` | operation-local or graph-global legacy setters |
-| `GoRequestBuilderAliases` | selected legacy body/query setter aliases |
-| `GoRequestBuilderOperationAliases` | route/operation-scoped alias continuation builder |
-| `GoQuerySetterArgumentPolicy` | typed, `any`, or selectively widened setters |
-| `GoExecuteCompatibility` | preserve selected legacy `Execute` signatures |
-
-## TypeScript SDK surface controls
-
-| Symbol | Use |
-|---|---|
-| `TsModelPropertyPolicy` | strict/OpenAPI-required/legacy-loose optional properties |
-| `TsNullablePolicy` | explicit or omitted nullable unions |
-| `TsResponsePolicy` | generated response return-shape policy |
-| `TsBarrelExports` | star or collision-aware compatibility barrel |
 
 ## Post-processors
 
@@ -161,12 +135,9 @@ See [SDK generation](../sdk/generation.md).
 | `gnr8::runner::PROTOCOL_VERSION` | current host/child protocol number |
 | `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph |
 | `gnr8::CoreError` | typed core error enum |
-| `gnr8::sdk::compat` | Go/Python/TypeScript surface extract/diff/contract APIs |
-| `gnr8::sdk::openapi_compat` | exact OpenAPI compare/report APIs |
 | `gnr8::sdk::validate_openapi_artifact` | generated OpenAPI readiness validation |
 
-Prefer the CLI for compatibility and lifecycle operations. Direct module APIs are useful for custom
-tooling and tests.
+Prefer the CLI for lifecycle operations. Direct module APIs are useful for custom tooling and tests.
 
 ## Choosing the right extension seam
 
@@ -175,8 +146,9 @@ tooling and tests.
 | add/change API meaning for every target | custom `Transform` |
 | emit a new artifact format | custom `Target` |
 | normalize already-declared files | custom `PostProcess` or `FormatCommand` |
-| preserve a legacy SDK name | target alias/profile control |
-| compare released public packages | CLI `compat`, not a generation transform |
+| rename a public operation or type | `RenameOperation` or `RenameType` transform |
+| ingest an existing OpenAPI document as input | `OpenApi` source |
+| reproduce another generator's SDK surface | nothing — a non-goal (CLAUDE.md rule 0) |
 
 Keep custom stages deterministic, return `CoreError` instead of panicking, and use explicit artifact
 ownership transitions.

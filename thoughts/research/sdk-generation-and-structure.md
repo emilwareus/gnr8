@@ -196,7 +196,7 @@ This points toward `.gnr8/` SDK backend code rather than config files.
 
 ## Research Tasks
 
-1. Compare generated Go SDK layouts from Stripe, Speakeasy, OpenAPI Generator, and oapi-codegen.
+1. Compare generated Go SDK layouts from several high-quality public SDKs.
 2. Decide whether Go backend should use flat methods or resource services by default.
 3. Define customization hooks.
 4. Define generated-file ownership boundaries.

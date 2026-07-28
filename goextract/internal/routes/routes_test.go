@@ -210,6 +210,10 @@ func (s Server) Register() {
 	active.Use(s.A.RequireActor())
 	active.GET("/files/:fileId/open", s.H.open)
 	active.POST("/files", s.A.RequireCSRF(), s.H.create)
+	mixed := s.R.Group("/mixed")
+	mixed.GET("/public", s.H.open)
+	mixed.Use(s.A.RequireActor())
+	mixed.GET("/private", s.H.open)
 	s.R.GET("/v1/admin/export/:exportId", s.A.RequireActor(), s.H.export)
 	s.R.Group("/inline", s.A.RequireActiveSchool()).Group("/files", s.A.RequireActor()).GET("/:fileId/open", s.H.open)
 }
@@ -230,6 +234,81 @@ func (Handler) export(*gin.Context) {}
 	assertRouteMiddleware(t, got[routeKey{"POST", "/v1/schools/active/files"}], []string{"RequireActiveSchool", "RequireActor", "RequireCSRF"})
 	assertRouteMiddleware(t, got[routeKey{"GET", "/v1/admin/export/{exportId}"}], []string{"RequireActor"})
 	assertRouteMiddleware(t, got[routeKey{"GET", "/inline/files/{fileId}/open"}], []string{"RequireActiveSchool", "RequireActor"})
+	public := got[routeKey{"GET", "/mixed/public"}]
+	if public.Secured || len(public.Middleware) != 0 {
+		t.Fatalf("middleware registered later must not apply retroactively: %+v", public)
+	}
+	assertRouteMiddleware(t, got[routeKey{"GET", "/mixed/private"}], []string{"RequireActor"})
+}
+
+func TestMiddlewarePropagatesThroughRouterGroupHelperCalls(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteRouteTestFile(t, filepath.Join(dir, "go.mod"), `module example.com/helpermiddleware
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWriteRouteTestFile(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWriteRouteTestFile(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Context struct{}
+type Engine struct{}
+type RouterGroup struct{}
+
+func (e *Engine) Group(string, ...HandlerFunc) *RouterGroup { return nil }
+func (g *RouterGroup) Use(...HandlerFunc) {}
+func (g *RouterGroup) GET(string, ...HandlerFunc) {}
+func (g *RouterGroup) POST(string, ...HandlerFunc) {}
+`)
+	mustWriteRouteTestFile(t, filepath.Join(dir, "app.go"), `package helpermiddleware
+
+import "github.com/gin-gonic/gin"
+
+type Server struct {
+	R *gin.Engine
+}
+
+func (s Server) RequestBudget() gin.HandlerFunc { return nil }
+func (s Server) AuthMiddleware() gin.HandlerFunc { return nil }
+
+func (s Server) Register() {
+	api := s.R.Group("/api")
+	api.Use(s.RequestBudget())
+	s.registerPublic(api)
+	api.Use(s.AuthMiddleware())
+	s.registerAuthenticated(api)
+}
+
+func (s Server) registerPublic(api *gin.RouterGroup) {
+	api.GET("/health", s.health)
+}
+
+func (s Server) registerAuthenticated(api *gin.RouterGroup) {
+	s.registerJobs(api)
+}
+
+func (s Server) registerJobs(api *gin.RouterGroup) {
+	api.POST("/jobs", s.createJob)
+}
+
+func (s Server) health(*gin.Context) {}
+func (s Server) createJob(*gin.Context) {}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load helpermiddleware: %v", err)
+	}
+	got := index(routes.Recognize(res))
+	assertRouteMiddleware(t, got[routeKey{"GET", "/health"}], []string{"RequestBudget"})
+	assertRouteMiddleware(t, got[routeKey{"POST", "/jobs"}], []string{"RequestBudget", "AuthMiddleware"})
 }
 
 func mustWriteRouteTestFile(t *testing.T, path string, body string) {

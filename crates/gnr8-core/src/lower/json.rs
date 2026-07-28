@@ -96,15 +96,18 @@ fn write_security(security: &[SecurityRequirement]) -> Value {
                 alternatives.push((req.alternative, Map::new()));
                 alternatives.len() - 1
             });
-        alternatives[index].1.insert(
-            req.scheme.clone(),
-            Value::Array(
-                req.scopes
-                    .iter()
-                    .map(|scope| Value::String(scope.clone()))
-                    .collect(),
-            ),
-        );
+        // `None` is the anonymous alternative: the object exists but stays empty.
+        if let Some(scheme) = &req.scheme {
+            alternatives[index].1.insert(
+                scheme.clone(),
+                Value::Array(
+                    req.scopes
+                        .iter()
+                        .map(|scope| Value::String(scope.clone()))
+                        .collect(),
+                ),
+            );
+        }
     }
     Value::Array(
         alternatives
@@ -540,7 +543,7 @@ mod tests {
             },
             servers: Vec::new(),
             security: vec![SecurityRequirement {
-                scheme: "ApiKeyAuth".to_string(),
+                scheme: Some("ApiKeyAuth".to_string()),
                 scopes: vec![],
                 alternative: 0,
             }],
@@ -662,7 +665,7 @@ mod tests {
     fn security_entries_emit_one_requirement_object() {
         let mut doc = sample_doc();
         doc.security.push(SecurityRequirement {
-            scheme: "CSRFAuth".to_string(),
+            scheme: Some("CSRFAuth".to_string()),
             scopes: vec![],
             alternative: 0,
         });
@@ -672,5 +675,29 @@ mod tests {
         assert_eq!(security.len(), 1, "{json}");
         assert!(security[0]["ApiKeyAuth"].is_array(), "{json}");
         assert!(security[0]["CSRFAuth"].is_array(), "{json}");
+    }
+
+    #[test]
+    fn anonymous_security_alternative_emits_an_empty_object() {
+        // `security: [{ApiKeyAuth: []}, {}]` means "credentials preferred, anonymous allowed".
+        // The empty alternative contributes no scheme rows, so it must still survive as `{}` or
+        // the document would claim auth is mandatory while the generated SDKs treat it as
+        // optional.
+        let mut doc = sample_doc();
+        doc.security.push(SecurityRequirement {
+            scheme: None,
+            scopes: vec![],
+            alternative: 1,
+        });
+
+        let json = write(&doc);
+        let security = json["security"].as_array().unwrap();
+        assert_eq!(security.len(), 2, "{json}");
+        assert!(security[0]["ApiKeyAuth"].is_array(), "{json}");
+        assert_eq!(
+            security[1].as_object().map(serde_json::Map::len),
+            Some(0),
+            "{json}"
+        );
     }
 }

@@ -31,15 +31,10 @@ pub mod builtins;
 pub mod bundle;
 pub mod docs;
 pub(crate) mod emit_common;
-pub mod go;
 pub mod layout;
 pub mod model;
 pub mod model_style;
-pub mod openapi_compat;
 pub(crate) mod openapi_source;
-pub mod profile;
-pub mod surface;
-pub mod typescript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -96,7 +91,6 @@ pub struct Artifact {
     /// The file's full UTF-8 text contents.
     pub text: String,
     /// The target or post-processor that most recently took ownership of this artifact.
-    #[serde(default = "legacy_artifact_producer")]
     pub producer: String,
     /// How the current producer obtained ownership.
     #[serde(default)]
@@ -118,10 +112,6 @@ impl Artifact {
             rewrite_chain: Vec::new(),
         }
     }
-}
-
-fn legacy_artifact_producer() -> String {
-    "legacy-bundle".to_string()
 }
 
 /// The explicit operation through which an artifact's current producer obtained ownership.
@@ -301,21 +291,6 @@ impl Artifacts {
             })?;
         self.replace_at(index, text, ArtifactOwnership::Rewritten);
         Ok(())
-    }
-
-    /// Compatibility alias for callers migrating from the old API. It now has create-only semantics
-    /// and can never silently replace an existing path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::ArtifactOwnership`] when another stage already owns `path`.
-    #[deprecated(note = "use create, overlay, or rewrite to make artifact ownership explicit")]
-    pub fn write(
-        &mut self,
-        path: impl Into<String>,
-        text: impl Into<String>,
-    ) -> Result<(), CoreError> {
-        self.create(path, text)
     }
 
     fn replace_at(&mut self, index: usize, text: String, ownership: ArtifactOwnership) {
@@ -525,12 +500,6 @@ impl Pipeline {
     pub fn post(mut self, p: impl PostProcess + 'static) -> Self {
         self.posts.push(Box::new(p));
         self
-    }
-
-    /// Append a post-write command/hook that rewrites generated artifacts before the host owns them.
-    #[must_use]
-    pub fn post_write(self, p: impl PostProcess + 'static) -> Self {
-        self.post(p)
     }
 
     /// Project-relative output anchors declared by every target in this pipeline.
@@ -1101,22 +1070,15 @@ pub mod prelude {
         ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, DiagnosticPolicy,
         DocumentOperation, EnumOrder, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations,
         Header, MarkIdempotent, NestJs, OpenApi, OpenApi31, OpenApi31Json, OpenApiFieldPatch,
-        OpenApiMetadata, OpenApiSchemaAliases, OpenApiSchemaPatch, OperationSelector,
-        ParameterOverride, PySdk, QueryParam, RenameOperation, RenameType, RequestParameter,
-        ResponseOverride, SdkOperationAliases, SdkPackageMetadata, SecurityOverride, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, StaticFiles,
-        TsSdk,
+        OpenApiMetadata, OpenApiSchemaPatch, OperationSelector, ParameterOverride, PySdk,
+        RenameOperation, RenameType, RequestParameter, ResponseOverride, SdkPackageMetadata,
+        SecurityOverride, SetBasePath, SetEnumOrder, SetOperationSuccessResponse,
+        SetSchemaFieldType, SetTitle, StaticFiles, TsSdk,
     };
     pub use super::docs::SdkDocs;
-    pub use super::go::{
-        GoQuerySetterArgumentPolicy, GoRequestBuilderAliases, GoRequestBuilderOperationAliases,
-    };
     pub use super::layout::{OperationFileSplit, SdkFileLayout};
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
-    pub use super::profile::SdkProfile;
-    pub use super::surface::SdkTypeAliases;
-    pub use super::typescript::{TsModelPropertyPolicy, TsNullablePolicy};
     pub use super::{
         Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
         Target, Transform,

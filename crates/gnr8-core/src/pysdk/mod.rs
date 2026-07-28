@@ -19,13 +19,12 @@ use std::fmt::Write as _;
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_schema_names, file_stem, http_auth_features,
-    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
-    validate_sdk_base_path,
+    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names, file_stem,
+    http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
+    operation_group_name, validate_sdk_base_path,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
-use crate::sdk::surface::SdkTypeAliases;
 
 /// Generate the Python SDK as a deterministic multi-file bundle String (D-06, PYSDK-01).
 ///
@@ -56,7 +55,6 @@ pub fn generate(
         base_path,
         &SdkFileLayout::compact(),
         PyModelStyle::default(),
-        &SdkTypeAliases::default(),
     )
 }
 
@@ -71,32 +69,22 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    generate_with_options(
-        graph,
-        package,
-        base_path,
-        layout,
-        PyModelStyle::default(),
-        &SdkTypeAliases::default(),
-    )
+    generate_with_options(graph, package, base_path, layout, PyModelStyle::default())
 }
 
 /// Generate the Python SDK with configurable file layout and model style.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`generate`], plus configuration errors for invalid compatibility
-/// aliases.
+/// Returns the same errors as [`generate`].
 pub fn generate_with_options(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: &SdkTypeAliases,
 ) -> Result<String, crate::CoreError> {
-    let files =
-        generate_files_with_options(graph, package, base_path, layout, model_style, aliases)?;
+    let files = generate_files_with_options(graph, package, base_path, layout, model_style)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -111,14 +99,15 @@ pub(crate) fn generate_files_with_options(
     base_path: &str,
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
-    aliases: &SdkTypeAliases,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Python SDK")?;
+    check_unique_model_file_names(graph, "Python SDK", layout, |schema| {
+        format!("{}.py", file_stem(&schema.name))
+    })?;
 
     let mut files: Vec<SdkFile> = Vec::new();
     let auth_credentials = api_key_credential_names(graph)?;
-    let resolved_aliases = aliases.resolve(graph)?;
 
     // Fixed sorted push order (alpha): __init__.py, client.py, errors.py, models.py — the D-06 frame
     // order the bundle locks. client.py is the client skeleton followed by the operation methods.
@@ -150,6 +139,7 @@ pub(crate) fn generate_files_with_options(
         &graph.runtime,
         !split_operations && !graph.pagination.is_empty(),
         !split_operations && emit::operations_need_parameter_literals(&ops),
+        !split_operations && emit::operations_need_parameter_unions(&ops),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);
@@ -204,24 +194,7 @@ pub(crate) fn generate_files_with_options(
             ));
             schema_file_names.insert(schema.name.clone(), name);
         }
-        let mut alias_file_names = BTreeMap::new();
-        for alias in &resolved_aliases {
-            let name = crate::sdk::emit_common::file_in_dir(
-                Some(model_dir),
-                &format!("{}.py", file_stem(&alias.alias)),
-            );
-            validate_python_module_file_name(&name)?;
-            model_imports.push((
-                python_relative_module(&model_init_name, &name),
-                alias.alias.clone(),
-            ));
-            alias_file_names.insert(alias.alias.clone(), name);
-        }
-        let model_package_files: Vec<String> = schema_file_names
-            .values()
-            .chain(alias_file_names.values())
-            .cloned()
-            .collect();
+        let model_package_files: Vec<String> = schema_file_names.values().cloned().collect();
         for init in package_init_files(model_package_files.iter().map(String::as_str)) {
             if init != model_init_name {
                 files.push(SdkFile {
@@ -253,39 +226,10 @@ pub(crate) fn generate_files_with_options(
                 contents: emit::emit_model_schema(graph, schema, model_style, &dep_modules)?,
             });
         }
-        for alias in &resolved_aliases {
-            let name = alias_file_names
-                .get(&alias.alias)
-                .ok_or_else(|| crate::CoreError::SdkGen {
-                    message: format!(
-                        "alias {} did not have a precomputed Python file",
-                        alias.alias
-                    ),
-                })?
-                .clone();
-            let canonical = schema_file_names.get(&alias.canonical).ok_or_else(|| {
-                crate::CoreError::SdkGen {
-                    message: format!(
-                        "type alias {} references unknown canonical model {}",
-                        alias.alias, alias.canonical
-                    ),
-                }
-            })?;
-            let canonical_module = python_relative_module(&name, canonical);
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_alias(alias, &canonical_module),
-            });
-        }
     } else {
         files.push(SdkFile {
             name: "models.py".to_string(),
-            contents: emit::emit_models_with_style_and_aliases(
-                graph,
-                package,
-                model_style,
-                &resolved_aliases,
-            )?,
+            contents: emit::emit_models_with_style(graph, package, model_style)?,
         });
     }
 
@@ -369,6 +313,19 @@ fn operation_groups<'op>(ops: &[&'op Operation]) -> BTreeMap<String, Vec<&'op Op
     groups
 }
 
+/// Whether `body` uses `symbol` as a whole identifier (not as part of a longer one).
+fn mentions_symbol(body: &str, symbol: &str) -> bool {
+    let boundary = |ch: char| !ch.is_ascii_alphanumeric() && ch != '_';
+    body.match_indices(symbol).any(|(at, _)| {
+        let before_ok = at == 0 || body[..at].chars().next_back().is_some_and(boundary);
+        let after_ok = body[at + symbol.len()..]
+            .chars()
+            .next()
+            .is_none_or(boundary);
+        before_ok && after_ok
+    })
+}
+
 fn emit_operation_file(
     graph: &ApiGraph,
     package: &str,
@@ -378,6 +335,12 @@ fn emit_operation_file(
     model_module: &str,
     file_name: &str,
 ) -> Result<String, crate::CoreError> {
+    // Render the method bodies FIRST so the import line can follow what is actually emitted.
+    // Deriving it from a hand-maintained list of conditions is how `RequestOptions` came to be used
+    // but never imported, and `Any` to be imported but never used.
+    let methods = emit::emit_operations_with_style(graph, package, base_path, ops, model_style)?;
+    let body = unindent_python_methods(&methods);
+
     let mut out = String::from("from __future__ import annotations\n\n");
     out.push_str("import json\n");
     out.push_str("import urllib.parse\n");
@@ -389,13 +352,23 @@ fn emit_operation_file(
     }) {
         out.push_str("from collections.abc import Iterator\n");
     }
-    if emit::operations_need_parameter_literals(ops) {
-        out.push_str("from typing import Any, Literal, Optional\n\n");
-    } else {
-        out.push_str("from typing import Any, Optional\n\n");
+    // Under a split layout the method signatures live here, not in client.py, so this file needs
+    // whichever typing names those signatures use — in ruff/isort order.
+    let typing_names: Vec<&str> = ["Any", "Literal", "Optional", "Union"]
+        .into_iter()
+        .filter(|name| mentions_symbol(&body, name))
+        .collect();
+    if !typing_names.is_empty() {
+        let _ = writeln!(out, "from typing import {}\n", typing_names.join(", "));
     }
     let prefix = py_relative_prefix(file_name);
-    let _ = writeln!(out, "from {prefix}client import Client");
+    // Every emitted method annotates `request_options: Optional[RequestOptions]`, so the split
+    // module needs the type as well as the client it hangs off.
+    if mentions_symbol(&body, "RequestOptions") {
+        let _ = writeln!(out, "from {prefix}client import Client, RequestOptions");
+    } else {
+        let _ = writeln!(out, "from {prefix}client import Client");
+    }
     let model_refs = emit::client_referenced_models(graph, ops)?;
     if !model_refs.is_empty() {
         let _ = writeln!(out, "from {prefix}{model_module} import (");
@@ -408,8 +381,7 @@ fn emit_operation_file(
     }
     out.push('\n');
 
-    let methods = emit::emit_operations_with_style(graph, package, base_path, ops, model_style)?;
-    out.push_str(&unindent_python_methods(&methods));
+    out.push_str(&body);
     out.push('\n');
     for op in ops {
         let mut methods = vec![emit::operation_method_name(op)];
@@ -462,13 +434,18 @@ fn emit_operation_module_imports(
 ) -> Result<String, crate::CoreError> {
     let files = operation_file_names(layout, graph)?;
     let mut out = String::new();
+    // These imports exist for their side effect: each operation module binds its methods onto
+    // Client. They sit at the bottom of client.py so the module is fully defined first, and the
+    // bound name is deliberately unused — both of which a consumer's linter would flag, so the
+    // generated code says why rather than leaving them to discover it.
+    let suppress = "  # noqa: E402, F401";
     for file in files {
         let module = file.trim_end_matches(".py").replace('/', ".");
         let alias = module.replace('.', "_");
         if let Some((package, leaf)) = module.rsplit_once('.') {
-            let _ = writeln!(out, "from .{package} import {leaf} as _{alias}");
+            let _ = writeln!(out, "from .{package} import {leaf} as _{alias}{suppress}");
         } else {
-            let _ = writeln!(out, "from . import {module} as _{alias}");
+            let _ = writeln!(out, "from . import {module} as _{alias}{suppress}");
         }
     }
     Ok(out)
@@ -823,6 +800,64 @@ mod tests {
         assert!(
             out.contains("from .schemas import ("),
             "__init__.py should re-export from the configured model package:\n{out}"
+        );
+    }
+
+    #[test]
+    fn split_operation_modules_import_union_for_union_typed_params() {
+        // Under a split layout the method signatures move out of client.py into api_*.py, which
+        // builds its own typing import. A union-typed param renders `Union[..]` there, so the
+        // import must follow it across — no committed example has one, so only this covers it.
+        const UNION_PARAM: &[u8] = br#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "list_items",
+              "group": "Items",
+              "params": [
+                {
+                  "name": "size",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "union", "of": [
+                    { "type": "primitive", "of": { "prim": "string" } },
+                    { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } }
+                  ] },
+                  "provenance": { "file": "m.py", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "request_body": null,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "m.py", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "Items API",
+          "security": []
+        }"#;
+
+        let graph: ApiGraph = serde_json::from_slice(UNION_PARAM).expect("graph");
+        let layout = SdkFileLayout::split().operations_per_tag();
+        let bundle =
+            generate_with_layout(&graph, "app", "/", &layout).expect("generate split python sdk");
+        let files = split_bundle(&bundle);
+
+        let (path, contents) = files
+            .iter()
+            .find(|(path, _)| path.starts_with("api_"))
+            .expect("a per-tag operation module");
+        assert!(
+            contents.contains("Union["),
+            "expected a Union hint in {path}: {contents}"
+        );
+        assert!(
+            contents.contains("from typing import Any, Optional, Union"),
+            "Union must be imported where it is used in {path}: {contents}"
         );
     }
 

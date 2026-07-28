@@ -20,12 +20,12 @@ fn toolchain_available() -> bool {
         && Path::new(TSC).is_file()
 }
 
-fn unique_temp_dir() -> PathBuf {
+fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let dir = std::env::temp_dir().join(format!(
-        "gnr8-tssdk-request-wire-{}-{nanos}",
+        "gnr8-tssdk-request-wire-{label}-{}-{nanos}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create request-wire temp dir");
@@ -105,6 +105,81 @@ fn parameter_graph() -> gnr8::graph::ApiGraph {
     .expect("request parameter graph must deserialize")
 }
 
+fn response_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "response.test",
+          "operations": [
+            {
+              "id": "emptyResponse",
+              "method": "GET",
+              "path": "/decode/empty",
+              "handler": "emptyResponse",
+              "params": [],
+              "request_body": null,
+              "responses": [{
+                "status": 200,
+                "body": { "ref_id": "response.Payload" },
+                "body_kind": "json",
+                "content_type": "application/json"
+              }],
+              "provenance": { "file": "response.ts", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "malformedResponse",
+              "method": "GET",
+              "path": "/decode/malformed",
+              "handler": "malformedResponse",
+              "params": [],
+              "request_body": null,
+              "responses": [{
+                "status": 200,
+                "body": { "ref_id": "response.Payload" },
+                "body_kind": "json",
+                "content_type": "application/json"
+              }],
+              "provenance": { "file": "response.ts", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "wrongContentType",
+              "method": "GET",
+              "path": "/decode/content-type",
+              "handler": "wrongContentType",
+              "params": [],
+              "request_body": null,
+              "responses": [{
+                "status": 200,
+                "body": { "ref_id": "response.Payload" },
+                "body_kind": "json",
+                "content_type": "application/json"
+              }],
+              "provenance": { "file": "response.ts", "start_line": 3, "end_line": 3 }
+            }
+          ],
+          "schemas": [{
+            "id": "response.Payload",
+            "name": "Payload",
+            "body": {
+              "type": "object",
+              "of": [{
+                "json_name": "value",
+                "required": true,
+                "optional": false,
+                "nullable": false,
+                "schema": { "type": "primitive", "of": { "prim": "string" } }
+              }]
+            },
+            "provenance": { "file": "response.ts", "start_line": 1, "end_line": 1 }
+          }],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "Response API",
+          "security": []
+        }"#,
+    )
+    .expect("response graph must deserialize")
+}
+
 fn command_output(mut command: Command) -> Result<(), String> {
     let output = command.output().map_err(|error| error.to_string())?;
     if output.status.success() {
@@ -134,8 +209,8 @@ const transport: typeof fetch = async (input, init) => {
     throw new Error(`strict query was not encoded: ${url.search}`);
   }
   if (headers.get("X-Signature") !== "sig") throw new Error("missing signature");
-  if (headers.get("Cookie") !== "session=session%2Fwith%20space%2Bplus") {
-    throw new Error(`wrong cookie: ${headers.get("Cookie")}`);
+  if (headers.has("Cookie")) {
+    throw new Error(`fetch transport emitted a forbidden cookie header`);
   }
   return new Response(null, { status: 204 });
 };
@@ -147,8 +222,98 @@ async function main(): Promise<void> {
     ["active", "pending"],
     "https://example.test/a b+c?x=1",
     "sig",
-    "session/with space+plus",
     "https://strict.test/a?x=1",
+  );
+}
+
+void main().catch((error: unknown) => {
+  console.error(error);
+  throw error;
+});
+"#;
+
+const RESPONSE_DRIVER: &str = r#"import {
+  Client,
+  ResponseDecodeError,
+  type ResponseDecodeFailure,
+} from "./index";
+
+const transport: typeof fetch = async (input) => {
+  const path = new URL(String(input)).pathname;
+  if (path === "/api/decode/empty") {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-request-id": "req-empty",
+      },
+    });
+  }
+  if (path === "/api/decode/malformed") {
+    return new Response("{", {
+      status: 200,
+      headers: {
+        "content-type": "application/problem+json; charset=utf-8",
+        "x-request-id": "req-malformed",
+      },
+    });
+  }
+  if (path === "/api/decode/content-type") {
+    return new Response('{"value":"ok"}', {
+      status: 200,
+      headers: {
+        "content-type": "text/plain",
+        "x-request-id": "req-content-type",
+      },
+    });
+  }
+  throw new Error(`unexpected path: ${path}`);
+};
+
+async function expectDecodeFailure(
+  call: () => Promise<unknown>,
+  failure: ResponseDecodeFailure,
+  rawBody: string,
+  requestId: string,
+): Promise<void> {
+  try {
+    await call();
+  } catch (error) {
+    if (!(error instanceof ResponseDecodeError)) {
+      throw new Error(`unexpected error type: ${String(error)}`);
+    }
+    if (error.failure !== failure) {
+      throw new Error(`failure=${error.failure}`);
+    }
+    if (error.status !== 200) throw new Error(`status=${error.status}`);
+    if (error.rawBody !== rawBody) throw new Error(`rawBody=${error.rawBody}`);
+    if (error.requestId !== requestId) {
+      throw new Error(`requestId=${error.requestId}`);
+    }
+    return;
+  }
+  throw new Error(`expected ${failure}`);
+}
+
+async function main(): Promise<void> {
+  const client = new Client({ baseUrl: "https://api.test", fetch: transport });
+  await expectDecodeFailure(
+    () => client.emptyResponse(),
+    "empty_body",
+    "",
+    "req-empty",
+  );
+  await expectDecodeFailure(
+    () => client.malformedResponse(),
+    "invalid_json",
+    "{",
+    "req-malformed",
+  );
+  await expectDecodeFailure(
+    () => client.wrongContentType(),
+    "unexpected_content_type",
+    '{"value":"ok"}',
+    "req-content-type",
   );
 }
 
@@ -168,7 +333,7 @@ fn generated_typescript_request_parameters_match_the_wire_contract() {
     let graph = parameter_graph();
     let bundle = gnr8::tssdk::generate(&graph, "wireapi", &graph.base_path)
         .expect("generate TypeScript request-wire SDK");
-    let dir = unique_temp_dir();
+    let dir = unique_temp_dir("request");
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
     std::fs::write(dir.join("driver.ts"), DRIVER).expect("write TypeScript driver");
 
@@ -205,6 +370,59 @@ fn generated_typescript_request_parameters_match_the_wire_contract() {
         command_output(run),
         Ok(()),
         "generated TypeScript request-wire driver must pass"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn generated_typescript_response_decoder_reports_stable_context() {
+    if !toolchain_available() {
+        eprintln!("skipping TypeScript response decoder test: node/tsc unavailable");
+        return;
+    }
+
+    let graph = response_graph();
+    let bundle = gnr8::tssdk::generate(&graph, "responseapi", &graph.base_path)
+        .expect("generate TypeScript response SDK");
+    let dir = unique_temp_dir("response");
+    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
+    std::fs::write(dir.join("driver.ts"), RESPONSE_DRIVER).expect("write response driver");
+
+    let mut compile = Command::new("node");
+    compile
+        .args([
+            TSC,
+            "--strict",
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--moduleResolution",
+            "node",
+            "--lib",
+            "es2022,dom",
+            "--outDir",
+            "dist",
+            "client.ts",
+            "errors.ts",
+            "index.ts",
+            "models.ts",
+            "driver.ts",
+        ])
+        .current_dir(&dir);
+    assert_eq!(
+        command_output(compile),
+        Ok(()),
+        "generated TypeScript response driver must compile"
+    );
+
+    let mut run = Command::new("node");
+    run.arg("dist/driver.js").current_dir(&dir);
+    assert_eq!(
+        command_output(run),
+        Ok(()),
+        "generated TypeScript response driver must report stable decode errors"
     );
 
     let _ = std::fs::remove_dir_all(dir);

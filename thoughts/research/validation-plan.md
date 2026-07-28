@@ -36,7 +36,7 @@ Compare against:
 - `swaggo/swag` for code-first annotation workflow.
 - `go-swagger` for Swagger 2.0 workflow.
 - `oapi-codegen` for spec-first Go generation.
-- OpenAPI Generator or another broad SDK generator for multi-language output expectations.
+- High-quality public SDKs for multi-language output expectations.
 
 Metrics:
 

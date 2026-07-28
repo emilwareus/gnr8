@@ -18,6 +18,28 @@ from .models import (
     OrderInput,
 )
 
+#: First transport-error backoff step; doubles per attempt up to the ceiling below.
+BASE_RETRY_DELAY_SECONDS = 0.1
+#: Ceiling for the TOTAL time spent waiting between retries, including any
+#: server-supplied Retry-After. A per-wait cap alone still lets
+#: max_retries x cap accumulate, so the budget is spent down across the whole
+#: retry sequence and retrying stops once it is exhausted.
+MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+def _header_value(headers: dict[str, str], name: str) -> str:
+    """Case-insensitive header lookup.
+
+    HTTP header names are case-insensitive, and the response header mapping
+    keeps whatever casing the server sent, so an exact-match lookup silently
+    misses a spelling like `X-Request-Id`.
+    """
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return ""
+
 
 class RequestOptions:
     """Per-request SDK runtime overrides."""
@@ -274,6 +296,7 @@ class Client:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
         last_error: Optional[BaseException] = None
+        _retry_budget = MAX_RETRY_DELAY_SECONDS
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
@@ -302,8 +325,17 @@ class Client:
                 context.response_headers = response_headers
                 for hook in self._hooks.response:
                     hook(context)
-                if self._should_retry_status(status) and attempt < max_retries:
-                    self._sleep_retry_after(response_headers)
+                if (
+                    self._should_retry_status(status)
+                    and attempt < max_retries
+                    and _retry_budget > 0
+                ):
+                    _delay = min(
+                        self._retry_delay(response_headers, attempt),
+                        _retry_budget,
+                    )
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
@@ -313,13 +345,19 @@ class Client:
                             "",
                             "",
                             headers=response_headers,
+                            request_id=_header_value(response_headers, "X-Request-ID"),
                             raw_body=raw,
                         ),
                     )
                 return status, response_headers, raw
             except urllib.error.URLError as e:
                 last_error = e
-                if attempt < max_retries:
+                if attempt < max_retries and _retry_budget > 0:
+                    # Back off before reconnecting: instant retries just
+                    # multiply load on a service that is already restarting.
+                    _delay = min(self._backoff_delay(attempt), _retry_budget)
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 self._call_error_hooks(context, e)
                 raise
@@ -331,28 +369,40 @@ class Client:
         return status in self._retry_statuses or status >= 500
 
     @staticmethod
-    def _sleep_retry_after(headers: dict[str, str]) -> None:
-        retry_after = headers.get("Retry-After") or headers.get("retry-after")
-        if not retry_after:
-            return
-        try:
-            seconds = int(retry_after)
-        except ValueError:
-            return
-        if seconds > 0:
-            time.sleep(seconds)
+    def _backoff_delay(attempt: int) -> float:
+        # 2 ** attempt is an exact int, so a large attempt count overflows the float
+        # multiply; past the cap the answer is the cap anyway.
+        if attempt >= 32:
+            return MAX_RETRY_DELAY_SECONDS
+        step = BASE_RETRY_DELAY_SECONDS * (2 ** max(attempt, 0))
+        return min(step, MAX_RETRY_DELAY_SECONDS)
+
+    @classmethod
+    def _retry_delay(cls, headers: dict[str, str], attempt: int) -> float:
+        retry_after = _header_value(headers, "Retry-After")
+        if retry_after:
+            try:
+                seconds = int(retry_after)
+            except ValueError:
+                seconds = 0
+            if seconds > 0:
+                # A server may ask for an arbitrarily long wait. Honour it
+                # only up to the ceiling, so a hostile or misconfigured origin
+                # cannot park the caller for hours.
+                return min(float(seconds), MAX_RETRY_DELAY_SECONDS)
+        return cls._backoff_delay(attempt)
 
     def _call_error_hooks(self, context: HookContext, error: BaseException) -> None:
         for hook in self._hooks.error:
             hook(context, error)
 
     @staticmethod
-    def _raise(
+    def _error(
         status: int,
         headers: dict[str, str],
         raw: bytes,
         error_model: Optional[type] = None,
-    ) -> None:
+    ) -> ApiError:
         try:
             json_body = json.loads(raw) if raw else None
         except ValueError:
@@ -364,8 +414,8 @@ class Client:
             except Exception:
                 body = json_body
         decoded = json_body if isinstance(json_body, dict) else {}
-        request_id = headers.get("X-Request-ID") or headers.get("x-request-id", "")
-        raise ApiError(
+        request_id = _header_value(headers, "X-Request-ID")
+        return ApiError(
             status,
             decoded.get("message", ""),
             decoded.get("slug", ""),
@@ -399,11 +449,11 @@ class Client:
             idempotency_key_header="Idempotency-Key",
         )
         if _status < 200 or _status >= 300:
-            self._raise(_status, _headers, _raw)
+            raise self._error(_status, _headers, _raw)
         if _status in (200,):
             _data = json.loads(_raw) if _raw else {}
             return OrderConfirmation.model_validate(_data)
-        self._raise(_status, _headers, _raw)
+        raise self._error(_status, _headers, _raw)
 
     def create_order(
         self,
@@ -424,11 +474,11 @@ class Client:
             idempotency_key_header="Idempotency-Key",
         )
         if _status < 200 or _status >= 300:
-            self._raise(_status, _headers, _raw)
+            raise self._error(_status, _headers, _raw)
         if _status in (201,):
             _data = json.loads(_raw) if _raw else {}
             return OrderConfirmation.model_validate(_data)
-        self._raise(_status, _headers, _raw)
+        raise self._error(_status, _headers, _raw)
 
     def create_order_raw(self, request_options: Optional[RequestOptions] = None) -> Any:
         path = "/orders/raw"
@@ -442,12 +492,12 @@ class Client:
             idempotency_key_header="Idempotency-Key",
         )
         if _status < 200 or _status >= 300:
-            self._raise(_status, _headers, _raw)
+            raise self._error(_status, _headers, _raw)
         return json.loads(_raw) if _raw else None
 
     def get_order(
         self,
-        order_id,
+        order_id: int,
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
         path = f"/orders/{urllib.parse.quote(str(order_id), safe='')}"
@@ -461,8 +511,8 @@ class Client:
             idempotency_key_header="Idempotency-Key",
         )
         if _status < 200 or _status >= 300:
-            self._raise(_status, _headers, _raw)
+            raise self._error(_status, _headers, _raw)
         if _status in (200,):
             _data = json.loads(_raw) if _raw else {}
             return OrderConfirmation.model_validate(_data)
-        self._raise(_status, _headers, _raw)
+        raise self._error(_status, _headers, _raw)

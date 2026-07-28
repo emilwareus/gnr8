@@ -87,7 +87,7 @@ impl Target for ApiMarkdown {
         for op in &ir.operations {
             md.push_str(&format!("| {} | `{}` | {} |\n", op.method, op.path, op.id));
         }
-        out.write(self.path.clone(), md);
+        out.create(self.path.clone(), md)?;
         Ok(())
     }
 }

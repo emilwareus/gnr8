@@ -91,10 +91,16 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 fn run_tsc(ts_files: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
     // The `--lib es2022,dom` is LOAD-BEARING: lib.dom.d.ts declares the `fetch` global so the SDK needs
     // no `@types/node` (omit `,dom` → error TS2304: Cannot find name 'fetch', RESEARCH Pitfall 3).
+    // `--noUnusedLocals` is LOAD-BEARING: it is off under plain `--strict`, so without it the gate
+    // stays green while emitting dead locals that any consumer with `noUnusedLocals: true` (common,
+    // and what `tsc --init` scaffolds) cannot compile.
     let mut args: Vec<&str> = vec![
         TSC,
         "--noEmit",
         "--strict",
+        "--noUnusedLocals",
+        "--exactOptionalPropertyTypes",
+        "--noUncheckedIndexedAccess",
         "--target",
         "es2022",
         "--module",
@@ -292,9 +298,14 @@ fn media_graph() -> gnr8::graph::ApiGraph {
 }
 
 fn materialize_media_sdk() -> PathBuf {
+    use gnr8::sdk::prelude::SdkFileLayout;
+
     let graph = media_graph();
-    let bundle = gnr8::tssdk::generate(&graph, PACKAGE, &graph.base_path)
-        .expect("media tssdk::generate must succeed");
+    let layout = SdkFileLayout::split()
+        .operation_file_template("apis/api_{service_snake}.ts")
+        .model_file_template("models/{schema_snake}.ts");
+    let bundle = gnr8::tssdk::generate_with_layout(&graph, PACKAGE, &graph.base_path, &layout)
+        .expect("split media tssdk::generate_with_layout must succeed");
     let dir = unique_temp_dir("media");
     gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the media SDK");

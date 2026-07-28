@@ -245,7 +245,7 @@ implements one trait and composes into the same pipeline.
 | Path | What |
 |------|------|
 | `crates/gnr8-core/` | the engine: model, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
-| `crates/gnr8/` | the `gnr8` CLI (`init`, `guide`, `generate`, `check`, `inspect`, `compat`, `watch`, `doctor`) |
+| `crates/gnr8/` | the `gnr8` CLI (`init`, `guide`, `generate`, `check`, `inspect`, `watch`, `doctor`) |
 | `goextract/` | the Go frontend that reads Gin source via `go/types` |
 | `examples/bookstore/` | a runnable example + its real generated output (the basic `.gnr8/` lifecycle) |
 | `examples/taskflow/` | a richer example: a custom `Transform` + a custom `Target` (writes `API.md`) in `.gnr8/` |

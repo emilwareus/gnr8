@@ -29,9 +29,6 @@ use crate::CoreError;
 /// parse error or silently-wrong output (forward/back-compat across the boundary).
 pub const PROTOCOL_VERSION: u32 = 3;
 
-/// Backwards-compatible constant name for integrations that previously inspected the bundle version.
-pub const BUNDLE_VERSION: u32 = PROTOCOL_VERSION;
-
 /// Environment variables carried from the host into the generation child.
 pub const HOST_PROTOCOL_ENV: &str = "GNR8_HOST_PROTOCOL_VERSION";
 pub const HOST_VERSION_ENV: &str = "GNR8_HOST_CLI_VERSION";

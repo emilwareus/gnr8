@@ -113,22 +113,17 @@ fn run_goextract_with(
         Command::new(goextract_binary(go_bin)?)
     } else {
         let mut cmd = Command::new(go_bin);
-        // Tests that pass a fake Go binary exercise the legacy `go run` shape so missing-toolchain
-        // categorization stays simple and explicit.
+        // Tests can pass a fake Go binary to exercise missing-toolchain categorization.
         cmd.args(["run", "."]);
         cmd
     };
     let dir = checked_sidecar_dir("goextract", goextract_dir()?)?;
     cmd.arg(target_dir);
-    if route_patterns == schema_patterns {
-        cmd.args(route_patterns);
-    } else {
-        for pattern in route_patterns {
-            cmd.args(["--route-package", pattern]);
-        }
-        for pattern in schema_patterns {
-            cmd.args(["--schema-package", pattern]);
-        }
+    for pattern in route_patterns {
+        cmd.args(["--route-package", pattern]);
+    }
+    for pattern in schema_patterns {
+        cmd.args(["--schema-package", pattern]);
     }
     cmd.current_dir(dir);
     let output = cmd

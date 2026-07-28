@@ -40,8 +40,7 @@ func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, li
 		Severity: severityWarn,
 		Category: categorySchema,
 		Message: "free-form map field: " + structName + "." + fieldName +
-			" (" + goType + ") lowers to additionalProperties: true; downstream generators " +
-			"may mishandle untyped maps (TARGET-API.md §5.1)",
+			" (" + goType + ") lowers to additionalProperties: true (TARGET-API.md §5.1)",
 		File:    file,
 		Line:    line,
 		EndLine: line,

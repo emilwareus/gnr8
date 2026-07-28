@@ -549,6 +549,27 @@ pub struct Response {
     pub content_types: Vec<String>,
 }
 
+impl Response {
+    /// Whether this response contradicts itself by declaring a body on a status that cannot carry
+    /// one.
+    ///
+    /// RFC 9110 gives `204 No Content` no message body. A source annotation or imported contract
+    /// that declares one is ambiguous, and gnr8 rejects ambiguity rather than silently recovering:
+    /// dropping the body in the SDK while the lowered `OpenAPI` kept it would make one graph produce
+    /// two artifacts that describe different contracts. This is the single definition both the SDK
+    /// emitters and the `OpenAPI` lowering consult (CLAUDE.md rule 3).
+    #[must_use]
+    pub fn declares_impossible_body(&self) -> bool {
+        self.status == 204 && self.body.is_some()
+    }
+
+    /// Whether this response carries no message body regardless of what the source declared.
+    #[must_use]
+    pub fn is_status_bodyless(&self) -> bool {
+        self.status == 204
+    }
+}
+
 fn default_response_body_kind() -> String {
     "json".to_string()
 }
@@ -626,8 +647,6 @@ pub enum DiagnosticCategory {
     Override,
     /// An artifact producer or rewrite violated ownership rules.
     Artifact,
-    /// A compatibility comparison found contract drift.
-    Compatibility,
 }
 
 impl From<DiagnosticCategoryFact> for DiagnosticCategory {
@@ -641,7 +660,6 @@ impl From<DiagnosticCategoryFact> for DiagnosticCategory {
             DiagnosticCategoryFact::Security => Self::Security,
             DiagnosticCategoryFact::Override => Self::Override,
             DiagnosticCategoryFact::Artifact => Self::Artifact,
-            DiagnosticCategoryFact::Compatibility => Self::Compatibility,
         }
     }
 }
@@ -1252,7 +1270,7 @@ mod tests {
         let json = serde_json::to_string(ok).unwrap();
         assert!(
             !json.contains("body_kind"),
-            "default json body kind should stay wire-compatible: {json}"
+            "default json body kind should stay wire-identical: {json}"
         );
         assert!(
             !json.contains("content_type"),

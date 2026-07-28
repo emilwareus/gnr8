@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo="${GNR8_REPO:-emilwareus/gnr8}"
 tag="${GNR8_RELEASE_TAG:-latest}"
+local_archive="${GNR8_ARCHIVE:-}"
 install_root="${GNR8_INSTALL_ROOT:-$HOME/.local/gnr8}"
 bin_dir="${GNR8_BIN_DIR:-$HOME/.local/bin}"
 
@@ -31,24 +32,38 @@ else
   base_url="https://github.com/${repo}/releases/download/${tag}"
 fi
 
-if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL "$1" -o "$2"; }
-elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -q "$1" -O "$2"; }
-else
-  echo "gnr8 install: curl or wget is required to download release assets" >&2
-  exit 1
-fi
-
 tmp_dir="$(mktemp -d)"
 cleanup() {
   rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
 
-echo "Downloading ${asset} from ${repo} release ${tag}..."
-fetch "${base_url}/${asset}" "${tmp_dir}/${asset}"
-fetch "${base_url}/${asset}.sha256" "${tmp_dir}/${asset}.sha256"
+if [[ -n "$local_archive" ]]; then
+  if [[ ! -f "$local_archive" ]]; then
+    echo "gnr8 install: local archive does not exist: $local_archive" >&2
+    exit 1
+  fi
+  if [[ ! -f "${local_archive}.sha256" ]]; then
+    echo "gnr8 install: local archive checksum does not exist: ${local_archive}.sha256" >&2
+    exit 1
+  fi
+  echo "Installing local archive ${local_archive}..."
+  cp "$local_archive" "${tmp_dir}/${asset}"
+  cp "${local_archive}.sha256" "${tmp_dir}/${asset}.sha256"
+else
+  if command -v curl >/dev/null 2>&1; then
+    fetch() { curl -fsSL "$1" -o "$2"; }
+  elif command -v wget >/dev/null 2>&1; then
+    fetch() { wget -q "$1" -O "$2"; }
+  else
+    echo "gnr8 install: curl or wget is required to download release assets" >&2
+    exit 1
+  fi
+
+  echo "Downloading ${asset} from ${repo} release ${tag}..."
+  fetch "${base_url}/${asset}" "${tmp_dir}/${asset}"
+  fetch "${base_url}/${asset}.sha256" "${tmp_dir}/${asset}.sha256"
+fi
 
 (
   cd "$tmp_dir"
@@ -79,4 +94,3 @@ case ":$PATH:" in
 esac
 
 "$bin_dir/gnr8" --version
-

@@ -54,10 +54,8 @@ inferred. Where neither the code nor the config can supply a fact, lowering emit
 
 ### 2.2 OpenAPI target version — 3.1.0
 
-The OpenAPI output target is **3.1.0** (JSON-Schema-aligned, modern) (D-04). Lowering must emit a
-**diagnostic** when a graph fact cannot be represented cleanly in OpenAPI (OAPI-03 groundwork).
-OpenAPI 3.0 downstream-generator compatibility is a future concern, behind diagnostics — not PoC
-scope.
+The OpenAPI output target is **3.1.0** (JSON-Schema-aligned, modern) (D-04). Lowering emits a
+**diagnostic** when a graph fact cannot be represented cleanly in that contract.
 
 ### 2.3 Go SDK shape
 

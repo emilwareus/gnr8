@@ -8,14 +8,18 @@ if [[ -z "$archive" || ! -f "$archive" ]]; then
   exit 1
 fi
 archive="$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")"
+root="$(cd "$(dirname "$0")/.." && pwd)"
 
 smoke_root="$(mktemp -d)"
 trap 'rm -rf -- "$smoke_root"' EXIT
 install_root="$smoke_root/install"
 link_root="$smoke_root/local-bin"
 project_root="$smoke_root/project"
-mkdir -p "$install_root" "$link_root" "$project_root"
-tar -xzf "$archive" -C "$install_root"
+mkdir -p "$project_root"
+GNR8_ARCHIVE="$archive" \
+  GNR8_INSTALL_ROOT="$install_root" \
+  GNR8_BIN_DIR="$link_root" \
+  "$root/scripts/install.sh"
 
 binary="$install_root/bin/gnr8"
 if [[ ! -x "$binary" ]]; then
@@ -26,6 +30,8 @@ for required in \
   "$install_root/share/gnr8/Cargo.toml" \
   "$install_root/share/gnr8/crates/gnr8-core/Cargo.toml" \
   "$install_root/share/gnr8/crates/gnr8/Cargo.toml" \
+  "$install_root/share/gnr8/goextract/go.mod" \
+  "$install_root/share/gnr8/tsextract/index.js" \
   "$install_root/share/gnr8/pyextract/__main__.py"; do
   if [[ ! -f "$required" ]]; then
     echo "archive resource missing: $required" >&2
@@ -33,8 +39,6 @@ for required in \
   fi
 done
 
-# Mimic the official installer: expose gnr8 through a PATH symlink, not the real binary path.
-ln -sf "$binary" "$link_root/gnr8"
 export PATH="$link_root:$PATH"
 unset GNR8_RESOURCE_DIR || true
 
@@ -90,12 +94,49 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
-needle = 'PySdk::new().module('
+needle = (
+    '.target(PySdk::new()'
+    '.module("example.com/yourservice/sdk")'
+    '.to("sdk"))'
+)
 if needle not in source:
     raise SystemExit("FastAPI/Python scaffold did not contain the expected PySdk target")
-path.write_text(source.replace(needle, 'PySdk::new().dataclasses().module(', 1), encoding="utf-8")
+targets = """\
+.target(
+                GoSdk::new()
+                    .module("example.com/gnr8/smoke-go")
+                    .layout(SdkFileLayout::split().operations_per_tag())
+                    .to("generated/go"),
+            )
+            .target(
+                PySdk::new()
+                    .dataclasses()
+                    .module("example.com/gnr8/smoke-python")
+                    .to("generated/python"),
+            )
+            .target(
+                TsSdk::new()
+                    .module("@gnr8/smoke-typescript")
+                    .layout(SdkFileLayout::split().operations_per_tag())
+                    .package_metadata(true)
+                    .to("generated/typescript"),
+            )"""
+path.write_text(source.replace(needle, targets, 1), encoding="utf-8")
 PY
+
+  test ! -e generated/go
+  test ! -e generated/python
+  test ! -e generated/typescript
   gnr8 generate
+
+  (cd generated/go && go test ./...)
+  python3 -m compileall -q generated/python
+  (
+    cd generated/typescript
+    npm install --ignore-scripts --no-audit --no-fund
+    npm run build
+  )
+
   if ! gnr8 --json doctor > doctor.json; then
     echo "archive doctor failed:" >&2
     cat doctor.json >&2
@@ -114,4 +155,4 @@ if not report.get("healthy"):
     raise SystemExit(f"archive doctor reported unhealthy: {report}")
 PY
 
-echo "archive smoke passed: symlink install, init, generate, doctor, check"
+echo "archive smoke passed: symlink install, portable init, clean Go/Python/TypeScript generation, SDK builds, doctor, check"

@@ -96,11 +96,50 @@ fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
     );
     text.push_str("## Agent workflow\n\n");
     text.push_str("1. Read `reference.md` in this directory for operation and schema names.\n");
+    // The error type is named per language; a combined "APIError/ApiError" would send half of
+    // readers looking for a symbol their SDK does not export.
+    let error_type = match language {
+        "Go" => "`*APIError`",
+        _ => "`ApiError`",
+    };
+    let construct = match language {
+        "TypeScript" => "2. Construct the generated `Client` with `{ baseUrl }`.\n",
+        _ => "2. Construct the generated `Client` with the service base URL.\n",
+    };
+    text.push_str(construct);
     text.push_str(
-        "2. Construct the generated `Client` with the service base URL.\n\
-         3. Pass typed request models and path/query parameters according to the generated method signatures.\n\
-         4. Handle generated `APIError`/`ApiError` values for non-2xx responses.\n\n",
+        "3. Pass typed request models and path/query parameters according to the generated method signatures.\n",
     );
+    let _ = writeln!(
+        text,
+        "4. Handle generated {error_type} values for non-2xx responses.\n"
+    );
+    // The timeout knob does not bound the same span in every language, and a caller who assumes
+    // it does will size it wrong. Say so where they will read it.
+    let timeout_note = match language {
+        "Go" => concat!(
+            "## Retries and timeouts\n\n",
+            "`WithTimeout` bounds the whole call, including retries and the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Cancelling the context interrupts a retry wait.\n\n"
+        ),
+        "Python" => concat!(
+            "## Retries and timeouts\n\n",
+            "`timeout` bounds each individual attempt, not the whole call: with retries, total ",
+            "wall time can reach `timeout x (max_retries + 1)` plus the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Retry waits are not interruptible.\n\n"
+        ),
+        "TypeScript" => concat!(
+            "## Retries and timeouts\n\n",
+            "`timeoutMs` bounds each individual attempt, not the whole call: with retries, total ",
+            "wall time can reach `timeoutMs x (maxRetries + 1)` plus the waits between them. ",
+            "Total time spent waiting between retries is capped at 60s, so a longer `Retry-After` ",
+            "is honoured only up to that cap. Pass `signal` to interrupt a retry wait.\n\n"
+        ),
+        _ => "",
+    };
+    text.push_str(timeout_note);
     match language {
         "Go" => text.push_str(
             "## Go quick start\n\n\
@@ -117,11 +156,12 @@ fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
              # Call generated methods with typed models from this package.\n\
              ```\n",
         ),
+        // The TypeScript constructor takes a ClientOptions object, not a bare URL string.
         "TypeScript" => text.push_str(
             "## TypeScript quick start\n\n\
              ```typescript\n\
              import { Client } from './client';\n\
-             const client = new Client('https://api.example.com');\n\
+             const client = new Client({ baseUrl: 'https://api.example.com' });\n\
              // Call generated async methods with typed request objects.\n\
              ```\n",
         ),
@@ -306,7 +346,7 @@ mod tests {
     use super::SdkDocs;
 
     #[test]
-    fn bool_conversion_preserves_legacy_docs_switch() {
+    fn bool_conversion_maps_true_to_reference_and_false_to_none() {
         assert!(!SdkDocs::from(true).is_none());
         assert!(SdkDocs::from(false).is_none());
     }

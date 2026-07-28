@@ -3494,6 +3494,9 @@ func (a *Analyzer) addExtractedParameter(
 	route routes.Route,
 	diags *diag.Accumulator,
 ) {
+	if param.Location == "header" && isOpenAPIRepresentationHeader(param.Name) {
+		return
+	}
 	key := param.Location + "/" + param.Name
 	wasResolved := resolved[key]
 	if isResolved {
@@ -3586,6 +3589,16 @@ func (a *Analyzer) addExtractedParameter(
 		)
 	}
 	existing.AllowReserved = existing.AllowReserved || param.AllowReserved
+}
+
+// OpenAPI defines Accept, Content-Type, and Authorization through response/request media types and
+// security schemes. Emitting implementation reads of those headers as ordinary parameters creates a
+// duplicate, contradictory public contract (and Content-Type is explicitly ignored as a Header
+// Parameter by the specification).
+func isOpenAPIRepresentationHeader(name string) bool {
+	return strings.EqualFold(name, "Accept") ||
+		strings.EqualFold(name, "Content-Type") ||
+		strings.EqualFold(name, "Authorization")
 }
 
 func parameterSchemaSpecificity(schema facts.Type) int {

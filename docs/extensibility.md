@@ -1,5 +1,11 @@
 # Research / design: extensibility — many sources, many targets, user-owned parsers & generators
 
+Status: design research. **The type and stage names below are exploratory and are not the shipped
+API** — several (`Service`, `SourceCx`/`TargetCx`, `Capabilities`, `OpenApiSource`, `TypeScriptSdk`,
+`gnr8 add-skill`) were never implemented or ship under different names. For the real public surface
+see [`reference/public-api.md`](reference/public-api.md); for the real trait signatures see
+[`USAGE.md`](USAGE.md).
+
 Companion to [`code-as-config.md`](code-as-config.md). That doc establishes *how* config is code (the
 `.gnr8/` Rust lifecycle crate + host/child model). This doc designs *what that code can compose*: the
 multi-source / multi-target architecture, the extension interfaces a user implements to add their own
@@ -180,7 +186,7 @@ impl Target for PostmanCollection {
     fn capabilities(&self) -> Capabilities { Capabilities::http_only() }
     fn generate(&self, ir: &Service, out: &mut Artifacts, _cx: &TargetCx) -> Result<(), Error> {
         let json = build_postman(ir);                 // your logic
-        out.write(&self.out, json.into_bytes(), Provenance::whole(ir));
+        out.create(&self.out, json)?;
         Ok(())
     }
 }
@@ -237,7 +243,7 @@ represent, say so with provenance — never silently drop.
   points at the source node.
 - `doctor` aggregates these per target; `check` can fail on them if configured in code.
 
-This is the generalization of today's OAPI-03 "report compatibility gaps as diagnostics," made N×M.
+This generalizes OAPI-03 representability diagnostics across every source and target.
 
 ---
 

@@ -100,53 +100,17 @@ TsSdk::new()
 `name` aliases `registry_name`; `keyword` adds one value. Go and Python metadata are enabled by
 default. Calling `.package(...)` enables TypeScript metadata unless explicitly overridden.
 
-## Profiles
-
-```rust
-SdkProfile::minimal()
-```
-
-The minimal profile is gnr8's native generated surface. Configure any intentional public API changes
-with the explicit target controls below.
-
 ## Go target controls
 
 ```rust
 GoSdk::new()
     .module("github.com/acme/books")
     .go_version("1.23")
-    .to("generated/go")
-    .error_model("ApiError")
-    .required_pointer_constructor_policy(
-        RequiredPointerConstructorPolicy::value_param(),
-    )
-    .query_time_format(QueryTimeFormat::date_only_at_midnight_else_rfc3339())
-    .request_builder_scope(GoRequestBuilderScope::operation());
+    .to("generated/go");
 ```
 
-Additional public-surface controls:
-
-- `GoRequestBuilderAliases`: preserve selected body/query setter names by request type, operation ID,
-  or route.
-- `GoQuerySetterArgumentPolicy`: typed, `any`, or selected `any` setters.
-- `GoExecuteCompatibility`: preserve selected legacy `Execute` signatures.
-- `module_path` is an alias for `module`.
-
-```rust
-.request_builder_aliases(
-    GoRequestBuilderAliases::new()
-        .operation("POST", "/books")
-        .body("Book")
-        .operation("GET", "/books")
-        .query("PageSize", "pageSize"),
-)
-.query_setter_argument_policy(
-    GoQuerySetterArgumentPolicy::typed().any_for_queries(["sort", "filter"]),
-)
-.execute_compatibility(
-    GoExecuteCompatibility::preserve_legacy().route("GET", "/books"),
-)
-```
+The generated Go SDK uses one ctx-first typed method surface, functional client options, explicit
+request structs, and graph-derived wire behavior.
 
 ## Python target controls
 
@@ -166,38 +130,11 @@ no-dependency consumers. `PyModelStyle` exposes the same choice when a reusable 
 ```rust
 TsSdk::new()
     .module("@acme/books")
-    .to("generated/typescript")
-    .model_property_policy(TsModelPropertyPolicy::openapi_required())
-    .nullable_policy(TsNullablePolicy::explicit_null())
-    .response_policy(TsResponsePolicy::data_only())
-    .request_body_param_name("body")
-    .init_override_function(true);
+    .to("generated/typescript");
 ```
 
-Policies:
-
-- Model presence: `strict` or `openapi_required`.
-- Nullability: `explicit_null`, `omit_null_from_optional_properties`, `omit_null`.
-- Response: `data_only`.
-- Barrel: `star`.
-
-## Type aliases
-
-Expose old public names without renaming canonical graph schemas:
-
-```rust
-let aliases = SdkTypeAliases::new()
-    .type_alias("Book", "BookResponse")
-    .source_prefix_alias("/transport/", "Transport");
-
-GoSdk::new()
-    .module("github.com/acme/books")
-    .to("generated/go")
-    .aliases(aliases);
-```
-
-Each target also has `.type_alias(schema, alias)` as a one-off shortcut. Missing, ambiguous,
-duplicate, or colliding aliases fail.
+The generated TypeScript SDK preserves graph optionality and nullability exactly and returns decoded
+response data through the native fetch client.
 
 ## Request wire behavior
 

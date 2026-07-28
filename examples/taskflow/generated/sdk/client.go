@@ -3,6 +3,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -22,16 +23,55 @@ type Client struct {
 	requestHooks       []RequestHook
 	responseHooks      []ResponseHook
 	errorHooks         []ErrorHook
+	defaultHeaders     http.Header
 	apiKey             string
 	apiKeys            map[string]string
+	authTransport      bool
 }
 
 // Option mutates a Client during construction (functional-options pattern).
 type Option func(*Client)
 
+// Ptr returns a pointer to value for optional request fields.
+func Ptr[T any](value T) *T {
+	return &value
+}
+
+// MapFrom converts a typed value into its JSON object representation.
+// It is useful when an API models a discriminated configuration body as
+// map[string]any while callers construct one of its typed variants.
+func MapFrom(value any) (map[string]any, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WithHTTPClient overrides the default *http.Client (timeouts, transport, etc.).
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithHeader sets a default header on requests that do not already define it.
+func WithHeader(name, value string) Option {
+	return func(c *Client) { c.defaultHeaders.Set(name, value) }
+}
+
+// SetHeader replaces a default header used by subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) SetHeader(name, value string) {
+	c.defaultHeaders.Set(name, value)
+}
+
+// DeleteHeader removes a default header from subsequent requests.
+// Configure headers before sharing a Client between goroutines.
+func (c *Client) DeleteHeader(name string) {
+	c.defaultHeaders.Del(name)
 }
 
 // WithTimeout sets the client-level default request timeout.
@@ -114,6 +154,17 @@ type runtimeRequestOptions struct {
 	Options              RequestOptions
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *cancelOnCloseReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.cancel()
+	return err
+}
+
 // WithAPIKey sets a fallback API key sent for any configured auth header without a specific key.
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
@@ -129,6 +180,28 @@ func WithAPIKeyHeader(header, key string) Option {
 	}
 }
 
+// SetAPIKey replaces the fallback API key used by subsequent requests.
+// Configure credentials before sharing a Client between goroutines.
+func (c *Client) SetAPIKey(key string) {
+	c.apiKey = key
+}
+
+// SetAPIKeyHeader replaces the API key for one auth header on subsequent requests.
+// Configure credentials before sharing a Client between goroutines.
+func (c *Client) SetAPIKeyHeader(header, key string) {
+	if c.apiKeys == nil {
+		c.apiKeys = map[string]string{}
+	}
+	c.apiKeys[header] = key
+}
+
+// WithTransportAuth delegates authentication to the transport (a signing http.RoundTripper,
+// an authenticating proxy, or a request hook). The client then sends no credential of its own
+// and skips the credential check that would otherwise return *AuthConfigurationError.
+func WithTransportAuth() Option {
+	return func(c *Client) { c.authTransport = true }
+}
+
 // NewClient builds a Client for the given base URL, applying any options. A
 // sensible default *http.Client is used unless WithHTTPClient overrides it.
 func NewClient(baseURL string, opts ...Option) *Client {
@@ -139,6 +212,7 @@ func NewClient(baseURL string, opts ...Option) *Client {
 		maxRetries:         0,
 		retryStatuses:      map[int]bool{408: true, 429: true},
 		retryUnsafeMethods: false,
+		defaultHeaders:     make(http.Header),
 		apiKeys:            map[string]string{},
 	}
 	for _, opt := range opts {
@@ -156,6 +230,14 @@ func newRequestOptions(opts ...RequestOption) RequestOptions {
 }
 
 func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Response, error) {
+	for name, values := range c.defaultHeaders {
+		if len(req.Header.Values(name)) != 0 {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	timeout := c.timeout
 	if runtime.Options.Timeout > 0 {
 		timeout = runtime.Options.Timeout
@@ -164,9 +246,13 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 	var cancel context.CancelFunc
 	if timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 		req = req.Clone(ctx)
 	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	if runtime.Idempotent && runtime.Options.IdempotencyKey != "" {
 		header := runtime.IdempotencyKeyHeader
 		if header == "" {
@@ -186,6 +272,7 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 		maxRetries = 0
 	}
 	var lastErr error
+	retryBudget := maxRetryDelay
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		attemptReq, err := cloneRequestForAttempt(req, attempt)
 		if err != nil {
@@ -201,7 +288,20 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 		resp, err := c.httpClient.Do(attemptReq)
 		if err != nil {
 			lastErr = err
-			if attempt < maxRetries {
+			if attempt < maxRetries && retryBudget > 0 {
+				// Back off before reconnecting: retrying a refused connection instantly just multiplies
+				// load on a service that is already restarting. A cancelled wait returns the context error,
+				// matching the status-retry path below, so errors.Is(err, context.Canceled) answers the same
+				// way wherever the cancellation lands.
+				wait := backoffDelay(attempt)
+				if wait > retryBudget {
+					wait = retryBudget
+				}
+				retryBudget -= wait
+				if waitErr := sleepRetry(attemptReq.Context(), wait); waitErr != nil {
+					c.callErrorHooks(attemptReq.Context(), ctx, waitErr)
+					return nil, waitErr
+				}
 				continue
 			}
 			c.callErrorHooks(attemptReq.Context(), ctx, err)
@@ -216,14 +316,26 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 				return nil, err
 			}
 		}
-		if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {
-			sleepRetryAfter(resp)
+		if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries && retryBudget > 0 {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
+			wait := retryDelay(resp, attempt)
+			if wait > retryBudget {
+				wait = retryBudget
+			}
+			retryBudget -= wait
+			if err := sleepRetry(attemptReq.Context(), wait); err != nil {
+				c.callErrorHooks(attemptReq.Context(), ctx, err)
+				return nil, err
+			}
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			c.callErrorHooks(attemptReq.Context(), ctx, &APIError{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get("X-Request-ID")})
+		}
+		if cancel != nil {
+			resp.Body = &cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
+			cancel = nil
 		}
 		return resp, nil
 	}
@@ -279,14 +391,57 @@ func shouldRetryStatus(status int, retryStatuses map[int]bool) bool {
 	return retryStatuses[status] || status >= 500
 }
 
-func sleepRetryAfter(resp *http.Response) {
-	retryAfter := resp.Header.Get("Retry-After")
-	if retryAfter == "" {
-		return
+// baseRetryDelay is the first transport-error backoff step; it doubles per attempt up to maxRetryDelay.
+const baseRetryDelay = 100 * time.Millisecond
+
+// maxRetryDelay caps the TOTAL time spent waiting between retries, including any server-supplied
+// Retry-After. A per-wait cap alone still lets maxRetries x cap accumulate, so the budget is spent
+// down across the whole retry sequence and retrying stops once it is exhausted.
+const maxRetryDelay = 60 * time.Second
+
+func retryDelay(resp *http.Response, attempt int) time.Duration {
+	if resp != nil {
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			seconds, err := strconv.Atoi(retryAfter)
+			if err == nil && seconds > 0 {
+				// A server may ask for an arbitrarily long wait. Honour it only up to the ceiling, so a
+				// hostile or misconfigured origin cannot park the caller for hours.
+				return capRetryDelay(time.Duration(seconds) * time.Second)
+			}
+		}
 	}
-	seconds, err := strconv.Atoi(retryAfter)
-	if err != nil || seconds <= 0 {
-		return
+	return backoffDelay(attempt)
+}
+
+func backoffDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
 	}
-	time.Sleep(time.Duration(seconds) * time.Second)
+	if attempt > 32 {
+		return maxRetryDelay
+	}
+	return capRetryDelay(baseRetryDelay << attempt)
+}
+
+func capRetryDelay(d time.Duration) time.Duration {
+	if d > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return d
+}
+
+// sleepRetry waits out a retry delay while remaining cancellable: without the ctx arm an aborted
+// or timed-out request still blocks for the full delay before anyone notices.
+func sleepRetry(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

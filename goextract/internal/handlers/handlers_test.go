@@ -1534,6 +1534,7 @@ type QueryInput struct {
 type HeaderInput struct {
 	Signature string `+"`"+`header:"X-Webhook-Signature" binding:"required"`+"`"+`
 	Retries   []int  `+"`"+`header:"X-Retry"`+"`"+`
+	Accept    string `+"`"+`header:"Accept"`+"`"+`
 }
 
 type UploadMetadata struct {
@@ -1562,6 +1563,8 @@ func (s Server) search(c *gin.Context) {
 	_, _ = c.GetQueryArray("optionalLabels")
 	_ = c.QueryMap("filters")
 	_ = c.GetHeader("X-Direct")
+	_ = c.GetHeader("Content-Type")
+	_ = c.GetHeader("Authorization")
 	_ = c.Request.Header.Get("X-Request-Direct")
 	_, _ = c.Cookie("session")
 	_, _ = c.GetPostForm("note")
@@ -1632,6 +1635,11 @@ func (s Server) search(c *gin.Context) {
 		header, exists := paramByName(code.Params, headerName)
 		if !exists || header.Location != "header" || !header.Required {
 			t.Fatalf("missing direct header %s: %+v", headerName, code.Params)
+		}
+	}
+	for _, headerName := range []string{"Accept", "Content-Type", "Authorization"} {
+		if _, exists := paramByName(code.Params, headerName); exists {
+			t.Fatalf("OpenAPI representation header %s must not be emitted as a parameter: %+v", headerName, code.Params)
 		}
 	}
 	cookie, _ := paramByName(code.Params, "session")

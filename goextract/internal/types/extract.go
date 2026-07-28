@@ -159,7 +159,6 @@ func extractFields(
 			fieldName:    f.Name(),
 			declaredType: typeString(f.Type()), // the AS-WRITTEN type, e.g. "*float64"
 			modulePath:   modulePath,
-			swaggerType:  tag.Get("swaggertype"),
 			file:         file,
 			line:         line,
 			diags:        diags,
@@ -752,7 +751,6 @@ type mapCtx struct {
 	fieldName    string
 	declaredType string
 	modulePath   string
-	swaggerType  string
 	file         string
 	line         uint32
 	diags        *diag.Accumulator
@@ -798,9 +796,6 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 	case pkgPath == timePkgPath && obj.Name() == "Time":
 		return facts.WellKnownType(facts.WellKnownDateTime)
 	case pkgPath == jsonPkgPath && obj.Name() == "RawMessage":
-		if swaggerTypeIsArrayObject(ctx.swaggerType) {
-			return facts.ArrayType(facts.AnyType())
-		}
 		return facts.AnyType()
 	case pkgPath == jsonPkgPath && obj.Name() == "Number":
 		return facts.PrimitiveType(facts.FloatPrim(64))
@@ -811,14 +806,6 @@ func mapNamed(u *gotypes.Named, ctx mapCtx) facts.Type {
 	// values are resolved by the enum SchemaFact (see Extract). A non-string named
 	// type is a struct ref. Both are stable, package-qualified ids.
 	return facts.NamedType(schemaID(u, ctx.modulePath))
-}
-
-func swaggerTypeIsArrayObject(value string) bool {
-	parts := strings.Split(value, ",")
-	if len(parts) != 2 {
-		return false
-	}
-	return strings.TrimSpace(parts[0]) == "array" && strings.TrimSpace(parts[1]) == "object"
 }
 
 func mapBasic(u *gotypes.Basic, ctx mapCtx) facts.Type {

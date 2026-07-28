@@ -19,7 +19,11 @@ export interface BookFilters {
   sort?: "asc" | "desc" | null;
 }
 
-export type BookFormat = "hardcover" | "paperback";
+export const BookFormat = {
+  Hardcover: "hardcover",
+  Paperback: "paperback",
+} as const;
+export type BookFormat = (typeof BookFormat)[keyof typeof BookFormat];
 
 export type BookOrError = BookDto | OutOfStockDto;
 

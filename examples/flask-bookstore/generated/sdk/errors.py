@@ -35,3 +35,16 @@ class ApiError(Exception):
 
     def is_not_found(self) -> bool:
         return self.status_code == 404
+
+
+class AuthConfigurationError(Exception):
+    """Raised when no configured credential set satisfies an operation."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        alternatives: list[list[str]],
+    ) -> None:
+        super().__init__(f"No configured credentials satisfy operation {operation_id}")
+        self.operation_id = operation_id
+        self.alternatives = alternatives

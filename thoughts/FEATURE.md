@@ -13,7 +13,7 @@ Status values:
 
 | ID | Status | Feature | Notes |
 | --- | --- | --- | --- |
-| F-001 | accepted | Native code-first API extraction | Build and own the Go-code-to-API-graph path. Do not wrap Swaggo, oapi-codegen, OpenAPI Generator, or similar tools as the core. |
+| F-001 | accepted | Native code-first API extraction | Build and own the source-to-API-graph path. |
 | F-002 | accepted | OpenAPI as generated artifact | OpenAPI is an output, not the source of truth or internal model. |
 | F-003 | accepted | SDK generation from internal graph | SDKs should be generated from the internal API graph, not by shelling out to an external OpenAPI SDK generator. |
 | F-004 | accepted | Code-as-config | User customization must be code, not YAML/TOML/JSON configuration. |

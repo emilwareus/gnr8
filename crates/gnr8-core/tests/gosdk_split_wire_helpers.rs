@@ -79,11 +79,18 @@ fn multi_tag_graph() -> gnr8::graph::ApiGraph {
                   "required": false,
                   "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "provenance": { "file": "a.go", "start_line": 3, "end_line": 3 }
+                },
+                {
+                  "name": "createdAtFrom",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "well_known", "of": "date_time" },
+                  "provenance": { "file": "a.go", "start_line": 4, "end_line": 4 }
                 }
               ],
               "request_body": null,
               "responses": [{ "status": 204, "body": null }],
-              "provenance": { "file": "a.go", "start_line": 1, "end_line": 3 }
+              "provenance": { "file": "a.go", "start_line": 1, "end_line": 4 }
             },
             {
               "id": "getCatalogItem",
@@ -317,6 +324,15 @@ fn body_encoding_graph(content_type: &str, required: bool) -> gnr8::graph::ApiGr
         r#"{"type":"primitive","of":{"prim":"bytes"}}"#
     } else if content_type == "text/plain" {
         r#"{"type":"primitive","of":{"prim":"string"}}"#
+    } else if content_type == "multipart/form-data" {
+        r#"{"type":"object","of":[
+             {"json_name":"name","required":true,"optional":false,"nullable":false,
+              "schema":{"type":"primitive","of":{"prim":"string"}},
+              "description":null,"example":null},
+             {"json_name":"file","required":true,"optional":false,"nullable":false,
+              "schema":{"type":"primitive","of":{"prim":"bytes"}},
+              "description":null,"example":null}
+           ]}"#
     } else {
         r#"{"type":"object","of":[
              {"json_name":"name","required":true,"optional":false,"nullable":false,

@@ -12,7 +12,7 @@ The audited P0 defects have been addressed. gnr8 now has an honest and coherent 
 it owns the source-to-SDK chain, accepts bounded commodity dependencies, emits standard-library-only
 SDKs, rejects missing or ambiguous facts instead of silently recovering, and documents the actual
 Rust and source-language toolchain requirements. Active product code, tests, generated examples, and
-current documentation no longer contain compatibility behavior for another generator.
+current documentation describe only gnr8's native generation surface.
 
 That is enough to market an early-access product for typed, statically discoverable Go/Gin,
 Python/FastAPI or Flask, and TypeScript/NestJS services. It is not enough to promise general framework
@@ -33,8 +33,7 @@ repository's declared runner matrix and release workflow.
 
 - Public claims distinguish ownership of the chain from dependency count and state the real build and
   source-toolchain prerequisites.
-- All active coupling to OpenAPI Generator profiles, scanners, config files, package conventions,
-  compatibility tests, and migration guidance has been removed.
+- The SDK pipeline has one native configuration, graph, emitter, package structure, and test path.
 - Helper/resource/core-dependency resolution and missing response facts use one declared source and
   fail with diagnostics instead of entering environment-dependent recovery chains.
 - Static FastAPI router, Flask blueprint, and NestJS controller/registration prefixes are preserved;

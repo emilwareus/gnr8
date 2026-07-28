@@ -2,7 +2,7 @@
 //!
 //! This test drives the public code-as-config target APIs over the committed Go fixture graph, then
 //! materializes generated Go, Python, and TypeScript SDKs with custom auth, split model layout,
-//! operation grouping, Pydantic defaults, and compatibility type aliases.
+//! operation grouping, and Pydantic defaults.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -81,7 +81,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     let mut ir = gnr8::analyze::build_graph(FIXTURE_DIR).expect("fixture graph");
     add_runtime_metadata(&mut ir);
 
-    let aliases = SdkTypeAliases::new().type_alias("CreateGoalInput", "CreateGoalPayload");
     let root = temp_dir("ok");
     let mut out = Artifacts::new();
 
@@ -94,7 +93,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
                 .operation_file_template("api_{service_snake}_{operation_snake}.go")
                 .model_file_template("model_{schema_snake}.go"),
         )
-        .aliases(aliases.clone())
         .generate(&ir, &mut out, &Cx::new(&root))
         .expect("generate Go SDK");
 
@@ -107,7 +105,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
                 .model_file_template("models/{schema_snake}.py"),
         )
         .pydantic()
-        .aliases(aliases.clone())
         .generate(&ir, &mut out, &Cx::new(&root))
         .expect("generate Python SDK");
 
@@ -119,7 +116,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
                 .model_dir("models")
                 .model_file_template("models/{schema_snake}.ts"),
         )
-        .aliases(aliases)
         .generate(&ir, &mut out, &Cx::new(&root))
         .expect("generate TypeScript SDK");
 
@@ -128,7 +124,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     let go_op = std::fs::read_to_string(root.join("go-sdk/api_goals_create_goal.go"))
         .expect("read grouped Go operation");
     assert!(go_op.contains("authorization"), "{go_op}");
-    assert!(root.join("go-sdk/aliases.go").exists());
 
     let py_op = std::fs::read_to_string(root.join("pysdk/api_goals.py"))
         .expect("read grouped Python operation");
@@ -136,14 +131,12 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     let py_model = std::fs::read_to_string(root.join("pysdk/models/create_goal_input.py"))
         .expect("read py model");
     assert!(py_model.contains("BaseModel"), "{py_model}");
-    assert!(root.join("pysdk/models/create_goal_payload.py").exists());
 
     let ts_client = std::fs::read_to_string(root.join("ts-sdk/client.ts")).expect("read ts client");
     assert!(ts_client.contains("apiKey?: string"), "{ts_client}");
     let ts_op = std::fs::read_to_string(root.join("ts-sdk/api_goals.ts"))
         .expect("read grouped TypeScript operation");
     assert!(ts_op.contains("authorization"), "{ts_op}");
-    assert!(root.join("ts-sdk/models/create_goal_payload.ts").exists());
 
     if command_available("go", "version") {
         std::fs::write(root.join("go-sdk/go.mod"), "module sdktest\n\ngo 1.26\n")
@@ -177,7 +170,7 @@ fn generated_sdks_support_configurable_surface_and_compile() {
         import
             .args([
                 "-c",
-                "import pysdk; from pysdk.models import CreateGoalPayload",
+                "import pysdk; from pysdk.models import CreateGoalInput",
             ])
             .current_dir(&root)
             .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -195,7 +188,6 @@ fn generated_sdks_support_configurable_surface_and_compile() {
             "index.ts",
             "models/index.ts",
             "models/create_goal_input.ts",
-            "models/create_goal_payload.ts",
         ];
         let mut cmd = Command::new("node");
         cmd.arg(TSC)

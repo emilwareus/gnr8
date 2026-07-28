@@ -6,7 +6,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install invariants
 
 # Auto-format the workspace in place.
 fmt:
@@ -16,11 +16,22 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-# Install the gnr8 CLI from this checkout into Cargo's bin directory.
+# Build the host release archive and install its complete binary + resource layout.
 install:
-	cargo install --path crates/gnr8 --locked --force
-	@echo "installed: $$(command -v gnr8 || echo "$${CARGO_HOME:-$$HOME/.cargo}/bin/gnr8")"
-	@echo "try: gnr8 --help"
+	@set -e; \
+	case "$$(uname -s)" in \
+	  Darwin) asset_os=macos ;; \
+	  Linux) asset_os=linux ;; \
+	  *) echo "make install: unsupported OS: $$(uname -s)" >&2; exit 1 ;; \
+	esac; \
+	case "$$(uname -m)" in \
+	  x86_64|amd64) asset_arch=x86_64 ;; \
+	  arm64|aarch64) asset_arch=aarch64 ;; \
+	  *) echo "make install: unsupported architecture: $$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	target="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	archive="$$(TARGET="$$target" ASSET_OS="$$asset_os" ASSET_ARCH="$$asset_arch" scripts/package-release.sh)"; \
+	GNR8_ARCHIVE="$$archive" scripts/install.sh
 
 # Lint with warnings denied; --locked requires a committed, up-to-date Cargo.lock (Pitfall 4).
 clippy:
@@ -124,7 +135,11 @@ examples-check: tsextract-deps
 	PATH="$$PATH:$(GO_BIN)" sh -c 'cd examples/nestjs-bookstore  && "$(CURDIR)/$(GNR8_BIN)" generate --force && "$(CURDIR)/$(GNR8_BIN)" check'; \
 	for dir in examples/*/generated; do diff -ru "$$tmp/$$dir" "$$dir"; done
 
+# Enforce CLAUDE.md rule 0: one native contract, no foreign annotation/compatibility coupling.
+invariants:
+	scripts/check-invariants.sh
+
 # Full local gate, mirrors CI.
-check: fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
+check: invariants fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
 
 all: check

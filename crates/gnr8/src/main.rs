@@ -1636,13 +1636,40 @@ fn command_label(program: &str, args: &[&str]) -> String {
 fn command_output_excerpt(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stderr
+    text_output_excerpt(&stderr, &stdout)
+}
+
+fn text_output_excerpt(stderr: &str, stdout: &str) -> String {
+    const MAX_LINES: usize = 6;
+    const HEAD_LINES: usize = 3;
+    const TAIL_LINES: usize = 2;
+
+    let lines = stderr
         .lines()
         .chain(stdout.lines())
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("command exited non-zero without output")
-        .to_string()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "command exited non-zero without output".to_string();
+    }
+    if lines.len() <= MAX_LINES {
+        return lines.join(" | ");
+    }
+
+    lines
+        .iter()
+        .take(HEAD_LINES)
+        .copied()
+        .chain(std::iter::once("…"))
+        .chain(
+            lines
+                .iter()
+                .skip(lines.len().saturating_sub(TAIL_LINES))
+                .copied(),
+        )
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn python_compile(files: &[PathBuf]) -> Result<(), String> {
@@ -2100,7 +2127,7 @@ mod tests {
 
     use super::{
         link_typescript_node_modules, local_node_modules, local_typescript_compiler,
-        reconcile_doctor_source_probe, typescript_compiler,
+        reconcile_doctor_source_probe, text_output_excerpt, typescript_compiler,
         validate_typescript_package_entrypoints, MaterializedTarget, TypeScriptCompiler,
     };
     use std::path::PathBuf;
@@ -2236,5 +2263,33 @@ mod tests {
         });
 
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn command_output_excerpt_keeps_the_actionable_end_of_a_traceback() {
+        let stderr = "\
+Traceback (most recent call last):
+  File \"<string>\", line 1, in <module>
+  File \"generated/sdk/models.py\", line 5, in <module>
+    from pydantic import BaseModel
+ModuleNotFoundError: No module named 'pydantic'
+";
+
+        assert_eq!(
+            text_output_excerpt(stderr, ""),
+            "Traceback (most recent call last): | File \"<string>\", line 1, in <module> | \
+File \"generated/sdk/models.py\", line 5, in <module> | from pydantic import BaseModel | \
+ModuleNotFoundError: No module named 'pydantic'"
+        );
+    }
+
+    #[test]
+    fn command_output_excerpt_bounds_long_subprocess_output() {
+        let stderr = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n";
+
+        assert_eq!(
+            text_output_excerpt(stderr, ""),
+            "one | two | three | … | seven | eight"
+        );
     }
 }

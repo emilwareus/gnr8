@@ -32,12 +32,11 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_api_key_headers, operation_api_key_queries, operation_http_auth_schemes, path_tokens,
-    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, HttpAuthScheme, RequestBodyEncoding,
+    operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
+    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme,
+    OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
 };
 use crate::sdk::model_style::PyModelStyle;
-use crate::sdk::surface::ResolvedTypeAlias;
 use crate::CoreError;
 
 /// Fold an indentation/`format!` write error into a typed [`CoreError::SdkGen`].
@@ -393,9 +392,14 @@ pub(crate) fn py_type(
                     ),
                 });
             }
-            format!("dict[str, {}]", py_type(value, false, graph)?)
+            let value_type = if matches!(value.as_ref(), Type::Any {}) {
+                "Any".to_string()
+            } else {
+                py_type(value, false, graph)?
+            };
+            format!("dict[str, {value_type}]")
         }
-        Type::Any {} => "Any".to_string(),
+        Type::Any {} => "dict[str, Any]".to_string(),
         Type::Named(ref_id) => {
             let target = graph
                 .schemas
@@ -467,20 +471,10 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     emit_models_with_style(graph, package, PyModelStyle::default())
 }
 
-#[cfg(test)]
 pub(crate) fn emit_models_with_style(
-    graph: &ApiGraph,
-    package: &str,
-    model_style: PyModelStyle,
-) -> Result<String, CoreError> {
-    emit_models_with_style_and_aliases(graph, package, model_style, &[])
-}
-
-pub(crate) fn emit_models_with_style_and_aliases(
     graph: &ApiGraph,
     _package: &str,
     model_style: PyModelStyle,
-    aliases: &[ResolvedTypeAlias],
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "Python SDK")?;
 
@@ -525,11 +519,6 @@ pub(crate) fn emit_models_with_style_and_aliases(
                 writeln!(out, "{} = \"{alias}\"", schema.name).map_err(sink)?;
             }
         }
-    }
-    for alias in aliases {
-        out.push_str(top_level_separator(first, false));
-        first = false;
-        writeln!(out, "{} = {}", alias.alias, alias.canonical).map_err(sink)?;
     }
     Ok(out)
 }
@@ -598,16 +587,6 @@ pub(crate) fn emit_model_schema(
         }
     }
     Ok(out)
-}
-
-/// Emit a split-model compatibility alias shim.
-pub(crate) fn emit_model_alias(alias: &ResolvedTypeAlias, canonical_module: &str) -> String {
-    format!(
-        "from __future__ import annotations\n\nfrom {canonical_module} import {} as {}\n\n__all__ = [\"{}\"]\n",
-        alias.canonical,
-        alias.alias,
-        alias.alias
-    )
 }
 
 /// Emit `models/__init__.py` for split-model layout.
@@ -947,6 +926,19 @@ class ApiError(Exception):
 
     def is_not_found(self) -> bool:
         return self.status_code == 404
+
+
+class AuthConfigurationError(Exception):
+    \"\"\"Raised when no configured credential set satisfies an operation.\"\"\"
+
+    def __init__(
+        self,
+        operation_id: str,
+        alternatives: list[list[str]],
+    ) -> None:
+        super().__init__(f\"No configured credentials satisfy operation {operation_id}\")
+        self.operation_id = operation_id
+        self.alternatives = alternatives
 "
     .to_string()
 }
@@ -970,6 +962,7 @@ pub(crate) fn emit_client(package: &str) -> String {
         false,
         &[],
         &RuntimePolicy::default(),
+        false,
         false,
         false,
     )
@@ -1087,6 +1080,27 @@ pub(crate) fn operations_need_parameter_literals(ops: &[&Operation]) -> bool {
     })
 }
 
+/// Whether any client parameter hint renders a `Union[..]`, which `client.py` must import.
+///
+/// `models.py` tracks its own typing imports; `client.py` builds its import line from a fixed set,
+/// so a union-typed parameter would otherwise render `Union[..]` with no import (ruff F821).
+pub(crate) fn operations_need_parameter_unions(ops: &[&Operation]) -> bool {
+    ops.iter().any(|op| {
+        op.params
+            .iter()
+            .any(|param| type_contains_union(&param.schema))
+    })
+}
+
+fn type_contains_union(schema: &Type) -> bool {
+    match schema {
+        Type::Union(_) => true,
+        Type::Array(items) => type_contains_union(items),
+        Type::Map { key, value } => type_contains_union(key) || type_contains_union(value),
+        _ => false,
+    }
+}
+
 fn type_contains_inline_enum(schema: &Type) -> bool {
     match schema {
         Type::Enum(_) => true,
@@ -1189,6 +1203,7 @@ pub(crate) fn emit_client_with_models(
     runtime: &RuntimePolicy,
     has_pagination: bool,
     has_parameter_literals: bool,
+    has_parameter_unions: bool,
 ) -> String {
     let body_value = match model_style {
         PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            mode = \"python\" if body_encoding == \"multipart\" else \"json\"\n            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)\n        return self._wire_value(body)\n",
@@ -1216,18 +1231,29 @@ pub(crate) fn emit_client_with_models(
         "from collections.abc import Callable"
     };
     stdlib.push(collections.to_string());
+    let mut typing_names = vec!["Any"];
     if has_parameter_literals {
-        stdlib.push("from typing import Any, Literal, Optional".to_string());
-    } else {
-        stdlib.push("from typing import Any, Optional".to_string());
+        typing_names.push("Literal");
     }
+    typing_names.push("Optional");
+    if has_parameter_unions {
+        typing_names.push("Union");
+    }
+    stdlib.push(format!("from typing import {}", typing_names.join(", ")));
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
         third_party.push("from pydantic import BaseModel".to_string());
     }
 
-    let mut first_party: Vec<String> = vec!["from .errors import ApiError".to_string()];
+    // AuthConfigurationError is only raised by the auth selector, which an unsecured client does
+    // not emit — importing it there would be an unused import (ruff F401).
+    let mut first_party: Vec<String> =
+        vec![if has_api_key_auth || has_bearer_auth || has_basic_auth {
+            "from .errors import ApiError, AuthConfigurationError".to_string()
+        } else {
+            "from .errors import ApiError".to_string()
+        }];
     if !model_refs.is_empty() {
         // A parenthesized, one-name-per-line import with a trailing comma: the "magic trailing comma"
         // keeps `ruff format` from collapsing it and stays stable regardless of the name count.
@@ -1261,46 +1287,89 @@ pub(crate) fn emit_client_with_models(
     } else {
         ""
     };
+    // `_select_auth_alternative` reads all four credential attributes whenever ANY scheme exists,
+    // so they must all be assigned together. Gating each on its own scheme kind left a client with
+    // only, say, apiKey auth referencing `self._bearer_token` — unsound, and only masked because
+    // the helper early-returns when an operation declares no alternatives.
     let auth_field = if has_api_key_auth {
         "        self._api_keys = api_keys or {}\n"
+    } else if has_bearer_auth || has_basic_auth {
+        "        self._api_keys: dict[str, str] = {}\n"
     } else {
         ""
     };
     let bearer_field = if has_bearer_auth {
         "        self._bearer_token = bearer_token\n"
+    } else if has_api_key_auth || has_basic_auth {
+        "        self._bearer_token = None\n"
     } else {
         ""
     };
     let basic_field = if has_basic_auth {
         "        self._basic_auth = basic_auth\n"
+    } else if has_api_key_auth || has_bearer_auth {
+        "        self._basic_auth = None\n"
     } else {
         ""
     };
-    let auth_headers_arg = if has_api_key_auth {
-        "        auth_headers: Optional[tuple[str, ...]] = None,\n"
+    // Auth can legitimately live in the transport (an authenticating proxy, a custom opener, a
+    // request hook). Those clients configure no credential here, so the credential check must be
+    // opt-out or they could never issue a request.
+    let has_any_auth = has_api_key_auth || has_bearer_auth || has_basic_auth;
+    let transport_auth_init = if has_any_auth {
+        "        auth_transport: bool = False,\n"
     } else {
         ""
     };
-    let auth_bearer_arg = if has_bearer_auth {
-        "        auth_bearer: bool = False,\n"
+    let transport_auth_field = if has_any_auth {
+        "        self._auth_transport = auth_transport\n"
     } else {
         ""
     };
-    let auth_basic_arg = if has_basic_auth {
-        "        auth_basic: bool = False,\n"
+    // The helper reads _auth_transport/_api_keys/_bearer_token/_basic_auth, and those are only
+    // assigned when the graph declares a scheme. Emitting it for an unsecured client would
+    // reference four attributes that do not exist.
+    let auth_selector = if has_any_auth {
+        r#"    def _select_auth_alternative(
+        self,
+        operation_id: str,
+        alternatives: list[list[dict[str, str]]],
+    ) -> set[str]:
+        if not alternatives:
+            return set()
+        if self._auth_transport:
+            return set()
+        for alternative in alternatives:
+            satisfied = True
+            for requirement in alternative:
+                kind = requirement["kind"]
+                if kind == "apiKey":
+                    credential = (
+                        self._api_keys.get(requirement["scheme_id"])
+                        or self._api_keys.get(requirement["name"])
+                        or self._api_key
+                    )
+                elif kind == "bearer":
+                    credential = self._bearer_token
+                else:
+                    credential = self._basic_auth
+                if not credential:
+                    satisfied = False
+                    break
+            if satisfied:
+                return {requirement["scheme_id"] for requirement in alternative}
+        raise AuthConfigurationError(
+            operation_id,
+            [
+                [requirement["scheme_id"] for requirement in alternative]
+                for alternative in alternatives
+            ],
+        )
+
+"#
     } else {
         ""
     };
-    let mut auth_loop = String::new();
-    if has_api_key_auth {
-        auth_loop.push_str("        for header in auth_headers or ():\n            key = self._api_keys.get(header) or self._api_key\n            if key:\n                headers[header] = key\n");
-    }
-    if has_bearer_auth {
-        auth_loop.push_str("        if auth_bearer and self._bearer_token:\n            headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\"\n");
-    }
-    if has_basic_auth {
-        auth_loop.push_str("        if auth_basic and self._basic_auth is not None:\n            raw = f\"{self._basic_auth[0]}:{self._basic_auth[1]}\".encode(\"utf-8\")\n            headers[\"Authorization\"] = \"Basic \" + base64.b64encode(raw).decode(\"ascii\")\n");
-    }
     let default_timeout = py_timeout_value(runtime.default_timeout_ms);
     let max_retries = runtime.max_retries;
     let retry_statuses = py_retry_status_tuple(runtime);
@@ -1310,6 +1379,28 @@ pub(crate) fn emit_client_with_models(
     format!(
         "\
 {header}
+#: First transport-error backoff step; doubles per attempt up to the ceiling below.
+BASE_RETRY_DELAY_SECONDS = 0.1
+#: Ceiling for the TOTAL time spent waiting between retries, including any
+#: server-supplied Retry-After. A per-wait cap alone still lets
+#: max_retries x cap accumulate, so the budget is spent down across the whole
+#: retry sequence and retrying stops once it is exhausted.
+MAX_RETRY_DELAY_SECONDS = 60.0
+
+
+def _header_value(headers: dict[str, str], name: str) -> str:
+    \"\"\"Case-insensitive header lookup.
+
+    HTTP header names are case-insensitive, and the response header mapping
+    keeps whatever casing the server sent, so an exact-match lookup silently
+    misses a spelling like `X-Request-Id`.
+    \"\"\"
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return \"\"
+
 
 class RequestOptions:
     \"\"\"Per-request SDK runtime overrides.\"\"\"
@@ -1376,14 +1467,14 @@ class Client:
         base_url: str,
         *,
         api_key: Optional[str] = None,
-{auth_init}{bearer_init}{basic_init}        opener: Optional[urllib.request.OpenerDirector] = None,
+{auth_init}{bearer_init}{basic_init}{transport_auth_init}        opener: Optional[urllib.request.OpenerDirector] = None,
         timeout: Optional[float] = {default_timeout},
         max_retries: int = {max_retries},
         hooks: Optional[ClientHooks] = None,
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}{bearer_field}{basic_field}        self._opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = opener or urllib.request.build_opener()
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_statuses = {retry_statuses}
@@ -1392,7 +1483,7 @@ class Client:
 
     def _body_value(self, body: Any, body_encoding: str) -> Any:
 {body_value}
-    def _wire_value(self, value: Any) -> Any:
+{auth_selector}    def _wire_value(self, value: Any) -> Any:
         if isinstance(value, enum.Enum):
             return self._wire_value(value.value)
         if isinstance(value, list):
@@ -1532,7 +1623,7 @@ class Client:
         *,
         body: Optional[Any] = None,
         request_headers: Optional[dict[str, str]] = None,
-{auth_headers_arg}{auth_bearer_arg}{auth_basic_arg}        operation_id: str,
+        operation_id: str,
         path_template: str,
         content_type: str = \"application/json\",
         body_encoding: str = \"json\",
@@ -1558,10 +1649,11 @@ class Client:
         headers: dict[str, str] = dict(request_headers or {{}})
         if data is not None:
             headers[\"Content-Type\"] = content_type
-{auth_loop}        if idempotent and options.idempotency_key:
+        if idempotent and options.idempotency_key:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
         last_error: Optional[BaseException] = None
+        _retry_budget = MAX_RETRY_DELAY_SECONDS
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
@@ -1590,8 +1682,17 @@ class Client:
                 context.response_headers = response_headers
                 for hook in self._hooks.response:
                     hook(context)
-                if self._should_retry_status(status) and attempt < max_retries:
-                    self._sleep_retry_after(response_headers)
+                if (
+                    self._should_retry_status(status)
+                    and attempt < max_retries
+                    and _retry_budget > 0
+                ):
+                    _delay = min(
+                        self._retry_delay(response_headers, attempt),
+                        _retry_budget,
+                    )
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
@@ -1601,13 +1702,19 @@ class Client:
                             \"\",
                             \"\",
                             headers=response_headers,
+                            request_id=_header_value(response_headers, \"X-Request-ID\"),
                             raw_body=raw,
                         ),
                     )
                 return status, response_headers, raw
             except urllib.error.URLError as e:
                 last_error = e
-                if attempt < max_retries:
+                if attempt < max_retries and _retry_budget > 0:
+                    # Back off before reconnecting: instant retries just
+                    # multiply load on a service that is already restarting.
+                    _delay = min(self._backoff_delay(attempt), _retry_budget)
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 self._call_error_hooks(context, e)
                 raise
@@ -1619,28 +1726,40 @@ class Client:
         return status in self._retry_statuses or status >= 500
 
     @staticmethod
-    def _sleep_retry_after(headers: dict[str, str]) -> None:
-        retry_after = headers.get(\"Retry-After\") or headers.get(\"retry-after\")
-        if not retry_after:
-            return
-        try:
-            seconds = int(retry_after)
-        except ValueError:
-            return
-        if seconds > 0:
-            time.sleep(seconds)
+    def _backoff_delay(attempt: int) -> float:
+        # 2 ** attempt is an exact int, so a large attempt count overflows the float
+        # multiply; past the cap the answer is the cap anyway.
+        if attempt >= 32:
+            return MAX_RETRY_DELAY_SECONDS
+        step = BASE_RETRY_DELAY_SECONDS * (2 ** max(attempt, 0))
+        return min(step, MAX_RETRY_DELAY_SECONDS)
+
+    @classmethod
+    def _retry_delay(cls, headers: dict[str, str], attempt: int) -> float:
+        retry_after = _header_value(headers, \"Retry-After\")
+        if retry_after:
+            try:
+                seconds = int(retry_after)
+            except ValueError:
+                seconds = 0
+            if seconds > 0:
+                # A server may ask for an arbitrarily long wait. Honour it
+                # only up to the ceiling, so a hostile or misconfigured origin
+                # cannot park the caller for hours.
+                return min(float(seconds), MAX_RETRY_DELAY_SECONDS)
+        return cls._backoff_delay(attempt)
 
     def _call_error_hooks(self, context: HookContext, error: BaseException) -> None:
         for hook in self._hooks.error:
             hook(context, error)
 
     @staticmethod
-    def _raise(
+    def _error(
         status: int,
         headers: dict[str, str],
         raw: bytes,
         error_model: Optional[type] = None,
-    ) -> None:
+    ) -> ApiError:
         try:
             json_body = json.loads(raw) if raw else None
         except ValueError:
@@ -1652,8 +1771,8 @@ class Client:
             except Exception:
                 body = json_body
         decoded = json_body if isinstance(json_body, dict) else {{}}
-        request_id = headers.get(\"X-Request-ID\") or headers.get(\"x-request-id\", \"\")
-        raise ApiError(
+        request_id = _header_value(headers, \"X-Request-ID\")
+        return ApiError(
             status,
             decoded.get(\"message\", \"\"),
             decoded.get(\"slug\", \"\"),
@@ -1676,7 +1795,7 @@ class Client:
 /// - interpolates each path param through `urllib.parse.quote(str(value), safe="")` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
 ///   present optional params; joins `base_path` + `op.path`;
-/// - calls `self._do`, raises `ApiError` via `self._raise` for non-2xx responses, and decodes JSON only
+/// - calls `self._do`, raises the `ApiError` built by `self._error` for non-2xx responses, and decodes JSON only
 ///   for success statuses that declare a body model.
 ///
 /// # Errors
@@ -1813,6 +1932,69 @@ fn method_def(name: &str, args: &[String], ret: &str) -> String {
     out
 }
 
+fn flattened_py_auth_schemes(
+    alternatives: &[Vec<OperationAuthScheme>],
+) -> Vec<OperationAuthScheme> {
+    let mut by_id = BTreeMap::new();
+    for scheme in alternatives.iter().flatten() {
+        let id = match scheme {
+            OperationAuthScheme::ApiKey(scheme) => &scheme.id,
+            OperationAuthScheme::Http { id, .. } => id,
+        };
+        by_id.entry(id.clone()).or_insert_with(|| scheme.clone());
+    }
+    by_id.into_values().collect()
+}
+
+fn emit_py_auth_selection(
+    out: &mut String,
+    operation_id: &str,
+    alternatives: &[Vec<OperationAuthScheme>],
+) -> Result<(), CoreError> {
+    // An operation with no credentialed alternative reads no credentials, so binding
+    // `_selected_auth` would leave dead scaffolding in every generated method.
+    if alternatives.is_empty() || alternatives.iter().all(Vec::is_empty) {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "        _selected_auth = self._select_auth_alternative({}, [",
+        quoted_string_literal(operation_id)
+    )
+    .map_err(sink)?;
+    for alternative in alternatives {
+        writeln!(out, "            [").map_err(sink)?;
+        for scheme in alternative {
+            match scheme {
+                OperationAuthScheme::ApiKey(scheme) => {
+                    writeln!(
+                        out,
+                        "                {{\"scheme_id\": {}, \"kind\": \"apiKey\", \"name\": {}}},",
+                        quoted_string_literal(&scheme.id),
+                        quoted_string_literal(&scheme.name)
+                    )
+                    .map_err(sink)?;
+                }
+                OperationAuthScheme::Http { id, scheme } => {
+                    let kind = match scheme {
+                        HttpAuthScheme::Bearer => "bearer",
+                        HttpAuthScheme::Basic => "basic",
+                    };
+                    writeln!(
+                        out,
+                        "                {{\"scheme_id\": {}, \"kind\": \"{kind}\"}},",
+                        quoted_string_literal(id)
+                    )
+                    .map_err(sink)?;
+                }
+            }
+        }
+        writeln!(out, "            ],").map_err(sink)?;
+    }
+    writeln!(out, "        ])").map_err(sink)?;
+    Ok(())
+}
+
 /// Emit a single operation method (4-space indented as a `Client` method body).
 #[allow(clippy::too_many_lines)]
 fn emit_operation(
@@ -1847,9 +2029,33 @@ fn emit_operation(
     let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let error_bodies = error_response_bodies_of(op, graph)?;
-    let auth_headers = operation_api_key_headers(graph, op)?;
-    let auth_queries = operation_api_key_queries(graph, op)?;
-    let auth_http = operation_http_auth_schemes(graph, op)?;
+    let auth_alternatives = operation_auth_alternatives(graph, op)?;
+    let auth_schemes = flattened_py_auth_schemes(&auth_alternatives);
+    let auth_headers: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Header => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_queries: Vec<OperationApiKeyScheme> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::ApiKey(scheme) if scheme.location == ApiKeyLocation::Query => {
+                Some(scheme.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let auth_http: Vec<(String, HttpAuthScheme)> = auth_schemes
+        .iter()
+        .filter_map(|scheme| match scheme {
+            OperationAuthScheme::Http { id, scheme } => Some((id.clone(), *scheme)),
+            OperationAuthScheme::ApiKey(_) => None,
+        })
+        .collect();
     let return_model = success.body_model.clone();
     let return_hint = if success.has_binary_body() {
         if success.has_bodyless_alternative() {
@@ -1884,7 +2090,14 @@ fn emit_operation(
     // (positional), optional body when present, then optional query params (= None). This preserves
     // the established required-body surface while keeping defaulted args after all required args.
     let mut args: Vec<String> = vec!["self".to_string()];
-    args.extend(path_idents.iter().cloned());
+    // Path params are always required, and they get the same type hint as query params — an
+    // unannotated `book_id` gives callers no completion and no mypy protection.
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        args.push(format!(
+            "{ident}: {}",
+            py_type(&param.schema, false, graph)?
+        ));
+    }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
         args.push(format!("body: {}", body.model));
     }
@@ -1933,6 +2146,7 @@ fn emit_operation(
         }
         writeln!(out, "        path = f\"{fstring}\"").map_err(sink)?;
     }
+    emit_py_auth_selection(out, &op.id, &auth_alternatives)?;
 
     // Query encoding (WR-01 + WR-04): a REQUIRED query param is always sent (it is a positional arg, no
     // None guard); an OPTIONAL one is included only when present. The local read is the SAFE identifier;
@@ -1957,17 +2171,23 @@ fn emit_operation(
         for query in &auth_queries {
             writeln!(
                 out,
-                "        _auth_query_{} = self._api_keys.get({}) or self._api_key",
-                safe_ident(&snake(query)),
-                quoted_string_literal(query)
+                "        if {} in _selected_auth:",
+                quoted_string_literal(&query.id)
             )
             .map_err(sink)?;
-            writeln!(out, "        if _auth_query_{}:", safe_ident(&snake(query))).map_err(sink)?;
+            writeln!(
+                out,
+                "            _auth_query_{} = self._api_keys.get({}) or self._api_keys.get({}) or self._api_key",
+                safe_ident(&snake(&query.name)),
+                quoted_string_literal(&query.id),
+                quoted_string_literal(&query.name)
+            )
+            .map_err(sink)?;
             writeln!(
                 out,
                 "            _query.append(({}, _auth_query_{}))",
-                quoted_string_literal(query),
-                safe_ident(&snake(query))
+                quoted_string_literal(&query.name),
+                safe_ident(&snake(&query.name))
             )
             .map_err(sink)?;
         }
@@ -1982,6 +2202,7 @@ fn emit_operation(
     let has_request_headers = request_params
         .iter()
         .any(|param| param.location == "header" || param.location == "cookie");
+    let has_auth_headers = !auth_headers.is_empty() || !auth_http.is_empty();
     if has_request_headers {
         emit_py_header_cookie_parameters(
             out,
@@ -1990,6 +2211,53 @@ fn emit_operation(
             &optional_query,
             &optional_query_idents,
         )?;
+    } else if has_auth_headers {
+        writeln!(out, "        _request_headers: dict[str, str] = {{}}").map_err(sink)?;
+    }
+    for header in &auth_headers {
+        writeln!(
+            out,
+            "        if {} in _selected_auth:",
+            quoted_string_literal(&header.id)
+        )
+        .map_err(sink)?;
+        writeln!(
+            out,
+            "            _request_headers[{}] = self._api_keys.get({}) or self._api_keys.get({}) or self._api_key",
+            quoted_string_literal(&header.name),
+            quoted_string_literal(&header.id),
+            quoted_string_literal(&header.name)
+        )
+        .map_err(sink)?;
+    }
+    for (scheme_id, scheme) in &auth_http {
+        writeln!(
+            out,
+            "        if {} in _selected_auth:",
+            quoted_string_literal(scheme_id)
+        )
+        .map_err(sink)?;
+        match scheme {
+            HttpAuthScheme::Bearer => {
+                writeln!(
+                    out,
+                    "            _request_headers[\"Authorization\"] = f\"Bearer {{self._bearer_token}}\""
+                )
+                .map_err(sink)?;
+            }
+            HttpAuthScheme::Basic => {
+                writeln!(
+                    out,
+                    "            _auth_raw = f\"{{self._basic_auth[0]}}:{{self._basic_auth[1]}}\".encode(\"utf-8\")"
+                )
+                .map_err(sink)?;
+                writeln!(
+                    out,
+                    "            _request_headers[\"Authorization\"] = \"Basic \" + base64.b64encode(_auth_raw).decode(\"ascii\")"
+                )
+                .map_err(sink)?;
+            }
+        }
     }
 
     // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
@@ -2005,17 +2273,8 @@ fn emit_operation(
             quoted_string_literal(py_body_encoding(body.encoding))
         ));
     }
-    if has_request_headers {
+    if has_request_headers || has_auth_headers {
         do_args.push("request_headers=_request_headers".to_string());
-    }
-    if !auth_headers.is_empty() {
-        do_args.push(format!("auth_headers={}", py_string_tuple(&auth_headers)));
-    }
-    if auth_http.contains(&HttpAuthScheme::Bearer) {
-        do_args.push("auth_bearer=True".to_string());
-    }
-    if auth_http.contains(&HttpAuthScheme::Basic) {
-        do_args.push("auth_basic=True".to_string());
     }
     let runtime = py_operation_runtime(graph, op);
     do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
@@ -2036,12 +2295,16 @@ fn emit_operation(
         writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
         writeln!(
             out,
-            "                self._raise(_status, _headers, _raw, {})",
+            "                raise self._error(_status, _headers, _raw, {})",
             error_body.model
         )
         .map_err(sink)?;
     }
-    writeln!(out, "            self._raise(_status, _headers, _raw)").map_err(sink)?;
+    writeln!(
+        out,
+        "            raise self._error(_status, _headers, _raw)"
+    )
+    .map_err(sink)?;
     if success.has_binary_body() {
         writeln!(
             out,
@@ -2053,7 +2316,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
+            writeln!(out, "        raise self._error(_status, _headers, _raw)").map_err(sink)?;
         }
     } else if let Some(model) = &return_model {
         writeln!(
@@ -2078,7 +2341,7 @@ fn emit_operation(
         if success.has_bodyless_alternative() {
             writeln!(out, "        return None").map_err(sink)?;
         } else {
-            writeln!(out, "        self._raise(_status, _headers, _raw)").map_err(sink)?;
+            writeln!(out, "        raise self._error(_status, _headers, _raw)").map_err(sink)?;
         }
     } else {
         writeln!(out, "        return json.loads(_raw) if _raw else None").map_err(sink)?;
@@ -2378,8 +2641,11 @@ fn py_pagination_args(
 
     let mut args: Vec<String> = vec!["self".to_string()];
     let mut call_args: Vec<String> = Vec::new();
-    for ident in &path_idents {
-        args.push(ident.clone());
+    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
+        args.push(format!(
+            "{ident}: {}",
+            py_type(&param.schema, false, graph)?
+        ));
         call_args.push(format!("{ident}={ident}"));
     }
     if let Some(body) = body_model.as_ref().filter(|body| body.required) {
@@ -2548,21 +2814,6 @@ fn py_status_tuple(statuses: &[u16]) -> String {
     }
 }
 
-fn py_string_tuple(values: &[String]) -> String {
-    match values {
-        [] => "()".to_string(),
-        [single] => format!("({},)", quoted_string_literal(single)),
-        many => {
-            let joined = many
-                .iter()
-                .map(|value| quoted_string_literal(value))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({joined})")
-        }
-    }
-}
-
 /// Emit `__init__.py`: re-export `Client`, `ApiError`, and every model/enum class so `import <pkg>`
 /// exposes the whole surface. Class names are emitted in graph order (deterministic). Twin of the Go
 /// twin's single-package surface (Go has no `__init__`, so this is Python-specific but deterministic).
@@ -2580,7 +2831,8 @@ pub(crate) fn emit_init_with_models(
     let mut out = String::new();
     out.push_str("from __future__ import annotations\n\n");
     out.push_str("from .client import Client, ClientHooks, HookContext, RequestOptions\n");
-    out.push_str("from .errors import ApiError\n");
+    // Both error types are raised by generated operations, so both belong in the package barrel.
+    out.push_str("from .errors import ApiError, AuthConfigurationError\n");
 
     // Every named schema becomes a top-level symbol in models.py (class or alias) — re-export them all.
     let names: Vec<&str> = graph.schemas.iter().map(|s| s.name.as_str()).collect();
@@ -2598,6 +2850,7 @@ pub(crate) fn emit_init_with_models(
     out.push_str("    \"HookContext\",\n");
     out.push_str("    \"RequestOptions\",\n");
     out.push_str("    \"ApiError\",\n");
+    out.push_str("    \"AuthConfigurationError\",\n");
     for name in &names {
         let _ = writeln!(out, "    \"{name}\",");
     }
@@ -2824,7 +3077,15 @@ mod tests {
                 value: Box::new(Type::Primitive(Prim::String)),
             };
             assert_eq!(py_type(&map, false, &g).unwrap(), "dict[str, str]");
-            assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "Any");
+            assert_eq!(py_type(&Type::Any {}, false, &g).unwrap(), "dict[str, Any]");
+            let free_form_map = Type::Map {
+                key: Box::new(Type::Primitive(Prim::String)),
+                value: Box::new(Type::Any {}),
+            };
+            assert_eq!(
+                py_type(&free_form_map, false, &g).unwrap(),
+                "dict[str, Any]"
+            );
         }
 
         #[test]
@@ -2973,16 +3234,16 @@ mod tests {
         }
 
         #[test]
-        fn pydantic_models_keep_from_dict_and_to_dict_compat_methods() {
+        fn pydantic_models_expose_native_dict_serialization() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(
                 out.contains("def from_dict(cls, _data: dict[str, Any]) -> Book:"),
-                "Pydantic models should keep legacy decode compatibility:\n{out}"
+                "Pydantic models should expose typed dictionary decoding:\n{out}"
             );
             assert!(out.contains("return cls.model_validate(_data)"), "{out}");
             assert!(
                 out.contains("def to_dict(self) -> dict[str, Any]:"),
-                "Pydantic models should keep legacy encode compatibility:\n{out}"
+                "Pydantic models should expose typed dictionary encoding:\n{out}"
             );
             assert!(
                 out.contains(
@@ -3114,11 +3375,11 @@ mod tests {
             );
             assert!(out.contains("if _status == 409:"), "{out}");
             assert!(
-                out.contains("self._raise(_status, _headers, _raw, OutOfStock)"),
+                out.contains("raise self._error(_status, _headers, _raw, OutOfStock)"),
                 "{out}"
             );
             assert!(
-                out.contains("self._raise(_status, _headers, _raw)"),
+                out.contains("raise self._error(_status, _headers, _raw)"),
                 "{out}"
             );
             assert!(
@@ -3265,7 +3526,7 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains(
-                    "_auth_query_api_key = self._api_keys.get(\"api_key\") or self._api_key"
+                    "_auth_query_api_key = self._api_keys.get(\"QueryAuth\") or self._api_keys.get(\"api_key\") or self._api_key"
                 ),
                 "{out}"
             );
@@ -3302,7 +3563,9 @@ mod tests {
             assert!(
                 out.contains("_status, _headers, _raw = self._do(")
                     && out.contains("\"GET\",")
-                    && out.contains("auth_bearer=True,")
+                    && out.contains(
+                        "_request_headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""
+                    )
                     && out.contains("operation_id=\"listBooks\","),
                 "{out}"
             );
@@ -3314,7 +3577,12 @@ mod tests {
             op.security = vec!["BasicAuth".to_string()];
             op.security_overrides_global = true;
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
-            assert!(out.contains("auth_basic=True,"), "{out}");
+            assert!(
+                out.contains(
+                    "_request_headers[\"Authorization\"] = \"Basic \" + base64.b64encode(_auth_raw).decode(\"ascii\")"
+                ),
+                "{out}"
+            );
         }
 
         #[test]
@@ -3436,6 +3704,7 @@ mod tests {
                 &crate::graph::RuntimePolicy::default(),
                 false,
                 false,
+                false,
             );
             assert!(out.contains("import base64"), "{out}");
             assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
@@ -3443,14 +3712,144 @@ mod tests {
                 out.contains("basic_auth: Optional[tuple[str, str]] = None"),
                 "{out}"
             );
+            assert!(out.contains("credential = self._bearer_token"), "{out}");
+            assert!(out.contains("credential = self._basic_auth"), "{out}");
+            // Credentials can live in the transport (authenticating proxy, custom opener, request
+            // hook), so the credential check must be opt-out or those clients could never issue a
+            // request.
+            assert!(out.contains("auth_transport: bool = False"), "{out}");
             assert!(
-                out.contains("headers[\"Authorization\"] = f\"Bearer {self._bearer_token}\""),
+                out.contains("self._auth_transport = auth_transport"),
                 "{out}"
             );
             assert!(
-                out.contains("base64.b64encode(raw).decode(\"ascii\")"),
+                out.contains("if self._auth_transport:\n            return set()"),
                 "{out}"
             );
+        }
+
+        #[test]
+        fn retry_waits_are_capped_and_error_helper_returns_for_the_caller_to_raise() {
+            let out = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                false,
+                false,
+                &[],
+                &crate::graph::RuntimePolicy::default(),
+                false,
+                false,
+                false,
+            );
+            // An unbounded sleep lets a hostile `Retry-After: 86400` park the caller for a day.
+            assert!(out.contains("MAX_RETRY_DELAY_SECONDS = 60.0"), "{out}");
+            assert!(
+                out.contains("min(float(seconds), MAX_RETRY_DELAY_SECONDS)"),
+                "{out}"
+            );
+            // Transport errors must back off rather than reconnect instantly, and the total wait
+            // across the whole retry sequence is budgeted, not just each individual wait.
+            assert!(out.contains("self._backoff_delay(attempt)"), "{out}");
+            assert!(
+                out.contains("_retry_budget = MAX_RETRY_DELAY_SECONDS"),
+                "{out}"
+            );
+            assert!(out.contains("_retry_budget -= _delay"), "{out}");
+            // The helper RETURNS the error so each call site can end in an explicit `raise` (the
+            // call sites themselves are asserted in the operations tests). A helper that raised
+            // internally left every operation looking like it fell through, to mypy and to
+            // ruff's RET503.
+            assert!(out.contains(") -> ApiError:"), "{out}");
+            assert!(!out.contains("def _raise("), "{out}");
+        }
+
+        #[test]
+        fn union_typed_parameters_import_union_into_the_client() {
+            // No committed example has a union-typed parameter, so without this the plumbing from
+            // the detector to client.py's fixed typing import line is untested — and a rendered
+            // `Union[..]` with no import is ruff F821 / mypy name-defined.
+            let with_union = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                false,
+                false,
+                &[],
+                &crate::graph::RuntimePolicy::default(),
+                false,
+                false,
+                true,
+            );
+            assert!(
+                with_union.contains("from typing import Any, Optional, Union"),
+                "{with_union}"
+            );
+
+            let without_union = emit_client("bookstore");
+            assert!(
+                without_union.contains("from typing import Any, Optional")
+                    && !without_union.contains("Union"),
+                "{without_union}"
+            );
+        }
+
+        #[test]
+        fn union_parameter_detector_walks_nested_types() {
+            use super::super::{operations_need_parameter_unions, Operation};
+            use crate::graph::{Param, Prim, SourceSpan, Type};
+            let param = |name: &str, schema: Type| Param {
+                name: name.to_string(),
+                location: "query".to_string(),
+                required: false,
+                schema,
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: SourceSpan {
+                    file: "m.py".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            };
+            let op = |params: Vec<Param>| Operation {
+                id: "op".to_string(),
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+                handler: "op".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params,
+                request_body: None,
+                request_body_required: false,
+                request_body_content_type: None,
+                responses: Vec::new(),
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: SourceSpan {
+                    file: "m.py".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            };
+
+            let plain = op(vec![param("a", Type::Primitive(Prim::String))]);
+            assert!(!operations_need_parameter_unions(&[&plain]));
+
+            // A union nested inside an array still renders `Union[..]` in the signature.
+            let nested = op(vec![param(
+                "a",
+                Type::Array(Box::new(Type::Union(vec![
+                    Type::Primitive(Prim::String),
+                    Type::Primitive(Prim::Bool),
+                ]))),
+            )]);
+            assert!(operations_need_parameter_unions(&[&nested]));
         }
 
         #[test]
@@ -3466,7 +3865,13 @@ mod tests {
         fn init_reexports_client_apierror_and_every_model() {
             let out = emit_init(&ops_graph(), "bookstore");
             assert!(out.contains("from .client import Client"), "{out}");
-            assert!(out.contains("from .errors import ApiError"), "{out}");
+            // Both error types are raised by generated operations, so both must be reachable
+            // from the package root rather than only from the private `errors` module.
+            assert!(
+                out.contains("from .errors import ApiError, AuthConfigurationError"),
+                "{out}"
+            );
+            assert!(out.contains("\"AuthConfigurationError\","), "{out}");
             assert!(out.contains("    Book,"), "{out}");
             assert!(out.contains("    CreatedMessage,"), "{out}");
             assert!(out.contains("\"Client\","), "{out}");

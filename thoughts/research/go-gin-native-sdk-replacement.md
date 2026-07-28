@@ -4,10 +4,10 @@ Date: 2026-07-01
 
 ## Goal
 
-Make `gnr8` replace Swaggo/openapi-generator for Gin services from native Go/Gin source only:
+Make `gnr8` own the complete Gin source-to-SDK path:
 
 - source of truth is Go route registration plus handler code
-- no Swagger/OpenAPI source input or OpenAPI-generator pass for SDKs
+- no intermediate specification pass for SDK generation
 - no Swagger UI hosting
 - no inferred behavior beyond the API already exposed by the service
 
@@ -199,7 +199,7 @@ Recommended support:
 - Add a grouped surface validation using either:
   - TS axios compatibility profile, which already emits grouped API classes, or
   - split file layout with `operation_file_template("{service_kebab}/{operation_kebab}.ts")`
-- For Go, decide whether grouped services are required in the minimal profile or only in the OpenAPI-generator compatibility profile. The compatibility client surface already has grouped-service concepts and should be the lowest-risk path.
+- For Go, use one grouped resource surface backed by the native client.
 
 ## Regression Fixture Plan
 
