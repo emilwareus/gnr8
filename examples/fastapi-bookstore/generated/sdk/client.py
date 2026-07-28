@@ -24,7 +24,10 @@ from .models import (
 
 #: First transport-error backoff step; doubles per attempt up to the ceiling below.
 BASE_RETRY_DELAY_SECONDS = 0.1
-#: Ceiling for any retry wait, including a server-supplied Retry-After.
+#: Ceiling for the TOTAL time spent waiting between retries, including any
+#: server-supplied Retry-After. A per-wait cap alone still lets
+#: max_retries x cap accumulate, so the budget is spent down across the whole
+#: retry sequence and retrying stops once it is exhausted.
 MAX_RETRY_DELAY_SECONDS = 60.0
 
 
@@ -283,6 +286,7 @@ class Client:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
         last_error: Optional[BaseException] = None
+        _retry_budget = MAX_RETRY_DELAY_SECONDS
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
@@ -311,8 +315,17 @@ class Client:
                 context.response_headers = response_headers
                 for hook in self._hooks.response:
                     hook(context)
-                if self._should_retry_status(status) and attempt < max_retries:
-                    time.sleep(self._retry_delay(response_headers, attempt))
+                if (
+                    self._should_retry_status(status)
+                    and attempt < max_retries
+                    and _retry_budget > 0
+                ):
+                    _delay = min(
+                        self._retry_delay(response_headers, attempt),
+                        _retry_budget,
+                    )
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
@@ -328,10 +341,12 @@ class Client:
                 return status, response_headers, raw
             except urllib.error.URLError as e:
                 last_error = e
-                if attempt < max_retries:
+                if attempt < max_retries and _retry_budget > 0:
                     # Back off before reconnecting: instant retries just
                     # multiply load on a service that is already restarting.
-                    time.sleep(self._backoff_delay(attempt))
+                    _delay = min(self._backoff_delay(attempt), _retry_budget)
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 self._call_error_hooks(context, e)
                 raise

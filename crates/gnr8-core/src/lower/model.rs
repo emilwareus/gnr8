@@ -71,8 +71,13 @@ pub(crate) struct Server {
 /// empty for an `apiKey` scheme, per the spec).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SecurityRequirement {
-    /// The referenced security scheme name (e.g. `ApiKeyAuth`).
-    pub scheme: String,
+    /// The referenced security scheme name (e.g. `ApiKeyAuth`), or `None` for the anonymous
+    /// alternative that `OpenAPI` writes as an empty object `{}`.
+    ///
+    /// A scheme-per-row list cannot otherwise represent "authentication is optional": the group
+    /// has no schemes, so it would contribute no rows and vanish — leaving the emitted document
+    /// claiming auth is mandatory while the generated SDKs treat it as optional.
+    pub scheme: Option<String>,
     /// Required scopes — always empty for an API-key scheme.
     pub scopes: Vec<String>,
     /// Zero-based OR-alternative index; schemes sharing an index are combined with AND in one object.

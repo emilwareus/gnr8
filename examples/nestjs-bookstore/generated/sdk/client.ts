@@ -70,7 +70,11 @@ interface AuthRequirement {
 
 /** First transport-error backoff step; doubles per attempt up to MAX_RETRY_DELAY_MS. */
 const BASE_RETRY_DELAY_MS = 100;
-/** Ceiling for any retry wait, including a server-supplied Retry-After. */
+/**
+ * Ceiling for the TOTAL time spent waiting between retries, including any server-supplied
+ * Retry-After. A per-wait cap alone still lets maxRetries x cap accumulate, so the budget is
+ * spent down across the whole retry sequence and retrying stops once it is exhausted.
+ */
 const MAX_RETRY_DELAY_MS = 60000;
 
 export class Client {
@@ -311,6 +315,7 @@ export class Client {
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
     const bodyPayload = this._encodeBody(body);
     let lastError: unknown = undefined;
+    let retryBudgetMs = MAX_RETRY_DELAY_MS;
     for (let attempt = 0; attempt <= retryAttempts; attempt += 1) {
       const controller =
         timeoutMs !== undefined && timeoutMs > 0
@@ -362,14 +367,15 @@ export class Client {
           clearTimeout(timeoutId);
         }
         lastError = error;
-        if (attempt < retryAttempts) {
+        if (attempt < retryAttempts && retryBudgetMs > 0) {
           // Back off before reconnecting: retrying a refused connection instantly just
           // multiplies load on a service that is already restarting.
-          await this._waitBeforeRetry(
+          const delayMs = Math.min(
             this._backoffDelayMs(attempt),
-            options.signal,
-            hookContext,
+            retryBudgetMs,
           );
+          retryBudgetMs -= delayMs;
+          await this._waitBeforeRetry(delayMs, options.signal, hookContext);
           continue;
         }
         for (const hook of this.hooks.error) {
@@ -392,15 +398,20 @@ export class Client {
         }
         throw error;
       }
-      if (this._shouldRetryStatus(response.status) && attempt < retryAttempts) {
+      if (
+        this._shouldRetryStatus(response.status) &&
+        attempt < retryAttempts &&
+        retryBudgetMs > 0
+      ) {
         // Release the connection before retrying. An unread body keeps its socket checked out
         // of the pool until GC, so a retry storm can exhaust the pool.
         await this._discardBody(response);
-        await this._waitBeforeRetry(
+        const delayMs = Math.min(
           this._retryDelayMs(response, attempt),
-          options.signal,
-          hookContext,
+          retryBudgetMs,
         );
+        retryBudgetMs -= delayMs;
+        await this._waitBeforeRetry(delayMs, options.signal, hookContext);
         continue;
       }
       if (response.status < 200 || response.status >= 300) {

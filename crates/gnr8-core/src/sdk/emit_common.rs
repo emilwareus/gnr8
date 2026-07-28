@@ -417,11 +417,24 @@ fn unknown_security_scheme_error(op: &Operation, scheme_id: &str) -> CoreError {
 /// components and SDK model symbols use, so two ids with the same name must be handled before emission.
 pub(crate) fn check_unique_schema_names(graph: &ApiGraph, target: &str) -> Result<(), CoreError> {
     let mut seen = BTreeSet::new();
+    // Distinct names can still collapse to one file stem — `UserIDs` and `UserIds` both lower to
+    // `user_ids`. Under a split layout that is two schemas writing one file, which would otherwise
+    // surface late as an opaque artifact-ownership error instead of a schema-level one.
+    let mut stems: BTreeMap<String, &str> = BTreeMap::new();
     for schema in &graph.schemas {
         if !seen.insert(schema.name.as_str()) {
             return Err(CoreError::SdkGen {
                 message: format!(
                     "two schemas share the {target} name '{}' (distinct ids map to one emitted symbol)",
+                    schema.name
+                ),
+            });
+        }
+        let stem = file_stem(&schema.name);
+        if let Some(previous) = stems.insert(stem.clone(), schema.name.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "{target} schemas '{previous}' and '{}' both map to the file stem '{stem}';                      rename one with RenameType so a split layout can give each its own file",
                     schema.name
                 ),
             });
@@ -729,6 +742,22 @@ pub(crate) fn error_response_bodies_of(
     Ok(out)
 }
 
+/// Reject a response that declares a body on a status that cannot carry one.
+///
+/// Silently dropping the body here while the `OpenAPI` lowering kept it would make one graph
+/// describe two different contracts, so the contradiction is surfaced instead (CLAUDE.md rule 3).
+fn reject_impossible_body(op: &Operation, resp: &crate::graph::Response) -> Result<(), CoreError> {
+    if !resp.declares_impossible_body() {
+        return Ok(());
+    }
+    Err(CoreError::SdkGen {
+        message: format!(
+            "operation '{}' response 204 declares a body schema, but HTTP 204 carries no message body; correct the source or declare the response empty with ResponseOverride",
+            op.id
+        ),
+    })
+}
+
 /// Resolve all 2xx responses for one operation.
 ///
 /// SDK methods have one return type, so multiple body-bearing success responses are accepted only when
@@ -746,10 +775,8 @@ pub(crate) fn success_responses_of(
     for resp in &op.responses {
         if (200..300).contains(&resp.status) {
             statuses.push(resp.status);
-            // HTTP 204 responses never carry a message body. Treat a contradictory source
-            // annotation or imported contract as bodyless so generated clients do not attempt a
-            // JSON decode that can only return EOF.
-            if resp.status == 204 {
+            reject_impossible_body(op, resp)?;
+            if resp.is_status_bodyless() {
                 continue;
             }
             match resp.body_kind.as_str() {
@@ -1001,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn success_response_204_is_bodyless_even_when_input_declares_a_schema(
+    fn success_response_204_with_a_declared_body_is_rejected_not_silently_dropped(
     ) -> Result<(), crate::CoreError> {
         let graph = ApiGraph {
             schemas: vec![crate::graph::Schema {
@@ -1046,7 +1073,18 @@ mod tests {
             },
         };
 
-        let success = success_responses_of(&op, &graph)?;
+        // Dropping the body here while the OpenAPI lowering kept it would make one graph
+        // describe two different contracts, so the contradiction is rejected instead.
+        let result = success_responses_of(&op, &graph);
+        assert!(result.is_err(), "204 with a declared body must be rejected");
+        let message = result.err().map_or_else(String::new, |err| err.to_string());
+        assert!(message.contains("204"), "{message}");
+        assert!(message.contains("ResponseOverride"), "{message}");
+
+        // A 204 that declares no body is the normal, accepted case.
+        let mut bodyless = op;
+        bodyless.responses[0].body = None;
+        let success = success_responses_of(&bodyless, &graph)?;
         assert_eq!(success.statuses, vec![204]);
         assert!(success.body_model.is_none());
         assert!(success.body_statuses.is_empty());

@@ -964,6 +964,7 @@ pub(crate) fn emit_client(package: &str) -> String {
         &RuntimePolicy::default(),
         false,
         false,
+        false,
     )
 }
 
@@ -1079,6 +1080,27 @@ pub(crate) fn operations_need_parameter_literals(ops: &[&Operation]) -> bool {
     })
 }
 
+/// Whether any client parameter hint renders a `Union[..]`, which `client.py` must import.
+///
+/// `models.py` tracks its own typing imports; `client.py` builds its import line from a fixed set,
+/// so a union-typed parameter would otherwise render `Union[..]` with no import (ruff F821).
+pub(crate) fn operations_need_parameter_unions(ops: &[&Operation]) -> bool {
+    ops.iter().any(|op| {
+        op.params
+            .iter()
+            .any(|param| type_contains_union(&param.schema))
+    })
+}
+
+fn type_contains_union(schema: &Type) -> bool {
+    match schema {
+        Type::Union(_) => true,
+        Type::Array(items) => type_contains_union(items),
+        Type::Map { key, value } => type_contains_union(key) || type_contains_union(value),
+        _ => false,
+    }
+}
+
 fn type_contains_inline_enum(schema: &Type) -> bool {
     match schema {
         Type::Enum(_) => true,
@@ -1181,6 +1203,7 @@ pub(crate) fn emit_client_with_models(
     runtime: &RuntimePolicy,
     has_pagination: bool,
     has_parameter_literals: bool,
+    has_parameter_unions: bool,
 ) -> String {
     let body_value = match model_style {
         PyModelStyle::Pydantic => "        if isinstance(body, BaseModel):\n            mode = \"python\" if body_encoding == \"multipart\" else \"json\"\n            body = body.model_dump(mode=mode, by_alias=True, exclude_unset=True)\n        return self._wire_value(body)\n",
@@ -1208,11 +1231,15 @@ pub(crate) fn emit_client_with_models(
         "from collections.abc import Callable"
     };
     stdlib.push(collections.to_string());
+    let mut typing_names = vec!["Any"];
     if has_parameter_literals {
-        stdlib.push("from typing import Any, Literal, Optional".to_string());
-    } else {
-        stdlib.push("from typing import Any, Optional".to_string());
+        typing_names.push("Literal");
     }
+    typing_names.push("Optional");
+    if has_parameter_unions {
+        typing_names.push("Union");
+    }
+    stdlib.push(format!("from typing import {}", typing_names.join(", ")));
 
     let mut third_party: Vec<String> = Vec::new();
     if let PyModelStyle::Pydantic = model_style {
@@ -1354,7 +1381,10 @@ pub(crate) fn emit_client_with_models(
 {header}
 #: First transport-error backoff step; doubles per attempt up to the ceiling below.
 BASE_RETRY_DELAY_SECONDS = 0.1
-#: Ceiling for any retry wait, including a server-supplied Retry-After.
+#: Ceiling for the TOTAL time spent waiting between retries, including any
+#: server-supplied Retry-After. A per-wait cap alone still lets
+#: max_retries x cap accumulate, so the budget is spent down across the whole
+#: retry sequence and retrying stops once it is exhausted.
 MAX_RETRY_DELAY_SECONDS = 60.0
 
 
@@ -1609,6 +1639,7 @@ class Client:
             headers[idempotency_key_header] = options.idempotency_key
         url = self._base_url + path
         last_error: Optional[BaseException] = None
+        _retry_budget = MAX_RETRY_DELAY_SECONDS
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
@@ -1637,8 +1668,17 @@ class Client:
                 context.response_headers = response_headers
                 for hook in self._hooks.response:
                     hook(context)
-                if self._should_retry_status(status) and attempt < max_retries:
-                    time.sleep(self._retry_delay(response_headers, attempt))
+                if (
+                    self._should_retry_status(status)
+                    and attempt < max_retries
+                    and _retry_budget > 0
+                ):
+                    _delay = min(
+                        self._retry_delay(response_headers, attempt),
+                        _retry_budget,
+                    )
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 if status < 200 or status >= 300:
                     self._call_error_hooks(
@@ -1654,10 +1694,12 @@ class Client:
                 return status, response_headers, raw
             except urllib.error.URLError as e:
                 last_error = e
-                if attempt < max_retries:
+                if attempt < max_retries and _retry_budget > 0:
                     # Back off before reconnecting: instant retries just
                     # multiply load on a service that is already restarting.
-                    time.sleep(self._backoff_delay(attempt))
+                    _delay = min(self._backoff_delay(attempt), _retry_budget)
+                    _retry_budget -= _delay
+                    time.sleep(_delay)
                     continue
                 self._call_error_hooks(context, e)
                 raise
@@ -3647,6 +3689,7 @@ mod tests {
                 &crate::graph::RuntimePolicy::default(),
                 false,
                 false,
+                false,
             );
             assert!(out.contains("import base64"), "{out}");
             assert!(out.contains("bearer_token: Optional[str] = None"), "{out}");
@@ -3683,6 +3726,7 @@ mod tests {
                 &crate::graph::RuntimePolicy::default(),
                 false,
                 false,
+                false,
             );
             // An unbounded sleep lets a hostile `Retry-After: 86400` park the caller for a day.
             assert!(out.contains("MAX_RETRY_DELAY_SECONDS = 60.0"), "{out}");
@@ -3690,11 +3734,14 @@ mod tests {
                 out.contains("min(float(seconds), MAX_RETRY_DELAY_SECONDS)"),
                 "{out}"
             );
-            // Transport errors must back off rather than reconnect instantly.
+            // Transport errors must back off rather than reconnect instantly, and the total wait
+            // across the whole retry sequence is budgeted, not just each individual wait.
+            assert!(out.contains("self._backoff_delay(attempt)"), "{out}");
             assert!(
-                out.contains("time.sleep(self._backoff_delay(attempt))"),
+                out.contains("_retry_budget = MAX_RETRY_DELAY_SECONDS"),
                 "{out}"
             );
+            assert!(out.contains("_retry_budget -= _delay"), "{out}");
             // The helper RETURNS the error so each call site can end in an explicit `raise` (the
             // call sites themselves are asserted in the operations tests). A helper that raised
             // internally left every operation looking like it fell through, to mypy and to

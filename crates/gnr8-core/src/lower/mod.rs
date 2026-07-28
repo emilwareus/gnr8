@@ -119,10 +119,11 @@ pub(crate) fn build_openapi_doc(
     let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
     let security = build_security(security, &graph.security_requirements)?;
     ensure_operation_security_refs(graph, &security)?;
+    // Named global schemes only: the anonymous alternative carries no scheme to inherit.
     let global_security = security
         .requirements
         .iter()
-        .map(|requirement| requirement.scheme.clone())
+        .filter_map(|requirement| requirement.scheme.clone())
         .collect::<Vec<_>>();
     let paths = build_paths(graph, base_path, &ref_to_name, &global_security)?;
 
@@ -268,7 +269,7 @@ fn build_security(
         }
         if configured_requirements.is_empty() && scheme.global {
             requirements.push(SecurityRequirement {
-                scheme: scheme.id.clone(),
+                scheme: Some(scheme.id.clone()),
                 scopes: vec![],
                 alternative: 0,
             });
@@ -284,9 +285,17 @@ fn build_security(
     }
     if !configured_requirements.is_empty() {
         for (alternative, requirement) in configured_requirements.iter().enumerate() {
+            if requirement.schemes.is_empty() {
+                requirements.push(SecurityRequirement {
+                    scheme: None,
+                    scopes: Vec::new(),
+                    alternative,
+                });
+                continue;
+            }
             for scheme in &requirement.schemes {
                 requirements.push(SecurityRequirement {
-                    scheme: scheme.clone(),
+                    scheme: Some(scheme.clone()),
                     scopes: Vec::new(),
                     alternative,
                 });
@@ -436,15 +445,23 @@ fn lower_operation(
             .iter()
             .enumerate()
             .flat_map(|(alternative, group)| {
+                if group.schemes.is_empty() {
+                    return vec![SecurityRequirement {
+                        scheme: None,
+                        scopes: Vec::new(),
+                        alternative,
+                    }];
+                }
                 group
                     .schemes
                     .iter()
                     .cloned()
-                    .map(move |scheme| SecurityRequirement {
-                        scheme,
+                    .map(|scheme| SecurityRequirement {
+                        scheme: Some(scheme),
                         scopes: Vec::new(),
                         alternative,
                     })
+                    .collect()
             })
             .collect()
     } else {
@@ -460,7 +477,7 @@ fn lower_operation(
         scheme_ids
             .into_iter()
             .map(|scheme| SecurityRequirement {
-                scheme,
+                scheme: Some(scheme),
                 scopes: Vec::new(),
                 alternative: 0,
             })
@@ -585,6 +602,16 @@ fn lower_response(
             .iter()
             .find(|response| response.status == resp.status)
     });
+    if resp.declares_impossible_body() {
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "operation '{}' response 204 declares a body schema, but HTTP 204 carries no \
+                 message body; correct the source or declare the response empty with \
+                 ResponseOverride",
+                op.id
+            ),
+        });
+    }
     let (schema_ref, content_type, content_types, binary, event_stream) =
         match resp.body_kind.as_str() {
             "json" => {

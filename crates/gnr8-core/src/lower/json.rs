@@ -96,15 +96,18 @@ fn write_security(security: &[SecurityRequirement]) -> Value {
                 alternatives.push((req.alternative, Map::new()));
                 alternatives.len() - 1
             });
-        alternatives[index].1.insert(
-            req.scheme.clone(),
-            Value::Array(
-                req.scopes
-                    .iter()
-                    .map(|scope| Value::String(scope.clone()))
-                    .collect(),
-            ),
-        );
+        // `None` is the anonymous alternative: the object exists but stays empty.
+        if let Some(scheme) = &req.scheme {
+            alternatives[index].1.insert(
+                scheme.clone(),
+                Value::Array(
+                    req.scopes
+                        .iter()
+                        .map(|scope| Value::String(scope.clone()))
+                        .collect(),
+                ),
+            );
+        }
     }
     Value::Array(
         alternatives
@@ -540,7 +543,7 @@ mod tests {
             },
             servers: Vec::new(),
             security: vec![SecurityRequirement {
-                scheme: "ApiKeyAuth".to_string(),
+                scheme: Some("ApiKeyAuth".to_string()),
                 scopes: vec![],
                 alternative: 0,
             }],
@@ -662,7 +665,7 @@ mod tests {
     fn security_entries_emit_one_requirement_object() {
         let mut doc = sample_doc();
         doc.security.push(SecurityRequirement {
-            scheme: "CSRFAuth".to_string(),
+            scheme: Some("CSRFAuth".to_string()),
             scopes: vec![],
             alternative: 0,
         });

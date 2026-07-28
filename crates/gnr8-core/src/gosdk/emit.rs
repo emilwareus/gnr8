@@ -810,6 +810,7 @@ if !allowRetries {{
 maxRetries = 0
 }}
 var lastErr error
+retryBudget := maxRetryDelay
 for attempt := 0; attempt <= maxRetries; attempt++ {{
 attemptReq, err := cloneRequestForAttempt(req, attempt)
 if err != nil {{
@@ -825,12 +826,17 @@ return nil, err
 resp, err := c.httpClient.Do(attemptReq)
 if err != nil {{
 lastErr = err
-if attempt < maxRetries {{
+if attempt < maxRetries && retryBudget > 0 {{
 // Back off before reconnecting: retrying a refused connection instantly just multiplies
 // load on a service that is already restarting. A cancelled wait returns the context error,
 // matching the status-retry path below, so errors.Is(err, context.Canceled) answers the same
 // way wherever the cancellation lands.
-if waitErr := sleepRetry(attemptReq.Context(), backoffDelay(attempt)); waitErr != nil {{
+wait := backoffDelay(attempt)
+if wait > retryBudget {{
+wait = retryBudget
+}}
+retryBudget -= wait
+if waitErr := sleepRetry(attemptReq.Context(), wait); waitErr != nil {{
 c.callErrorHooks(attemptReq.Context(), ctx, waitErr)
 return nil, waitErr
 }}
@@ -848,10 +854,15 @@ c.callErrorHooks(attemptReq.Context(), ctx, err)
 return nil, err
 }}
 }}
-if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries {{
+if shouldRetryStatus(resp.StatusCode, c.retryStatuses) && attempt < maxRetries && retryBudget > 0 {{
 _, _ = io.Copy(io.Discard, resp.Body)
 _ = resp.Body.Close()
-if err := sleepRetry(attemptReq.Context(), retryDelay(resp, attempt)); err != nil {{
+wait := retryDelay(resp, attempt)
+if wait > retryBudget {{
+wait = retryBudget
+}}
+retryBudget -= wait
+if err := sleepRetry(attemptReq.Context(), wait); err != nil {{
 c.callErrorHooks(attemptReq.Context(), ctx, err)
 return nil, err
 }}
@@ -921,7 +932,9 @@ return retryStatuses[status] || status >= 500
 // baseRetryDelay is the first transport-error backoff step; it doubles per attempt up to maxRetryDelay.
 const baseRetryDelay = 100 * time.Millisecond
 
-// maxRetryDelay caps every retry wait, including a server-supplied Retry-After.
+// maxRetryDelay caps the TOTAL time spent waiting between retries, including any server-supplied
+// Retry-After. A per-wait cap alone still lets maxRetries x cap accumulate, so the budget is spent
+// down across the whole retry sequence and retrying stops once it is exhausted.
 const maxRetryDelay = 60 * time.Second
 
 func retryDelay(resp *http.Response, attempt int) time.Duration {{

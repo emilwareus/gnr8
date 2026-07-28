@@ -136,6 +136,7 @@ pub(crate) fn generate_files_with_options(
         &graph.runtime,
         !split_operations && !graph.pagination.is_empty(),
         !split_operations && emit::operations_need_parameter_literals(&ops),
+        !split_operations && emit::operations_need_parameter_unions(&ops),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);

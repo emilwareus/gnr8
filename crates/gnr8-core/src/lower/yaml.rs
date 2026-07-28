@@ -105,12 +105,20 @@ fn write_security_requirement(out: &mut String, security: &[SecurityRequirement]
             current_alternative = Some(req.alternative);
             "- "
         };
-        let _ = writeln!(
-            out,
-            "{pad}{prefix}{}: {}",
-            map_key(&req.scheme),
-            flow_seq(&req.scopes)
-        );
+        match &req.scheme {
+            // The anonymous alternative: OpenAPI spells "auth is optional" as an empty object.
+            None => {
+                let _ = writeln!(out, "{pad}{prefix}{{}}");
+            }
+            Some(scheme) => {
+                let _ = writeln!(
+                    out,
+                    "{pad}{prefix}{}: {}",
+                    map_key(scheme),
+                    flow_seq(&req.scopes)
+                );
+            }
+        }
     }
 }
 
@@ -727,7 +735,7 @@ mod tests {
             },
             servers: Vec::new(),
             security: vec![SecurityRequirement {
-                scheme: "ApiKeyAuth".to_string(),
+                scheme: Some("ApiKeyAuth".to_string()),
                 scopes: vec![],
                 alternative: 0,
             }],
@@ -776,7 +784,7 @@ mod tests {
     #[test]
     fn source_derived_mapping_keys_are_quoted_when_needed() {
         let mut doc = sample_doc();
-        doc.security[0].scheme = "Api:Key".to_string();
+        doc.security[0].scheme = Some("Api:Key".to_string());
         doc.components.security_schemes[0].0 = "Api:Key".to_string();
         doc.components.schemas[0].0 = "Foo#{id}".to_string();
         doc.components.schemas[0].1.properties[0].0 = "x:y".to_string();
@@ -824,6 +832,33 @@ mod tests {
         assert!(
             type_pos < format_pos,
             "type must be emitted before format:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn anonymous_security_alternative_survives_as_an_empty_object() {
+        // `security: [{}, {ApiKeyAuth: []}]` means "credentials preferred, anonymous allowed".
+        // A scheme-per-row list drops the empty group, which would leave the emitted document
+        // claiming auth is mandatory while the generated SDKs treat it as optional.
+        let mut doc = sample_doc();
+        doc.security = vec![
+            SecurityRequirement {
+                scheme: Some("ApiKeyAuth".to_string()),
+                scopes: vec![],
+                alternative: 0,
+            },
+            SecurityRequirement {
+                scheme: None,
+                scopes: vec![],
+                alternative: 1,
+            },
+        ];
+
+        let out = write(&doc);
+
+        assert!(
+            out.contains("security:\n  - ApiKeyAuth: []\n  - {}\n"),
+            "{out}"
         );
     }
 

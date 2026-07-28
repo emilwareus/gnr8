@@ -6,6 +6,14 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      bump:
+        description: >-
+          Version bump level. Use "minor" whenever the release removes or changes public API:
+          Cargo treats 0.x.y -> 0.x.(y+1) as compatible, so a patch bump would push a breaking
+          change to every downstream `gnr8 = "0.1"` silently.
+        type: choice
+        options: [patch, minor]
+        default: patch
       publish_crates:
         description: Publish the public gnr8 crate to crates.io after tag
         type: boolean
@@ -59,7 +67,11 @@ jobs:
       - name: Bump release version
         id: bump
         run: |
-          new="$(python3 scripts/bump-workspace-version.py)"
+          if [ "${{ inputs.bump }}" = "minor" ]; then
+            new="$(python3 scripts/bump-workspace-version.py --minor)"
+          else
+            new="$(python3 scripts/bump-workspace-version.py)"
+          fi
           echo "version=$new" >> "$GITHUB_OUTPUT"
 
       - name: Refresh Cargo.lock

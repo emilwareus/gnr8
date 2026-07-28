@@ -67,9 +67,13 @@ remain standard-library-only.
 
 1. Make sure `main` is green and contains only the intended release changes.
 2. Open **Actions → Release → Run workflow** on `main`.
-3. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
-4. Leave `publish_cli=true` to upload the CLI archives.
-5. The workflow bumps the version and creates the commit locally, runs `make check`, builds and smokes
+3. Choose `bump`. **Use `minor` whenever the release removes or changes public Rust API.** Cargo
+   treats `0.x.y → 0.x.(y+1)` as a *compatible* upgrade, so a patch bump would hand a breaking
+   change to every downstream `gnr8 = "0.1"` without warning. `CHANGELOG.md` records which releases
+   were breaking; check it before choosing.
+4. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
+5. Leave `publish_cli=true` to upload the CLI archives.
+6. The workflow bumps the version and creates the commit locally, runs `make check`, builds and smokes
    the host archive, and performs a crates.io dry run. A failure in any of those steps leaves `main`
    and tags untouched. Only after they pass does it push the commit and `vX.Y.Z`, publish when
    requested, build the platform assets, and create/update the GitHub Release.

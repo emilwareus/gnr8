@@ -16,6 +16,7 @@ status=0
 # Paths searched. Everything else (.planning, thoughts, target, node_modules, .git) is out of scope.
 scope=(
   README.md
+  CHANGELOG.md
   PLAN.md
   RELEASE-READINESS-V2.md
   llms.txt
@@ -41,9 +42,11 @@ scope=(
 #
 #   scripts/check-invariants.sh  — this file necessarily names what it forbids.
 #   CLAUDE.md / AGENTS.md        — the invariant text itself (AGENTS.md is a symlink to CLAUDE.md).
+#   CHANGELOG.md                 — a record of what was REMOVED must name the removed symbols; it
+#                                  is evidence of the deletion, the same category as `.planning/`.
 is_exempt_file() {
   case "$1" in
-    scripts/check-invariants.sh | CLAUDE.md | AGENTS.md) return 0 ;;
+    scripts/check-invariants.sh | CLAUDE.md | AGENTS.md | CHANGELOG.md) return 0 ;;
     *) return 1 ;;
   esac
 }
