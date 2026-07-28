@@ -56,10 +56,24 @@ versions no longer deserialize.
 
 - **TypeScript SDKs were unusable in browsers.** The global `fetch` was captured unbound and then
   invoked as a method, so the receiver was the client and every call threw `Illegal invocation`.
-- **Retry waits were unbounded and uninterruptible** in all three languages. A `Retry-After` header
-  is now capped at 60s and the wait observes cancellation. Transport-error retries back off
-  exponentially instead of reconnecting instantly.
+- **Retry waits were unbounded and uninterruptible** in all three languages. Total time spent
+  waiting between retries is now capped at 60s across the whole retry sequence — a longer
+  `Retry-After` is honoured only up to that cap — and the wait observes cancellation in Go and
+  TypeScript. Transport-error retries back off exponentially instead of reconnecting instantly.
+  Note that `timeout` bounds the whole call in Go but each individual attempt in Python and
+  TypeScript; each generated README now states which.
 - TypeScript did not release discarded retry response bodies, holding sockets out of the pool.
+- Python matched response headers case-sensitively, so a server sending `X-Request-Id` or
+  `Retry-after` — both common — was silently missed. Header lookups are case-insensitive now, as
+  HTTP requires. Go and TypeScript were already correct.
+- The `ApiError` handed to error hooks carried no request id in Python and TypeScript, while the
+  error thrown to the caller did, so one failure looked different depending on how it was observed.
+- A `204` response that declared a body was silently dropped by the SDK emitters while the OpenAPI
+  lowering kept it, so one graph produced two artifacts describing different contracts. The
+  contradiction is now rejected with a typed error.
+- The anonymous security alternative could not survive lowering: an empty group produced no rows,
+  so the emitted document claimed authentication was mandatory while the SDKs treated it as
+  optional.
 - Optional security (`security: [{}, {Scheme: []}]`) silently sent no credentials, because the
   always-satisfiable anonymous alternative shadowed every credentialed one.
 - Security alternatives were reordered alphabetically, discarding the author's preference order.
