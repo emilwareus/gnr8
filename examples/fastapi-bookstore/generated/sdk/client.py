@@ -31,6 +31,20 @@ BASE_RETRY_DELAY_SECONDS = 0.1
 MAX_RETRY_DELAY_SECONDS = 60.0
 
 
+def _header_value(headers: dict[str, str], name: str) -> str:
+    """Case-insensitive header lookup.
+
+    HTTP header names are case-insensitive, and the response header mapping
+    keeps whatever casing the server sent, so an exact-match lookup silently
+    misses a spelling like `X-Request-Id`.
+    """
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return ""
+
+
 class RequestOptions:
     """Per-request SDK runtime overrides."""
 
@@ -335,8 +349,7 @@ class Client:
                             "",
                             "",
                             headers=response_headers,
-                            request_id=response_headers.get("X-Request-ID")
-                            or response_headers.get("x-request-id", ""),
+                            request_id=_header_value(response_headers, "X-Request-ID"),
                             raw_body=raw,
                         ),
                     )
@@ -370,7 +383,7 @@ class Client:
 
     @classmethod
     def _retry_delay(cls, headers: dict[str, str], attempt: int) -> float:
-        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        retry_after = _header_value(headers, "Retry-After")
         if retry_after:
             try:
                 seconds = int(retry_after)
@@ -405,7 +418,7 @@ class Client:
             except Exception:
                 body = json_body
         decoded = json_body if isinstance(json_body, dict) else {}
-        request_id = headers.get("X-Request-ID") or headers.get("x-request-id", "")
+        request_id = _header_value(headers, "X-Request-ID")
         return ApiError(
             status,
             decoded.get("message", ""),
