@@ -3751,6 +3751,93 @@ mod tests {
         }
 
         #[test]
+        fn union_typed_parameters_import_union_into_the_client() {
+            // No committed example has a union-typed parameter, so without this the plumbing from
+            // the detector to client.py's fixed typing import line is untested — and a rendered
+            // `Union[..]` with no import is ruff F821 / mypy name-defined.
+            let with_union = emit_client_with_models(
+                "bookstore",
+                "models",
+                crate::sdk::model_style::PyModelStyle::default(),
+                false,
+                false,
+                false,
+                &[],
+                &crate::graph::RuntimePolicy::default(),
+                false,
+                false,
+                true,
+            );
+            assert!(
+                with_union.contains("from typing import Any, Optional, Union"),
+                "{with_union}"
+            );
+
+            let without_union = emit_client("bookstore");
+            assert!(
+                without_union.contains("from typing import Any, Optional")
+                    && !without_union.contains("Union"),
+                "{without_union}"
+            );
+        }
+
+        #[test]
+        fn union_parameter_detector_walks_nested_types() {
+            use super::super::{operations_need_parameter_unions, Operation};
+            use crate::graph::{Param, Prim, SourceSpan, Type};
+            let param = |name: &str, schema: Type| Param {
+                name: name.to_string(),
+                location: "query".to_string(),
+                required: false,
+                schema,
+                default: None,
+                style: None,
+                explode: None,
+                allow_reserved: false,
+                openapi_content: None,
+                openapi_fields: Vec::new(),
+                provenance: SourceSpan {
+                    file: "m.py".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            };
+            let op = |params: Vec<Param>| Operation {
+                id: "op".to_string(),
+                method: "GET".to_string(),
+                path: "/x".to_string(),
+                handler: "op".to_string(),
+                group: None,
+                middleware: Vec::new(),
+                params,
+                request_body: None,
+                request_body_required: false,
+                request_body_content_type: None,
+                responses: Vec::new(),
+                security: Vec::new(),
+                security_overrides_global: false,
+                provenance: SourceSpan {
+                    file: "m.py".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            };
+
+            let plain = op(vec![param("a", Type::Primitive(Prim::String))]);
+            assert!(!operations_need_parameter_unions(&[&plain]));
+
+            // A union nested inside an array still renders `Union[..]` in the signature.
+            let nested = op(vec![param(
+                "a",
+                Type::Array(Box::new(Type::Union(vec![
+                    Type::Primitive(Prim::String),
+                    Type::Primitive(Prim::Bool),
+                ]))),
+            )]);
+            assert!(operations_need_parameter_unions(&[&nested]));
+        }
+
+        #[test]
         fn errors_define_typed_apierror_with_is_not_found() {
             let out = emit_errors("bookstore");
             assert!(out.contains("class ApiError(Exception):"), "{out}");
