@@ -775,6 +775,64 @@ mod tests {
     }
 
     #[test]
+    fn split_operation_modules_import_union_for_union_typed_params() {
+        // Under a split layout the method signatures move out of client.py into api_*.py, which
+        // builds its own typing import. A union-typed param renders `Union[..]` there, so the
+        // import must follow it across — no committed example has one, so only this covers it.
+        const UNION_PARAM: &[u8] = br#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "listItems",
+              "method": "GET",
+              "path": "/items",
+              "handler": "list_items",
+              "group": "Items",
+              "params": [
+                {
+                  "name": "size",
+                  "location": "query",
+                  "required": false,
+                  "schema": { "type": "union", "of": [
+                    { "type": "primitive", "of": { "prim": "string" } },
+                    { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } }
+                  ] },
+                  "provenance": { "file": "m.py", "start_line": 1, "end_line": 1 }
+                }
+              ],
+              "request_body": null,
+              "responses": [ { "status": 204, "body": null } ],
+              "provenance": { "file": "m.py", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [],
+          "diagnostics": [],
+          "base_path": "/",
+          "title": "Items API",
+          "security": []
+        }"#;
+
+        let graph: ApiGraph = serde_json::from_slice(UNION_PARAM).expect("graph");
+        let layout = SdkFileLayout::split().operations_per_tag();
+        let bundle =
+            generate_with_layout(&graph, "app", "/", &layout).expect("generate split python sdk");
+        let files = split_bundle(&bundle);
+
+        let (path, contents) = files
+            .iter()
+            .find(|(path, _)| path.starts_with("api_"))
+            .expect("a per-tag operation module");
+        assert!(
+            contents.contains("Union["),
+            "expected a Union hint in {path}: {contents}"
+        );
+        assert!(
+            contents.contains("from typing import Any, Optional, Union"),
+            "Union must be imported where it is used in {path}: {contents}"
+        );
+    }
+
+    #[test]
     fn split_model_template_updates_model_package_imports() {
         let layout = SdkFileLayout::split()
             .model_dir("schemas")
