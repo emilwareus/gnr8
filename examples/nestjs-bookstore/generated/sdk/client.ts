@@ -365,7 +365,11 @@ export class Client {
         if (attempt < retryAttempts) {
           // Back off before reconnecting: retrying a refused connection instantly just
           // multiplies load on a service that is already restarting.
-          await this._sleep(this._backoffDelayMs(attempt), options.signal);
+          await this._waitBeforeRetry(
+            this._backoffDelayMs(attempt),
+            options.signal,
+            hookContext,
+          );
           continue;
         }
         for (const hook of this.hooks.error) {
@@ -392,9 +396,10 @@ export class Client {
         // Release the connection before retrying. An unread body keeps its socket checked out
         // of the pool until GC, so a retry storm can exhaust the pool.
         await this._discardBody(response);
-        await this._sleep(
+        await this._waitBeforeRetry(
           this._retryDelayMs(response, attempt),
           options.signal,
+          hookContext,
         );
         continue;
       }
@@ -448,6 +453,23 @@ export class Client {
 
   private _backoffDelayMs(attempt: number): number {
     return Math.min(BASE_RETRY_DELAY_MS * 2 ** attempt, MAX_RETRY_DELAY_MS);
+  }
+
+  private async _waitBeforeRetry(
+    ms: number,
+    signal: AbortSignal | undefined,
+    hookContext: HookContext,
+  ): Promise<void> {
+    try {
+      await this._sleep(ms, signal);
+    } catch (error) {
+      // Every other failure path notifies the error hooks; an abort landing mid-wait must not
+      // be the one exception, or callers lose the event entirely.
+      for (const hook of this.hooks.error) {
+        await hook(hookContext, error);
+      }
+      throw error;
+    }
   }
 
   private async _sleep(ms: number, signal?: AbortSignal): Promise<void> {
