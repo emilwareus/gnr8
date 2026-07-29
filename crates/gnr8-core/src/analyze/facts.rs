@@ -461,7 +461,7 @@ pub(crate) struct DiagnosticFact {
     /// Stable dotted diagnostic identity.
     #[serde(default = "default_diagnostic_code")]
     pub(crate) code: String,
-    /// Severity, `"WARN"` or `"ERROR"`.
+    /// Severity, `"INFO"`, `"WARN"`, or `"ERROR"`.
     pub(crate) severity: String,
     /// Stable diagnostic category.
     #[serde(default = "default_diagnostic_category")]

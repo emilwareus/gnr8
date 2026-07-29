@@ -38,7 +38,7 @@ pub const HOST_CAPABILITY_ENV: &str = "GNR8_HOST_CAPABILITY_FINGERPRINT";
 #[must_use]
 pub fn capability_fingerprint() -> String {
     let manifest = format!(
-        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1",
+        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1;declared-readiness:1",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION
     );
@@ -289,7 +289,7 @@ mod tests {
 
     use super::{capability_fingerprint, emit, inspect, ArtifactBundle, PROTOCOL_VERSION};
     use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
-    use crate::sdk::{Cx, Pipeline, Source};
+    use crate::sdk::{Artifacts, Cx, Pipeline, ReadinessKind, ReadinessTarget, Source, Target};
     use crate::CoreError;
 
     /// A source yielding a fixed graph with one diagnostic, so emit/inspect run without a toolchain.
@@ -311,6 +311,20 @@ mod tests {
                 )],
                 ..ApiGraph::default()
             })
+        }
+    }
+
+    struct StubTarget;
+    impl Target for StubTarget {
+        fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+            out.create("generated/openapi.yaml", "openapi: 3.1.0\n")
+        }
+
+        fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.yaml",
+            )]
         }
     }
 
@@ -338,6 +352,35 @@ mod tests {
         let json = inspect(&Pipeline::new().source(StubSource), &cx()).unwrap();
         // The IR JSON carries the title the source set.
         assert!(json.contains("\"title\": \"Stub API\""), "{json}");
+    }
+
+    #[test]
+    fn emit_carries_declared_readiness_targets_across_the_wire() {
+        let json = emit(
+            &Pipeline::new().source(StubSource).target(StubTarget),
+            &cx(),
+        )
+        .unwrap();
+        let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            bundle.readiness_targets,
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.yaml",
+            )]
+        );
+    }
+
+    #[test]
+    fn bundles_without_readiness_targets_deserialize_to_an_empty_list() {
+        let json = emit(&Pipeline::new().source(StubSource), &cx()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("readiness_targets");
+
+        let bundle: ArtifactBundle = serde_json::from_value(value).unwrap();
+
+        assert!(bundle.readiness_targets.is_empty());
     }
 
     #[test]

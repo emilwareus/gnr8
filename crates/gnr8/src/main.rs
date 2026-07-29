@@ -320,6 +320,7 @@ struct LifecycleTimings {
 #[derive(Debug, serde::Serialize)]
 struct DiagnosticCounts {
     total: usize,
+    info: usize,
     warn: usize,
     error: usize,
 }
@@ -1850,32 +1851,72 @@ fn validate_typescript_package_entrypoints(package_dir: &Path) -> Result<(), Str
         .get("main")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "generated package.json is missing string entrypoint main".to_string())?;
-    let declarations = package
-        .get("types")
-        .and_then(serde_json::Value::as_str)
-        .map(|value| ("types", value))
-        .or_else(|| {
-            package
-                .get("typings")
-                .and_then(serde_json::Value::as_str)
-                .map(|value| ("typings", value))
-        })
-        .ok_or_else(|| {
+    let declarations = if let Some(types) = package.get("types") {
+        (
+            "types",
+            types.as_str().ok_or_else(|| {
+                "generated package.json entrypoint types must be a string".to_string()
+            })?,
+        )
+    } else {
+        let typings = package.get("typings").ok_or_else(|| {
             "generated package.json is missing string entrypoint types or typings".to_string()
         })?;
-    let mut entrypoints = vec![("main", main), declarations];
-    if let Some(module) = package.get("module").and_then(serde_json::Value::as_str) {
-        entrypoints.push(("module", module));
+        (
+            "typings",
+            typings.as_str().ok_or_else(|| {
+                "generated package.json entrypoint typings must be a string".to_string()
+            })?,
+        )
+    };
+    let mut entrypoints = vec![
+        ("main".to_string(), main),
+        (declarations.0.to_string(), declarations.1),
+    ];
+    if let Some(module) = package.get("module") {
+        entrypoints.push((
+            "module".to_string(),
+            module.as_str().ok_or_else(|| {
+                "generated package.json entrypoint module must be a string".to_string()
+            })?,
+        ));
     }
-    if let Some(exports) = package.pointer("/exports/.") {
+    if let Some(exports_root) = package.get("exports") {
+        let (exports, label_prefix) = match exports_root {
+            serde_json::Value::Object(root) if root.contains_key(".") => (&root["."], "exports[.]"),
+            serde_json::Value::Object(_) | serde_json::Value::String(_) => {
+                (exports_root, "exports")
+            }
+            _ => {
+                return Err(
+                    "generated package.json entrypoint exports must be a string or object"
+                        .to_string(),
+                );
+            }
+        };
         if let Some(relative) = exports.as_str() {
-            entrypoints.push(("exports[.]", relative));
-        } else {
+            entrypoints.push((label_prefix.to_string(), relative));
+        } else if let Some(exports) = exports.as_object() {
+            let mut recognized = false;
             for key in ["types", "import", "require", "default"] {
-                if let Some(relative) = exports.get(key).and_then(serde_json::Value::as_str) {
-                    entrypoints.push((key, relative));
+                if let Some(value) = exports.get(key) {
+                    let label = format!("{label_prefix}.{key}");
+                    let relative = value.as_str().ok_or_else(|| {
+                        format!("generated package.json entrypoint {label} must be a string")
+                    })?;
+                    entrypoints.push((label, relative));
+                    recognized = true;
                 }
             }
+            if !recognized {
+                return Err(format!(
+                    "generated package.json {label_prefix} has no supported string entrypoints"
+                ));
+            }
+        } else {
+            return Err(format!(
+                "generated package.json entrypoint {label_prefix} must be a string or object"
+            ));
         }
     }
 
@@ -2086,9 +2127,15 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
         return;
     }
     if output.verbose == 0 {
+        let counts = diagnostic_counts(diagnostics);
+        let level = if counts.warn == 0 && counts.error == 0 {
+            "info"
+        } else {
+            "warning"
+        };
         eprintln!(
-            "warning: {} pipeline diagnostics (run with -v for details)",
-            diagnostics.len()
+            "{level}: {} pipeline diagnostics (run with -v for details)",
+            counts.total
         );
         return;
     }
@@ -2101,6 +2148,10 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
 }
 
 fn diagnostic_counts(diagnostics: &[gnr8::graph::Diagnostic]) -> DiagnosticCounts {
+    let info = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("INFO"))
+        .count();
     let warn = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("WARN"))
@@ -2111,6 +2162,7 @@ fn diagnostic_counts(diagnostics: &[gnr8::graph::Diagnostic]) -> DiagnosticCount
         .count();
     DiagnosticCounts {
         total: diagnostics.len(),
+        info,
         warn,
         error,
     }
@@ -2134,10 +2186,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        link_typescript_node_modules, local_node_modules, local_typescript_compiler,
-        reconcile_doctor_source_probe, text_output_excerpt, typescript_compiler,
-        validate_typescript_package_entrypoints, MaterializedTarget, TypeScriptCompiler,
+        diagnostic_counts, link_typescript_node_modules, local_node_modules,
+        local_typescript_compiler, readiness_for_target, reconcile_doctor_source_probe,
+        text_output_excerpt, typescript_compiler, validate_typescript_package_entrypoints,
+        MaterializedTarget, TypeScriptCompiler,
     };
+    use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
+    use gnr8::sdk::{Artifact, ReadinessKind, ReadinessTarget};
     use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
@@ -2177,6 +2232,44 @@ mod tests {
 
         assert_eq!(language, "configured");
         assert!(present);
+    }
+
+    #[test]
+    fn diagnostic_counts_report_all_supported_severities() {
+        let diagnostic = |severity| {
+            Diagnostic::new(
+                "source.test",
+                DiagnosticCategory::Source,
+                severity,
+                "test",
+                SourceSpan {
+                    file: "src/service.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            )
+        };
+        let counts =
+            diagnostic_counts(&[diagnostic("INFO"), diagnostic("WARN"), diagnostic("ERROR")]);
+
+        assert_eq!(
+            (counts.total, counts.info, counts.warn, counts.error),
+            (3, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn declared_openapi_readiness_requires_the_exact_artifact() {
+        let readiness = readiness_for_target(
+            &ReadinessTarget::new(ReadinessKind::OpenApi, "generated/openapi.yaml"),
+            &[Artifact::new(
+                "generated/other.yaml",
+                "openapi: 3.1.0\ninfo:\n  title: Other\n  version: 1.0.0\npaths: {}\n",
+            )],
+        );
+
+        assert_eq!(readiness.status, "not_ready");
+        assert!(readiness.reason.contains("did not emit its artifact"));
     }
 
     #[test]
@@ -2286,6 +2379,88 @@ mod tests {
         .unwrap();
 
         assert!(validate_typescript_package_entrypoints(&root).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_package_rejects_non_string_optional_entrypoint() {
+        let root = temp_root("package-invalid-module");
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/index.js"), "exports.answer = 42;\n").unwrap();
+        std::fs::write(
+            root.join("dist/index.d.ts"),
+            "export declare const answer: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "module": false
+}"#,
+        )
+        .unwrap();
+
+        let err = validate_typescript_package_entrypoints(&root).unwrap_err();
+
+        assert!(err.contains("module must be a string"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_package_rejects_unsupported_exports_shape() {
+        let root = temp_root("package-invalid-exports");
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/index.js"), "exports.answer = 42;\n").unwrap();
+        std::fs::write(
+            root.join("dist/index.d.ts"),
+            "export declare const answer: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "browser": "./dist/index.js"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let err = validate_typescript_package_entrypoints(&root).unwrap_err();
+
+        assert!(err.contains("no supported string entrypoints"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_package_rejects_invalid_top_level_exports() {
+        let root = temp_root("package-invalid-root-exports");
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/index.js"), "exports.answer = 42;\n").unwrap();
+        std::fs::write(
+            root.join("dist/index.d.ts"),
+            "export declare const answer: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": false
+}"#,
+        )
+        .unwrap();
+
+        let err = validate_typescript_package_entrypoints(&root).unwrap_err();
+
+        assert!(err.contains("exports must be a string or object"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 

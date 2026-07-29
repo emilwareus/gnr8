@@ -460,12 +460,14 @@ impl ReadinessTarget {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessKind {
     /// Parse and validate an OpenAPI artifact.
+    #[serde(rename = "openapi")]
     OpenApi,
     /// Compile and vet a generated Go package.
     Go,
     /// Compile and import a generated Python package.
     Python,
     /// Type-check and validate a generated TypeScript package.
+    #[serde(rename = "typescript")]
     TypeScript,
 }
 
@@ -1153,7 +1155,10 @@ mod tests {
     // so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{stamp_project_paths, Artifacts, Cx, Pipeline, Source, Target, Transform};
+    use super::{
+        stamp_project_paths, Artifacts, Cx, Pipeline, ReadinessKind, ReadinessTarget, Source,
+        Target, Transform,
+    };
     use crate::graph::ApiGraph;
     use crate::CoreError;
 
@@ -1191,6 +1196,26 @@ mod tests {
 
         fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
             Ok(vec![cx.project_root.join(self.source)])
+        }
+    }
+
+    struct ReadinessOnlyTarget {
+        kind: ReadinessKind,
+        path: &'static str,
+    }
+
+    impl Target for ReadinessOnlyTarget {
+        fn generate(
+            &self,
+            _ir: &ApiGraph,
+            _out: &mut Artifacts,
+            _cx: &Cx,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+            vec![ReadinessTarget::new(self.kind, self.path)]
         }
     }
 
@@ -1249,6 +1274,43 @@ mod tests {
             .unwrap();
         // The later transform wins → ordered application.
         assert_eq!(ir.title, "Second");
+    }
+
+    #[test]
+    fn readiness_targets_are_sorted_and_deduplicated() {
+        let pipeline = Pipeline::new()
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::TypeScript,
+                path: "generated/z",
+            })
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::OpenApi,
+                path: "generated/openapi.yaml",
+            })
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::TypeScript,
+                path: "generated/z",
+            });
+
+        assert_eq!(
+            pipeline.readiness_targets(),
+            vec![
+                ReadinessTarget::new(ReadinessKind::OpenApi, "generated/openapi.yaml"),
+                ReadinessTarget::new(ReadinessKind::TypeScript, "generated/z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_kind_uses_canonical_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&ReadinessKind::OpenApi).unwrap(),
+            "\"openapi\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReadinessKind::TypeScript).unwrap(),
+            "\"typescript\""
+        );
     }
 
     #[test]

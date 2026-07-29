@@ -672,7 +672,7 @@ impl From<DiagnosticCategoryFact> for DiagnosticCategory {
 pub struct Diagnostic {
     /// Stable dotted identity used by [`crate::sdk::builtins::DiagnosticPolicy`].
     pub code: String,
-    /// Severity, `"WARN"` or `"ERROR"`.
+    /// Severity, `"INFO"`, `"WARN"`, or `"ERROR"`.
     pub severity: String,
     /// Stable category used for broader policy matching.
     pub category: DiagnosticCategory,
@@ -745,7 +745,7 @@ impl Diagnostic {
 ///
 /// Graph-owned (not the crate-private `facts::SourceSpan`) so the public graph surface is
 /// self-contained and the analyzed-module prefix has been stripped from `file` for portability.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     /// The source file path, relative to the analyzed module.
     pub file: String,
@@ -819,6 +819,13 @@ impl ApiGraph {
                 .cmp(&b.file)
                 .then_with(|| a.line.cmp(&b.line))
                 .then_with(|| a.message.cmp(&b.message))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.severity.cmp(&b.severity))
+                .then_with(|| a.category.cmp(&b.category))
+                .then_with(|| a.span.cmp(&b.span))
+                .then_with(|| a.operation.cmp(&b.operation))
+                .then_with(|| a.schema.cmp(&b.schema))
+                .then_with(|| a.subject.cmp(&b.subject))
         });
         diagnostics.dedup();
 
@@ -1340,11 +1347,22 @@ mod tests {
     #[test]
     fn exact_duplicate_diagnostics_are_collapsed() {
         let mut facts = sample_facts();
-        facts.diagnostics.push(facts.diagnostics[0].clone());
+        let duplicate = facts.diagnostics[0].clone();
+        let mut same_rendered_location = duplicate.clone();
+        same_rendered_location.code = "schema.other".to_string();
+        facts.diagnostics = vec![duplicate.clone(), same_rendered_location, duplicate.clone()];
 
         let graph = ApiGraph::from_facts(facts, "/root");
 
-        assert_eq!(graph.diagnostics.len(), 1);
+        assert_eq!(graph.diagnostics.len(), 2);
+        assert_eq!(
+            graph
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == duplicate.code)
+                .count(),
+            1
+        );
     }
 
     #[test]

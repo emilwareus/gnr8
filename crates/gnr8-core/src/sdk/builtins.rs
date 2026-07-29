@@ -7777,10 +7777,30 @@ mod tests {
             )]
         );
         assert_eq!(
+            OpenApi31Json::new()
+                .to("generated/openapi.json")
+                .readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.json",
+            )]
+        );
+        assert_eq!(
+            GoSdk::new().to("generated/go").readiness_targets(),
+            vec![ReadinessTarget::new(ReadinessKind::Go, "generated/go")]
+        );
+        assert_eq!(
             PySdk::new().to("generated/python").readiness_targets(),
             vec![ReadinessTarget::new(
                 ReadinessKind::Python,
                 "generated/python",
+            )]
+        );
+        assert_eq!(
+            TsSdk::new().to("generated/typescript").readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::TypeScript,
+                "generated/typescript",
             )]
         );
         assert!(StaticFiles::new()
