@@ -455,7 +455,7 @@ pub(crate) struct TypeRef {
 }
 
 /// One diagnostic (lossy/unsupported pattern) with a source location (D-10).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiagnosticFact {
     /// Stable dotted diagnostic identity.

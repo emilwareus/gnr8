@@ -422,6 +422,51 @@ pub trait Target {
     fn output_anchors(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Generated targets that `gnr8 doctor` can validate with a built-in readiness check.
+    ///
+    /// Output anchors describe ownership and loop safety; they are not necessarily standalone
+    /// packages. Targets opt into readiness explicitly so static overlays and support files are not
+    /// misclassified from their file extensions.
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        Vec::new()
+    }
+}
+
+/// A generated target that `gnr8 doctor` can validate after the pipeline runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ReadinessTarget {
+    /// The validator to run.
+    pub kind: ReadinessKind,
+    /// Project-relative artifact path or package directory.
+    pub output_path: String,
+}
+
+impl ReadinessTarget {
+    /// Declare a generated target readiness check.
+    #[must_use]
+    pub fn new(kind: ReadinessKind, output_path: impl Into<String>) -> Self {
+        Self {
+            kind,
+            output_path: output_path.into(),
+        }
+    }
+}
+
+/// Built-in readiness validators available to generated targets.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessKind {
+    /// Parse and validate an OpenAPI artifact.
+    OpenApi,
+    /// Compile and vet a generated Go package.
+    Go,
+    /// Compile and import a generated Python package.
+    Python,
+    /// Type-check and validate a generated TypeScript package.
+    TypeScript,
 }
 
 /// A post-processor: [`Artifacts`] → [`Artifacts`], run (in order) after all targets and before the
@@ -512,6 +557,19 @@ impl Pipeline {
             .iter()
             .flat_map(|target| target.output_anchors())
             .collect()
+    }
+
+    /// Readiness checks declared by every target in this pipeline.
+    #[must_use]
+    pub fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        let mut targets = self
+            .targets
+            .iter()
+            .flat_map(|target| target.readiness_targets())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        targets
     }
 
     /// Source input roots that are safe for the host to rescan before a hot no-op child skip.
@@ -1080,8 +1138,8 @@ pub mod prelude {
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::{
-        Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
-        Target, Transform,
+        Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, ReadinessKind,
+        ReadinessTarget, Source, Target, Transform,
     };
     pub use crate::graph::{
         DiagnosticCategory, OpenApiContact, OpenApiLicense, OpenApiServer, PaginationMode,

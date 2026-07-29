@@ -20,7 +20,7 @@
 use std::process::ExitCode;
 
 use crate::graph::Diagnostic;
-use crate::sdk::{Artifact, Cx, FileStamp, Pipeline};
+use crate::sdk::{Artifact, Cx, FileStamp, Pipeline, ReadinessTarget};
 use crate::CoreError;
 
 /// The current host/child protocol version. Bumped on any breaking change to the JSON shape;
@@ -75,6 +75,9 @@ pub struct ArtifactBundle {
     /// Project-relative target output anchors, used by the host to prune stale generated files.
     #[serde(default)]
     pub output_anchors: Vec<String>,
+    /// Generated targets that the host can validate with built-in readiness checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readiness_targets: Vec<ReadinessTarget>,
     /// Optional key for artifacts stored under `.gnr8/cache/artifacts/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_cache_key: Option<String>,
@@ -93,6 +96,7 @@ impl ArtifactBundle {
         artifacts: Vec<Artifact>,
         diagnostics: Vec<Diagnostic>,
         output_anchors: Vec<String>,
+        readiness_targets: Vec<ReadinessTarget>,
         artifact_cache_key: Option<String>,
         cache_input_roots: Vec<String>,
         cache_input_stamps: Vec<FileStamp>,
@@ -105,6 +109,7 @@ impl ArtifactBundle {
             artifacts,
             diagnostics,
             output_anchors,
+            readiness_targets,
             artifact_cache_key,
             cache_input_roots,
             cache_input_stamps,
@@ -237,6 +242,7 @@ fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
         outcome.artifacts.into_files(),
         outcome.diagnostics,
         pipeline.output_anchors(),
+        pipeline.readiness_targets(),
         outcome.artifact_cache_key,
         pipeline.cache_input_roots(cx),
         pipeline.cache_input_stamps(cx),
@@ -322,6 +328,7 @@ mod tests {
         assert_eq!(bundle.core_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(bundle.capability_fingerprint, capability_fingerprint());
         assert!(bundle.artifacts.is_empty());
+        assert!(bundle.readiness_targets.is_empty());
         assert_eq!(bundle.diagnostics.len(), 1);
         assert_eq!(bundle.diagnostics[0].message, "stub diagnostic");
     }

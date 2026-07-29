@@ -13,6 +13,7 @@ import "github.com/gnr8/goextract/internal/facts"
 
 const severityWarn = "WARN"
 const severityError = "ERROR"
+const severityInfo = "INFO"
 
 const (
 	categorySource           = "source"
@@ -32,12 +33,12 @@ func New() *Accumulator {
 	return &Accumulator{items: []facts.DiagnosticFact{}}
 }
 
-// FreeFormMap records the free-form map warning for a struct field
+// FreeFormMap records the free-form map diagnostic for a struct field
 // (TARGET-API.md §5.1): map[string]any lowers to additionalProperties: true.
 func (a *Accumulator) FreeFormMap(structName, fieldName, goType, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Code:     "schema.free_form_map",
-		Severity: severityWarn,
+		Severity: severityInfo,
 		Category: categorySchema,
 		Message: "free-form map field: " + structName + "." + fieldName +
 			" (" + goType + ") lowers to additionalProperties: true (TARGET-API.md §5.1)",

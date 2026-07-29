@@ -13,10 +13,9 @@ mod doctor;
 mod render;
 mod watch;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -25,8 +24,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let output = Output::new(cli.json, cli.verbose);
 
-    // `inspect` renders straight to stdout. In initialized projects it delegates to the user's `.gnr8/`
-    // child pipeline, while uninitialized/direct use still analyzes the requested source path.
+    // `inspect` renders straight to stdout. With no path it delegates to the user's `.gnr8/` child
+    // pipeline; an explicit path requests direct source analysis.
     // The remaining commands either scaffold (`init`) or delegate to the user's `.gnr8/` child crate and
     // own writing/policy.
     match &cli.command {
@@ -1207,89 +1206,56 @@ fn collect_sdk_readiness(
         )];
     }
 
-    let groups = artifact_groups_by_anchor(bundle);
-    let mut readiness = groups
-        .into_iter()
-        .filter_map(|(anchor, artifacts)| readiness_for_artifact_group(&anchor, &artifacts))
-        .collect::<Vec<_>>();
-    // Nested StaticFiles anchors can share one Python package root — keep a single readiness entry.
-    dedupe_python_readiness(&mut readiness);
-    readiness
+    bundle
+        .readiness_targets
+        .iter()
+        .map(|target| {
+            let artifacts = artifacts_for_readiness(bundle, target);
+            readiness_for_target(target, &artifacts)
+        })
+        .collect()
 }
 
-fn dedupe_python_readiness(readiness: &mut Vec<doctor::SdkReadiness>) {
-    let mut seen_roots = BTreeSet::new();
-    readiness.retain(|entry| {
-        if entry.language != "python" {
-            return true;
-        }
-        seen_roots.insert(entry.output_path.clone())
-    });
-}
-
-fn artifact_groups_by_anchor(
+fn artifacts_for_readiness(
     bundle: &gnr8::runner::ArtifactBundle,
-) -> BTreeMap<String, Vec<gnr8::sdk::Artifact>> {
-    let mut groups: BTreeMap<String, Vec<gnr8::sdk::Artifact>> = BTreeMap::new();
-    for anchor in &bundle.output_anchors {
-        let normalized = anchor.trim_end_matches('/').to_string();
-        if normalized.is_empty() {
-            continue;
-        }
-        let prefix = format!("{normalized}/");
-        let artifacts = bundle
-            .artifacts
-            .iter()
-            .filter(|artifact| artifact.path == normalized || artifact.path.starts_with(&prefix))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !artifacts.is_empty() {
-            groups.insert(normalized, artifacts);
-        }
-    }
-    groups
+    target: &gnr8::sdk::ReadinessTarget,
+) -> Vec<gnr8::sdk::Artifact> {
+    let output_path = target.output_path.trim_end_matches('/');
+    let prefix = format!("{output_path}/");
+    bundle
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.path == output_path || artifact.path.starts_with(&prefix))
+        .cloned()
+        .collect()
 }
 
-fn readiness_for_artifact_group(
-    anchor: &str,
+fn readiness_for_target(
+    target: &gnr8::sdk::ReadinessTarget,
     artifacts: &[gnr8::sdk::Artifact],
-) -> Option<doctor::SdkReadiness> {
-    if let Some(openapi) = artifacts
-        .iter()
-        .find(|artifact| is_openapi_artifact(&artifact.path, &artifact.text))
-    {
-        return Some(validate_openapi_target(&openapi.path, &openapi.text));
-    }
-    if artifacts
-        .iter()
-        .any(|artifact| path_extension_is(&artifact.path, "go"))
-    {
-        return Some(validate_go_target(anchor, artifacts));
-    }
-    if artifacts
-        .iter()
-        .any(|artifact| path_extension_is(&artifact.path, "py"))
-    {
-        return Some(validate_python_target(anchor, artifacts));
-    }
-    if artifacts
-        .iter()
-        .any(|artifact| path_extension_is(&artifact.path, "ts"))
-    {
-        return Some(validate_typescript_target(anchor, artifacts));
-    }
-    None
-}
+) -> doctor::SdkReadiness {
+    use gnr8::sdk::ReadinessKind;
 
-fn is_openapi_artifact(path: &str, text: &str) -> bool {
-    let openapi_like = text.contains("openapi:")
-        || text.contains("\"openapi\"")
-        || text.contains("swagger:")
-        || text.contains("\"swagger\"");
-    (path_extension_is(path, "yaml")
-        || path_extension_is(path, "yml")
-        || path_extension_is(path, "json"))
-        && openapi_like
+    let output_path = target.output_path.as_str();
+    match target.kind {
+        ReadinessKind::OpenApi => artifacts
+            .iter()
+            .find(|artifact| artifact.path == output_path)
+            .map_or_else(
+                || {
+                    doctor::SdkReadiness::not_ready(
+                        "openapi",
+                        output_path,
+                        "built-in OpenAPI parser",
+                        "declared OpenAPI target did not emit its artifact",
+                    )
+                },
+                |artifact| validate_openapi_target(&artifact.path, &artifact.text),
+            ),
+        ReadinessKind::Go => validate_go_target(output_path, artifacts),
+        ReadinessKind::Python => validate_python_target(output_path, artifacts),
+        ReadinessKind::TypeScript => validate_typescript_target(output_path, artifacts),
+    }
 }
 
 fn path_extension_is(path: &str, ext: &str) -> bool {
@@ -1492,6 +1458,13 @@ fn validate_typescript_target(
         // Prefer the package project build so doctor honors tsconfig paths/rootDir.
         if let Err(reason) = typescript_build(&tsc, &materialized.target_dir) {
             return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+        }
+        if materialized.target_dir.join("tsconfig.esm.json").is_file() {
+            if let Err(reason) =
+                typescript_build_config(&tsc, &materialized.target_dir, "tsconfig.esm.json")
+            {
+                return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
+            }
         }
         if let Err(reason) = validate_typescript_package_entrypoints(&materialized.target_dir) {
             return doctor::SdkReadiness::not_ready("typescript", anchor, TOOLCHAIN, reason);
@@ -1852,9 +1825,17 @@ fn typescript_typecheck(
 }
 
 fn typescript_build(compiler: &TypeScriptCompiler, cwd: &Path) -> Result<(), String> {
+    typescript_build_config(compiler, cwd, "tsconfig.json")
+}
+
+fn typescript_build_config(
+    compiler: &TypeScriptCompiler,
+    cwd: &Path,
+    config: &str,
+) -> Result<(), String> {
     run_typescript_compiler(
         compiler,
-        &["--project".to_string(), "tsconfig.json".to_string()],
+        &["--project".to_string(), config.to_string()],
         cwd,
     )
 }
@@ -1865,17 +1846,40 @@ fn validate_typescript_package_entrypoints(package_dir: &Path) -> Result<(), Str
         .map_err(|err| format!("failed to read '{}': {err}", package_path.display()))?;
     let package: serde_json::Value = serde_json::from_str(&text)
         .map_err(|err| format!("invalid generated package.json: {err}"))?;
-    for (label, value) in [
-        ("main", package.get("main")),
-        ("types", package.get("types")),
-        ("exports[.].types", package.pointer("/exports/./types")),
-        ("exports[.].import", package.pointer("/exports/./import")),
-        ("exports[.].require", package.pointer("/exports/./require")),
-        ("exports[.].default", package.pointer("/exports/./default")),
-    ] {
-        let relative = value.and_then(serde_json::Value::as_str).ok_or_else(|| {
-            format!("generated package.json is missing string entrypoint {label}")
+    let main = package
+        .get("main")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "generated package.json is missing string entrypoint main".to_string())?;
+    let declarations = package
+        .get("types")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| ("types", value))
+        .or_else(|| {
+            package
+                .get("typings")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| ("typings", value))
+        })
+        .ok_or_else(|| {
+            "generated package.json is missing string entrypoint types or typings".to_string()
         })?;
+    let mut entrypoints = vec![("main", main), declarations];
+    if let Some(module) = package.get("module").and_then(serde_json::Value::as_str) {
+        entrypoints.push(("module", module));
+    }
+    if let Some(exports) = package.pointer("/exports/.") {
+        if let Some(relative) = exports.as_str() {
+            entrypoints.push(("exports[.]", relative));
+        } else {
+            for key in ["types", "import", "require", "default"] {
+                if let Some(relative) = exports.get(key).and_then(serde_json::Value::as_str) {
+                    entrypoints.push((key, relative));
+                }
+            }
+        }
+    }
+
+    for (label, relative) in entrypoints {
         let relative = Path::new(relative.strip_prefix("./").unwrap_or(relative));
         if relative.is_absolute()
             || relative
@@ -2026,22 +2030,22 @@ fn run_watch(debounce_ms: u64, output: Output) -> Result<()> {
 
 /// Build the API graph for an `inspect` subcommand, render it (table or `--json`), and print it.
 ///
-/// In a project with `.gnr8/`, inspect uses the same child `__inspect` pipeline as generation so source
-/// package filters, transforms, and resource/toolchain resolution match `generate`/`check`. Without a
-/// local `.gnr8/` workspace it falls back to direct source inspection of the provided path.
+/// With no path, inspect uses the same child `__inspect` pipeline as generation so source package
+/// filters, transforms, and resource/toolchain resolution match `generate`/`check`. An explicit path
+/// requests direct source inspection.
 fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     let total_start = Instant::now();
     let rendered = match action {
         InspectAction::Routes { path } => {
-            let graph = inspect_graph(path, output)?;
+            let graph = inspect_graph(path.as_deref(), output)?;
             render::render_routes(&graph, output.json)?
         }
         InspectAction::Schemas { path } => {
-            let graph = inspect_graph(path, output)?;
+            let graph = inspect_graph(path.as_deref(), output)?;
             render::render_schemas(&graph, output.json)?
         }
         InspectAction::Graph { path } => {
-            let graph = inspect_graph(path, output)?;
+            let graph = inspect_graph(path.as_deref(), output)?;
             render::render_graph(&graph, output.json)?
         }
     };
@@ -2050,7 +2054,12 @@ fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     Ok(())
 }
 
-fn inspect_graph(path: &str, output: Output) -> Result<gnr8::graph::ApiGraph> {
+fn inspect_graph(path: Option<&str>, output: Output) -> Result<gnr8::graph::ApiGraph> {
+    if let Some(path) = path {
+        output.verbose(format!("inspect: analyzing source path directly: {path}"));
+        return Ok(gnr8::analyze::build_graph(path)?);
+    }
+
     let root = project_root()?;
     if gnr8::workspace::manifest_path(&root).is_file() {
         output.verbose(format!(
@@ -2059,8 +2068,7 @@ fn inspect_graph(path: &str, output: Output) -> Result<gnr8::graph::ApiGraph> {
         ));
         return Ok(child::inspect_child(&root)?);
     }
-    output.verbose(format!("inspect: analyzing source path directly: {path}"));
-    Ok(gnr8::analyze::build_graph(path)?)
+    bail!("no .gnr8 pipeline found; run `gnr8 init` or pass a source path to `gnr8 inspect`")
 }
 
 fn lifecycle_summary(outcome: &gnr8::lifecycle::GenerateOutcome) -> String {
@@ -2249,6 +2257,35 @@ mod tests {
         std::fs::remove_file(root.join("dist/index.js")).unwrap();
         let err = validate_typescript_package_entrypoints(&root).unwrap_err();
         assert!(err.contains("does not exist after build"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn typescript_package_accepts_typings_without_exports() {
+        let root = temp_root("package-typings");
+        std::fs::create_dir_all(root.join("dist/esm")).unwrap();
+        std::fs::write(root.join("dist/index.js"), "exports.answer = 42;\n").unwrap();
+        std::fs::write(
+            root.join("dist/esm/index.js"),
+            "export const answer = 42;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("dist/index.d.ts"),
+            "export declare const answer: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "main": "./dist/index.js",
+  "typings": "./dist/index.d.ts",
+  "module": "./dist/esm/index.js"
+}"#,
+        )
+        .unwrap();
+
+        assert!(validate_typescript_package_entrypoints(&root).is_ok());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -2,6 +2,16 @@ package diag
 
 import "testing"
 
+func TestFreeFormMapIsInformationalBecauseItIsFullyRepresented(t *testing.T) {
+	diagnostics := New()
+	diagnostics.FreeFormMap("Widget", "Metadata", "map[string]any", "widget.go", 12)
+
+	diagnostic := diagnostics.Items()[0]
+	if diagnostic.Severity != severityInfo {
+		t.Fatalf("severity = %q, want %q", diagnostic.Severity, severityInfo)
+	}
+}
+
 func TestDynamicResponseCarriesRouteIdentity(t *testing.T) {
 	diagnostics := New()
 	diagnostics.DynamicResponse("POST", "/widgets", "createWidget", "dynamic body", "handlers.go", 42)

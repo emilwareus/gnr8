@@ -668,7 +668,7 @@ impl From<DiagnosticCategoryFact> for DiagnosticCategory {
 ///
 /// Derives `Deserialize` as well as `Serialize` so it survives the host↔child JSON boundary inside
 /// an [`crate::runner::ArtifactBundle`] (the host deserializes the child's emitted bundle).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Diagnostic {
     /// Stable dotted identity used by [`crate::sdk::builtins::DiagnosticPolicy`].
     pub code: String,
@@ -745,7 +745,7 @@ impl Diagnostic {
 ///
 /// Graph-owned (not the crate-private `facts::SourceSpan`) so the public graph surface is
 /// self-contained and the analyzed-module prefix has been stripped from `file` for portability.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     /// The source file path, relative to the analyzed module.
     pub file: String,
@@ -820,6 +820,7 @@ impl ApiGraph {
                 .then_with(|| a.line.cmp(&b.line))
                 .then_with(|| a.message.cmp(&b.message))
         });
+        diagnostics.dedup();
 
         Self {
             module: facts.module,
@@ -1334,6 +1335,16 @@ mod tests {
             assert!(!schema.provenance.file.starts_with('/'));
         }
         assert_eq!(graph.diagnostics[0].file, "goal.go");
+    }
+
+    #[test]
+    fn exact_duplicate_diagnostics_are_collapsed() {
+        let mut facts = sample_facts();
+        facts.diagnostics.push(facts.diagnostics[0].clone());
+
+        let graph = ApiGraph::from_facts(facts, "/root");
+
+        assert_eq!(graph.diagnostics.len(), 1);
     }
 
     #[test]

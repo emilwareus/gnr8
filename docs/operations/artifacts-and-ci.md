@@ -22,7 +22,7 @@ The current bundle protocol is version 3 and carries:
 
 - protocol, host CLI, child core version, and capability fingerprint;
 - sorted artifacts with producer/ownership/rewrite history;
-- structured diagnostics and target output anchors;
+- structured diagnostics, target output anchors, and explicitly declared readiness targets;
 - artifact cache key, input roots, and input file stamps.
 
 Handshake environment variables are `GNR8_HOST_PROTOCOL_VERSION`, `GNR8_HOST_CLI_VERSION`, and

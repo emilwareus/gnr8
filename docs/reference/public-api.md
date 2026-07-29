@@ -116,6 +116,8 @@ See [OpenAPI generation](../openapi/generation.md).
 | `SdkModel` | normalized target-facing SDK model built from the graph |
 | `PyModelStyle` | Pydantic v2 or stdlib dataclass model policy |
 | `StaticFiles` | copy exact companion files or included directory trees |
+| `ReadinessTarget` | declare a generated package/artifact for `doctor` validation |
+| `ReadinessKind` | choose the OpenAPI, Go, Python, or TypeScript readiness validator |
 
 See [SDK generation](../sdk/generation.md).
 
