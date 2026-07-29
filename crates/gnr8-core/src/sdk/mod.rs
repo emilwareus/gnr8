@@ -422,6 +422,53 @@ pub trait Target {
     fn output_anchors(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Generated targets that `gnr8 doctor` can validate with a built-in readiness check.
+    ///
+    /// Output anchors describe ownership and loop safety; they are not necessarily standalone
+    /// packages. Targets opt into readiness explicitly so static overlays and support files are not
+    /// misclassified from their file extensions.
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        Vec::new()
+    }
+}
+
+/// A generated target that `gnr8 doctor` can validate after the pipeline runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ReadinessTarget {
+    /// The validator to run.
+    pub kind: ReadinessKind,
+    /// Project-relative artifact path or package directory.
+    pub output_path: String,
+}
+
+impl ReadinessTarget {
+    /// Declare a generated target readiness check.
+    #[must_use]
+    pub fn new(kind: ReadinessKind, output_path: impl Into<String>) -> Self {
+        Self {
+            kind,
+            output_path: output_path.into(),
+        }
+    }
+}
+
+/// Built-in readiness validators available to generated targets.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessKind {
+    /// Parse and validate an OpenAPI artifact.
+    #[serde(rename = "openapi")]
+    OpenApi,
+    /// Compile and vet a generated Go package.
+    Go,
+    /// Compile and import a generated Python package.
+    Python,
+    /// Type-check and validate a generated TypeScript package.
+    #[serde(rename = "typescript")]
+    TypeScript,
 }
 
 /// A post-processor: [`Artifacts`] → [`Artifacts`], run (in order) after all targets and before the
@@ -512,6 +559,19 @@ impl Pipeline {
             .iter()
             .flat_map(|target| target.output_anchors())
             .collect()
+    }
+
+    /// Readiness checks declared by every target in this pipeline.
+    #[must_use]
+    pub fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        let mut targets = self
+            .targets
+            .iter()
+            .flat_map(|target| target.readiness_targets())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        targets
     }
 
     /// Source input roots that are safe for the host to rescan before a hot no-op child skip.
@@ -1080,8 +1140,8 @@ pub mod prelude {
     pub use super::model::SdkModel;
     pub use super::model_style::PyModelStyle;
     pub use super::{
-        Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, Source,
-        Target, Transform,
+        Artifact, ArtifactMetadata, Artifacts, Cx, FileStamp, Pipeline, PostProcess, ReadinessKind,
+        ReadinessTarget, Source, Target, Transform,
     };
     pub use crate::graph::{
         DiagnosticCategory, OpenApiContact, OpenApiLicense, OpenApiServer, PaginationMode,
@@ -1095,7 +1155,10 @@ mod tests {
     // so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{stamp_project_paths, Artifacts, Cx, Pipeline, Source, Target, Transform};
+    use super::{
+        stamp_project_paths, Artifacts, Cx, Pipeline, ReadinessKind, ReadinessTarget, Source,
+        Target, Transform,
+    };
     use crate::graph::ApiGraph;
     use crate::CoreError;
 
@@ -1133,6 +1196,26 @@ mod tests {
 
         fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
             Ok(vec![cx.project_root.join(self.source)])
+        }
+    }
+
+    struct ReadinessOnlyTarget {
+        kind: ReadinessKind,
+        path: &'static str,
+    }
+
+    impl Target for ReadinessOnlyTarget {
+        fn generate(
+            &self,
+            _ir: &ApiGraph,
+            _out: &mut Artifacts,
+            _cx: &Cx,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+            vec![ReadinessTarget::new(self.kind, self.path)]
         }
     }
 
@@ -1191,6 +1274,43 @@ mod tests {
             .unwrap();
         // The later transform wins → ordered application.
         assert_eq!(ir.title, "Second");
+    }
+
+    #[test]
+    fn readiness_targets_are_sorted_and_deduplicated() {
+        let pipeline = Pipeline::new()
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::TypeScript,
+                path: "generated/z",
+            })
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::OpenApi,
+                path: "generated/openapi.yaml",
+            })
+            .target(ReadinessOnlyTarget {
+                kind: ReadinessKind::TypeScript,
+                path: "generated/z",
+            });
+
+        assert_eq!(
+            pipeline.readiness_targets(),
+            vec![
+                ReadinessTarget::new(ReadinessKind::OpenApi, "generated/openapi.yaml"),
+                ReadinessTarget::new(ReadinessKind::TypeScript, "generated/z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_kind_uses_canonical_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&ReadinessKind::OpenApi).unwrap(),
+            "\"openapi\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReadinessKind::TypeScript).unwrap(),
+            "\"typescript\""
+        );
     }
 
     #[test]

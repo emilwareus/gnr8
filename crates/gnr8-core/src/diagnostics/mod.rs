@@ -1,4 +1,4 @@
-//! Diagnostics seam (Phase 2+): collects warnings for unsupported / lossy source patterns (D-10).
+//! Diagnostics seam (Phase 2+): collects structured source diagnostics (D-10).
 //!
 //! [`collect`] runs the `goextract` helper, takes the diagnostics it emits (each a severity + a
 //! machine-stable rule/identity message + a `file:line`), and renders them to a canonical text block.
@@ -7,7 +7,7 @@
 //!
 //! Canonical phrasing (Open Q2 / RESEARCH Pitfall 4): the helper normalizes each rule to ONE template
 //! carrying the field-or-route identity. We render each diagnostic as
-//! `WARN  <message> (<file>:<line>)` (severity + identity + source location, D-10),
+//! `<SEVERITY>  <message> (<file>:<line>)` (severity + identity + source location, D-10),
 //! relativizing the file path against the analyzed module so the output is portable + byte-stable.
 //! The `snapshot_diagnostics` test locks the exact final text.
 
@@ -16,7 +16,7 @@ use crate::analyze::{facts::DiagnosticFact, helper, Lang};
 /// Collect diagnostics for a Go fixture/module directory and render them as canonical text (D-10).
 ///
 /// Runs the helper, sorts the diagnostics by `(file, line, message)` for a stable, reviewable order,
-/// and renders one `WARN  <message> (<file>:<line>)` line each. File paths are relativized against
+/// and renders one `<SEVERITY>  <message> (<file>:<line>)` line each. File paths are relativized against
 /// `fixture_dir` so the text is identical across machines (GRAPH-02 discipline).
 ///
 /// # Errors
@@ -88,10 +88,10 @@ mod tests {
     use super::render;
     use crate::analyze::facts::{DiagnosticCategoryFact, DiagnosticFact};
 
-    fn warn(message: &str, file: &str, line: u32) -> DiagnosticFact {
+    fn diagnostic(severity: &str, message: &str, file: &str, line: u32) -> DiagnosticFact {
         DiagnosticFact {
             code: "source.unresolved".to_string(),
-            severity: "WARN".to_string(),
+            severity: severity.to_string(),
             category: DiagnosticCategoryFact::Source,
             message: message.to_string(),
             file: file.to_string(),
@@ -106,7 +106,8 @@ mod tests {
     #[test]
     fn renders_severity_message_and_relative_location_per_line() {
         let out = render(
-            vec![warn(
+            vec![diagnostic(
+                "INFO",
                 "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true",
                 "/root/internal/common/dto/goal.go",
                 62,
@@ -115,7 +116,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "WARN  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true (internal/common/dto/goal.go:62)"
+            "INFO  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true (internal/common/dto/goal.go:62)"
         );
     }
 
@@ -124,13 +125,24 @@ mod tests {
         // Intentionally out of order: handlers.go before goal.go, lines descending.
         let out = render(
             vec![
-                warn("untyped query param 'aggregation'", "/root/handlers.go", 59),
-                warn(
+                diagnostic(
+                    "WARN",
+                    "untyped query param 'aggregation'",
+                    "/root/handlers.go",
+                    59,
+                ),
+                diagnostic(
+                    "WARN",
                     "float64 narrowing GoalResponse.TargetValue",
                     "/root/goal.go",
                     57,
                 ),
-                warn("untyped query param 'cursor'", "/root/handlers.go", 57),
+                diagnostic(
+                    "WARN",
+                    "untyped query param 'cursor'",
+                    "/root/handlers.go",
+                    57,
+                ),
             ],
             "/root",
         );
@@ -143,22 +155,12 @@ mod tests {
 
     #[test]
     fn render_is_byte_identical_across_two_runs() {
-        let diags = vec![warn("b", "/root/x.go", 2), warn("a", "/root/x.go", 1)];
-        let a = render(diags.clone_for_test(), "/root");
+        let diags = vec![
+            diagnostic("WARN", "b", "/root/x.go", 2),
+            diagnostic("WARN", "a", "/root/x.go", 1),
+        ];
+        let a = render(diags.clone(), "/root");
         let b = render(diags, "/root");
         assert_eq!(a, b);
-    }
-
-    // Small test helper: DiagnosticFact is not Clone in production (it is a deserialize-only DTO), so
-    // clone it field-by-field for the determinism test without widening the production surface.
-    trait CloneForTest {
-        fn clone_for_test(&self) -> Vec<DiagnosticFact>;
-    }
-    impl CloneForTest for Vec<DiagnosticFact> {
-        fn clone_for_test(&self) -> Vec<DiagnosticFact> {
-            self.iter()
-                .map(|d| warn(&d.message, &d.file, d.line))
-                .collect()
-        }
     }
 }

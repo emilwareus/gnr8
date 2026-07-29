@@ -455,13 +455,13 @@ pub(crate) struct TypeRef {
 }
 
 /// One diagnostic (lossy/unsupported pattern) with a source location (D-10).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiagnosticFact {
     /// Stable dotted diagnostic identity.
     #[serde(default = "default_diagnostic_code")]
     pub(crate) code: String,
-    /// Severity, `"WARN"` or `"ERROR"`.
+    /// Severity, `"INFO"`, `"WARN"`, or `"ERROR"`.
     pub(crate) severity: String,
     /// Stable diagnostic category.
     #[serde(default = "default_diagnostic_category")]

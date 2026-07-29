@@ -268,7 +268,7 @@ type TypeRef struct {
 	RefID string `json:"ref_id"`
 }
 
-// DiagnosticFact is one warning/error with a source location (D-10 / GO-06).
+// DiagnosticFact is one diagnostic with a source location (D-10 / GO-06).
 type DiagnosticFact struct {
 	Code      string `json:"code,omitempty"`
 	Severity  string `json:"severity"`

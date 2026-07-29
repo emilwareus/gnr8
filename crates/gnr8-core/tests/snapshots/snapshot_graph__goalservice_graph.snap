@@ -572,7 +572,7 @@ schemas:
       end_line: 39
 diagnostics:
   - code: schema.free_form_map
-    severity: WARN
+    severity: INFO
     category: schema
     message: "free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties: true (TARGET-API.md §5.1)"
     file: internal/common/dto/goal.go

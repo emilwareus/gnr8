@@ -134,6 +134,7 @@ files:
 | `Source::cache_input_roots` | the source has enumerable input roots | enables the verified pre-child no-op path; `None` disables it |
 | `Target::cache_input_files` | the target reads templates/static project files | folds those files into the artifact-cache key |
 | `Target::output_anchors` | the target emits project paths | enables stale cleanup and prevents generated-source re-ingestion |
+| `Target::readiness_targets` | the target emits a package/artifact supported by a built-in validator | lets `doctor` validate the declared target without guessing from ownership paths |
 | `PostProcess::cache_key_fragment` | output depends on executable/config state | invalidates cached artifacts when that state changes |
 | `Target::producer`, `PostProcess::producer` | a stable custom label is preferable | records ownership/audit identity; defaults to the Rust type name |
 

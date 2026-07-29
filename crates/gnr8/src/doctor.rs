@@ -6,7 +6,7 @@
 //! serializable report. The impure half — probing `.gnr8/`, probing the source-language toolchain, and RUNNING the
 //! user's `.gnr8/` pipeline (the child) to harvest its diagnostics + compute drift — lives in
 //! `main::run_doctor`, mirroring the `run_check` shell-vs-decision split. Keeping `assemble` pure makes
-//! the entire exit-policy truth table (Pitfall 1 — informational WARNs must NOT force a non-zero exit)
+//! the entire exit-policy truth table (Pitfall 1 — INFO/WARN diagnostics must not force a non-zero exit)
 //! unit-testable without a filesystem, a toolchain, or a child process.
 //!
 //! ## Exit policy (Pitfall 1 / HARD-01)
@@ -72,7 +72,7 @@ pub(crate) struct OutputHealth {
 pub(crate) struct DoctorDiagnostic {
     /// Stable diagnostic identity.
     pub(crate) code: String,
-    /// Severity copied from the source diagnostic (`"WARN"` / `"ERROR"`).
+    /// Severity copied from the source diagnostic (`"INFO"`, `"WARN"`, or `"ERROR"`).
     pub(crate) severity: String,
     /// Stable diagnostic category.
     pub(crate) category: gnr8::graph::DiagnosticCategory,
@@ -410,7 +410,7 @@ impl DoctorReport {
     }
 
     /// Whether `doctor` should exit non-zero: `true` iff an ACTIONABLE lifecycle/staleness problem
-    /// exists. Informational WARN diagnostics are excluded; ERROR diagnostics make doctor red.
+    /// exists. INFO/WARN diagnostics are excluded; ERROR diagnostics make doctor red.
     #[must_use]
     pub(crate) fn has_actionable_problem(&self) -> bool {
         !self.lifecycle.initialized
@@ -581,12 +581,26 @@ mod tests {
     use gnr8::lifecycle::{PlannedFile, WriteAction, WritePlan};
     use std::collections::HashSet;
 
-    /// One informational analysis WARN (the kind the fixture emits several of).
+    /// One informational analysis warning.
     fn warn_diag(message: &str) -> Diagnostic {
         Diagnostic::new(
             "source.test",
             DiagnosticCategory::Source,
             "WARN",
+            message,
+            SourceSpan {
+                file: "internal/common/dto/goal.go".to_string(),
+                start_line: 32,
+                end_line: 32,
+            },
+        )
+    }
+
+    fn info_diag(message: &str) -> Diagnostic {
+        Diagnostic::new(
+            "schema.free_form_map",
+            DiagnosticCategory::Schema,
+            "INFO",
             message,
             SourceSpan {
                 file: "internal/common/dto/goal.go".to_string(),
@@ -629,12 +643,12 @@ mod tests {
         plan_with(WriteAction::Unchanged)
     }
 
-    /// Exit-policy (Pitfall 1): a report whose ONLY findings are analysis WARNs is NOT actionable —
-    /// the informational WARNs must NOT make doctor red (exit 0).
+    /// Exit-policy (Pitfall 1): a report whose only findings are INFO/WARN diagnostics is not
+    /// actionable and must not make doctor red.
     #[test]
     fn informational_diagnostics_alone_are_not_actionable() {
         let diags = vec![
-            warn_diag("free-form map field: GoalResponse.Metadata (map[string]any) ..."),
+            info_diag("free-form map field: GoalResponse.Metadata (map[string]any) ..."),
             warn_diag("float64 -> float32 narrowing: field CreateGoalInput.TargetValue ..."),
             warn_diag("untyped query param 'cursor' on GET /goal/list ..."),
         ];
@@ -648,7 +662,7 @@ mod tests {
         );
         assert!(
             !report.has_actionable_problem(),
-            "informational WARNs must NOT be actionable (Pitfall 1)"
+            "INFO/WARN diagnostics must not be actionable (Pitfall 1)"
         );
         assert!(report.healthy, "healthy must be the inverse of actionable");
         assert_eq!(report.summary.actionable_problems, 0);

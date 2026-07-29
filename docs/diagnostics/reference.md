@@ -4,8 +4,9 @@
 [Agent docs index](../agents/index.md)
 
 Diagnostics are structured evidence that extraction or an explicit override was incomplete, lossy,
-or intentional. They travel with the graph and appear in `inspect`, `generate`, `check`, and `doctor`.
-Warnings do not fail generation unless `DiagnosticPolicy` denies them.
+unconstrained, or intentional. They travel with the graph and appear in `inspect`, `generate`,
+`check`, and `doctor`. INFO and WARN diagnostics do not fail generation unless `DiagnosticPolicy`
+denies them.
 
 ## Shape
 
@@ -57,7 +58,7 @@ keys; message is explanatory text. Results are deterministically sorted.
 | `schema.type.unresolved` | field/schema type could not be resolved | add source type or `SetSchemaFieldType` |
 | `schema.metadata.unresolved` | schema constraint/metadata could not be preserved | type source or add target patch |
 | `schema.numeric.narrowing` | numeric shape required a lossy narrowing | choose an explicit graph type |
-| `schema.free_form_map` | source contains a free-form map | accept `Type::Any` explicitly or model a schema |
+| `schema.free_form_map` | source contains a fully represented but unconstrained free-form map (`INFO`) | accept `additionalProperties: true` or model a narrower schema |
 | `security.unresolved` | security/auth fact was incomplete | use `ApplySecurity`/`SecurityOverride` |
 
 Not every source emits every code. The diagnostic message and span identify the exact unsupported

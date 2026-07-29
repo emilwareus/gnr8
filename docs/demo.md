@@ -230,7 +230,7 @@ This SDK compiles and is exercised by `crates/gnr8-core/tests/sdk_compile.rs` (a
 facts, stale/drift status of the generated outputs, and analysis diagnostics — each diagnostic carries
 a `file:line` plus a short *why* and *fix*. It exits **0** when healthy and **1** on an actionable
 problem: lifecycle/toolchain/pipeline failure, stale or drifted output, SDK readiness failure, or an
-ERROR-severity extraction diagnostic. Informational unsupported-pattern WARNs do **not** make it red.
+ERROR-severity extraction diagnostic. INFO and WARN diagnostics do **not** make it red.
 
 ```bash
 "$GNR8" doctor
@@ -246,17 +246,17 @@ OUTPUTS (0 stale, 0 drifted, 5 unchanged)
   (all outputs up to date)
 
 DIAGNOSTICS (17 informational — expected limitations)
-  WARN  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties:
+  INFO  free-form map field: GoalResponse.Metadata (map[string]any) lowers to additionalProperties:
         true ... (internal/common/dto/goal.go:62)
   WARN  untyped query param 'cursor' on GET /list ... (internal/goal/ports/handlers.go:57)
-  ... (untyped query params, free-form map, and duplicate-handler WARNs)
+  ... (untyped query parameter and duplicate-handler WARNs, plus the free-form map INFO)
 
 healthy — 0 actionable problems (17 informational diagnostic(s))
 ```
 
 ```bash
 "$GNR8" doctor; echo "exit=$?"
-# exit=0   (healthy: the WARNs are informational, not actionable)
+# exit=0   (healthy: INFO/WARN diagnostics are informational, not actionable)
 ```
 
 > **Why 17 informational diagnostics, not 4?** The scratch copy contains *both* the committed

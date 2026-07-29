@@ -113,34 +113,24 @@ pub(crate) enum GuideTopic {
     NestjsToTypescriptSdk,
 }
 
-/// The default analysis target when `inspect` is run without an explicit path: the goalservice Gin
-/// fixture, resolved relative to this crate's manifest dir (mirrors how the contract tests resolve
-/// `FIXTURE_DIR`). Keeps `gnr8 inspect routes` working out of the box this phase (D-09).
-pub(crate) const DEFAULT_INSPECT_TARGET: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
-
-/// `inspect` subcommands (D-11). Each takes an optional target directory (the Go module to analyze),
-/// defaulting to the goalservice fixture so the command works with no argument and with an explicit
-/// path (`gnr8 inspect routes <dir>`).
+/// `inspect` subcommands. With no path they inspect the project-local `.gnr8` pipeline; an explicit
+/// path directly analyzes that source tree.
 #[derive(Debug, Subcommand)]
 pub(crate) enum InspectAction {
     /// Show discovered routes.
     Routes {
-        /// The Go module directory to analyze (defaults to the goalservice fixture).
-        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
-        path: String,
+        /// Source directory to inspect directly; omit to use the local `.gnr8` pipeline.
+        path: Option<String>,
     },
     /// Show discovered schemas.
     Schemas {
-        /// The Go module directory to analyze (defaults to the goalservice fixture).
-        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
-        path: String,
+        /// Source directory to inspect directly; omit to use the local `.gnr8` pipeline.
+        path: Option<String>,
     },
     /// Show the raw API graph.
     Graph {
-        /// The Go module directory to analyze (defaults to the goalservice fixture).
-        #[arg(default_value = DEFAULT_INSPECT_TARGET)]
-        path: String,
+        /// Source directory to inspect directly; omit to use the local `.gnr8` pipeline.
+        path: Option<String>,
     },
 }
 
@@ -234,27 +224,11 @@ mod tests {
 
     #[test]
     fn cli_parses_inspect_subcommands() {
-        // Each variant now carries a `path` (defaulted to the fixture); discriminant compares the
-        // variant only, so the `want` path is irrelevant.
+        // Each variant carries an optional path; discriminant comparison only checks the subcommand.
         for (arg, want) in [
-            (
-                "routes",
-                InspectAction::Routes {
-                    path: String::new(),
-                },
-            ),
-            (
-                "schemas",
-                InspectAction::Schemas {
-                    path: String::new(),
-                },
-            ),
-            (
-                "graph",
-                InspectAction::Graph {
-                    path: String::new(),
-                },
-            ),
+            ("routes", InspectAction::Routes { path: None }),
+            ("schemas", InspectAction::Schemas { path: None }),
+            ("graph", InspectAction::Graph { path: None }),
         ] {
             let cli = Cli::try_parse_from(["gnr8", "inspect", arg]).unwrap();
             match cli.command {
@@ -268,8 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_inspect_defaults_target_and_accepts_explicit_path() {
-        // No path → the fixture default.
+    fn cli_inspect_uses_pipeline_by_default_and_accepts_explicit_path() {
         let cli = Cli::try_parse_from(["gnr8", "inspect", "routes"]).unwrap();
         let Commands::Inspect {
             action: InspectAction::Routes { path },
@@ -277,12 +250,8 @@ mod tests {
         else {
             panic!("expected inspect routes");
         };
-        assert!(
-            path.ends_with("fixtures/goalservice"),
-            "default target: {path}"
-        );
+        assert_eq!(path, None);
 
-        // Explicit path wins.
         let cli = Cli::try_parse_from(["gnr8", "inspect", "schemas", "/some/dir"]).unwrap();
         let Commands::Inspect {
             action: InspectAction::Schemas { path },
@@ -290,7 +259,7 @@ mod tests {
         else {
             panic!("expected inspect schemas");
         };
-        assert_eq!(path, "/some/dir");
+        assert_eq!(path.as_deref(), Some("/some/dir"));
     }
 
     #[test]

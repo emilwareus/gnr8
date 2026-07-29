@@ -20,7 +20,7 @@
 use std::process::ExitCode;
 
 use crate::graph::Diagnostic;
-use crate::sdk::{Artifact, Cx, FileStamp, Pipeline};
+use crate::sdk::{Artifact, Cx, FileStamp, Pipeline, ReadinessTarget};
 use crate::CoreError;
 
 /// The current host/child protocol version. Bumped on any breaking change to the JSON shape;
@@ -38,7 +38,7 @@ pub const HOST_CAPABILITY_ENV: &str = "GNR8_HOST_CAPABILITY_FINGERPRINT";
 #[must_use]
 pub fn capability_fingerprint() -> String {
     let manifest = format!(
-        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1",
+        "gnr8-core:{};protocol:{};artifact-ownership:1;structured-diagnostics:1;openapi-exact:1;declared-readiness:1",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION
     );
@@ -75,6 +75,9 @@ pub struct ArtifactBundle {
     /// Project-relative target output anchors, used by the host to prune stale generated files.
     #[serde(default)]
     pub output_anchors: Vec<String>,
+    /// Generated targets that the host can validate with built-in readiness checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readiness_targets: Vec<ReadinessTarget>,
     /// Optional key for artifacts stored under `.gnr8/cache/artifacts/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_cache_key: Option<String>,
@@ -93,6 +96,7 @@ impl ArtifactBundle {
         artifacts: Vec<Artifact>,
         diagnostics: Vec<Diagnostic>,
         output_anchors: Vec<String>,
+        readiness_targets: Vec<ReadinessTarget>,
         artifact_cache_key: Option<String>,
         cache_input_roots: Vec<String>,
         cache_input_stamps: Vec<FileStamp>,
@@ -105,6 +109,7 @@ impl ArtifactBundle {
             artifacts,
             diagnostics,
             output_anchors,
+            readiness_targets,
             artifact_cache_key,
             cache_input_roots,
             cache_input_stamps,
@@ -237,6 +242,7 @@ fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
         outcome.artifacts.into_files(),
         outcome.diagnostics,
         pipeline.output_anchors(),
+        pipeline.readiness_targets(),
         outcome.artifact_cache_key,
         pipeline.cache_input_roots(cx),
         pipeline.cache_input_stamps(cx),
@@ -283,7 +289,7 @@ mod tests {
 
     use super::{capability_fingerprint, emit, inspect, ArtifactBundle, PROTOCOL_VERSION};
     use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
-    use crate::sdk::{Cx, Pipeline, Source};
+    use crate::sdk::{Artifacts, Cx, Pipeline, ReadinessKind, ReadinessTarget, Source, Target};
     use crate::CoreError;
 
     /// A source yielding a fixed graph with one diagnostic, so emit/inspect run without a toolchain.
@@ -308,6 +314,20 @@ mod tests {
         }
     }
 
+    struct StubTarget;
+    impl Target for StubTarget {
+        fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+            out.create("generated/openapi.yaml", "openapi: 3.1.0\n")
+        }
+
+        fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.yaml",
+            )]
+        }
+    }
+
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
     }
@@ -322,6 +342,7 @@ mod tests {
         assert_eq!(bundle.core_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(bundle.capability_fingerprint, capability_fingerprint());
         assert!(bundle.artifacts.is_empty());
+        assert!(bundle.readiness_targets.is_empty());
         assert_eq!(bundle.diagnostics.len(), 1);
         assert_eq!(bundle.diagnostics[0].message, "stub diagnostic");
     }
@@ -331,6 +352,35 @@ mod tests {
         let json = inspect(&Pipeline::new().source(StubSource), &cx()).unwrap();
         // The IR JSON carries the title the source set.
         assert!(json.contains("\"title\": \"Stub API\""), "{json}");
+    }
+
+    #[test]
+    fn emit_carries_declared_readiness_targets_across_the_wire() {
+        let json = emit(
+            &Pipeline::new().source(StubSource).target(StubTarget),
+            &cx(),
+        )
+        .unwrap();
+        let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            bundle.readiness_targets,
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.yaml",
+            )]
+        );
+    }
+
+    #[test]
+    fn bundles_without_readiness_targets_deserialize_to_an_empty_list() {
+        let json = emit(&Pipeline::new().source(StubSource), &cx()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("readiness_targets");
+
+        let bundle: ArtifactBundle = serde_json::from_value(value).unwrap();
+
+        assert!(bundle.readiness_targets.is_empty());
     }
 
     #[test]

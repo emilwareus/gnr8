@@ -12,7 +12,8 @@
 #![allow(clippy::doc_markdown)]
 
 use super::{
-    collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, Source, Target, Transform,
+    collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, ReadinessKind,
+    ReadinessTarget, Source, Target, Transform,
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
@@ -4042,6 +4043,17 @@ impl Target for OpenApi31 {
             vec![self.path.clone()]
         }
     }
+
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        if self.path.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                self.path.clone(),
+            )]
+        }
+    }
 }
 
 /// The OpenAPI 3.1 JSON target: lowers the frozen IR to OpenAPI and writes pretty JSON.
@@ -4101,6 +4113,17 @@ impl Target for OpenApi31Json {
             Vec::new()
         } else {
             vec![self.path.clone()]
+        }
+    }
+
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        if self.path.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                self.path.clone(),
+            )]
         }
     }
 }
@@ -4385,6 +4408,17 @@ impl Target for GoSdk {
             vec![self.dir.trim_end_matches('/').to_string()]
         }
     }
+
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReadinessTarget::new(
+                ReadinessKind::Go,
+                self.dir.trim_end_matches('/'),
+            )]
+        }
+    }
 }
 
 /// The Python SDK target: generates the multi-file Python SDK bundle and writes each file under
@@ -4596,6 +4630,17 @@ impl Target for PySdk {
             Vec::new()
         } else {
             vec![self.dir.trim_end_matches('/').to_string()]
+        }
+    }
+
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReadinessTarget::new(
+                ReadinessKind::Python,
+                self.dir.trim_end_matches('/'),
+            )]
         }
     }
 }
@@ -4908,6 +4953,17 @@ impl Target for TsSdk {
             Vec::new()
         } else {
             vec![self.dir.trim_end_matches('/').to_string()]
+        }
+    }
+
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![ReadinessTarget::new(
+                ReadinessKind::TypeScript,
+                self.dir.trim_end_matches('/'),
+            )]
         }
     }
 }
@@ -5742,7 +5798,7 @@ mod tests {
 
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::model::SdkModel;
-    use crate::sdk::Artifacts;
+    use crate::sdk::{Artifacts, ReadinessKind, ReadinessTarget};
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
@@ -7707,6 +7763,51 @@ mod tests {
                 .generate(&ir, &mut out, &cx()),
             Err(crate::CoreError::Config { .. })
         ));
+    }
+
+    #[test]
+    fn built_in_targets_declare_readiness_without_static_overlays() {
+        assert_eq!(
+            OpenApi31::new()
+                .to("generated/openapi.yaml")
+                .readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.yaml",
+            )]
+        );
+        assert_eq!(
+            OpenApi31Json::new()
+                .to("generated/openapi.json")
+                .readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::OpenApi,
+                "generated/openapi.json",
+            )]
+        );
+        assert_eq!(
+            GoSdk::new().to("generated/go").readiness_targets(),
+            vec![ReadinessTarget::new(ReadinessKind::Go, "generated/go")]
+        );
+        assert_eq!(
+            PySdk::new().to("generated/python").readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::Python,
+                "generated/python",
+            )]
+        );
+        assert_eq!(
+            TsSdk::new().to("generated/typescript").readiness_targets(),
+            vec![ReadinessTarget::new(
+                ReadinessKind::TypeScript,
+                "generated/typescript",
+            )]
+        );
+        assert!(StaticFiles::new()
+            .to("generated/python")
+            .include(["support.py"])
+            .readiness_targets()
+            .is_empty());
     }
 
     #[test]
