@@ -1,0 +1,320 @@
+openapi: 3.1.0
+info:
+  title: Fixture API
+  version: 0.0.1
+paths:
+  /v1/pipelines:
+    post:
+      operationId: createPipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineInput'
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pipeline'
+  /v1/pipelines/search:
+    get:
+      operationId: searchPipelines
+      parameters:
+        - name: excludedStepUuids
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+          style: form
+          explode: false
+        - name: ownerIds
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineList'
+  /v1/items/list/paginated:
+    get:
+      operationId: getItemsPaginated
+      parameters:
+        - name: kinds
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+        - name: query
+          in: query
+          schema:
+            type: string
+        - name: statuses
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemPage'
+  /v1/items/pages:
+    get:
+      operationId: listItemsByPage
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: perPage
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemPage'
+  /v1/items/offset:
+    get:
+      operationId: listItemsByOffset
+      parameters:
+        - name: offset
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemPage'
+  /v1/items:
+    post:
+      operationId: createItem
+      parameters:
+        - name: notify
+          in: query
+          schema:
+            type: boolean
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemInput'
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+  /v1/items/export:
+    get:
+      operationId: exportItems
+      parameters:
+        - name: format
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: locale
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemPage'
+  /v1/items/{itemId}:
+    get:
+      operationId: getItem
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: verbose
+          in: query
+          schema:
+            type: boolean
+        # A wire name whose camelCase form is not a legal bare TypeScript member name.
+        - name: 2fa
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+    put:
+      operationId: replaceItem
+      parameters:
+        - name: itemId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: dryRun
+          in: query
+          schema:
+            type: boolean
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemInput'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+  /v1/health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+components:
+  schemas:
+    PipelineInput:
+      type: object
+      required: [name, stepUuids]
+      properties:
+        name:
+          type: string
+        stepUuids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        primaryFileId:
+          type: string
+        labelIds:
+          type: array
+          items:
+            type: string
+    Pipeline:
+      type: object
+      required: [uuid, name, stepUuids]
+      properties:
+        uuid:
+          type: string
+          format: uuid
+        name:
+          type: string
+        stepUuids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        createdByUuid:
+          type: string
+          format: uuid
+        primaryFileId:
+          type: string
+        labelIds:
+          type: array
+          items:
+            type: string
+        siteUrls:
+          type: array
+          items:
+            type: string
+        publicApis:
+          type: array
+          items:
+            type: string
+    PipelineList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Pipeline'
+    ItemInput:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+        ownerUuids:
+          type: array
+          items:
+            type: string
+            format: uuid
+    Item:
+      type: object
+      required: [uuid, kind]
+      properties:
+        uuid:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        ownerUuids:
+          type: array
+          items:
+            type: string
+            format: uuid
+    ItemPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Item'
+        nextCursor:
+          type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string

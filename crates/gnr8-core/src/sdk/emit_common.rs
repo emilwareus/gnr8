@@ -20,6 +20,10 @@ use crate::CoreError;
 /// `workflowChainIds` → `["workflow", "Chain", "Ids"]`; `page_size` → `["page", "size"]`;
 /// `openai/gpt-image-2` → `["openai", "gpt", "image", "2"]`. The shared tokenizer behind every
 /// per-language casing helper.
+///
+/// A lowercase `s` immediately after an all-caps run is the PLURAL of that acronym, not the start of
+/// a new word: `userUUIDsList` → `["user", "UUIDs", "List"]`, never `["user", "UUI", "Ds", "List"]`
+/// (which is what produced the `uui_ds` / `UuiDs` splits). See [`plural_acronym_s`].
 pub(crate) fn split_words(name: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -34,10 +38,7 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
             continue;
         }
         let next_is_lower = chars.get(idx + 1).is_some_and(char::is_ascii_lowercase);
-        let next_is_plural_s = chars.get(idx + 1).is_some_and(|next| *next == 's')
-            && chars
-                .get(idx + 2)
-                .is_none_or(|after| !after.is_ascii_alphanumeric());
+        let next_is_plural_s = plural_acronym_s(&chars, idx);
         let prev_is_upper = current
             .chars()
             .last()
@@ -55,6 +56,25 @@ pub(crate) fn split_words(name: &str) -> Vec<String> {
         words.push(current);
     }
     words
+}
+
+/// Whether the character after `idx` is the lowercase `s` that PLURALIZES the acronym ending at `idx`.
+///
+/// `chars[idx]` is the last uppercase letter of an all-caps run and `chars[idx + 1]` is `'s'`. That `s`
+/// belongs to the acronym exactly when what follows it cannot continue a lowercase word — the end of
+/// the identifier, a separator, a digit, or the uppercase letter that starts the NEXT word. Only a
+/// following lowercase letter means the `s` genuinely opens a new word.
+///
+/// `integrationUUIDs` → the `s` closes `UUIDs` (end of input).
+/// `userUUIDsList` → the `s` closes `UUIDs` (`L` starts the next word).
+/// `IDsomething` → the `s` opens `Dsomething` (`o` continues a lowercase word).
+///
+/// One rule, no fallback (CLAUDE.md rule 3): the decision reads only the two characters after `idx`.
+fn plural_acronym_s(chars: &[char], idx: usize) -> bool {
+    chars.get(idx + 1).is_some_and(|next| *next == 's')
+        && chars
+            .get(idx + 2)
+            .is_none_or(|after| !after.is_ascii_lowercase())
 }
 
 /// Convert an operation/type name into a deterministic lowercase file stem.
@@ -975,8 +995,8 @@ fn validate_request_body_schema(
 mod tests {
     use super::{
         check_unique_model_file_names, check_unique_schema_names, file_stem, http_auth_features,
-        operation_auth_alternatives, success_responses_of, ApiKeyLocation, HttpAuthScheme,
-        OperationAuthScheme,
+        operation_auth_alternatives, split_words, success_responses_of, ApiKeyLocation,
+        HttpAuthScheme, OperationAuthScheme,
     };
     use crate::graph::{
         ApiGraph, Operation, OperationSecurityPolicy, Response, SecurityRequirementGroup,
@@ -1067,6 +1087,23 @@ mod tests {
         );
         assert_eq!(file_stem("integrationUUIDs"), "integration_uuids");
         assert_eq!(file_stem("userIDs"), "user_ids");
+    }
+
+    #[test]
+    fn plural_acronym_stays_one_token_before_the_next_word() {
+        // The `s` that pluralizes an acronym belongs to it wherever the acronym sits, so a
+        // mid-identifier plural no longer splits into `UUI` + `Ds` (the `uui_ds` file-stem defect).
+        assert_eq!(split_words("userUUIDsList"), ["user", "UUIDs", "List"]);
+        assert_eq!(split_words("integrationUUIDs"), ["integration", "UUIDs"]);
+        assert_eq!(split_words("jobUuids"), ["job", "Uuids"]);
+        assert_eq!(split_words("APIsForUser"), ["APIs", "For", "User"]);
+        assert_eq!(split_words("IDsAndURLs"), ["IDs", "And", "URLs"]);
+        assert_eq!(file_stem("userUUIDsList"), "user_uuids_list");
+        assert_eq!(file_stem("APIsForUser"), "apis_for_user");
+        // A lowercase continuation still starts a new word, so no acronym is over-greedy.
+        assert_eq!(split_words("IDsomething"), ["I", "Dsomething"]);
+        // A separator or digit after the plural `s` closes the acronym the same way.
+        assert_eq!(split_words("user_UUIDs_list"), ["user", "UUIDs", "list"]);
     }
 
     #[test]

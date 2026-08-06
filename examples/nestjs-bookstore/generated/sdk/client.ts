@@ -507,35 +507,33 @@ export class Client {
   }
 
   async listBooks(
-    genre: string,
-    cursor?: string,
-    sort?: string,
+    params: ListBooksParams,
     options?: RequestOptions,
   ): Promise<models.ListBooksResponse> {
     let path = `/books/`;
     const searchParams = new URLSearchParams();
     for (const [wireName, wireValue] of wireParameterPairs(
       "genre",
-      genre,
+      params.genre,
       "form",
       true,
     )) {
       searchParams.append(wireName, wireValue);
     }
-    if (cursor !== undefined) {
+    if (params.cursor !== undefined) {
       for (const [wireName, wireValue] of wireParameterPairs(
         "cursor",
-        cursor,
+        params.cursor,
         "form",
         true,
       )) {
         searchParams.append(wireName, wireValue);
       }
     }
-    if (sort !== undefined) {
+    if (params.sort !== undefined) {
       for (const [wireName, wireValue] of wireParameterPairs(
         "sort",
-        sort,
+        params.sort,
         "form",
         true,
       )) {
@@ -616,15 +614,15 @@ export class Client {
 
   async getBook(
     bookId: number,
-    fmt?: models.BookFormat,
+    params?: GetBookParams,
     options?: RequestOptions,
   ): Promise<models.BookOrError> {
     let path = `/books/${encodeURIComponent(String(bookId))}`;
     const searchParams = new URLSearchParams();
-    if (fmt !== undefined) {
+    if (params?.fmt !== undefined) {
       for (const [wireName, wireValue] of wireParameterPairs(
         "fmt",
-        fmt,
+        params.fmt,
         "form",
         true,
       )) {
@@ -704,6 +702,16 @@ export class Client {
     throw new ApiError(res.status);
   }
 }
+
+export type ListBooksParams = {
+  cursor?: string;
+  genre: string;
+  sort?: string;
+};
+
+export type GetBookParams = {
+  fmt?: models.BookFormat;
+};
 
 function wireParameterPairs(
   name: string,

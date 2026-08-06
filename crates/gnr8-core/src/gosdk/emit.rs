@@ -50,6 +50,11 @@ fn sink(err: std::fmt::Error) -> CoreError {
 /// Splits on `_`/`-` and ASCII-case boundaries, upper-cases the first letter of each word, and special-
 /// cases the common Go initialisms (`id`→`ID`, `uuid`→`UUID`, `url`→`URL`, `api`→`API`, `http`→`HTTP`,
 /// `json`→`JSON`) so `workflowChainIds`→`WorkflowChainIDs` and `uuid`→`UUID` like `expected/sdk`.
+///
+/// An initialism stays FULL CAPS when pluralized (Go Code Review Comments): `stepUuids`→`StepUUIDs`,
+/// `labelIds`→`LabelIDs`, `siteUrls`→`SiteURLs`, `publicApis`→`PublicAPIs`. This is a GO-LOCAL spelling
+/// of the exported identifier only — the wire token (`json` tag, query key, `OpenAPI` property name) is
+/// never derived from it, and the TypeScript/Python emitters keep their own language-native casing.
 pub(crate) fn exported(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for word in split_words(name) {
@@ -58,9 +63,11 @@ pub(crate) fn exported(name: &str) -> String {
             "id" => out.push_str("ID"),
             "ids" => out.push_str("IDs"),
             "uuid" => out.push_str("UUID"),
+            "uuids" => out.push_str("UUIDs"),
             "url" => out.push_str("URL"),
             "urls" => out.push_str("URLs"),
             "api" => out.push_str("API"),
+            "apis" => out.push_str("APIs"),
             "http" => out.push_str("HTTP"),
             "json" => out.push_str("JSON"),
             _ => {
@@ -3573,6 +3580,32 @@ mod tests {
             assert_eq!(exported("openai/gpt-image-2"), "OpenaiGptImage2");
             assert_eq!(exported("3d-model"), "Value3dModel");
             assert_eq!(exported("///"), "Value");
+        }
+
+        #[test]
+        fn pluralized_initialisms_stay_full_caps() {
+            // Go Code Review Comments: an initialism keeps its caps when pluralized. The wire token
+            // (`stepUuids`) is untouched — only the exported Go identifier changes.
+            assert_eq!(exported("stepUuids"), "StepUUIDs");
+            assert_eq!(exported("excludedStepUuids"), "ExcludedStepUUIDs");
+            assert_eq!(exported("userUuids"), "UserUUIDs");
+            assert_eq!(exported("createdByUuid"), "CreatedByUUID");
+            assert_eq!(exported("uuids"), "UUIDs");
+            // Already-capitalized spellings round-trip to the same identifier.
+            assert_eq!(exported("stepUUIDs"), "StepUUIDs");
+            assert_eq!(exported("step_uuids"), "StepUUIDs");
+            // The ID/URL/API families follow the same rule.
+            assert_eq!(exported("labelIds"), "LabelIDs");
+            assert_eq!(exported("primaryFileId"), "PrimaryFileID");
+            assert_eq!(exported("ownerIds"), "OwnerIDs");
+            assert_eq!(exported("siteUrls"), "SiteURLs");
+            assert_eq!(exported("publicApis"), "PublicAPIs");
+            // A plural initialism in the MIDDLE of a name keeps one clean token boundary — the old
+            // tokenizer split `UUIDsList` into `UUI` + `Ds` + `List`.
+            assert_eq!(exported("userUUIDsList"), "UserUUIDsList");
+            assert_eq!(exported("jobUuidsByOwner"), "JobUUIDsByOwner");
+            // A lowercase word that merely STARTS with `s` is not an acronym plural.
+            assert_eq!(exported("IDsomething"), "IDsomething");
         }
 
         #[test]

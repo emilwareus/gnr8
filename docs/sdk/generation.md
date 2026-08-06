@@ -112,6 +112,23 @@ GoSdk::new()
 The generated Go SDK uses one ctx-first typed method surface, functional client options, explicit
 request structs, and graph-derived wire behavior.
 
+Exported Go identifiers are CamelCase of the wire token with Go initialisms applied, including when
+the initialism is pluralized:
+
+| Wire token | Go identifier |
+|---|---|
+| `uuid` | `UUID` |
+| `stepUuids` | `StepUUIDs` |
+| `primaryFileId` | `PrimaryFileID` |
+| `labelIds` | `LabelIDs` |
+| `siteUrls` | `SiteURLs` |
+| `publicApis` | `PublicAPIs` |
+
+This spelling is Go-local. The json tag, query key, path template, and OpenAPI property name keep the
+wire token exactly, and the TypeScript and Python targets keep their own language-native casing
+(`stepUuids`, `step_uuids`). Use `RenameType` / `RenameOperation` when you want a different canonical
+name.
+
 ## Python target controls
 
 ```rust
@@ -135,6 +152,42 @@ TsSdk::new()
 
 The generated TypeScript SDK preserves graph optionality and nullability exactly and returns decoded
 response data through the native fetch client.
+
+### TypeScript call shape
+
+Each operation takes its path parameters positionally, then the typed request body, then ONE params
+object carrying every remaining request parameter, then `RequestOptions`:
+
+```ts
+export type GetItemsPaginatedParams = {
+  cursor?: string;
+  kinds?: string[];
+  pageSize?: number;
+};
+
+await client.getItemsPaginated({ cursor, pageSize: 50 });
+await client.getItem(itemId, { verbose: true });
+await client.createItem(body, { notify: true });
+await client.replaceItem(itemId, body, { dryRun: true });
+```
+
+| Operation shape | Signature |
+|---|---|
+| Query/header params, all optional | `op(params?: OpParams, options?: RequestOptions)` |
+| Query/header params, any required | `op(params: OpParams, options?: RequestOptions)` |
+| Path + params | `op(id: string, params?: OpParams, options?: RequestOptions)` |
+| Body + params | `op(body: Body, params?: OpParams, options?: RequestOptions)` |
+| Path + body + params | `op(id: string, body: Body, params?: OpParams, options?: RequestOptions)` |
+| No request parameters | `op(options?: RequestOptions)` — no params argument |
+
+The params type is named `{OperationId}Params` in PascalCase, is declared in `client.ts` next to
+`RequestOptions`, and is re-exported from the package root. Header parameters ride the same object;
+cookies and browser-forbidden headers stay with the fetch transport and never appear on it. Wire
+names, `style`, and `explode` are unaffected — the object changes how a caller writes the call, not
+what goes on the wire.
+
+A `{OperationId}Params` name that would collide with a schema name, with another operation's params
+type, or with a symbol `client.ts` already exports is a typed generation error, not a broken emit.
 
 ## Request wire behavior
 

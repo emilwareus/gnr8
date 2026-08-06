@@ -110,7 +110,16 @@ paths:
 ```
 
 **TypeScript SDK** — a typed, dependency-free client using the built-in `fetch`
-with a method per operation and typed interfaces that mirror the schemas.
+with a method per operation and typed interfaces that mirror the schemas. Path
+parameters stay positional; query and header parameters arrive as one named
+`{OperationId}Params` object, so a caller never counts positions:
+
+```typescript
+const client = new Client({ baseUrl: 'https://api.example.com' });
+
+await client.listBooks({ genre: 'fiction', cursor });
+await client.getBook(7, { fmt: BookFormat.Hardcover });
+```
 
 ## What this showcases
 

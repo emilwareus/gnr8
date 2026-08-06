@@ -38,6 +38,32 @@ place of `Artifacts::write`. Preserving a previous generator's exact SDK surface
 
 Behaviour changes in generated SDKs:
 
+- **TS: optional query positionals → single params object.** A TypeScript operation no longer
+  expands its query and header parameters into a positional argument list. Path parameters stay
+  positional and come first, the typed request body stays its own argument, and every other request
+  parameter arrives as one exported `{OperationId}Params` object, with `RequestOptions` last. The
+  params object is optional (`params?: FooParams`) when every parameter is optional and required
+  (`params: FooParams`) when any one of them is. An operation with no such parameters is unchanged
+  and gains no empty argument. Query wire names, styles, `explode`, and the emitted query string are
+  identical; Go and Python are untouched.
+
+  Updating call sites: pass the arguments you were passing by name instead of by position, and drop
+  the `undefined` placeholders.
+
+  ```ts
+  // before
+  await client.getItemsPaginated(undefined, cursor, undefined, undefined, 50);
+  // after
+  await client.getItemsPaginated({ cursor, pageSize: 50 });
+
+  // before
+  await client.getItem(itemId, true);
+  // after
+  await client.getItem(itemId, { verbose: true });
+  ```
+
+  Each params type is re-exported from the package root (`import type { GetItemsPaginatedParams }
+  from "@acme/sdk"`), so a caller can name the object it builds.
 - Operations whose security cannot be satisfied now fail before the request is built
   (`AuthConfigurationError` in all three languages) instead of silently sending an unauthenticated
   request. Clients that supply credentials from the transport (a signing round-tripper, an
@@ -45,6 +71,13 @@ Behaviour changes in generated SDKs:
   `auth_transport=True` (Python), or `authMode: "transport"` (TypeScript).
 - Go no longer emits the duplicate suffix-style enum constants (`FictionGenre`); only the prefix
   form (`GenreFiction`) remains.
+- **Go: a pluralized initialism keeps its capitals.** `stepUuids` emitted `StepUuids` while the
+  singular `uuid` correctly emitted `UUID`. Every exported Go identifier gnr8 derives — model
+  fields, `*Params` struct fields, method names — now spells the `ID`/`UUID`/`URL`/`API` families
+  full caps when pluralized: `StepUUIDs`, `LabelIDs`, `SiteURLs`, `PublicAPIs`. This changes the Go
+  identifier ONLY. Json tags, query wire names, path templates, and OpenAPI property names are
+  untouched, and TypeScript (`stepUuids`) and Python (`step_uuids`) keep their own language-native
+  spelling. Use `RenameType` / `RenameOperation` if you want a different canonical name.
 - TypeScript enums are emitted as a runtime const object plus a derived type, so the name is now a
   value export rather than a type-only export.
 - `204` responses are treated as bodyless.
@@ -54,6 +87,13 @@ versions no longer deserialize.
 
 ### Fixed
 
+- A plural initialism in the MIDDLE of an identifier tokenized one letter short, so `userUUIDsList`
+  split into `UUI` + `Ds` and produced `uui_ds` file stems, `UserUUIDsList`-by-accident Go names,
+  and `userUuiDsList` TypeScript identifiers. The pluralizing `s` now stays with its acronym
+  wherever the acronym sits, in all three languages.
+- A generated TypeScript cursor-pagination generator bound the page's item list without reading it,
+  so the SDK did not compile under `--noUnusedLocals`. The list is now bound only where the loop
+  uses it (empty-page termination and the offset advance).
 - **TypeScript SDKs were unusable in browsers.** The global `fetch` was captured unbound and then
   invoked as a method, so the receiver was the client and every call threw `Illegal invocation`.
 - **Retry waits were unbounded and uninterruptible** in all three languages. Total time spent
