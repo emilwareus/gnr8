@@ -117,12 +117,17 @@ fn assert_absent(haystack: &str, needle: &str, what: &str) {
     );
 }
 
-/// Strip every quoted literal from generated source, leaving the identifiers.
+/// Strip every double-quoted and backquoted literal from generated Go, leaving the identifiers.
 ///
 /// Wire tokens are quoted (`"excludedStepUuids"`, `` `json:"stepUuids"` ``) and are DELIBERATELY not
 /// respelled, so a raw substring search for a wrong identifier would match the very wire name the
 /// rename is required to preserve. Removing the literals lets the negative assertions say exactly what
 /// they mean: no such IDENTIFIER exists.
+///
+/// A lone `'` is NOT treated as an opener: it appears in prose comments far more often than as a Go
+/// rune literal, and mistaking one for a delimiter would swallow the rest of the file and make every
+/// downstream "must be absent" assertion pass vacuously. Callers guard the remaining direction with
+/// [`assert_survives_literal_stripping`].
 fn identifiers_only(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut quote: Option<char> = None;
@@ -139,7 +144,7 @@ fn identifiers_only(source: &str) -> String {
                 }
             }
             None => {
-                if ch == '"' || ch == '\'' || ch == '`' {
+                if ch == '"' || ch == '`' {
                     quote = Some(ch);
                 } else {
                     out.push(ch);
@@ -148,6 +153,16 @@ fn identifiers_only(source: &str) -> String {
         }
     }
     out
+}
+
+/// Prove the stripped source still carries the identifiers, so "must be absent" means something.
+fn assert_survives_literal_stripping(stripped: &str, expected: &[&str], what: &str) {
+    for identifier in expected {
+        assert!(
+            stripped.contains(identifier),
+            "{what}: literal stripping swallowed real source — '{identifier}' is missing from:\n{stripped}"
+        );
+    }
 }
 
 #[test]
@@ -183,6 +198,12 @@ fn go_identifiers_keep_initialisms_capitalized_when_pluralized() {
     // stay exactly as the document spells them, so the literals are stripped before this check.
     let model_idents = identifiers_only(models);
     let operation_idents = identifiers_only(operations);
+    assert_survives_literal_stripping(&model_idents, &["StepUUIDs", "LabelIDs"], "Go models");
+    assert_survives_literal_stripping(
+        &operation_idents,
+        &["ExcludedStepUUIDs", "SearchPipelines"],
+        "Go operations",
+    );
     for wrong in [
         "StepUuids",
         "ExcludedStepUuids",
