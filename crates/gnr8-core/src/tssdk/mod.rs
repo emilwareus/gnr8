@@ -603,6 +603,12 @@ mod tests {
             out.contains("export type { ListBooksParams } from \"./client\";"),
             "index.ts re-exports the params types:\n{out}"
         );
+        // A prototype function sits at module level, so its body is two columns left of the
+        // class-method form the same emitter writes. (Prettier gates this in `sdk_lint`.)
+        assert!(
+            out.contains("): Promise<models.Book> {\n  let path = `/list`;\n"),
+            "a split operation body must sit at module-level indentation:\n{out}"
+        );
     }
 
     #[test]

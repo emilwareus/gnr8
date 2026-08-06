@@ -1401,11 +1401,29 @@ struct ResolvedArgs<'op> {
 /// The bound name of the generated params-object argument.
 const PARAMS_ARG: &str = "params";
 
-/// Binding names a generated method or its pagination generators already occupy, which a POSITIONAL
-/// path param must not collide with (WR-03 analog): the params object, the trailing request options,
-/// and the generators' page-local params copy. `body` is added only for body-bearing operations, which
-/// are the only ones that bind it.
-const RESERVED_ARGS: &[&str] = &[PARAMS_ARG, "options", PAGE_PARAMS_LOCAL];
+/// Names a generated method already binds, which a POSITIONAL path param must not collide with
+/// (WR-03 analog).
+///
+/// Two groups, both unconditional: the arguments every method declares after the path params
+/// (`params`, `options`, plus the pagination generators' `pageParams` copy), and the locals EVERY
+/// method body declares (`let path`, `const headers`, `const res`). A path param that camel-cases
+/// onto any of them shadows or redeclares it, which is a TypeScript error: the interpolated `path`
+/// template becomes a use-before-declaration, and `headers`/`res` become duplicate block-scoped
+/// declarations.
+/// Rejecting the name with a typed error turns broken emitted TypeScript into an actionable message,
+/// and no graph that compiles today starts failing: every listed name already emits invalid output.
+///
+/// `body` is added only for body-bearing operations, the only ones that bind it. Conditionally-emitted
+/// locals (`searchParams`, `qs`, `items`, …) are deliberately NOT reserved — an operation that never
+/// emits them can legitimately name a path param after one.
+const RESERVED_ARGS: &[&str] = &[
+    PARAMS_ARG,
+    "options",
+    PAGE_PARAMS_LOCAL,
+    "path",
+    "headers",
+    "res",
+];
 
 impl ResolvedArgs<'_> {
     /// Whether this operation takes a params object at all.
@@ -1516,8 +1534,8 @@ fn resolve_op_args<'op>(
             return Err(CoreError::SdkGen {
                 message: format!(
                     "operation '{}' has a path parameter whose TypeScript identifier '{ident}' \
-                     collides with a binding the generated method already uses (body, params, \
-                     options, pageParams, or another path param)",
+                     collides with a name the generated method already binds (body, params, \
+                     options, pageParams, path, headers, res, or another path param)",
                     op.id
                 ),
             });
@@ -1895,11 +1913,18 @@ fn emit_operation(
         }
     }
 
-    emit_op_path(out, &abs, &tokens, &path_params, &resolved.path_idents)?;
-    emit_ts_auth_selection(out, &op.id, &auth_alternatives)?;
-    emit_op_query(out, graph, &resolved, &auth_queries)?;
+    let mut body = String::new();
+    emit_op_path(
+        &mut body,
+        &abs,
+        &tokens,
+        &path_params,
+        &resolved.path_idents,
+    )?;
+    emit_ts_auth_selection(&mut body, &op.id, &auth_alternatives)?;
+    emit_op_query(&mut body, graph, &resolved, &auth_queries)?;
     emit_op_dispatch(
-        out,
+        &mut body,
         &op.method,
         &success,
         TsRequestBody::from_body(body_model.as_ref()),
@@ -1910,11 +1935,36 @@ fn emit_operation(
         graph,
         &resolved,
     )?;
+    out.push_str(&body_at_style_depth(&body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
     }
     Ok(())
+}
+
+/// Shift one generated body to the indentation depth its emit style sits at.
+///
+/// Bodies are written ONCE, at the class-method depth: 4 spaces, inside a method that is itself
+/// indented 2 inside `class Client`. A split layout emits the SAME body as a module-level prototype
+/// function, which is two columns further left — writing it at the class depth is what left the split
+/// SDK non-Prettier-clean.
+///
+/// Shifting whole lines is exact here: a generated body contains no multi-line string or template
+/// literal (the only backquoted value is the single-line `let path = …`), so no line inside it is
+/// significant whitespace. One body writer, one shift, no per-call-site indent plumbing (rule 3).
+fn body_at_style_depth(body: &str, style: OperationEmitStyle) -> String {
+    match style {
+        OperationEmitStyle::ClassMethod => body.to_string(),
+        OperationEmitStyle::PrototypeFunction => {
+            let mut out = String::with_capacity(body.len());
+            for line in body.lines() {
+                out.push_str(line.strip_prefix("  ").unwrap_or(line));
+                out.push('\n');
+            }
+            out
+        }
+    }
 }
 
 /// The per-operation argument facts every emit site needs.
@@ -2075,10 +2125,13 @@ fn emit_pagination_helpers(
             .map_err(sink)?;
         }
     }
-    emit_ts_pagination_page_params(out, &params_type, &binding)?;
-    writeln!(out, "    while (true) {{").map_err(sink)?;
+    // Both generator bodies are written at the class-method depth and then shifted to the depth the
+    // emit style actually sits at, exactly like `emit_operation` does.
+    let body = &mut String::new();
+    emit_ts_pagination_page_params(body, &params_type, &binding)?;
+    writeln!(body, "    while (true) {{").map_err(sink)?;
     writeln!(
-        out,
+        body,
         "      const page = await this.{method_name}({});",
         page_call_args.join(", ")
     )
@@ -2088,14 +2141,14 @@ fn emit_pagination_helpers(
     // any consumer compiling with `noUnusedLocals` cannot build.
     let stops_on_empty_page = policy.termination == PaginationTermination::EmptyItems;
     if stops_on_empty_page || policy.mode == PaginationMode::Offset {
-        writeln!(out, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
+        writeln!(body, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
     }
     if stops_on_empty_page {
-        writeln!(out, "      if (items.length === 0) {{").map_err(sink)?;
-        writeln!(out, "        break;").map_err(sink)?;
-        writeln!(out, "      }}").map_err(sink)?;
+        writeln!(body, "      if (items.length === 0) {{").map_err(sink)?;
+        writeln!(body, "        break;").map_err(sink)?;
+        writeln!(body, "      }}").map_err(sink)?;
     }
-    writeln!(out, "      yield page;").map_err(sink)?;
+    writeln!(body, "      yield page;").map_err(sink)?;
     let advancing = &binding.access;
     match policy.mode {
         PaginationMode::Cursor => {
@@ -2108,24 +2161,25 @@ fn emit_pagination_helpers(
                     op.id
                 ),
                 })?;
-            writeln!(out, "      const nextCursor = {next_expr};").map_err(sink)?;
+            writeln!(body, "      const nextCursor = {next_expr};").map_err(sink)?;
             writeln!(
-                out,
+                body,
                 "      if (nextCursor === undefined || nextCursor === null || nextCursor === \"\") {{"
             )
             .map_err(sink)?;
-            writeln!(out, "        break;").map_err(sink)?;
-            writeln!(out, "      }}").map_err(sink)?;
-            writeln!(out, "      {advancing} = nextCursor;").map_err(sink)?;
+            writeln!(body, "        break;").map_err(sink)?;
+            writeln!(body, "      }}").map_err(sink)?;
+            writeln!(body, "      {advancing} = nextCursor;").map_err(sink)?;
         }
         PaginationMode::Page => {
-            writeln!(out, "      {advancing} += 1;").map_err(sink)?;
+            writeln!(body, "      {advancing} += 1;").map_err(sink)?;
         }
         PaginationMode::Offset => {
-            writeln!(out, "      {advancing} += items.length;").map_err(sink)?;
+            writeln!(body, "      {advancing} += items.length;").map_err(sink)?;
         }
     }
-    writeln!(out, "    }}").map_err(sink)?;
+    writeln!(body, "    }}").map_err(sink)?;
+    out.push_str(&body_at_style_depth(body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
@@ -2157,21 +2211,23 @@ fn emit_pagination_helpers(
             .map_err(sink)?;
         }
     }
+    let body = &mut String::new();
     writeln!(
-        out,
+        body,
         "    for await (const page of this.{pages_name}({})) {{",
         delegate_call_args.join(", ")
     )
     .map_err(sink)?;
     writeln!(
-        out,
+        body,
         "      for (const item of {} ?? []) {{",
         info.items_expr
     )
     .map_err(sink)?;
-    writeln!(out, "        yield item;").map_err(sink)?;
-    writeln!(out, "      }}").map_err(sink)?;
-    writeln!(out, "    }}").map_err(sink)?;
+    writeln!(body, "        yield item;").map_err(sink)?;
+    writeln!(body, "      }}").map_err(sink)?;
+    writeln!(body, "    }}").map_err(sink)?;
+    out.push_str(&body_at_style_depth(body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
@@ -4804,9 +4860,11 @@ mod tests {
 
         #[test]
         fn path_param_named_like_a_bound_argument_is_a_typed_error() {
-            // `params` and `options` are bound by every generated method; a path param that shadows
-            // one would silently take over the caller's arguments. Reject it (WR-03 analog).
-            for shadow in ["params", "options"] {
+            // Every generated method binds `params`/`options` as arguments and `path`/`headers`/`res`
+            // as body locals. A path param that camel-cases onto one of them shadows or redeclares
+            // it, so the emitted TypeScript would not compile. Reject the name with a typed error
+            // instead (WR-03 analog).
+            for shadow in ["params", "options", "path", "headers", "res"] {
                 let facts = format!(
                     r#"{{
                       "module": "app",

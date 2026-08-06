@@ -94,6 +94,13 @@ versions no longer deserialize.
 - A generated TypeScript cursor-pagination generator bound the page's item list without reading it,
   so the SDK did not compile under `--noUnusedLocals`. The list is now bound only where the loop
   uses it (empty-page termination and the offset advance).
+- The split-layout TypeScript SDK was not Prettier-clean: every operation body was written at the
+  class-method depth even though a split operation is a module-level function, leaving each line
+  two columns too far right. The Prettier gate now covers the split layout as well as the compact
+  one, the way the Python gate already covered both.
+- A TypeScript path parameter named `path`, `headers`, or `res` silently emitted a method that could
+  not compile, because each shadows or redeclares a local the body binds. Those names now raise the
+  same typed error `body` already did.
 - **TypeScript SDKs were unusable in browsers.** The global `fetch` was captured unbound and then
   invoked as a method, so the receiver was the client and every call threw `Illegal invocation`.
 - **Retry waits were unbounded and uninterruptible** in all three languages. Total time spent
