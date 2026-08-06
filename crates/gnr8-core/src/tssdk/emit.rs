@@ -38,7 +38,7 @@ use crate::sdk::emit_common::{
     operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
     request_body_model_of, split_words, success_responses_of, ApiKeyLocation, ErrorResponseBody,
     HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
-    SuccessResponses,
+    RequestBodyModel, SuccessResponses,
 };
 use crate::CoreError;
 
@@ -1172,6 +1172,7 @@ pub(crate) fn emit_operations(
     base_path: &str,
     ops: &[&Operation],
 ) -> Result<String, CoreError> {
+    check_params_type_names(graph, ops)?;
     let mut out = String::new();
     for op in ops {
         out.push('\n');
@@ -1188,17 +1189,25 @@ pub(crate) fn emit_operations(
     // Close the `class Client {` opened by emit_client.
     out.push_str("}\n");
     emit_group_facades(&mut out, ops)?;
+    emit_operation_params_types(&mut out, graph, ops)?;
     if ts_operations_need_wire_helpers(ops) {
         emit_ts_wire_helpers(&mut out, ts_operations_need_query_string_helper(ops));
     }
     Ok(out)
 }
 
-pub(crate) fn emit_split_operation_surface(ops: &[&Operation]) -> Result<String, CoreError> {
+pub(crate) fn emit_split_operation_surface(
+    graph: &ApiGraph,
+    ops: &[&Operation],
+) -> Result<String, CoreError> {
+    check_params_type_names(graph, ops)?;
     let mut out = String::new();
     emit_group_getters(&mut out, ops)?;
     out.push_str("}\n");
     emit_group_facades(&mut out, ops)?;
+    // The params types live in client.ts under BOTH layouts: they are part of the call shape, next to
+    // `RequestOptions`, and index.ts re-exports them from there. Split operation modules import them.
+    emit_operation_params_types(&mut out, graph, ops)?;
     Ok(out)
 }
 
@@ -1229,10 +1238,41 @@ pub(crate) fn emit_operation_module(
     } else {
         String::new()
     };
+    // The params types are declared in client.ts (see `emit_split_operation_surface`), so this module
+    // imports the ones its own operations take. Type-only, so the client↔operation module cycle is
+    // erased at compile time, exactly like the `Client`/`RequestOptions` imports beside them.
+    let mut client_types = vec!["Client".to_string(), "RequestOptions".to_string()];
+    for op in ops {
+        if ts_operation_shape(op, graph)?.resolved.has_params() {
+            client_types.push(operation_params_type_name(op));
+        }
+    }
     let out = format!(
-        "import type {{ Client, RequestOptions }} from \"{client_module}\";\nimport {{ ApiError }} from \"{errors_module}\";\n{model_import}\n{body}",
+        "{}import {{ ApiError }} from \"{errors_module}\";\n{model_import}\n{body}",
+        ts_module_specifier_list("import type", &client_types, client_module)
     );
     Ok(out)
+}
+
+/// Render one ES module specifier list — `export { A, B } from "./m";`, `import type { A } from "./m";`
+/// — on a single line when it fits inside Prettier's default 80-column `printWidth`, and one specifier
+/// per line otherwise.
+///
+/// Prettier ALWAYS collapses a specifier list that fits, so emitting the broken form unconditionally
+/// would leave `index.ts` unformatted for a small API. One width rule for every specifier list gnr8
+/// writes (CLAUDE.md rule 2: the emitted TypeScript is already formatter-clean, with no formatter
+/// dependency).
+fn ts_module_specifier_list(prefix: &str, names: &[String], module: &str) -> String {
+    let one_line = format!("{prefix} {{ {} }} from \"{module}\";", names.join(", "));
+    if one_line.chars().count() <= 80 {
+        return format!("{one_line}\n");
+    }
+    let mut out = format!("{prefix} {{\n");
+    for name in names {
+        let _ = writeln!(out, "  {name},");
+    }
+    let _ = writeln!(out, "}} from \"{module}\";");
+    out
 }
 
 pub(crate) fn pagination_method_names(graph: &ApiGraph, op: &Operation) -> Vec<String> {
@@ -1336,45 +1376,139 @@ fn api_class_name(group: &str) -> String {
     out
 }
 
-/// The collision-checked TypeScript identifiers for one operation's arguments.
-///
-/// Each `*_idents` vector aligns positionally with its params vector. Path params and required query
-/// params are positional (no default); optional query params take a `?: T` default.
-struct ResolvedArgs<'op> {
-    path_idents: Vec<String>,
-    required_query: Vec<&'op Param>,
-    required_query_idents: Vec<String>,
-    optional_query: Vec<&'op Param>,
-    optional_query_idents: Vec<String>,
+/// One non-path request parameter, as a property of its operation's params object.
+struct ResolvedParam<'op> {
+    param: &'op Param,
+    /// The `camelCase` property key inside the params object. The WIRE name stays `param.name`.
+    key: String,
 }
 
-/// Reserved argument name a generated method already binds (`body`), which a path/query param must not
-/// collide with (it would shadow the typed body argument — WR-03 analog).
-const RESERVED_ARGS: &[&str] = &["body"];
+/// The collision-checked TypeScript arguments of one operation.
+///
+/// Path params stay POSITIONAL — they are always required and they interpolate into the URL. Every
+/// OTHER request parameter (query and header alike) becomes a property of ONE typed params object, so
+/// a caller never threads `undefined` through a positional list to reach the argument it wants. This
+/// is the same shape the Go target has always emitted (`<Method>Params`), now in TypeScript.
+///
+/// `params` is in GRAPH order — the declaration order the emitted `{Operation}Params` type reproduces.
+/// Wire-append order (required first, then optional) is applied at the write sites so the emitted query
+/// string is unchanged by this shape.
+struct ResolvedArgs<'op> {
+    path_idents: Vec<String>,
+    params: Vec<ResolvedParam<'op>>,
+}
+
+/// The bound name of the generated params-object argument.
+const PARAMS_ARG: &str = "params";
+
+/// Names a generated method already binds, which a POSITIONAL path param must not collide with
+/// (WR-03 analog).
+///
+/// Two groups, both unconditional: the arguments every method declares after the path params
+/// (`params`, `options`, plus the pagination generators' `pageParams` copy), and the locals EVERY
+/// method body declares (`let path`, `const headers`, `const res`). A path param that camel-cases
+/// onto any of them shadows or redeclares it, which is a TypeScript error: the interpolated `path`
+/// template becomes a use-before-declaration, and `headers`/`res` become duplicate block-scoped
+/// declarations.
+/// Rejecting the name with a typed error turns broken emitted TypeScript into an actionable message,
+/// and no graph that compiles today starts failing: every listed name already emits invalid output.
+///
+/// `body` is added only for body-bearing operations, the only ones that bind it. Conditionally-emitted
+/// locals (`searchParams`, `qs`, `items`, …) are deliberately NOT reserved — an operation that never
+/// emits them can legitimately name a path param after one.
+const RESERVED_ARGS: &[&str] = &[
+    PARAMS_ARG,
+    "options",
+    PAGE_PARAMS_LOCAL,
+    "path",
+    "headers",
+    "res",
+];
+
+impl ResolvedArgs<'_> {
+    /// Whether this operation takes a params object at all.
+    fn has_params(&self) -> bool {
+        !self.params.is_empty()
+    }
+
+    /// Whether the params object is itself a REQUIRED argument, i.e. some property is required.
+    fn params_required(&self) -> bool {
+        self.params.iter().any(|resolved| resolved.param.required)
+    }
+
+    /// The expression that TESTS one property for presence.
+    ///
+    /// An all-optional params object may itself be `undefined`, so the test optional-chains through
+    /// it. TypeScript narrows BOTH `params` and the property inside the resulting guard, which is why
+    /// [`params_read`] can stay a plain member access at every use site.
+    fn params_probe(&self, key: &str) -> String {
+        if self.params_required() {
+            params_read(key)
+        } else if is_ident(key) {
+            format!("{PARAMS_ARG}?.{key}")
+        } else {
+            format!("{PARAMS_ARG}?.[{}]", ts_string_literal(key))
+        }
+    }
+
+    /// The params-object key of the QUERY parameter named `param_name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::SdkGen`] when the operation has no such query parameter — the single check
+    /// behind every pagination-policy reference to a query param.
+    fn params_key(&self, op: &Operation, param_name: &str) -> Result<&str, CoreError> {
+        self.params
+            .iter()
+            .find(|resolved| {
+                resolved.param.location == "query" && resolved.param.name == param_name
+            })
+            .map(|resolved| resolved.key.as_str())
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "pagination policy for operation '{}' references missing query parameter '{}'",
+                    op.id, param_name
+                ),
+            })
+    }
+
+    /// The parameters at `location`, in WIRE-APPEND order: required first, then optional.
+    ///
+    /// This is the order the previous positional surface appended values in, so moving to a params
+    /// object leaves the emitted query string and header set byte-identical.
+    fn wire_ordered(&self, location: &str) -> Vec<&ResolvedParam<'_>> {
+        let matching = self
+            .params
+            .iter()
+            .filter(|resolved| resolved.param.location == location);
+        let (required, optional): (Vec<_>, Vec<_>) =
+            matching.partition(|resolved| resolved.param.required);
+        required.into_iter().chain(optional).collect()
+    }
+}
+
+/// The expression that READS one params property, valid wherever the property is known to be present.
+fn params_read(key: &str) -> String {
+    ts_property_access(PARAMS_ARG, key)
+}
 
 /// Resolve + collision-check every operation argument's TypeScript identifier (WR-03 / WR-01 analog).
 ///
-/// Each identifier is the `camelCase` form of the param name; the set is tracked as it grows so a
-/// collision (two params whose identifier matches, or a param colliding with the bound `body`) is a
-/// typed [`CoreError::SdkGen`] rather than a TS "duplicate parameter" error. Query params are split
-/// required-first (positional) / optional-last (`?: T`) so all non-defaulted args precede optional ones.
-/// One deterministic pass, no fallback (rule 3).
+/// Each identifier is the `camelCase` form of the param name. Positional path params and params-object
+/// properties are two SEPARATE namespaces (a property never shadows a binding), so each is checked on
+/// its own: a duplicate inside either one is a typed [`CoreError::SdkGen`] rather than a TS "duplicate
+/// parameter"/"duplicate property" error. One deterministic pass, no fallback (rule 3).
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::SdkGen`] on an argument-identifier collision.
+/// Returns [`CoreError::SdkGen`] on an argument-identifier collision or an empty identifier.
 fn resolve_op_args<'op>(
     op: &Operation,
     path_params: &[&'op Param],
-    query_params: &[&'op Param],
+    request_params: &[&'op Param],
     has_body: bool,
 ) -> Result<ResolvedArgs<'op>, CoreError> {
-    let mut used_args: Vec<String> = if has_body {
-        RESERVED_ARGS.iter().map(|s| (*s).to_string()).collect()
-    } else {
-        Vec::new()
-    };
-    let mut reserve = |name: &str| -> Result<String, CoreError> {
+    let ident_of = |name: &str| -> Result<String, CoreError> {
         let ident = camel(name);
         // A param name that tokenizes to nothing (e.g. `"_"`, `"-"`, or empty) would emit `: T` with
         // no binding name → invalid TS. Reject it with a typed error rather than emit broken code
@@ -1388,43 +1522,124 @@ fn resolve_op_args<'op>(
                 ),
             });
         }
-        if used_args.contains(&ident) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "operation '{}' has a parameter whose TypeScript identifier '{ident}' collides \
-                     with another argument (body or another param)",
-                    op.id
-                ),
-            });
-        }
-        used_args.push(ident.clone());
         Ok(ident)
     };
 
     let mut path_idents: Vec<String> = Vec::with_capacity(path_params.len());
     for p in path_params {
-        path_idents.push(reserve(&p.name)?);
+        let ident = ident_of(&p.name)?;
+        let shadows_bound_arg =
+            RESERVED_ARGS.contains(&ident.as_str()) || (has_body && ident == "body");
+        if shadows_bound_arg || path_idents.contains(&ident) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a path parameter whose TypeScript identifier '{ident}' \
+                     collides with a name the generated method already binds (body, params, \
+                     options, pageParams, path, headers, res, or another path param)",
+                    op.id
+                ),
+            });
+        }
+        path_idents.push(ident);
     }
-    // Required query params are positional (WR-01: a required query param MUST be supplied); optional
-    // ones take the `?: T` default.
-    let (required_query, optional_query): (Vec<&Param>, Vec<&Param>) =
-        query_params.iter().copied().partition(|p| p.required);
-    let mut required_query_idents: Vec<String> = Vec::with_capacity(required_query.len());
-    for p in &required_query {
-        required_query_idents.push(reserve(&p.name)?);
-    }
-    let mut optional_query_idents: Vec<String> = Vec::with_capacity(optional_query.len());
-    for p in &optional_query {
-        optional_query_idents.push(reserve(&p.name)?);
+
+    let mut params: Vec<ResolvedParam<'op>> = Vec::with_capacity(request_params.len());
+    for p in request_params {
+        let key = ident_of(&p.name)?;
+        if params.iter().any(|resolved| resolved.key == key) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' has a parameter whose TypeScript identifier '{key}' collides \
+                     with another params property",
+                    op.id
+                ),
+            });
+        }
+        params.push(ResolvedParam { param: p, key });
     }
 
     Ok(ResolvedArgs {
         path_idents,
-        required_query,
-        required_query_idents,
-        optional_query,
-        optional_query_idents,
+        params,
     })
+}
+
+/// The exported `{Operation}Params` type name for one operation.
+///
+/// `PascalCase` of the operation's method name — itself the `camelCase` of the operation id — so
+/// `getItemsPaginated` → `GetItemsPaginatedParams`.
+pub(crate) fn operation_params_type_name(op: &Operation) -> String {
+    format!("{}Params", upper_camel_first(&operation_method_name(op)))
+}
+
+/// Reject a `{Operation}Params` type name that would be declared twice or shadow another export.
+///
+/// The params types live in `client.ts` next to `RequestOptions` and are re-exported from `index.ts`
+/// alongside the models, so a name shared with another operation or with a schema would emit a
+/// duplicate declaration/export. Surface it as a typed error at generation time (T-03) instead of
+/// shipping TypeScript that does not compile.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] naming the colliding operation and symbol.
+fn check_params_type_names(graph: &ApiGraph, ops: &[&Operation]) -> Result<(), CoreError> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for op in ops {
+        if !ts_operation_shape(op, graph)?.resolved.has_params() {
+            continue;
+        }
+        let name = operation_params_type_name(op);
+        if graph.schemas.iter().any(|schema| schema.name == name) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' emits TypeScript params type '{name}', which collides with an \
+                     existing exported symbol",
+                    op.id
+                ),
+            });
+        }
+        if let Some(existing) = seen.insert(name.clone(), op.id.as_str()) {
+            return Err(CoreError::SdkGen {
+                message: format!(
+                    "operations '{existing}' and '{}' both emit TypeScript params type '{name}'",
+                    op.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Emit the exported `{Operation}Params` type for every params-bearing operation, in graph order.
+///
+/// Type aliases are hoisted in TypeScript, so declaring them after the `Client` class — next to the
+/// wire helpers the methods also call — keeps `client.ts` in one deterministic write order.
+fn emit_operation_params_types(
+    out: &mut String,
+    graph: &ApiGraph,
+    ops: &[&Operation],
+) -> Result<(), CoreError> {
+    for op in ops {
+        let args = ts_operation_shape(op, graph)?.resolved;
+        if !args.has_params() {
+            continue;
+        }
+        writeln!(out, "\nexport type {} = {{", operation_params_type_name(op)).map_err(sink)?;
+        for resolved in &args.params {
+            // A camelCase key that is not a legal bare member name (a leading digit, say) is emitted
+            // as a QUOTED string-literal member — the same rule `emit_interface` applies to wire keys.
+            let key = if is_ident(&resolved.key) {
+                resolved.key.clone()
+            } else {
+                ts_string_literal(&resolved.key)
+            };
+            let optional = if resolved.param.required { "" } else { "?" };
+            let ty = ts_type(&resolved.param.schema, false, graph, "models.")?;
+            writeln!(out, "  {key}{optional}: {ty};").map_err(sink)?;
+        }
+        writeln!(out, "}};").map_err(sink)?;
+    }
+    Ok(())
 }
 
 /// Render a class method's `async` signature at 2-space indent, wrapping the parameter list one per line
@@ -1594,14 +1809,11 @@ fn emit_operation(
     let abs = join_path(base_path, &op.path);
     let tokens = path_tokens(&abs);
 
-    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    // Fetch owns cookies and forbidden browser headers through its transport. They are not
-    // required operation arguments in the TypeScript SDK.
-    let request_params: Vec<&Param> = op
-        .params
-        .iter()
-        .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
-        .collect();
+    let TsOperationShape {
+        path_params,
+        body_model,
+        resolved,
+    } = ts_operation_shape(op, graph)?;
 
     // The templated path tokens must be exactly the declared path params (order-independent set
     // equality), so neither a dangling token nor an unused arg can slip through (twin of WR-03).
@@ -1617,7 +1829,6 @@ fn emit_operation(
         });
     }
 
-    let body_model = request_body_model_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_alternatives = operation_auth_alternatives(graph, op)?;
@@ -1669,40 +1880,14 @@ fn emit_operation(
         )
     };
 
-    let ResolvedArgs {
-        path_idents,
-        required_query,
-        required_query_idents,
-        optional_query,
-        optional_query_idents,
-    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
-
-    // Signature: path params (positional), required body when present, required query
-    // (positional), optional body when present, then optional query params (`?: T`). This preserves
-    // the established required-body surface while keeping optional args after all required args.
-    let mut args: Vec<String> = Vec::new();
-    // A param type emitted into client.ts must reach a named model/enum through the `models` namespace
-    // import (the symbols live in models.ts, not in scope here) — pass the `"models."` prefix so a named
-    // enum param (e.g. `format: models.BookFormat`) resolves instead of emitting a bare TS2304 name.
-    for (p, ident) in path_params.iter().zip(path_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph, "models.")?;
-        args.push(format!("{ident}: {ty}"));
-    }
-    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
-    }
-    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph, "models.")?;
-        args.push(format!("{ident}: {ty}"));
-    }
-    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
-    }
-    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-        let ty = ts_type(&p.schema, false, graph, "models.")?;
-        args.push(format!("{ident}?: {ty}"));
-    }
-    args.push("options?: RequestOptions".to_string());
+    let TsOperationArgs { declared: args, .. } = ts_operation_args(
+        op,
+        graph,
+        &path_params,
+        body_model.as_ref(),
+        &resolved,
+        PARAMS_ARG,
+    )?;
 
     let ret_promise = if return_model.is_some() || success.has_binary_body() {
         format!("Promise<{return_ty}>")
@@ -1728,19 +1913,18 @@ fn emit_operation(
         }
     }
 
-    emit_op_path(out, &abs, &tokens, &path_params, &path_idents)?;
-    emit_ts_auth_selection(out, &op.id, &auth_alternatives)?;
-    emit_op_query(
-        out,
-        graph,
-        &required_query,
-        &required_query_idents,
-        &optional_query,
-        &optional_query_idents,
-        &auth_queries,
+    let mut body = String::new();
+    emit_op_path(
+        &mut body,
+        &abs,
+        &tokens,
+        &path_params,
+        &resolved.path_idents,
     )?;
+    emit_ts_auth_selection(&mut body, &op.id, &auth_alternatives)?;
+    emit_op_query(&mut body, graph, &resolved, &auth_queries)?;
     emit_op_dispatch(
-        out,
+        &mut body,
         &op.method,
         &success,
         TsRequestBody::from_body(body_model.as_ref()),
@@ -1749,16 +1933,138 @@ fn emit_operation(
         &error_bodies,
         op,
         graph,
-        &required_query,
-        &required_query_idents,
-        &optional_query,
-        &optional_query_idents,
+        &resolved,
     )?;
+    out.push_str(&body_at_style_depth(&body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
     }
     Ok(())
+}
+
+/// Shift one generated body to the indentation depth its emit style sits at.
+///
+/// Bodies are written ONCE, at the class-method depth: 4 spaces, inside a method that is itself
+/// indented 2 inside `class Client`. A split layout emits the SAME body as a module-level prototype
+/// function, which is two columns further left — writing it at the class depth is what left the split
+/// SDK non-Prettier-clean.
+///
+/// Shifting whole lines is exact here: a generated body contains no multi-line string or template
+/// literal (the only backquoted value is the single-line `let path = …`), so no line inside it is
+/// significant whitespace. One body writer, one shift, no per-call-site indent plumbing (rule 3).
+fn body_at_style_depth(body: &str, style: OperationEmitStyle) -> String {
+    match style {
+        OperationEmitStyle::ClassMethod => body.to_string(),
+        OperationEmitStyle::PrototypeFunction => {
+            let mut out = String::with_capacity(body.len());
+            for line in body.lines() {
+                out.push_str(line.strip_prefix("  ").unwrap_or(line));
+                out.push('\n');
+            }
+            out
+        }
+    }
+}
+
+/// The per-operation argument facts every emit site needs.
+///
+/// Resolved ONCE per site by [`ts_operation_shape`] so the method signature, the emitted
+/// `{Operation}Params` type, and the pagination generators are all derived from the same reading of
+/// the operation (rule 3: one path per fact).
+struct TsOperationShape<'op> {
+    path_params: Vec<&'op Param>,
+    body_model: Option<RequestBodyModel>,
+    resolved: ResolvedArgs<'op>,
+}
+
+/// Split one operation's parameters into positional path params and params-object properties.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] on a dangling request-body `$ref` or an argument-identifier collision.
+fn ts_operation_shape<'op>(
+    op: &'op Operation,
+    graph: &ApiGraph,
+) -> Result<TsOperationShape<'op>, CoreError> {
+    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
+    // Fetch owns cookies and forbidden browser headers through its transport. They are not
+    // required operation arguments in the TypeScript SDK.
+    let request_params: Vec<&Param> = op
+        .params
+        .iter()
+        .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
+        .collect();
+    let body_model = request_body_model_of(op, graph)?;
+    let resolved = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
+    Ok(TsOperationShape {
+        path_params,
+        body_model,
+        resolved,
+    })
+}
+
+/// One operation's arguments, declared and forwarded, built in a SINGLE place.
+///
+/// `declared` is the method's parameter list; `forwarded` is the matching call-site list. The
+/// pagination generators reuse the same builder so their signature can never drift from the operation
+/// method they call.
+struct TsOperationArgs {
+    declared: Vec<String>,
+    forwarded: Vec<String>,
+}
+
+/// Assemble one operation's argument list: positional path params, the typed body, the single params
+/// object, then the trailing `RequestOptions`.
+///
+/// TypeScript forbids a required parameter after an optional one, so the body and the params object
+/// each land in the required or the optional half according to their OWN requiredness — the same
+/// required-before-optional rule the positional surface followed, now over two arguments instead of a
+/// long optional tail.
+///
+/// `params_expr` is what `forwarded` passes in the params slot: the caller's own `params` for a
+/// straight forward, or the generator's mutable page-local copy.
+fn ts_operation_args(
+    op: &Operation,
+    graph: &ApiGraph,
+    path_params: &[&Param],
+    body_model: Option<&RequestBodyModel>,
+    resolved: &ResolvedArgs,
+    params_expr: &str,
+) -> Result<TsOperationArgs, CoreError> {
+    let mut declared: Vec<String> = Vec::new();
+    let mut forwarded: Vec<String> = Vec::new();
+    // A param type emitted into client.ts must reach a named model/enum through the `models` namespace
+    // import (the symbols live in models.ts, not in scope here) — pass the `"models."` prefix so a named
+    // enum param (e.g. `format: models.BookFormat`) resolves instead of emitting a bare TS2304 name.
+    for (p, ident) in path_params.iter().zip(resolved.path_idents.iter()) {
+        let ty = ts_type(&p.schema, false, graph, "models.")?;
+        declared.push(format!("{ident}: {ty}"));
+        forwarded.push(ident.clone());
+    }
+    let params_type = operation_params_type_name(op);
+    if let Some(body) = body_model.filter(|body| body.required) {
+        declared.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
+        forwarded.push("body".to_string());
+    }
+    if resolved.params_required() {
+        declared.push(format!("{PARAMS_ARG}: {params_type}"));
+        forwarded.push(params_expr.to_string());
+    }
+    if let Some(body) = body_model.filter(|body| !body.required) {
+        declared.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
+        forwarded.push("body".to_string());
+    }
+    if resolved.has_params() && !resolved.params_required() {
+        declared.push(format!("{PARAMS_ARG}?: {params_type}"));
+        forwarded.push(params_expr.to_string());
+    }
+    declared.push("options?: RequestOptions".to_string());
+    forwarded.push("options".to_string());
+    Ok(TsOperationArgs {
+        declared,
+        forwarded,
+    })
 }
 
 struct TsPaginationInfo {
@@ -1785,7 +2091,13 @@ fn emit_pagination_helpers(
     let pages_name = format!("{method_name}Pages");
     let items_name = format!("iterate{}", upper_camel_first(&method_name));
     let info = ts_pagination_info(graph, op, policy)?;
-    let TsPaginationArgs { args, call_args } = ts_pagination_args(op, graph)?;
+    let TsPaginationArgs {
+        args,
+        page_call_args,
+        delegate_call_args,
+        params_type,
+        binding,
+    } = ts_pagination_args(op, graph, policy)?;
 
     match style {
         OperationEmitStyle::ClassMethod => {
@@ -1813,32 +2125,33 @@ fn emit_pagination_helpers(
             .map_err(sink)?;
         }
     }
-    emit_ts_pagination_initialization(out, op, policy)?;
-    writeln!(out, "    while (true) {{").map_err(sink)?;
+    // Both generator bodies are written at the class-method depth and then shifted to the depth the
+    // emit style actually sits at, exactly like `emit_operation` does.
+    let body = &mut String::new();
+    emit_ts_pagination_page_params(body, &params_type, &binding)?;
+    writeln!(body, "    while (true) {{").map_err(sink)?;
     writeln!(
-        out,
+        body,
         "      const page = await this.{method_name}({});",
-        call_args.join(", ")
+        page_call_args.join(", ")
     )
     .map_err(sink)?;
-    writeln!(out, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
-    if policy.termination == PaginationTermination::EmptyItems {
-        writeln!(out, "      if (items.length === 0) {{").map_err(sink)?;
-        writeln!(out, "        break;").map_err(sink)?;
-        writeln!(out, "      }}").map_err(sink)?;
+    // The page's item list is bound only where the loop actually reads it: the empty-page
+    // termination check and the offset advance. Binding it unconditionally leaves a dead local that
+    // any consumer compiling with `noUnusedLocals` cannot build.
+    let stops_on_empty_page = policy.termination == PaginationTermination::EmptyItems;
+    if stops_on_empty_page || policy.mode == PaginationMode::Offset {
+        writeln!(body, "      const items = {} ?? [];", info.items_expr).map_err(sink)?;
     }
-    writeln!(out, "      yield page;").map_err(sink)?;
+    if stops_on_empty_page {
+        writeln!(body, "      if (items.length === 0) {{").map_err(sink)?;
+        writeln!(body, "        break;").map_err(sink)?;
+        writeln!(body, "      }}").map_err(sink)?;
+    }
+    writeln!(body, "      yield page;").map_err(sink)?;
+    let advancing = &binding.access;
     match policy.mode {
         PaginationMode::Cursor => {
-            let cursor_param = policy
-                .cursor_param
-                .as_deref()
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "pagination policy for operation '{}' is cursor mode without cursor_param",
-                        op.id
-                    ),
-                })?;
             let next_expr = info
                 .next_cursor_expr
                 .as_deref()
@@ -1848,45 +2161,25 @@ fn emit_pagination_helpers(
                     op.id
                 ),
                 })?;
-            let cursor_ident = ts_query_ident(op, cursor_param)?;
-            writeln!(out, "      const nextCursor = {next_expr};").map_err(sink)?;
+            writeln!(body, "      const nextCursor = {next_expr};").map_err(sink)?;
             writeln!(
-                out,
+                body,
                 "      if (nextCursor === undefined || nextCursor === null || nextCursor === \"\") {{"
             )
             .map_err(sink)?;
-            writeln!(out, "        break;").map_err(sink)?;
-            writeln!(out, "      }}").map_err(sink)?;
-            writeln!(out, "      {cursor_ident} = nextCursor;").map_err(sink)?;
+            writeln!(body, "        break;").map_err(sink)?;
+            writeln!(body, "      }}").map_err(sink)?;
+            writeln!(body, "      {advancing} = nextCursor;").map_err(sink)?;
         }
         PaginationMode::Page => {
-            let page_param = policy
-                .page_param
-                .as_deref()
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "pagination policy for operation '{}' is page mode without page_param",
-                        op.id
-                    ),
-                })?;
-            let page_ident = ts_query_ident(op, page_param)?;
-            writeln!(out, "      {page_ident} += 1;").map_err(sink)?;
+            writeln!(body, "      {advancing} += 1;").map_err(sink)?;
         }
         PaginationMode::Offset => {
-            let offset_param = policy
-                .offset_param
-                .as_deref()
-                .ok_or_else(|| CoreError::SdkGen {
-                    message: format!(
-                        "pagination policy for operation '{}' is offset mode without offset_param",
-                        op.id
-                    ),
-                })?;
-            let offset_ident = ts_query_ident(op, offset_param)?;
-            writeln!(out, "      {offset_ident} += items.length;").map_err(sink)?;
+            writeln!(body, "      {advancing} += items.length;").map_err(sink)?;
         }
     }
-    writeln!(out, "    }}").map_err(sink)?;
+    writeln!(body, "    }}").map_err(sink)?;
+    out.push_str(&body_at_style_depth(body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
@@ -1918,21 +2211,23 @@ fn emit_pagination_helpers(
             .map_err(sink)?;
         }
     }
+    let body = &mut String::new();
     writeln!(
-        out,
+        body,
         "    for await (const page of this.{pages_name}({})) {{",
-        call_args.join(", ")
+        delegate_call_args.join(", ")
     )
     .map_err(sink)?;
     writeln!(
-        out,
+        body,
         "      for (const item of {} ?? []) {{",
         info.items_expr
     )
     .map_err(sink)?;
-    writeln!(out, "        yield item;").map_err(sink)?;
-    writeln!(out, "      }}").map_err(sink)?;
-    writeln!(out, "    }}").map_err(sink)?;
+    writeln!(body, "        yield item;").map_err(sink)?;
+    writeln!(body, "      }}").map_err(sink)?;
+    writeln!(body, "    }}").map_err(sink)?;
+    out.push_str(&body_at_style_depth(body, style));
     match style {
         OperationEmitStyle::ClassMethod => writeln!(out, "  }}").map_err(sink)?,
         OperationEmitStyle::PrototypeFunction => writeln!(out, "}};").map_err(sink)?,
@@ -1940,90 +2235,133 @@ fn emit_pagination_helpers(
     Ok(())
 }
 
-fn emit_ts_pagination_initialization(
+/// The generator-local, mutable copy of the caller's params object.
+const PAGE_PARAMS_LOCAL: &str = "pageParams";
+
+/// Emit the page-local params copy the generator advances between requests.
+///
+/// The generator never mutates the caller's object: it advances a COPY. Spreading `params` covers both
+/// params-object shapes in one form — `{ ...undefined }` is `{}` — so an all-optional params object
+/// needs no separate guard (rule 3). Page and offset modes then seed a starting value when the caller
+/// left theirs unset; the `=== undefined` guard narrows the property, so the `+=` advance below is
+/// well-typed under `--strict`.
+fn emit_ts_pagination_page_params(
     out: &mut String,
-    op: &Operation,
-    policy: &PaginationPolicy,
+    params_type: &str,
+    binding: &TsPaginationBinding,
 ) -> Result<(), CoreError> {
-    match policy.mode {
-        PaginationMode::Cursor => {}
-        PaginationMode::Page => {
-            let Some(page_param) = policy.page_param.as_deref() else {
-                return Ok(());
-            };
-            if ts_query_param(op, page_param)?.required {
-                return Ok(());
-            }
-            let ident = ts_query_ident(op, page_param)?;
-            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
-            writeln!(out, "      {ident} = 1;").map_err(sink)?;
-            writeln!(out, "    }}").map_err(sink)?;
-        }
-        PaginationMode::Offset => {
-            let Some(offset_param) = policy.offset_param.as_deref() else {
-                return Ok(());
-            };
-            if ts_query_param(op, offset_param)?.required {
-                return Ok(());
-            }
-            let ident = ts_query_ident(op, offset_param)?;
-            writeln!(out, "    if ({ident} === undefined) {{").map_err(sink)?;
-            writeln!(out, "      {ident} = 0;").map_err(sink)?;
-            writeln!(out, "    }}").map_err(sink)?;
-        }
-    }
+    writeln!(
+        out,
+        "    const {PAGE_PARAMS_LOCAL}: {params_type} = {{ ...{PARAMS_ARG} }};"
+    )
+    .map_err(sink)?;
+    let Some(start) = binding.seed else {
+        return Ok(());
+    };
+    let access = &binding.access;
+    writeln!(out, "    if ({access} === undefined) {{").map_err(sink)?;
+    writeln!(out, "      {access} = {start};").map_err(sink)?;
+    writeln!(out, "    }}").map_err(sink)?;
     Ok(())
 }
 
-struct TsPaginationArgs {
-    args: Vec<String>,
-    call_args: Vec<String>,
+/// The params-object property one pagination policy advances between pages.
+struct TsPaginationBinding {
+    /// `pageParams.<key>` — the expression the generator reads and writes.
+    access: String,
+    /// The value seeded when the caller left the property unset; `None` for cursor mode and for a
+    /// REQUIRED page/offset param, which the caller always supplies.
+    seed: Option<&'static str>,
 }
 
-fn ts_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<TsPaginationArgs, CoreError> {
-    let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
-    let request_params: Vec<&Param> = op
-        .params
-        .iter()
-        .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
-        .collect();
-    let body_model = request_body_model_of(op, graph)?;
-    let ResolvedArgs {
-        path_idents,
-        required_query,
-        required_query_idents,
-        optional_query,
-        optional_query_idents,
-    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
+/// Resolve the params-object property a pagination policy advances, plus its starting value.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] when the policy names no parameter for its mode, or names one that is
+/// not a query parameter of the operation.
+fn ts_pagination_binding(
+    op: &Operation,
+    policy: &PaginationPolicy,
+    resolved: &ResolvedArgs,
+) -> Result<TsPaginationBinding, CoreError> {
+    let (param_name, mode, seed) = match policy.mode {
+        PaginationMode::Cursor => (policy.cursor_param.as_deref(), "cursor", None),
+        PaginationMode::Page => (policy.page_param.as_deref(), "page", Some("1")),
+        PaginationMode::Offset => (policy.offset_param.as_deref(), "offset", Some("0")),
+    };
+    let param_name = param_name.ok_or_else(|| CoreError::SdkGen {
+        message: format!(
+            "pagination policy for operation '{}' is {mode} mode without {mode}_param",
+            op.id
+        ),
+    })?;
+    let key = resolved.params_key(op, param_name)?;
+    // A REQUIRED page/offset param is always supplied by the caller, so there is nothing to seed.
+    let seed = if ts_query_param(op, param_name)?.required {
+        None
+    } else {
+        seed
+    };
+    Ok(TsPaginationBinding {
+        access: ts_property_access(PAGE_PARAMS_LOCAL, key),
+        seed,
+    })
+}
 
-    let mut args: Vec<String> = Vec::new();
-    let mut call_args: Vec<String> = Vec::new();
-    for (param, ident) in path_params.iter().zip(path_idents.iter()) {
-        let ty = ts_type(&param.schema, false, graph, "models.")?;
-        args.push(format!("{ident}: {ty}"));
-        call_args.push(ident.clone());
-    }
-    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
-        call_args.push("body".to_string());
-    }
-    for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        let ty = ts_type(&param.schema, false, graph, "models.")?;
-        args.push(format!("{ident}: {ty}"));
-        call_args.push(ident.clone());
-    }
-    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
-        call_args.push("body".to_string());
-    }
-    for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-        let ty = ts_type(&param.schema, false, graph, "models.")?;
-        args.push(format!("{ident}?: {ty}"));
-        call_args.push(ident.clone());
-    }
-    args.push("options?: RequestOptions".to_string());
-    call_args.push("options".to_string());
-    Ok(TsPaginationArgs { args, call_args })
+/// Everything the pagination generators need about their arguments.
+struct TsPaginationArgs {
+    /// The generator's declared parameters — identical to the operation method's.
+    args: Vec<String>,
+    /// Arguments the page generator forwards to the operation method: the page-local params copy.
+    page_call_args: Vec<String>,
+    /// Arguments the item generator forwards to the page generator: its own arguments, unchanged.
+    delegate_call_args: Vec<String>,
+    /// The operation's params type, which the page-local copy is annotated with.
+    params_type: String,
+    binding: TsPaginationBinding,
+}
+
+fn ts_pagination_args(
+    op: &Operation,
+    graph: &ApiGraph,
+    policy: &PaginationPolicy,
+) -> Result<TsPaginationArgs, CoreError> {
+    let TsOperationShape {
+        path_params,
+        body_model,
+        resolved,
+    } = ts_operation_shape(op, graph)?;
+    let binding = ts_pagination_binding(op, policy, &resolved)?;
+    let TsOperationArgs {
+        declared: args,
+        forwarded: page_call_args,
+    } = ts_operation_args(
+        op,
+        graph,
+        &path_params,
+        body_model.as_ref(),
+        &resolved,
+        PAGE_PARAMS_LOCAL,
+    )?;
+    let TsOperationArgs {
+        forwarded: delegate_call_args,
+        ..
+    } = ts_operation_args(
+        op,
+        graph,
+        &path_params,
+        body_model.as_ref(),
+        &resolved,
+        PARAMS_ARG,
+    )?;
+    Ok(TsPaginationArgs {
+        args,
+        page_call_args,
+        delegate_call_args,
+        params_type: operation_params_type_name(op),
+        binding,
+    })
 }
 
 fn ts_pagination_info(
@@ -2123,10 +2461,6 @@ fn ts_query_param<'a>(op: &'a Operation, param_name: &str) -> Result<&'a Param, 
         })
 }
 
-fn ts_query_ident(op: &Operation, param_name: &str) -> Result<String, CoreError> {
-    ts_query_param(op, param_name).map(|param| camel(&param.name))
-}
-
 fn ts_parameter_style(param: &Param) -> &str {
     param
         .style
@@ -2173,39 +2507,36 @@ fn ts_operations_need_query_string_helper(ops: &[&Operation]) -> bool {
         .any(|op| op.params.iter().any(|param| param.allow_reserved))
 }
 
-fn emit_ts_header_parameters(
-    out: &mut String,
-    required_params: &[&Param],
-    required_idents: &[String],
-    optional_params: &[&Param],
-    optional_idents: &[String],
-) -> Result<(), CoreError> {
-    for (param, ident) in required_params.iter().zip(required_idents.iter()) {
-        if param.location == "header" {
-            emit_ts_header_parameter(out, param, ident, "    ")?;
+fn emit_ts_header_parameters(out: &mut String, args: &ResolvedArgs) -> Result<(), CoreError> {
+    for resolved in args.wire_ordered("header") {
+        let read = params_read(&resolved.key);
+        if resolved.param.required {
+            emit_ts_header_parameter(out, resolved.param, &read, "    ")?;
+        } else {
+            writeln!(
+                out,
+                "    if ({} !== undefined) {{",
+                args.params_probe(&resolved.key)
+            )
+            .map_err(sink)?;
+            emit_ts_header_parameter(out, resolved.param, &read, "      ")?;
+            writeln!(out, "    }}").map_err(sink)?;
         }
-    }
-    for (param, ident) in optional_params.iter().zip(optional_idents.iter()) {
-        if param.location != "header" {
-            continue;
-        }
-        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        emit_ts_header_parameter(out, param, ident, "      ")?;
-        writeln!(out, "    }}").map_err(sink)?;
     }
     Ok(())
 }
 
+/// Set one header parameter, reading its value from `value_expr` (a params-object member access).
 fn emit_ts_header_parameter(
     out: &mut String,
     param: &Param,
-    ident: &str,
+    value_expr: &str,
     padding: &str,
 ) -> Result<(), CoreError> {
     if ts_parameter_needs_pairs(param) {
         writeln!(
             out,
-            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, {ident}, {}, {})) {{",
+            "{padding}for (const [wireName, wireValue] of wireParameterPairs({}, {value_expr}, {}, {})) {{",
             quoted_string_literal(&param.name),
             quoted_string_literal(ts_parameter_style(param)),
             ts_parameter_explode(param)
@@ -2220,7 +2551,7 @@ fn emit_ts_header_parameter(
     } else {
         writeln!(
             out,
-            "{padding}headers[{}] = String({ident});",
+            "{padding}headers[{}] = String({value_expr});",
             quoted_string_literal(&param.name)
         )
         .map_err(sink)?;
@@ -2377,46 +2708,41 @@ fn emit_op_path(
 }
 
 /// Emit the `URLSearchParams` query-building block for one operation (WR-01 analog): a REQUIRED query
-/// param is always appended (positional arg, no guard); an OPTIONAL one is appended only when defined.
-/// The wire key stays the ORIGINAL `p.name`.
+/// param is always appended (the params object guarantees it); an OPTIONAL one is appended only when
+/// defined. The wire key stays the ORIGINAL `p.name`, and required params are appended before optional
+/// ones — the same order the previous positional surface produced.
 fn emit_op_query(
     out: &mut String,
     graph: &ApiGraph,
-    required_query: &[&Param],
-    required_query_idents: &[String],
-    optional_query: &[&Param],
-    optional_query_idents: &[String],
+    args: &ResolvedArgs,
     auth_queries: &[OperationApiKeyScheme],
 ) -> Result<(), CoreError> {
-    let has_query_params = required_query
-        .iter()
-        .chain(optional_query.iter())
-        .any(|param| param.location == "query");
-    if !has_query_params && auth_queries.is_empty() {
+    let query_params = args.wire_ordered("query");
+    if query_params.is_empty() && auth_queries.is_empty() {
         return Ok(());
     }
     writeln!(out, "    const searchParams = new URLSearchParams();").map_err(sink)?;
-    let has_allow_reserved = required_query
+    let has_allow_reserved = query_params
         .iter()
-        .chain(optional_query.iter())
-        .any(|param| param.location == "query" && param.allow_reserved);
+        .any(|resolved| resolved.param.allow_reserved);
     if has_allow_reserved {
         writeln!(out, "    const allowReserved = new Set<number>();").map_err(sink)?;
         writeln!(out, "    let queryPairIndex = 0;").map_err(sink)?;
     }
-    for (p, ident) in required_query.iter().zip(required_query_idents.iter()) {
-        if p.location != "query" {
-            continue;
+    for resolved in &query_params {
+        let read = params_read(&resolved.key);
+        if resolved.param.required {
+            emit_query_param_value(out, graph, resolved.param, &read, 4, has_allow_reserved)?;
+        } else {
+            writeln!(
+                out,
+                "    if ({} !== undefined) {{",
+                args.params_probe(&resolved.key)
+            )
+            .map_err(sink)?;
+            emit_query_param_value(out, graph, resolved.param, &read, 6, has_allow_reserved)?;
+            writeln!(out, "    }}").map_err(sink)?;
         }
-        emit_query_param_value(out, graph, p, ident, 4, has_allow_reserved)?;
-    }
-    for (p, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
-        if p.location != "query" {
-            continue;
-        }
-        writeln!(out, "    if ({ident} !== undefined) {{").map_err(sink)?;
-        emit_query_param_value(out, graph, p, ident, 6, has_allow_reserved)?;
-        writeln!(out, "    }}").map_err(sink)?;
     }
     for (idx, query) in auth_queries.iter().enumerate() {
         let local = format!("apiKeyQuery{idx}");
@@ -2467,11 +2793,16 @@ enum TsQueryShape {
     Array,
 }
 
+/// Serialize one parameter's value into `searchParams`.
+///
+/// `value_expr` is the TypeScript expression that READS the value (`params.cursor`,
+/// `params["odd-key"]`) — never a bare binding name, since every non-path parameter now lives on the
+/// params object.
 fn emit_query_param_value(
     out: &mut String,
     graph: &ApiGraph,
     param: &Param,
-    ident: &str,
+    value_expr: &str,
     indent_width: usize,
     track_pair_index: bool,
 ) -> Result<(), CoreError> {
@@ -2486,7 +2817,7 @@ fn emit_query_param_value(
     )
     .map_err(sink)?;
     writeln!(out, "{inner}{},", quoted_string_literal(&param.name)).map_err(sink)?;
-    writeln!(out, "{inner}{ident},").map_err(sink)?;
+    writeln!(out, "{inner}{value_expr},").map_err(sink)?;
     writeln!(
         out,
         "{inner}{},",
@@ -2798,19 +3129,10 @@ fn emit_op_dispatch(
     error_bodies: &[ErrorResponseBody],
     op: &Operation,
     graph: &ApiGraph,
-    required_params: &[&Param],
-    required_param_idents: &[String],
-    optional_params: &[&Param],
-    optional_param_idents: &[String],
+    args: &ResolvedArgs,
 ) -> Result<(), CoreError> {
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
-    emit_ts_header_parameters(
-        out,
-        required_params,
-        required_param_idents,
-        optional_params,
-        optional_param_idents,
-    )?;
+    emit_ts_header_parameters(out, args)?;
     for (idx, header) in auth_headers.iter().enumerate() {
         let local = format!("apiKey{idx}");
         writeln!(
@@ -2981,65 +3303,88 @@ pub(crate) fn emit_index_with_models(
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
+    let ops: Vec<&Operation> = graph.operations.iter().collect();
+    check_params_type_names(graph, &ops)?;
+
     let mut out = String::new();
     out.push_str("export { Client } from \"./client\";\n");
-    out.push_str("export type {\n");
-    out.push_str("  ClientHooks,\n");
-    out.push_str("  ClientOptions,\n");
-    out.push_str("  ErrorHook,\n");
-    out.push_str("  HookContext,\n");
-    out.push_str("  RequestHook,\n");
-    out.push_str("  RequestOptions,\n");
-    out.push_str("  ResponseHook,\n");
-    out.push_str("} from \"./client\";\n");
-    out.push_str("export {\n");
-    out.push_str("  ApiError,\n");
-    out.push_str("  AuthConfigurationError,\n");
-    out.push_str("  ResponseDecodeError,\n");
-    out.push_str("} from \"./errors\";\n");
-    out.push_str("export type {\n");
-    out.push_str("  ApiErrorInit,\n");
-    out.push_str("  ResponseDecodeErrorInit,\n");
-    out.push_str("  ResponseDecodeFailure,\n");
-    out.push_str("} from \"./errors\";\n");
+    out.push_str(&ts_module_specifier_list(
+        "export type",
+        &fixed_exports(&[
+            "ClientHooks",
+            "ClientOptions",
+            "ErrorHook",
+            "HookContext",
+            "RequestHook",
+            "RequestOptions",
+            "ResponseHook",
+        ]),
+        "./client",
+    ));
+    // Every operation's params type is part of the public call shape, so it is re-exported next to
+    // `RequestOptions`. Sorted, so index.ts stays byte-stable regardless of graph order.
+    let mut params_types: Vec<String> = Vec::new();
+    for op in &ops {
+        if ts_operation_shape(op, graph)?.resolved.has_params() {
+            params_types.push(operation_params_type_name(op));
+        }
+    }
+    params_types.sort();
+    if !params_types.is_empty() {
+        out.push_str(&ts_module_specifier_list(
+            "export type",
+            &params_types,
+            "./client",
+        ));
+    }
+    out.push_str(&ts_module_specifier_list(
+        "export",
+        &fixed_exports(&["ApiError", "AuthConfigurationError", "ResponseDecodeError"]),
+        "./errors",
+    ));
+    out.push_str(&ts_module_specifier_list(
+        "export type",
+        &fixed_exports(&[
+            "ApiErrorInit",
+            "ResponseDecodeErrorInit",
+            "ResponseDecodeFailure",
+        ]),
+        "./errors",
+    ));
 
     // Every named schema becomes a top-level type. Named enums additionally expose runtime values.
-    let names = graph
+    let model_names: Vec<String> = graph
         .schemas
         .iter()
-        .filter_map(|schema| {
-            (!matches!(schema.body, Type::Enum(_))).then_some(schema.name.as_str())
-        })
-        .collect::<Vec<_>>();
-    if !names.is_empty() {
-        out.push_str("export type {\n");
-        for name in &names {
-            writeln!(out, "  {name},").map_err(sink)?;
-        }
-        writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
+        .filter(|schema| !matches!(schema.body, Type::Enum(_)))
+        .map(|schema| schema.name.clone())
+        .collect();
+    if !model_names.is_empty() {
+        out.push_str(&ts_module_specifier_list(
+            "export type",
+            &model_names,
+            &format!("./{model_module}"),
+        ));
     }
-    let enum_names = graph
+    let enum_names: Vec<String> = graph
         .schemas
         .iter()
-        .filter_map(|schema| matches!(schema.body, Type::Enum(_)).then_some(schema.name.as_str()))
-        .collect::<Vec<_>>();
+        .filter(|schema| matches!(schema.body, Type::Enum(_)))
+        .map(|schema| schema.name.clone())
+        .collect();
     if !enum_names.is_empty() {
-        if enum_names.len() == 1 {
-            writeln!(
-                out,
-                "export {{ {} }} from \"./{model_module}\";",
-                enum_names[0]
-            )
-            .map_err(sink)?;
-        } else {
-            out.push_str("export {\n");
-            for name in enum_names {
-                writeln!(out, "  {name},").map_err(sink)?;
-            }
-            writeln!(out, "}} from \"./{model_module}\";").map_err(sink)?;
-        }
+        out.push_str(&ts_module_specifier_list(
+            "export",
+            &enum_names,
+            &format!("./{model_module}"),
+        ));
     }
     Ok(out)
+}
+
+/// Lift a fixed list of symbol names into the owned form [`ts_module_specifier_list`] takes.
+fn fixed_exports(fixed: &[&str]) -> Vec<String> {
+    fixed.iter().map(|name| (*name).to_string()).collect()
 }
 
 #[cfg(test)]
@@ -3755,26 +4100,35 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops).unwrap();
             assert!(
                 out.contains(
-                    "  async listBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): Promise<models.BookPage> {"
+                    "  async listBooks(\n    params?: ListBooksParams,\n    options?: RequestOptions,\n  ): Promise<models.BookPage> {"
                 ),
                 "raw method must remain available:\n{out}"
             );
             assert!(
                 out.contains(
-                    "  async *listBooksPages(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.BookPage> {"
+                    "  async *listBooksPages(\n    params?: ListBooksParams,\n    options?: RequestOptions,\n  ): AsyncIterable<models.BookPage> {"
                 ),
+                "{out}"
+            );
+            // The generator advances a COPY of the caller's params object, never the caller's own.
+            assert!(
+                out.contains("    const pageParams: ListBooksParams = { ...params };"),
+                "{out}"
+            );
+            assert!(
+                out.contains("      const page = await this.listBooks(pageParams, options);"),
                 "{out}"
             );
             assert!(out.contains("const nextCursor = page.nextCursor;"), "{out}");
-            assert!(out.contains("cursor = nextCursor;"), "{out}");
+            assert!(out.contains("pageParams.cursor = nextCursor;"), "{out}");
             assert!(
                 out.contains(
-                    "  async *iterateListBooks(\n    cursor?: string,\n    options?: RequestOptions,\n  ): AsyncIterable<models.Book> {"
+                    "  async *iterateListBooks(\n    params?: ListBooksParams,\n    options?: RequestOptions,\n  ): AsyncIterable<models.Book> {"
                 ),
                 "{out}"
             );
             assert!(
-                out.contains("for await (const page of this.listBooksPages(cursor, options)) {"),
+                out.contains("for await (const page of this.listBooksPages(params, options)) {"),
                 "{out}"
             );
             assert!(
@@ -3810,7 +4164,7 @@ mod tests {
         }
 
         #[test]
-        fn required_body_precedes_required_query_param() {
+        fn required_body_precedes_the_required_params_object() {
             let mut g = ops_graph();
             g.operations[0].params.push(crate::graph::Param {
                 name: "tenant".to_string(),
@@ -3831,15 +4185,26 @@ mod tests {
             });
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             // The single-line form exceeds Prettier's 80-col printWidth, so the signature wraps one
-            // parameter per line (still body-before-query).
+            // parameter per line. A required query param makes the params object itself required, and
+            // it still sits after the body.
             assert!(
                 out.contains(
-                    "  async createBook(\n    body: models.Book,\n    tenant: string,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
+                    "  async createBook(\n    body: models.Book,\n    params: CreateBookParams,\n    options?: RequestOptions,\n  ): Promise<models.CreatedMessage> {"
                 ),
-                "required body must stay before required query params:\n{out}"
+                "required body must stay before the params object:\n{out}"
             );
             assert!(
-                out.contains(&wire_pairs_block(4, "tenant", "tenant", "form", true)),
+                out.contains("export type CreateBookParams = {\n  tenant: string;\n};"),
+                "a required query param is a required property:\n{out}"
+            );
+            assert!(
+                out.contains(&wire_pairs_block(
+                    4,
+                    "tenant",
+                    "params.tenant",
+                    "form",
+                    true
+                )),
                 "{out}"
             );
         }
@@ -3859,13 +4224,19 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "createBook")).unwrap();
             assert!(
-                out.contains("headers[\"X-Signature\"] = String(xSignature);")
+                out.contains("headers[\"X-Signature\"] = String(params.xSignature);")
                     && !out.contains("session: string")
                     && !out.contains("headers[\"Cookie\"]")
                     && !out.contains("userAgent: string")
                     && !out.contains("headers[\"User-Agent\"]")
                     && !out.contains("const searchParams = new URLSearchParams();"),
                 "application headers must be emitted and transport-owned headers omitted:\n{out}"
+            );
+            // Header params ride the SAME params object as query params — one call shape, and the
+            // transport-owned ones never reach it.
+            assert!(
+                out.contains("export type CreateBookParams = {\n  xSignature: string;\n};"),
+                "{out}"
             );
         }
 
@@ -3882,8 +4253,13 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains(&wire_pairs_block(4, "redirect", "redirect", "form", true))
-                    && out.contains("allowReserved.add(queryPairIndex);")
+                out.contains(&wire_pairs_block(
+                    4,
+                    "redirect",
+                    "params.redirect",
+                    "form",
+                    true
+                )) && out.contains("allowReserved.add(queryPairIndex);")
                     && out.contains("queryPairIndex += 1;"),
                 "allowReserved scalar query parameter must mark and advance its pair index:\n{out}"
             );
@@ -3962,7 +4338,7 @@ mod tests {
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
-                out.contains(&wire_pairs_block(6, "tag", "tag", "form", true))
+                out.contains(&wire_pairs_block(6, "tag", "params.tag", "form", true))
                     && out.contains("allowReserved.add(queryPairIndex);")
                     && out.contains("queryPairIndex += 1;"),
                 "every repeated allowReserved value must mark and advance its pair index:\n{out}"
@@ -4046,13 +4422,23 @@ mod tests {
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
             assert!(
                 out.contains(
-                    "async listBooks(cursor?: string, options?: RequestOptions): Promise<void> {"
+                    "  async listBooks(\n    params?: ListBooksParams,\n    options?: RequestOptions,\n  ): Promise<void> {"
                 ),
                 "{out}"
             );
-            assert!(out.contains("if (cursor !== undefined) {"), "{out}");
             assert!(
-                out.contains(&wire_pairs_block(6, "cursor", "cursor", "form", true)),
+                out.contains("export type ListBooksParams = {\n  cursor?: string;\n};"),
+                "an all-optional query surface makes every property optional:\n{out}"
+            );
+            assert!(out.contains("if (params?.cursor !== undefined) {"), "{out}");
+            assert!(
+                out.contains(&wire_pairs_block(
+                    6,
+                    "cursor",
+                    "params.cursor",
+                    "form",
+                    true
+                )),
                 "{out}"
             );
             assert!(out.contains("path = path + \"?\" + qs;"), "{out}");
@@ -4092,9 +4478,9 @@ mod tests {
             });
 
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
-            assert!(out.contains("if (tag !== undefined) {"), "{out}");
+            assert!(out.contains("if (params?.tag !== undefined) {"), "{out}");
             assert!(
-                out.contains(&wire_pairs_block(6, "tag", "tag", "form", true)),
+                out.contains(&wire_pairs_block(6, "tag", "params.tag", "form", true)),
                 "array query values must go through wireParameterPairs:\n{out}"
             );
             assert!(
@@ -4102,7 +4488,7 @@ mod tests {
                 "{out}"
             );
             assert!(
-                !out.contains("searchParams.set(\"tag\", String(tag));"),
+                !out.contains("searchParams.set(\"tag\", String(params.tag));"),
                 "array query values must not be implicitly comma-joined:\n{out}"
             );
         }
@@ -4369,7 +4755,7 @@ mod tests {
         }
 
         #[test]
-        fn required_query_param_is_positional_and_always_sent() {
+        fn a_required_query_param_makes_the_params_object_required() {
             let facts = br#"{
               "module": "app",
               "routes": [
@@ -4393,19 +4779,24 @@ mod tests {
             let g = ApiGraph::from_facts(facts, "/root");
             let ops: Vec<&Operation> = g.operations.iter().collect();
             let out = emit_operations(&g, "pkg", "/", &ops).unwrap();
-            // required `q` is positional (no `?:`), optional `page` keeps the `?:`.
+            // One required query param makes the whole params object a REQUIRED argument, so the
+            // caller cannot omit it and the emitter can read `params.q` without optional chaining.
             assert!(
                 out.contains(
-                    "  async search(\n    q: string,\n    page?: string,\n    options?: RequestOptions,\n  ): Promise<void> {"
+                    "  async search(params: SearchParams, options?: RequestOptions): Promise<void> {"
                 ),
-                "{out}"
+                "one params object keeps the signature inside Prettier's 80 columns:\n{out}"
+            );
+            assert!(
+                out.contains("export type SearchParams = {\n  page?: string;\n  q: string;\n};"),
+                "properties follow graph order; `?` marks the optional ones:\n{out}"
             );
             // required `q` unconditionally set; optional `page` guarded.
             assert!(
-                out.contains(&wire_pairs_block(4, "q", "q", "form", true)),
+                out.contains(&wire_pairs_block(4, "q", "params.q", "form", true)),
                 "{out}"
             );
-            assert!(out.contains("if (page !== undefined) {"), "{out}");
+            assert!(out.contains("if (params.page !== undefined) {"), "{out}");
         }
 
         #[test]
@@ -4465,6 +4856,117 @@ mod tests {
             let ops: Vec<&Operation> = g.operations.iter().collect();
             let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
             assert!(err.to_string().contains("collides"), "{err}");
+        }
+
+        #[test]
+        fn path_param_named_like_a_bound_argument_is_a_typed_error() {
+            // Every generated method binds `params`/`options` as arguments and `path`/`headers`/`res`
+            // as body locals. A path param that camel-cases onto one of them shadows or redeclares
+            // it, so the emitted TypeScript would not compile. Reject the name with a typed error
+            // instead (WR-03 analog).
+            for shadow in ["params", "options", "path", "headers", "res"] {
+                let facts = format!(
+                    r#"{{
+                      "module": "app",
+                      "routes": [
+                        {{ "method": "GET", "path": "/x/{{{shadow}}}", "handler": "x",
+                          "operation_id": "x",
+                          "params": [
+                            {{ "name": "{shadow}", "location": "path", "required": true,
+                              "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
+                              "span": {{ "file": "/root/m.ts", "start_line": 1, "end_line": 1 }} }}
+                          ],
+                          "request_body": null,
+                          "responses": [ {{ "status": 200, "body": null }} ],
+                          "span": {{ "file": "/root/m.ts", "start_line": 1, "end_line": 1 }} }}
+                      ],
+                      "schemas": [], "diagnostics": []
+                    }}"#
+                );
+                let facts = serde_json::from_slice(facts.as_bytes()).unwrap();
+                let g = ApiGraph::from_facts(facts, "/root");
+                let ops: Vec<&Operation> = g.operations.iter().collect();
+                let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+                assert!(
+                    err.to_string().contains("collides"),
+                    "path param '{shadow}' must be rejected: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn params_type_colliding_with_a_schema_name_is_a_typed_error() {
+            // client.ts and models.ts both feed index.ts, so a schema already called `SearchParams`
+            // would be exported twice. Fail at generation time instead of shipping broken TypeScript.
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/search", "handler": "search",
+                  "operation_id": "search",
+                  "params": [
+                    { "name": "q", "location": "query", "required": true,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+              ],
+              "schemas": [
+                { "id": "app.SearchParams", "name": "SearchParams",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+              ],
+              "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("collides with an existing exported symbol"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn two_operations_emitting_the_same_params_type_is_a_typed_error() {
+            let facts = br#"{
+              "module": "app",
+              "routes": [
+                { "method": "GET", "path": "/a", "handler": "listItems",
+                  "operation_id": "listItems",
+                  "params": [
+                    { "name": "q", "location": "query", "required": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 1, "end_line": 1 } },
+                { "method": "GET", "path": "/b", "handler": "list_items",
+                  "operation_id": "list_items",
+                  "params": [
+                    { "name": "q", "location": "query", "required": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+                  ],
+                  "request_body": null,
+                  "responses": [ { "status": 200, "body": null } ],
+                  "span": { "file": "/root/m.ts", "start_line": 2, "end_line": 2 } }
+              ],
+              "schemas": [], "diagnostics": []
+            }"#;
+            let facts = serde_json::from_slice(facts).unwrap();
+            let g = ApiGraph::from_facts(facts, "/root");
+            let ops: Vec<&Operation> = g.operations.iter().collect();
+            let err = emit_operations(&g, "pkg", "/", &ops).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("both emit TypeScript params type 'ListItemsParams'"),
+                "{err}"
+            );
         }
     }
 
@@ -4689,9 +5191,16 @@ mod tests {
                 ),
                 "{out}"
             );
-            assert!(out.contains("  Book,"), "{out}");
-            assert!(out.contains("  CreatedMessage,"), "{out}");
-            assert!(out.contains("} from \"./models\";"), "{out}");
+            // Prettier collapses a specifier list that fits inside 80 columns, so the emitter does too.
+            assert!(
+                out.contains("export type { Book, CreatedMessage, OutOfStock } from \"./models\";"),
+                "{out}"
+            );
+            // Every operation params type is re-exported from the package root next to RequestOptions.
+            assert!(
+                out.contains("export type { ListBooksParams } from \"./client\";"),
+                "{out}"
+            );
         }
     }
 

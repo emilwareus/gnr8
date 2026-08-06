@@ -100,7 +100,7 @@ pub(crate) fn generate_files_with_layout(
         &graph.runtime,
     );
     if split_operations {
-        client.push_str(&emit::emit_split_operation_surface(&ops)?);
+        client.push_str(&emit::emit_split_operation_surface(graph, &ops)?);
         client.push_str(&emit_operation_module_imports(layout, graph)?);
     } else {
         client.push_str(&emit::emit_operations(graph, package, base_path, &ops)?);
@@ -575,6 +575,39 @@ mod tests {
             generate(&graph, "bookstore", "/").unwrap(),
             generate(&graph, "bookstore", "/").unwrap(),
             "two generate runs must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn split_operations_import_their_params_types_from_the_client_module() {
+        // The `{Operation}Params` types are declared ONCE, in client.ts, under both layouts — they
+        // are part of the call shape, next to `RequestOptions`, and index.ts re-exports them from
+        // there. A split operation module therefore imports the ones its own operations take.
+        let layout = SdkFileLayout::split().operations_per_endpoint();
+        let out = generate_with_layout(&sample_graph(), "bookstore", "/", &layout).unwrap();
+        assert!(
+            out.contains("export type ListBooksParams = {\n  cursor?: string;\n};"),
+            "params types belong to client.ts under the split layout too:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "import type { Client, RequestOptions, ListBooksParams } from \"./client\";"
+            ),
+            "the operation module must import the params type it references:\n{out}"
+        );
+        assert!(
+            out.contains("import type { Client, RequestOptions } from \"./client\";"),
+            "a parameterless operation module must not import an unused params type:\n{out}"
+        );
+        assert!(
+            out.contains("export type { ListBooksParams } from \"./client\";"),
+            "index.ts re-exports the params types:\n{out}"
+        );
+        // A prototype function sits at module level, so its body is two columns left of the
+        // class-method form the same emitter writes. (Prettier gates this in `sdk_lint`.)
+        assert!(
+            out.contains("): Promise<models.Book> {\n  let path = `/list`;\n"),
+            "a split operation body must sit at module-level indentation:\n{out}"
         );
     }
 

@@ -255,6 +255,27 @@ fn typescript_sdk_is_prettier_clean() {
         ok,
         "prettier --check would reformat the generated TS SDK:\nstdout:\n{out}\nstderr:\n{err}"
     );
-
     let _ = std::fs::remove_dir_all(&dir);
+
+    // The split layout moves every operation into api_*.ts, which builds its OWN import header —
+    // including the per-operation params types it takes from client.ts. That header is invisible to
+    // the compact check above, and a specifier list is exactly the shape whose width rule decides
+    // between the one-line and the one-per-line form. Lint that layout too (twin of the Python gate).
+    let split_bundle = gnr8::tssdk::generate_with_layout(
+        &graph,
+        "bookstore",
+        &graph.base_path,
+        &gnr8::sdk::layout::SdkFileLayout::split().operations_per_endpoint(),
+    )
+    .expect("tssdk::generate_with_layout must succeed");
+    let split_dir = unique_temp_dir("ts-split");
+    gnr8::sdk::bundle::write_to_dir(&split_bundle, &split_dir).expect("materialize split TS SDK");
+
+    let (split_ok, split_out, split_err) = run(&prettier, &["--check", "."], &split_dir, &[]);
+    assert!(
+        split_ok,
+        "prettier --check would reformat the split-layout TS SDK:\nstdout:\n{split_out}\nstderr:\n{split_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&split_dir);
 }

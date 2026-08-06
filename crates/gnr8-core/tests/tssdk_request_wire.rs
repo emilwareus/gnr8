@@ -190,7 +190,7 @@ fn command_output(mut command: Command) -> Result<(), String> {
     Err(diagnostics)
 }
 
-const DRIVER: &str = r#"import { Client } from "./client";
+const DRIVER: &str = r#"import { Client, type SendWireParams } from "./client";
 
 const transport: typeof fetch = async (input, init) => {
   const url = new URL(String(input));
@@ -217,13 +217,15 @@ const transport: typeof fetch = async (input, init) => {
 
 async function main(): Promise<void> {
   const client = new Client({ baseUrl: "https://api.test", fetch: transport });
-  await client.sendWire(
-    "catalog/alpha",
-    ["active", "pending"],
-    "https://example.test/a b+c?x=1",
-    "sig",
-    "https://strict.test/a?x=1",
-  );
+  // Path params stay positional; every other request parameter — query AND header — arrives as one
+  // named params object, so the call site never depends on declaration order.
+  const params: SendWireParams = {
+    statuses: ["active", "pending"],
+    redirect: "https://example.test/a b+c?x=1",
+    xSignature: "sig",
+    strict: "https://strict.test/a?x=1",
+  };
+  await client.sendWire("catalog/alpha", params);
 }
 
 void main().catch((error: unknown) => {

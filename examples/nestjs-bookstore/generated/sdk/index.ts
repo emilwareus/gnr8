@@ -8,6 +8,7 @@ export type {
   RequestOptions,
   ResponseHook,
 } from "./client";
+export type { GetBookParams, ListBooksParams } from "./client";
 export {
   ApiError,
   AuthConfigurationError,
