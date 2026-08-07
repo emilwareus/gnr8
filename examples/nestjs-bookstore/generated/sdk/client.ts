@@ -506,6 +506,12 @@ export class Client {
     });
   }
 
+  /**
+   * List books in one genre.
+   *
+   * Results are ordered by title and paginated with an opaque cursor. Pass the
+   * cursor from the previous page to continue; omit it to start from the beginning.
+   */
   async listBooks(
     params: ListBooksParams,
     options?: RequestOptions,
@@ -575,6 +581,11 @@ export class Client {
     throw new ApiError(res.status);
   }
 
+  /**
+   * Add a book to the catalogue.
+   *
+   * The book is created immediately and its generated identifier is returned.
+   */
   async createBook(
     body: models.BookDto,
     options?: RequestOptions,
@@ -612,6 +623,11 @@ export class Client {
     throw new ApiError(res.status);
   }
 
+  /**
+   * Fetch one book by its identifier.
+   *
+   * Returns the book when it is in stock, and an out-of-stock notice otherwise.
+   */
   async getBook(
     bookId: number,
     params?: GetBookParams,
@@ -664,6 +680,11 @@ export class Client {
     throw new ApiError(res.status);
   }
 
+  /**
+   * Update the stored filters for one book.
+   *
+   * Filters left unset in the payload keep their current values.
+   */
   async updateBook(
     bookId: number,
     body: models.BookFilters,

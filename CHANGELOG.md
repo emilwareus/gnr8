@@ -9,11 +9,47 @@ must move the minor version.
 
 ## Unreleased
 
+### Added
+
+**Operation prose from handler doc comments.** `summary` and `description` are now read from the
+routed handler's own documentation comment — a Go doc comment, a Python docstring, or a TypeScript
+JSDoc leading description — as plain prose. The first sentence becomes the `summary`; the remainder
+becomes the `description`. The same rule applies in all three languages.
+
+Adding an endpoint no longer requires a `.gnr8/` edit to document it.
+
+- There is **no directive syntax, no marker prefix, and no key/value grammar** inside the comment —
+  not `@Summary`, not `gnr8:summary`, not anything. A comment adds words and nothing else; method,
+  path, params, body, responses, status codes, tags, security, and operationId remain code-inferred
+  and a comment can neither state nor override them.
+- Only **routed** handlers are read, so an internal helper's doc comment cannot reach the API surface.
+- Go strips a leading `funcName ` and capitalizes the remainder, matching Go's own doc convention.
+  TypeScript reads the JSDoc leading description only, so JSDoc **tags are excluded by the compiler**
+  and an `@openapi`/`@param` block is invisible to gnr8.
+- The prose reaches the OpenAPI document **and** the generated SDKs: Go method comments, Python
+  docstrings, and TypeScript JSDoc. An IDE now shows the same words as the spec.
+- New opt-in transform **`RequireOperationDocs`** fails generation when any remaining operation has
+  no summary, naming its id, method, path, and handler. Off by default. It is a pipeline stage, not
+  a source-level check, so place it after your own public-surface filters.
+
+### Fixed
+
+- The OpenAPI YAML writer emitted multi-line strings as plain scalars, putting continuation lines at
+  column 0 and producing an invalid document. Multi-line values are now JSON-escaped. Latent before
+  this release; multi-line operation descriptions make it reachable.
+
 ### Breaking
 
 The generated-SDK surface and the code-as-config API are now purely native. Everything whose
 purpose was to make gnr8's output resemble another generator's is gone, permanently — see rule 0
 in [`CLAUDE.md`](CLAUDE.md), enforced by `make invariants`.
+
+`DocumentOperation::summary()` / `::description()` now **error** when they target an operation that
+already has prose from its source (its handler's doc comment, or an imported spec). An operation's
+prose has exactly one source; two ways to state one fact is the defect, and picking a winner between
+them is the same defect with extra steps (rule 3). They remain the supported path for operations that
+have no source prose. `OperationDocsPolicy` no longer carries `summary`/`description` — prose lives on
+`Operation`, so duplication is structurally impossible rather than merely discouraged.
 
 Removed public API (no replacement; these were compatibility surface):
 

@@ -8,6 +8,8 @@ operations:
     method: POST
     path: /
     handler: createGoal
+    summary: Creates a goal for the calling actor.
+    description: "The goal starts in the pending state and is assigned a server-generated\nidentifier, which is returned in the response."
     middleware:
       - AuthMiddleware
     params: []
@@ -33,6 +35,8 @@ operations:
     method: GET
     path: /list
     handler: listGoals
+    summary: Returns a page of goals for the calling actor.
+    description: "Results are ordered newest first and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the beginning."
     middleware:
       - AuthMiddleware
     params:
@@ -45,20 +49,9 @@ operations:
             prim: string
         provenance:
           file: internal/goal/ports/handlers.go
-          start_line: 47
-          end_line: 47
+          start_line: 48
+          end_line: 48
       - name: cursor
-        location: query
-        required: false
-        schema:
-          type: primitive
-          of:
-            prim: string
-        provenance:
-          file: internal/goal/ports/handlers.go
-          start_line: 45
-          end_line: 45
-      - name: page_size
         location: query
         required: false
         schema:
@@ -69,6 +62,17 @@ operations:
           file: internal/goal/ports/handlers.go
           start_line: 46
           end_line: 46
+      - name: page_size
+        location: query
+        required: false
+        schema:
+          type: primitive
+          of:
+            prim: string
+        provenance:
+          file: internal/goal/ports/handlers.go
+          start_line: 47
+          end_line: 47
     request_body: ~
     responses:
       - status: 200
@@ -84,6 +88,7 @@ operations:
     method: DELETE
     path: "/{uuid}"
     handler: deleteGoal
+    summary: Permanently removes one goal.
     middleware:
       - AuthMiddleware
     params:
@@ -118,6 +123,8 @@ operations:
     method: PUT
     path: "/{uuid}"
     handler: updateGoal
+    summary: Replaces the mutable fields of one goal.
+    description: "The goal is identified by its uuid. Fields omitted from the payload are left\nunchanged; the goal's identifier and creation time are never modified."
     middleware:
       - AuthMiddleware
     params:
@@ -588,11 +595,11 @@ diagnostics:
     category: request_parameter
     message: "untyped query param 'cursor' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 45
+    line: 46
     span:
       file: internal/goal/ports/handlers.go
-      start_line: 45
-      end_line: 45
+      start_line: 46
+      end_line: 46
     operation: GET /list
     subject: cursor
   - code: request.parameter.unresolved
@@ -600,11 +607,11 @@ diagnostics:
     category: request_parameter
     message: "untyped query param 'page_size' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 46
+    line: 47
     span:
       file: internal/goal/ports/handlers.go
-      start_line: 46
-      end_line: 46
+      start_line: 47
+      end_line: 47
     operation: GET /list
     subject: page_size
   - code: request.parameter.unresolved
@@ -612,11 +619,11 @@ diagnostics:
     category: request_parameter
     message: "untyped query param 'aggregation' on GET /list: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)"
     file: internal/goal/ports/handlers.go
-    line: 47
+    line: 48
     span:
       file: internal/goal/ports/handlers.go
-      start_line: 47
-      end_line: 47
+      start_line: 48
+      end_line: 48
     operation: GET /list
     subject: aggregation
   - code: source.route.unresolved

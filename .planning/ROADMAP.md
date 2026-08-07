@@ -164,3 +164,23 @@ the NestJS example output, which the Phase-5 REVIEW-FIX deliberately skipped for
 - **Backlog 999.1 — WR-02: TsSdk non-scalar query param `String()` wire-encoding rule** (deferred
   Phase-5 finding; folding it changes the green TsSdk snapshots).
 - **Backlog 999.2 — WR-04: TsSdk asymmetric success/error JSON decode** (same reason).
+
+### Phase 6: Handler-local operation prose from doc comments
+
+**Goal:** Operation `summary`/`description` are derived from the routed handler's own doc comment —
+Go doc comment, Python docstring, TypeScript JSDoc — read as **plain prose** with no marker, prefix, or
+grammar, and emitted into OpenAPI and all three generated SDKs. Adding an endpoint requires no `.gnr8/`
+edit.
+
+**Requirements:** DOC-01..DOC-07 (see `.planning/phases/06-.../PLAN.md`)
+**Depends on:** Phase 5
+**Plans:** 7 plans
+
+Plans:
+- [ ] 06-01 Graph contract — `Operation.summary`/`.description`
+- [ ] 06-02 Go extraction — `goextract` doc comments + shared synopsis split
+- [ ] 06-03 Python + TypeScript extraction — docstrings + JSDoc
+- [ ] 06-04 Lowering + dual-source conflict detection
+- [ ] 06-05 SDK doc emission — Go / Python / TypeScript
+- [ ] 06-06 `RequireOperationDocs` opt-in completeness gate
+- [ ] 06-07 Fixtures, examples, acceptance tests, docs

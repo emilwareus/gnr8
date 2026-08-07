@@ -2007,3 +2007,124 @@ func sortedCopy(in []string) []string {
 	}
 	return out
 }
+
+// TestHandlerDocCommentsBecomeOperationProse proves the four properties that keep doc
+// comments a documentation convention rather than an annotation dialect (CLAUDE.md
+// rule 0.1 category 2):
+//
+//  1. a ROUTED handler's doc comment yields summary + description;
+//  2. the Go `funcName ` prefix is stripped and the remainder capitalized;
+//  3. a handler with NO doc comment yields empty prose (never a guess, rule 3);
+//  4. an UNROUTED helper's doc comment is never read, so internal prose cannot leak.
+//
+// It also pins that a `//go:`-style directive line in the doc block is dropped by
+// `(*ast.CommentGroup).Text` rather than becoming prose.
+func TestHandlerDocCommentsBecomeOperationProse(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/docprose
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "handlers.go"), `package main
+
+import "github.com/gin-gonic/gin"
+
+type Server struct{ R *gin.Engine }
+type Widget struct { ID string `+"`json:\"id\"`"+` }
+
+func (s Server) Register() {
+	s.R.GET("/widgets", s.listWidgets)
+	s.R.GET("/undocumented", s.undocumented)
+}
+
+// listWidgets returns widgets for
+// the caller organisation.
+//
+//go:noinline
+//
+// Results are paginated by cursor.
+func (s Server) listWidgets(c *gin.Context) {
+	c.JSON(200, Widget{})
+}
+
+func (s Server) undocumented(c *gin.Context) {
+	c.JSON(200, Widget{})
+}
+
+// unrouted describes an internal helper that is never registered as a route.
+//
+// Its prose must never reach the API surface.
+func (s Server) unrouted(c *gin.Context) {
+	c.JSON(200, Widget{})
+}
+`)
+
+	res, err := load.Load(dir, "./...")
+	if err != nil {
+		t.Fatalf("load doc prose fixture: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/docprose", diags)
+	recognized := routes.Recognize(res)
+	got := map[string]handlers.CodeFacts{}
+	for _, r := range recognized {
+		got[r.Path] = analyzer.Analyze(r, diags)
+	}
+
+	// (1) + (2): prose is read, wrapped lines collapse, the symbol name is stripped and
+	// the remainder capitalized. (Directive lines are dropped by CommentGroup.Text.)
+	documented, ok := got["/widgets"]
+	if !ok {
+		t.Fatalf("expected a recognized /widgets route, got %v", keysOf(got))
+	}
+	if want := "Returns widgets for the caller organisation."; documented.Summary != want {
+		t.Errorf("summary:\n got  %q\n want %q", documented.Summary, want)
+	}
+	if want := "Results are paginated by cursor."; documented.Description != want {
+		t.Errorf("description:\n got  %q\n want %q", documented.Description, want)
+	}
+
+	// (3): no doc comment yields empty prose — never an inferred or borrowed value.
+	bare, ok := got["/undocumented"]
+	if !ok {
+		t.Fatalf("expected a recognized /undocumented route, got %v", keysOf(got))
+	}
+	if bare.Summary != "" || bare.Description != "" {
+		t.Errorf("undocumented handler must yield empty prose, got summary=%q description=%q",
+			bare.Summary, bare.Description)
+	}
+
+	// (4): the unrouted helper has a doc comment but no route, so its prose is never
+	// read. Assert on the whole analyzed set rather than a single route.
+	for path, facts := range got {
+		if strings.Contains(facts.Summary, "internal helper") ||
+			strings.Contains(facts.Description, "never reach the API surface") {
+			t.Errorf("unrouted helper prose leaked into route %s: %+v", path, facts)
+		}
+	}
+}
+
+func keysOf(m map[string]handlers.CodeFacts) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return sortedCopy(out)
+}

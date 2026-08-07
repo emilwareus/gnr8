@@ -17,7 +17,7 @@ A ParamFact has EXACTLY ``name, location, required, schema, span``. A ResponseFa
 
 import ast
 
-from pyextract import symtab, types
+from pyextract import docs, symtab, types
 
 #: The HTTP verbs an ``@<router>.<verb>(...)`` decorator may name (FastAPI route methods).
 _HTTP_METHODS = frozenset(
@@ -32,6 +32,27 @@ _FLASK_CTORS = frozenset({"Flask", "Blueprint"})
 
 #: HTTP methods that carry no request body — a request.json read here is never a body fact.
 _BODYLESS_METHODS = frozenset({"GET", "HEAD", "DELETE"})
+
+
+def _prose(stmt):
+    """Return ``{"summary": ..., "description": ...}`` keys for a routed handler's docstring.
+
+    CLAUDE.md rule 0.1 category 2: the handler's own docstring read as PLAIN PROSE, split
+    by the shared positional rule in :mod:`pyextract.docs`. Nothing here matches on
+    docstring CONTENT — that is what keeps this a documentation convention rather than a
+    dialect. Only ROUTED handlers reach here, so an internal helper's docstring can never
+    leak into the API surface.
+
+    Empty prose is OMITTED rather than emitted as ``None``: the host DTO defaults the
+    field, so an absent key and an explicit null would be two spellings of one fact.
+    """
+    summary, description = docs.split(ast.get_docstring(stmt))
+    prose = {}
+    if summary:
+        prose["summary"] = summary
+    if description:
+        prose["description"] = description
+    return prose
 
 
 class _ContextDiags:
@@ -711,6 +732,7 @@ def recognize_fastapi(modules, table, diags, synthetic_schemas=None):
                     ),
                     "responses": [response],
                     "span": _span(abs_path, stmt),
+                    **_prose(stmt),
                 }
             )
     return routes
@@ -1143,6 +1165,7 @@ def recognize_flask(modules, table, diags):
                         ),
                         "responses": responses,
                         "span": _span(abs_path, stmt),
+                        **_prose(stmt),
                     }
                 )
     return routes

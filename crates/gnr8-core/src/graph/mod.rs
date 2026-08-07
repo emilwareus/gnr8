@@ -354,12 +354,11 @@ pub struct OperationDocsPolicy {
     /// Exact public `OpenAPI` operation id when it differs from the graph's SDK-safe identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openapi_operation_id: Option<String>,
-    /// Optional short operation summary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    /// Optional longer operation description.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    // NOTE: `summary`/`description` are deliberately NOT here. Prose lives on
+    // [`Operation`] itself, so an operation has exactly one place its words are written
+    // down and a second source is structurally impossible rather than merely discouraged
+    // (CLAUDE.md rule 3). `DocumentOperation` writes through to the operation and errors
+    // on collision.
     /// Whether the operation is deprecated.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deprecated: bool,
@@ -440,10 +439,14 @@ pub struct SecurityScheme {
 /// One HTTP operation: a method + path template plus its inferred params/body/responses (D-07).
 ///
 /// Language-neutral — there is deliberately no framework handle here; only the recognized HTTP facts.
-/// Every field is derived PURELY from source code (CLAUDE.md rules 1 & 3); there is no annotation
-/// carry-through (no summary, router-path override, or security here — security comes from the
+/// Every structural field is derived PURELY from source code (CLAUDE.md rules 1 & 3); there is no
+/// annotation carry-through (no router-path override or security here — security comes from the
 /// user's gnr8 config at lowering time, rule 4). `group` is optional static router grouping
 /// metadata derived from source and used as an `OpenAPI` tag / SDK grouping hint.
+///
+/// `summary`/`description` are the ONE non-structural pair, and they are still a source fact: they are
+/// the routed handler's own doc comment read as plain prose via the language's native synopsis
+/// convention (CLAUDE.md rule 0.1 category 2). They carry no grammar and can state nothing structural.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
@@ -457,6 +460,16 @@ pub struct Operation {
     pub path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
     pub handler: String,
+    /// Short human prose: the first sentence of the routed handler's own doc comment.
+    ///
+    /// One source per operation — the handler's doc comment for source-extracted operations, the spec
+    /// for `OpenApi`-imported ones. A `DocumentOperation` that targets an operation already carrying
+    /// this is a hard error, never an override (CLAUDE.md rule 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Longer human prose: everything after the summary sentence, trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Optional static route-group/tag metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -880,6 +893,8 @@ impl Operation {
             method: route.method,
             path: route.path,
             handler: route.handler,
+            summary: route.summary,
+            description: route.description,
             group: route.group,
             middleware,
             params,

@@ -26,20 +26,20 @@ const FIXTURE = path.join(__dirname, "..", "..", "fixtures", "nestjs-bookstore")
 
 // Snapshot-asserted operation span lines (method-name line).
 const OP_LINES = {
-  listBooks: 41,
-  createBook: 51,
-  getBook: 57,
-  updateBook: 65,
+  listBooks: 48,
+  createBook: 61,
+  getBook: 70,
+  updateBook: 78,
 };
 
 // Snapshot-asserted param span lines (param-name line), keyed "op.param".
 const PARAM_LINES = {
-  "listBooks.genre": 42,
-  "listBooks.sort": 43,
-  "listBooks.cursor": 44,
-  "getBook.bookId": 58,
-  "getBook.fmt": 59,
-  "updateBook.bookId": 66,
+  "listBooks.genre": 49,
+  "listBooks.sort": 50,
+  "listBooks.cursor": 51,
+  "getBook.bookId": 71,
+  "getBook.fmt": 72,
+  "updateBook.bookId": 79,
 };
 
 // Snapshot-asserted schema span lines (declaration line), keyed by short name.

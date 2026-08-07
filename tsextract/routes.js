@@ -22,8 +22,36 @@
 
 const ts = require("./ts");
 
+const docs = require("./docs");
 const load = require("./load");
 const types = require("./types");
+
+// Return the `{summary, description}` keys for a routed method's JSDoc block.
+//
+// CLAUDE.md rule 0.1 category 2: the method's own JSDoc read as PLAIN PROSE, split by
+// the shared positional rule in `./docs`. `getDocumentationComment` returns the LEADING
+// DESCRIPTION ONLY — JSDoc tags are excluded by the compiler itself, so this file NEVER
+// reads a tag of any kind and needs no list of tags to avoid.
+//
+// Only ROUTED methods reach here, so an internal helper's JSDoc can never leak into the
+// API surface. Empty prose is OMITTED rather than emitted as null: the host DTO defaults
+// the field, and an absent key plus an explicit null would be two spellings of one fact.
+function _prose(loaded, member) {
+  const symbol = loaded.checker.getSymbolAtLocation(member.name);
+  if (!symbol) {
+    return {};
+  }
+  const text = ts.displayPartsToString(symbol.getDocumentationComment(loaded.checker));
+  const { summary, description } = docs.split(text);
+  const prose = {};
+  if (summary) {
+    prose.summary = summary;
+  }
+  if (description) {
+    prose.description = description;
+  }
+  return prose;
+}
 
 // The HTTP-verb method decorators -> neutral method names. Recognized by NAME
 // (rule 1): these are @nestjs/common's framework-native routing decorators.
@@ -613,6 +641,7 @@ function recognizeNestController(loaded, diags, registry) {
           request_body_content_type:
             requestBody === null ? null : "application/json",
           responses: responses,
+          ..._prose(loaded, member),
           span: {
             file: rel,
             start_line: opLine,

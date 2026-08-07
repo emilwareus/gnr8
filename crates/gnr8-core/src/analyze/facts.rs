@@ -51,6 +51,14 @@ pub(crate) struct RouteFact {
     pub(crate) handler: String,
     /// Operation id, derived deterministically from the handler symbol in code.
     pub(crate) operation_id: String,
+    /// First sentence of the routed handler's own doc comment, read as plain prose via the source
+    /// language's native synopsis convention (CLAUDE.md rule 0.1 category 2). `#[serde(default)]`
+    /// keeps a sidecar that does not yet emit it parseable under `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
+    /// The remainder of that doc comment after the summary sentence, trimmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
     /// Source-derived route group/tag name, if the source router exposes one statically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group: Option<String>,

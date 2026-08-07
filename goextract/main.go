@@ -173,6 +173,10 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 
 		// Code-inferred request/response/param facts — the only source.
 		cf := analyzer.Analyze(r, diags)
+		// Handler doc-comment prose (rule 0.1 category 2): human words only. It cannot
+		// state or override any structural fact assembled above or below it.
+		rf.Summary = cf.Summary
+		rf.Description = cf.Description
 		rf.RequestBody = cf.RequestBody
 		rf.RequestBodyRequired = cf.RequestBodyRequired
 		rf.RequestBodyContentType = cf.RequestBodyContentType

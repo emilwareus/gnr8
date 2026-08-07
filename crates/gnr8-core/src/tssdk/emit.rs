@@ -35,10 +35,10 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, ErrorResponseBody,
-    HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
-    RequestBodyModel, SuccessResponses,
+    operation_auth_alternatives, operation_prose, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    ApiKeyLocation, ErrorResponseBody, HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme,
+    RequestBodyEncoding, RequestBodyModel, SuccessResponses,
 };
 use crate::CoreError;
 
@@ -1642,6 +1642,42 @@ fn emit_operation_params_types(
     Ok(())
 }
 
+/// Emit the generated method's `JSDoc` block: the summary, then the description after a
+/// blank comment line.
+///
+/// Nothing is emitted for an operation with no prose, so an undocumented SDK is
+/// byte-identical to what it was before `JSDoc` existed.
+///
+/// `*/` inside the prose is neutralized to `*\/` — it would otherwise close the comment
+/// block and spill the remaining prose into the module as syntax errors. Prose is never
+/// re-wrapped: reflowing it would make the SDK comment disagree with the source comment
+/// it came from, and Prettier does not reflow comment bodies either, so the output stays
+/// format-stable.
+fn emit_operation_jsdoc(out: &mut String, op: &Operation, indent: &str) -> Result<(), CoreError> {
+    let prose = operation_prose(op, &["*/"], "*\\/");
+    if prose.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "{indent}/**").map_err(sink)?;
+    if let Some(summary) = &prose.summary {
+        writeln!(out, "{indent} * {summary}").map_err(sink)?;
+    }
+    if !prose.description.is_empty() {
+        if prose.summary.is_some() {
+            writeln!(out, "{indent} *").map_err(sink)?;
+        }
+        for line in &prose.description {
+            if line.is_empty() {
+                writeln!(out, "{indent} *").map_err(sink)?;
+            } else {
+                writeln!(out, "{indent} * {line}").map_err(sink)?;
+            }
+        }
+    }
+    writeln!(out, "{indent} */").map_err(sink)?;
+    Ok(())
+}
+
 /// Render a class method's `async` signature at 2-space indent, wrapping the parameter list one per line
 /// when the single-line form would exceed Prettier's default 80-column `printWidth` — so the emitted TS
 /// is already prettier-clean (CLAUDE.md rule 2: no formatter dependency). When wrapped, each parameter
@@ -1894,6 +1930,13 @@ fn emit_operation(
     } else {
         "Promise<void>".to_string()
     };
+    // A class method sits at 2-space indent; a prototype function at column 0. The JSDoc
+    // block must match, or the emitted file is not prettier-clean.
+    let doc_indent = match style {
+        OperationEmitStyle::ClassMethod => "  ",
+        OperationEmitStyle::PrototypeFunction => "",
+    };
+    emit_operation_jsdoc(out, op, doc_indent)?;
     match style {
         OperationEmitStyle::ClassMethod => {
             writeln!(

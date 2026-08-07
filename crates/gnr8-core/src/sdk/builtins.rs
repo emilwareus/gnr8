@@ -716,6 +716,73 @@ impl Transform for DiagnosticPolicy {
     }
 }
 
+/// Require every remaining operation to carry a summary.
+///
+/// This is the completeness gate for operation prose. It is OPT-IN and a PIPELINE STAGE
+/// rather than a check inside a `Source`, because only the user's own pipeline knows when
+/// their public-surface filtering has finished: gnr8 has no built-in operation-exclusion
+/// transform, so an internal route a consumer strips later must not fail the gate before
+/// it is stripped. Place it after those filters and before the targets.
+///
+/// A missing summary is a hard error naming the operation id, method, path, and handler,
+/// so the fix is always locatable: write a doc comment on that handler.
+///
+/// Descriptions stay optional — a one-line operation is a legitimately documented
+/// operation, and requiring more would push authors toward filler prose.
+///
+/// ```no_run
+/// # use gnr8::sdk::prelude::*;
+/// Pipeline::new()
+///     .source(GoGin::new().inputs(["."]))
+///     .transform(RequireOperationDocs::new())
+///     .target(OpenApi31::new().to("openapi.yaml"));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct RequireOperationDocs {
+    _private: (),
+}
+
+impl RequireOperationDocs {
+    /// Require a summary on every operation still in the graph.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Transform for RequireOperationDocs {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+        // Report EVERY undocumented operation, not just the first: a consumer adopting
+        // the gate wants one list to work through, not one error per re-run.
+        let undocumented: Vec<String> = ir
+            .operations
+            .iter()
+            .filter(|op| {
+                op.summary
+                    .as_deref()
+                    .is_none_or(|summary| summary.trim().is_empty())
+            })
+            .map(|op| {
+                format!(
+                    "  {} — {} {} (handler `{}`)",
+                    op.id, op.method, op.path, op.handler
+                )
+            })
+            .collect();
+        if undocumented.is_empty() {
+            return Ok(());
+        }
+        Err(CoreError::Config {
+            message: format!(
+                "{} operation(s) have no summary. Write a doc comment on each handler \
+                 (its first sentence becomes the summary):\n{}",
+                undocumented.len(),
+                undocumented.join("\n")
+            ),
+        })
+    }
+}
+
 /// Set or replace the typed success response for one operation.
 ///
 /// This is a graph-level correction hook for source frameworks where a handler's response type is not
@@ -3246,6 +3313,15 @@ impl Transform for DocumentOperation {
 
         let base_path = ir.base_path.clone();
         let mut matched = 0_usize;
+        // Check EVERY matched operation for a prose collision before mutating any of them,
+        // so a transform that is going to fail leaves the graph exactly as it found it. A
+        // half-applied transform would make the error depend on operation order.
+        for operation in &ir.operations {
+            if operation_selector_matches(&self.selector, operation, &base_path) {
+                check_operation_prose_conflict(operation, self)?;
+            }
+        }
+
         let mut policies = ir.operation_docs.clone();
         for index in 0..ir.operations.len() {
             if !operation_selector_matches(&self.selector, &ir.operations[index], &base_path) {
@@ -3253,6 +3329,7 @@ impl Transform for DocumentOperation {
             }
             matched += 1;
             let operation_id = ir.operations[index].id.clone();
+            apply_operation_prose(&mut ir.operations[index], self);
             apply_documented_error_responses(&mut ir.operations[index], &resolved_errors);
             let mut policy = policies
                 .iter()
@@ -3261,8 +3338,6 @@ impl Transform for DocumentOperation {
                 .unwrap_or_else(|| OperationDocsPolicy {
                     operation_id,
                     openapi_operation_id: None,
-                    summary: None,
-                    description: None,
                     deprecated: false,
                     tags: Vec::new(),
                     request_examples: Vec::new(),
@@ -3353,17 +3428,64 @@ fn apply_documented_error_responses(
     }
 }
 
+/// Write configured prose onto the operation, or refuse if the operation already has a
+/// source of its own.
+///
+/// An operation's `summary`/`description` have EXACTLY ONE source: the routed handler's
+/// doc comment for source-extracted operations, the spec for `OpenApi`-imported ones, or
+/// this transform for operations that have neither. Two ways to state one fact is the
+/// defect CLAUDE.md rule 3 exists to prevent, and picking a winner between them is the
+/// same defect with extra steps — so a collision is a hard error, never a silent
+/// override and never a fallback.
+///
+/// Setting the SAME text the source already carries is still an error: it is a second
+/// place the fact is written down, so it drifts the moment either side is edited.
+fn check_operation_prose_conflict(
+    operation: &crate::graph::Operation,
+    update: &DocumentOperation,
+) -> Result<(), CoreError> {
+    for (configured, existing, field) in [
+        (update.summary.as_ref(), &operation.summary, "summary"),
+        (
+            update.description.as_ref(),
+            &operation.description,
+            "description",
+        ),
+    ] {
+        if configured.is_some() && existing.is_some() {
+            return Err(CoreError::Config {
+                message: format!(
+                    "operation '{}' already has a {field} from its source (its handler's doc \
+                     comment, or the imported spec), so `DocumentOperation::{field}` would be a \
+                     second source for one fact. Edit the source prose instead, or narrow the \
+                     selector so it does not match this operation.",
+                    operation.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Write configured prose onto the operation.
+///
+/// Infallible by construction: [`check_operation_prose_conflict`] has already run over
+/// every matched operation, so reaching here means no operation in the match set has a
+/// source of its own.
+fn apply_operation_prose(operation: &mut crate::graph::Operation, update: &DocumentOperation) {
+    if update.summary.is_some() {
+        operation.summary.clone_from(&update.summary);
+    }
+    if update.description.is_some() {
+        operation.description.clone_from(&update.description);
+    }
+}
+
 fn apply_documentation_policy_updates(
     policy: &mut OperationDocsPolicy,
     update: &DocumentOperation,
     errors: &[ResolvedDocumentedJsonErrorResponse],
 ) {
-    if update.summary.is_some() {
-        policy.summary.clone_from(&update.summary);
-    }
-    if update.description.is_some() {
-        policy.description.clone_from(&update.description);
-    }
     if let Some(deprecated) = update.deprecated {
         policy.deprecated = deprecated;
     }
@@ -5817,6 +5939,46 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// A doc-comment-only edit must change the source cache key.
+    ///
+    /// Regression guard for the "silent hot no-op" class of bug: prose is a real input, so
+    /// editing only a handler's doc comment has to miss the cache and re-extract. The key
+    /// hashes file CONTENTS (not mtimes or a file list), so this already held before doc
+    /// comments existed — this test is what keeps it true.
+    #[test]
+    fn go_gin_cache_key_changes_when_only_a_doc_comment_changes() {
+        let cx = cx();
+        let dir = cx
+            .project_root
+            .join(format!("gnr8-doc-comment-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp input dir");
+        let handler = dir.join("handlers.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+
+        std::fs::write(
+            &handler,
+            "package p\n\n// listWidgets returns widgets.\nfunc listWidgets() {}\n",
+        )
+        .expect("write handler");
+        let before = go_gin_cache_key(&dir, &routes, &schemas, "helper", &cx);
+
+        // ONLY the doc comment changes; the declaration below it is byte-identical.
+        std::fs::write(
+            &handler,
+            "package p\n\n// listWidgets returns every widget.\nfunc listWidgets() {}\n",
+        )
+        .expect("rewrite handler");
+        let after = go_gin_cache_key(&dir, &routes, &schemas, "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(
+            before, after,
+            "a doc-comment-only edit must invalidate the source cache"
+        );
+    }
+
     fn span() -> SourceSpan {
         SourceSpan {
             file: "handlers.go".to_string(),
@@ -5855,6 +6017,30 @@ mod tests {
         )
     }
 
+    /// A minimal `Operation` for selector tests: only id/method/path vary, everything else
+    /// is the neutral default. Keeps the selector assertions readable and means a new
+    /// `Operation` field is a one-line change here rather than N literal edits.
+    fn selector_test_operation(id: &str, method: &str, path: &str) -> Operation {
+        Operation {
+            id: id.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            handler: id.to_string(),
+            summary: None,
+            description: None,
+            group: None,
+            middleware: Vec::new(),
+            params: vec![],
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: vec![],
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: span(),
+        }
+    }
+
     fn grouped_test_operation(
         id: &str,
         method: &str,
@@ -5867,6 +6053,8 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             handler: id.to_string(),
+            summary: None,
+            description: None,
             group: group.map(str::to_string),
             middleware: Vec::new(),
             params: Vec::new(),
@@ -5960,6 +6148,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/schools/active/profile".to_string(),
                     handler: "activeSchool".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -5976,6 +6166,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/items".to_string(),
                     handler: "createItem".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -5992,6 +6184,8 @@ mod tests {
                     method: "PATCH".to_string(),
                     path: "/schools/active/items".to_string(),
                     handler: "activeWrite".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6049,6 +6243,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/v1/schools/active/files/{fileId}/open".to_string(),
                     handler: "openActiveFile".to_string(),
+                    summary: None,
+                    description: None,
                     group: Some("files".to_string()),
                     middleware: vec!["RequireActiveSchool".to_string()],
                     params: vec![],
@@ -6065,6 +6261,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/v1/schools/active/files".to_string(),
                     handler: "createActiveFile".to_string(),
+                    summary: None,
+                    description: None,
                     group: Some("files".to_string()),
                     middleware: vec!["RequireActiveSchool".to_string(), "RequireCSRF".to_string()],
                     params: vec![],
@@ -6081,6 +6279,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/v1/admin/export/{exportId}".to_string(),
                     handler: "exportAdmin".to_string(),
+                    summary: None,
+                    description: None,
                     group: Some("admin".to_string()),
                     middleware: vec!["Auth.RequireActor".to_string()],
                     params: vec![],
@@ -6127,70 +6327,18 @@ mod tests {
 
         let mut ir = ApiGraph {
             operations: vec![
-                Operation {
-                    id: "readActive".to_string(),
-                    method: "GET".to_string(),
-                    path: "/v1/schools/active/files".to_string(),
-                    handler: "readActive".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "createActive".to_string(),
-                    method: "POST".to_string(),
-                    path: "/v1/schools/active/files".to_string(),
-                    handler: "createActive".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "deleteGovernance".to_string(),
-                    method: "DELETE".to_string(),
-                    path: "/v1/governance/legal-holds/book/1".to_string(),
-                    handler: "deleteGovernance".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
-                Operation {
-                    id: "readGovernance".to_string(),
-                    method: "GET".to_string(),
-                    path: "/v1/governance/legal-holds/book/1".to_string(),
-                    handler: "readGovernance".to_string(),
-                    group: None,
-                    middleware: Vec::new(),
-                    params: vec![],
-                    request_body: None,
-                    request_body_required: true,
-                    request_body_content_type: None,
-                    responses: vec![],
-                    security: Vec::new(),
-                    security_overrides_global: false,
-                    provenance: span(),
-                },
+                selector_test_operation("readActive", "GET", "/v1/schools/active/files"),
+                selector_test_operation("createActive", "POST", "/v1/schools/active/files"),
+                selector_test_operation(
+                    "deleteGovernance",
+                    "DELETE",
+                    "/v1/governance/legal-holds/book/1",
+                ),
+                selector_test_operation(
+                    "readGovernance",
+                    "GET",
+                    "/v1/governance/legal-holds/book/1",
+                ),
             ],
             ..ApiGraph::default()
         };
@@ -6245,6 +6393,8 @@ mod tests {
                     method: "PATCH".to_string(),
                     path: "/conversations/{conversationId}/read".to_string(),
                     handler: "markRead".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6263,6 +6413,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/files/{fileId}/download".to_string(),
                     handler: "download".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6279,6 +6431,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/sync/stream".to_string(),
                     handler: "stream".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6571,6 +6725,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/books/import".to_string(),
                     handler: "importBooks".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6587,6 +6743,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/oauth/token".to_string(),
                     handler: "token".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6603,6 +6761,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/files/upload".to_string(),
                     handler: "upload".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6663,6 +6823,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/books/import".to_string(),
                 handler: "importBooks".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],
@@ -6807,6 +6969,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/schedule/week".to_string(),
                 handler: "listSchedule".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],
@@ -6860,6 +7024,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/files/{fileId}/download".to_string(),
                 handler: "downloadFile".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],
@@ -6938,6 +7104,8 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/books/current".to_string(),
                     handler: "getBook".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -6962,6 +7130,8 @@ mod tests {
                     method: "POST".to_string(),
                     path: "/books".to_string(),
                     handler: "createBook".to_string(),
+                    summary: None,
+                    description: None,
                     group: None,
                     middleware: Vec::new(),
                     params: vec![],
@@ -7082,6 +7252,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/books/current".to_string(),
                 handler: "getBook".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],
@@ -7318,6 +7490,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],
@@ -7385,6 +7559,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params: vec![],

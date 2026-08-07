@@ -36,15 +36,24 @@ type GoFacts struct {
 //     `/{uuid}`). The dynamic mount prefix is a lowering concern on the host side.
 //   - RequestBody / Responses / Params come from the recognized handler-body calls.
 //
-// Security, summary, router-path overrides, and param enum/required-from-
-// annotation are DELIBERATELY ABSENT: those were doc-comment-annotation facts.
-// Security now lives in the user's gnr8 config (CLAUDE.md rule 4). Group is a
-// source-derived route-group/tag name from static Gin groups, not an annotation.
+// Security, router-path overrides, and param enum/required-from-annotation are
+// DELIBERATELY ABSENT: those were doc-comment-annotation facts. Security now lives in
+// the user's gnr8 config (CLAUDE.md rule 4). Group is a source-derived route-group/tag
+// name from static Gin groups, not an annotation.
+//
+// Summary/Description ARE present, and are still a single code-derived source: the
+// routed handler's own doc comment read as PLAIN PROSE via the language's native
+// synopsis convention (CLAUDE.md rule 0.1 category 2). They carry no grammar — there is
+// no marker, prefix, or key/value syntax inside the comment — and they can state
+// nothing structural. Every field above them stays code-inferred and a doc comment can
+// neither set nor override any of them.
 type RouteFact struct {
 	Method                 string         `json:"method"`
 	Path                   string         `json:"path"`
 	Handler                string         `json:"handler"`
 	OperationID            string         `json:"operation_id"`
+	Summary                string         `json:"summary,omitempty"`
+	Description            string         `json:"description,omitempty"`
 	Group                  string         `json:"group,omitempty"`
 	Middleware             []string       `json:"middleware,omitempty"`
 	Params                 []ParamFact    `json:"params"`

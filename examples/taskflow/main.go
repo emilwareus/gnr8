@@ -37,7 +37,10 @@ func registerRoutes(r *gin.Engine) {
 	}
 }
 
-// createTask handles POST /tasks: bind a CreateTaskRequest, return the new Task.
+// createTask creates a task.
+//
+// The task starts in the pending status and is returned with its generated
+// identifier.
 func createTask(c *gin.Context) {
 	var req CreateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -48,14 +51,16 @@ func createTask(c *gin.Context) {
 	c.JSON(http.StatusCreated, task)
 }
 
-// listTasks handles GET /tasks with an optional ?status= filter.
+// listTasks returns every task.
+//
+// Pass a status to narrow the results to one status; omit it to list everything.
 func listTasks(c *gin.Context) {
 	status := c.Query("status")
 	_ = status
 	c.JSON(http.StatusOK, TaskList{Tasks: []Task{}})
 }
 
-// getTask handles GET /tasks/:id.
+// getTask returns one task by its identifier.
 func getTask(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -65,7 +70,9 @@ func getTask(c *gin.Context) {
 	c.JSON(http.StatusOK, Task{ID: id})
 }
 
-// updateTask handles PUT /tasks/:id: bind an UpdateTaskRequest, return the Task.
+// updateTask replaces the mutable fields of one task.
+//
+// Fields omitted from the payload keep their current values.
 func updateTask(c *gin.Context) {
 	id := c.Param("id")
 	var req UpdateTaskRequest
@@ -76,7 +83,7 @@ func updateTask(c *gin.Context) {
 	c.JSON(http.StatusOK, Task{ID: id})
 }
 
-// deleteTask handles DELETE /tasks/:id.
+// deleteTask permanently removes one task.
 func deleteTask(c *gin.Context) {
 	id := c.Param("id")
 	c.JSON(http.StatusOK, ErrorResponse{Message: "deleted " + id, Code: "ok"})

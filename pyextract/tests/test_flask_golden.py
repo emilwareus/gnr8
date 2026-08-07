@@ -26,14 +26,14 @@ FIXTURE = os.path.join(REPO_ROOT, "fixtures", "flask-bookstore")
 # Route def-line anchors (snapshot routes.py spans).
 EXPECTED_ROUTE_LINES = {
     "list_orders": 31,
-    "create_order": 48,
-    "create_order_raw": 69,
-    "get_order": 59,
+    "create_order": 49,
+    "create_order_raw": 68,
+    "get_order": 61,
 }
 # Per-param anchors: the typed query AnnAssign line + the converter path-param line.
 EXPECTED_PARAM_LINES = {
-    ("list_orders", "status"): 41,
-    ("get_order", "order_id"): 59,
+    ("list_orders", "status"): 42,
+    ("get_order", "order_id"): 61,
 }
 # Schema ClassDef-line anchors (snapshot dto.py spans).
 EXPECTED_SCHEMA_LINES = {
@@ -43,7 +43,7 @@ EXPECTED_SCHEMA_LINES = {
     "app.dto.Price": 49,
 }
 # The three untyped-surface diagnostic lines (OQ2 resolution).
-EXPECTED_DIAGNOSTIC_LINES = [42, 69, 78]
+EXPECTED_DIAGNOSTIC_LINES = [43, 68, 80]
 
 
 def _extract(target):
@@ -84,7 +84,7 @@ class FlaskGoldenLineTests(unittest.TestCase):
         for sid, line in EXPECTED_SCHEMA_LINES.items():
             self.assertEqual(self.schemas[sid]["span"]["start_line"], line, sid)
 
-    def test_diagnostic_lines_are_42_69_78(self):
+    def test_diagnostic_lines_are_43_68_80(self):
         lines = sorted(d["line"] for d in self.doc["diagnostics"])
         self.assertEqual(lines, EXPECTED_DIAGNOSTIC_LINES)
 

@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/gnr8/goextract/internal/diag"
+	"github.com/gnr8/goextract/internal/docs"
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
 	"github.com/gnr8/goextract/internal/routes"
@@ -43,6 +44,10 @@ const maxContextHelperDepth = 32
 // CodeFacts is the code-inferred contract for one handler: the request body, the
 // responses keyed by status, and the params. This is the ONLY source of these
 // facts — there is no annotation/fallback path (CLAUDE.md rules 1 & 3).
+//
+// Summary/Description are the handler's own doc comment read as PLAIN PROSE (rule 0.1
+// category 2) — never a directive, never structural. They are carried here rather than
+// read at the call site so a route and its prose come from the same resolved decl.
 type CodeFacts struct {
 	RequestBody            *facts.TypeRef
 	RequestBodyRequired    bool
@@ -50,6 +55,8 @@ type CodeFacts struct {
 	Responses              []facts.ResponseFact
 	Params                 []facts.ParamFact
 	Schemas                []facts.SchemaFact
+	Summary                string
+	Description            string
 }
 
 // handlerDecl bundles a handler FuncDecl with its owning package's type info and
@@ -869,6 +876,26 @@ func requestHeaderGetInFrame(frame helperFrame, call *ast.CallExpr) (string, boo
 // the operation. Unknown handlers (no matching decl) yield empty facts plus an
 // ERROR diagnostic, not a panic or a false-complete contract (GO-06). The module prefix used to qualify schema refs is read
 // from the Analyzer's per-invocation context (WR-03), not a package global.
+// handlerProse reads the handler declaration's own doc comment as plain prose and
+// splits it into a summary sentence and the remaining description (CLAUDE.md rule 0.1
+// category 2). Only a ROUTED handler ever reaches here, so an internal helper's doc
+// comment can never leak into the API surface.
+//
+// `(*ast.CommentGroup).Text` strips the comment markers AND drops `//go:`-style
+// directive lines, so build/generate directives never pollute prose — the text handed
+// to the splitter is exactly what a human wrote for humans. Nothing here matches on
+// comment CONTENT; that is what keeps this a doc convention rather than a dialect.
+func handlerProse(h handlerDecl) (summary, description string) {
+	if h.decl == nil || h.decl.Doc == nil {
+		return "", ""
+	}
+	summary, description = docs.Split(h.decl.Doc.Text())
+	if h.decl.Name != nil {
+		summary = docs.StripSymbolName(summary, h.decl.Name.Name)
+	}
+	return summary, description
+}
+
 func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFacts {
 	h, ok := a.handlerForRoute(route)
 	if !ok || h.decl == nil || h.decl.Body == nil {
@@ -885,6 +912,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	}
 
 	cf := CodeFacts{RequestBodyRequired: true, Responses: []facts.ResponseFact{}, Params: []facts.ParamFact{}}
+	cf.Summary, cf.Description = handlerProse(h)
 	seenParam := map[string]bool{}
 	resolvedParam := map[string]bool{}
 	untypedQueryReads := []untypedQueryRead{}

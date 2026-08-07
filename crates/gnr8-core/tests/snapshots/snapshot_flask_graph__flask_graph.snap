@@ -8,6 +8,8 @@ operations:
     method: GET
     path: /orders/
     handler: list_orders
+    summary: "List orders, optionally narrowed to one stock status."
+    description: "Orders are returned newest first. Omit the status filter to list every order\nregardless of availability."
     params:
       - name: status
         location: query
@@ -18,8 +20,8 @@ operations:
             prim: string
         provenance:
           file: app/routes.py
-          start_line: 41
-          end_line: 41
+          start_line: 42
+          end_line: 42
     request_body: ~
     responses:
       - status: 200
@@ -35,6 +37,8 @@ operations:
     method: POST
     path: /orders/
     handler: create_order
+    summary: Place a new order.
+    description: The order is confirmed immediately and its confirmation number is returned.
     params: []
     request_body:
       ref_id: app.dto.OrderInput
@@ -47,23 +51,26 @@ operations:
           - application/json
     provenance:
       file: app/routes.py
-      start_line: 48
-      end_line: 48
+      start_line: 49
+      end_line: 49
   - id: create_order_raw
     method: POST
     path: /orders/raw
     handler: create_order_raw
+    summary: "Place an order from a raw, unvalidated payload."
+    description: "Provided for clients that cannot produce the typed order shape. The payload is\naccepted as-is and validated downstream."
     params: []
     request_body: ~
     responses: []
     provenance:
       file: app/routes.py
-      start_line: 69
-      end_line: 69
+      start_line: 68
+      end_line: 68
   - id: get_order
     method: GET
     path: "/orders/{order_id}"
     handler: get_order
+    summary: Fetch one order by its identifier.
     params:
       - name: order_id
         location: path
@@ -76,8 +83,8 @@ operations:
             signed: true
         provenance:
           file: app/routes.py
-          start_line: 59
-          end_line: 59
+          start_line: 61
+          end_line: 61
     request_body: ~
     responses:
       - status: 200
@@ -87,8 +94,8 @@ operations:
           - application/json
     provenance:
       file: app/routes.py
-      start_line: 59
-      end_line: 59
+      start_line: 61
+      end_line: 61
 schemas:
   - id: app.dto.Availability
     name: Availability
@@ -284,11 +291,11 @@ diagnostics:
     category: request_parameter
     message: "untyped query param 'q' on GET /orders/: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only"
     file: app/routes.py
-    line: 42
+    line: 43
     span:
       file: app/routes.py
-      start_line: 42
-      end_line: 42
+      start_line: 43
+      end_line: 43
     operation: GET /orders/
     subject: q
   - code: response.schema.unresolved
@@ -296,11 +303,11 @@ diagnostics:
     category: response
     message: "untyped response on POST /orders/raw: handler has no return annotation; response shape under-specified, no schema inferred"
     file: app/routes.py
-    line: 69
+    line: 68
     span:
       file: app/routes.py
-      start_line: 69
-      end_line: 69
+      start_line: 68
+      end_line: 68
     operation: POST /orders/raw
     subject: create_order_raw
   - code: request.body.unresolved
@@ -308,11 +315,11 @@ diagnostics:
     category: request_body
     message: "untyped request body on POST /orders/raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred"
     file: app/routes.py
-    line: 78
+    line: 80
     span:
       file: app/routes.py
-      start_line: 78
-      end_line: 78
+      start_line: 80
+      end_line: 80
     operation: POST /orders/raw
     subject: payload
 base_path: /

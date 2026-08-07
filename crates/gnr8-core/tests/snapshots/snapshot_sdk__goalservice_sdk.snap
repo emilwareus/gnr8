@@ -597,7 +597,12 @@ import (
 	"net/url"
 )
 
-// CreateGoal -> POST /goal/
+// CreateGoal Creates a goal for the calling actor.
+//
+// The goal starts in the pending state and is assigned a server-generated
+// identifier, which is returned in the response.
+//
+// POST /goal/
 func (c *Client) CreateGoal(ctx context.Context, in CreateGoalInput, opts ...RequestOption) (CommandMessageWithUUID, error) {
 	var out CommandMessageWithUUID
 	payload, err := json.Marshal(in)
@@ -668,7 +673,12 @@ type ListGoalsParams struct {
 	PageSize    *string
 }
 
-// ListGoals -> GET /goal/list
+// ListGoals Returns a page of goals for the calling actor.
+//
+// Results are ordered newest first and paginated with an opaque cursor. Pass the
+// cursor from the previous page to continue; omit it to start from the beginning.
+//
+// GET /goal/list
 func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...RequestOption) (ListGoalsOutput, error) {
 	var out ListGoalsOutput
 	reqURL := c.baseURL + "/goal/list"
@@ -729,7 +739,9 @@ func (c *Client) ListGoals(ctx context.Context, params ListGoalsParams, opts ...
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// DeleteGoal -> DELETE /goal/{uuid}
+// DeleteGoal Permanently removes one goal.
+//
+// DELETE /goal/{uuid}
 func (c *Client) DeleteGoal(ctx context.Context, uuid string, opts ...RequestOption) (CommandMessage, error) {
 	var out CommandMessage
 	reqURL := c.baseURL + fmt.Sprintf("/goal/%s", url.PathEscape(fmt.Sprint(uuid)))
@@ -787,7 +799,12 @@ func (c *Client) DeleteGoal(ctx context.Context, uuid string, opts ...RequestOpt
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// UpdateGoal -> PUT /goal/{uuid}
+// UpdateGoal Replaces the mutable fields of one goal.
+//
+// The goal is identified by its uuid. Fields omitted from the payload are left
+// unchanged; the goal's identifier and creation time are never modified.
+//
+// PUT /goal/{uuid}
 func (c *Client) UpdateGoal(ctx context.Context, uuid string, in UpdateGoalInput, opts ...RequestOption) (CommandMessage, error) {
 	var out CommandMessage
 	payload, err := json.Marshal(in)

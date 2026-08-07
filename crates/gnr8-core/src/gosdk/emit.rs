@@ -29,8 +29,8 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, join_path, operation_auth_alternatives,
-    path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
-    success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
+    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
+    split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
     OperationAuthScheme, RequestBodyEncoding, SuccessResponses,
 };
 use crate::CoreError;
@@ -1433,6 +1433,56 @@ fn ordered_path_params(op: &Operation) -> Result<Vec<&crate::graph::Param>, Core
         .collect()
 }
 
+/// Emit the generated method's doc comment.
+///
+/// Go's convention is that a doc comment opens with the symbol's own name, so the
+/// summary is emitted as `// <Method> <summary>` and the route line follows the prose.
+/// An operation with no prose keeps the historical single `// <Method> -> GET /path`
+/// line, so an undocumented SDK is byte-identical to what it was before doc comments
+/// existed.
+///
+/// The prose is the handler's own words, carried through verbatim: it is never re-wrapped
+/// (that would make the SDK comment disagree with the source comment) and needs no
+/// escaping, because `//` line comments have no terminator to escape out of.
+fn emit_operation_doc(
+    body: &mut String,
+    op: &Operation,
+    method_name: &str,
+    base_path: &str,
+) -> Result<(), CoreError> {
+    let route = format!("{} {}", op.method, join_path(base_path, &op.path));
+    let prose = operation_prose(op, &[], "");
+
+    // The opening line always starts with the method name — Go's doc convention, and what
+    // every Go linter checks for. With a summary that IS the opening line; without one the
+    // historical `-> route` line opens instead.
+    match &prose.summary {
+        Some(summary) => writeln!(body, "// {method_name} {summary}"),
+        None => writeln!(body, "// {method_name} -> {route}"),
+    }
+    .map_err(sink)?;
+
+    if !prose.description.is_empty() {
+        writeln!(body, "//").map_err(sink)?;
+        for line in &prose.description {
+            if line.is_empty() {
+                writeln!(body, "//").map_err(sink)?;
+            } else {
+                writeln!(body, "// {line}").map_err(sink)?;
+            }
+        }
+    }
+
+    // The route trailer is emitted only when the summary opened the block. Without a
+    // summary the route line IS the opener, and repeating it would print it twice — the
+    // case that arises when `DocumentOperation` sets a description with no summary.
+    if prose.summary.is_some() {
+        writeln!(body, "//").map_err(sink)?;
+        writeln!(body, "// {route}").map_err(sink)?;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "operation emission keeps one linear view of the generated method's signature, request, and response contract"
@@ -1534,13 +1584,7 @@ fn emit_operation(
     }
     args.push("opts ...RequestOption".to_string());
 
-    writeln!(
-        body,
-        "// {method_name} -> {} {}",
-        op.method,
-        join_path(base_path, &op.path)
-    )
-    .map_err(sink)?;
+    emit_operation_doc(body, op, method_name.as_str(), base_path)?;
     writeln!(
         body,
         "func (c *Client) {method_name}({}) ({return_model}, error) {{",

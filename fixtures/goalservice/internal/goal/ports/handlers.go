@@ -10,12 +10,10 @@ import (
 	"github.com/gnr8/gnr8-fixtures/goalservice/internal/common/dto"
 )
 
-// createGoal handles POST /goal/.
+// createGoal creates a goal for the calling actor.
 //
-// This handler is fully code-inferable:
-//   - request body type = dto.CreateGoalInput (from ShouldBindJSON(&input))
-//   - success           = 201 dto.CommandMessageWithUUID (c.JSON(StatusCreated, ...))
-//   - error             = 400 dto.HttpError              (c.JSON(StatusBadRequest, ...))
+// The goal starts in the pending state and is assigned a server-generated
+// identifier, which is returned in the response.
 func (h HttpServer) createGoal(c *gin.Context) {
 	var input dto.CreateGoalInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -35,14 +33,17 @@ func (h HttpServer) createGoal(c *gin.Context) {
 	})
 }
 
-// listGoals handles GET /goal/list.
+// listGoals returns a page of goals for the calling actor.
 //
-// Query params are read loosely via c.Query (no binding struct), so their type
-// and required-ness aren't expressible in the code. The untyped c.Query reads
-// are the "param type unknown" diagnostic trigger (TARGET-API.md §5.4).
-//
+// Results are ordered newest first and paginated with an opaque cursor. Pass the
+// cursor from the previous page to continue; omit it to start from the beginning.
 func (h HttpServer) listGoals(c *gin.Context) {
-	cursor := c.Query("cursor")           // untyped query param -> diagnostic trigger
+	// Fixture note, deliberately INSIDE the body rather than in the doc comment:
+	// these params are read loosely via c.Query with no binding struct, so their
+	// type and required-ness are not expressible in code. That is the "param type
+	// unknown" diagnostic trigger (TARGET-API.md §5.4). Keeping this here proves
+	// that only the doc comment becomes API prose — body comments never do.
+	cursor := c.Query("cursor")
 	pageSize := c.Query("page_size")      // untyped query param
 	aggregation := c.Query("aggregation") // untyped query param
 
@@ -58,11 +59,10 @@ func (h HttpServer) listGoals(c *gin.Context) {
 	})
 }
 
-// updateGoal handles PUT /goal/{uuid}.
+// updateGoal replaces the mutable fields of one goal.
 //
-// This handler exercises c.Param (path param) and ShouldBindJSON (request body)
-// and returns multiple success/failure status codes — all derived from the code.
-//
+// The goal is identified by its uuid. Fields omitted from the payload are left
+// unchanged; the goal's identifier and creation time are never modified.
 func (h HttpServer) updateGoal(c *gin.Context) {
 	id := c.Param("uuid") // path param :uuid -> {uuid}
 	if _, err := uuid.Parse(id); err != nil {
@@ -87,7 +87,7 @@ func (h HttpServer) updateGoal(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.CommandMessage{Message: "goal updated"})
 }
 
-// deleteGoal handles DELETE /goal/{uuid}: path param + simple response.
+// deleteGoal permanently removes one goal.
 func (h HttpServer) deleteGoal(c *gin.Context) {
 	id := c.Param("uuid") // path param :uuid -> {uuid}
 	if _, err := uuid.Parse(id); err != nil {

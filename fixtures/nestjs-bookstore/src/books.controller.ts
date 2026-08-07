@@ -37,6 +37,13 @@ import {
 // line to the committed graph snapshot's asserted span. (spacing — non-fact)
 @Controller('books')
 export class BooksController {
+  /**
+   * List books in one genre.
+   *
+   * Results are ordered by title and paginated with an opaque cursor.
+   * @param genre a JSDoc TAG — the compiler excludes it from the description, so
+   *   gnr8 never sees it and no tag dialect can take hold (rule 0.1).
+   */
   @Get('/')
   listBooks(
     @Query('genre') genre: string,
@@ -45,14 +52,20 @@ export class BooksController {
   ): ListBooksResponse {
     throw new Error('static fixture: never executed this phase');
   }
-  // POST /books/ — a typed request body + a typed response. (spacing follows.)
-  //
+  /**
+   * Add a book to the catalogue.
+   *
+   * The book is created immediately and its generated identifier is returned.
+   */
   @Post('/')
   createBook(@Body() book: BookDto): CreatedMessage {
     throw new Error('static fixture: never executed this phase');
   }
-  // GET /books/:bookId — a path param + a UNION response. (spacing follows.)
-  //
+  /**
+   * Fetch one book by its identifier.
+   *
+   * Returns the book when it is in stock, and an out-of-stock notice otherwise.
+   */
   @Get('/:bookId')
   getBook(
     @Param('bookId') bookId: number,

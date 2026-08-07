@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_openapi.rs
-assertion_line: 40
 expression: openapi
 ---
 openapi: 3.1.0
@@ -13,6 +12,8 @@ paths:
   '/goal/':
     post:
       operationId: createGoal
+      summary: Creates a goal for the calling actor.
+      description: "The goal starts in the pending state and is assigned a server-generated\nidentifier, which is returned in the response."
       requestBody:
         required: true
         content:
@@ -35,6 +36,8 @@ paths:
   '/goal/list':
     get:
       operationId: listGoals
+      summary: Returns a page of goals for the calling actor.
+      description: "Results are ordered newest first and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the beginning."
       parameters:
       - name: aggregation
         in: query
@@ -61,6 +64,8 @@ paths:
   '/goal/{uuid}':
     put:
       operationId: updateGoal
+      summary: Replaces the mutable fields of one goal.
+      description: "The goal is identified by its uuid. Fields omitted from the payload are left\nunchanged; the goal's identifier and creation time are never modified."
       parameters:
       - name: uuid
         in: path
@@ -88,6 +93,7 @@ paths:
                 $ref: '#/components/schemas/HttpError'
     delete:
       operationId: deleteGoal
+      summary: Permanently removes one goal.
       parameters:
       - name: uuid
         in: path

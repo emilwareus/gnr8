@@ -8,6 +8,8 @@ paths:
   '/tasks':
     get:
       operationId: listTasks
+      summary: Returns every task.
+      description: Pass a status to narrow the results to one status; omit it to list everything.
       tags: [tasks]
       parameters:
       - name: status
@@ -24,6 +26,8 @@ paths:
                 $ref: '#/components/schemas/TaskList'
     post:
       operationId: createTask
+      summary: Creates a task.
+      description: "The task starts in the pending status and is returned with its generated\nidentifier."
       tags: [tasks]
       requestBody:
         required: true
@@ -47,6 +51,7 @@ paths:
   '/tasks/{id}':
     get:
       operationId: getTask
+      summary: Returns one task by its identifier.
       tags: [tasks]
       parameters:
       - name: id
@@ -69,6 +74,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     put:
       operationId: updateTask
+      summary: Replaces the mutable fields of one task.
+      description: Fields omitted from the payload keep their current values.
       tags: [tasks]
       parameters:
       - name: id
@@ -97,6 +104,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     delete:
       operationId: deleteTask
+      summary: Permanently removes one task.
       tags: [tasks]
       parameters:
       - name: id

@@ -6,6 +6,8 @@ paths:
   '/orders/':
     get:
       operationId: list_orders
+      summary: List orders, optionally narrowed to one stock status.
+      description: "Orders are returned newest first. Omit the status filter to list every order\nregardless of availability."
       parameters:
       - name: status
         in: query
@@ -21,6 +23,8 @@ paths:
                 $ref: '#/components/schemas/OrderConfirmation'
     post:
       operationId: create_order
+      summary: Place a new order.
+      description: The order is confirmed immediately and its confirmation number is returned.
       requestBody:
         required: true
         content:
@@ -37,12 +41,15 @@ paths:
   '/orders/raw':
     post:
       operationId: create_order_raw
+      summary: Place an order from a raw, unvalidated payload.
+      description: "Provided for clients that cannot produce the typed order shape. The payload is\naccepted as-is and validated downstream."
       responses:
         '201':
           description: Response 201
   '/orders/{order_id}':
     get:
       operationId: get_order
+      summary: Fetch one order by its identifier.
       parameters:
       - name: order_id
         in: path

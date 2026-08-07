@@ -8,6 +8,8 @@ operations:
     method: GET
     path: /books/
     handler: list_books
+    summary: List books in one genre.
+    description: "Results are ordered by title and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the\nbeginning."
     params:
       - name: cursor
         location: query
@@ -57,6 +59,8 @@ operations:
     method: POST
     path: /books/
     handler: create_book
+    summary: Add a book to the catalogue.
+    description: The book is created immediately and its generated identifier is returned.
     params: []
     request_body:
       ref_id: app.models.Book
@@ -75,6 +79,8 @@ operations:
     method: GET
     path: "/books/{book_id}"
     handler: get_book
+    summary: Fetch one book by its identifier.
+    description: "Returns the book when it is in stock, and an out-of-stock notice otherwise."
     params:
       - name: book_id
         location: path
@@ -87,8 +93,8 @@ operations:
             signed: true
         provenance:
           file: app/main.py
-          start_line: 66
-          end_line: 66
+          start_line: 68
+          end_line: 68
       - name: fmt
         location: query
         required: false
@@ -97,8 +103,8 @@ operations:
           of: app.models.BookFormat
         provenance:
           file: app/main.py
-          start_line: 66
-          end_line: 66
+          start_line: 68
+          end_line: 68
     request_body: ~
     responses:
       - status: 200
@@ -108,12 +114,14 @@ operations:
           - application/json
     provenance:
       file: app/main.py
-      start_line: 65
-      end_line: 65
+      start_line: 67
+      end_line: 67
   - id: update_book
     method: PUT
     path: "/books/{book_id}"
     handler: update_book
+    summary: Update the stored filters for one book.
+    description: Filters left unset in the payload keep their current values.
     params:
       - name: book_id
         location: path
@@ -126,8 +134,8 @@ operations:
             signed: true
         provenance:
           file: app/main.py
-          start_line: 76
-          end_line: 76
+          start_line: 80
+          end_line: 80
     request_body:
       ref_id: app.models.BookFilters
     request_body_content_type: application/json
@@ -139,8 +147,8 @@ operations:
           - application/json
     provenance:
       file: app/main.py
-      start_line: 75
-      end_line: 75
+      start_line: 79
+      end_line: 79
 schemas:
   - id: app.models.Author
     name: Author

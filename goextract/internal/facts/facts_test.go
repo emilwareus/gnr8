@@ -125,9 +125,9 @@ func TestEmptySlicesMarshalAsArrays(t *testing.T) {
 var canonicalFieldNames = []string{
 	// GoFacts
 	"module", "routes", "schemas", "diagnostics",
-	// RouteFact
-	"method", "path", "handler", "operation_id", "group", "middleware", "params", "request_body",
-	"request_body_required", "request_body_content_type", "responses", "span",
+	// RouteFact ("description" is shared with FieldFact below; "summary" is route-only)
+	"method", "path", "handler", "operation_id", "summary", "group", "middleware", "params",
+	"request_body", "request_body_required", "request_body_content_type", "responses", "span",
 	// ParamFact (name/location/required/schema/span)
 	"name", "location", "required", "schema", "default",
 	// ResponseFact
@@ -219,8 +219,10 @@ func fullyPopulatedDoc() facts.GoFacts {
 		Routes: []facts.RouteFact{
 			{
 				Method: "PUT", Path: "/{uuid}", Handler: "updateGoal", OperationID: "updateGoal",
-				Group:      "goals",
-				Middleware: []string{"RequireActor"},
+				Summary:     "Updates one goal.",
+				Description: "The goal must belong to the calling actor.",
+				Group:       "goals",
+				Middleware:  []string{"RequireActor"},
 				Params: []facts.ParamFact{
 					{
 						Name: "uuid", Location: "path", Required: true,
