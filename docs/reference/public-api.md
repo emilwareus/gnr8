@@ -83,7 +83,8 @@ See [Transforms and overrides](../pipeline/transforms.md).
 | `ConfigureSdkRuntime` | timeout, retry, unsafe-method, and hook defaults |
 | `MarkIdempotent` | mark selected operations safe for retries |
 | `ConfigurePagination` | configure cursor/page/offset SDK helpers |
-| `DocumentOperation` | summaries, descriptions, tags, examples, documented errors |
+| `DocumentOperation` | tags, examples, documented errors; prose only for operations with no source doc comment |
+| `RequireOperationDocs` | opt-in gate: fail when any operation has no summary |
 | `PaginationMode` | cursor, page, or offset mode enum |
 | `PaginationTermination` | no-next-cursor or empty-items termination enum |
 | `RuntimeHookKind` | request, response, or error hook kind |

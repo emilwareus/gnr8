@@ -438,6 +438,12 @@ class Client:
         sort: Optional[str] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> ListBooksResponse:
+        """List books in one genre.
+
+        Results are ordered by title and paginated with an opaque cursor. Pass the
+        cursor from the previous page to continue; omit it to start from the
+        beginning.
+        """
         path = "/books/"
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
@@ -469,6 +475,10 @@ class Client:
         body: Book,
         request_options: Optional[RequestOptions] = None,
     ) -> CreatedMessage:
+        """Add a book to the catalogue.
+
+        The book is created immediately and its generated identifier is returned.
+        """
         path = "/books/"
         _status, _headers, _raw = self._do(
             "POST",
@@ -495,6 +505,10 @@ class Client:
         fmt: Optional[BookFormat] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> BookOrError:
+        """Fetch one book by its identifier.
+
+        Returns the book when it is in stock, and an out-of-stock notice otherwise.
+        """
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
@@ -524,6 +538,10 @@ class Client:
         body: BookFilters,
         request_options: Optional[RequestOptions] = None,
     ) -> CreatedMessage:
+        """Update the stored filters for one book.
+
+        Filters left unset in the payload keep their current values.
+        """
         path = f"/books/{urllib.parse.quote(str(book_id), safe='')}"
         _status, _headers, _raw = self._do(
             "PUT",

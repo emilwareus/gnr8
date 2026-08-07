@@ -595,6 +595,14 @@ fn needs_quoting(value: &str) -> bool {
     if value.trim() != value {
         return true;
     }
+    // A line break cannot appear in a plain scalar: emitted raw it would put continuation
+    // text at column 0 and break the document. Any other control character is equally
+    // unrepresentable. `quote` renders these with JSON escaping, which is valid YAML and
+    // cannot change indentation. Multi-line operation descriptions make this the common
+    // case, not an edge one.
+    if value.chars().any(char::is_control) {
+        return true;
+    }
     let Some(&first) = value.as_bytes().first() else {
         return true;
     };
@@ -769,6 +777,47 @@ mod tests {
         assert!(
             openapi < info && info < security && security < paths && paths < components,
             "top-level key order wrong:\n{yaml}"
+        );
+    }
+
+    /// A multi-line operation description must never be emitted as a plain scalar: the
+    /// continuation lines would land at column 0 and break the document. Handler doc
+    /// comments make multi-line descriptions the norm, so this is a load-bearing case,
+    /// and the assertion is that the result actually re-parses.
+    #[test]
+    fn multi_line_description_is_quoted_and_reparses() {
+        let mut doc = sample_doc();
+        let post = doc.paths[0]
+            .1
+            .post
+            .as_mut()
+            .expect("sample document has a POST operation");
+        post.description = Some("First line.\nSecond line.\n\nAfter a blank line.".to_string());
+
+        let yaml = write(&doc);
+
+        assert!(
+            !yaml.contains("\nSecond line."),
+            "a raw newline escaped into the document:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"description: "First line.\nSecond line.\n\nAfter a blank line.""#),
+            "expected a JSON-escaped multi-line description:\n{yaml}"
+        );
+        // Every line must still belong to the document's indented block structure. A raw
+        // newline would leave prose sitting at column 0, which is the actual failure this
+        // guards against. (No YAML parser is available to re-parse with: the writer
+        // exists precisely because this crate takes no YAML dependency — see the module
+        // header — so the assertion is on the emitted bytes.)
+        for line in yaml.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.starts_with(' ') || line.split(':').next().is_some_and(|key| !key.is_empty()),
+                "line escaped the block structure: {line:?}\n{yaml}"
+            );
+        }
+        assert!(
+            !yaml.contains("\nSecond line."),
+            "continuation text must not reach column 0:\n{yaml}"
         );
     }
 

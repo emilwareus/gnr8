@@ -432,6 +432,11 @@ class Client:
         status: Optional[str] = None,
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
+        """List orders, optionally narrowed to one stock status.
+
+        Orders are returned newest first. Omit the status filter to list every order
+        regardless of availability.
+        """
         path = "/orders/"
         _query: list[tuple[str, str]] = []
         _allow_reserved: set[int] = set()
@@ -460,6 +465,10 @@ class Client:
         body: OrderInput,
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
+        """Place a new order.
+
+        The order is confirmed immediately and its confirmation number is returned.
+        """
         path = "/orders/"
         _status, _headers, _raw = self._do(
             "POST",
@@ -481,6 +490,11 @@ class Client:
         raise self._error(_status, _headers, _raw)
 
     def create_order_raw(self, request_options: Optional[RequestOptions] = None) -> Any:
+        """Place an order from a raw, unvalidated payload.
+
+        Provided for clients that cannot produce the typed order shape. The payload is
+        accepted as-is and validated downstream.
+        """
         path = "/orders/raw"
         _status, _headers, _raw = self._do(
             "POST",
@@ -500,6 +514,7 @@ class Client:
         order_id: int,
         request_options: Optional[RequestOptions] = None,
     ) -> OrderConfirmation:
+        """Fetch one order by its identifier."""
         path = f"/orders/{urllib.parse.quote(str(order_id), safe='')}"
         _status, _headers, _raw = self._do(
             "GET",

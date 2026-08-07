@@ -28,14 +28,10 @@ bp = Blueprint("orders", __name__, url_prefix="/orders")
 
 @bp.route("/", methods=["GET"])
 def list_orders() -> OrderConfirmation:
-    """GET /orders/ — a typed response; one typed + one UNTYPED query param.
+    """List orders, optionally narrowed to one stock status.
 
-    Query params:
-      - status : read via the framework's typed query helper (typed) -> a fact.
-      - q      : raw stringly-typed read with no annotation -> UNTYPED, diagnostic.
-
-    Response: 200 -> `OrderConfirmation` ($ref). The status is method-derived
-    (GET -> 200), a code fact; the docstring is never read for it (rule 1).
+    Orders are returned newest first. Omit the status filter to list every order
+    regardless of availability.
     """
     status: str = request.args.get("status", "in_stock")  # typed query -> fact
     q = request.args.get("q")  # UNTYPED -> diagnostic in Phase 2 (no annotation)
@@ -45,9 +41,9 @@ def list_orders() -> OrderConfirmation:
 
 @bp.route("/", methods=["POST"])
 def create_order() -> OrderConfirmation:
-    """POST /orders/ — a typed request DTO body + a typed response.
+    """Place a new order.
 
-    Body: `OrderInput`; status method-derived (POST -> 201), a code fact (OQ1).
+    The order is confirmed immediately and its confirmation number is returned.
     """
     order: OrderInput = OrderInput(**request.json)  # typed DTO body -> fact
     _ = order
@@ -56,24 +52,16 @@ def create_order() -> OrderConfirmation:
 
 @bp.route("/<int:order_id>", methods=["GET"])
 def get_order(order_id: int) -> OrderConfirmation:
-    """GET /orders/<int:order_id> — an `<int:...>` converter path param.
-
-    Params: order_id : required path `int` (from the `<int:...>` converter).
-    Response: 200 -> `OrderConfirmation` ($ref).
-    """
+    """Fetch one order by its identifier."""
     raise NotImplementedError
 
 
 @bp.route("/raw", methods=["POST"])
 def create_order_raw():
-    """POST /orders/raw — the HONEST untyped envelope.
+    """Place an order from a raw, unvalidated payload.
 
-    The body is read straight from `request.json` with NO typed DTO and NO return
-    annotation, so neither the request body nor the response is a source fact: the
-    extractor emits a DIAGNOSTIC, and `.gnr8` explicitly declares the bodyless
-    `201` response (rule 3, no guessing). The extra
-    non-fact prose here (rule 1) only positions the `request.json` read on the
-    snapshot's asserted line; it encodes nothing about the API surface itself.
+    Provided for clients that cannot produce the typed order shape. The payload is
+    accepted as-is and validated downstream.
     """
     payload = request.json  # UNTYPED -> diagnostic in Phase 2 (no DTO)
     _ = payload

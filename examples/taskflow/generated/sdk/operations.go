@@ -16,7 +16,11 @@ type ListTasksParams struct {
 	Status *string
 }
 
-// ListTasks -> GET /tasks
+// ListTasks Returns every task.
+//
+// Pass a status to narrow the results to one status; omit it to list everything.
+//
+// GET /tasks
 func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...RequestOption) (TaskList, error) {
 	var out TaskList
 	reqURL := c.baseURL + "/tasks"
@@ -88,7 +92,12 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// CreateTask -> POST /tasks
+// CreateTask Creates a task.
+//
+// The task starts in the pending status and is returned with its generated
+// identifier.
+//
+// POST /tasks
 func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...RequestOption) (Task, error) {
 	var out Task
 	payload, err := json.Marshal(in)
@@ -169,7 +178,9 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// DeleteTask -> DELETE /tasks/{id}
+// DeleteTask Permanently removes one task.
+//
+// DELETE /tasks/{id}
 func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOption) (ErrorResponse, error) {
 	var out ErrorResponse
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
@@ -236,7 +247,9 @@ func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOptio
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// GetTask -> GET /tasks/{id}
+// GetTask Returns one task by its identifier.
+//
+// GET /tasks/{id}
 func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) (Task, error) {
 	var out Task
 	reqURL := c.baseURL + fmt.Sprintf("/tasks/%s", url.PathEscape(fmt.Sprint(id)))
@@ -311,7 +324,11 @@ func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) 
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// UpdateTask -> PUT /tasks/{id}
+// UpdateTask Replaces the mutable fields of one task.
+//
+// Fields omitted from the payload keep their current values.
+//
+// PUT /tasks/{id}
 func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest, opts ...RequestOption) (Task, error) {
 	var out Task
 	payload, err := json.Marshal(in)

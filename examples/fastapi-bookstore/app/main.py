@@ -40,14 +40,11 @@ def list_books(
     sort: str = "asc",
     cursor: Optional[str] = None,
 ) -> ListBooksResponse:
-    """GET /books/ — typed query params + a typed response envelope.
+    """List books in one genre.
 
-    Query params (derived from the signature):
-      - genre  : required `str`        (no default)
-      - sort   : optional `str`        (has a default)
-      - cursor : optional `str`        (default None)
-    Response: 200 -> `ListBooksResponse` ($ref).
-    (Layout note: exercises the typed-query-param path.)
+    Results are ordered by title and paginated with an opaque cursor. Pass the
+    cursor from the previous page to continue; omit it to start from the
+    beginning.
     """
     raise NotImplementedError  # static fixture: never executed this phase
 
@@ -55,8 +52,9 @@ def list_books(
 # create_book registers POST with a typed body and a 201 status_code anchor.
 @router.post("/", response_model=CreatedMessage, status_code=201)
 def create_book(book: Book) -> CreatedMessage:
-    """POST /books/ — typed request body + a 201 typed response.
-    Request body: `Book` ($ref). Response: 201 -> `CreatedMessage` ($ref).
+    """Add a book to the catalogue.
+
+    The book is created immediately and its generated identifier is returned.
     """
     raise NotImplementedError
 
@@ -65,8 +63,9 @@ def create_book(book: Book) -> CreatedMessage:
 def get_book(
     book_id: int, fmt: Optional[BookFormat] = None
 ) -> BookOrError:
-    """GET /books/{book_id} — a path param + a UNION response.
-    Response: 200 -> `BookOrError` (a union of `Book` and `OutOfStock`).
+    """Fetch one book by its identifier.
+
+    Returns the book when it is in stock, and an out-of-stock notice otherwise.
     """
     raise NotImplementedError
 
@@ -75,10 +74,9 @@ def get_book(
 def update_book(
     book_id: int, filters: BookFilters
 ) -> CreatedMessage:
-    """PUT /books/{book_id} — path param + a body exercising all four axes.
+    """Update the stored filters for one book.
 
-    Request body: `BookFilters` (the optional x nullable matrix).
-    Response: 200 -> `CreatedMessage` ($ref).
+    Filters left unset in the payload keep their current values.
     """
     raise NotImplementedError
 

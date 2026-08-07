@@ -16,7 +16,11 @@ type ListBooksParams struct {
 	Genre *string
 }
 
-// ListBooks -> GET /books
+// ListBooks Returns every book in the catalogue.
+//
+// Pass a genre to narrow the results to one genre; omit it to list everything.
+//
+// GET /books
 func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...RequestOption) (BookList, error) {
 	var out BookList
 	reqURL := c.baseURL + "/books"
@@ -88,7 +92,11 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// CreateBook -> POST /books
+// CreateBook Adds a book to the catalogue.
+//
+// The book is stored immediately and returned with its generated identifier.
+//
+// POST /books
 func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...RequestOption) (Book, error) {
 	var out Book
 	payload, err := json.Marshal(in)
@@ -169,7 +177,9 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...R
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// DeleteBook -> DELETE /books/{id}
+// DeleteBook Permanently removes one book from the catalogue.
+//
+// DELETE /books/{id}
 func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOption) (ErrorResponse, error) {
 	var out ErrorResponse
 	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
@@ -236,7 +246,9 @@ func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOptio
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// GetBook -> GET /books/{id}
+// GetBook Returns one book by its identifier.
+//
+// GET /books/{id}
 func (c *Client) GetBook(ctx context.Context, id string, opts ...RequestOption) (Book, error) {
 	var out Book
 	reqURL := c.baseURL + fmt.Sprintf("/books/%s", url.PathEscape(fmt.Sprint(id)))
@@ -311,7 +323,11 @@ func (c *Client) GetBook(ctx context.Context, id string, opts ...RequestOption) 
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
-// UpdateBook -> PUT /books/{id}
+// UpdateBook Replaces the mutable fields of one book.
+//
+// Fields omitted from the payload keep their current values.
+//
+// PUT /books/{id}
 func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest, opts ...RequestOption) (Book, error) {
 	var out Book
 	payload, err := json.Marshal(in)

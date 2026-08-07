@@ -488,8 +488,14 @@ fn lower_operation(
         operation_id: docs
             .and_then(|policy| policy.openapi_operation_id.clone())
             .unwrap_or_else(|| op.id.clone()),
-        summary: docs.and_then(|policy| policy.summary.clone()),
-        description: docs.and_then(|policy| policy.description.clone()),
+        // Prose has EXACTLY ONE source per operation and it lives on the operation
+        // itself: the routed handler's doc comment for source-extracted operations, the
+        // spec for `OpenApi`-imported ones, or `DocumentOperation` for operations that
+        // have neither. `DocumentOperation` writes straight to these fields and errors
+        // on collision, so there is no precedence to apply here and no policy fallback
+        // to consult (CLAUDE.md rule 3).
+        summary: op.summary.clone(),
+        description: op.description.clone(),
         deprecated: docs.is_some_and(|policy| policy.deprecated),
         tags: operation_tags(op, docs),
         security: operation_security,
@@ -2026,8 +2032,6 @@ mod tests {
             .push(crate::graph::OperationDocsPolicy {
                 operation_id: "createGoal".to_string(),
                 openapi_operation_id: None,
-                summary: None,
-                description: None,
                 deprecated: false,
                 tags: Vec::new(),
                 request_examples: Vec::new(),

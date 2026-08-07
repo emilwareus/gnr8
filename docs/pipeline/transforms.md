@@ -272,11 +272,33 @@ request parameter must exist as a query parameter on each selected operation.
 
 ## Operation documentation
 
+### Prose comes from the handler, not from here
+
+An operation's `summary` and `description` are read from the **routed handler's own doc comment** —
+a Go doc comment, a Python docstring, a TypeScript JSDoc block — as plain prose:
+
+```go
+// listBooks returns every book in the catalogue.
+//
+// Pass a genre to narrow the results to one genre; omit it to list everything.
+func listBooks(c *gin.Context) { ... }
+```
+
+The first sentence becomes the `summary`; the remainder becomes the `description`. There is no
+marker, prefix, or grammar of any kind inside the comment, and a comment can carry nothing else —
+method, path, params, body, responses, status codes, tags, and security stay code-inferred. Only
+routed handlers are read, so an internal helper's doc comment never reaches the API surface.
+
+Adding an endpoint therefore requires **no `.gnr8/` edit**.
+
+### What `DocumentOperation` is still for
+
+Tags, deprecation, examples, and documented error responses — facts that span operations or live
+outside the handler:
+
 ```rust
 .transform(
     DocumentOperation::when(OperationSelector::post("/books"))
-        .summary("Create a book")
-        .description("Creates and returns one book.")
         .tag("Books")
         .request_example_json("minimal", serde_json::json!({"title": "Dune"}))
         .response_description(201, "Created")
@@ -285,8 +307,26 @@ request parameter must exist as a query parameter on each selected operation.
 )
 ```
 
-Also supports `deprecated`, multiple `tags`, text or arbitrary-media request/response examples, and
-documented JSON 4xx/5xx responses. A selector that matches nothing is an error.
+`.summary()` and `.description()` remain available for operations that have **no** source prose —
+notably those imported from an OpenAPI document, or handlers whose words genuinely live elsewhere.
+Using them on an operation that already has source prose is a **hard error**, not an override: one
+fact has one source (CLAUDE.md rule 3). Fix the doc comment, or narrow the selector.
+
+A selector that matches nothing is an error.
+
+## Requiring documentation
+
+`RequireOperationDocs` fails generation when any remaining operation has no summary, naming the
+operation id, method, path, and handler:
+
+```rust
+.transform(RequireOperationDocs::new())
+```
+
+It is opt-in and off by default, and it is a **pipeline stage** rather than a source-level check
+because only your pipeline knows when your own public-surface filtering has finished — place it
+after any transform that removes internal routes, and before the targets. Descriptions stay
+optional.
 Object/array examples using `serde_json::json!` require `serde_json = "1"` in
 `.gnr8/Cargo.toml`; scalar values can be passed directly.
 

@@ -29,6 +29,10 @@ ROUTE_KEYS = {
     "responses",
     "span",
 }
+#: Prose keys are emitted ONLY when the handler has a docstring, so they are optional
+#: rather than part of the always-present set. The host DTO defaults both, so an absent
+#: key and an explicit null would be two spellings of one fact (rule 3).
+OPTIONAL_ROUTE_KEYS = {"summary", "description"}
 PARAM_KEYS = {"name", "location", "required", "schema", "span"}
 
 _STRING = {"type": "primitive", "of": {"prim": "string"}}
@@ -66,7 +70,9 @@ class RouteRecognitionTests(unittest.TestCase):
 
     def test_route_key_set_matches_contract(self):
         for route in self.doc["routes"]:
-            self.assertEqual(set(route), ROUTE_KEYS, route["operation_id"])
+            keys = set(route)
+            self.assertEqual(keys - OPTIONAL_ROUTE_KEYS, ROUTE_KEYS, route["operation_id"])
+            self.assertTrue(keys >= ROUTE_KEYS, route["operation_id"])
             for param in route["params"]:
                 self.assertEqual(set(param), PARAM_KEYS, param["name"])
 

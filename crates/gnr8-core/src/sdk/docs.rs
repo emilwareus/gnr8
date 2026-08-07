@@ -218,50 +218,49 @@ fn sdk_reference(language: &str, package: &str, ir: &ApiGraph) -> String {
     text
 }
 
+/// Render the "Operation Documentation" section.
+///
+/// Iteration is over OPERATIONS, not over `operation_docs`: prose lives on the operation
+/// (CLAUDE.md rule 3), so an operation documented purely by its handler's doc comment has
+/// no policy entry at all and would otherwise be skipped. The policy is joined in for the
+/// facts that genuinely are policy — tags, deprecation, and examples.
 fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
-    if ir.operation_docs.is_empty() {
+    let documented: Vec<(&crate::graph::Operation, Option<&OperationDocsPolicy>)> = ir
+        .operations
+        .iter()
+        .map(|op| {
+            let policy = ir
+                .operation_docs
+                .iter()
+                .find(|policy| policy.operation_id == op.id);
+            (op, policy)
+        })
+        .filter(|(op, policy)| op.summary.is_some() || op.description.is_some() || policy.is_some())
+        .collect();
+    if documented.is_empty() {
         return;
     }
     text.push_str("\n## Operation Documentation\n\n");
-    for policy in &ir.operation_docs {
-        let Some(op) = ir
-            .operations
-            .iter()
-            .find(|candidate| candidate.id == policy.operation_id)
-        else {
-            continue;
-        };
+    for (op, policy) in documented {
         let _ = writeln!(text, "### `{}`\n", op.id);
-        append_policy_body(text, None, Some(policy));
+        append_operation_docs_body(text, op, policy);
     }
 }
 
-fn append_policy_body(
+fn append_operation_docs_body(
     text: &mut String,
-    docs: Option<&crate::sdk::model::SdkOperationDocs>,
+    op: &crate::graph::Operation,
     policy: Option<&OperationDocsPolicy>,
 ) {
-    let summary = docs
-        .and_then(|docs| docs.summary.as_deref())
-        .or_else(|| policy.and_then(|policy| policy.summary.as_deref()));
-    if let Some(summary) = summary {
+    if let Some(summary) = op.summary.as_deref() {
         let _ = writeln!(text, "- Summary: {summary}");
     }
-    let deprecated = docs.map_or_else(
-        || policy.is_some_and(|policy| policy.deprecated),
-        |docs| docs.deprecated,
-    );
-    if deprecated {
+    if policy.is_some_and(|policy| policy.deprecated) {
         text.push_str("- Deprecated: yes\n");
     }
-    let tags = docs
-        .map(|docs| docs.tags.as_slice())
-        .filter(|tags| !tags.is_empty())
-        .or_else(|| {
-            policy
-                .map(|policy| policy.tags.as_slice())
-                .filter(|tags| !tags.is_empty())
-        });
+    let tags = policy
+        .map(|policy| policy.tags.as_slice())
+        .filter(|tags| !tags.is_empty());
     if let Some(tags) = tags {
         let joined = tags
             .iter()
@@ -270,12 +269,9 @@ fn append_policy_body(
             .join(", ");
         let _ = writeln!(text, "- Tags: {joined}");
     }
-    let description = docs
-        .and_then(|docs| docs.description.as_deref())
-        .or_else(|| policy.and_then(|policy| policy.description.as_deref()));
-    if let Some(description) = description {
+    if let Some(description) = op.description.as_deref() {
         let _ = writeln!(text, "\n{description}\n");
-    } else if docs.is_some() || policy.is_some() {
+    } else {
         text.push('\n');
     }
     if let Some(policy) = policy {

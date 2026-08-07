@@ -6,6 +6,8 @@ paths:
   '/books/':
     get:
       operationId: listBooks
+      summary: List books in one genre.
+      description: "Results are ordered by title and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the beginning."
       parameters:
       - name: cursor
         in: query
@@ -31,6 +33,8 @@ paths:
                 $ref: '#/components/schemas/ListBooksResponse'
     post:
       operationId: createBook
+      summary: Add a book to the catalogue.
+      description: The book is created immediately and its generated identifier is returned.
       requestBody:
         required: true
         content:
@@ -47,6 +51,8 @@ paths:
   '/books/{bookId}':
     get:
       operationId: getBook
+      summary: Fetch one book by its identifier.
+      description: Returns the book when it is in stock, and an out-of-stock notice otherwise.
       parameters:
       - name: bookId
         in: path
@@ -67,6 +73,8 @@ paths:
                 $ref: '#/components/schemas/BookOrError'
     put:
       operationId: updateBook
+      summary: Update the stored filters for one book.
+      description: Filters left unset in the payload keep their current values.
       parameters:
       - name: bookId
         in: path

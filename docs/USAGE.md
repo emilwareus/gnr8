@@ -284,10 +284,44 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | request body | `c.ShouldBindJSON(&x)` where `x: T` | T → request schema. |
 | response | `c.JSON(http.StatusXxx, v)` where `v: T` | status→T. Unresolved/dynamic → diagnostic. |
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
+| summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
 | required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. |
 | source-optional field | pointer `*T` and/or `json:",omitempty"` | source optionality signal; schema `required` still comes from required tags. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
+
+## Operation prose (all three languages)
+
+An operation's human-readable `summary` and `description` come from the routed handler's own
+documentation comment, read the way that language's own toolchain reads it:
+
+| Language | Read from |
+|---|---|
+| Go | the handler's doc comment (`// listBooks returns …`). A leading `listBooks ` is stripped and the next letter capitalized, matching Go's universal convention. |
+| Python | the handler's docstring (PEP 257). |
+| TypeScript | the method's JSDoc **leading description**. JSDoc tags are excluded by the compiler, so an `@param` or `@openapi` block is invisible to gnr8. |
+
+The rule is identical everywhere:
+
+> **first sentence → `summary`; everything after it → `description`.**
+
+A `.` preceded by a single capital does not end the sentence, so `Reviewed by A. Smith before
+release.` stays one sentence. The summary is folded to a single line; the description keeps the
+author's line structure verbatim and is never re-wrapped. Nothing is dropped.
+
+There is **no directive syntax, no marker prefix, and no key/value grammar** inside the comment —
+not `@Summary`, not `gnr8:summary`, not anything. A comment adds words and nothing else: method,
+path, params, body, responses, status codes, tags, security, deprecation, and operationId are all
+code-inferred and a comment can neither state nor override them.
+
+Only handlers that are **actually routed** are read, so documenting an internal helper cannot
+affect generation.
+
+The prose reaches the OpenAPI document *and* the generated SDKs — Go method comments, Python
+docstrings, and TypeScript JSDoc — so an IDE shows the same words as the spec.
+
+To make documentation mandatory, add the opt-in `RequireOperationDocs` transform; see
+[`docs/pipeline/transforms.md`](pipeline/transforms.md).
 
 ## Type mapping (Go → OpenAPI → generated SDK) — verified
 | Go | OpenAPI | SDK Go | Note |

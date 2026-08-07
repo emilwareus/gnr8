@@ -32,9 +32,10 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_auth_alternatives, path_tokens, path_tokens_match, quoted_string_literal,
-    request_body_model_of, split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme,
-    OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding,
+    operation_auth_alternatives, operation_prose, path_tokens, path_tokens_match,
+    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
+    ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme,
+    RequestBodyEncoding,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::CoreError;
@@ -1912,6 +1913,57 @@ fn resolve_op_args<'op>(
     })
 }
 
+/// Emit the generated method's docstring, PEP 257 style: a one-line summary, a blank
+/// line, then the description.
+///
+/// Emitted at 8-space indent (inside a 4-space-indented `def`) and nothing is emitted at
+/// all for an operation with no prose, so an undocumented SDK is byte-identical to what
+/// it was before docstrings existed.
+///
+/// `"""` inside the prose is neutralized to `\"\"\"` — it would otherwise close the
+/// docstring and turn the remaining prose into executable code. Prose is never
+/// re-wrapped: reflowing it would make the SDK docstring disagree with the source
+/// docstring it came from, and `ruff format` does not reflow docstring bodies either, so
+/// the output stays format-stable.
+///
+/// The PEP 257 one-liner (`"""text"""`) is used only when the text can safely sit against
+/// the closing quotes. Text ending in `"` would make four adjacent quotes, and text ending
+/// in `\` would escape the first quote of the terminator; either way the generated module
+/// does not compile. Those cases take the multi-line form, where the terminator is on its
+/// own line and both are harmless.
+fn emit_operation_docstring(out: &mut String, op: &Operation) -> Result<(), CoreError> {
+    let prose = operation_prose(op, &["\"\"\""], "\\\"\\\"\\\"");
+    if prose.is_empty() {
+        return Ok(());
+    }
+    let indent = "        ";
+    let closes_safely = |text: &str| !text.ends_with('"') && !text.ends_with('\\');
+    match (&prose.summary, prose.description.is_empty()) {
+        // Summary only, and it can sit against the closing quotes — the PEP 257 one-liner.
+        (Some(summary), true) if closes_safely(summary) => {
+            writeln!(out, "{indent}\"\"\"{summary}\"\"\"").map_err(sink)?;
+        }
+        (summary, _) => {
+            match summary {
+                Some(summary) => writeln!(out, "{indent}\"\"\"{summary}").map_err(sink)?,
+                None => writeln!(out, "{indent}\"\"\"").map_err(sink)?,
+            }
+            if !prose.description.is_empty() {
+                writeln!(out).map_err(sink)?;
+                for line in &prose.description {
+                    if line.is_empty() {
+                        writeln!(out).map_err(sink)?;
+                    } else {
+                        writeln!(out, "{indent}{line}").map_err(sink)?;
+                    }
+                }
+            }
+            writeln!(out, "{indent}\"\"\"").map_err(sink)?;
+        }
+    }
+    Ok(())
+}
+
 /// Render a method `def` header at 4-space (Client-method) indent, wrapping to one-argument-per-line
 /// when the single-line form would exceed the 88-column limit — matching `ruff format` so the emitted
 /// source is already format-stable (CLAUDE.md rule 2: no formatter dependency). When exploded, each
@@ -2119,6 +2171,7 @@ fn emit_operation(
     args.push("request_options: Optional[RequestOptions] = None".to_string());
 
     writeln!(out, "{}", method_def(&method_name, &args, &return_hint)).map_err(sink)?;
+    emit_operation_docstring(out, op)?;
 
     // Build the path: f-string interpolation with each path param percent-escaped (V5). The token order
     // matches path_params order (set-equality was already asserted), so path_idents aligns by position.
@@ -3822,6 +3875,8 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/x".to_string(),
                 handler: "op".to_string(),
+                summary: None,
+                description: None,
                 group: None,
                 middleware: Vec::new(),
                 params,

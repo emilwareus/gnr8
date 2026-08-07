@@ -8,6 +8,8 @@ paths:
   '/books':
     get:
       operationId: listBooks
+      summary: Returns every book in the catalogue.
+      description: Pass a genre to narrow the results to one genre; omit it to list everything.
       tags: [books]
       parameters:
       - name: genre
@@ -24,6 +26,8 @@ paths:
                 $ref: '#/components/schemas/BookList'
     post:
       operationId: createBook
+      summary: Adds a book to the catalogue.
+      description: The book is stored immediately and returned with its generated identifier.
       tags: [books]
       requestBody:
         required: true
@@ -47,6 +51,7 @@ paths:
   '/books/{id}':
     get:
       operationId: getBook
+      summary: Returns one book by its identifier.
       tags: [books]
       parameters:
       - name: id
@@ -69,6 +74,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     put:
       operationId: updateBook
+      summary: Replaces the mutable fields of one book.
+      description: Fields omitted from the payload keep their current values.
       tags: [books]
       parameters:
       - name: id
@@ -97,6 +104,7 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
     delete:
       operationId: deleteBook
+      summary: Permanently removes one book from the catalogue.
       tags: [books]
       parameters:
       - name: id

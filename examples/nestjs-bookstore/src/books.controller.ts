@@ -32,11 +32,18 @@ import {
   ListBooksResponse,
 } from './books.dto';
 //
-// The comment/blank lines between handlers below are SPACING ONLY (rule 1): no
-// API fact is encoded in any comment. They anchor each method-name and param-name
-// line to the committed graph snapshot's asserted span. (spacing — non-fact)
+// Each handler carries an ordinary JSDoc block. gnr8 reads the LEADING DESCRIPTION
+// only — the compiler excludes JSDoc tags, so an `@param`/`@openapi` tag is invisible
+// to it and no API fact is ever encoded in a comment (rule 1). Method, path, params,
+// body, and status stay derived from the decorators and the typed signature.
 @Controller('books')
 export class BooksController {
+  /**
+   * List books in one genre.
+   *
+   * Results are ordered by title and paginated with an opaque cursor. Pass the
+   * cursor from the previous page to continue; omit it to start from the beginning.
+   */
   @Get('/')
   listBooks(
     @Query('genre') genre: string,
@@ -45,14 +52,20 @@ export class BooksController {
   ): ListBooksResponse {
     throw new Error('static fixture: never executed this phase');
   }
-  // POST /books/ — a typed request body + a typed response. (spacing follows.)
-  //
+  /**
+   * Add a book to the catalogue.
+   *
+   * The book is created immediately and its generated identifier is returned.
+   */
   @Post('/')
   createBook(@Body() book: BookDto): CreatedMessage {
     throw new Error('static fixture: never executed this phase');
   }
-  // GET /books/:bookId — a path param + a UNION response. (spacing follows.)
-  //
+  /**
+   * Fetch one book by its identifier.
+   *
+   * Returns the book when it is in stock, and an out-of-stock notice otherwise.
+   */
   @Get('/:bookId')
   getBook(
     @Param('bookId') bookId: number,
@@ -60,7 +73,11 @@ export class BooksController {
   ): BookOrError {
     throw new Error('static fixture: never executed this phase');
   }
-  // PUT /books/:bookId — path param + a body exercising all four axes.
+  /**
+   * Update the stored filters for one book.
+   *
+   * Filters left unset in the payload keep their current values.
+   */
   @Put('/:bookId')
   updateBook(
     @Param('bookId') bookId: number,

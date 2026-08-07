@@ -991,6 +991,76 @@ fn validate_request_body_schema(
     })
 }
 
+/// One operation's human prose, normalized into lines ready for comment emission.
+///
+/// The source is the operation's own `summary`/`description` — the routed handler's doc
+/// comment, the imported spec, or `DocumentOperation` for operations with neither. There
+/// is exactly one source per operation (CLAUDE.md rule 3), so this helper reads the
+/// operation directly and never consults a policy.
+pub(crate) struct OperationProse {
+    /// The single-line summary sentence, if the operation has one.
+    pub(crate) summary: Option<String>,
+    /// Description lines, already split on newlines. Empty when there is no description.
+    pub(crate) description: Vec<String>,
+}
+
+impl OperationProse {
+    /// Whether there is nothing to emit.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.summary.is_none() && self.description.is_empty()
+    }
+}
+
+/// Collect an operation's prose with comment-hostile sequences neutralized.
+///
+/// `unsafe_sequences` are the byte sequences that would terminate or corrupt the target
+/// language's comment form (`*/` inside a JSDoc block, `"""` inside a Python docstring);
+/// each is replaced by `replacement`. Passing an empty slice leaves the text untouched,
+/// which is correct for Go, where `//` line comments cannot be escaped out of.
+///
+/// Prose is NEVER re-wrapped: the author's line structure is theirs, and reflowing it
+/// would make the generated comment disagree with the source comment it came from. Only
+/// control characters that would break the comment (a lone CR, a form feed) are removed.
+pub(crate) fn operation_prose(
+    op: &Operation,
+    unsafe_sequences: &[&str],
+    replacement: &str,
+) -> OperationProse {
+    let sanitize = |text: &str| -> String {
+        let mut cleaned = text.replace("\r\n", "\n");
+        for sequence in unsafe_sequences {
+            cleaned = cleaned.replace(sequence, replacement);
+        }
+        cleaned
+            .chars()
+            .filter(|ch| *ch == '\n' || !ch.is_control())
+            .collect()
+    };
+    OperationProse {
+        summary: op
+            .summary
+            .as_deref()
+            .map(sanitize)
+            // A summary is a single line by construction, but sanitizing could in
+            // principle leave one behind; folding here keeps the comment shape stable.
+            .map(|summary| summary.replace('\n', " "))
+            .map(|summary| summary.trim().to_string())
+            .filter(|summary| !summary.is_empty()),
+        description: op
+            .description
+            .as_deref()
+            .map(sanitize)
+            .map(|description| {
+                description
+                    .trim_end()
+                    .lines()
+                    .map(|line| line.trim_end().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1114,6 +1184,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/download".to_string(),
             handler: "download".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: vec![],
@@ -1177,6 +1249,8 @@ mod tests {
             method: "DELETE".to_string(),
             path: "/items/{id}".to_string(),
             handler: "deleteItem".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: Vec::new(),
@@ -1246,6 +1320,8 @@ mod tests {
             method: "POST".to_string(),
             path: "/write".to_string(),
             handler: "write".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: vec![],
@@ -1305,6 +1381,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/items".to_string(),
             handler: "list".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: vec![],
@@ -1355,6 +1433,8 @@ mod tests {
             method: "GET".to_string(),
             path: "/items".to_string(),
             handler: "list".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: vec![],
@@ -1420,6 +1500,8 @@ mod tests {
             method: "POST".to_string(),
             path: "/write".to_string(),
             handler: "write".to_string(),
+            summary: None,
+            description: None,
             group: None,
             middleware: Vec::new(),
             params: vec![],

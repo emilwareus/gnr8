@@ -92,6 +92,15 @@ Recent decisions affecting current work:
 - [Phase ?]: [06-01] doctor/watch follow the SOURCE language via one pub source_toolchain decision delegating to detect_language (rule 3, no fallback); LifecycleHealth.go_toolchain renamed to source_toolchain + a language field added; pinned --json field set updated in lockstep (T-06-03).
 - [Phase 06]: [06-02] Cross-language examples = copied static source + a .gnr8/ Pipeline crate (config is code, rule 4) + REAL committed gnr8 generate output. FastApi uses inputs([.]) not inputs([app]) so the source's absolute app.models imports resolve (.gnr8/ already excluded from detection); make examples-check reuses gnr8 check (exits 1 on drift) as the regen-and-diff (rule 2), wired into make check across Go/Python/TS.
 
+### Roadmap Evolution
+
+- Phase 6 added: Handler-local operation prose from doc comments — operation `summary`/`description`
+  read as plain prose from routed-handler doc comments (Go), docstrings (Python), and JSDoc
+  (TypeScript), emitted to OpenAPI and all three SDKs, with an opt-in `RequireOperationDocs` gate.
+  Required a CLAUDE.md rule-0 amendment ("steal freely; never be compliant") to permit reading the
+  language's own doc convention for prose while keeping every marker dialect — foreign *and*
+  gnr8-invented — forbidden.
+
 ### Pending Todos
 
 None.

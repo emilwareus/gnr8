@@ -829,18 +829,22 @@ impl Importer {
                     self.import_responses(operation, &operation_id);
                 responses.sort_by_key(|response| response.status);
                 let request_examples = self.import_request_examples(operation);
+                // Prose is a first-class `Operation` field, not a docs policy: an operation has
+                // exactly ONE prose source (the spec here, a handler doc comment for extracted
+                // sources), and `DocumentOperation` must be able to detect a collision with it
+                // (CLAUDE.md rule 3). Keeping it in the policy bucket would make that undetectable.
+                let summary = operation_object
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let description = operation_object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 self.operation_docs.push(OperationDocsPolicy {
                     operation_id: operation_id.clone(),
                     openapi_operation_id: source_operation_id
                         .filter(|source_id| source_id != &operation_id),
-                    summary: operation_object
-                        .get("summary")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    description: operation_object
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
                     deprecated: operation_object
                         .get("deprecated")
                         .and_then(Value::as_bool)
@@ -873,6 +877,8 @@ impl Importer {
                     method: method.to_uppercase(),
                     path: normalize_path(&path),
                     handler: operation_id,
+                    summary,
+                    description,
                     group,
                     middleware: Vec::new(),
                     params,
@@ -3104,12 +3110,19 @@ paths:
         )
         .unwrap();
 
-        let docs = &graph.operation_docs[0];
-        assert_eq!(docs.summary.as_deref(), Some("Create a report"));
+        // Prose is a first-class `Operation` field, not a docs policy entry: one source
+        // per operation (the spec here), so a `DocumentOperation` collision is
+        // detectable rather than a silent override (CLAUDE.md rule 3).
+        let operation = &graph.operations[0];
+        assert_eq!(operation.summary.as_deref(), Some("Create a report"));
         assert_eq!(
-            docs.description.as_deref(),
+            operation.description.as_deref(),
             Some("Creates an audited report.")
         );
+
+        // The policy carries no prose at all — `OperationDocsPolicy` has no summary or
+        // description field, so duplication is structurally impossible (rule 3).
+        let docs = &graph.operation_docs[0];
         assert_eq!(docs.tags, vec!["Reports", "Audited"]);
         assert!(docs.deprecated);
         assert_eq!(docs.request_examples.len(), 1);

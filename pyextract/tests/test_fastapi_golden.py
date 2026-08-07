@@ -24,16 +24,16 @@ FIXTURE = os.path.join(REPO_ROOT, "fixtures", "fastapi-bookstore")
 EXPECTED_ROUTE_LINES = {
     "list_books": 38,
     "create_book": 57,
-    "get_book": 65,
-    "update_book": 75,
+    "get_book": 67,
+    "update_book": 79,
 }
 EXPECTED_PARAM_LINES = {
     ("list_books", "genre"): 39,
     ("list_books", "sort"): 40,
     ("list_books", "cursor"): 41,
-    ("get_book", "book_id"): 66,
-    ("get_book", "fmt"): 66,
-    ("update_book", "book_id"): 76,
+    ("get_book", "book_id"): 68,
+    ("get_book", "fmt"): 68,
+    ("update_book", "book_id"): 80,
 }
 # Schema ClassDef / Assign-line anchors (snapshot models.py spans).
 EXPECTED_SCHEMA_LINES = {

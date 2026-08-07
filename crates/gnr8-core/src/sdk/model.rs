@@ -360,8 +360,9 @@ impl SdkModel {
             operation_docs.push(SdkOperationDocs {
                 operation_id: op.id.clone(),
                 service: service.clone(),
-                summary: docs_policy.and_then(|policy| policy.summary.clone()),
-                description: docs_policy.and_then(|policy| policy.description.clone()),
+                // Prose comes from the operation — its one source (CLAUDE.md rule 3).
+                summary: op.summary.clone(),
+                description: op.description.clone(),
                 deprecated: docs_policy.is_some_and(|policy| policy.deprecated),
                 tags,
             });
@@ -582,6 +583,8 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/books".to_string(),
                 handler: "createBook".to_string(),
+                summary: None,
+                description: None,
                 group: Some("Books".to_string()),
                 middleware: Vec::new(),
                 params: vec![],

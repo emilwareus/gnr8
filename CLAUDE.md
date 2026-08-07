@@ -5,11 +5,7 @@ it **owns its pipeline end-to-end and stands on its own legs**. Violating any ru
 no matter how convenient. If a task seems to require breaking one of these, STOP and surface it — do
 not work around it.
 
-## 0. gnr8 has exactly one native contract. No annotations. No brownfield. No compatibility modes. Ever.
-
-This rule is absolute and permanent. It is not a current-scope decision that a future milestone can
-revisit, and no amount of user demand, migration convenience, or adoption pressure justifies weakening
-it. **If a task appears to require any of the below, the task is wrong. STOP and surface it.**
+## 0. gnr8 has exactly one native contract. Steal freely; never be compliant.
 
 gnr8 is a **replacement** for annotation-driven and template-driven API tooling. A replacement that
 speaks its predecessor's dialect is not a replacement — it is a wrapper, and it inherits every
@@ -17,15 +13,33 @@ constraint it was built to escape. The moment gnr8 can be configured to imitate 
 imitation becomes the contract we are held to, and every future design decision gets litigated against
 someone else's output. That is the failure mode this rule exists to prevent.
 
+The line is **compliance, not inspiration.**
+
+- **Borrowing a good idea is encouraged.** If another tool — or an entire language ecosystem — has
+  found a design that works, take it, make it ours, and evolve it on our own schedule. A good idea is
+  not contaminated by its origin, and refusing to learn from prior art is not independence, it is
+  vanity.
+- **Speaking another tool's dialect is forbidden.** Reading its markers, honoring its config files,
+  matching its emitted output, or promising that its input keeps working — that is compliance, and
+  compliance means we no longer own our contract.
+
+The test is one question: **if that tool changed tomorrow, would we have to change?** If yes, we are
+compliant with it and the design is wrong. If no, we merely learned something and the design is fine.
+
+Rules 0.1–0.5 are the concrete form of that line. On the compliance side they are absolute and
+permanent: no amount of user demand, migration convenience, or adoption pressure justifies crossing
+it. **If a task appears to require crossing it, the task is wrong. STOP and surface it.**
+
 ### 0.1 Forbidden: reading another tool's annotations or conventions
 
 Never parse, detect, infer from, honor, or branch on any of the following — in any language, in any
 sidecar, in any transform, in any config surface, under any flag:
 
-- **Comment-directive dialects** — swaggo/swag (`// @Summary`, `// @Router`, `// @Param`, …), godoc
-  directive conventions that encode API facts, JSDoc/TSDoc `@openapi` blocks, Python docstring
-  YAML/OpenAPI fragments (apispec, flasgger, drf-yasg, drf-spectacular), Javadoc/springdoc annotations,
-  and any equivalent in any language we may add later.
+- **Another tool's comment-directive dialect** — swaggo/swag (`// @Summary`, `// @Router`, `// @Param`,
+  …), JSDoc/TSDoc `@openapi` blocks, Python docstring YAML/OpenAPI fragments (apispec, flasgger,
+  drf-yasg, drf-spectacular), Javadoc/springdoc annotations, and any equivalent in any language we may
+  add later. The defining trait is that the marker exists *only* because some generator invented it,
+  so honoring it makes that generator's choices our contract.
 - **Third-party schema/validation/annotation libraries** — `@nestjs/swagger` decorators, `zod`,
   `class-validator`, `class-transformer`, `io-ts`, `typebox`, `joi`, `yup`, `marshmallow`,
   `attrs`/`cattrs` schema metadata, `go-playground/validator` beyond what the source type itself
@@ -37,11 +51,40 @@ sidecar, in any transform, in any config surface, under any flag:
   naming scheme, marker comments, or generated packages (`typescript-axios`, `typescript-fetch`,
   `go-experimental`, `antihax/optional`, `python-legacy`, …).
 
-The only annotations gnr8 reads are the source language's **own first-class type and routing
-constructs** — Go struct tags that the *language runtime itself* consumes (`json`, `form`, `uri`,
-`header`), Python type hints and native framework signatures, TypeScript types via the language's own
-Compiler API. If a marker exists only because a third-party generator invented it, gnr8 does not know
-it exists.
+If a marker exists only because a third-party generator invented it, gnr8 does not know it exists.
+
+#### What gnr8 does read
+
+Exactly two categories, and nothing else:
+
+1. **The source language's own first-class type and routing constructs** — Go struct tags the
+   *language runtime itself* consumes (`json`, `form`, `uri`, `header`), Python type hints and native
+   framework signatures, TypeScript types via the language's own Compiler API.
+2. **The source language's own native documentation convention, for human prose only** — a Go doc
+   comment, a Python docstring, a TypeScript JSDoc block, read the way that language's own toolchain
+   already reads it: first sentence is the synopsis, the remainder is detail (`go/doc`'s `Synopsis`,
+   PEP 257, the JSDoc leading description).
+
+Category 2 is narrow and **stays** narrow. It carries only the operation `summary` and `description` —
+words written for humans that no typed construct can express — and only from a declaration's own doc
+comment, and only for handlers that are actually routed. It never carries structure: method, path,
+params, body, responses, status codes, tags, security, deprecation, and operationId are code-inferred,
+always, and a doc comment can neither state nor override them.
+
+There is **no directive syntax, no marker prefix, and no key/value grammar inside the comment** — not
+`@Summary`, not `gnr8:summary`, not anything. The moment a comment has grammar it is a dialect, and
+dialects grow until they are someone's annotation system. Plain prose has nowhere to grow.
+
+This is "steal, don't comply" in practice. `go/doc`, FastAPI, and JSDoc all treat the first sentence as
+a synopsis and the rest as detail; we took that idea because it is good and idiomatic in every language
+we support. We took none of their tags. If any of them changed tomorrow, nothing in gnr8 would change.
+
+> **Known inconsistency (pre-existing, under review):** `goextract` also reads `description:"…"`,
+> `example:"…"`, and `schema:"description=…"` struct tags for *field*-level prose
+> (`goextract/internal/types/extract.go`). Those are gnr8-invented tag grammar, not runtime-consumed
+> tags, and the `schema:` sub-key path is a rule-3 fallback. This predates the rule above and is not a
+> licence to add more. Field prose should move to the field's own doc comment; until it does, do not
+> extend the tag grammar.
 
 ### 0.2 Forbidden: brownfield / compatibility / migration product surface
 
@@ -89,6 +132,7 @@ is always the same single path:
 
 | They want | The answer |
 |---|---|
+| prose describing an operation | the handler's own doc comment / docstring / JSDoc (rule 0.1, category 2) |
 | a fact the source cannot express (security schemes, cross-cutting metadata) | a `Transform` in their `.gnr8/` crate (rule 4) |
 | a specific operation or type name | `RenameOperation` / `RenameType` — one canonical name, changed |
 | a specific file layout or package shape | `SdkFileLayout`, `OperationFileSplit`, `SdkPackageMetadata` |
@@ -106,20 +150,30 @@ forbidden vocabulary and foreign-tool identifiers listed above. It is a hard gat
 legitimate use trips it, narrow the match or add a documented, justified exception in
 `scripts/check-invariants.sh` — never disable the check.
 
+Doc-comment reading (0.1 category 2) is bounded by construction, not by grep: the extractors take the
+comment text as an opaque string and split it on the language's own synopsis rule. If a change ever
+introduces matching, tokenizing, or branching on *content* inside a comment, that is a dialect and it
+must be rejected in review.
+
 ## 1. Never couple to another tool's conventions or output format
 
-gnr8 derives API facts from the **source language's own constructs** (Go code, `go/ast`, `go/types`)
-and from **the user's own configuration of our engine** — never from another tool's annotations,
-comments, or formats. Rule 0 is the absolute statement of this; this rule is its day-to-day form.
+gnr8 derives API facts from the **source language's own constructs** (Go code, `go/ast`, `go/types`),
+from **its native documentation convention for human prose** (rule 0.1, category 2), and from **the
+user's own configuration of our engine** — never from another tool's annotations, markers, or formats.
+Rule 0 is the absolute statement of this; this rule is its day-to-day form.
 
 **FORBIDDEN — do not parse, infer from, detect, or depend on, in any way:**
 - any other tool's directive-style annotations embedded in code comments (e.g. `// @...`-style comment
   directives that encode API facts)
 - any code generator's templates, markers, or sidecar formats
 - any other tool's comment dialect or sidecar format
+- any grammar of our own invention inside a comment — a `gnr8:`-style prefix is just as forbidden as
+  `@Summary`, because a comment with grammar is a dialect regardless of who owns it
 
-There must be **zero code anywhere in the repo that reads or understands another tool's convention.**
-We are a *replacement* for those tools, not a consumer of them.
+Reading a doc comment as **plain prose** is not reading a convention; it is reading the language's own
+documentation facility, the same one `go doc`, `help()`, and every IDE already read. There must be
+**zero code anywhere in the repo that reads or understands another tool's convention.** We are a
+*replacement* for those tools, not a consumer of them.
 
 ## 2. Own the product chain; bound commodity dependencies
 
@@ -173,6 +227,13 @@ There must be **exactly one deterministic way** to derive each fact. **Forbidden
 One source of truth per fact, one path, always. If the single source can't provide a fact, that fact
 comes from the user's config (rule 4) — it is never "filled in" by a fallback.
 
+**Operation prose obeys this too.** `summary`/`description` have exactly one source per operation: the
+handler's doc comment for source-extracted operations, the spec for `OpenApi`-imported ones. Config
+(`DocumentOperation`) may still set prose for operations that have no doc-comment source. What is
+forbidden is precedence: a `DocumentOperation` that targets an operation already documented from its
+source is a **hard error**, never a silent override and never a fallback. Two ways to state one fact is
+the defect; picking a winner between them is the same defect with extra steps.
+
 ## 4. What the source can't express comes from user code-as-config — never from scraping
 
 Some facts are genuinely not present in typed source (e.g. security schemes — auth lives in middleware,
@@ -181,6 +242,12 @@ drive gnr8** (the `.gnr8/` crate, below), **not** by scraping another tool's ann
 Examples that MUST come from config, not inference:
 - security schemes and which operations they apply to
 - any cross-cutting metadata the handler/types don't carry
+
+**Config is for cross-cutting facts, not per-endpoint prose.** A rule that forces a `.gnr8/` edit every
+time someone adds an endpoint is a bad rule: it puts the words far from the code they describe, it
+lets new routes ship undocumented, and it scales as a central table nobody maintains. Prose that
+belongs to one handler lives on that handler, in the language's own doc comment (rule 0.1, category 2).
+Reach for config when a fact spans operations or lives outside the handler entirely.
 
 The config surface is part of *our* product. Other tools' annotations are not.
 
@@ -210,7 +277,8 @@ over broadening the dependency surface, and keep product semantics in repository
 
 - Internal API graph is the source of truth; OpenAPI/SDK are **artifacts** generated from it.
 - Code-first extraction; the user's engine config — the `.gnr8/` Rust crate, never a data file — is the
-  only escape hatch (see rule 4).
+  escape hatch for facts the source cannot express (see rule 4). Human prose about one operation is not
+  such a fact: it lives in that handler's own doc comment (rule 0.1, category 2).
 - No dynamic plugin runtime, no macro-heavy config API, no graph database; extension is compile-time only.
 - Typed library errors; no production `unwrap`/`expect`/`panic`; deterministic, sorted output
   (identical input ⇒ byte-identical output).

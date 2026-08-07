@@ -29,7 +29,9 @@ func registerRoutes(r *gin.Engine) {
 	}
 }
 
-// createBook handles POST /books: bind a CreateBookRequest, return the new Book.
+// createBook adds a book to the catalogue.
+//
+// The book is stored immediately and returned with its generated identifier.
 func createBook(c *gin.Context) {
 	var req CreateBookRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -40,14 +42,16 @@ func createBook(c *gin.Context) {
 	c.JSON(http.StatusCreated, book)
 }
 
-// listBooks handles GET /books with an optional ?genre= filter.
+// listBooks returns every book in the catalogue.
+//
+// Pass a genre to narrow the results to one genre; omit it to list everything.
 func listBooks(c *gin.Context) {
 	genre := c.Query("genre")
 	_ = genre
 	c.JSON(http.StatusOK, BookList{Books: []Book{}})
 }
 
-// getBook handles GET /books/:id.
+// getBook returns one book by its identifier.
 func getBook(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -57,7 +61,9 @@ func getBook(c *gin.Context) {
 	c.JSON(http.StatusOK, Book{ID: id})
 }
 
-// updateBook handles PUT /books/:id: bind an UpdateBookRequest, return the Book.
+// updateBook replaces the mutable fields of one book.
+//
+// Fields omitted from the payload keep their current values.
 func updateBook(c *gin.Context) {
 	id := c.Param("id")
 	var req UpdateBookRequest
@@ -68,7 +74,7 @@ func updateBook(c *gin.Context) {
 	c.JSON(http.StatusOK, Book{ID: id})
 }
 
-// deleteBook handles DELETE /books/:id.
+// deleteBook permanently removes one book from the catalogue.
 func deleteBook(c *gin.Context) {
 	id := c.Param("id")
 	c.JSON(http.StatusOK, ErrorResponse{Message: "deleted " + id, Code: "ok"})
