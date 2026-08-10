@@ -32,10 +32,7 @@ fn main() -> Result<()> {
         Commands::Inspect { action } => run_inspect(action, output),
         Commands::Init { source, sdk } => run_init(*source, *sdk, output),
         Commands::Guide { topic } => run_guide(*topic, output),
-        Commands::Generate {
-            force,
-            accept_generated_baseline,
-        } => run_generate(*force, *accept_generated_baseline, output),
+        Commands::Generate { force } => run_generate(*force, output),
         Commands::Check => run_check(output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
         Commands::Doctor => run_doctor(output),
@@ -297,8 +294,6 @@ struct LifecycleReport {
     source_files: usize,
     /// Number of generated artifact files considered.
     artifact_files: usize,
-    /// Whether `--accept-generated-baseline` was used.
-    baseline_adopted: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -330,51 +325,50 @@ struct DiagnosticCounts {
 /// the "no silent clobbering" protection is VISIBLE (T-04-02-04). Pipeline diagnostics the child carried
 /// are surfaced too. `--json` serializes the counts. A missing `.gnr8/` (run `gnr8 init`), a compile
 /// error in the user's pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
-fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) -> Result<()> {
+fn run_generate(force: bool, output: Output) -> Result<()> {
     let root = project_root()?;
     let total_start = Instant::now();
     let hot_start = Instant::now();
-    let hot_noop = if force || accept_generated_baseline {
+    let hot_noop = if force {
         None
     } else {
-        pre_child_verified_noop(&root)
+        pre_child_generate_verified_noop(&root)?
     };
     let hot_elapsed = hot_start.elapsed();
     let mut pipeline_elapsed = None;
     let mut write_elapsed = None;
-    let (outcome, diagnostics, cache_label, source_files, artifact_files) = if let Some(noop) =
-        hot_noop
-    {
-        (
-            noop.outcome,
-            noop.diagnostics,
-            "verified hot no-op",
-            noop.source_files,
-            noop.artifact_files,
-        )
-    } else {
-        output.progress("generate: running pipeline");
-        let pipeline_start = Instant::now();
-        let mut bundle = child::run_child(&root, "__emit")?;
-        pipeline_elapsed = Some(pipeline_start.elapsed());
-        let source_files = bundle.cache_input_stamps.len();
-        let mut artifact_files = bundle.artifacts.len();
-        output.progress("generate: writing outputs");
-        let write_start = Instant::now();
-        let outcome = regenerate_bundle(&root, &mut bundle, force || accept_generated_baseline)?;
-        write_elapsed = Some(write_start.elapsed());
-        if artifact_files == 0 {
-            artifact_files =
-                outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
-        }
-        (
-            outcome,
-            bundle.diagnostics.clone(),
-            "pipeline",
-            source_files,
-            artifact_files,
-        )
-    };
+    let (outcome, diagnostics, cache_label, source_files, artifact_files) =
+        if let Some(noop) = hot_noop {
+            (
+                noop.outcome,
+                noop.diagnostics,
+                "verified hot no-op",
+                noop.source_files,
+                noop.artifact_files,
+            )
+        } else {
+            output.progress("generate: running pipeline");
+            let pipeline_start = Instant::now();
+            let mut bundle = child::run_child(&root, "__emit")?;
+            pipeline_elapsed = Some(pipeline_start.elapsed());
+            let source_files = bundle.cache_input_stamps.len();
+            let mut artifact_files = bundle.artifacts.len();
+            output.progress("generate: writing outputs");
+            let write_start = Instant::now();
+            let outcome = regenerate_bundle(&root, &mut bundle, force)?;
+            write_elapsed = Some(write_start.elapsed());
+            if artifact_files == 0 {
+                artifact_files =
+                    outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
+            }
+            (
+                outcome,
+                bundle.diagnostics.clone(),
+                "pipeline",
+                source_files,
+                artifact_files,
+            )
+        };
 
     print_diagnostics(output, &diagnostics);
     // Warn (stderr) for every protected file so the user SEES which outputs were not clobbered.
@@ -384,6 +378,7 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
         );
     }
 
+    let skipped_count = outcome.skipped.len();
     if output.json {
         let counts = LifecycleCounts {
             written: outcome.written.len(),
@@ -407,7 +402,6 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
             cache_mode: cache_label.to_string(),
             source_files,
             artifact_files,
-            baseline_adopted: accept_generated_baseline,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -427,6 +421,9 @@ fn run_generate(force: bool, accept_generated_baseline: bool, output: Output) ->
         output.verbose_paths("written", &outcome.written);
         output.verbose_paths("deleted", &outcome.deleted);
         output.verbose_paths("skipped", &outcome.skipped);
+    }
+    if skipped_count > 0 {
+        bail!("generation incomplete: {skipped_count} protected output(s) were skipped");
     }
     Ok(())
 }
@@ -465,7 +462,7 @@ fn run_check(output: Output) -> Result<()> {
             let diagnostics = bundle.diagnostics.clone();
             output.progress("check: planning writes");
             let plan_start = Instant::now();
-            let plan = plan_check_bundle(&root, &mut bundle)?;
+            let plan = plan_bundle(&root, &mut bundle)?;
             plan_elapsed = Some(plan_start.elapsed());
             if artifact_files == 0 {
                 artifact_files = plan.files.len();
@@ -572,12 +569,13 @@ fn clean_plan_from_paths(paths: Vec<String>) -> gnr8::lifecycle::WritePlan {
     }
 }
 
-fn regenerate_bundle(
+pub(crate) fn regenerate_bundle(
     root: &std::path::Path,
     bundle: &mut gnr8::runner::ArtifactBundle,
     force: bool,
 ) -> Result<gnr8::lifecycle::GenerateOutcome, gnr8::CoreError> {
     if let Some(metadata) = cached_artifact_metadata(root, bundle) {
+        gnr8::lifecycle::recover_cached_output_transactions(root, &metadata)?;
         if let Some(outcome) = verified_noop_outcome(root, bundle, &metadata) {
             save_verified_noop_stamp(root, bundle, &metadata, &outcome);
             return Ok(outcome);
@@ -612,50 +610,6 @@ fn plan_bundle(
     }
     ensure_bundle_artifacts(root, bundle)?;
     gnr8::lifecycle::plan_only(root, &bundle.artifacts)
-}
-
-fn plan_check_bundle(
-    root: &std::path::Path,
-    bundle: &mut gnr8::runner::ArtifactBundle,
-) -> Result<gnr8::lifecycle::WritePlan, gnr8::CoreError> {
-    let mut plan = plan_bundle(root, bundle)?;
-    normalize_unowned_identical_outputs_for_check(root, &mut plan);
-    if !plan.has_drift() {
-        save_verified_noop_stamp_from_plan(root, bundle, &plan);
-    }
-    Ok(plan)
-}
-
-fn save_verified_noop_stamp_from_plan(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    plan: &gnr8::lifecycle::WritePlan,
-) {
-    let paths = plan.files.iter().map(|file| file.path.clone()).collect();
-    let outcome = gnr8::lifecycle::GenerateOutcome {
-        written: Vec::new(),
-        unchanged: plan.files.iter().map(|file| file.path.clone()).collect(),
-        skipped: Vec::new(),
-        deleted: Vec::new(),
-    };
-    save_verified_noop_stamp_for_paths(root, bundle, paths, &outcome);
-}
-
-fn normalize_unowned_identical_outputs_for_check(
-    root: &std::path::Path,
-    plan: &mut gnr8::lifecycle::WritePlan,
-) {
-    for file in &mut plan.files {
-        if file.action != gnr8::lifecycle::WriteAction::UserEdited {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(root.join(&file.path)) else {
-            continue;
-        };
-        if gnr8::manifest::blake3_hex(&bytes) == file.new_hash {
-            file.action = gnr8::lifecycle::WriteAction::Unchanged;
-        }
-    }
 }
 
 fn cached_artifact_metadata(
@@ -734,8 +688,16 @@ struct CachedNoop {
 
 fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     let stamp = load_verified_noop_stamp(root)?;
+    if stamp.output_files.len() != stamp.artifact_paths.len()
+        || !manifest_covers_output_files(root, &stamp.output_files)
+    {
+        return None;
+    }
     let current_inputs = collect_hot_input_fast_stamps(root, &stamp.input_roots)?;
     if current_inputs != stamp.input_fast_files {
+        return None;
+    }
+    if content_stamps_from_fast(root, &current_inputs)? != stamp.input_files {
         return None;
     }
     let current_outputs =
@@ -743,6 +705,9 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     if current_outputs.artifact_files != stamp.output_artifact_fast_files
         || current_outputs.dirs != stamp.output_dir_fast_stamps
     {
+        return None;
+    }
+    if content_stamps_from_fast(root, &current_outputs.artifact_files)? != stamp.output_files {
         return None;
     }
     let source_files = stamp.input_fast_files.len();
@@ -760,6 +725,22 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     })
 }
 
+fn pre_child_generate_verified_noop(root: &std::path::Path) -> Result<Option<CachedNoop>> {
+    let Some(stamp) = load_verified_noop_stamp(root) else {
+        return Ok(None);
+    };
+    let metadata = stamp
+        .output_files
+        .iter()
+        .map(|file| gnr8::sdk::ArtifactMetadata {
+            path: file.path.clone(),
+            hash: file.hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    gnr8::lifecycle::recover_cached_output_transactions(root, &metadata)?;
+    Ok(pre_child_verified_noop(root))
+}
+
 fn verified_noop_outcome(
     root: &std::path::Path,
     bundle: &gnr8::runner::ArtifactBundle,
@@ -770,11 +751,28 @@ fn verified_noop_outcome(
     if stamp.artifact_cache_key != key || stamp.output_anchors != bundle.output_anchors {
         return None;
     }
+    if !manifest_covers_metadata(root, metadata) {
+        return None;
+    }
     let artifact_paths = artifact_paths(metadata);
+    if stamp.artifact_paths != artifact_paths {
+        return None;
+    }
     let current =
         collect_verified_fast_output_stamps(root, &bundle.output_anchors, &artifact_paths)?;
     if current.artifact_files != stamp.output_artifact_fast_files
         || current.dirs != stamp.output_dir_fast_stamps
+    {
+        return None;
+    }
+    let current_files = content_stamps_from_fast(root, &current.artifact_files)?;
+    if current_files != stamp.output_files
+        || metadata.iter().any(|artifact| {
+            current_files
+                .iter()
+                .find(|file| file.path == artifact.path)
+                .is_none_or(|file| file.hash != artifact.hash)
+        })
     {
         return None;
     }
@@ -831,8 +829,19 @@ fn save_verified_noop_stamp_for_paths(
     else {
         return;
     };
+    let Some(output_files) = content_stamps_from_fast(root, &output_fast.artifact_files) else {
+        return;
+    };
+    if output_files.len() != artifact_paths.len()
+        || !manifest_covers_output_files(root, &output_files)
+    {
+        return;
+    }
     let Some(input_fast_files) = collect_hot_input_fast_stamps(root, &bundle.cache_input_roots)
     else {
+        return;
+    };
+    let Some(input_files) = content_stamps_from_fast(root, &input_fast_files) else {
         return;
     };
     let stamp = VerifiedNoopStamp {
@@ -843,8 +852,8 @@ fn save_verified_noop_stamp_for_paths(
         input_fast_files,
         output_artifact_fast_files: output_fast.artifact_files,
         output_dir_fast_stamps: output_fast.dirs,
-        input_files: Vec::new(),
-        output_files: Vec::new(),
+        input_files,
+        output_files,
         diagnostics: bundle.diagnostics.clone(),
     };
     let path = verified_noop_stamp_path(root);
@@ -858,6 +867,52 @@ fn save_verified_noop_stamp_for_paths(
         return;
     };
     let _ = std::fs::write(path, bytes);
+}
+
+fn content_stamps_from_fast(
+    root: &std::path::Path,
+    fast_files: &[FastFileStamp],
+) -> Option<Vec<gnr8::sdk::FileStamp>> {
+    let mut stamps = Vec::with_capacity(fast_files.len());
+    for fast in fast_files {
+        let path = root.join(&fast.path);
+        let metadata = path.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        stamps.push(gnr8::sdk::FileStamp {
+            path: fast.path.clone(),
+            len: metadata.len(),
+            modified_ns: fast_modified_ns(&metadata),
+            hash: gnr8::manifest::blake3_hex(&bytes),
+        });
+    }
+    stamps.sort();
+    Some(stamps)
+}
+
+fn manifest_covers_output_files(root: &std::path::Path, files: &[gnr8::sdk::FileStamp]) -> bool {
+    let Ok(manifest) = gnr8::manifest::load(&root.join(".gnr8")) else {
+        return false;
+    };
+    manifest.files.len() == files.len()
+        && files
+            .iter()
+            .all(|file| manifest.recorded_hash(&file.path) == Some(file.hash.as_str()))
+}
+
+fn manifest_covers_metadata(
+    root: &std::path::Path,
+    artifacts: &[gnr8::sdk::ArtifactMetadata],
+) -> bool {
+    let Ok(manifest) = gnr8::manifest::load(&root.join(".gnr8")) else {
+        return false;
+    };
+    manifest.files.len() == artifacts.len()
+        && artifacts
+            .iter()
+            .all(|artifact| manifest.recorded_hash(&artifact.path) == Some(artifact.hash.as_str()))
 }
 
 fn collect_verified_fast_output_stamps(
@@ -2186,10 +2241,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        diagnostic_counts, link_typescript_node_modules, local_node_modules,
-        local_typescript_compiler, readiness_for_target, reconcile_doctor_source_probe,
-        text_output_excerpt, typescript_compiler, validate_typescript_package_entrypoints,
-        MaterializedTarget, TypeScriptCompiler,
+        content_stamps_from_fast, diagnostic_counts, link_typescript_node_modules,
+        local_node_modules, local_typescript_compiler, pre_child_verified_noop,
+        readiness_for_target, reconcile_doctor_source_probe, text_output_excerpt,
+        typescript_compiler, validate_typescript_package_entrypoints, FastFileStamp,
+        MaterializedTarget, TypeScriptCompiler, VerifiedNoopStamp,
     };
     use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
     use gnr8::sdk::{Artifact, ReadinessKind, ReadinessTarget};
@@ -2204,6 +2260,54 @@ mod tests {
             std::env::temp_dir().join(format!("gnr8-doctor-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn old_verified_noop_stamp_cannot_bypass_missing_ownership() {
+        let root = temp_root("orphaned-noop-stamp");
+        let cache = root.join(".gnr8/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let stamp = VerifiedNoopStamp {
+            artifact_cache_key: "old-key".to_string(),
+            output_anchors: vec!["openapi.yaml".to_string()],
+            artifact_paths: vec!["openapi.yaml".to_string()],
+            input_roots: vec!["src".to_string()],
+            input_fast_files: Vec::new(),
+            output_artifact_fast_files: Vec::new(),
+            output_dir_fast_stamps: Vec::new(),
+            input_files: Vec::new(),
+            output_files: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        std::fs::write(
+            cache.join("verified-noop.json"),
+            serde_json::to_vec(&stamp).unwrap(),
+        )
+        .unwrap();
+
+        assert!(pre_child_verified_noop(&root).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn content_stamps_detect_same_length_file_edits() {
+        let root = temp_root("content-stamp");
+        let path = root.join("source.go");
+        std::fs::write(&path, "AAAA").unwrap();
+        let metadata = path.metadata().unwrap();
+        let fast = vec![FastFileStamp {
+            path: "source.go".to_string(),
+            len: metadata.len(),
+            modified_ns: super::fast_modified_ns(&metadata),
+        }];
+        let before = content_stamps_from_fast(&root, &fast).unwrap();
+
+        std::fs::write(&path, "BBBB").unwrap();
+        let after = content_stamps_from_fast(&root, &fast).unwrap();
+
+        assert_ne!(before[0].hash, after[0].hash);
+        assert_eq!(before[0].len, after[0].len);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

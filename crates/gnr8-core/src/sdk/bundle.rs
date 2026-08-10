@@ -43,10 +43,18 @@ pub(crate) fn check_unique_file_names(
 ) -> Result<(), crate::CoreError> {
     let mut seen = BTreeSet::new();
     for file in files {
-        if !seen.insert(file.name.as_str()) {
+        let identity = super::portable_path_identity(&file.name).map_err(|reason| {
+            crate::CoreError::SdkGen {
+                message: format!(
+                    "{target} generated non-portable SDK file {:?}: {reason}",
+                    file.name
+                ),
+            }
+        })?;
+        if !seen.insert(identity) {
             return Err(crate::CoreError::SdkGen {
                 message: format!(
-                    "{target} generated duplicate SDK file {:?}; adjust the SDK file layout templates",
+                    "{target} generated duplicate SDK file {:?} under portable path identity rules; adjust the SDK file layout templates",
                     file.name
                 ),
             });
@@ -127,19 +135,11 @@ fn parse_marker(line: &str) -> Option<String> {
 /// Returns [`crate::CoreError::SdkGen`] if `name` is empty, absolute, contains `..`, or uses Windows
 /// separators.
 pub(crate) fn safe_frame_name(name: &str) -> Result<(), crate::CoreError> {
-    let path = std::path::Path::new(name);
-    if name.is_empty()
-        || name.contains('\\')
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(crate::CoreError::SdkGen {
-            message: format!("refusing to write SDK file with unsafe name {name:?}"),
-        });
-    }
-    Ok(())
+    super::portable_path_identity(name)
+        .map(|_| ())
+        .map_err(|reason| crate::CoreError::SdkGen {
+            message: format!("refusing to write SDK file with unsafe name {name:?}: {reason}"),
+        })
 }
 
 /// Materialize a generated SDK bundle String's framed files to `dir/<name>`.
@@ -156,20 +156,38 @@ pub(crate) fn safe_frame_name(name: &str) -> Result<(), crate::CoreError> {
 /// Returns [`crate::CoreError::SdkGen`] if a frame name is empty, absolute, parent-traversing, or uses
 /// platform-ambiguous separators (so no frame can escape `dir`) or if any file cannot be written.
 pub fn write_to_dir(bundle: &str, dir: &std::path::Path) -> Result<(), crate::CoreError> {
-    for (name, contents) in parse(bundle) {
-        safe_frame_name(&name)?;
-        let path = dir.join(&name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| crate::CoreError::SdkGen {
+    let files = parse(bundle);
+    let mut identities = BTreeSet::new();
+    for (name, _) in &files {
+        safe_frame_name(name)?;
+        let identity =
+            super::portable_path_identity(name).map_err(|reason| crate::CoreError::SdkGen {
+                message: format!("refusing to write SDK file with unsafe name {name:?}: {reason}"),
+            })?;
+        if !identities.insert(identity) {
+            return Err(crate::CoreError::SdkGen {
                 message: format!(
-                    "failed to create SDK output dir {}: {err}",
-                    parent.display()
+                    "refusing to materialize duplicate SDK file identity for {name:?}"
+                ),
+            });
+        }
+    }
+
+    std::fs::create_dir_all(dir).map_err(|err| crate::CoreError::SdkGen {
+        message: format!("failed to create SDK output dir {}: {err}", dir.display()),
+    })?;
+    let output_dir =
+        crate::lifecycle::open_project_dir(dir).map_err(|err| crate::CoreError::SdkGen {
+            message: format!("failed to open SDK output dir {}: {err}", dir.display()),
+        })?;
+    for (name, contents) in files {
+        crate::lifecycle::transactional_replace_output(&output_dir, &name, contents.as_bytes())
+            .map_err(|err| crate::CoreError::SdkGen {
+                message: format!(
+                    "failed to write SDK file {}: {err}",
+                    dir.join(name).display()
                 ),
             })?;
-        }
-        std::fs::write(&path, contents).map_err(|err| crate::CoreError::SdkGen {
-            message: format!("failed to write SDK file {}: {err}", path.display()),
-        })?;
     }
     Ok(())
 }
@@ -180,7 +198,7 @@ mod tests {
     // the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{parse, safe_frame_name, SdkBundle, SdkFile};
+    use super::{parse, safe_frame_name, write_to_dir, SdkBundle, SdkFile};
 
     fn sample_bundle() -> SdkBundle {
         SdkBundle {
@@ -271,11 +289,86 @@ mod tests {
             "models/../../escape.py",
             "/tmp/escape.go",
             "models\\book.ts",
+            "models/con.ts",
+            "models/book.ts.",
+            "models/book:stream.ts",
+            "models/e\u{301}.ts",
+            "models/COM¹.ts",
         ] {
             assert!(
                 safe_frame_name(name).is_err(),
                 "unsafe frame name should be rejected: {name}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_to_dir_rejects_intermediate_symlinks_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-bundle-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("models")).unwrap();
+        let bundle = "// ==== gnr8:file models/book.ts ====\nexport {};\n";
+
+        assert!(write_to_dir(bundle, &root).is_err());
+        assert!(!outside.join("book.ts").exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_to_dir_replaces_a_final_symlink_without_mutating_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-bundle-leaf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let outside = root.with_extension("outside-file");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, root.join("client.ts")).unwrap();
+        let bundle = "// ==== gnr8:file client.ts ====\ninside\n";
+
+        write_to_dir(bundle, &root).unwrap();
+        assert_eq!(std::fs::read(root.join("client.ts")).unwrap(), b"inside\n");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn write_to_dir_rejects_duplicate_portable_identities_before_any_write() {
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-bundle-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle =
+            "// ==== gnr8:file Client.ts ====\nfirst\n// ==== gnr8:file client.ts ====\nsecond\n";
+
+        assert!(write_to_dir(bundle, &root).is_err());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

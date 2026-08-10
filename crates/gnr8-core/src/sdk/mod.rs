@@ -36,13 +36,99 @@ pub mod model;
 pub mod model_style;
 pub(crate) mod openapi_source;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::graph::{ApiGraph, Diagnostic};
 use crate::manifest::blake3_hex;
 use crate::CoreError;
+
+pub(crate) fn is_internal_transaction_name(name: &str, suffix: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    let Some(token) = normalized
+        .strip_prefix(".gnr8-")
+        .and_then(|rest| rest.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    token.len() == 24 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_reserved_transaction_name(name: &str) -> bool {
+    ["-txn", "-building", "-building-lease"]
+        .into_iter()
+        .any(|suffix| is_internal_transaction_name(name, suffix))
+}
+
+/// Return the single portable identity for an artifact path.
+///
+/// Paths are required to use NFC and `/` separators, and every component must be valid on the
+/// filesystems gnr8 supports. The returned identity additionally applies full Unicode case folding,
+/// so paths that would alias on case-insensitive or normalization-insensitive filesystems are caught
+/// before any output is written.
+pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Err("path is empty".to_string());
+    }
+    if path.nfc().collect::<String>() != path {
+        return Err("path must use Unicode NFC normalization".to_string());
+    }
+    if path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
+        return Err("path must be relative and use canonical `/` separators".to_string());
+    }
+
+    let mut identity = Vec::new();
+    for (index, component) in path.split('/').enumerate() {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err("path contains an empty, `.` or `..` component".to_string());
+        }
+        if component.ends_with(['.', ' ']) {
+            return Err("path components may not end with a dot or space".to_string());
+        }
+        if component
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err(
+                "path contains a character that is not portable across filesystems".to_string(),
+            );
+        }
+        if index == 0 && component.eq_ignore_ascii_case(".gnr8") {
+            return Err("the `.gnr8` workspace is reserved for gnr8 state".to_string());
+        }
+        if is_reserved_transaction_name(component) {
+            return Err(format!(
+                "path component {component:?} is reserved for generated-output transactions"
+            ));
+        }
+
+        let basename = component
+            .split_once('.')
+            .map_or(component, |(basename, _)| basename);
+        let upper = basename.to_ascii_uppercase();
+        let numbered_device = upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            });
+        if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered_device {
+            return Err(format!(
+                "path component {component:?} is a reserved device name"
+            ));
+        }
+
+        let folded = component.case_fold().collect::<String>();
+        identity.push(folded.nfc().collect::<String>());
+    }
+    Ok(identity.join("/"))
+}
 
 /// Validate a generated OpenAPI artifact enough for `gnr8 doctor` readiness.
 ///
@@ -204,6 +290,25 @@ impl Artifacts {
     ) -> Result<(), CoreError> {
         let path = path.into();
         let text = text.into();
+        let identity = portable_path_identity(&path).map_err(|reason| {
+            self.ownership_error(
+                "artifact.path_invalid",
+                path.clone(),
+                format!("artifact path is not portable: {reason}"),
+            )
+        })?;
+        if let Some(existing) = self.files.iter().find(|artifact| {
+            portable_path_identity(&artifact.path).is_ok_and(|candidate| candidate == identity)
+        }) {
+            return Err(self.ownership_error(
+                "artifact.path_collision",
+                path,
+                format!(
+                    "path resolves to the same portable output identity as {:?}, owned by {}; use one canonical path",
+                    existing.path, existing.producer
+                ),
+            ));
+        }
         match self.files.binary_search_by(|a| a.path.cmp(&path)) {
             Ok(index) => {
                 let owner = self
@@ -924,18 +1029,6 @@ pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-pub(crate) fn hash_project_files(root: &Path, paths: &[String]) -> HashMap<String, Option<String>> {
-    let mut cache = FileHashCacheState::load(root, FileHashCacheScope::Outputs);
-    let mut out = HashMap::with_capacity(paths.len());
-    for path in paths {
-        let absolute = root.join(path);
-        let hash = absolute.is_file().then(|| cache.hash_path(&absolute));
-        out.insert(path.clone(), hash);
-    }
-    cache.save();
-    out
-}
-
 /// Build metadata-only stamps for project files.
 #[must_use]
 pub fn stamp_project_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
@@ -1247,6 +1340,33 @@ mod tests {
         assert_eq!(b.text, "B2");
         assert_eq!(b.ownership, super::ArtifactOwnership::Overlaid);
         assert_eq!(b.rewrite_chain.len(), 1);
+    }
+
+    #[test]
+    fn artifact_creation_rejects_portable_path_aliases_and_invalid_names() {
+        let mut artifacts = Artifacts::new();
+        artifacts.create("models/Straße.ts", "first").unwrap();
+        let folded = artifacts.create("models/STRASSE.ts", "second").unwrap_err();
+        assert!(
+            matches!(folded, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision")
+        );
+
+        for path in [
+            "models/e\u{301}.ts",
+            "models/con.ts",
+            "models/model.ts.",
+            "models/model.ts:stream",
+            "models/.gnr8-0123456789abcdef01234567-building-lease",
+            ".GNR8-0123456789ABCDEF01234567-TXN/client.ts",
+            ".gnr8/cache/manifest.json",
+            ".GNR8/cache/artifacts/file.json",
+        ] {
+            let err = artifacts.create(path, "invalid").unwrap_err();
+            assert!(
+                matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
+                "{path}: {err:?}"
+            );
+        }
     }
 
     #[test]

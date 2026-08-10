@@ -63,6 +63,12 @@ struct LatencyReport {
     written: usize,
     /// Number of files byte-identical and therefore not rewritten (no-op).
     unchanged: usize,
+    /// Number of stale manifest-owned files deleted.
+    deleted: usize,
+    /// Number of protected outputs skipped.
+    skipped: usize,
+    /// Whether every requested output was reconciled.
+    complete: bool,
 }
 
 impl LatencyReport {
@@ -73,6 +79,9 @@ impl LatencyReport {
             millis: elapsed.as_millis(),
             written: outcome.written.len(),
             unchanged: outcome.unchanged.len(),
+            deleted: outcome.deleted.len(),
+            skipped: outcome.skipped.len(),
+            complete: outcome.skipped.is_empty(),
         }
     }
 
@@ -363,8 +372,8 @@ pub(crate) fn run(
 /// The single regeneration path shared by the cold run and each watch tick: `child::run_child(__emit)`
 /// then `lifecycle::regenerate`. Errors propagate as a typed `CoreError` for the caller to log/surface.
 fn regenerate_once(project_root: &Path) -> Result<GenerateOutcome, gnr8::CoreError> {
-    let bundle = child::run_child(project_root, "__emit")?;
-    gnr8::lifecycle::regenerate(project_root, &bundle.artifacts, false)
+    let mut bundle = child::run_child(project_root, "__emit")?;
+    crate::regenerate_bundle(project_root, &mut bundle, false)
 }
 
 /// Time one regeneration and print its latency line (human or `--json`). A regeneration error is logged
@@ -381,6 +390,12 @@ fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool, verbos
             }
             let report = LatencyReport::from_outcome(scenario, elapsed, &outcome);
             print_report(&report, json, verbose, &outcome);
+            if !outcome.skipped.is_empty() {
+                eprintln!(
+                    "watch: regeneration incomplete ({} protected output(s) skipped; continuing)",
+                    outcome.skipped.len()
+                );
+            }
         }
         Err(err) => eprintln!("watch: regeneration failed (continuing): {err}"),
     }
@@ -424,6 +439,12 @@ pub(crate) fn cold_regenerate(project_root: &Path, json: bool, verbose: u8) -> a
     }
     let report = LatencyReport::from_outcome("cold", elapsed, &outcome);
     print_report(&report, json, verbose, &outcome);
+    if !outcome.skipped.is_empty() {
+        anyhow::bail!(
+            "initial generation incomplete: {} protected output(s) were skipped",
+            outcome.skipped.len()
+        );
+    }
     Ok(())
 }
 
@@ -695,15 +716,26 @@ mod tests {
             .expect("latency report serializes to a JSON object");
 
         let keys: HashSet<&str> = obj.keys().map(String::as_str).collect();
-        let expected: HashSet<&str> = ["scenario", "millis", "written", "unchanged"]
-            .into_iter()
-            .collect();
+        let expected: HashSet<&str> = [
+            "scenario",
+            "millis",
+            "written",
+            "unchanged",
+            "deleted",
+            "skipped",
+            "complete",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(keys, expected, "latency --json field set drifted");
 
         assert_eq!(obj["scenario"], serde_json::json!("single-file-edit"));
         assert_eq!(obj["millis"], serde_json::json!(42));
         assert_eq!(obj["written"], serde_json::json!(2));
         assert_eq!(obj["unchanged"], serde_json::json!(1));
+        assert_eq!(obj["deleted"], serde_json::json!(0));
+        assert_eq!(obj["skipped"], serde_json::json!(0));
+        assert_eq!(obj["complete"], serde_json::json!(true));
     }
 
     #[test]

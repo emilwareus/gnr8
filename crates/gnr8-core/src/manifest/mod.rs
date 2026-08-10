@@ -29,13 +29,117 @@
 // (skill ch.2.4, mirrors the scoped allow in workspace/mod.rs).
 #![allow(clippy::doc_markdown)]
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The current on-disk manifest schema version written by [`Manifest::save`].
 const MANIFEST_VERSION: u32 = 1;
 
 /// The manifest path relative to the `.gnr8/` workspace dir.
 const MANIFEST_REL: &str = "cache/manifest.json";
+
+static MANIFEST_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type ManifestPublishHook = Box<dyn FnOnce() -> std::io::Result<()>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_MANIFEST_PUBLISH_HOOK: std::cell::RefCell<Option<ManifestPublishHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_before_manifest_publish_hook() -> std::io::Result<()> {
+    BEFORE_MANIFEST_PUBLISH_HOOK.with(|slot| slot.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+}
+
+fn manifest_temp_path(cache: &Path) -> PathBuf {
+    let sequence = MANIFEST_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    cache.join(format!(
+        ".manifest-{}-{nanos}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+fn is_manifest_temp_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix(".manifest-")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let fields = stem.split('-').collect::<Vec<_>>();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|field| !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_WRITE_THROUGH,
+        };
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_WRITE_THROUGH)
+            .open(path)?
+            .sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+pub(crate) fn cleanup_temporary_files(gnr8_dir: &Path) -> Result<(), crate::CoreError> {
+    let cache = gnr8_dir.join("cache");
+    let entries = match std::fs::read_dir(&cache) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(crate::CoreError::Manifest {
+                message: format!("failed to inspect {}: {err}", cache.display()),
+            });
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|err| crate::CoreError::Manifest {
+            message: format!("failed to inspect {}: {err}", cache.display()),
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_manifest_temp_name(&name) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            std::fs::remove_file(entry.path()).map_err(|err| crate::CoreError::Manifest {
+                message: format!("failed to remove interrupted manifest temp {name:?}: {err}"),
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(&cache).map_err(|err| crate::CoreError::Manifest {
+            message: format!(
+                "failed to sync {} after temp cleanup: {err}",
+                cache.display()
+            ),
+        })?;
+    }
+    Ok(())
+}
 
 /// Hash `bytes` into a stable 64-char lowercase hex blake3 digest.
 ///
@@ -155,6 +259,9 @@ impl Manifest {
         std::fs::create_dir_all(cache).map_err(|err| crate::CoreError::Manifest {
             message: format!("failed to create {}: {err}", cache.display()),
         })?;
+        sync_directory(gnr8_dir).map_err(|err| crate::CoreError::Manifest {
+            message: format!("failed to sync {}: {err}", gnr8_dir.display()),
+        })?;
 
         // Serialize a normalized view: current version + path-sorted entries (deterministic diff).
         let normalized = Manifest {
@@ -167,9 +274,25 @@ impl Manifest {
             }
         })?;
 
-        std::fs::write(&path, json).map_err(|err| crate::CoreError::Manifest {
-            message: format!("failed to write {}: {err}", path.display()),
-        })
+        let temp_path = manifest_temp_path(cache);
+        let publish = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = options.open(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(test)]
+            run_before_manifest_publish_hook()?;
+            std::fs::rename(&temp_path, &path)?;
+            sync_directory(cache)
+        })();
+        if let Err(err) = publish {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::CoreError::Manifest {
+                message: format!("failed to publish {}: {err}", path.display()),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +334,17 @@ mod tests {
 
     use super::{blake3_hex, Manifest};
 
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let sequence =
+            super::MANIFEST_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-manifest-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn record_inserts_then_updates_in_place_keeping_sorted() {
         let mut manifest = Manifest::default();
@@ -228,5 +362,55 @@ mod tests {
     #[test]
     fn blake3_hex_matches_the_underlying_digest() {
         assert_eq!(blake3_hex(b"x"), blake3::hash(b"x").to_hex().to_string());
+    }
+
+    #[test]
+    fn interrupted_publish_preserves_the_previous_manifest() {
+        let root = temp_root("atomic-publish");
+        let gnr8_dir = root.join(".gnr8");
+        let mut previous = Manifest::default();
+        previous.record("client.ts", "old", "generated");
+        previous.save(&gnr8_dir).unwrap();
+        let mut next = Manifest::default();
+        next.record("client.ts", "new", "generated");
+        super::BEFORE_MANIFEST_PUBLISH_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected before atomic publish",
+                ))
+            }));
+        });
+
+        assert!(next.save(&gnr8_dir).is_err());
+
+        let loaded = super::load(&gnr8_dir).unwrap();
+        assert_eq!(loaded.recorded_hash("client.ts"), Some("old"));
+        assert!(std::fs::read_dir(gnr8_dir.join("cache"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn temp_cleanup_removes_only_exact_private_names() {
+        let root = temp_root("temp-cleanup");
+        let gnr8_dir = root.join(".gnr8");
+        let cache = gnr8_dir.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let interrupted = cache.join(".manifest-12-34-56.tmp");
+        let unrelated = cache.join(".manifest-user.tmp");
+        std::fs::write(&interrupted, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        super::cleanup_temporary_files(&gnr8_dir).unwrap();
+
+        assert!(!interrupted.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

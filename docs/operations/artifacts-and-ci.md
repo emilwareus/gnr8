@@ -48,22 +48,25 @@ uses the generated hash, recorded hash, and disk hash to distinguish:
 - new/stale output safe to write;
 - byte-identical output (no-op);
 - output previously owned by gnr8 and safe to delete after configuration removal;
-- user-edited or unowned output that must be protected.
+- byte-identical unowned output that can be adopted without a rewrite;
+- user-edited or divergent unowned output that must be protected.
 
 `gnr8 generate` writes safe changes and reports protected files. `gnr8 check` computes the same plan
-without writing. A missing/corrupt cache degrades to an empty manifest instead of panicking.
+without writing. A missing/corrupt cache degrades to an empty manifest instead of panicking. Generate
+reconstructs ownership for identical outputs and exits non-zero if any divergent output remains
+protected; check never creates ownership or a no-op cache entry.
 
 All artifact paths must be safe project-relative paths: absolute paths, parent traversal, and unsafe
 output-anchor relationships are rejected.
 
-## Force and baseline adoption
+## Force
 
-- `gnr8 generate --force` permits overwriting protected edits and may delete any file below a target
-  output anchor that the current pipeline does not produce. Dedicate anchors to generated content.
-- `gnr8 generate --accept-generated-baseline` records the current generator result as an intentional
-  migration baseline, reports adoption in JSON, and uses the same overwrite/prune path as `--force`.
+- `gnr8 generate --force` permits overwriting protected emitted paths. It may also remove a stale
+  path that the ownership manifest records, even when that path was edited.
+- Force never recursively cleans an output directory. Unowned support files and other neighbors are
+  outside gnr8's ownership and remain untouched.
 
-Neither flag changes extraction semantics. Durable fixes still belong in service source or
+The flag does not change extraction semantics. Durable fixes still belong in service source or
 `.gnr8/src/main.rs`.
 
 ## Post-processing

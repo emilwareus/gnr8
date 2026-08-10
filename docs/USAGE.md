@@ -63,7 +63,7 @@ artifact bundle the child prints, and owns the writes. Global flags: `--json` (m
 |---|---|---|---|---|
 | `gnr8 guide` | `[go-gin-to-python-typescript\|python-apis-to-python-sdk\|nestjs-to-typescript-sdk]` | bundled docs | — (prints basic or scenario-specific agent guide) | 0 |
 | `gnr8 init` | `--source go-gin\|fastapi\|flask\|nestjs`, `--sdk go\|python\|typescript` | — | `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`, `.gnr8/README.md`, `.gnr8/.gitignore` (skips existing — idempotent) | 0; 1 on error |
-| `gnr8 generate` | `--force` | `.gnr8/` crate, the source dirs its `Source` reads | the paths the pipeline's targets declare, `.gnr8/cache/manifest.json` | 0; 1 on error |
+| `gnr8 generate` | `--force` | `.gnr8/` crate, the source dirs its `Source` reads | the paths the pipeline's targets declare, `.gnr8/cache/manifest.json` | 0 when fully reconciled; 1 on protected outputs or error |
 | `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
@@ -72,7 +72,10 @@ reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
 | `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 1 on error |
 
 Notes:
-- `--force` overwrites outputs a user hand-edited (otherwise generate warns+skips them — ownership protection).
+- Missing local cache state is safe: generate adopts byte-identical outputs without rewriting and
+  reconstructs ownership; divergent outputs are preserved and make the command fail.
+- `--force` overwrites protected emitted paths (otherwise generate warns and skips them). It never
+  recursively deletes unrelated files that share an output directory.
 - `inspect` is the ONLY command taking a target dir; the others derive inputs from the pipeline's `Source`.
 - `watch` re-runs on a source-language edit (`.go`/`.py`/`.ts`, picked from the detected source language)
   OR a `*.rs` edit under `.gnr8/src/` (you changed the pipeline → recompile + re-run); it ignores its own

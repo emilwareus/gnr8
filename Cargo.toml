@@ -48,6 +48,22 @@ insta = { version = "1.48", features = ["yaml"] }
 # member crates reference them with `{ workspace = true }`. Stable releases ONLY — the
 # notify 9.0 / debouncer 0.8 release candidates are deliberately NOT used.
 blake3 = "1.8"                  # content hashing for the ownership manifest (consumed in 04-02)
+# Capability-relative filesystem access keeps generated writes inside the project directory even if
+# an output path is changed to a symlink between validation and I/O. cap-fs-ext supplies no-follow
+# opens for the final component; neither crate defines product behavior.
+cap-std = "4.0"
+cap-fs-ext = "4.0"
+# OS-held file locks serialize generated-output transactions and are released automatically if a
+# process exits, so recovery never mistakes another live gnr8 process for a crashed writer.
+fs2 = "0.4"
+# Portable artifact identity uses Unicode normalization + full case folding so output collisions are
+# rejected consistently before reaching case-insensitive or normalization-insensitive filesystems.
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+# Atomic no-clobber rename is the commit primitive for staged generated files on Unix.
+rustix = { version = "1.1", features = ["fs"] }
+# Constants only: safe Windows directory handles use backup/write-through flags for durability.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consumed in 04-03)
 ctrlc = "3.5"                   # graceful Ctrl-C → AtomicBool for the watch loop (consumed in 04-03;
                                 # the FSEvents backend suppresses the default SIGINT disposition, so the
