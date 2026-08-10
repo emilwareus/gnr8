@@ -56,14 +56,20 @@ cap-fs-ext = "4.0"
 # OS-held file locks serialize generated-output transactions and are released automatically if a
 # process exits, so recovery never mistakes another live gnr8 process for a crashed writer.
 fs2 = "0.4"
+# Cross-platform file identity distinguishes a case-insensitive spelling alias from a distinct
+# hard-linked output during generated-file renames.
+same-file = "1.0"
 # Portable artifact identity uses Unicode normalization + full case folding so output collisions are
 # rejected consistently before reaching case-insensitive or normalization-insensitive filesystems.
 unicode-normalization = "0.1"
 unicode-casefold = "0.2"
 # Atomic no-clobber rename is the commit primitive for staged generated files on Unix.
 rustix = { version = "1.1", features = ["fs"] }
-# Constants only: safe Windows directory handles use backup/write-through flags for durability.
+# A focused Windows-only wrapper supplies MoveFileExW's atomic fail-if-destination-exists move on
+# filesystems that do not support hard links. windows-sys constants configure directory durability.
+atomicwrites = "0.4"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+winx = "0.36"
 notify-debouncer-full = "0.7"   # debounced FS watcher for `gnr8 watch` (consumed in 04-03)
 ctrlc = "3.5"                   # graceful Ctrl-C → AtomicBool for the watch loop (consumed in 04-03;
                                 # the FSEvents backend suppresses the default SIGINT disposition, so the

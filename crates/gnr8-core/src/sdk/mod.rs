@@ -36,8 +36,10 @@ pub mod model;
 pub mod model_style;
 pub(crate) mod openapi_source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
@@ -45,6 +47,8 @@ use unicode_normalization::UnicodeNormalization;
 use crate::graph::{ApiGraph, Diagnostic};
 use crate::manifest::blake3_hex;
 use crate::CoreError;
+
+static ARTIFACT_CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn is_internal_transaction_name(name: &str, suffix: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
@@ -88,6 +92,11 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
         if component.ends_with(['.', ' ']) {
             return Err("path components may not end with a dot or space".to_string());
         }
+        if component.len() > 255 || component.encode_utf16().count() > 255 {
+            return Err(
+                "path components may not exceed 255 UTF-8 bytes or UTF-16 code units".to_string(),
+            );
+        }
         if component
             .chars()
             .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
@@ -115,10 +124,14 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
             .is_some_and(|suffix| {
                 matches!(
                     suffix,
-                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
                 )
             });
-        if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered_device {
+        if matches!(
+            upper.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || numbered_device
+        {
             return Err(format!(
                 "path component {component:?} is a reserved device name"
             ));
@@ -278,11 +291,17 @@ impl Artifacts {
         Self::default()
     }
 
-    /// Create a new artifact, failing with `artifact.path_collision` if the path already exists.
+    /// Create a new artifact with one portable, project-relative path.
+    ///
+    /// Paths use NFC-normalized UTF-8 and `/` separators. Each component is at most 255 UTF-8 bytes
+    /// and UTF-16 code units, excludes control/Windows-invalid characters, trailing dots/spaces,
+    /// Windows device names, and gnr8's state/transaction namespace. Unicode case-fold-equivalent
+    /// paths collide so one bundle behaves identically on case-sensitive and insensitive filesystems.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ArtifactOwnership`] when another stage already owns `path`.
+    /// Returns [`CoreError::ArtifactOwnership`] when `path` is non-portable or another stage already
+    /// owns its portable identity.
     pub fn create(
         &mut self,
         path: impl Into<String>,
@@ -797,6 +816,9 @@ impl Pipeline {
             });
         }
         if let Some(cached) = load_artifact_cache(cx, &cache_key) {
+            if let Some(metadata) = artifact_metadata(&cached.artifacts) {
+                save_artifact_metadata_cache(cx, &cache_key, &metadata);
+            }
             return Ok(RunOutcome {
                 artifacts: Artifacts::from_files(cached.artifacts),
                 diagnostics,
@@ -895,11 +917,19 @@ fn config_surface_fingerprint(cx: &Cx) -> String {
 fn load_artifact_cache(cx: &Cx, key: &str) -> Option<ArtifactCache> {
     let path = artifact_cache_path(cx, key);
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let cache: ArtifactCache = serde_json::from_slice(&bytes).ok()?;
+    artifact_metadata(&cache.artifacts)?;
+    Some(cache)
 }
 
 fn artifact_cache_exists(cx: &Cx, key: &str) -> bool {
-    artifact_cache_path(cx, key).is_file()
+    let Some(cache) = load_artifact_cache(cx, key) else {
+        return false;
+    };
+    let Some(metadata) = load_artifact_metadata_cache(cx, key) else {
+        return false;
+    };
+    artifact_metadata(&cache.artifacts).is_some_and(|expected| expected == metadata.artifacts)
 }
 
 /// Load cached artifacts for a child-emitted artifact-cache reference.
@@ -926,22 +956,159 @@ fn save_artifact_cache(cx: &Cx, key: &str, artifacts: &[Artifact]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
+    let Some(metadata) = artifact_metadata(artifacts) else {
+        return;
+    };
     let cache = ArtifactCache {
         artifacts: artifacts.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&cache) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    if publish_artifact_cache_file(&path, &bytes).is_err() {
+        return;
+    }
+    save_artifact_metadata_cache(cx, key, &metadata);
+}
 
-    let metadata: Vec<ArtifactMetadata> = artifacts
-        .iter()
-        .map(|artifact| ArtifactMetadata {
+fn artifact_metadata(artifacts: &[Artifact]) -> Option<Vec<ArtifactMetadata>> {
+    let mut seen = BTreeSet::new();
+    let mut previous_path: Option<&str> = None;
+    let mut metadata = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if previous_path.is_some_and(|previous| previous >= artifact.path.as_str()) {
+            return None;
+        }
+        previous_path = Some(&artifact.path);
+        let identity = portable_path_identity(&artifact.path).ok()?;
+        if !seen.insert(identity) {
+            return None;
+        }
+        metadata.push(ArtifactMetadata {
             path: artifact.path.clone(),
             hash: blake3_hex(artifact.text.as_bytes()),
-        })
-        .collect();
-    save_artifact_metadata_cache(cx, key, &metadata);
+        });
+    }
+    Some(metadata)
+}
+
+fn publish_artifact_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact cache path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact cache path has no UTF-8 file name",
+            )
+        })?;
+    let (temporary, mut file) = loop {
+        let sequence = ARTIFACT_CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    };
+    let published = file
+        .lock_exclusive()
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| replace_atomic_file(&temporary, path));
+    drop(file);
+    if published.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    published
+}
+
+fn replace_atomic_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        atomicwrites::replace_atomic(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+pub(crate) fn cleanup_artifact_cache_temporary_files(project_root: &Path) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let dir = project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("artifacts");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_artifact_cache_temporary_name(name) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())?;
+        match file.try_lock_exclusive() {
+            Ok(()) => std::fs::remove_file(entry.path())?,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn is_artifact_cache_temporary_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((cache_name, token)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let key = cache_name
+        .strip_suffix(".meta.json")
+        .or_else(|| cache_name.strip_suffix(".json"));
+    let Some(key) = key else {
+        return false;
+    };
+    let Some((pid, sequence)) = token.split_once('-') else {
+        return false;
+    };
+    key.len() == 64
+        && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn artifact_cache_path(cx: &Cx, key: &str) -> PathBuf {
@@ -955,7 +1122,23 @@ fn artifact_cache_path(cx: &Cx, key: &str) -> PathBuf {
 fn load_artifact_metadata_cache(cx: &Cx, key: &str) -> Option<ArtifactMetadataCache> {
     let path = artifact_metadata_cache_path(cx, key);
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let cache: ArtifactMetadataCache = serde_json::from_slice(&bytes).ok()?;
+    let mut seen = BTreeSet::new();
+    let mut previous_path: Option<&str> = None;
+    for artifact in &cache.artifacts {
+        if previous_path.is_some_and(|previous| previous >= artifact.path.as_str())
+            || artifact.hash.len() != 64
+            || !artifact.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        previous_path = Some(&artifact.path);
+        let identity = portable_path_identity(&artifact.path).ok()?;
+        if !seen.insert(identity) {
+            return None;
+        }
+    }
+    Some(cache)
 }
 
 fn save_artifact_metadata_cache(cx: &Cx, key: &str, artifacts: &[ArtifactMetadata]) {
@@ -972,7 +1155,7 @@ fn save_artifact_metadata_cache(cx: &Cx, key: &str, artifacts: &[ArtifactMetadat
     let Ok(bytes) = serde_json::to_vec(&cache) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    let _ = publish_artifact_cache_file(&path, &bytes);
 }
 
 fn artifact_metadata_cache_path(cx: &Cx, key: &str) -> PathBuf {
@@ -1011,6 +1194,66 @@ pub(crate) fn collect_cache_input_files(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
     out.sort();
+}
+
+fn collect_cache_input_files_strict(dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
+            if matches!(
+                name,
+                ".context"
+                    | ".git"
+                    | ".gnr8"
+                    | "node_modules"
+                    | "target"
+                    | "vendor"
+                    | "__pycache__"
+            ) {
+                continue;
+            }
+            collect_cache_input_files_strict(&path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            return None;
+        }
+    }
+    out.sort();
+    Some(())
+}
+
+pub(crate) fn cache_config_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
+    let gnr8_dir = cx.project_root.join(crate::lifecycle::WORKSPACE_DIR);
+    let cargo_toml = gnr8_dir.join("Cargo.toml");
+    if !cargo_toml.is_file() {
+        return None;
+    }
+    let mut paths = vec![cargo_toml];
+    collect_cache_input_files_strict(&gnr8_dir.join("src"), &mut paths)?;
+    let cargo_lock = gnr8_dir.join("Cargo.lock");
+    if cargo_lock.exists() {
+        if !cargo_lock.is_file() {
+            return None;
+        }
+        paths.push(cargo_lock);
+    }
+    paths.sort();
+    stamp_project_paths(&cx.project_root, &paths)
+}
+
+pub(crate) fn cache_tool_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
+    let mut paths = vec![std::env::current_exe().ok()?];
+    let resource_root = crate::resource::resource_dir().ok()?;
+    for sidecar in ["goextract", "pyextract", "tsextract"] {
+        collect_cache_input_files_strict(&resource_root.join(sidecar), &mut paths)?;
+    }
+    paths.sort();
+    stamp_project_paths(&cx.project_root, &paths)
 }
 
 pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
@@ -1120,11 +1363,6 @@ impl FileHashCacheState {
             return "<missing>".to_string();
         };
         let fingerprint = FileHashFingerprint::from_metadata(&metadata);
-        if let Some(entry) = self.cache.entries.get(&key) {
-            if entry.len == fingerprint.len && entry.modified_ns == fingerprint.modified_ns {
-                return entry.hash.clone();
-            }
-        }
         let hash = match std::fs::read(path) {
             Ok(bytes) => blake3_hex(&bytes),
             Err(_) => "<missing>".to_string(),
@@ -1354,6 +1592,10 @@ mod tests {
         for path in [
             "models/e\u{301}.ts",
             "models/con.ts",
+            "models/com0.ts",
+            "models/LPT0.ts",
+            "models/conin$.ts",
+            "models/CONOUT$.ts",
             "models/model.ts.",
             "models/model.ts:stream",
             "models/.gnr8-0123456789abcdef01234567-building-lease",
@@ -1367,6 +1609,13 @@ mod tests {
                 "{path}: {err:?}"
             );
         }
+
+        let long_path = format!("models/{}", "a".repeat(256));
+        let err = artifacts.create(&long_path, "invalid").unwrap_err();
+        assert!(
+            matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
+            "{long_path}: {err:?}"
+        );
     }
 
     #[test]
@@ -1465,6 +1714,67 @@ mod tests {
             "target input changes must invalidate artifact cache"
         );
         assert_eq!(second.artifacts.files()[0].text, "two\n");
+    }
+
+    #[test]
+    fn truncated_artifact_cache_is_rebuilt_instead_of_becoming_a_permanent_hit() {
+        let root = temp_project("truncated-artifact-cache");
+        std::fs::create_dir_all(root.join("static")).unwrap();
+        std::fs::write(root.join("static/runtime.txt"), "stable\n").unwrap();
+        let cx = Cx::new(&root);
+        let pipeline = Pipeline::new().source(StubSource).target(CopyFileTarget {
+            source: "static/runtime.txt",
+            dest: "generated/runtime.txt",
+        });
+
+        let first = pipeline.run_for_emit(&cx).unwrap();
+        let key = first.artifact_cache_key.unwrap();
+        let cache_path = super::artifact_cache_path(&cx, &key);
+        std::fs::write(&cache_path, b"{\"artifacts\":").unwrap();
+
+        let rebuilt = pipeline.run_for_emit(&cx).unwrap();
+        assert!(!rebuilt.artifact_cache_hit);
+        assert_eq!(rebuilt.artifacts.files()[0].text, "stable\n");
+
+        let compact_hit = pipeline.run_for_emit(&cx).unwrap();
+        assert!(compact_hit.artifact_cache_hit);
+        assert!(compact_hit.artifacts.files().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_cache_temp_cleanup_removes_only_exact_private_names() {
+        use fs2::FileExt;
+
+        let root = temp_project("artifact-temp-cleanup");
+        let cache = root.join(".gnr8/cache/artifacts");
+        std::fs::create_dir_all(&cache).unwrap();
+        let key = "a".repeat(64);
+        let stale_full = cache.join(format!(".{key}.json.123-4.tmp"));
+        let stale_meta = cache.join(format!(".{key}.meta.json.123-5.tmp"));
+        let live = cache.join(format!(".{key}.json.123-6.tmp"));
+        let unrelated = cache.join(format!(".{key}.json.backup.tmp"));
+        std::fs::write(&stale_full, b"stale").unwrap();
+        std::fs::write(&stale_meta, b"stale").unwrap();
+        std::fs::write(&live, b"live").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let live_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&live)
+            .unwrap();
+        live_file.lock_exclusive().unwrap();
+
+        super::cleanup_artifact_cache_temporary_files(&root).unwrap();
+
+        assert!(!stale_full.exists());
+        assert!(!stale_meta.exists());
+        assert_eq!(std::fs::read(&live).unwrap(), b"live");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        drop(live_file);
+        super::cleanup_artifact_cache_temporary_files(&root).unwrap();
+        assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

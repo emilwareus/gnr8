@@ -56,8 +56,13 @@ without writing. A missing/corrupt cache degrades to an empty manifest instead o
 reconstructs ownership for identical outputs and exits non-zero if any divergent output remains
 protected; check never creates ownership or a no-op cache entry.
 
-All artifact paths must be safe project-relative paths: absolute paths, parent traversal, and unsafe
-output-anchor relationships are rejected.
+All artifact paths use one portable project-relative form. They must be NFC-normalized UTF-8 with
+canonical `/` separators; each component is limited to 255 UTF-8 bytes and 255 UTF-16 code units.
+Empty, `.`/`..`, absolute, control-character, Windows-invalid-character, trailing-dot/space, and
+Windows device-name components are rejected. The top-level `.gnr8` state directory and gnr8's
+transaction names are reserved. Unicode case-fold-equivalent paths collide even on a case-sensitive
+host, so a custom `Target` or `PostProcess` must emit one canonical spelling. Unsafe output-anchor
+relationships are rejected by the same host boundary.
 
 ## Force
 

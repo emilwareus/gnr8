@@ -515,6 +515,52 @@ fn noop_second_run_writes_nothing() {
 }
 
 #[test]
+fn case_only_output_rename_removes_distinct_old_spelling_without_deleting_an_alias() {
+    let root = init_root("case-only-output-rename");
+    lifecycle::regenerate(
+        &root,
+        &[artifact("generated/Client.ts", "export const value = 1;\n")],
+        false,
+    )
+    .expect("write original spelling");
+    let filesystem_aliases_case = root.join("generated/client.ts").exists();
+
+    let outcome = lifecycle::regenerate(
+        &root,
+        &[artifact("generated/client.ts", "export const value = 1;\n")],
+        false,
+    )
+    .expect("reconcile case-only output rename");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("generated/client.ts")).unwrap(),
+        "export const value = 1;\n"
+    );
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    assert_eq!(manifest.files.len(), 1);
+    assert_eq!(manifest.files[0].path, "generated/client.ts");
+    let matching_entries = std::fs::read_dir(root.join("generated"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("client.ts")
+        })
+        .count();
+    assert_eq!(matching_entries, 1);
+    if filesystem_aliases_case {
+        assert!(!outcome.deleted.contains(&"generated/Client.ts".to_string()));
+    } else {
+        assert!(!root.join("generated/Client.ts").exists());
+        assert!(outcome.deleted.contains(&"generated/Client.ts".to_string()));
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn missing_manifest_adopts_identical_outputs_without_rewriting() {
     let root = init_root("adopt-identical");
     let artifacts = vec![
@@ -775,6 +821,10 @@ fn regenerate_rejects_aliased_and_case_folded_artifact_paths() {
         "generated/Client.go",
         "generated/e\u{301}.go",
         "generated/con.go",
+        "generated/COM0.go",
+        "generated/lpt0.go",
+        "generated/CONIN$.go",
+        "generated/conout$.go",
         "generated/client.go.",
         "generated/client.go:stream",
     ] {
@@ -795,6 +845,33 @@ fn regenerate_rejects_aliased_and_case_folded_artifact_paths() {
             "an aliased path must be rejected, got {err:?}"
         );
         assert!(!root.join("generated/client.go").exists());
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn regenerate_rejects_oversized_component_before_creating_recovery_state() {
+    let root = init_root("oversized-output-component");
+    let path = format!("generated/{}", "a".repeat(256));
+
+    let err = lifecycle::regenerate(&root, &[artifact(&path, "generated")], false)
+        .expect_err("a non-portable oversized output component must be rejected");
+
+    assert!(matches!(err, CoreError::Io { .. }), "{err:?}");
+    assert!(!root.join("generated").exists());
+    let cache = root.join(".gnr8/cache");
+    if cache.is_dir() {
+        assert!(
+            std::fs::read_dir(cache)
+                .expect("read cache")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gnr8-generation-")),
+            "invalid paths must not publish a generation recovery journal"
+        );
     }
 
     let _ = std::fs::remove_dir_all(root);

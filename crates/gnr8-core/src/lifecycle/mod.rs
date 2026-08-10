@@ -37,7 +37,7 @@
 // (skill ch.2.4, mirrors manifest/mod.rs).
 #![allow(clippy::doc_markdown)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,6 +301,30 @@ fn validate_manifest_paths(manifest: &Manifest) -> Result<(), crate::CoreError> 
     Ok(())
 }
 
+fn generation_recovery_files<'a>(
+    manifest: &Manifest,
+    current: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<Vec<(String, String)>, crate::CoreError> {
+    let mut files = BTreeMap::new();
+    for entry in &manifest.files {
+        let identity =
+            portable_path_identity(&entry.path).map_err(|reason| crate::CoreError::Manifest {
+                message: format!(
+                    "ownership manifest contains non-portable path {:?}: {reason}",
+                    entry.path
+                ),
+            })?;
+        files.insert(identity, (entry.path.clone(), entry.hash.clone()));
+    }
+    for (path, hash) in current {
+        let identity = portable_path_identity(path).map_err(|reason| crate::CoreError::Io {
+            message: format!("refusing to journal non-portable output path {path:?}: {reason}"),
+        })?;
+        files.insert(identity, (path.to_string(), hash.to_string()));
+    }
+    Ok(files.into_values().collect())
+}
+
 /// Materialize a [`WritePlan`] to disk (the impure half, RESEARCH Pattern 3).
 ///
 /// For each file: `Write` (and `UserEdited` when `force`) → validate the path against `project_root`,
@@ -397,12 +421,16 @@ pub fn apply_writes_with_anchors(
         }
     }
 
-    let current_identities: BTreeSet<String> = plan
+    let current_paths = plan
         .files
         .iter()
-        .filter_map(|file| portable_path_identity(&file.path).ok())
+        .filter_map(|file| {
+            portable_path_identity(&file.path)
+                .ok()
+                .map(|identity| (identity, file.path.clone()))
+        })
         .collect();
-    prune_stale_manifest_files(project_root, manifest, &current_identities, force, &mut out)?;
+    prune_stale_manifest_files(project_root, manifest, &current_paths, force, &mut out)?;
 
     // D-04: drop manifest entries for paths this generation no longer produces.
     let current_paths_vec: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
@@ -505,7 +533,7 @@ fn replace_planned_file(
 fn prune_stale_manifest_files(
     project_root: &Path,
     manifest: &Manifest,
-    current_identities: &BTreeSet<String>,
+    current_paths: &BTreeMap<String, String>,
     force: bool,
     out: &mut GenerateOutcome,
 ) -> Result<(), crate::CoreError> {
@@ -518,12 +546,78 @@ fn prune_stale_manifest_files(
                     entry.path
                 ),
             })?;
-        if current_identities.contains(&identity) {
-            continue;
+        if let Some(current_path) = current_paths.get(&identity) {
+            if entry.path == *current_path {
+                continue;
+            }
+            let same_entry =
+                output_paths_are_same_directory_entry(&project_dir, &entry.path, current_path)
+                    .map_err(|err| crate::CoreError::Io {
+                        message: format!(
+                            "failed to compare output spellings {:?} and {:?}: {err}",
+                            entry.path, current_path
+                        ),
+                    })?;
+            if same_entry {
+                continue;
+            }
         }
         prune_stale_manifest_entry(project_root, &project_dir, entry, force, out)?;
     }
     Ok(())
+}
+
+fn output_paths_are_same_directory_entry(
+    project_dir: &Dir,
+    left: &str,
+    right: &str,
+) -> std::io::Result<bool> {
+    let open = |path: &str| -> std::io::Result<Option<std::fs::File>> {
+        let (parent, leaf) = match open_output_parent(project_dir, path, false) {
+            Ok(parts) => parts,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        match parent.open_with(&leaf, &options) {
+            Ok(file) => Ok(Some(file.into_std())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    };
+    let (Some(left_file), Some(right_file)) = (open(left)?, open(right)?) else {
+        return Ok(false);
+    };
+    if same_file::Handle::from_file(left_file)? != same_file::Handle::from_file(right_file)? {
+        return Ok(false);
+    }
+    let left_components = left.split('/').collect::<Vec<_>>();
+    let right_components = right.split('/').collect::<Vec<_>>();
+    if left_components.len() != right_components.len() {
+        return Ok(false);
+    }
+    let mut parent = project_dir.try_clone()?;
+    for (index, (left_component, right_component)) in
+        left_components.iter().zip(&right_components).enumerate()
+    {
+        if left_component != right_component {
+            let mut left_exact = false;
+            let mut right_exact = false;
+            for entry in parent.read_dir(".")? {
+                let name = entry?.file_name();
+                left_exact |= name == std::ffi::OsStr::new(left_component);
+                right_exact |= name == std::ffi::OsStr::new(right_component);
+            }
+            if left_exact && right_exact {
+                return Ok(false);
+            }
+        }
+        if index + 1 < left_components.len() {
+            parent = parent.open_dir_nofollow(left_component)?;
+        }
+    }
+    Ok(true)
 }
 
 fn prune_stale_manifest_entry(
@@ -824,6 +918,7 @@ fn begin_generation_operation(
     };
     let guard = lock_generation_guard(&journal_dir).map_err(recovery_io_error)?;
     manifest::cleanup_temporary_files(&project_root.join(WORKSPACE_DIR))?;
+    crate::sdk::cleanup_artifact_cache_temporary_files(project_root).map_err(recovery_io_error)?;
     Ok(Some(GenerationOperation {
         project_dir,
         journal_dir,
@@ -870,8 +965,12 @@ fn recover_abandoned_generations_locked(
                     .map(|_| journal_file.generated_hash.clone())
             };
             if let Some(hash) = owned_hash {
-                manifest.record(&journal_file.path, &hash, SOURCE_GENERATED);
-                changed = true;
+                changed |= record_recovered_hash(
+                    &mut manifest,
+                    &operation.project_dir,
+                    &journal_file.path,
+                    &hash,
+                )?;
             }
         }
     }
@@ -889,6 +988,46 @@ fn recover_abandoned_generations_locked(
     }
     sync_dir(&operation.journal_dir).map_err(recovery_io_error)?;
     Ok(())
+}
+
+fn record_recovered_hash(
+    manifest: &mut Manifest,
+    project_dir: &Dir,
+    path: &str,
+    hash: &str,
+) -> Result<bool, crate::CoreError> {
+    let identity = portable_path_identity(path).map_err(|reason| crate::CoreError::Manifest {
+        message: format!("invalid recovered output path {path:?}: {reason}"),
+    })?;
+    let existing = manifest.files.iter().find_map(|entry| {
+        portable_path_identity(&entry.path)
+            .is_ok_and(|candidate| candidate == identity)
+            .then(|| entry.path.clone())
+    });
+    match existing {
+        None => {
+            manifest.record(path, hash, SOURCE_GENERATED);
+            Ok(true)
+        }
+        Some(existing) if existing == path => {
+            let changed = manifest.recorded_hash(path) != Some(hash);
+            manifest.record(path, hash, SOURCE_GENERATED);
+            Ok(changed)
+        }
+        Some(existing) => {
+            let same_entry = output_paths_are_same_directory_entry(project_dir, &existing, path)
+                .map_err(recovery_io_error)?;
+            if same_entry {
+                let changed = manifest.recorded_hash(&existing) != Some(hash);
+                manifest.record(&existing, hash, SOURCE_GENERATED);
+                Ok(changed)
+            } else {
+                // Keep the prior spelling owned until the next normal plan can transactionally
+                // prune it; recording both spellings would make the manifest non-portable.
+                Ok(false)
+            }
+        }
+    }
 }
 
 fn acquire_generation_journals(
@@ -1030,7 +1169,12 @@ fn unique_token() -> String {
 fn sync_dir(dir: &Dir) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        dir.try_clone()?.into_std_file().sync_all()
+        // cap-std may retain an `O_PATH` directory handle on Linux; `fsync` on that descriptor is
+        // `EBADF`. Open `.` for reading through the capability so durability uses a real directory
+        // descriptor without converting back to an ambient path.
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        dir.open_with(".", &options)?.into_std().sync_all()
     }
     #[cfg(windows)]
     {
@@ -1078,11 +1222,17 @@ fn rename_noreplace(from_dir: &Dir, from: &str, to_dir: &Dir, to: &str) -> std::
     }
     #[cfg(windows)]
     {
-        // Creating the destination link is the Windows safe-Rust primitive with fail-if-exists
-        // semantics. The journal reconciles a crash between link and unlink as two names for the
-        // same bytes. Unsupported filesystems fail closed without changing either name.
-        from_dir.hard_link(from, to_dir, to)?;
-        from_dir.remove_file(from)
+        // Get ambient paths from the already-open directory handles. `Dir::canonicalize` returns a
+        // capability-relative path on Windows, so it must not be passed to an ambient API. Keep
+        // no-delete-share handles for each ancestor alive across MoveFileExW: after the final handle
+        // identity check this prevents the resolved directory chain from being renamed/replaced in
+        // the path-based API's remaining race window. The leaf is appended without canonicalizing it,
+        // so a final symlink is moved as a link rather than followed.
+        let (source_parent, _source_guards) = windows_guarded_dir_path(from_dir)?;
+        let (destination_parent, _destination_guards) = windows_guarded_dir_path(to_dir)?;
+        let source = source_parent.join(from);
+        let destination = destination_parent.join(to);
+        atomicwrites::move_atomic(&source, &destination)
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
     {
@@ -1092,6 +1242,45 @@ fn rename_noreplace(from_dir: &Dir, from: &str, to_dir: &Dir, to: &str) -> std::
             "atomic no-replace rename is not supported on this platform",
         ))
     }
+}
+
+#[cfg(windows)]
+fn windows_guarded_dir_path(
+    dir: &Dir,
+) -> std::io::Result<(std::path::PathBuf, Vec<std::fs::File>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let capability_file = dir.try_clone()?.into_std_file();
+    let path = winx::file::get_file_path(&capability_file)?;
+    let mut guards = Vec::new();
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(ancestor)?;
+        guards.push(guard);
+    }
+    let final_guard = guards.last().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows directory handle resolved to an empty path",
+        )
+    })?;
+    let capability_identity = same_file::Handle::from_file(capability_file)?;
+    let guarded_identity = same_file::Handle::from_file(final_guard.try_clone()?)?;
+    if capability_identity != guarded_identity {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Windows output directory changed while preparing an atomic move",
+        ));
+    }
+    Ok((path, guards))
 }
 
 struct TransactionLease(std::fs::File);
@@ -2265,12 +2454,12 @@ pub fn regenerate_with_anchors(
     output_anchors: &[String],
     force: bool,
 ) -> Result<GenerateOutcome, crate::CoreError> {
+    validate_output_paths(project_root, artifacts)?;
     let operation =
         begin_generation_operation(project_root, true)?.ok_or_else(|| crate::CoreError::Io {
             message: "failed to open generation operation state".to_string(),
         })?;
     recover_abandoned_generations_locked(project_root, &operation)?;
-    validate_output_paths(project_root, artifacts)?;
     let gnr8_dir = project_root.join(WORKSPACE_DIR);
     let mut manifest = manifest::load(&gnr8_dir)?;
     validate_manifest_paths(&manifest)?;
@@ -2279,14 +2468,12 @@ pub fn regenerate_with_anchors(
     let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
     let plan = plan_writes(artifacts, &manifest, &on_disk);
 
-    let mut recovery_files: BTreeMap<String, String> = manifest
-        .files
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.hash.clone()))
-        .collect();
-    for file in &plan.files {
-        recovery_files.insert(file.path.clone(), file.new_hash.clone());
-    }
+    let recovery_files = generation_recovery_files(
+        &manifest,
+        plan.files
+            .iter()
+            .map(|file| (file.path.as_str(), file.new_hash.as_str())),
+    )?;
     let GenerationOperation {
         project_dir: _,
         journal_dir,
@@ -2356,14 +2543,12 @@ pub fn regenerate_cached_with_anchors(
         }));
     }
 
-    let mut recovery_files: BTreeMap<String, String> = manifest
-        .files
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.hash.clone()))
-        .collect();
-    for artifact in artifacts {
-        recovery_files.insert(artifact.path.clone(), artifact.hash.clone());
-    }
+    let recovery_files = generation_recovery_files(
+        &manifest,
+        artifacts
+            .iter()
+            .map(|artifact| (artifact.path.as_str(), artifact.hash.as_str())),
+    )?;
     let GenerationOperation {
         project_dir: _,
         journal_dir,
@@ -2384,18 +2569,16 @@ pub fn regenerate_cached_with_anchors(
         }
     }
 
-    let current_identities: BTreeSet<String> = plan
+    let current_paths = plan
         .files
         .iter()
-        .filter_map(|file| portable_path_identity(&file.path).ok())
+        .filter_map(|file| {
+            portable_path_identity(&file.path)
+                .ok()
+                .map(|identity| (identity, file.path.clone()))
+        })
         .collect();
-    prune_stale_manifest_files(
-        project_root,
-        &manifest,
-        &current_identities,
-        force,
-        &mut out,
-    )?;
+    prune_stale_manifest_files(project_root, &manifest, &current_paths, force, &mut out)?;
 
     let current_paths_vec: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
     manifest.prune_to(&current_paths_vec);
@@ -2425,6 +2608,27 @@ pub fn recover_cached_output_transactions(
     recover_cached_output_transactions_locked(project_root, artifacts, &operation)
 }
 
+/// Run a host-side state publication while holding the same project generation lock as output and
+/// manifest commits. This is an internal host seam, not a code-as-config extension point.
+///
+/// # Errors
+///
+/// Returns a typed recovery error if interrupted output work cannot be reconciled before `publish`.
+#[doc(hidden)]
+pub fn with_generation_state_lock<T>(
+    project_root: &Path,
+    publish: impl FnOnce() -> T,
+) -> Result<T, crate::CoreError> {
+    let operation =
+        begin_generation_operation(project_root, true)?.ok_or_else(|| crate::CoreError::Io {
+            message: "failed to open generation state publication lock".to_string(),
+        })?;
+    recover_abandoned_generations_locked(project_root, &operation)?;
+    let result = publish();
+    drop(operation);
+    Ok(result)
+}
+
 fn recover_cached_output_transactions_locked(
     project_root: &Path,
     artifacts: &[ArtifactMetadata],
@@ -2446,8 +2650,12 @@ fn recover_cached_output_transactions_locked(
                 }
             })?;
         if let Some(hash) = recovered {
-            manifest.record(&artifact.path, &hash, SOURCE_GENERATED);
-            changed = true;
+            changed |= record_recovered_hash(
+                &mut manifest,
+                &operation.project_dir,
+                &artifact.path,
+                &hash,
+            )?;
         }
     }
     if changed {
@@ -2570,6 +2778,72 @@ mod tests {
             .count()
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_noreplace_move_is_atomic_and_preserves_existing_destinations() {
+        let root = temp_root("windows-noreplace-move");
+        std::fs::create_dir_all(root.join("from/nested")).unwrap();
+        std::fs::create_dir_all(root.join("to/nested")).unwrap();
+        let project = super::open_project_dir(&root).unwrap();
+        let from_dir = project.open_dir("from/nested").unwrap();
+        let to_dir = project.open_dir("to/nested").unwrap();
+        std::fs::write(root.join("from/nested/source"), b"first").unwrap();
+
+        super::rename_noreplace(&from_dir, "source", &to_dir, "destination").unwrap();
+        assert!(!root.join("from/nested/source").exists());
+        assert_eq!(
+            std::fs::read(root.join("to/nested/destination")).unwrap(),
+            b"first"
+        );
+
+        std::fs::write(root.join("from/nested/source"), b"second").unwrap();
+        let err = super::rename_noreplace(&from_dir, "source", &to_dir, "destination").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(root.join("from/nested/source")).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            std::fs::read(root.join("to/nested/destination")).unwrap(),
+            b"first"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_noreplace_move_moves_a_final_symlink_without_touching_its_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = temp_root("windows-noreplace-symlink");
+        let outside = temp_root("windows-noreplace-symlink-target").join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        match symlink_file(&outside, root.join("source")) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let outside_root = outside.parent().unwrap().to_path_buf();
+                let _ = std::fs::remove_dir_all(root);
+                let _ = std::fs::remove_dir_all(outside_root);
+                return;
+            }
+            Err(err) => panic!("create Windows file symlink: {err}"),
+        }
+        let dir = super::open_project_dir(&root).unwrap();
+
+        super::rename_noreplace(&dir, "source", &dir, "destination").unwrap();
+
+        assert!(!root.join("source").exists());
+        assert!(std::fs::symlink_metadata(root.join("destination"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        let outside_root = outside.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+
     #[test]
     fn safe_output_path_rejects_traversal_and_absolute() {
         let root = std::path::Path::new("/tmp/proj");
@@ -2581,6 +2855,20 @@ mod tests {
         assert!(safe_output_path(root, "sdk/./client.go").is_err());
         assert!(safe_output_path(root, "sdk//client.go").is_err());
         assert!(safe_output_path(root, "sdk\\client.go").is_err());
+    }
+
+    #[test]
+    fn generation_recovery_journal_deduplicates_portable_aliases_in_favor_of_current_path() {
+        let mut manifest = Manifest::default();
+        manifest.record("generated/Client.ts", "old", "generated");
+
+        let files =
+            super::generation_recovery_files(&manifest, [("generated/client.ts", "new")]).unwrap();
+
+        assert_eq!(
+            files,
+            vec![("generated/client.ts".to_string(), "new".to_string())]
+        );
     }
 
     #[cfg(unix)]

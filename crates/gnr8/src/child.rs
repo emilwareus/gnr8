@@ -62,8 +62,12 @@ pub(crate) fn run_child(
     project_root: &Path,
     subcommand: &str,
 ) -> Result<ArtifactBundle, CoreError> {
+    // Bracket the whole cargo build + child run. The child brackets its own execution too, but a
+    // config edit after cargo compiled the binary and before that binary started would otherwise
+    // pair old pipeline code with new `.gnr8/src` stamps.
+    let config_before = host_config_snapshot(project_root);
     let (stdout, stderr) = run_child_stdout(project_root, subcommand)?;
-    let bundle = parse_bundle(stdout.trim(), &stderr)?;
+    let mut bundle = parse_bundle(stdout.trim(), &stderr)?;
 
     // Reject a bundle this host does not understand: the `.gnr8/` crate links its own `gnr8`, so a
     // version skew (e.g. a pinned published `gnr8` vs a newer host) must fail with an actionable
@@ -98,7 +102,21 @@ pub(crate) fn run_child(
             ),
         });
     }
+    let config_after = host_config_snapshot(project_root);
+    if config_before.is_none()
+        || config_before != config_after
+        || config_after.as_ref() != Some(&bundle.cache_config_stamps)
+    {
+        // Keep the artifact-cache key so a compact child response can still be materialized. An
+        // empty config snapshot only disables publication of the cross-process verified no-op.
+        bundle.cache_config_stamps.clear();
+    }
     Ok(bundle)
+}
+
+fn host_config_snapshot(project_root: &Path) -> Option<Vec<gnr8::sdk::FileStamp>> {
+    let fast = crate::collect_required_config_fast_stamps(project_root)?;
+    crate::content_stamps_from_fast(project_root, &fast)
 }
 
 /// Run the user's `.gnr8/` generation crate in inspect mode and parse the transformed graph.
