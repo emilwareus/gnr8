@@ -25,6 +25,12 @@ case "$(uname -m)" in
     ;;
 esac
 
+if [[ -z "$local_archive" && "$os" == "macos" && "$arch" == "x86_64" ]]; then
+  echo "gnr8 install: prebuilt releases are unavailable for Intel macOS" >&2
+  echo "gnr8 install: use 'cargo install gnr8' instead" >&2
+  exit 1
+fi
+
 asset="gnr8-${os}-${arch}.tar.gz"
 if [[ "${tag}" == "latest" ]]; then
   base_url="https://github.com/${repo}/releases/latest/download"

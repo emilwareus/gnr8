@@ -34,11 +34,12 @@ The archive lands under `target/release-local-dist/dist/` and uses the same name
 
 - `gnr8-linux-x86_64.tar.gz`
 - `gnr8-linux-aarch64.tar.gz`
-- `gnr8-macos-x86_64.tar.gz`
 - `gnr8-macos-aarch64.tar.gz`
 - `gnr8-windows-x86_64.tar.gz`
 
 Each archive also gets a matching `.sha256` file.
+Intel macOS has no prebuilt archive because its GitHub-hosted build cannot reliably finish within the
+five-minute job deadline; Intel Mac users can install from crates.io with `cargo install gnr8`.
 
 ## Archive Layout
 
