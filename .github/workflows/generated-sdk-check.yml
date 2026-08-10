@@ -13,46 +13,107 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  gnr8-check:
-    name: gnr8 check
+  build-cli:
+    name: Build check binary
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
 
-      - uses: actions/setup-go@v6
+      - uses: Swatinem/rust-cache@v2
         with:
-          go-version: '1.26'
-          check-latest: true
+          key: generated-sdk-binary
 
-      - uses: actions/setup-python@v6
+      - name: Build gnr8
+        run: cargo build --release -p gnr8-cli --locked
+
+      - uses: actions/upload-artifact@v6
         with:
-          python-version: '3.13'
+          name: generated-sdk-check-binary
+          path: target/release/gnr8
+          if-no-files-found: error
+          retention-days: 1
+
+  check-example:
+    name: Check ${{ matrix.project }}
+    needs: build-cli
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: bookstore
+            setup_go: "true"
+            setup_python: "false"
+            setup_node: "false"
+          - project: taskflow
+            setup_go: "true"
+            setup_python: "false"
+            setup_node: "false"
+          - project: fastapi-bookstore
+            setup_go: "false"
+            setup_python: "true"
+            setup_node: "false"
+          - project: flask-bookstore
+            setup_go: "false"
+            setup_python: "true"
+            setup_node: "false"
+          - project: nestjs-bookstore
+            setup_go: "false"
+            setup_python: "false"
+            setup_node: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: generated-sdk-check-binary
+          path: target/release
+
+      - name: Make gnr8 executable
+        run: chmod +x target/release/gnr8
 
       - uses: actions/setup-node@v6
+        if: matrix.setup_node == 'true'
         with:
-          node-version: '24'
+          node-version: "24"
           cache: npm
           cache-dependency-path: tsextract/package-lock.json
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Restore TypeScript sidecar dependency
+        if: matrix.setup_node == 'true'
         run: npm ci --silent
         working-directory: tsextract
 
-      - name: Check committed generated SDKs
+      - name: Check committed generated artifacts
         uses: ./
+        env:
+          GNR8_RESOURCE_DIR: ${{ github.workspace }}
         with:
-          install-method: source
-          setup-rust: "false"
-          working-directories: |
-            examples/bookstore
-            examples/taskflow
-            examples/fastapi-bookstore
-            examples/flask-bookstore
-            examples/nestjs-bookstore
+          working-directories: examples/${{ matrix.project }}
+          gnr8-binary: ${{ github.workspace }}/target/release/gnr8
+          setup-go: ${{ matrix.setup_go }}
+          go-version: "1.26"
+          setup-python: ${{ matrix.setup_python }}
+          python-version: "3.13"
+          setup-node: "false"
+          node-version: "24"
+          cache-key-prefix: gnr8-${{ matrix.project }}
+
+  check:
+    name: gnr8 check
+    needs: [build-cli, check-example]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require the binary and every example
+        env:
+          BUILD_RESULT: ${{ needs.build-cli.result }}
+          EXAMPLE_RESULT: ${{ needs.check-example.result }}
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$EXAMPLE_RESULT" = success

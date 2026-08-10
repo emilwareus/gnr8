@@ -164,7 +164,7 @@ target project's `typescript` dependency.
 
 ## CI gates in this repository
 
-For gnr8 contributors, `make check` is the full local/CI gate:
+For gnr8 contributors, `make check` remains the complete local gate:
 
 ```bash
 make check
@@ -172,6 +172,10 @@ make check
 
 It runs Rust formatting, clippy with warnings denied, all Rust tests, Go/Python/TypeScript sidecar
 tests, fixture builds/vet, Action resolver tests, and deterministic example regeneration/checks.
+
+CI runs the same confidence areas as focused jobs rather than invoking `make check` as one process.
+Every job is capped at five total minutes, and generated-project checks are isolated per example. A
+fast repository policy job rejects missing or larger job deadlines.
 
 For application repositories, the normal gate is narrower:
 

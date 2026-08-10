@@ -1,6 +1,7 @@
 # gnr8 quality gates (D-16 + Go fixture gate).
 #
-# `make check` is the full LOCAL gate and mirrors CI. It runs fmt-check, clippy
+# `make check` is the full LOCAL gate. CI splits the same confidence areas into bounded jobs. It runs
+# fmt-check, clippy
 # (--locked, -D warnings), Rust tests, sidecar tests, fixture/helper builds, and example regen checks.
 #
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
@@ -138,8 +139,9 @@ examples-check: tsextract-deps
 # Enforce CLAUDE.md rule 0: one native contract, no foreign annotation/compatibility coupling.
 invariants:
 	scripts/check-invariants.sh
+	python3 scripts/check-ci-budget.py
 
-# Full local gate, mirrors CI.
+# Full local gate; CI runs these confidence areas as focused jobs.
 check: invariants fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check
 
 all: check
