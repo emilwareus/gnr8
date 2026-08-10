@@ -257,6 +257,10 @@ impl OpenApi {
 }
 
 impl Source for OpenApi {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         if self.input.is_empty() {
             return Err(CoreError::Config {
@@ -494,6 +498,10 @@ impl SetBasePath {
 }
 
 impl Transform for SetBasePath {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         validate_base_path(&self.base_path)?;
         ir.base_path.clone_from(&self.base_path);
@@ -539,6 +547,10 @@ impl SetTitle {
 }
 
 impl Transform for SetTitle {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.title.clone_from(&self.title);
         Ok(())
@@ -623,6 +635,10 @@ impl OpenApiMetadata {
 }
 
 impl Transform for OpenApiMetadata {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         validate_optional_metadata_value("OpenAPI title", self.title.as_deref())?;
         validate_optional_metadata_value("OpenAPI version", self.policy.version.as_deref())?;
@@ -691,6 +707,10 @@ impl DiagnosticPolicy {
 }
 
 impl Transform for DiagnosticPolicy {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if self.denied_codes.iter().any(|code| code.trim().is_empty()) {
             return Err(CoreError::Config {
@@ -751,6 +771,10 @@ impl RequireOperationDocs {
 }
 
 impl Transform for RequireOperationDocs {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         // Report EVERY undocumented operation, not just the first: a consumer adopting
         // the gate wants one list to work through, not one error per re-run.
@@ -838,6 +862,10 @@ impl SetOperationSuccessResponse {
 }
 
 impl Transform for SetOperationSuccessResponse {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if !(200..300).contains(&self.status) {
             return Err(CoreError::Config {
@@ -956,6 +984,10 @@ impl SetSchemaFieldType {
 }
 
 impl Transform for SetSchemaFieldType {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let matches: Vec<usize> = ir
             .schemas
@@ -1545,6 +1577,10 @@ impl ApiOverrides {
 }
 
 impl Transform for ApiOverrides {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if let Some(message) = self.configuration_errors.first() {
             return Err(CoreError::Config {
@@ -2299,6 +2335,10 @@ impl SetEnumOrder {
 }
 
 impl Transform for SetEnumOrder {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         match &self.order {
             EnumOrder::Lexical => {
@@ -2641,6 +2681,10 @@ impl ApplySecurity {
 }
 
 impl Transform for ApplySecurity {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.security.push(self.scheme.clone());
         if self.selectors.is_empty() {
@@ -2804,6 +2848,10 @@ impl Default for ConfigureSdkRuntime {
 }
 
 impl Transform for ConfigureSdkRuntime {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut policy = self.policy.clone();
         policy.retry_statuses.sort_unstable();
@@ -2863,6 +2911,10 @@ impl MarkIdempotent {
 }
 
 impl Transform for MarkIdempotent {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if self
             .idempotency_key_header
@@ -2997,6 +3049,10 @@ impl ConfigurePagination {
 }
 
 impl Transform for ConfigurePagination {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         self.validate()?;
         let base_path = ir.base_path.clone();
@@ -3293,6 +3349,10 @@ impl DocumentOperation {
 }
 
 impl Transform for DocumentOperation {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         self.validate()?;
         let resolved_errors = self
@@ -3646,6 +3706,10 @@ impl RenameOperation {
 }
 
 impl Transform for RenameOperation {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut naming = crate::lifecycle::NamingOverrides::default();
         naming.operations.insert(self.from.clone(), self.to.clone());
@@ -3674,6 +3738,10 @@ impl RenameType {
 }
 
 impl Transform for RenameType {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut naming = crate::lifecycle::NamingOverrides::default();
         naming.types.insert(self.from.clone(), self.to.clone());
@@ -3747,6 +3815,10 @@ impl GroupOperations {
 }
 
 impl Transform for GroupOperations {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         for op in &mut ir.operations {
             for rule in &self.rules {
@@ -4141,6 +4213,10 @@ impl Default for OpenApi31 {
 }
 
 impl Target for OpenApi31 {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.path.is_empty() {
             return Err(CoreError::Config {
@@ -4217,6 +4293,10 @@ impl Default for OpenApi31Json {
 }
 
 impl Target for OpenApi31Json {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.path.is_empty() {
             return Err(CoreError::Config {
@@ -4316,6 +4396,15 @@ impl Target for StaticFiles {
     fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
         let (source_root, files) = self.static_source_files(cx)?;
         Ok(files.into_iter().map(|rel| source_root.join(rel)).collect())
+    }
+
+    fn verified_noop_input_files(&self, cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        self.cache_input_files(cx).map(Some)
+    }
+
+    fn verified_noop_input_roots(&self, cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        let (source_root, _) = self.static_source_files(cx)?;
+        Ok(Some(vec![source_root]))
     }
 
     fn output_anchors(&self) -> Vec<String> {
@@ -4476,6 +4565,12 @@ impl Default for GoSdk {
 }
 
 impl Target for GoSdk {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        // `gofmt` is selected through PATH. A file stamp cannot prove that a later host process
+        // would resolve the same executable, so this target deliberately disables pre-child skips.
+        Ok(None)
+    }
+
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -4686,6 +4781,10 @@ impl Default for PySdk {
 }
 
 impl Target for PySdk {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -5002,6 +5101,10 @@ impl Default for TsSdk {
 }
 
 impl Target for TsSdk {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -5468,6 +5571,10 @@ impl Header {
 }
 
 impl PostProcess for Header {
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
+
     fn run(&self, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         // Collect the rewrites first (we can't mutate while iterating `files()`), then re-write each
         // through explicit artifact ownership so the set stays sorted (a rewrite of an existing path replaces
@@ -8032,12 +8139,19 @@ mod tests {
         std::fs::write(root.join("static/runtime/__init__.py"), "ROOT\n").unwrap();
         std::fs::write(root.join("static/README.md"), "README\n").unwrap();
 
-        let files = StaticFiles::new()
+        let target = StaticFiles::new()
             .from("static")
             .to("pkg")
-            .include(["runtime/**", "README.md"])
-            .cache_input_files(&Cx::new(&root))
-            .unwrap();
+            .include(["runtime/**", "README.md"]);
+        let files = target.cache_input_files(&Cx::new(&root)).unwrap();
+        assert_eq!(
+            target.verified_noop_input_files(&Cx::new(&root)).unwrap(),
+            Some(files.clone())
+        );
+        assert_eq!(
+            target.verified_noop_input_roots(&Cx::new(&root)).unwrap(),
+            Some(vec![root.join("static")])
+        );
         let rels: Vec<_> = files
             .iter()
             .map(|path| {

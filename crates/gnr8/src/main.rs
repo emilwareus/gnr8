@@ -676,6 +676,10 @@ struct VerifiedNoopStamp {
     #[serde(default)]
     tool_files: Vec<gnr8::sdk::FileStamp>,
     #[serde(default)]
+    pipeline_files: Vec<gnr8::sdk::FileStamp>,
+    #[serde(default)]
+    pipeline_roots: Vec<String>,
+    #[serde(default)]
     output_files: Vec<gnr8::sdk::FileStamp>,
     diagnostics: Vec<gnr8::graph::Diagnostic>,
 }
@@ -704,6 +708,7 @@ struct VerifiedInputStamps {
     source: Vec<gnr8::sdk::FileStamp>,
     config: Vec<gnr8::sdk::FileStamp>,
     tools: Vec<gnr8::sdk::FileStamp>,
+    pipeline: Vec<gnr8::sdk::FileStamp>,
 }
 
 struct CachedNoop {
@@ -714,6 +719,9 @@ struct CachedNoop {
 }
 
 fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
+    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
+        return None;
+    }
     let stamp = load_verified_noop_stamp(root)?;
     if stamp.cli_version != env!("CARGO_PKG_VERSION")
         || stamp.core_version != env!("CARGO_PKG_VERSION")
@@ -729,15 +737,19 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
     let source_fast = collect_declared_input_fast_stamps(root, &stamp.input_roots)?;
     let config_fast = collect_required_config_fast_stamps(root)?;
     let tool_fast = fast_stamps_for_expected_files(root, &stamp.tool_files)?;
+    let pipeline_fast =
+        collect_pipeline_fast_stamps(root, &stamp.pipeline_roots, &stamp.pipeline_files)?;
     if content_stamps_from_fast(root, &source_fast)? != stamp.source_files
         || content_stamps_from_fast(root, &config_fast)? != stamp.config_files
         || content_stamps_from_fast(root, &tool_fast)? != stamp.tool_files
+        || content_stamps_from_fast(root, &pipeline_fast)? != stamp.pipeline_files
     {
         return None;
     }
     let mut current_inputs = source_fast;
     current_inputs.extend(config_fast);
     current_inputs.extend(tool_fast);
+    current_inputs.extend(pipeline_fast);
     current_inputs.sort();
     if current_inputs != stamp.input_fast_files {
         return None;
@@ -771,6 +783,9 @@ fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
 }
 
 fn pre_child_generate_verified_noop(root: &std::path::Path) -> Result<Option<CachedNoop>> {
+    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
+        return Ok(None);
+    }
     let Some(stamp) = load_verified_noop_stamp(root) else {
         return Ok(None);
     };
@@ -874,6 +889,9 @@ fn save_verified_noop_stamp_locked(
     metadata: &[gnr8::sdk::ArtifactMetadata],
     outcome: &gnr8::lifecycle::GenerateOutcome,
 ) {
+    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
+        return;
+    }
     if cleanup_verified_noop_temporary_files(root).is_err() {
         return;
     }
@@ -886,6 +904,8 @@ fn save_verified_noop_stamp_locked(
     if bundle.cache_input_roots.is_empty()
         || bundle.cache_input_stamps.is_empty()
         || bundle.cache_config_stamps.is_empty()
+        || !bundle.cache_config_complete
+        || !bundle.cache_pipeline_complete
         || bundle.cache_tool_stamps.is_empty()
     {
         return;
@@ -928,6 +948,8 @@ fn save_verified_noop_stamp_locked(
         source_files: inputs.source,
         config_files: inputs.config,
         tool_files: inputs.tools,
+        pipeline_files: inputs.pipeline,
+        pipeline_roots: bundle.cache_pipeline_roots.clone(),
         output_files,
         diagnostics: bundle.diagnostics.clone(),
     };
@@ -963,9 +985,19 @@ fn collect_verified_input_stamps(
     if tools != bundle.cache_tool_stamps {
         return None;
     }
+    let pipeline_fast = collect_pipeline_fast_stamps(
+        root,
+        &bundle.cache_pipeline_roots,
+        &bundle.cache_pipeline_stamps,
+    )?;
+    let pipeline = content_stamps_from_fast(root, &pipeline_fast)?;
+    if pipeline != bundle.cache_pipeline_stamps {
+        return None;
+    }
     let mut fast = source_fast;
     fast.extend(config_fast);
     fast.extend(tool_fast);
+    fast.extend(pipeline_fast);
     fast.sort();
     let all = content_stamps_from_fast(root, &fast)?;
     Some(VerifiedInputStamps {
@@ -974,6 +1006,7 @@ fn collect_verified_input_stamps(
         source,
         config,
         tools,
+        pipeline,
     })
 }
 
@@ -1186,30 +1219,20 @@ fn collect_declared_input_fast_stamps(
     }
     let mut stamps = Vec::new();
     for input_root in input_roots {
-        collect_hot_input_file_stamps(root, &root.join(input_root), &mut stamps)?;
+        let path = root.join(input_root);
+        if path.is_file() {
+            push_fast_file_stamp(root, &path, &mut stamps)?;
+        } else {
+            collect_hot_input_file_stamps(root, &path, &mut stamps)?;
+        }
     }
     stamps.sort();
     Some(stamps)
 }
 
 fn collect_required_config_fast_stamps(root: &std::path::Path) -> Option<Vec<FastFileStamp>> {
-    let gnr8_dir = root.join(".gnr8");
-    let mut stamps = Vec::new();
-    collect_hot_input_file_stamps(root, &gnr8_dir.join("src"), &mut stamps)?;
-    let cargo_toml = gnr8_dir.join("Cargo.toml");
-    if !cargo_toml.is_file() {
-        return None;
-    }
-    push_fast_file_stamp(root, &cargo_toml, &mut stamps)?;
-    let cargo_lock = gnr8_dir.join("Cargo.lock");
-    if cargo_lock.exists() {
-        if !cargo_lock.is_file() {
-            return None;
-        }
-        push_fast_file_stamp(root, &cargo_lock, &mut stamps)?;
-    }
-    stamps.sort();
-    Some(stamps)
+    let paths = gnr8::sdk::cache_config_input_paths(root)?;
+    stamp_fast_project_files(root, &paths)
 }
 
 fn fast_stamps_for_expected_files(
@@ -1217,13 +1240,27 @@ fn fast_stamps_for_expected_files(
     expected: &[gnr8::sdk::FileStamp],
 ) -> Option<Vec<FastFileStamp>> {
     if expected.is_empty() {
-        return None;
+        return Some(Vec::new());
     }
     let paths = expected
         .iter()
         .map(|stamp| root.join(&stamp.path))
         .collect::<Vec<_>>();
     stamp_fast_project_files(root, &paths)
+}
+
+fn collect_pipeline_fast_stamps(
+    root: &std::path::Path,
+    input_roots: &[String],
+    expected: &[gnr8::sdk::FileStamp],
+) -> Option<Vec<FastFileStamp>> {
+    let mut stamps = fast_stamps_for_expected_files(root, expected)?;
+    if !input_roots.is_empty() {
+        stamps.extend(collect_declared_input_fast_stamps(root, input_roots)?);
+    }
+    stamps.sort();
+    stamps.dedup();
+    Some(stamps)
 }
 
 fn collect_hot_input_file_stamps(
@@ -2491,6 +2528,8 @@ mod tests {
             source_files: Vec::new(),
             config_files: Vec::new(),
             tool_files: Vec::new(),
+            pipeline_files: Vec::new(),
+            pipeline_roots: Vec::new(),
             output_files: Vec::new(),
             diagnostics: Vec::new(),
         };
@@ -2595,6 +2634,10 @@ mod tests {
             cache_input_roots: vec!["service".to_string()],
             cache_input_stamps: child_stamps,
             cache_config_stamps: config_stamps,
+            cache_config_complete: true,
+            cache_pipeline_stamps: Vec::new(),
+            cache_pipeline_roots: Vec::new(),
+            cache_pipeline_complete: true,
             cache_tool_stamps: tool_stamps,
         };
         let outcome = gnr8::lifecycle::GenerateOutcome {
@@ -2608,6 +2651,108 @@ mod tests {
         super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
 
         assert!(!super::verified_noop_stamp_path(&root).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn arbitrary_runtime_inputs_keep_the_pre_child_noop_disabled() {
+        let root = temp_root("static-input-invalidates-noop");
+        gnr8::workspace::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("service")).unwrap();
+        let source = root.join("service/input.go");
+        std::fs::write(&source, "stable-source").unwrap();
+        let source_stamps =
+            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&source)).unwrap();
+        let (config_stamps, tool_stamps) = cache_snapshots(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let static_input = root.join("assets/template.txt");
+        std::fs::write(&static_input, "version-a").unwrap();
+        let pipeline_stamps =
+            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&static_input)).unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(root.join("generated/template.txt"), "version-a").unwrap();
+        let output_hash = gnr8::manifest::blake3_hex(b"version-a");
+        let mut manifest = gnr8::manifest::Manifest::default();
+        manifest.record("generated/template.txt", &output_hash, "generated");
+        manifest.save(&root.join(".gnr8")).unwrap();
+        let bundle = gnr8::runner::ArtifactBundle {
+            protocol_version: gnr8::runner::PROTOCOL_VERSION,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            core_version: env!("CARGO_PKG_VERSION").to_string(),
+            capability_fingerprint: gnr8::runner::capability_fingerprint(),
+            artifacts: vec![Artifact::new("generated/template.txt", "version-a")],
+            diagnostics: Vec::new(),
+            output_anchors: vec!["generated".to_string()],
+            readiness_targets: Vec::new(),
+            artifact_cache_key: Some("static-input-key".to_string()),
+            cache_input_roots: vec!["service".to_string()],
+            cache_input_stamps: source_stamps,
+            cache_config_stamps: config_stamps,
+            cache_config_complete: true,
+            cache_pipeline_stamps: pipeline_stamps,
+            cache_pipeline_roots: vec!["assets".to_string()],
+            cache_pipeline_complete: true,
+            cache_tool_stamps: tool_stamps,
+        };
+        let outcome = gnr8::lifecycle::GenerateOutcome {
+            written: Vec::new(),
+            unchanged: vec!["generated/template.txt".to_string()],
+            skipped: Vec::new(),
+            deleted: Vec::new(),
+        };
+
+        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
+        assert!(super::pre_child_verified_noop(&root).is_none());
+
+        std::fs::write(root.join("assets/added.txt"), "new-static-input").unwrap();
+        assert!(super::pre_child_verified_noop(&root).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pure_file_backed_pipeline_still_runs_child_without_whole_config_contract() {
+        let root = temp_root("empty-pipeline-inputs-noop");
+        gnr8::workspace::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("service")).unwrap();
+        let source = root.join("service/input.yaml");
+        std::fs::write(&source, "openapi: 3.1.0\n").unwrap();
+        let source_stamps =
+            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&source)).unwrap();
+        let (config_stamps, tool_stamps) = cache_snapshots(&root);
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(root.join("generated/openapi.yaml"), "openapi: 3.1.0\n").unwrap();
+        let output_hash = gnr8::manifest::blake3_hex(b"openapi: 3.1.0\n");
+        let mut manifest = gnr8::manifest::Manifest::default();
+        manifest.record("generated/openapi.yaml", &output_hash, "generated");
+        manifest.save(&root.join(".gnr8")).unwrap();
+        let bundle = gnr8::runner::ArtifactBundle {
+            protocol_version: gnr8::runner::PROTOCOL_VERSION,
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            core_version: env!("CARGO_PKG_VERSION").to_string(),
+            capability_fingerprint: gnr8::runner::capability_fingerprint(),
+            artifacts: vec![Artifact::new("generated/openapi.yaml", "openapi: 3.1.0\n")],
+            diagnostics: Vec::new(),
+            output_anchors: vec!["generated".to_string()],
+            readiness_targets: Vec::new(),
+            artifact_cache_key: Some("empty-pipeline-key".to_string()),
+            cache_input_roots: vec!["service".to_string()],
+            cache_input_stamps: source_stamps,
+            cache_config_stamps: config_stamps,
+            cache_config_complete: true,
+            cache_pipeline_stamps: Vec::new(),
+            cache_pipeline_roots: Vec::new(),
+            cache_pipeline_complete: true,
+            cache_tool_stamps: tool_stamps,
+        };
+        let outcome = gnr8::lifecycle::GenerateOutcome {
+            written: Vec::new(),
+            unchanged: vec!["generated/openapi.yaml".to_string()],
+            skipped: Vec::new(),
+            deleted: Vec::new(),
+        };
+
+        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
+        assert!(super::pre_child_verified_noop(&root).is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2640,6 +2785,10 @@ mod tests {
             cache_input_roots: vec!["service".to_string()],
             cache_input_stamps: child_stamps,
             cache_config_stamps: config_stamps,
+            cache_config_complete: true,
+            cache_pipeline_stamps: Vec::new(),
+            cache_pipeline_roots: Vec::new(),
+            cache_pipeline_complete: true,
             cache_tool_stamps: tool_stamps,
         };
         let outcome = gnr8::lifecycle::GenerateOutcome {
@@ -2684,6 +2833,10 @@ mod tests {
             cache_input_roots: vec!["service".to_string()],
             cache_input_stamps: child_stamps,
             cache_config_stamps: config_stamps,
+            cache_config_complete: true,
+            cache_pipeline_stamps: Vec::new(),
+            cache_pipeline_roots: Vec::new(),
+            cache_pipeline_complete: true,
             cache_tool_stamps: tool_stamps,
         };
         let outcome = gnr8::lifecycle::GenerateOutcome {

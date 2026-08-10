@@ -27,7 +27,12 @@ use crate::CoreError;
 /// the host (the `gnr8` binary) rejects a bundle whose `protocol_version` differs from this, so a `.gnr8/`
 /// crate built against a skewed `gnr8-core` fails with an actionable error instead of a confusing
 /// parse error or silently-wrong output (forward/back-compat across the boundary).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+/// Whether the host may skip starting the Rust code-as-config child from a prior local stamp.
+///
+/// Disabled because arbitrary Rust used to construct a pipeline may read non-file runtime inputs
+/// that a host cannot prove unchanged. Cargo and bounded source-analysis caches remain available.
+pub const PRE_CHILD_NOOP_SUPPORTED: bool = false;
 
 /// Environment variables carried from the host into the generation child.
 pub const HOST_PROTOCOL_ENV: &str = "GNR8_HOST_PROTOCOL_VERSION";
@@ -90,6 +95,18 @@ pub struct ArtifactBundle {
     /// User `.gnr8/` configuration file stamps captured by the generation child.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_config_stamps: Vec<FileStamp>,
+    /// Whether those stamps cover every supported Cargo code input for pre-child skipping.
+    #[serde(default)]
+    pub cache_config_complete: bool,
+    /// Transform, target, and post-process file inputs captured by the generation child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_pipeline_stamps: Vec<FileStamp>,
+    /// Stage input roots whose recursive membership must be rescanned by the host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_pipeline_roots: Vec<String>,
+    /// Whether every pipeline stage declared a complete host-verifiable input surface.
+    #[serde(default)]
+    pub cache_pipeline_complete: bool,
     /// Child executable and bundled extractor stamps captured by the generation child.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_tool_stamps: Vec<FileStamp>,
@@ -219,32 +236,27 @@ fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
     let input_stamps_before = pipeline.cache_input_stamps(cx);
     let config_stamps_before = crate::sdk::cache_config_input_stamps(cx);
     let tool_stamps_before = crate::sdk::cache_tool_input_stamps(cx);
+    let pipeline_inputs_before = pipeline.artifact_cache_inputs(cx)?;
     let outcome = pipeline.run_for_emit(cx)?;
     let input_stamps_after = pipeline.cache_input_stamps(cx);
     let config_stamps_after = crate::sdk::cache_config_input_stamps(cx);
+    let cache_config_complete = crate::sdk::cache_config_inputs_complete(cx);
     let tool_stamps_after = crate::sdk::cache_tool_input_stamps(cx);
+    let pipeline_inputs_after = pipeline.artifact_cache_inputs(cx)?;
     let stable_snapshot = input_stamps_before == input_stamps_after
-        && config_stamps_before.is_some()
         && config_stamps_before == config_stamps_after
-        && tool_stamps_before.is_some()
-        && tool_stamps_before == tool_stamps_after;
-    let mut artifacts = outcome.artifacts.into_files();
-    if !stable_snapshot && outcome.artifact_cache_hit {
-        let key = outcome
-            .artifact_cache_key
-            .as_deref()
-            .ok_or_else(|| CoreError::SdkGen {
-                message: "artifact cache hit did not carry its cache key".to_string(),
-            })?;
-        artifacts =
-            crate::sdk::load_artifact_cache_files(&cx.project_root, key).ok_or_else(|| {
-                CoreError::SdkGen {
-                    message: format!(
-                    "artifact cache {key} changed while materializing an unstable source snapshot"
-                ),
-                }
-            })?;
+        && tool_stamps_before == tool_stamps_after
+        && pipeline_inputs_before == pipeline_inputs_after;
+    if !stable_snapshot {
+        if let Some(key) = outcome.artifact_cache_key.as_deref() {
+            crate::sdk::discard_artifact_cache(&cx.project_root, key)?;
+        }
+        return Err(CoreError::SdkGen {
+            message: "generation inputs changed while the pipeline was running; no outputs were accepted — rerun generate"
+                .to_string(),
+        });
     }
+    let artifacts = outcome.artifacts.into_files();
     let bundle = ArtifactBundle {
         protocol_version: PROTOCOL_VERSION,
         cli_version: host_cli_version(),
@@ -254,25 +266,15 @@ fn emit(pipeline: &Pipeline, cx: &Cx) -> Result<String, CoreError> {
         diagnostics: outcome.diagnostics,
         output_anchors: pipeline.output_anchors(),
         readiness_targets: pipeline.readiness_targets(),
-        artifact_cache_key: stable_snapshot
-            .then_some(outcome.artifact_cache_key)
-            .flatten(),
+        artifact_cache_key: outcome.artifact_cache_key,
         cache_input_roots,
-        cache_input_stamps: if stable_snapshot {
-            input_stamps_after
-        } else {
-            Vec::new()
-        },
-        cache_config_stamps: if stable_snapshot {
-            config_stamps_after.unwrap_or_default()
-        } else {
-            Vec::new()
-        },
-        cache_tool_stamps: if stable_snapshot {
-            tool_stamps_after.unwrap_or_default()
-        } else {
-            Vec::new()
-        },
+        cache_input_stamps: input_stamps_after,
+        cache_config_stamps: config_stamps_after.unwrap_or_default(),
+        cache_config_complete,
+        cache_pipeline_complete: PRE_CHILD_NOOP_SUPPORTED && pipeline_inputs_after.complete,
+        cache_pipeline_roots: Vec::new(),
+        cache_pipeline_stamps: Vec::new(),
+        cache_tool_stamps: tool_stamps_after.unwrap_or_default(),
     };
     serde_json::to_string(&bundle).map_err(|err| CoreError::SdkGen {
         message: format!("failed to serialize the artifact bundle: {err}"),
@@ -316,6 +318,7 @@ mod tests {
 
     use super::{capability_fingerprint, emit, inspect, ArtifactBundle, PROTOCOL_VERSION};
     use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
+    use crate::sdk::builtins::{OpenApi, OpenApi31};
     use crate::sdk::{Artifacts, Cx, Pipeline, ReadinessKind, ReadinessTarget, Source, Target};
     use crate::CoreError;
 
@@ -343,6 +346,13 @@ mod tests {
 
     struct StubTarget;
     impl Target for StubTarget {
+        fn verified_noop_input_files(
+            &self,
+            _cx: &Cx,
+        ) -> Result<Option<Vec<std::path::PathBuf>>, CoreError> {
+            Ok(Some(Vec::new()))
+        }
+
         fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
             out.create("generated/openapi.yaml", "openapi: 3.1.0\n")
         }
@@ -352,6 +362,37 @@ mod tests {
                 ReadinessKind::OpenApi,
                 "generated/openapi.yaml",
             )]
+        }
+    }
+
+    struct MutatingDeclaredTarget {
+        input: std::path::PathBuf,
+    }
+
+    impl Target for MutatingDeclaredTarget {
+        fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+            let text = std::fs::read_to_string(&self.input).map_err(|err| CoreError::Io {
+                message: err.to_string(),
+            })?;
+            out.create("generated/static.txt", text)?;
+            std::fs::write(&self.input, "after").map_err(|err| CoreError::Io {
+                message: err.to_string(),
+            })
+        }
+
+        fn verified_noop_input_files(
+            &self,
+            _cx: &Cx,
+        ) -> Result<Option<Vec<std::path::PathBuf>>, CoreError> {
+            Ok(Some(vec![self.input.clone()]))
+        }
+    }
+
+    struct IncompleteTarget;
+
+    impl Target for IncompleteTarget {
+        fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+            out.create("generated/incomplete.txt", "fixed")
         }
     }
 
@@ -401,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_disables_cache_reference_when_inputs_change_during_generation() {
+    fn emit_rejects_inputs_that_change_during_generation_and_discards_the_cache() {
         let root =
             std::env::temp_dir().join(format!("gnr8-runner-snapshot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -413,41 +454,35 @@ mod tests {
             mutate_on_load: std::rc::Rc::new(std::cell::Cell::new(true)),
         });
 
-        let json = emit(&pipeline, &Cx::new(&root)).unwrap();
-        let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
+        let err = emit(&pipeline, &Cx::new(&root)).unwrap_err();
 
-        assert!(bundle.artifact_cache_key.is_none());
-        assert!(bundle.cache_input_stamps.is_empty());
-        assert_eq!(bundle.cache_input_roots, vec!["src"]);
+        assert!(err.to_string().contains("generation inputs changed"));
+        let cache_dir = root.join(".gnr8/cache/artifacts");
+        assert!(
+            !cache_dir.exists() || std::fs::read_dir(cache_dir).unwrap().next().is_none(),
+            "unstable runs must not retain artifact cache entries"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn unstable_compact_cache_hit_materializes_artifacts_before_dropping_its_key() {
-        let root =
-            std::env::temp_dir().join(format!("gnr8-runner-unstable-hit-{}", std::process::id()));
+    fn known_target_inputs_remain_bracketed_in_a_mixed_incomplete_pipeline() {
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-runner-mixed-target-snapshot-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        let input = root.join("src/input.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("static.txt");
         std::fs::write(&input, "before").unwrap();
-        let mutate_on_load = std::rc::Rc::new(std::cell::Cell::new(false));
         let pipeline = Pipeline::new()
-            .source(MutatingSource {
-                input,
-                mutate_on_load: mutate_on_load.clone(),
-            })
-            .target(StubTarget);
+            .source(StubSource)
+            .target(MutatingDeclaredTarget { input })
+            .target(IncompleteTarget);
 
-        let warm = pipeline.run_for_emit(&Cx::new(&root)).unwrap();
-        assert!(!warm.artifact_cache_hit);
-        mutate_on_load.set(true);
+        let err = emit(&pipeline, &Cx::new(&root)).unwrap_err();
 
-        let json = emit(&pipeline, &Cx::new(&root)).unwrap();
-        let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
-
-        assert!(bundle.artifact_cache_key.is_none());
-        assert_eq!(bundle.artifacts.len(), 1);
-        assert_eq!(bundle.artifacts[0].path, "generated/openapi.yaml");
+        assert!(err.to_string().contains("generation inputs changed"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -474,6 +509,37 @@ mod tests {
                 "generated/openapi.yaml",
             )]
         );
+        assert!(
+            !bundle.cache_pipeline_complete,
+            "a custom target must explicitly declare a host-verifiable input surface"
+        );
+    }
+
+    #[test]
+    fn file_backed_pipeline_does_not_bypass_arbitrary_rust_construction() {
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-runner-openapi-noop-surface-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.1.0\ninfo:\n  title: Test\n  version: 1.0.0\npaths: {}\n",
+        )
+        .unwrap();
+        let pipeline = Pipeline::new()
+            .source(OpenApi::new().input("openapi.yaml"))
+            .target(OpenApi31::new().to("generated/openapi.yaml"));
+
+        let json = emit(&pipeline, &Cx::new(&root)).unwrap();
+        let bundle: ArtifactBundle = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(bundle.cache_input_stamps.len(), 1);
+        assert!(!bundle.cache_pipeline_complete);
+        assert!(bundle.cache_pipeline_stamps.is_empty());
+        assert!(bundle.cache_pipeline_roots.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

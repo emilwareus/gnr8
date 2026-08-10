@@ -271,12 +271,39 @@ pub fn plan_metadata_writes(
 }
 
 fn recorded_hash_for_path<'a>(manifest: &'a Manifest, path: &str) -> Option<&'a str> {
-    let identity = portable_path_identity(path).ok()?;
-    manifest.files.iter().find_map(|entry| {
-        portable_path_identity(&entry.path)
-            .is_ok_and(|candidate| candidate == identity)
-            .then_some(entry.hash.as_str())
-    })
+    manifest.recorded_hash(path)
+}
+
+fn reconcile_manifest_path_aliases<'a>(
+    project_dir: &Dir,
+    manifest: &mut Manifest,
+    current_paths: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    let mut renamed = false;
+    for path in current_paths {
+        if manifest.recorded_hash(path).is_some() {
+            continue;
+        }
+        let Some(identity) = portable_path_identity(path).ok() else {
+            continue;
+        };
+        let Some(index) = manifest.files.iter().position(|entry| {
+            portable_path_identity(&entry.path).is_ok_and(|candidate| candidate == identity)
+        }) else {
+            continue;
+        };
+        let previous = manifest.files[index].path.clone();
+        if output_paths_are_same_directory_entry(project_dir, &previous, path)? {
+            manifest.files[index].path = path.to_string();
+            renamed = true;
+        }
+    }
+    if renamed {
+        manifest
+            .files
+            .sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    Ok(())
 }
 
 fn validate_manifest_paths(manifest: &Manifest) -> Result<(), crate::CoreError> {
@@ -369,6 +396,12 @@ pub fn apply_writes_with_anchors(
     validate_write_plan(project_root, plan)?;
     let mut out = GenerateOutcome::default();
     let project_dir = open_project_dir(project_root)?;
+    reconcile_manifest_path_aliases(
+        &project_dir,
+        manifest,
+        plan.files.iter().map(|file| file.path.as_str()),
+    )
+    .map_err(recovery_io_error)?;
     for file in &plan.files {
         let safe = safe_output_path(project_root, &file.path)?;
         let recovered_hash =
@@ -2391,8 +2424,15 @@ pub fn plan_only(
     artifacts: &[Artifact],
 ) -> Result<WritePlan, crate::CoreError> {
     validate_output_paths(project_root, artifacts)?;
-    let manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
+    let mut manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
     validate_manifest_paths(&manifest)?;
+    let project_dir = open_project_dir(project_root)?;
+    reconcile_manifest_path_aliases(
+        &project_dir,
+        &mut manifest,
+        artifacts.iter().map(|artifact| artifact.path.as_str()),
+    )
+    .map_err(recovery_io_error)?;
     let disk = read_artifacts_from_disk(project_root, artifacts)?;
     let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
     Ok(plan_writes(artifacts, &manifest, &on_disk))
@@ -2411,8 +2451,15 @@ pub fn plan_only_cached(
     artifacts: &[ArtifactMetadata],
 ) -> Result<WritePlan, crate::CoreError> {
     validate_metadata_output_paths(project_root, artifacts)?;
-    let manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
+    let mut manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
     validate_manifest_paths(&manifest)?;
+    let project_dir = open_project_dir(project_root)?;
+    reconcile_manifest_path_aliases(
+        &project_dir,
+        &mut manifest,
+        artifacts.iter().map(|artifact| artifact.path.as_str()),
+    )
+    .map_err(recovery_io_error)?;
     let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts)?;
     let on_disk_hash =
         move |path: &str| -> Option<String> { disk_hashes.get(path).cloned().flatten() };
@@ -2463,6 +2510,12 @@ pub fn regenerate_with_anchors(
     let gnr8_dir = project_root.join(WORKSPACE_DIR);
     let mut manifest = manifest::load(&gnr8_dir)?;
     validate_manifest_paths(&manifest)?;
+    reconcile_manifest_path_aliases(
+        &operation.project_dir,
+        &mut manifest,
+        artifacts.iter().map(|artifact| artifact.path.as_str()),
+    )
+    .map_err(recovery_io_error)?;
 
     let disk = read_artifacts_from_disk(project_root, artifacts)?;
     let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
@@ -2513,6 +2566,12 @@ pub fn regenerate_cached_with_anchors(
     let gnr8_dir = project_root.join(WORKSPACE_DIR);
     let mut manifest = manifest::load(&gnr8_dir)?;
     validate_manifest_paths(&manifest)?;
+    reconcile_manifest_path_aliases(
+        &operation.project_dir,
+        &mut manifest,
+        artifacts.iter().map(|artifact| artifact.path.as_str()),
+    )
+    .map_err(recovery_io_error)?;
 
     let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts)?;
     let on_disk_hash =

@@ -107,6 +107,10 @@ Possible future work:
 
 ## Cache Iteration
 
+> Historical experiment: the artifact-reuse portions below are disabled in the current
+> implementation because arbitrary Rust target configuration is not captured by the key. The source
+> analysis cache remains active.
+
 After the SDK shape migration, the realistic target grew substantially:
 
 - about 6,300 generated artifacts across OpenAPI, Go, Python, and TypeScript outputs
@@ -184,6 +188,9 @@ Remaining opportunities:
 
 ## Hot No-Op Iteration
 
+> Historical experiment: direct child execution, verified pre-child skipping, and artifact reuse
+> described below are disabled. Current commands always use `cargo run`; see Cross-Run Skip Boundary.
+
 The next pass focused on the realistic edit loop: repeated generation after no source, config, or
 output changes. The goal was to stop doing work just to prove no work was needed.
 
@@ -252,50 +259,14 @@ Remaining opportunities:
   package subset changed.
 - A compact diagnostics mode would reduce the remaining 0.92 MB child payload on large APIs.
 
-## Pre-Child No-Op Iteration
+## Cross-Run Skip Boundary
 
-The previous fast path still started the child on every run. The next improvement was to let the host
-prove a no-op before process startup.
-
-Changes:
-
-1. Source input roots
-
-   `Source` now has an opt-in `cache_input_roots` hook. Built-in Go/Gin sources declare their configured
-   source root, while custom sources default to conservative behavior and keep using the child path.
-
-2. Child-emitted input stamps
-
-   The artifact bundle now carries source input roots and metadata-only file stamps. The host combines
-   those with `.gnr8` config files and the current host executable when writing the verified no-op stamp.
-
-3. Host pre-child verification
-
-   On the next run, the host rescans the recorded input roots and output tree by path/length/mtime. If
-   both match the stamp, `gnr8 generate` returns the no-op outcome without starting the child process,
-   deserializing diagnostics, loading artifacts, or hashing generated outputs.
-
-4. Scratch-directory exclusion
-
-   `.context` is now excluded from source/cache scans alongside `.git`, `.gnr8`, `node_modules`,
-   `target`, `vendor`, and `__pycache__`. This avoids invalidating generation from workspace scratch
-   files under a source root.
-
-Measured impact on the same realistic target:
-
-| Scenario | Previous best | After |
-| --- | ---: | ---: |
-| Hot no-op `gnr8 generate --force` | 0.83-0.86s | 0.19-0.23s |
-| Hot no-op `gnr8 check` | 1.08-1.31s | 0.21s |
-| After source mtime touch | 0.92-1.24s for the invalidating run, then 0.20s again |
-
-Invalidation probes:
-
-- Touching a real source file missed the pre-child path, ran the child/cache verification path, reported
-  `0 written, 6298 unchanged, 0 deleted, 0 skipped`, refreshed the input stamp, and the following run
-  returned to 0.20s.
-- Touching a generated output still misses the output stamp and falls back to hash verification before
-  restamping.
+Every command currently starts the Rust generation child. Code-as-config may read environment, time,
+network, or arbitrary files while constructing sources, transforms, and targets; file stamps alone
+cannot prove that effective pipeline unchanged. For the same reason, cross-run artifact reuse is
+disabled until stages can provide a complete deterministic behavior fingerprint. Cargo's build cache
+and the bounded source-analysis caches remain active, while output planning still avoids rewriting
+byte-identical files.
 
 Validation after this pass:
 

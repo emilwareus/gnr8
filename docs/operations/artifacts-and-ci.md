@@ -18,12 +18,12 @@ gnr8 host
   └─ write/check plan
 ```
 
-The current bundle protocol is version 3 and carries:
+The current bundle protocol is version 4 and carries:
 
 - protocol, host CLI, child core version, and capability fingerprint;
 - sorted artifacts with producer/ownership/rewrite history;
 - structured diagnostics, target output anchors, and explicitly declared readiness targets;
-- artifact cache key, input roots, and input file stamps.
+- source, configuration, and tool snapshots used to reject inputs that change during a run.
 
 Handshake environment variables are `GNR8_HOST_PROTOCOL_VERSION`, `GNR8_HOST_CLI_VERSION`, and
 `GNR8_HOST_CAPABILITY_FINGERPRINT`. A mismatch fails before output is trusted and instructs the user
@@ -98,11 +98,17 @@ an explicit script/program that performs discovery.
 | `.gnr8/target/` | compiled project-local generator | no |
 | `.gnr8/cache/manifest.json` | generated ownership hashes | no |
 | `.gnr8/cache/sources/` | source analysis cache | no |
-| `.gnr8/cache/artifacts/` | artifact text/metadata cache | no |
-| `.gnr8/cache/verified-noop.json` | hot no-op validation stamp | no |
+| `.gnr8/cache/artifacts/` | reserved; cross-run artifact reuse is disabled | no |
+| `.gnr8/cache/verified-noop.json` | reserved; ignored while pre-child skipping is disabled | no |
 
-Cache hits may skip compilation, extraction, or rendering after validating inputs/outputs. Deleting
-cache is safe; the next run recomputes it.
+Source cache hits may skip extraction inside a normal child run after validating their bounded inputs.
+Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:
+Rust code-as-config may read environment, time, network, or arbitrary files while constructing the
+pipeline, and the host cannot prove those inputs unchanged. Every command therefore runs the child;
+Cargo's build cache and source-analysis caches retain the safe acceleration. Cross-run artifact reuse
+is also disabled because target configuration may be derived from the same arbitrary Rust inputs. If a monitored input
+changes during a run, the run is rejected and its disposable artifact-cache entry is removed; no
+mixed-snapshot outputs are accepted.
 
 ## GitHub Action
 

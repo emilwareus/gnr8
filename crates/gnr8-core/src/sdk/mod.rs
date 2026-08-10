@@ -49,6 +49,9 @@ use crate::manifest::blake3_hex;
 use crate::CoreError;
 
 static ARTIFACT_CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Effective target/post configuration may be computed from arbitrary Rust runtime inputs. Until
+// stages expose a complete deterministic behavior fingerprint, cross-run artifact reuse is unsafe.
+const ARTIFACT_CACHE_SUPPORTED: bool = false;
 
 pub(crate) fn is_internal_transaction_name(name: &str, suffix: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
@@ -249,7 +252,7 @@ pub struct ArtifactMetadata {
     pub hash: String,
 }
 
-/// A metadata-only file identity for hot no-op checks.
+/// A content-backed file identity for generation snapshot checks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct FileStamp {
     /// Project-relative file path.
@@ -480,12 +483,24 @@ pub trait Source {
     /// or the source fails to parse). Never panics.
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError>;
 
-    /// Roots that define this source's input surface for host-side hot no-op checks.
+    /// Roots that define this source's input surface for in-child snapshot checks.
     ///
-    /// Returning `None` disables the pre-child fast path for this source. Built-in sources with
-    /// explicit input directories implement this; custom sources are conservative by default.
+    /// Built-in sources with explicit input directories implement this; custom sources are
+    /// conservative by default.
     fn cache_input_roots(&self, _cx: &Cx) -> Option<Vec<PathBuf>> {
         None
+    }
+
+    /// External tool or project files that complete this source's host-verifiable input surface.
+    ///
+    /// Toolchain-backed and custom sources must either return every resolved dependency here or
+    /// conservatively use the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the source cannot enumerate its declared dependencies.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
     }
 }
 
@@ -502,6 +517,29 @@ pub trait Transform {
     /// Returns a typed [`CoreError`] if the transform cannot be applied (e.g. a rename that would
     /// collide). Never panics.
     fn apply(&self, ir: &mut ApiGraph, cx: &Cx) -> Result<(), CoreError>;
+
+    /// Project files this transform reads outside the frozen source graph.
+    ///
+    /// `Some(files)` declares a complete file-backed input surface. Custom transforms are
+    /// conservative by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the transform cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this transform reads.
+    ///
+    /// These roots are rescanned by the host, so additions and removals invalidate a no-op stamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the transform cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
 }
 
 /// A target: the frozen IR → [`Artifacts`]. Targets get `&ApiGraph` (read-only) — they never mutate
@@ -534,6 +572,29 @@ pub trait Target {
     /// Returns a typed [`CoreError`] when a configured input path is invalid or cannot be enumerated.
     fn cache_input_files(&self, _cx: &Cx) -> Result<Vec<PathBuf>, CoreError> {
         Ok(Vec::new())
+    }
+
+    /// Complete project-file input surface for rendering snapshot checks.
+    ///
+    /// This is separate from [`Target::cache_input_files`] because a custom target must explicitly
+    /// opt into being skipped before its code runs. `None` disables that optimization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the target cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this target reads.
+    ///
+    /// The host rescans these roots to catch files added after the child published its bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the target cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
     }
 
     /// The project-relative output path(s) this target writes — its **loop-safety anchors**.
@@ -623,6 +684,29 @@ pub trait PostProcess {
     fn cache_key_fragment(&self, _cx: &Cx) -> Result<Vec<u8>, CoreError> {
         Ok(Vec::new())
     }
+
+    /// Complete project-file input surface for rendering snapshot checks.
+    ///
+    /// `None` disables the optimization. This is the safe default for custom command-backed or
+    /// environment-sensitive post-processors whose behavior cannot be verified from project files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the post-processor cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this post-processor reads.
+    ///
+    /// The host rescans these roots to catch membership changes between generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the post-processor cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
 }
 
 /// The composed generation pipeline: the user builds this and hands it to [`crate::runner::run`].
@@ -636,6 +720,13 @@ pub struct Pipeline {
     transforms: Vec<Box<dyn Transform>>,
     targets: Vec<Box<dyn Target>>,
     posts: Vec<Box<dyn PostProcess>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactCacheInputs {
+    pub(crate) complete: bool,
+    pub(crate) roots: Vec<String>,
+    pub(crate) stamps: Vec<FileStamp>,
 }
 
 impl Pipeline {
@@ -698,7 +789,7 @@ impl Pipeline {
         targets
     }
 
-    /// Source input roots that are safe for the host to rescan before a hot no-op child skip.
+    /// Source input roots that can be bracketed before and after a child generation run.
     #[must_use]
     pub fn cache_input_roots(&self, cx: &Cx) -> Vec<String> {
         let mut roots = Vec::new();
@@ -726,9 +817,94 @@ impl Pipeline {
         }
         let mut paths = Vec::new();
         for root in roots {
-            collect_cache_input_files(&cx.project_root.join(root), &mut paths);
+            let path = cx.project_root.join(root);
+            if path.is_file() {
+                paths.push(path);
+            } else {
+                collect_cache_input_files(&path, &mut paths);
+            }
         }
         stamp_project_paths(&cx.project_root, &paths).unwrap_or_default()
+    }
+
+    /// Rescannable roots and content stamps for all declared pipeline inputs.
+    ///
+    /// The returned completeness bit is false when any stage lacks a complete file-backed surface;
+    /// known inputs are still returned so generation can reject changes during a run.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a stage's typed error when its declared inputs cannot be enumerated.
+    pub(crate) fn artifact_cache_inputs(&self, cx: &Cx) -> Result<ArtifactCacheInputs, CoreError> {
+        let mut complete = true;
+        let mut paths = Vec::new();
+        let mut roots = Vec::new();
+        for source in &self.sources {
+            match source.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+        }
+        for transform in &self.transforms {
+            match transform.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match transform.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        for target in &self.targets {
+            match target.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match target.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        for post in &self.posts {
+            match post.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match post.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        for root in &roots {
+            let mut root_paths = Vec::new();
+            if collect_verified_root_files_strict(root, &mut root_paths).is_some() {
+                paths.extend(root_paths);
+            } else {
+                complete = false;
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let mut stamps = Vec::new();
+        for path in paths {
+            if let Some(mut stamp) = stamp_project_paths(&cx.project_root, &[path]) {
+                stamps.append(&mut stamp);
+            } else {
+                complete = false;
+            }
+        }
+        stamps.sort();
+        let roots = roots
+            .iter()
+            .map(|root| project_relative_path(&cx.project_root, root))
+            .collect();
+        Ok(ArtifactCacheInputs {
+            complete,
+            roots,
+            stamps,
+        })
     }
 
     /// Run the pipeline through transforms only and return the frozen IR (no targets, no posts).
@@ -804,27 +980,38 @@ impl Pipeline {
         let ir = self.build_ir(cx)?;
         // Collect diagnostics off the frozen IR (clone so the borrow ends before targets read `ir`).
         let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
-        let target_inputs = self.target_cache_input_files(cx)?;
-        let post_cache_key = self.post_cache_key(cx)?;
-        let cache_key = artifact_cache_key(&ir, cx, &target_inputs, &post_cache_key)?;
-        if compact_cache_hit && artifact_cache_exists(cx, &cache_key) {
-            return Ok(RunOutcome {
-                artifacts: Artifacts::new(),
-                diagnostics,
-                artifact_cache_key: Some(cache_key),
-                artifact_cache_hit: true,
-            });
-        }
-        if let Some(cached) = load_artifact_cache(cx, &cache_key) {
-            if let Some(metadata) = artifact_metadata(&cached.artifacts) {
-                save_artifact_metadata_cache(cx, &cache_key, &metadata);
+        let cache_key = if ARTIFACT_CACHE_SUPPORTED && self.artifact_cache_inputs(cx)?.complete {
+            let target_inputs = self.target_cache_input_files(cx)?;
+            let post_cache_key = self.post_cache_key(cx)?;
+            Some(artifact_cache_key(
+                &ir,
+                cx,
+                &target_inputs,
+                &post_cache_key,
+            )?)
+        } else {
+            None
+        };
+        if let Some(cache_key) = cache_key.as_deref() {
+            if compact_cache_hit && artifact_cache_exists(cx, cache_key) {
+                return Ok(RunOutcome {
+                    artifacts: Artifacts::new(),
+                    diagnostics,
+                    artifact_cache_key: Some(cache_key.to_string()),
+                    artifact_cache_hit: true,
+                });
             }
-            return Ok(RunOutcome {
-                artifacts: Artifacts::from_files(cached.artifacts),
-                diagnostics,
-                artifact_cache_key: Some(cache_key),
-                artifact_cache_hit: true,
-            });
+            if let Some(cached) = load_artifact_cache(cx, cache_key) {
+                if let Some(metadata) = artifact_metadata(&cached.artifacts) {
+                    save_artifact_metadata_cache(cx, cache_key, &metadata);
+                }
+                return Ok(RunOutcome {
+                    artifacts: Artifacts::from_files(cached.artifacts),
+                    diagnostics,
+                    artifact_cache_key: Some(cache_key.to_string()),
+                    artifact_cache_hit: true,
+                });
+            }
         }
 
         let mut artifacts = Artifacts::new();
@@ -836,11 +1023,13 @@ impl Pipeline {
             artifacts.begin_stage(format!("post[{index}]:{}", post.producer()));
             post.run(&mut artifacts, cx)?;
         }
-        save_artifact_cache(cx, &cache_key, artifacts.files());
+        if let Some(cache_key) = cache_key.as_deref() {
+            save_artifact_cache(cx, cache_key, artifacts.files());
+        }
         Ok(RunOutcome {
             artifacts,
             diagnostics,
-            artifact_cache_key: Some(cache_key),
+            artifact_cache_key: cache_key,
             artifact_cache_hit: false,
         })
     }
@@ -936,6 +1125,38 @@ fn artifact_cache_exists(cx: &Cx, key: &str) -> bool {
 #[must_use]
 pub fn load_artifact_cache_files(project_root: &Path, key: &str) -> Option<Vec<Artifact>> {
     load_artifact_cache(&Cx::new(project_root.to_path_buf()), key).map(|cache| cache.artifacts)
+}
+
+/// Remove one exact disposable artifact-cache entry after a generation snapshot changed.
+///
+/// This is an internal host/runner seam. The key is validated before it is used as a file name.
+///
+/// # Errors
+///
+/// Returns a typed I/O error if a matching cache file exists but cannot be removed.
+#[doc(hidden)]
+pub fn discard_artifact_cache(root: &Path, key: &str) -> Result<(), CoreError> {
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CoreError::SdkGen {
+            message: format!("refusing to discard invalid artifact cache key {key:?}"),
+        });
+    }
+    let cx = Cx::new(root);
+    for path in [
+        artifact_cache_path(&cx, key),
+        artifact_metadata_cache_path(&cx, key),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    message: format!("failed to discard artifact cache {}: {err}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load cached artifact path/hash metadata for a child-emitted artifact-cache reference.
@@ -1227,8 +1448,31 @@ fn collect_cache_input_files_strict(dir: &Path, out: &mut Vec<PathBuf>) -> Optio
     Some(())
 }
 
-pub(crate) fn cache_config_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
-    let gnr8_dir = cx.project_root.join(crate::lifecycle::WORKSPACE_DIR);
+fn collect_verified_root_files_strict(dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
+            collect_verified_root_files_strict(&path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            // The stage may legitimately ignore symlinks or special entries. Such a tree remains
+            // generatable, but its membership is not safe for a host-side skip.
+            return None;
+        }
+    }
+    out.sort();
+    Some(())
+}
+
+/// Return the conventional Cargo inputs the host can safely monitor for `.gnr8` no-op decisions.
+#[doc(hidden)]
+#[must_use]
+pub fn cache_config_input_paths(project_root: &Path) -> Option<Vec<PathBuf>> {
+    let gnr8_dir = project_root.join(crate::lifecycle::WORKSPACE_DIR);
     let cargo_toml = gnr8_dir.join("Cargo.toml");
     if !cargo_toml.is_file() {
         return None;
@@ -1242,8 +1486,66 @@ pub(crate) fn cache_config_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
         }
         paths.push(cargo_lock);
     }
+    let build_rs = gnr8_dir.join("build.rs");
+    if build_rs.exists() {
+        if !build_rs.is_file() {
+            return None;
+        }
+        paths.push(build_rs);
+    }
+    for name in ["rust-toolchain", "rust-toolchain.toml"] {
+        let path = project_root.join(name);
+        if path.exists() {
+            if !path.is_file() {
+                return None;
+            }
+            paths.push(path);
+        }
+    }
+    for name in ["config", "config.toml"] {
+        let path = project_root.join(".cargo").join(name);
+        if path.exists() {
+            if !path.is_file() {
+                return None;
+            }
+            paths.push(path);
+        }
+    }
     paths.sort();
+    Some(paths)
+}
+
+pub(crate) fn cache_config_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
+    let paths = cache_config_input_paths(&cx.project_root)?;
     stamp_project_paths(&cx.project_root, &paths)
+}
+
+pub(crate) fn cache_config_inputs_complete(cx: &Cx) -> bool {
+    let gnr8_dir = cx.project_root.join(crate::lifecycle::WORKSPACE_DIR);
+    if gnr8_dir.join("build.rs").exists() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(gnr8_dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    !toml_contains_key(&value, "path")
+        && value
+            .get("package")
+            .and_then(|package| package.get("build"))
+            .is_none_or(|build| build.as_bool() == Some(false))
+}
+
+fn toml_contains_key(value: &toml::Value, needle: &str) -> bool {
+    match value {
+        toml::Value::Table(table) => table
+            .iter()
+            .any(|(key, value)| key == needle || toml_contains_key(value, needle)),
+        toml::Value::Array(values) => values.iter().any(|value| toml_contains_key(value, needle)),
+        _ => false,
+    }
 }
 
 pub(crate) fn cache_tool_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
@@ -1528,6 +1830,13 @@ mod tests {
         fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
             Ok(vec![cx.project_root.join(self.source)])
         }
+
+        fn verified_noop_input_files(
+            &self,
+            cx: &Cx,
+        ) -> Result<Option<Vec<std::path::PathBuf>>, CoreError> {
+            self.cache_input_files(cx).map(Some)
+        }
     }
 
     struct ReadinessOnlyTarget {
@@ -1683,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_cache_key_includes_target_cache_inputs() {
+    fn artifact_cache_stays_disabled_without_a_complete_behavior_fingerprint() {
         let root = temp_project("target-input-cache");
         std::fs::create_dir_all(root.join("static")).unwrap();
         std::fs::write(root.join("static/runtime.txt"), "one\n").unwrap();
@@ -1697,6 +2006,7 @@ mod tests {
             })
             .run(&cx)
             .unwrap();
+        assert!(first.artifact_cache_key.is_none());
         assert_eq!(first.artifacts.files()[0].text, "one\n");
 
         std::fs::write(root.join("static/runtime.txt"), "two\n").unwrap();
@@ -1711,34 +2021,40 @@ mod tests {
 
         assert!(
             !second.artifact_cache_hit,
-            "target input changes must invalidate artifact cache"
+            "pipelines without a complete behavior fingerprint must render normally"
         );
+        assert!(second.artifact_cache_key.is_none());
         assert_eq!(second.artifacts.files()[0].text, "two\n");
     }
 
     #[test]
-    fn truncated_artifact_cache_is_rebuilt_instead_of_becoming_a_permanent_hit() {
-        let root = temp_project("truncated-artifact-cache");
+    fn runtime_derived_target_configuration_cannot_reuse_another_targets_artifacts() {
+        let root = temp_project("target-config-cache-disabled");
         std::fs::create_dir_all(root.join("static")).unwrap();
         std::fs::write(root.join("static/runtime.txt"), "stable\n").unwrap();
         let cx = Cx::new(&root);
-        let pipeline = Pipeline::new().source(StubSource).target(CopyFileTarget {
-            source: "static/runtime.txt",
-            dest: "generated/runtime.txt",
-        });
 
-        let first = pipeline.run_for_emit(&cx).unwrap();
-        let key = first.artifact_cache_key.unwrap();
-        let cache_path = super::artifact_cache_path(&cx, &key);
-        std::fs::write(&cache_path, b"{\"artifacts\":").unwrap();
+        let first = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "out-a/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
+        let second = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "out-b/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
 
-        let rebuilt = pipeline.run_for_emit(&cx).unwrap();
-        assert!(!rebuilt.artifact_cache_hit);
-        assert_eq!(rebuilt.artifacts.files()[0].text, "stable\n");
-
-        let compact_hit = pipeline.run_for_emit(&cx).unwrap();
-        assert!(compact_hit.artifact_cache_hit);
-        assert!(compact_hit.artifacts.files().is_empty());
+        assert_eq!(first.artifacts.files()[0].path, "out-a/runtime.txt");
+        assert_eq!(second.artifacts.files()[0].path, "out-b/runtime.txt");
+        assert!(first.artifact_cache_key.is_none());
+        assert!(second.artifact_cache_key.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1774,6 +2090,34 @@ mod tests {
         drop(live_file);
         super::cleanup_artifact_cache_temporary_files(&root).unwrap();
         assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_snapshot_tracks_build_rs_but_disables_hot_skip_for_unbounded_cargo_inputs() {
+        let root = temp_project("config-input-policy");
+        std::fs::create_dir_all(root.join(".gnr8/src")).unwrap();
+        std::fs::write(root.join(".gnr8/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            root.join(".gnr8/Cargo.toml"),
+            "[package]\nname = \"config-test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let cx = Cx::new(&root);
+        assert!(super::cache_config_inputs_complete(&cx));
+
+        std::fs::write(root.join(".gnr8/build.rs"), "fn main() {}\n").unwrap();
+        let paths = super::cache_config_input_paths(&root).unwrap();
+        assert!(paths.contains(&root.join(".gnr8/build.rs")));
+        assert!(!super::cache_config_inputs_complete(&cx));
+
+        std::fs::remove_file(root.join(".gnr8/build.rs")).unwrap();
+        std::fs::write(
+            root.join(".gnr8/Cargo.toml"),
+            "[package]\nname = \"config-test\"\nversion = \"0.1.0\"\n\n[dependencies]\nlocal = { path = \"../local\" }\n",
+        )
+        .unwrap();
+        assert!(!super::cache_config_inputs_complete(&cx));
         let _ = std::fs::remove_dir_all(root);
     }
 

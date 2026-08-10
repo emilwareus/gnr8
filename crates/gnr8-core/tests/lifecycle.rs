@@ -519,26 +519,38 @@ fn case_only_output_rename_removes_distinct_old_spelling_without_deleting_an_ali
     let root = init_root("case-only-output-rename");
     lifecycle::regenerate(
         &root,
-        &[artifact("generated/Client.ts", "export const value = 1;\n")],
+        &[
+            artifact("generated/B.ts", "export const neighbor = 1;\n"),
+            artifact("generated/a.ts", "export const value = 1;\n"),
+        ],
         false,
     )
     .expect("write original spelling");
-    let filesystem_aliases_case = root.join("generated/client.ts").exists();
+    let filesystem_aliases_case = root.join("generated/b.ts").exists();
 
     let outcome = lifecycle::regenerate(
         &root,
-        &[artifact("generated/client.ts", "export const value = 1;\n")],
+        &[
+            artifact("generated/a.ts", "export const value = 1;\n"),
+            artifact("generated/b.ts", "export const neighbor = 1;\n"),
+        ],
         false,
     )
     .expect("reconcile case-only output rename");
 
     assert_eq!(
-        std::fs::read_to_string(root.join("generated/client.ts")).unwrap(),
-        "export const value = 1;\n"
+        std::fs::read_to_string(root.join("generated/b.ts")).unwrap(),
+        "export const neighbor = 1;\n"
     );
     let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
-    assert_eq!(manifest.files.len(), 1);
-    assert_eq!(manifest.files[0].path, "generated/client.ts");
+    assert_eq!(
+        manifest
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["generated/a.ts", "generated/b.ts"]
+    );
     let matching_entries = std::fs::read_dir(root.join("generated"))
         .unwrap()
         .filter_map(Result::ok)
@@ -546,17 +558,51 @@ fn case_only_output_rename_removes_distinct_old_spelling_without_deleting_an_ali
             entry
                 .file_name()
                 .to_string_lossy()
-                .eq_ignore_ascii_case("client.ts")
+                .eq_ignore_ascii_case("b.ts")
         })
         .count();
     assert_eq!(matching_entries, 1);
     if filesystem_aliases_case {
-        assert!(!outcome.deleted.contains(&"generated/Client.ts".to_string()));
+        assert!(!outcome.deleted.contains(&"generated/B.ts".to_string()));
     } else {
-        assert!(!root.join("generated/Client.ts").exists());
-        assert!(outcome.deleted.contains(&"generated/Client.ts".to_string()));
+        assert!(!root.join("generated/B.ts").exists());
+        assert!(outcome.deleted.contains(&"generated/B.ts".to_string()));
     }
 
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn portable_alias_does_not_transfer_ownership_to_a_distinct_case_sensitive_entry() {
+    let root = init_root("distinct-portable-alias");
+    std::fs::create_dir_all(root.join("SDK")).unwrap();
+    std::fs::write(root.join("SDK/client.go"), "owned-old").unwrap();
+    std::fs::create_dir_all(root.join("sdk")).unwrap();
+    if root.join("SDK/client.go") == root.join("sdk/client.go")
+        || std::fs::read(root.join("sdk/client.go")).is_ok()
+    {
+        let _ = std::fs::remove_dir_all(root);
+        return;
+    }
+    std::fs::write(root.join("sdk/client.go"), "owned-old").unwrap();
+    let old_hash = blake3_hex(b"owned-old");
+    let mut manifest = gnr8::manifest::Manifest::default();
+    manifest.record("SDK/client.go", &old_hash, "generated");
+    manifest.save(&root.join(".gnr8")).unwrap();
+
+    let outcome =
+        lifecycle::regenerate(&root, &[artifact("sdk/client.go", "generated-new")], false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("sdk/client.go")).unwrap(),
+        "owned-old",
+        "the distinct unowned spelling must not be overwritten"
+    );
+    assert_eq!(outcome.skipped, vec!["sdk/client.go"]);
+    assert!(!root.join("SDK/client.go").exists());
+    assert_eq!(outcome.deleted, vec!["SDK/client.go"]);
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    assert!(manifest.files.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
 
