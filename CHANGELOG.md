@@ -41,6 +41,8 @@ Adding an endpoint no longer requires a `.gnr8/` edit to document it.
   adopting byte-identical emitted files without rewriting them. Divergent files remain protected and
   make generation exit non-zero instead of reporting false success. `generate`, `check`, `doctor`, and
   `watch` now use the same classification rule, and verified no-op state cannot bypass ownership.
+- Ownership-manifest updates now atomically replace the prior manifest on Windows as well as Unix, so
+  a second generation can publish its reconciled ownership state on every supported platform.
 - `--force` now acts only on exact emitted or manifest-owned paths. It no longer recursively deletes
   unrelated files that happen to share an output directory.
 

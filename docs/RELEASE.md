@@ -76,6 +76,8 @@ remain standard-library-only.
    were breaking; check it before choosing.
 4. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
 5. Leave `publish_cli=true` to upload the CLI archives.
+   CLI publication requires `publish_crates=true`: generated projects pin the exact release version,
+   so the workflow waits for crates.io publication to succeed before it creates the GitHub Release.
 6. The workflow bumps the version, refreshes the root and example lockfiles, compile-checks that
    version-only commit, and pushes it with `vX.Y.Z`. The required focused CI jobs on `main` provide the
    behavioral gate; the dry-run workflow has already checked packaging and the unpacked archive.

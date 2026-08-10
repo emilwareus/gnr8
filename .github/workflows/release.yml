@@ -50,6 +50,16 @@ jobs:
       - name: Sync main
         run: git pull --rebase origin main
 
+      - name: Validate release selections
+        env:
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+          PUBLISH_CLI: ${{ inputs.publish_cli }}
+        run: |
+          if [[ "$PUBLISH_CLI" = true && "$PUBLISH_CRATES" != true ]]; then
+            echo "::error::CLI archives require the exact gnr8 crate version to be published first."
+            exit 1
+          fi
+
       - name: Bump release version
         id: bump
         run: |
@@ -201,8 +211,14 @@ jobs:
 
   github-release-cli:
     name: GitHub Release assets
-    needs: [bump-and-tag, build-cli]
-    if: github.ref == 'refs/heads/main' && inputs.publish_cli
+    needs: [bump-and-tag, crates-io, build-cli]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      inputs.publish_cli &&
+      needs.bump-and-tag.result == 'success' &&
+      needs.crates-io.result == 'success' &&
+      needs.build-cli.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

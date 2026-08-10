@@ -105,6 +105,17 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn replace_manifest_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        atomicwrites::replace_atomic(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
 pub(crate) fn cleanup_temporary_files(gnr8_dir: &Path) -> Result<(), crate::CoreError> {
     let cache = gnr8_dir.join("cache");
     let entries = match std::fs::read_dir(&cache) {
@@ -283,7 +294,7 @@ impl Manifest {
             file.sync_all()?;
             #[cfg(test)]
             run_before_manifest_publish_hook()?;
-            std::fs::rename(&temp_path, &path)?;
+            replace_manifest_file(&temp_path, &path)?;
             sync_directory(cache)
         })();
         if let Err(err) = publish {
@@ -393,6 +404,22 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_atomically_replaces_an_existing_manifest() {
+        let root = temp_root("atomic-replace");
+        let gnr8_dir = root.join(".gnr8");
+        let mut manifest = Manifest::default();
+        manifest.record("client.ts", "old", "generated");
+        manifest.save(&gnr8_dir).unwrap();
+
+        manifest.record("client.ts", "new", "generated");
+        manifest.save(&gnr8_dir).unwrap();
+
+        let loaded = super::load(&gnr8_dir).unwrap();
+        assert_eq!(loaded.recorded_hash("client.ts"), Some("new"));
         let _ = std::fs::remove_dir_all(root);
     }
 
