@@ -18,12 +18,12 @@ gnr8 host
   └─ write/check plan
 ```
 
-The current bundle protocol is version 3 and carries:
+The current bundle protocol is version 4 and carries:
 
 - protocol, host CLI, child core version, and capability fingerprint;
 - sorted artifacts with producer/ownership/rewrite history;
 - structured diagnostics, target output anchors, and explicitly declared readiness targets;
-- artifact cache key, input roots, and input file stamps.
+- source, configuration, and tool snapshots used to reject inputs that change during a run.
 
 Handshake environment variables are `GNR8_HOST_PROTOCOL_VERSION`, `GNR8_HOST_CLI_VERSION`, and
 `GNR8_HOST_CAPABILITY_FINGERPRINT`. A mismatch fails before output is trusted and instructs the user
@@ -48,22 +48,30 @@ uses the generated hash, recorded hash, and disk hash to distinguish:
 - new/stale output safe to write;
 - byte-identical output (no-op);
 - output previously owned by gnr8 and safe to delete after configuration removal;
-- user-edited or unowned output that must be protected.
+- byte-identical unowned output that can be adopted without a rewrite;
+- user-edited or divergent unowned output that must be protected.
 
 `gnr8 generate` writes safe changes and reports protected files. `gnr8 check` computes the same plan
-without writing. A missing/corrupt cache degrades to an empty manifest instead of panicking.
+without writing. A missing/corrupt cache degrades to an empty manifest instead of panicking. Generate
+reconstructs ownership for identical outputs and exits non-zero if any divergent output remains
+protected; check never creates ownership or a no-op cache entry.
 
-All artifact paths must be safe project-relative paths: absolute paths, parent traversal, and unsafe
-output-anchor relationships are rejected.
+All artifact paths use one portable project-relative form. They must be NFC-normalized UTF-8 with
+canonical `/` separators; each component is limited to 255 UTF-8 bytes and 255 UTF-16 code units.
+Empty, `.`/`..`, absolute, control-character, Windows-invalid-character, trailing-dot/space, and
+Windows device-name components are rejected. The top-level `.gnr8` state directory and gnr8's
+transaction names are reserved. Unicode case-fold-equivalent paths collide even on a case-sensitive
+host, so a custom `Target` or `PostProcess` must emit one canonical spelling. Unsafe output-anchor
+relationships are rejected by the same host boundary.
 
-## Force and baseline adoption
+## Force
 
-- `gnr8 generate --force` permits overwriting protected edits and may delete any file below a target
-  output anchor that the current pipeline does not produce. Dedicate anchors to generated content.
-- `gnr8 generate --accept-generated-baseline` records the current generator result as an intentional
-  migration baseline, reports adoption in JSON, and uses the same overwrite/prune path as `--force`.
+- `gnr8 generate --force` permits overwriting protected emitted paths. It may also remove a stale
+  path that the ownership manifest records, even when that path was edited.
+- Force never recursively cleans an output directory. Unowned support files and other neighbors are
+  outside gnr8's ownership and remain untouched.
 
-Neither flag changes extraction semantics. Durable fixes still belong in service source or
+The flag does not change extraction semantics. Durable fixes still belong in service source or
 `.gnr8/src/main.rs`.
 
 ## Post-processing
@@ -90,11 +98,17 @@ an explicit script/program that performs discovery.
 | `.gnr8/target/` | compiled project-local generator | no |
 | `.gnr8/cache/manifest.json` | generated ownership hashes | no |
 | `.gnr8/cache/sources/` | source analysis cache | no |
-| `.gnr8/cache/artifacts/` | artifact text/metadata cache | no |
-| `.gnr8/cache/verified-noop.json` | hot no-op validation stamp | no |
+| `.gnr8/cache/artifacts/` | reserved; cross-run artifact reuse is disabled | no |
+| `.gnr8/cache/verified-noop.json` | reserved; ignored while pre-child skipping is disabled | no |
 
-Cache hits may skip compilation, extraction, or rendering after validating inputs/outputs. Deleting
-cache is safe; the next run recomputes it.
+Source cache hits may skip extraction inside a normal child run after validating their bounded inputs.
+Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:
+Rust code-as-config may read environment, time, network, or arbitrary files while constructing the
+pipeline, and the host cannot prove those inputs unchanged. Every command therefore runs the child;
+Cargo's build cache and source-analysis caches retain the safe acceleration. Cross-run artifact reuse
+is also disabled because target configuration may be derived from the same arbitrary Rust inputs. If a monitored input
+changes during a run, the run is rejected and its disposable artifact-cache entry is removed; no
+mixed-snapshot outputs are accepted.
 
 ## GitHub Action
 
@@ -150,7 +164,7 @@ target project's `typescript` dependency.
 
 ## CI gates in this repository
 
-For gnr8 contributors, `make check` is the full local/CI gate:
+For gnr8 contributors, `make check` remains the complete local gate:
 
 ```bash
 make check
@@ -158,6 +172,10 @@ make check
 
 It runs Rust formatting, clippy with warnings denied, all Rust tests, Go/Python/TypeScript sidecar
 tests, fixture builds/vet, Action resolver tests, and deterministic example regeneration/checks.
+
+CI runs the same confidence areas as focused jobs rather than invoking `make check` as one process.
+Every job is capped at five total minutes, and generated-project checks are isolated per example. A
+fast repository policy job rejects missing or larger job deadlines.
 
 For application repositories, the normal gate is narrower:
 

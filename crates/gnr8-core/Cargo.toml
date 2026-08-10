@@ -27,6 +27,24 @@ noyalib = { workspace = true }
 # content fingerprint (NOT std DefaultHasher, which is not stable across toolchains — RESEARCH
 # Pitfall 4). First consumer is this plan's manifest module (PLAN-CHECK W1).
 blake3 = { workspace = true }
+# Bounded filesystem safety primitives: capability-relative directory handles plus no-follow opens
+# prevent generated output paths from escaping the project root through symlink races.
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+# Cross-platform advisory locks serialize transaction/recovery within one output directory.
+fs2 = { workspace = true }
+same-file = { workspace = true }
+# Bounded text primitives used only to define a deterministic, portable artifact-path identity.
+unicode-normalization = { workspace = true }
+unicode-casefold = { workspace = true }
+# Safe wrappers for atomic rename-without-replacement on supported Unix kernels.
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+atomicwrites = { workspace = true }
+windows-sys = { workspace = true }
+winx = { workspace = true }
+
 # NOTE: the ergonomic binary-boundary error crate is intentionally absent here —
 # it lives only in the gnr8 binary (D-09). Library code uses thiserror typed errors.
 

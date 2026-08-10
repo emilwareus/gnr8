@@ -13,10 +13,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: make check
+  policy:
+    name: Repository policy
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check invariants and CI budgets
+        run: make invariants
+
+  rust-quality:
+    name: Rust format and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 
@@ -24,25 +34,118 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: gnr8
+            needs_go: "true"
+            needs_python: "true"
+            needs_node: "true"
+          - package: gnr8-cli
+            needs_go: "true"
+            needs_python: "false"
+            needs_node: "false"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
       - uses: actions/setup-go@v6
+        if: matrix.needs_go == 'true'
         with:
-          go-version: '1.26'
+          go-version: "1.26"
           check-latest: true
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-python@v6
+        if: matrix.needs_python == 'true'
         with:
-          node-version: '24'
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v6
+        if: matrix.needs_node == 'true'
+        with:
+          node-version: "24"
           cache: npm
           cache-dependency-path: tsextract/package-lock.json
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
+      - name: Restore TypeScript test toolchain
+        if: matrix.needs_node == 'true'
+        run: npm ci --silent
+        working-directory: tsextract
 
       - name: Install independent YAML parser
+        if: matrix.needs_python == 'true'
         run: python -m pip install PyYAML==6.0.2
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: tests-${{ matrix.package }}
 
-      - name: Full release gate
-        run: make check
+      - name: Test package
+        run: cargo test -p "${{ matrix.package }}" --all-features
+
+  sidecars:
+    name: Language sidecars and action contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          check-latest: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tsextract/package-lock.json
+
+      - name: Test Go fixture and extractor
+        run: make fixture-build goextract-build
+
+      - name: Test Python extractor
+        run: make pyextract-test
+
+      - name: Test TypeScript extractor
+        run: make tsextract-test
+
+      - name: Test the composite action contract
+        run: make action-test
+
+  check:
+    name: make check
+    needs: [policy, rust-quality, rust-tests, sidecars]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every focused check
+        env:
+          POLICY_RESULT: ${{ needs.policy.result }}
+          QUALITY_RESULT: ${{ needs.rust-quality.result }}
+          RUST_RESULT: ${{ needs.rust-tests.result }}
+          SIDECAR_RESULT: ${{ needs.sidecars.result }}
+        run: |
+          test "$POLICY_RESULT" = success
+          test "$QUALITY_RESULT" = success
+          test "$RUST_RESULT" = success
+          test "$SIDECAR_RESULT" = success

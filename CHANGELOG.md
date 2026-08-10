@@ -37,8 +37,20 @@ Adding an endpoint no longer requires a `.gnr8/` edit to document it.
 - The OpenAPI YAML writer emitted multi-line strings as plain scalars, putting continuation lines at
   column 0 and producing an invalid document. Multi-line values are now JSON-escaped. Latent before
   this release; multi-line operation descriptions make it reachable.
+- `gnr8 generate` now reconstructs its disposable local ownership manifest after cache loss by
+  adopting byte-identical emitted files without rewriting them. Divergent files remain protected and
+  make generation exit non-zero instead of reporting false success. `generate`, `check`, `doctor`, and
+  `watch` now use the same classification rule, and verified no-op state cannot bypass ownership.
+- Ownership-manifest updates now atomically replace the prior manifest on Windows as well as Unix, so
+  a second generation can publish its reconciled ownership state on every supported platform.
+- `--force` now acts only on exact emitted or manifest-owned paths. It no longer recursively deletes
+  unrelated files that happen to share an output directory.
 
 ### Breaking
+
+`gnr8 generate --accept-generated-baseline` and the `baseline_adopted` JSON field were removed. No
+replacement flag is needed: byte-identical output adoption is normal generation behavior, while
+`--force` remains the explicit way to overwrite divergent emitted files.
 
 The generated-SDK surface and the code-as-config API are now purely native. Everything whose
 purpose was to make gnr8's output resemble another generator's is gone, permanently — see rule 0

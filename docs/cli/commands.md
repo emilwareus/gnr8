@@ -65,20 +65,21 @@ Without a topic, lists available guides. Topics:
 ## `generate`
 
 ```bash
-gnr8 generate [--force] [--accept-generated-baseline]
+gnr8 generate [--force]
 gnr8 --json generate
 ```
 
 Runs the project-local pipeline, plans writes, preserves hand-edited generated files, removes stale
-files previously owned by gnr8, and updates the ownership manifest.
+files previously owned by gnr8, and updates the ownership manifest. If the local manifest is absent
+or corrupt, byte-identical outputs are adopted without being rewritten; divergent outputs remain
+protected. Any protected output makes the command exit non-zero after reporting every skipped path.
 
-- `--force` permits overwriting protected edits and can delete any file under a target output anchor
-  that the current pipeline no longer produces. Keep output anchors dedicated to generated content.
-- `--accept-generated-baseline` adopts the current generator result as an intentional migration
-  baseline. It uses the same overwrite/prune path as `--force` and reports `baseline_adopted` in JSON.
+- `--force` permits overwriting protected emitted paths and removing changed stale files that the
+  ownership manifest records. It never deletes unrelated files merely because they share an output
+  directory.
 
 JSON includes changed-file groups, counts, timings, diagnostics, cache mode, input/output identity,
-baseline state, and cleanup guidance.
+and cleanup guidance.
 
 ## `watch`
 

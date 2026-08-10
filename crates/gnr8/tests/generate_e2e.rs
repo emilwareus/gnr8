@@ -24,8 +24,14 @@
     clippy::doc_markdown
 )]
 
+#[cfg(not(windows))]
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(not(windows))]
+use std::time::Duration;
 
 /// The installed `gnr8` host binary cargo built for this integration test.
 const GNR8_BIN: &str = env!("CARGO_BIN_EXE_gnr8");
@@ -113,6 +119,152 @@ fn run_gnr8(root: &Path, args: &[&str]) -> (bool, String, String) {
     )
 }
 
+#[cfg(not(windows))]
+fn assert_cached_watch_cold_start_preserves_outputs(root: &Path) {
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl ChildGuard {
+        fn stop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                #[cfg(unix)]
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg(format!("-{}", child.id()))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    let mut command = Command::new(GNR8_BIN);
+    command
+        .arg("watch")
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = ChildGuard(Some(command.spawn().expect("spawn watch")));
+    let process = child.0.as_mut().expect("watch child is present");
+    let stdout = process.stdout.take().expect("capture watch stdout");
+    let mut stderr = process.stderr.take().expect("capture watch stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("watch: cold done") {
+                let _ = tx.send(line);
+                return;
+            }
+        }
+    });
+    let error_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let cold_result = rx.recv_timeout(Duration::from_secs(30));
+    child.stop();
+    reader.join().expect("join watch output reader");
+    let stderr = error_reader.join().expect("join watch error reader");
+    let cold_line = cold_result.unwrap_or_else(|err| {
+        panic!("watch must finish its cold regeneration: {err}\nstderr:\n{stderr}")
+    });
+
+    assert!(cold_line.contains("unchanged"), "{cold_line}");
+    assert!(root.join("openapi.yaml").is_file());
+    assert!(root.join("sdk/client.go").is_file());
+}
+
+fn assert_cache_recovery(root: &Path, openapi: &Path) {
+    std::fs::remove_dir_all(root.join(".gnr8/cache")).expect("remove .gnr8/cache");
+    let (ok, out, err) = run_gnr8(root, &["check"]);
+    assert!(
+        ok && out.contains("up to date"),
+        "gnr8 check must pass without local cache when outputs match.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        !root.join(".gnr8/cache/manifest.json").exists()
+            && !root.join(".gnr8/cache/verified-noop.json").exists(),
+        "check must not create lifecycle ownership or a no-op shortcut"
+    );
+
+    let openapi_mtime = std::fs::metadata(openapi)
+        .expect("openapi metadata before adoption")
+        .modified()
+        .expect("openapi mtime before adoption");
+    let (ok, out, err) = run_gnr8(root, &["generate"]);
+    assert!(
+        ok && out.contains("0 written"),
+        "generate must adopt matching outputs without rewriting.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert_eq!(
+        std::fs::metadata(openapi)
+            .expect("openapi metadata after adoption")
+            .modified()
+            .expect("openapi mtime after adoption"),
+        openapi_mtime,
+        "adoption must not rewrite byte-identical output"
+    );
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load reconstructed manifest");
+    assert!(
+        manifest.files.len() >= 5,
+        "generate must reconstruct ownership for every emitted artifact"
+    );
+}
+
+fn assert_protection_and_force(root: &Path) {
+    let (ok, out, err) = run_gnr8(root, &["generate"]);
+    assert!(
+        ok,
+        "regenerate changed source.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let client = root.join("sdk/client.go");
+    std::fs::write(&client, "package sdk\n// protected edit\n").expect("edit generated client");
+    std::fs::write(root.join("sdk/package.json"), "{\"private\":true}\n")
+        .expect("write unrelated support file");
+
+    let (ok, out, err) = run_gnr8(root, &["generate", "--json"]);
+    assert!(
+        !ok && err.contains("generation incomplete"),
+        "generate must fail when preserving divergent output.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&out).expect("generate JSON remains valid");
+    assert_eq!(report["counts"]["skipped"], 1);
+    assert!(
+        std::fs::read_to_string(&client)
+            .expect("read protected client")
+            .contains("protected edit"),
+        "non-forced generation must preserve the edit"
+    );
+
+    let (ok, out, err) = run_gnr8(root, &["generate", "--force"]);
+    assert!(
+        ok,
+        "force must repair the emitted path.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        root.join("sdk/package.json").is_file(),
+        "force must preserve unrelated files beneath an output directory"
+    );
+}
+
 #[test]
 fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
     if !toolchains_available() {
@@ -180,6 +332,8 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         out.contains("0 written"),
         "a second generate over unchanged source must write nothing (no-op):\n{out}"
     );
+    #[cfg(not(windows))]
+    assert_cached_watch_cold_start_preserves_outputs(&root);
 
     // 4. `gnr8 check` reports up-to-date (exit 0) after the no-op.
     let (ok, out, _err) = run_gnr8(&root, &["check"]);
@@ -188,16 +342,12 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         "gnr8 check must report up-to-date after a no-op generate:\n{out}"
     );
 
-    // 5. A fresh CI checkout has committed generated artifacts but no local .gnr8/cache/manifest.json.
-    //    `gnr8 check` must still pass when those artifacts are byte-identical to a fresh generation.
-    std::fs::remove_dir_all(root.join(".gnr8").join("cache")).expect("remove .gnr8/cache");
-    let (ok, out, err) = run_gnr8(&root, &["check"]);
-    assert!(
-        ok && out.contains("up to date"),
-        "gnr8 check must pass in a fresh checkout without local cache when outputs match.\nstdout:\n{out}\nstderr:\n{err}"
-    );
+    // 5. A fresh checkout has committed generated artifacts but no local ownership manifest.
+    //    `gnr8 check` must still pass when those artifacts are byte-identical to a fresh generation,
+    //    while remaining read-only: it must not create ownership or a verified no-op shortcut.
+    assert_cache_recovery(&root, &openapi);
 
-    // 6. If source changes after generation, `gnr8 check` must fail before SDKs are regenerated.
+    // 7. If source changes after generation, `gnr8 check` must fail before SDKs are regenerated.
     let main_go = root.join("main.go");
     let source = std::fs::read_to_string(&main_go).expect("read main.go");
     let changed_source = source.replace(
@@ -214,6 +364,11 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         !ok && out.contains("not up to date"),
         "gnr8 check must fail when source changes require regenerated artifacts.\nstdout:\n{out}\nstderr:\n{err}"
     );
+
+    // 8. A protected generated-file edit makes generate fail rather than reporting false success.
+    //    Force repairs the emitted path, but an unrelated support file sharing the SDK directory
+    //    survives because directory membership alone is not ownership evidence.
+    assert_protection_and_force(&root);
 
     let _ = std::fs::remove_dir_all(&root);
 }

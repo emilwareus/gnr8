@@ -333,23 +333,26 @@ fn action_for<'a>(plan: &'a lifecycle::WritePlan, path: &str) -> &'a WriteAction
         .action
 }
 
-/// WS-04 / WATCH-01: the PURE decision function classifies ALL FIVE truth-table arms correctly,
+/// WS-04 / WATCH-01: the PURE decision function classifies the complete truth table correctly,
 /// WITHOUT a filesystem (on-disk bytes are injected via a mock closure — the property that makes the
 /// heart of the phase exhaustively unit-testable). Inputs are SYNTHETIC artifacts (no child needed).
 #[test]
 fn plan_writes_truth_table() {
     let artifacts = vec![
-        artifact("absent.go", "NEW"),    // arm 1: absent on disk
-        artifact("noop.go", "SAME"),     // arm 2: present, recorded, byte-identical
-        artifact("changed.go", "NEW"),   // arm 3: present, recorded, content changed
-        artifact("edited.go", "NEW"),    // arm 4: present, recorded, hash != recorded
-        artifact("untracked.go", "NEW"), // arm 5: present, absent from manifest
+        artifact("absent.go", "NEW"),       // arm 1: absent on disk
+        artifact("noop.go", "SAME"),        // arm 2: present, recorded, byte-identical
+        artifact("changed.go", "NEW"),      // arm 3: present, recorded, content changed
+        artifact("edited.go", "NEW"),       // arm 4: present, recorded, hash != recorded
+        artifact("adopted.go", "NEW"),      // arm 5: unowned, byte-identical
+        artifact("untracked.go", "NEW"),    // arm 6: unowned, divergent
+        artifact("stale-record.go", "NEW"), // stale ownership, byte-identical
     ];
 
     let mut manifest = Manifest::default();
     manifest.record("noop.go", &blake3_hex(b"SAME"), "generated");
     manifest.record("changed.go", &blake3_hex(b"OLD"), "generated");
     manifest.record("edited.go", &blake3_hex(b"WHAT-GNR8-WROTE"), "generated");
+    manifest.record("stale-record.go", &blake3_hex(b"OLD"), "generated");
     // untracked.go is deliberately NOT in the manifest.
 
     let on_disk = |path: &str| -> Option<Vec<u8>> {
@@ -358,6 +361,7 @@ fn plan_writes_truth_table() {
             "noop.go" => Some(b"SAME".to_vec()),
             "changed.go" => Some(b"OLD".to_vec()),
             "edited.go" => Some(b"HUMAN-EDIT".to_vec()),
+            "adopted.go" | "stale-record.go" => Some(b"NEW".to_vec()),
             "untracked.go" => Some(b"PRE-EXISTING".to_vec()),
             other => panic!("unexpected on_disk lookup for {other}"),
         }
@@ -379,8 +383,16 @@ fn plan_writes_truth_table() {
         WriteAction::UserEdited
     ));
     assert!(matches!(
+        action_for(&plan, "adopted.go"),
+        WriteAction::Unchanged
+    ));
+    assert!(matches!(
         action_for(&plan, "untracked.go"),
         WriteAction::UserEdited
+    ));
+    assert!(matches!(
+        action_for(&plan, "stale-record.go"),
+        WriteAction::Unchanged
     ));
 
     let absent = plan.files.iter().find(|f| f.path == "absent.go").unwrap();
@@ -395,13 +407,16 @@ fn plan_metadata_writes_truth_table_without_generated_bytes() {
         artifact_metadata("noop.go", "SAME"),
         artifact_metadata("changed.go", "NEW"),
         artifact_metadata("edited.go", "NEW"),
+        artifact_metadata("adopted.go", "NEW"),
         artifact_metadata("untracked.go", "NEW"),
+        artifact_metadata("stale-record.go", "NEW"),
     ];
 
     let mut manifest = Manifest::default();
     manifest.record("noop.go", &blake3_hex(b"SAME"), "generated");
     manifest.record("changed.go", &blake3_hex(b"OLD"), "generated");
     manifest.record("edited.go", &blake3_hex(b"WHAT-GNR8-WROTE"), "generated");
+    manifest.record("stale-record.go", &blake3_hex(b"OLD"), "generated");
 
     let on_disk_hash = |path: &str| -> Option<String> {
         match path {
@@ -409,6 +424,7 @@ fn plan_metadata_writes_truth_table_without_generated_bytes() {
             "noop.go" => Some(blake3_hex(b"SAME")),
             "changed.go" => Some(blake3_hex(b"OLD")),
             "edited.go" => Some(blake3_hex(b"HUMAN-EDIT")),
+            "adopted.go" | "stale-record.go" => Some(blake3_hex(b"NEW")),
             "untracked.go" => Some(blake3_hex(b"PRE-EXISTING")),
             other => panic!("unexpected on_disk lookup for {other}"),
         }
@@ -430,8 +446,16 @@ fn plan_metadata_writes_truth_table_without_generated_bytes() {
         WriteAction::UserEdited
     ));
     assert!(matches!(
+        action_for(&plan, "adopted.go"),
+        WriteAction::Unchanged
+    ));
+    assert!(matches!(
         action_for(&plan, "untracked.go"),
         WriteAction::UserEdited
+    ));
+    assert!(matches!(
+        action_for(&plan, "stale-record.go"),
+        WriteAction::Unchanged
     ));
     assert!(
         plan.files.iter().all(|file| file.new_bytes.is_empty()),
@@ -488,6 +512,164 @@ fn noop_second_run_writes_nothing() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn case_only_output_rename_removes_distinct_old_spelling_without_deleting_an_alias() {
+    let root = init_root("case-only-output-rename");
+    lifecycle::regenerate(
+        &root,
+        &[
+            artifact("generated/B.ts", "export const neighbor = 1;\n"),
+            artifact("generated/a.ts", "export const value = 1;\n"),
+        ],
+        false,
+    )
+    .expect("write original spelling");
+    let filesystem_aliases_case = root.join("generated/b.ts").exists();
+
+    let outcome = lifecycle::regenerate(
+        &root,
+        &[
+            artifact("generated/a.ts", "export const value = 1;\n"),
+            artifact("generated/b.ts", "export const neighbor = 1;\n"),
+        ],
+        false,
+    )
+    .expect("reconcile case-only output rename");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("generated/b.ts")).unwrap(),
+        "export const neighbor = 1;\n"
+    );
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    assert_eq!(
+        manifest
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["generated/a.ts", "generated/b.ts"]
+    );
+    let matching_entries = std::fs::read_dir(root.join("generated"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("b.ts")
+        })
+        .count();
+    assert_eq!(matching_entries, 1);
+    if filesystem_aliases_case {
+        assert!(!outcome.deleted.contains(&"generated/B.ts".to_string()));
+    } else {
+        assert!(!root.join("generated/B.ts").exists());
+        assert!(outcome.deleted.contains(&"generated/B.ts".to_string()));
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn portable_alias_does_not_transfer_ownership_to_a_distinct_case_sensitive_entry() {
+    let root = init_root("distinct-portable-alias");
+    std::fs::create_dir_all(root.join("SDK")).unwrap();
+    std::fs::write(root.join("SDK/client.go"), "owned-old").unwrap();
+    std::fs::create_dir_all(root.join("sdk")).unwrap();
+    if root.join("SDK/client.go") == root.join("sdk/client.go")
+        || std::fs::read(root.join("sdk/client.go")).is_ok()
+    {
+        let _ = std::fs::remove_dir_all(root);
+        return;
+    }
+    std::fs::write(root.join("sdk/client.go"), "owned-old").unwrap();
+    let old_hash = blake3_hex(b"owned-old");
+    let mut manifest = gnr8::manifest::Manifest::default();
+    manifest.record("SDK/client.go", &old_hash, "generated");
+    manifest.save(&root.join(".gnr8")).unwrap();
+
+    let outcome =
+        lifecycle::regenerate(&root, &[artifact("sdk/client.go", "generated-new")], false).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("sdk/client.go")).unwrap(),
+        "owned-old",
+        "the distinct unowned spelling must not be overwritten"
+    );
+    assert_eq!(outcome.skipped, vec!["sdk/client.go"]);
+    assert!(!root.join("SDK/client.go").exists());
+    assert_eq!(outcome.deleted, vec!["SDK/client.go"]);
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    assert!(manifest.files.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_manifest_adopts_identical_outputs_without_rewriting() {
+    let root = init_root("adopt-identical");
+    let artifacts = vec![
+        artifact("openapi.yaml", "openapi: 3.1.0\n"),
+        artifact("sdk/client.go", "package sdk\n"),
+    ];
+    lifecycle::regenerate(&root, &artifacts, false).expect("cold regenerate");
+    let openapi_mtime = std::fs::metadata(root.join("openapi.yaml"))
+        .expect("openapi metadata")
+        .modified()
+        .expect("openapi mtime");
+
+    std::fs::remove_dir_all(root.join(".gnr8/cache")).expect("remove disposable cache");
+    let recovered = lifecycle::regenerate(&root, &artifacts, false).expect("recover ownership");
+
+    assert!(recovered.written.is_empty(), "{recovered:?}");
+    assert_eq!(recovered.unchanged.len(), 2, "{recovered:?}");
+    assert!(recovered.skipped.is_empty(), "{recovered:?}");
+    assert_eq!(
+        std::fs::metadata(root.join("openapi.yaml"))
+            .expect("openapi metadata after recovery")
+            .modified()
+            .expect("openapi mtime after recovery"),
+        openapi_mtime,
+        "adoption must not rewrite byte-identical output"
+    );
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
+    assert_eq!(manifest.files.len(), 2);
+    assert_eq!(
+        manifest.recorded_hash("sdk/client.go"),
+        Some(blake3_hex(b"package sdk\n").as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn corrupt_manifest_adopts_only_identical_outputs() {
+    let root = init_root("adopt-mixed");
+    std::fs::write(root.join("openapi.yaml"), "openapi: 3.1.0\n").expect("write matching output");
+    std::fs::create_dir_all(root.join("sdk")).expect("create sdk");
+    std::fs::write(root.join("sdk/client.go"), "package custom\n").expect("write divergent output");
+    let cache = root.join(".gnr8/cache");
+    std::fs::create_dir_all(&cache).expect("create cache");
+    std::fs::write(cache.join("manifest.json"), "not json").expect("write corrupt manifest");
+
+    let artifacts = vec![
+        artifact("openapi.yaml", "openapi: 3.1.0\n"),
+        artifact("sdk/client.go", "package sdk\n"),
+    ];
+    let recovered = lifecycle::regenerate(&root, &artifacts, false).expect("recover ownership");
+
+    assert_eq!(recovered.unchanged, vec!["openapi.yaml"], "{recovered:?}");
+    assert_eq!(recovered.skipped, vec!["sdk/client.go"], "{recovered:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("sdk/client.go")).expect("read protected output"),
+        "package custom\n"
+    );
+    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
+    assert!(manifest.recorded_hash("openapi.yaml").is_some());
+    assert_eq!(manifest.recorded_hash("sdk/client.go"), None);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -673,6 +855,92 @@ fn regenerate_rejects_duplicate_artifact_paths() {
         "a duplicate path must be an artifact ownership error, got {err:?}"
     );
     assert!(!root.join("generated/client.go").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn regenerate_rejects_aliased_and_case_folded_artifact_paths() {
+    let root = init_root("aliased-artifact-path");
+    for second in [
+        "generated/./client.go",
+        "generated/Client.go",
+        "generated/e\u{301}.go",
+        "generated/con.go",
+        "generated/COM0.go",
+        "generated/lpt0.go",
+        "generated/CONIN$.go",
+        "generated/conout$.go",
+        "generated/client.go.",
+        "generated/client.go:stream",
+    ] {
+        let err = lifecycle::regenerate(
+            &root,
+            &[
+                artifact("generated/client.go", "first"),
+                artifact(second, "second"),
+            ],
+            false,
+        )
+        .expect_err("filesystem aliases must be rejected before writing");
+        assert!(
+            matches!(
+                err,
+                CoreError::Io { .. } | CoreError::ArtifactOwnership { .. }
+            ),
+            "an aliased path must be rejected, got {err:?}"
+        );
+        assert!(!root.join("generated/client.go").exists());
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn regenerate_rejects_oversized_component_before_creating_recovery_state() {
+    let root = init_root("oversized-output-component");
+    let path = format!("generated/{}", "a".repeat(256));
+
+    let err = lifecycle::regenerate(&root, &[artifact(&path, "generated")], false)
+        .expect_err("a non-portable oversized output component must be rejected");
+
+    assert!(matches!(err, CoreError::Io { .. }), "{err:?}");
+    assert!(!root.join("generated").exists());
+    let cache = root.join(".gnr8/cache");
+    if cache.is_dir() {
+        assert!(
+            std::fs::read_dir(cache)
+                .expect("read cache")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gnr8-generation-")),
+            "invalid paths must not publish a generation recovery journal"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn planning_propagates_output_read_errors_instead_of_treating_them_as_absent() {
+    let root = init_root("output-read-error");
+    std::fs::create_dir_all(root.join("generated/client.go"))
+        .expect("create a directory where a generated file is expected");
+    let artifacts = vec![artifact("generated/client.go", "generated")];
+
+    let full_err = lifecycle::plan_only(&root, &artifacts)
+        .expect_err("a generated output that cannot be read as a file must fail planning");
+    assert!(matches!(full_err, CoreError::Io { .. }), "{full_err:?}");
+
+    let metadata = vec![gnr8::sdk::ArtifactMetadata {
+        path: "generated/client.go".to_string(),
+        hash: gnr8::manifest::blake3_hex(b"generated"),
+    }];
+    let cached_err = lifecycle::plan_only_cached(&root, &metadata)
+        .expect_err("cached planning must propagate the same output read failure");
+    assert!(matches!(cached_err, CoreError::Io { .. }), "{cached_err:?}");
 
     let _ = std::fs::remove_dir_all(root);
 }

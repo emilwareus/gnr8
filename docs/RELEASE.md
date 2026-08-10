@@ -2,11 +2,14 @@
 
 The release process is intentionally shaped like `exlint`:
 
-- `Release dry-run` runs on pushes/PRs and exercises crates.io dry-run packaging plus per-platform CLI
-  archives.
-- `Release` is a manual `workflow_dispatch` from `main`: prepare the version commit locally, run the
-  full gate and an unpacked-archive lifecycle smoke on that exact commit, and only then push `main`,
-  create `vX.Y.Z`, optionally publish the public `gnr8` crate, and upload CLI archives/checksums.
+- `Release dry-run` runs on pull requests and pushes to `main`. Separate jobs exercise crates.io
+  packaging, per-platform CLI archives, and an unpacked Linux archive.
+- `Release` is a manual `workflow_dispatch` from a green `main`: prepare and compile-check the
+  version-only commit, push `main` and `vX.Y.Z`, optionally publish the public `gnr8` crate, and upload
+  CLI archives/checksums.
+
+Every GitHub Actions job has a hard five-minute deadline. The repository policy check rejects a
+workflow that omits that deadline or reintroduces a monolithic full-suite command.
 
 ## Local Dry Run
 
@@ -73,10 +76,12 @@ remain standard-library-only.
    were breaking; check it before choosing.
 4. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
 5. Leave `publish_cli=true` to upload the CLI archives.
-6. The workflow bumps the version and creates the commit locally, runs `make check`, builds and smokes
-   the host archive, and performs a crates.io dry run. A failure in any of those steps leaves `main`
-   and tags untouched. Only after they pass does it push the commit and `vX.Y.Z`, publish when
-   requested, build the platform assets, and create/update the GitHub Release.
+   CLI publication requires `publish_crates=true`: generated projects pin the exact release version,
+   so the workflow waits for crates.io publication to succeed before it creates the GitHub Release.
+6. The workflow bumps the version, refreshes the root and example lockfiles, compile-checks that
+   version-only commit, and pushes it with `vX.Y.Z`. The required focused CI jobs on `main` provide the
+   behavioral gate; the dry-run workflow has already checked packaging and the unpacked archive.
+   Publishing and platform asset jobs then run independently with the same five-minute deadline.
 
 ## Install Script
 

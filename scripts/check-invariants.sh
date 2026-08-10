@@ -105,8 +105,14 @@ check_rule "brownfield/compatibility product surface" \
 # (types, functions, modules, methods, CLI flags) rather than prose, so that legitimate protocol
 # and wire compatibility discussion stays allowed.
 check_rule "compat/legacy/brownfield vocabulary in identifiers" \
-  '((pub )?(fn|mod|struct|enum|trait|const) [a-zA-Z_]*(compat|legacy|brownfield)|fn [a-zA-Z_]*_(compat|legacy)|--(compat|legacy)\b|--profile[= ](minimal|native|compat|legacy)|def [a-z_]*(compat|legacy)|(class|function) [a-zA-Z]*(Compat|Legacy|Brownfield))' \
+  '((pub )?(fn|mod|struct|enum|trait|const) [a-zA-Z_]*(compat|legacy|brownfield|migration|baseline)|fn [a-zA-Z_]*_(compat|legacy|migration|baseline)|--(compat|legacy|migration|baseline)\b|--profile[= ](minimal|native|compat|legacy)|def [a-z_]*(compat|legacy|migration|baseline)|(class|function) [a-zA-Z]*(Compat|Legacy|Brownfield|Migration|Baseline))' \
   '(protocol|handshake|PROTOCOL_VERSION|forward-compat)'
+
+# Removed lifecycle surface must stay removed. The sole active-code occurrence is a clap regression
+# test proving the old flag is rejected; historical release notes are exempt above.
+check_rule "removed baseline-adoption surface" \
+  '(--accept-generated-baseline|accept_generated_baseline|baseline_adopted)' \
+  'try_parse_from.*--accept-generated-baseline.*is_err'
 
 # 0.3 — the rules above grep file CONTENTS, so a forbidden name can hide in a path. An empty
 # `fixtures/brownfield-openapi/` directory survived exactly that way.

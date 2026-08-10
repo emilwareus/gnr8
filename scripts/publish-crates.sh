@@ -34,7 +34,9 @@ wait_for_crate_version() {
   local name="$1"
   local version="$2"
 
-  for _ in {1..30}; do
+  # Keep the complete release job inside its five-minute wall-clock budget. Registry visibility is
+  # advisory after a successful upload, so two minutes is enough before warning and continuing.
+  for _ in {1..12}; do
     if crate_version_exists "$name" "$version"; then
       return 0
     fi

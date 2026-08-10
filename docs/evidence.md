@@ -55,12 +55,11 @@ deterministic watch-loop tests remain part of the blocking CLI suite.
 
 ## Release gate
 
-The release workflow refreshes the root and independent example lockfiles before creating the version
-commit, runs `make check`, and verifies that the tested commit remains clean. It then packages and
-unpacks a host archive, exercises `init` → `generate` → `doctor` → `check` in an unrelated FastAPI
-project, and performs a crates.io dry run. Only after all of those steps pass does it atomically push
-`main` and the version tag. The branch/PR dry-run workflow exercises the same local release check
-without publishing.
+Focused CI jobs cover formatting, linting, Rust packages, language sidecars, and each committed
+example, with a hard five-minute deadline per job. The release dry-run separately packages every CLI
+platform, unpacks and exercises the Linux archive through `init` → `generate` → `doctor` → `check`,
+and verifies the crates.io package. The manual release refreshes lockfiles and compile-checks the
+version-only commit before atomically pushing `main` and the version tag.
 
 The final market-readiness verdict and remaining gaps belong in `RELEASE-READINESS-V2.md`; this page
 records what was actually tested and where the current environment could not provide evidence.

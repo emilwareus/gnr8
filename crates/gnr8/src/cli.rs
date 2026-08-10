@@ -55,9 +55,6 @@ pub(crate) enum Commands {
         /// Overwrite generated files a user has hand-edited (D-04 / A4 override verb).
         #[arg(long)]
         force: bool,
-        /// Explicitly adopt current generated baselines, overwriting migration drift intentionally.
-        #[arg(long)]
-        accept_generated_baseline: bool,
     },
     /// Watch source and regenerate on change.
     Watch {
@@ -164,30 +161,16 @@ mod tests {
         // `generate` defaults `--force` to false.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "generate"]).unwrap().command,
-            Commands::Generate {
-                force: false,
-                accept_generated_baseline: false
-            }
+            Commands::Generate { force: false }
         ));
         // `generate --force` sets the flag.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "generate", "--force"])
                 .unwrap()
                 .command,
-            Commands::Generate {
-                force: true,
-                accept_generated_baseline: false
-            }
+            Commands::Generate { force: true }
         ));
-        assert!(matches!(
-            Cli::try_parse_from(["gnr8", "generate", "--accept-generated-baseline"])
-                .unwrap()
-                .command,
-            Commands::Generate {
-                force: false,
-                accept_generated_baseline: true
-            }
-        ));
+        assert!(Cli::try_parse_from(["gnr8", "generate", "--accept-generated-baseline"]).is_err());
         // `watch` defaults `--debounce-ms` to 200.
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "watch"]).unwrap().command,

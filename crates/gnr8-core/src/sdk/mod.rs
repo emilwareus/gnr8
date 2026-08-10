@@ -36,13 +36,115 @@ pub mod model;
 pub mod model_style;
 pub(crate) mod openapi_source;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::graph::{ApiGraph, Diagnostic};
 use crate::manifest::blake3_hex;
 use crate::CoreError;
+
+static ARTIFACT_CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Effective target/post configuration may be computed from arbitrary Rust runtime inputs. Until
+// stages expose a complete deterministic behavior fingerprint, cross-run artifact reuse is unsafe.
+const ARTIFACT_CACHE_SUPPORTED: bool = false;
+
+pub(crate) fn is_internal_transaction_name(name: &str, suffix: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    let Some(token) = normalized
+        .strip_prefix(".gnr8-")
+        .and_then(|rest| rest.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    token.len() == 24 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_reserved_transaction_name(name: &str) -> bool {
+    ["-txn", "-building", "-building-lease"]
+        .into_iter()
+        .any(|suffix| is_internal_transaction_name(name, suffix))
+}
+
+/// Return the single portable identity for an artifact path.
+///
+/// Paths are required to use NFC and `/` separators, and every component must be valid on the
+/// filesystems gnr8 supports. The returned identity additionally applies full Unicode case folding,
+/// so paths that would alias on case-insensitive or normalization-insensitive filesystems are caught
+/// before any output is written.
+pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Err("path is empty".to_string());
+    }
+    if path.nfc().collect::<String>() != path {
+        return Err("path must use Unicode NFC normalization".to_string());
+    }
+    if path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
+        return Err("path must be relative and use canonical `/` separators".to_string());
+    }
+
+    let mut identity = Vec::new();
+    for (index, component) in path.split('/').enumerate() {
+        if component.is_empty() || matches!(component, "." | "..") {
+            return Err("path contains an empty, `.` or `..` component".to_string());
+        }
+        if component.ends_with(['.', ' ']) {
+            return Err("path components may not end with a dot or space".to_string());
+        }
+        if component.len() > 255 || component.encode_utf16().count() > 255 {
+            return Err(
+                "path components may not exceed 255 UTF-8 bytes or UTF-16 code units".to_string(),
+            );
+        }
+        if component
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err(
+                "path contains a character that is not portable across filesystems".to_string(),
+            );
+        }
+        if index == 0 && component.eq_ignore_ascii_case(".gnr8") {
+            return Err("the `.gnr8` workspace is reserved for gnr8 state".to_string());
+        }
+        if is_reserved_transaction_name(component) {
+            return Err(format!(
+                "path component {component:?} is reserved for generated-output transactions"
+            ));
+        }
+
+        let basename = component
+            .split_once('.')
+            .map_or(component, |(basename, _)| basename);
+        let upper = basename.to_ascii_uppercase();
+        let numbered_device = upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            });
+        if matches!(
+            upper.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || numbered_device
+        {
+            return Err(format!(
+                "path component {component:?} is a reserved device name"
+            ));
+        }
+
+        let folded = component.case_fold().collect::<String>();
+        identity.push(folded.nfc().collect::<String>());
+    }
+    Ok(identity.join("/"))
+}
 
 /// Validate a generated OpenAPI artifact enough for `gnr8 doctor` readiness.
 ///
@@ -150,7 +252,7 @@ pub struct ArtifactMetadata {
     pub hash: String,
 }
 
-/// A metadata-only file identity for hot no-op checks.
+/// A content-backed file identity for generation snapshot checks.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct FileStamp {
     /// Project-relative file path.
@@ -192,11 +294,17 @@ impl Artifacts {
         Self::default()
     }
 
-    /// Create a new artifact, failing with `artifact.path_collision` if the path already exists.
+    /// Create a new artifact with one portable, project-relative path.
+    ///
+    /// Paths use NFC-normalized UTF-8 and `/` separators. Each component is at most 255 UTF-8 bytes
+    /// and UTF-16 code units, excludes control/Windows-invalid characters, trailing dots/spaces,
+    /// Windows device names, and gnr8's state/transaction namespace. Unicode case-fold-equivalent
+    /// paths collide so one bundle behaves identically on case-sensitive and insensitive filesystems.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ArtifactOwnership`] when another stage already owns `path`.
+    /// Returns [`CoreError::ArtifactOwnership`] when `path` is non-portable or another stage already
+    /// owns its portable identity.
     pub fn create(
         &mut self,
         path: impl Into<String>,
@@ -204,6 +312,25 @@ impl Artifacts {
     ) -> Result<(), CoreError> {
         let path = path.into();
         let text = text.into();
+        let identity = portable_path_identity(&path).map_err(|reason| {
+            self.ownership_error(
+                "artifact.path_invalid",
+                path.clone(),
+                format!("artifact path is not portable: {reason}"),
+            )
+        })?;
+        if let Some(existing) = self.files.iter().find(|artifact| {
+            portable_path_identity(&artifact.path).is_ok_and(|candidate| candidate == identity)
+        }) {
+            return Err(self.ownership_error(
+                "artifact.path_collision",
+                path,
+                format!(
+                    "path resolves to the same portable output identity as {:?}, owned by {}; use one canonical path",
+                    existing.path, existing.producer
+                ),
+            ));
+        }
         match self.files.binary_search_by(|a| a.path.cmp(&path)) {
             Ok(index) => {
                 let owner = self
@@ -356,12 +483,24 @@ pub trait Source {
     /// or the source fails to parse). Never panics.
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError>;
 
-    /// Roots that define this source's input surface for host-side hot no-op checks.
+    /// Roots that define this source's input surface for in-child snapshot checks.
     ///
-    /// Returning `None` disables the pre-child fast path for this source. Built-in sources with
-    /// explicit input directories implement this; custom sources are conservative by default.
+    /// Built-in sources with explicit input directories implement this; custom sources are
+    /// conservative by default.
     fn cache_input_roots(&self, _cx: &Cx) -> Option<Vec<PathBuf>> {
         None
+    }
+
+    /// External tool or project files that complete this source's host-verifiable input surface.
+    ///
+    /// Toolchain-backed and custom sources must either return every resolved dependency here or
+    /// conservatively use the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the source cannot enumerate its declared dependencies.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
     }
 }
 
@@ -378,6 +517,29 @@ pub trait Transform {
     /// Returns a typed [`CoreError`] if the transform cannot be applied (e.g. a rename that would
     /// collide). Never panics.
     fn apply(&self, ir: &mut ApiGraph, cx: &Cx) -> Result<(), CoreError>;
+
+    /// Project files this transform reads outside the frozen source graph.
+    ///
+    /// `Some(files)` declares a complete file-backed input surface. Custom transforms are
+    /// conservative by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the transform cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this transform reads.
+    ///
+    /// These roots are rescanned by the host, so additions and removals invalidate a no-op stamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the transform cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
 }
 
 /// A target: the frozen IR → [`Artifacts`]. Targets get `&ApiGraph` (read-only) — they never mutate
@@ -410,6 +572,29 @@ pub trait Target {
     /// Returns a typed [`CoreError`] when a configured input path is invalid or cannot be enumerated.
     fn cache_input_files(&self, _cx: &Cx) -> Result<Vec<PathBuf>, CoreError> {
         Ok(Vec::new())
+    }
+
+    /// Complete project-file input surface for rendering snapshot checks.
+    ///
+    /// This is separate from [`Target::cache_input_files`] because a custom target must explicitly
+    /// opt into being skipped before its code runs. `None` disables that optimization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the target cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this target reads.
+    ///
+    /// The host rescans these roots to catch files added after the child published its bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the target cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
     }
 
     /// The project-relative output path(s) this target writes — its **loop-safety anchors**.
@@ -499,6 +684,29 @@ pub trait PostProcess {
     fn cache_key_fragment(&self, _cx: &Cx) -> Result<Vec<u8>, CoreError> {
         Ok(Vec::new())
     }
+
+    /// Complete project-file input surface for rendering snapshot checks.
+    ///
+    /// `None` disables the optimization. This is the safe default for custom command-backed or
+    /// environment-sensitive post-processors whose behavior cannot be verified from project files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the post-processor cannot enumerate its declared inputs.
+    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(None)
+    }
+
+    /// Project directories whose complete recursive membership this post-processor reads.
+    ///
+    /// The host rescans these roots to catch membership changes between generations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`CoreError`] when the post-processor cannot enumerate its declared roots.
+    fn verified_noop_input_roots(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
+        Ok(Some(Vec::new()))
+    }
 }
 
 /// The composed generation pipeline: the user builds this and hands it to [`crate::runner::run`].
@@ -512,6 +720,13 @@ pub struct Pipeline {
     transforms: Vec<Box<dyn Transform>>,
     targets: Vec<Box<dyn Target>>,
     posts: Vec<Box<dyn PostProcess>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactCacheInputs {
+    pub(crate) complete: bool,
+    pub(crate) roots: Vec<String>,
+    pub(crate) stamps: Vec<FileStamp>,
 }
 
 impl Pipeline {
@@ -574,7 +789,7 @@ impl Pipeline {
         targets
     }
 
-    /// Source input roots that are safe for the host to rescan before a hot no-op child skip.
+    /// Source input roots that can be bracketed before and after a child generation run.
     #[must_use]
     pub fn cache_input_roots(&self, cx: &Cx) -> Vec<String> {
         let mut roots = Vec::new();
@@ -602,9 +817,94 @@ impl Pipeline {
         }
         let mut paths = Vec::new();
         for root in roots {
-            collect_cache_input_files(&cx.project_root.join(root), &mut paths);
+            let path = cx.project_root.join(root);
+            if path.is_file() {
+                paths.push(path);
+            } else {
+                collect_cache_input_files(&path, &mut paths);
+            }
         }
         stamp_project_paths(&cx.project_root, &paths).unwrap_or_default()
+    }
+
+    /// Rescannable roots and content stamps for all declared pipeline inputs.
+    ///
+    /// The returned completeness bit is false when any stage lacks a complete file-backed surface;
+    /// known inputs are still returned so generation can reject changes during a run.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a stage's typed error when its declared inputs cannot be enumerated.
+    pub(crate) fn artifact_cache_inputs(&self, cx: &Cx) -> Result<ArtifactCacheInputs, CoreError> {
+        let mut complete = true;
+        let mut paths = Vec::new();
+        let mut roots = Vec::new();
+        for source in &self.sources {
+            match source.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+        }
+        for transform in &self.transforms {
+            match transform.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match transform.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        for target in &self.targets {
+            match target.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match target.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        for post in &self.posts {
+            match post.verified_noop_input_files(cx)? {
+                Some(inputs) => paths.extend(inputs),
+                None => complete = false,
+            }
+            match post.verified_noop_input_roots(cx)? {
+                Some(input_roots) => roots.extend(input_roots),
+                None => complete = false,
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        for root in &roots {
+            let mut root_paths = Vec::new();
+            if collect_verified_root_files_strict(root, &mut root_paths).is_some() {
+                paths.extend(root_paths);
+            } else {
+                complete = false;
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let mut stamps = Vec::new();
+        for path in paths {
+            if let Some(mut stamp) = stamp_project_paths(&cx.project_root, &[path]) {
+                stamps.append(&mut stamp);
+            } else {
+                complete = false;
+            }
+        }
+        stamps.sort();
+        let roots = roots
+            .iter()
+            .map(|root| project_relative_path(&cx.project_root, root))
+            .collect();
+        Ok(ArtifactCacheInputs {
+            complete,
+            roots,
+            stamps,
+        })
     }
 
     /// Run the pipeline through transforms only and return the frozen IR (no targets, no posts).
@@ -680,24 +980,38 @@ impl Pipeline {
         let ir = self.build_ir(cx)?;
         // Collect diagnostics off the frozen IR (clone so the borrow ends before targets read `ir`).
         let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
-        let target_inputs = self.target_cache_input_files(cx)?;
-        let post_cache_key = self.post_cache_key(cx)?;
-        let cache_key = artifact_cache_key(&ir, cx, &target_inputs, &post_cache_key)?;
-        if compact_cache_hit && artifact_cache_exists(cx, &cache_key) {
-            return Ok(RunOutcome {
-                artifacts: Artifacts::new(),
-                diagnostics,
-                artifact_cache_key: Some(cache_key),
-                artifact_cache_hit: true,
-            });
-        }
-        if let Some(cached) = load_artifact_cache(cx, &cache_key) {
-            return Ok(RunOutcome {
-                artifacts: Artifacts::from_files(cached.artifacts),
-                diagnostics,
-                artifact_cache_key: Some(cache_key),
-                artifact_cache_hit: true,
-            });
+        let cache_key = if ARTIFACT_CACHE_SUPPORTED && self.artifact_cache_inputs(cx)?.complete {
+            let target_inputs = self.target_cache_input_files(cx)?;
+            let post_cache_key = self.post_cache_key(cx)?;
+            Some(artifact_cache_key(
+                &ir,
+                cx,
+                &target_inputs,
+                &post_cache_key,
+            )?)
+        } else {
+            None
+        };
+        if let Some(cache_key) = cache_key.as_deref() {
+            if compact_cache_hit && artifact_cache_exists(cx, cache_key) {
+                return Ok(RunOutcome {
+                    artifacts: Artifacts::new(),
+                    diagnostics,
+                    artifact_cache_key: Some(cache_key.to_string()),
+                    artifact_cache_hit: true,
+                });
+            }
+            if let Some(cached) = load_artifact_cache(cx, cache_key) {
+                if let Some(metadata) = artifact_metadata(&cached.artifacts) {
+                    save_artifact_metadata_cache(cx, cache_key, &metadata);
+                }
+                return Ok(RunOutcome {
+                    artifacts: Artifacts::from_files(cached.artifacts),
+                    diagnostics,
+                    artifact_cache_key: Some(cache_key.to_string()),
+                    artifact_cache_hit: true,
+                });
+            }
         }
 
         let mut artifacts = Artifacts::new();
@@ -709,11 +1023,13 @@ impl Pipeline {
             artifacts.begin_stage(format!("post[{index}]:{}", post.producer()));
             post.run(&mut artifacts, cx)?;
         }
-        save_artifact_cache(cx, &cache_key, artifacts.files());
+        if let Some(cache_key) = cache_key.as_deref() {
+            save_artifact_cache(cx, cache_key, artifacts.files());
+        }
         Ok(RunOutcome {
             artifacts,
             diagnostics,
-            artifact_cache_key: Some(cache_key),
+            artifact_cache_key: cache_key,
             artifact_cache_hit: false,
         })
     }
@@ -790,17 +1106,57 @@ fn config_surface_fingerprint(cx: &Cx) -> String {
 fn load_artifact_cache(cx: &Cx, key: &str) -> Option<ArtifactCache> {
     let path = artifact_cache_path(cx, key);
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let cache: ArtifactCache = serde_json::from_slice(&bytes).ok()?;
+    artifact_metadata(&cache.artifacts)?;
+    Some(cache)
 }
 
 fn artifact_cache_exists(cx: &Cx, key: &str) -> bool {
-    artifact_cache_path(cx, key).is_file()
+    let Some(cache) = load_artifact_cache(cx, key) else {
+        return false;
+    };
+    let Some(metadata) = load_artifact_metadata_cache(cx, key) else {
+        return false;
+    };
+    artifact_metadata(&cache.artifacts).is_some_and(|expected| expected == metadata.artifacts)
 }
 
 /// Load cached artifacts for a child-emitted artifact-cache reference.
 #[must_use]
 pub fn load_artifact_cache_files(project_root: &Path, key: &str) -> Option<Vec<Artifact>> {
     load_artifact_cache(&Cx::new(project_root.to_path_buf()), key).map(|cache| cache.artifacts)
+}
+
+/// Remove one exact disposable artifact-cache entry after a generation snapshot changed.
+///
+/// This is an internal host/runner seam. The key is validated before it is used as a file name.
+///
+/// # Errors
+///
+/// Returns a typed I/O error if a matching cache file exists but cannot be removed.
+#[doc(hidden)]
+pub fn discard_artifact_cache(root: &Path, key: &str) -> Result<(), CoreError> {
+    if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CoreError::SdkGen {
+            message: format!("refusing to discard invalid artifact cache key {key:?}"),
+        });
+    }
+    let cx = Cx::new(root);
+    for path in [
+        artifact_cache_path(&cx, key),
+        artifact_metadata_cache_path(&cx, key),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    message: format!("failed to discard artifact cache {}: {err}", path.display()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load cached artifact path/hash metadata for a child-emitted artifact-cache reference.
@@ -821,22 +1177,159 @@ fn save_artifact_cache(cx: &Cx, key: &str, artifacts: &[Artifact]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
+    let Some(metadata) = artifact_metadata(artifacts) else {
+        return;
+    };
     let cache = ArtifactCache {
         artifacts: artifacts.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&cache) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    if publish_artifact_cache_file(&path, &bytes).is_err() {
+        return;
+    }
+    save_artifact_metadata_cache(cx, key, &metadata);
+}
 
-    let metadata: Vec<ArtifactMetadata> = artifacts
-        .iter()
-        .map(|artifact| ArtifactMetadata {
+fn artifact_metadata(artifacts: &[Artifact]) -> Option<Vec<ArtifactMetadata>> {
+    let mut seen = BTreeSet::new();
+    let mut previous_path: Option<&str> = None;
+    let mut metadata = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if previous_path.is_some_and(|previous| previous >= artifact.path.as_str()) {
+            return None;
+        }
+        previous_path = Some(&artifact.path);
+        let identity = portable_path_identity(&artifact.path).ok()?;
+        if !seen.insert(identity) {
+            return None;
+        }
+        metadata.push(ArtifactMetadata {
             path: artifact.path.clone(),
             hash: blake3_hex(artifact.text.as_bytes()),
-        })
-        .collect();
-    save_artifact_metadata_cache(cx, key, &metadata);
+        });
+    }
+    Some(metadata)
+}
+
+fn publish_artifact_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact cache path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact cache path has no UTF-8 file name",
+            )
+        })?;
+    let (temporary, mut file) = loop {
+        let sequence = ARTIFACT_CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{file_name}.{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    };
+    let published = file
+        .lock_exclusive()
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| replace_atomic_file(&temporary, path));
+    drop(file);
+    if published.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    published
+}
+
+fn replace_atomic_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        atomicwrites::replace_atomic(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+pub(crate) fn cleanup_artifact_cache_temporary_files(project_root: &Path) -> std::io::Result<()> {
+    use fs2::FileExt;
+
+    let dir = project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("artifacts");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_artifact_cache_temporary_name(name) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())?;
+        match file.try_lock_exclusive() {
+            Ok(()) => std::fs::remove_file(entry.path())?,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn is_artifact_cache_temporary_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((cache_name, token)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let key = cache_name
+        .strip_suffix(".meta.json")
+        .or_else(|| cache_name.strip_suffix(".json"));
+    let Some(key) = key else {
+        return false;
+    };
+    let Some((pid, sequence)) = token.split_once('-') else {
+        return false;
+    };
+    key.len() == 64
+        && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !sequence.is_empty()
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn artifact_cache_path(cx: &Cx, key: &str) -> PathBuf {
@@ -850,7 +1343,23 @@ fn artifact_cache_path(cx: &Cx, key: &str) -> PathBuf {
 fn load_artifact_metadata_cache(cx: &Cx, key: &str) -> Option<ArtifactMetadataCache> {
     let path = artifact_metadata_cache_path(cx, key);
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let cache: ArtifactMetadataCache = serde_json::from_slice(&bytes).ok()?;
+    let mut seen = BTreeSet::new();
+    let mut previous_path: Option<&str> = None;
+    for artifact in &cache.artifacts {
+        if previous_path.is_some_and(|previous| previous >= artifact.path.as_str())
+            || artifact.hash.len() != 64
+            || !artifact.hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        previous_path = Some(&artifact.path);
+        let identity = portable_path_identity(&artifact.path).ok()?;
+        if !seen.insert(identity) {
+            return None;
+        }
+    }
+    Some(cache)
 }
 
 fn save_artifact_metadata_cache(cx: &Cx, key: &str, artifacts: &[ArtifactMetadata]) {
@@ -867,7 +1376,7 @@ fn save_artifact_metadata_cache(cx: &Cx, key: &str, artifacts: &[ArtifactMetadat
     let Ok(bytes) = serde_json::to_vec(&cache) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    let _ = publish_artifact_cache_file(&path, &bytes);
 }
 
 fn artifact_metadata_cache_path(cx: &Cx, key: &str) -> PathBuf {
@@ -908,6 +1417,147 @@ pub(crate) fn collect_cache_input_files(dir: &Path, out: &mut Vec<PathBuf>) {
     out.sort();
 }
 
+fn collect_cache_input_files_strict(dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
+            if matches!(
+                name,
+                ".context"
+                    | ".git"
+                    | ".gnr8"
+                    | "node_modules"
+                    | "target"
+                    | "vendor"
+                    | "__pycache__"
+            ) {
+                continue;
+            }
+            collect_cache_input_files_strict(&path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            return None;
+        }
+    }
+    out.sort();
+    Some(())
+}
+
+fn collect_verified_root_files_strict(dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
+            collect_verified_root_files_strict(&path, out)?;
+        } else if kind.is_file() {
+            out.push(path);
+        } else {
+            // The stage may legitimately ignore symlinks or special entries. Such a tree remains
+            // generatable, but its membership is not safe for a host-side skip.
+            return None;
+        }
+    }
+    out.sort();
+    Some(())
+}
+
+/// Return the conventional Cargo inputs the host can safely monitor for `.gnr8` no-op decisions.
+#[doc(hidden)]
+#[must_use]
+pub fn cache_config_input_paths(project_root: &Path) -> Option<Vec<PathBuf>> {
+    let gnr8_dir = project_root.join(crate::lifecycle::WORKSPACE_DIR);
+    let cargo_toml = gnr8_dir.join("Cargo.toml");
+    if !cargo_toml.is_file() {
+        return None;
+    }
+    let mut paths = vec![cargo_toml];
+    collect_cache_input_files_strict(&gnr8_dir.join("src"), &mut paths)?;
+    let cargo_lock = gnr8_dir.join("Cargo.lock");
+    if cargo_lock.exists() {
+        if !cargo_lock.is_file() {
+            return None;
+        }
+        paths.push(cargo_lock);
+    }
+    let build_rs = gnr8_dir.join("build.rs");
+    if build_rs.exists() {
+        if !build_rs.is_file() {
+            return None;
+        }
+        paths.push(build_rs);
+    }
+    for name in ["rust-toolchain", "rust-toolchain.toml"] {
+        let path = project_root.join(name);
+        if path.exists() {
+            if !path.is_file() {
+                return None;
+            }
+            paths.push(path);
+        }
+    }
+    for name in ["config", "config.toml"] {
+        let path = project_root.join(".cargo").join(name);
+        if path.exists() {
+            if !path.is_file() {
+                return None;
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Some(paths)
+}
+
+pub(crate) fn cache_config_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
+    let paths = cache_config_input_paths(&cx.project_root)?;
+    stamp_project_paths(&cx.project_root, &paths)
+}
+
+pub(crate) fn cache_config_inputs_complete(cx: &Cx) -> bool {
+    let gnr8_dir = cx.project_root.join(crate::lifecycle::WORKSPACE_DIR);
+    if gnr8_dir.join("build.rs").exists() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(gnr8_dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    !toml_contains_key(&value, "path")
+        && value
+            .get("package")
+            .and_then(|package| package.get("build"))
+            .is_none_or(|build| build.as_bool() == Some(false))
+}
+
+fn toml_contains_key(value: &toml::Value, needle: &str) -> bool {
+    match value {
+        toml::Value::Table(table) => table
+            .iter()
+            .any(|(key, value)| key == needle || toml_contains_key(value, needle)),
+        toml::Value::Array(values) => values.iter().any(|value| toml_contains_key(value, needle)),
+        _ => false,
+    }
+}
+
+pub(crate) fn cache_tool_input_stamps(cx: &Cx) -> Option<Vec<FileStamp>> {
+    let mut paths = vec![std::env::current_exe().ok()?];
+    let resource_root = crate::resource::resource_dir().ok()?;
+    for sidecar in ["goextract", "pyextract", "tsextract"] {
+        collect_cache_input_files_strict(&resource_root.join(sidecar), &mut paths)?;
+    }
+    paths.sort();
+    stamp_project_paths(&cx.project_root, &paths)
+}
+
 pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
     let mut hasher = blake3::Hasher::new();
     let mut sorted = files.to_vec();
@@ -922,18 +1572,6 @@ pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
     }
     cache.save();
     hasher.finalize().to_hex().to_string()
-}
-
-pub(crate) fn hash_project_files(root: &Path, paths: &[String]) -> HashMap<String, Option<String>> {
-    let mut cache = FileHashCacheState::load(root, FileHashCacheScope::Outputs);
-    let mut out = HashMap::with_capacity(paths.len());
-    for path in paths {
-        let absolute = root.join(path);
-        let hash = absolute.is_file().then(|| cache.hash_path(&absolute));
-        out.insert(path.clone(), hash);
-    }
-    cache.save();
-    out
 }
 
 /// Build metadata-only stamps for project files.
@@ -1027,11 +1665,6 @@ impl FileHashCacheState {
             return "<missing>".to_string();
         };
         let fingerprint = FileHashFingerprint::from_metadata(&metadata);
-        if let Some(entry) = self.cache.entries.get(&key) {
-            if entry.len == fingerprint.len && entry.modified_ns == fingerprint.modified_ns {
-                return entry.hash.clone();
-            }
-        }
         let hash = match std::fs::read(path) {
             Ok(bytes) => blake3_hex(&bytes),
             Err(_) => "<missing>".to_string(),
@@ -1197,6 +1830,13 @@ mod tests {
         fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
             Ok(vec![cx.project_root.join(self.source)])
         }
+
+        fn verified_noop_input_files(
+            &self,
+            cx: &Cx,
+        ) -> Result<Option<Vec<std::path::PathBuf>>, CoreError> {
+            self.cache_input_files(cx).map(Some)
+        }
     }
 
     struct ReadinessOnlyTarget {
@@ -1247,6 +1887,44 @@ mod tests {
         assert_eq!(b.text, "B2");
         assert_eq!(b.ownership, super::ArtifactOwnership::Overlaid);
         assert_eq!(b.rewrite_chain.len(), 1);
+    }
+
+    #[test]
+    fn artifact_creation_rejects_portable_path_aliases_and_invalid_names() {
+        let mut artifacts = Artifacts::new();
+        artifacts.create("models/Straße.ts", "first").unwrap();
+        let folded = artifacts.create("models/STRASSE.ts", "second").unwrap_err();
+        assert!(
+            matches!(folded, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision")
+        );
+
+        for path in [
+            "models/e\u{301}.ts",
+            "models/con.ts",
+            "models/com0.ts",
+            "models/LPT0.ts",
+            "models/conin$.ts",
+            "models/CONOUT$.ts",
+            "models/model.ts.",
+            "models/model.ts:stream",
+            "models/.gnr8-0123456789abcdef01234567-building-lease",
+            ".GNR8-0123456789ABCDEF01234567-TXN/client.ts",
+            ".gnr8/cache/manifest.json",
+            ".GNR8/cache/artifacts/file.json",
+        ] {
+            let err = artifacts.create(path, "invalid").unwrap_err();
+            assert!(
+                matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
+                "{path}: {err:?}"
+            );
+        }
+
+        let long_path = format!("models/{}", "a".repeat(256));
+        let err = artifacts.create(&long_path, "invalid").unwrap_err();
+        assert!(
+            matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
+            "{long_path}: {err:?}"
+        );
     }
 
     #[test]
@@ -1314,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_cache_key_includes_target_cache_inputs() {
+    fn artifact_cache_stays_disabled_without_a_complete_behavior_fingerprint() {
         let root = temp_project("target-input-cache");
         std::fs::create_dir_all(root.join("static")).unwrap();
         std::fs::write(root.join("static/runtime.txt"), "one\n").unwrap();
@@ -1328,6 +2006,7 @@ mod tests {
             })
             .run(&cx)
             .unwrap();
+        assert!(first.artifact_cache_key.is_none());
         assert_eq!(first.artifacts.files()[0].text, "one\n");
 
         std::fs::write(root.join("static/runtime.txt"), "two\n").unwrap();
@@ -1342,9 +2021,104 @@ mod tests {
 
         assert!(
             !second.artifact_cache_hit,
-            "target input changes must invalidate artifact cache"
+            "pipelines without a complete behavior fingerprint must render normally"
         );
+        assert!(second.artifact_cache_key.is_none());
         assert_eq!(second.artifacts.files()[0].text, "two\n");
+    }
+
+    #[test]
+    fn runtime_derived_target_configuration_cannot_reuse_another_targets_artifacts() {
+        let root = temp_project("target-config-cache-disabled");
+        std::fs::create_dir_all(root.join("static")).unwrap();
+        std::fs::write(root.join("static/runtime.txt"), "stable\n").unwrap();
+        let cx = Cx::new(&root);
+
+        let first = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "out-a/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
+        let second = Pipeline::new()
+            .source(StubSource)
+            .target(CopyFileTarget {
+                source: "static/runtime.txt",
+                dest: "out-b/runtime.txt",
+            })
+            .run(&cx)
+            .unwrap();
+
+        assert_eq!(first.artifacts.files()[0].path, "out-a/runtime.txt");
+        assert_eq!(second.artifacts.files()[0].path, "out-b/runtime.txt");
+        assert!(first.artifact_cache_key.is_none());
+        assert!(second.artifact_cache_key.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_cache_temp_cleanup_removes_only_exact_private_names() {
+        use fs2::FileExt;
+
+        let root = temp_project("artifact-temp-cleanup");
+        let cache = root.join(".gnr8/cache/artifacts");
+        std::fs::create_dir_all(&cache).unwrap();
+        let key = "a".repeat(64);
+        let stale_full = cache.join(format!(".{key}.json.123-4.tmp"));
+        let stale_meta = cache.join(format!(".{key}.meta.json.123-5.tmp"));
+        let live = cache.join(format!(".{key}.json.123-6.tmp"));
+        let unrelated = cache.join(format!(".{key}.json.backup.tmp"));
+        std::fs::write(&stale_full, b"stale").unwrap();
+        std::fs::write(&stale_meta, b"stale").unwrap();
+        std::fs::write(&live, b"live").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let live_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&live)
+            .unwrap();
+        live_file.lock_exclusive().unwrap();
+
+        super::cleanup_artifact_cache_temporary_files(&root).unwrap();
+
+        assert!(!stale_full.exists());
+        assert!(!stale_meta.exists());
+        assert_eq!(std::fs::read(&live).unwrap(), b"live");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        drop(live_file);
+        super::cleanup_artifact_cache_temporary_files(&root).unwrap();
+        assert!(!live.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_snapshot_tracks_build_rs_but_disables_hot_skip_for_unbounded_cargo_inputs() {
+        let root = temp_project("config-input-policy");
+        std::fs::create_dir_all(root.join(".gnr8/src")).unwrap();
+        std::fs::write(root.join(".gnr8/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            root.join(".gnr8/Cargo.toml"),
+            "[package]\nname = \"config-test\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let cx = Cx::new(&root);
+        assert!(super::cache_config_inputs_complete(&cx));
+
+        std::fs::write(root.join(".gnr8/build.rs"), "fn main() {}\n").unwrap();
+        let paths = super::cache_config_input_paths(&root).unwrap();
+        assert!(paths.contains(&root.join(".gnr8/build.rs")));
+        assert!(!super::cache_config_inputs_complete(&cx));
+
+        std::fs::remove_file(root.join(".gnr8/build.rs")).unwrap();
+        std::fs::write(
+            root.join(".gnr8/Cargo.toml"),
+            "[package]\nname = \"config-test\"\nversion = \"0.1.0\"\n\n[dependencies]\nlocal = { path = \"../local\" }\n",
+        )
+        .unwrap();
+        assert!(!super::cache_config_inputs_complete(&cx));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-# One-shot release: prepare the version commit locally, gate and smoke that exact revision, then
-# atomically push main + vX.Y.Z before optional publication and release assets.
+# One-shot release: prepare and validate the version-only commit, then atomically push main +
+# vX.Y.Z before optional publication and release assets. Main's focused CI jobs own test coverage.
 
 name: Release
 
@@ -32,8 +32,9 @@ concurrency:
 
 jobs:
   bump-and-tag:
-    name: Prepare, gate, smoke, then tag
+    name: Prepare and tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: github.ref == 'refs/heads/main'
     outputs:
       version: ${{ steps.metadata.outputs.version }}
@@ -46,23 +47,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: goextract/go.mod
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.x"
-
-      - name: Install Python test dependencies
-        run: python -m pip install PyYAML==6.0.2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
       - name: Sync main
         run: git pull --rebase origin main
+
+      - name: Validate release selections
+        env:
+          PUBLISH_CRATES: ${{ inputs.publish_crates }}
+          PUBLISH_CLI: ${{ inputs.publish_cli }}
+        run: |
+          if [[ "$PUBLISH_CLI" = true && "$PUBLISH_CRATES" != true ]]; then
+            echo "::error::CLI archives require the exact gnr8 crate version to be published first."
+            exit 1
+          fi
 
       - name: Bump release version
         id: bump
@@ -75,7 +71,7 @@ jobs:
           echo "version=$new" >> "$GITHUB_OUTPUT"
 
       - name: Refresh Cargo.lock
-        run: cargo build --workspace
+        run: cargo check --workspace
 
       - name: Refresh committed example lockfiles
         env:
@@ -104,27 +100,10 @@ jobs:
           fi
           git commit -m "chore(release): bump crate version to ${NEW_VERSION}"
 
-      - name: Full release gate on versioned commit
-        run: make check
-
-      - name: Verify release gate left the versioned commit clean
+      - name: Verify version update is complete
         run: git diff --exit-code
 
-      - name: Package and smoke host archive
-        env:
-          TARGET: x86_64-unknown-linux-gnu
-          ASSET_OS: linux
-          ASSET_ARCH: x86_64
-        run: |
-          set -euo pipefail
-          scripts/package-release.sh
-          scripts/smoke-release-archive.sh \
-            target/release-local-dist/dist/gnr8-linux-x86_64.tar.gz
-
-      - name: Verify crates.io package
-        run: DRY_RUN=1 ./scripts/publish-crates.sh
-
-      - name: Atomically push gated commit and tag
+      - name: Atomically push versioned commit and tag
         id: metadata
         env:
           NEW_VERSION: ${{ steps.bump.outputs.version }}
@@ -141,6 +120,7 @@ jobs:
     needs: bump-and-tag
     if: github.ref == 'refs/heads/main' && inputs.publish_crates
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
@@ -189,6 +169,7 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
@@ -196,7 +177,6 @@ jobs:
 
       - name: Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        timeout-minutes: 5
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -231,9 +211,16 @@ jobs:
 
   github-release-cli:
     name: GitHub Release assets
-    needs: [bump-and-tag, build-cli]
-    if: github.ref == 'refs/heads/main' && inputs.publish_cli
+    needs: [bump-and-tag, crates-io, build-cli]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      inputs.publish_cli &&
+      needs.bump-and-tag.result == 'success' &&
+      needs.crates-io.result == 'success' &&
+      needs.build-cli.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/download-artifact@v6
         with:

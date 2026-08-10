@@ -38,8 +38,6 @@ const GNR8_CARGO_ENV: &str = "GNR8_CARGO";
 const CARGO_ENV: &str = "CARGO";
 /// The default cargo binary when neither override is set.
 const DEFAULT_CARGO: &str = "cargo";
-/// The generation crate directory under the project root.
-const WORKSPACE_DIR: &str = ".gnr8";
 
 /// Run the user's `.gnr8/` generation crate with `subcommand` (`__emit` / `__inspect`) and return the
 /// parsed [`ArtifactBundle`] it printed on stdout.
@@ -62,6 +60,11 @@ pub(crate) fn run_child(
     project_root: &Path,
     subcommand: &str,
 ) -> Result<ArtifactBundle, CoreError> {
+    ensure_cargo_lock(project_root)?;
+    // Bracket the whole cargo build + child run. The child brackets its own execution too, but a
+    // config edit after cargo compiled the binary and before that binary started would otherwise
+    // pair old pipeline code with new `.gnr8/src` stamps.
+    let config_before = host_config_snapshot(project_root);
     let (stdout, stderr) = run_child_stdout(project_root, subcommand)?;
     let bundle = parse_bundle(stdout.trim(), &stderr)?;
 
@@ -98,12 +101,81 @@ pub(crate) fn run_child(
             ),
         });
     }
+    let config_after = host_config_snapshot(project_root);
+    validate_host_config_snapshot(
+        project_root,
+        bundle.artifact_cache_key.as_deref(),
+        &bundle.cache_config_stamps,
+        config_before.as_deref(),
+        config_after.as_deref(),
+    )?;
     Ok(bundle)
+}
+
+fn validate_host_config_snapshot(
+    project_root: &Path,
+    artifact_cache_key: Option<&str>,
+    child_snapshot: &[gnr8::sdk::FileStamp],
+    before: Option<&[gnr8::sdk::FileStamp]>,
+    after: Option<&[gnr8::sdk::FileStamp]>,
+) -> Result<(), CoreError> {
+    let config_changed = before != after;
+    let child_snapshot_disagrees = after.is_some_and(|after| after != child_snapshot);
+    if config_changed || child_snapshot_disagrees {
+        if let Some(key) = artifact_cache_key {
+            gnr8::sdk::discard_artifact_cache(project_root, key)?;
+        }
+        return Err(CoreError::ChildRun {
+            message: "the .gnr8 configuration changed while cargo built or ran the generation crate; no outputs were accepted — rerun generate"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_cargo_lock(project_root: &Path) -> Result<(), CoreError> {
+    let manifest = gnr8::workspace::manifest_path(project_root);
+    let lock = manifest.with_file_name("Cargo.lock");
+    if lock.is_file() || !manifest.is_file() {
+        return Ok(());
+    }
+    let cargo = cargo_binary();
+    let output = Command::new(&cargo)
+        .args(["generate-lockfile", "--manifest-path"])
+        .arg(&manifest)
+        .current_dir(project_root)
+        .output()
+        .map_err(|err| CoreError::ChildRun {
+            message: format!("failed to create .gnr8/Cargo.lock with {cargo:?}: {err}"),
+        })?;
+    if !output.status.success() {
+        return Err(CoreError::ChildRun {
+            message: format!(
+                "failed to create .gnr8/Cargo.lock before building the generation crate:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn host_config_snapshot(project_root: &Path) -> Option<Vec<gnr8::sdk::FileStamp>> {
+    let fast = crate::collect_required_config_fast_stamps(project_root)?;
+    crate::content_stamps_from_fast(project_root, &fast)
 }
 
 /// Run the user's `.gnr8/` generation crate in inspect mode and parse the transformed graph.
 pub(crate) fn inspect_child(project_root: &Path) -> Result<gnr8::graph::ApiGraph, CoreError> {
+    ensure_cargo_lock(project_root)?;
+    let config_before = host_config_snapshot(project_root);
     let (stdout, stderr) = run_child_stdout(project_root, "__inspect")?;
+    let config_after = host_config_snapshot(project_root);
+    if config_before != config_after {
+        return Err(CoreError::ChildRun {
+            message: "the .gnr8 configuration changed while cargo built or ran the inspection crate; no graph was accepted — rerun inspect"
+                .to_string(),
+        });
+    }
     parse_graph(stdout.trim(), &stderr)
 }
 
@@ -202,11 +274,6 @@ fn cargo_binary() -> String {
 }
 
 enum ChildInvocation {
-    Direct {
-        binary: PathBuf,
-        project_root: PathBuf,
-        subcommand: String,
-    },
     CargoRun {
         cargo: String,
         manifest: PathBuf,
@@ -218,15 +285,6 @@ enum ChildInvocation {
 impl ChildInvocation {
     fn command(&self) -> Result<Command, CoreError> {
         let mut command = match self {
-            Self::Direct {
-                binary,
-                project_root,
-                subcommand,
-            } => {
-                let mut command = Command::new(binary);
-                command.arg(subcommand).current_dir(project_root);
-                command
-            }
             Self::CargoRun {
                 cargo,
                 manifest,
@@ -252,11 +310,6 @@ impl ChildInvocation {
 
     fn description(&self, fallback_cargo: &str) -> String {
         match self {
-            Self::Direct {
-                binary, subcommand, ..
-            } => {
-                format!("{} {subcommand}", binary.display())
-            }
             Self::CargoRun {
                 cargo, subcommand, ..
             } => format!(
@@ -286,85 +339,12 @@ fn configure_child_environment(command: &mut Command, resource_dir: &Path) {
 }
 
 fn child_invocation(project_root: &Path, manifest: &Path, subcommand: &str) -> ChildInvocation {
-    if let Some(binary) = fresh_child_binary(project_root, manifest) {
-        return ChildInvocation::Direct {
-            binary,
-            project_root: project_root.to_path_buf(),
-            subcommand: subcommand.to_string(),
-        };
-    }
     ChildInvocation::CargoRun {
         cargo: cargo_binary(),
         manifest: manifest.to_path_buf(),
         project_root: project_root.to_path_buf(),
         subcommand: subcommand.to_string(),
     }
-}
-
-fn fresh_child_binary(project_root: &Path, manifest: &Path) -> Option<PathBuf> {
-    let package = package_name(manifest)?;
-    for profile in ["release", "debug"] {
-        let binary = project_root
-            .join(WORKSPACE_DIR)
-            .join("target")
-            .join(profile)
-            .join(&package);
-        if binary.is_file() && is_executable_fresh(&binary, project_root, manifest) {
-            return Some(binary);
-        }
-    }
-    None
-}
-
-fn is_executable_fresh(binary: &Path, project_root: &Path, manifest: &Path) -> bool {
-    let Ok(binary_modified) = binary.metadata().and_then(|metadata| metadata.modified()) else {
-        return false;
-    };
-    generation_workspace_inputs(project_root, manifest)
-        .into_iter()
-        .filter_map(|path| {
-            path.metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        })
-        .all(|modified| modified <= binary_modified)
-}
-
-fn generation_workspace_inputs(project_root: &Path, manifest: &Path) -> Vec<PathBuf> {
-    let mut inputs = vec![manifest.to_path_buf()];
-    let lock = manifest.with_file_name("Cargo.lock");
-    if lock.is_file() {
-        inputs.push(lock);
-    }
-    collect_files(&project_root.join(WORKSPACE_DIR).join("src"), &mut inputs);
-    if let Ok(exe) = std::env::current_exe() {
-        inputs.push(exe);
-    }
-    inputs
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
-
-fn package_name(manifest: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(manifest).ok()?;
-    let parsed: toml::Value = toml::from_str(&body).ok()?;
-    parsed
-        .get("package")?
-        .get("name")?
-        .as_str()
-        .map(ToString::to_string)
 }
 
 /// Render an [`std::process::ExitStatus`] as a short string for the error message (the numeric code,
@@ -381,7 +361,7 @@ fn describe_status(status: std::process::ExitStatus) -> String {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{configure_child_environment, package_name};
+    use super::{configure_child_environment, validate_host_config_snapshot};
     use std::ffi::OsStr;
     use std::process::Command;
 
@@ -408,19 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn package_name_reads_toml_package_name() {
-        let manifest = temp_manifest(
-            r#"
-[package]
-name = 'quoted-child' # comments are valid TOML
-version = "0.1.0"
-"#,
-        );
-
-        assert_eq!(package_name(&manifest), Some("quoted-child".to_string()));
-    }
-
-    #[test]
     fn child_environment_includes_complete_compatibility_handshake() {
         let mut command = Command::new("child");
         configure_child_environment(&mut command, std::path::Path::new("/resources"));
@@ -437,5 +404,37 @@ version = "0.1.0"
             env_value(&command, gnr8::runner::HOST_CAPABILITY_ENV),
             Some(OsStr::new(&gnr8::runner::capability_fingerprint()))
         );
+    }
+
+    #[test]
+    fn changed_outer_config_snapshot_rejects_the_bundle_and_discards_its_cache() {
+        let manifest = temp_manifest("[package]\nname = 'snapshot-test'\nversion = '0.1.0'\n");
+        let root = manifest.parent().unwrap();
+        let key = "a".repeat(64);
+        let cache = root.join(".gnr8/cache/artifacts");
+        std::fs::create_dir_all(&cache).unwrap();
+        let full = cache.join(format!("{key}.json"));
+        let metadata = cache.join(format!("{key}.meta.json"));
+        std::fs::write(&full, b"poisoned").unwrap();
+        std::fs::write(&metadata, b"poisoned").unwrap();
+        let before = vec![gnr8::sdk::FileStamp {
+            path: ".gnr8/src/main.rs".to_string(),
+            len: 1,
+            modified_ns: 1,
+            hash: "b".repeat(64),
+        }];
+        let after = vec![gnr8::sdk::FileStamp {
+            hash: "c".repeat(64),
+            ..before[0].clone()
+        }];
+
+        let err =
+            validate_host_config_snapshot(root, Some(&key), &after, Some(&before), Some(&after))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("configuration changed"));
+        assert!(!full.exists());
+        assert!(!metadata.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
