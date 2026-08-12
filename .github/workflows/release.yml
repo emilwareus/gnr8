@@ -70,6 +70,11 @@ jobs:
           fi
           echo "version=$new" >> "$GITHUB_OUTPUT"
 
+      - name: Validate release changelog
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
+        run: python3 scripts/release-notes.py check "$NEW_VERSION"
+
       - name: Refresh Cargo.lock
         run: cargo check --workspace
 
@@ -218,6 +223,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.bump-and-tag.outputs.tag }}
+
       - uses: actions/download-artifact@v6
         with:
           path: dist
@@ -238,11 +247,16 @@ jobs:
             echo "::error::No artifacts in dist/"
             exit 1
           fi
+          python3 scripts/release-notes.py body "${VERSION}" --repo "${REPO}" > release-notes.md
           if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
             gh release upload "${TAG}" dist/* --repo "${REPO}" --clobber
+            gh release edit "${TAG}" \
+              --repo "${REPO}" \
+              --title "gnr8 ${VERSION}" \
+              --notes-file release-notes.md
           else
             gh release create "${TAG}" "${files[@]}" \
               --repo "${REPO}" \
               --title "gnr8 ${VERSION}" \
-              --notes "Install with the archive assets below, or run: \`curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash\`. See [docs/RELEASE.md](https://github.com/${REPO}/blob/main/docs/RELEASE.md)."
+              --notes-file release-notes.md
           fi

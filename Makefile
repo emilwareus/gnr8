@@ -7,7 +7,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test red check all examples-check install invariants
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test release-notes-test red check all examples-check install invariants
 
 # Auto-format the workspace in place.
 fmt:
@@ -90,6 +90,10 @@ tsextract-test: tsextract-deps
 action-test:
 	bash scripts/test-action-version.sh
 
+# Keep release publication tied to a dated changelog section with an empty Unreleased section.
+release-notes-test:
+	python3 -m unittest discover -s scripts -p 'test_release_notes.py'
+
 # Compile + vet the standalone Go Gin fixture module (Pitfall 5 — cargo never builds it).
 fixture-build:
 	cd fixtures/goalservice && go build ./... && go vet ./...
@@ -140,6 +144,7 @@ examples-check: tsextract-deps
 invariants:
 	scripts/check-invariants.sh
 	python3 scripts/check-ci-budget.py
+	$(MAKE) release-notes-test
 
 # Full local gate; CI runs these confidence areas as focused jobs.
 check: invariants fmt-check clippy tsextract-deps test fixture-build goextract-build pyextract-test tsextract-test action-test examples-check

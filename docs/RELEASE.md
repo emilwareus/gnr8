@@ -70,19 +70,32 @@ remain standard-library-only.
 ## GitHub Release
 
 1. Make sure `main` is green and contains only the intended release changes.
-2. Open **Actions → Release → Run workflow** on `main`.
-3. Choose `bump`. **Use `minor` whenever the release removes or changes public Rust API.** Cargo
+2. Move the release's entries from `## Unreleased` into `## X.Y.Z — YYYY-MM-DD`, leaving
+   `## Unreleased` empty. Commit that changelog update to `main`. Check it locally with the bump you
+   intend to select:
+
+   ```bash
+   VERSION="$(python3 scripts/bump-workspace-version.py --dry-run)"
+   python3 scripts/release-notes.py check "$VERSION"
+   ```
+
+   Add `--minor` to the first command when preparing a minor release.
+3. Open **Actions → Release → Run workflow** on `main`.
+4. Choose `bump`. **Use `minor` whenever the release removes or changes public Rust API.** Cargo
    treats `0.x.y → 0.x.(y+1)` as a *compatible* upgrade, so a patch bump would hand a breaking
    change to every downstream `gnr8 = "0.1"` without warning. `CHANGELOG.md` records which releases
    were breaking; check it before choosing.
-4. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
-5. Leave `publish_cli=true` to upload the CLI archives.
+5. Leave `publish_crates=true` to publish exactly one crates.io package: `gnr8`.
+6. Leave `publish_cli=true` to upload the CLI archives.
    CLI publication requires `publish_crates=true`: generated projects pin the exact release version,
    so the workflow waits for crates.io publication to succeed before it creates the GitHub Release.
-6. The workflow bumps the version, refreshes the root and example lockfiles, compile-checks that
-   version-only commit, and pushes it with `vX.Y.Z`. The required focused CI jobs on `main` provide the
-   behavioral gate; the dry-run workflow has already checked packaging and the unpacked archive.
-   Publishing and platform asset jobs then run independently with the same five-minute deadline.
+7. The workflow computes and stages the version bump, verifies that `Unreleased` is empty and its
+   dated changelog section exists before any commit or tag, refreshes the root and example lockfiles,
+   compile-checks that version-only commit, and pushes it with `vX.Y.Z`. The required focused CI jobs
+   on `main` provide the behavioral gate; the dry-run workflow has already checked packaging and the
+   unpacked archive. Publishing and platform asset jobs then run independently with the same
+   five-minute deadline. The GitHub Release body keeps the installation instructions and is rendered
+   from the same dated changelog section.
 
 ## Install Script
 

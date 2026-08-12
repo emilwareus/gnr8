@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.5.0 — 2026-08-10
+
 ### Added
 
 **Operation prose from handler doc comments.** `summary` and `description` are now read from the
