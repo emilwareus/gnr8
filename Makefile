@@ -86,9 +86,11 @@ tsextract-test: tsextract-deps
 	fi
 
 # Exercise the composite action's exact direct-dependency version resolver against real and
-# adversarial lock graphs (including a conflicting transitive gnr8 version).
+# adversarial lock graphs (including a conflicting transitive gnr8 version), and its Rust toolchain
+# resolver against repository pins (so CI compiles `.gnr8` with the same rustc as developer machines).
 action-test:
 	bash scripts/test-action-version.sh
+	bash scripts/test-action-toolchain.sh
 
 # Keep release publication tied to a dated changelog section with an empty Unreleased section.
 release-notes-test:

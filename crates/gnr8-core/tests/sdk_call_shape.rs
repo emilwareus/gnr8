@@ -27,12 +27,18 @@ const TSC: &str = concat!(
     "/../../tsextract/node_modules/typescript/bin/tsc"
 );
 
+/// Distinguishes concurrent staging dirs: several tests share the `generate` label, and the clock
+/// alone is not fine-grained enough to keep two threads that start together apart. Two threads that
+/// picked the same directory raced, one deleting the fixture the other was still generating from.
+static TEMP_DIR_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
+    let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "gnr8-call-shape-{label}-{}-{nanos}",
+        "gnr8-call-shape-{label}-{}-{nanos}-{sequence}",
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");

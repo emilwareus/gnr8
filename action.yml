@@ -35,9 +35,12 @@ inputs:
     required: false
     default: "true"
   rust-toolchain:
-    description: Rust toolchain passed to dtolnay/rust-toolchain.
+    description: >-
+      Rust toolchain to install. "auto" honors a repository-root rust-toolchain.toml
+      (or rust-toolchain) pin and uses "stable" when there is none. Any other value
+      overrides the repository pin.
     required: false
-    default: "stable"
+    default: "auto"
   setup-go:
     description: Install Go before running gnr8 check.
     required: false
@@ -138,11 +141,21 @@ runs:
           exit 2
         fi
 
+    - name: Resolve Rust toolchain
+      id: rust
+      if: ${{ inputs.setup-rust == 'true' }}
+      shell: bash
+      env:
+        REQUESTED_TOOLCHAIN: ${{ inputs.rust-toolchain }}
+      run: |
+        set -euo pipefail
+        "$GITHUB_ACTION_PATH/scripts/resolve-action-toolchain.sh"
+
     - name: Set up Rust
       if: ${{ inputs.setup-rust == 'true' }}
       uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: ${{ inputs.rust-toolchain }}
+        toolchain: ${{ steps.rust.outputs.toolchain }}
 
     - name: Set up Go
       if: ${{ inputs.setup-go == 'true' }}
@@ -199,10 +212,12 @@ runs:
       with:
         path: ${{ steps.projects.outputs.cache_paths }}
         key: ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-${{ github.ref_name }}-${{ github.sha }}
+        # Every fallback keeps the .gnr8 crate hash: a restored entry may only ever save time, and
+        # `.gnr8/target` built from a different pipeline crate saves none. There is deliberately no
+        # prefix-only fallback.
         restore-keys: |
           ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-${{ github.ref_name }}-
           ${{ inputs.cache-key-prefix }}-${{ runner.os }}-${{ hashFiles('**/.gnr8/Cargo.lock', '**/.gnr8/Cargo.toml', '**/.gnr8/src/**') }}-
-          ${{ inputs.cache-key-prefix }}-${{ runner.os }}-
 
     - name: Resolve exact gnr8 release version
       id: version
