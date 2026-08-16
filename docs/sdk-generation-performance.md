@@ -130,6 +130,8 @@ Changes in this iteration:
 
    - gnr8-core version
    - the goextract sidecar source hash
+   - the Go toolchain identity (`go env GOVERSION GOOS GOARCH GOFLAGS`), because `go/packages`
+     type-checks with whatever `go` is on PATH
    - the configured input dir and package pattern list
    - a stable content hash of the **enclosing Go module's build inputs** — its Go sources and module
      manifests, under the nearest `go.mod` at or above the input dir, resolved no higher than the

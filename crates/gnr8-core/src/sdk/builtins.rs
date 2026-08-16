@@ -313,12 +313,34 @@ fn go_gin_cache_scope_files(scope: &Path) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
+/// The identity of the Go toolchain the extractor will type-check with, or `None` when it is absent.
+///
+/// The sidecar reads nothing from disk itself: every fact comes through `go/packages`, which shells
+/// out to the `go` on PATH. The selected toolchain therefore decides the stdlib type information and
+/// the build constraints that pick which files compile, which makes it an extraction input like any
+/// source file. It is read from `dir` so a module that selects its own toolchain reports the one that
+/// will actually run. Reading it costs one `go env` per run; without a toolchain there is no cache,
+/// and extraction then fails with its own actionable error.
+fn go_toolchain_identity(dir: &Path) -> Option<String> {
+    let output = Command::new("go")
+        .args(["env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let identity = String::from_utf8(output.stdout).ok()?;
+    let identity = identity.trim();
+    (!identity.is_empty()).then(|| identity.to_string())
+}
+
 /// The cache key for one Go source analysis, or `None` when the inputs cannot be proven.
 ///
-/// The key covers the extractor's whole input surface: the enclosing Go module's file contents, the
-/// configured input dir and package scopes (which decide WHICH packages are loaded), the goextract
-/// source, and the gnr8 version. `None` means "no cache for this run" — the analysis is recomputed,
-/// which is the same single derivation, only slower.
+/// The key covers the extractor's whole input surface: the enclosing Go module's build inputs, the
+/// configured input dir and package scopes (which decide WHICH packages are loaded), the Go toolchain
+/// identity, the goextract source, and the gnr8 version. `None` means "no cache for this run" — the
+/// analysis is recomputed, which is the same single derivation, only slower.
 fn go_gin_cache_key(
     input: &Path,
     route_package_patterns: &[String],
@@ -327,6 +349,7 @@ fn go_gin_cache_key(
     cx: &Cx,
 ) -> Option<String> {
     let scope = go_gin_cache_scope(&cx.project_root, input)?;
+    let toolchain = go_toolchain_identity(&scope)?;
     let files = go_gin_cache_scope_files(&scope)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-go-gin-source-cache-v5\n");
@@ -334,6 +357,9 @@ fn go_gin_cache_key(
     hasher.update(b"\n");
     hasher.update(b"helper\n");
     hasher.update(helper_source_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(b"toolchain\n");
+    hasher.update(toolchain.as_bytes());
     hasher.update(b"\n");
     // The loaded package set depends on the input dir and the scopes, so both are part of the key:
     // two inputs inside ONE module hash the same tree and must not share an entry.
@@ -6212,6 +6238,12 @@ mod tests {
         Cx::new(std::env::temp_dir())
     }
 
+    /// The Go source cache keys on the toolchain identity, so a key needs `go` on PATH exactly like
+    /// the rest of the Go-dependent suite. These tests skip gracefully where it is absent.
+    fn go_toolchain_present() -> bool {
+        super::go_toolchain_identity(&std::env::temp_dir()).is_some()
+    }
+
     /// A throwaway project root that is also a Go module root.
     fn go_module_cx(name: &str) -> Cx {
         let root = std::env::temp_dir().join(format!("gnr8-{name}-{}", std::process::id()));
@@ -6224,6 +6256,9 @@ mod tests {
 
     #[test]
     fn go_gin_cache_key_changes_with_extractor_source() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("cache-key-extractor-source");
         let input = cx.project_root.clone();
         let routes = vec!["./routes".to_string()];
@@ -6245,6 +6280,9 @@ mod tests {
     /// comments existed — this test is what keeps it true.
     #[test]
     fn go_gin_cache_key_changes_when_only_a_doc_comment_changes() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("doc-comment-cache");
         let dir = cx.project_root.clone();
         let handler = dir.join("handlers.go");
@@ -6282,6 +6320,9 @@ mod tests {
     /// warm CI cache (issue #50). The key covers the whole enclosing module.
     #[test]
     fn go_gin_cache_key_covers_module_files_outside_the_input_dir() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("cache-key-module-scope");
         let input = cx.project_root.join("api");
         let shared = cx.project_root.join("shared");
@@ -6317,6 +6358,9 @@ mod tests {
     /// what keeps the cache useful in a repository that also holds generated SDK output.
     #[test]
     fn go_gin_cache_key_ignores_files_go_never_compiles() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("cache-key-non-go-files");
         let input = cx.project_root.clone();
         std::fs::write(input.join("handlers.go"), "package p\n").expect("write handler");
@@ -6343,6 +6387,9 @@ mod tests {
     /// Two input dirs inside ONE module hash the same tree, so the input must be part of the key.
     #[test]
     fn go_gin_cache_key_separates_two_inputs_in_one_module() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("cache-key-two-inputs");
         let first_input = cx.project_root.join("api");
         let second_input = cx.project_root.join("admin");
@@ -6359,10 +6406,35 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// The toolchain identity names the toolchain and is stable across calls.
+    ///
+    /// It is part of the key because `go/packages` type-checks with whatever `go` is on PATH: the
+    /// stdlib type information and the build constraints that pick which files compile both come
+    /// from there. An identity that drifted between two calls would also destroy every cache hit.
+    #[test]
+    fn go_toolchain_identity_names_the_toolchain_and_is_stable() {
+        if !go_toolchain_present() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+
+        let first = super::go_toolchain_identity(&dir).expect("go is present");
+        let second = super::go_toolchain_identity(&dir).expect("go is present");
+
+        assert!(
+            first.contains("go1."),
+            "the identity must name the toolchain version, got {first:?}"
+        );
+        assert_eq!(first, second, "the identity must be stable across calls");
+    }
+
     /// A Go workspace puts other modules in scope, so one module directory no longer bounds the
     /// inputs ⇒ no cache at all.
     #[test]
     fn go_gin_cache_key_is_absent_inside_a_go_workspace() {
+        if !go_toolchain_present() {
+            return;
+        }
         let cx = go_module_cx("cache-key-go-workspace");
         let input = cx.project_root.clone();
         std::fs::write(input.join("handlers.go"), "package p\n").expect("write handler");

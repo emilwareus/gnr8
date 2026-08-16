@@ -17,10 +17,13 @@ must move the minor version.
   extracted schemas. An edit to such a package left the key unchanged, so a restored cache answered
   with a stale graph and `check` reported drift against artifacts that were in fact up to date. The
   key now covers the whole enclosing Go module (the nearest `go.mod` at or above the input dir,
-  resolved no higher than the project root), plus the input dir itself and the goextract sidecar
-  hash. When the module root sits above the project root, a Go workspace (`go.work` / `GOWORK`) puts
-  other modules in scope, or the module tree cannot be enumerated exactly, there is no cache at all —
-  slower, never wrong.
+  resolved no higher than the project root), plus the input dir itself, the goextract sidecar hash,
+  and the Go toolchain identity — `go/packages` type-checks with whatever `go` is on PATH, so the
+  selected toolchain decides the stdlib type information and the build constraints that pick which
+  files compile. When the module root sits above the project root, a Go workspace (`go.work` /
+  `GOWORK`) puts other modules in scope, or the module tree cannot be enumerated exactly, there is no
+  cache at all — slower, never wrong. Projects in those shapes will see `check` and `generate` re-run
+  Go extraction every time.
 - **A restored cache entry can no longer decide a verdict.** Each stored analysis now records the key
   it was computed under. An entry whose recording does not match the current run is discarded and the
   analysis is recomputed, so a cache directory restored from another commit only ever costs time.

@@ -103,9 +103,10 @@ an explicit script/program that performs discovery.
 
 Source cache hits may skip extraction inside a normal child run after validating their bounded inputs.
 For the Go source that bound is the **enclosing module**, not just the configured input dir, because
-`go/packages` type-checks the input packages together with everything they import; a module rooted
-above the project root, a Go workspace that puts other modules in scope, or a tree that cannot be
-enumerated exactly, is not cached at all. Every entry
+`go/packages` type-checks the input packages together with everything they import, using whatever `go`
+is on PATH, so the module's build inputs and the toolchain identity are both part of the key. A module
+rooted above the project root, a Go workspace that puts other modules in scope, or a tree that cannot
+be enumerated exactly, is not cached at all. Every entry
 records the key it was computed under and is discarded when that recording does not match the current
 run, so a cache restored from another commit can only cost time, never change a verdict.
 Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:
