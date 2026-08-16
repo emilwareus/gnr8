@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.5.1 — 2026-08-16
+
 ### Fixed
 
 - **`gnr8 check` no longer reports false drift from a warm project cache.** The Go source-analysis
