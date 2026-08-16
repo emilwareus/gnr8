@@ -12,8 +12,8 @@
 #![allow(clippy::doc_markdown)]
 
 use super::{
-    collect_cache_input_files, hash_files, Artifacts, Cx, PostProcess, ReadinessKind,
-    ReadinessTarget, Source, Target, Transform,
+    hash_files, Artifacts, Cx, PostProcess, ReadinessKind, ReadinessTarget, Source, Target,
+    Transform,
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
@@ -144,7 +144,10 @@ impl Source for GoGin {
             &helper_source_hash,
             cx,
         );
-        if let Some(cached) = load_go_gin_cache(cx, &cache_key) {
+        if let Some(cached) = cache_key
+            .as_deref()
+            .and_then(|key| load_go_gin_cache(cx, key))
+        {
             return Ok(cached);
         }
         let input_arg = resolved.to_string_lossy();
@@ -153,7 +156,9 @@ impl Source for GoGin {
             &self.route_package_patterns,
             &self.schema_package_patterns,
         )?;
-        save_go_gin_cache(cx, &cache_key, &graph);
+        if let Some(key) = cache_key.as_deref() {
+            save_go_gin_cache(cx, key, &graph);
+        }
         Ok(graph)
     }
 
@@ -172,21 +177,171 @@ fn single_input_cache_root(
     Some(vec![project_root.join(single)])
 }
 
+/// The envelope schema version for a stored Go source-analysis graph.
+const GO_GIN_SOURCE_CACHE_VERSION: u32 = 1;
+
+/// One stored Go source-analysis result, with the key it was computed under.
+///
+/// The key is recorded INSIDE the entry, not just in its file name, so a restored or rewritten
+/// cache directory cannot present an entry as an answer to a question it did not answer.
+#[derive(Debug, serde::Deserialize)]
+struct GoGinSourceCacheEntry {
+    version: u32,
+    key: String,
+    graph: ApiGraph,
+}
+
+/// The write side of [`GoGinSourceCacheEntry`], borrowing the graph it stores.
+#[derive(Debug, serde::Serialize)]
+struct GoGinSourceCacheRecord<'a> {
+    version: u32,
+    key: &'a str,
+    graph: &'a ApiGraph,
+}
+
+/// The Go module directory whose full contents are the extractor's provable input surface.
+///
+/// `go/packages` type-checks the input packages together with everything they import, so the
+/// analyzed facts depend on the whole enclosing module — not only on the configured input dir. The
+/// scope is therefore the nearest `go.mod` at or above `input`, and the walk stops at the project
+/// root: a module rooted ABOVE the project has inputs gnr8 cannot enumerate, so it gets no cache
+/// (slower, never wrong) rather than a key that silently ignores them.
+fn go_gin_cache_scope(project_root: &Path, input: &Path) -> Option<PathBuf> {
+    // Containment must be provable from the path itself: a `..` component means the input may leave
+    // the project, and a tree gnr8 cannot bound is a tree it will not key on.
+    if input.components().any(|part| part == Component::ParentDir)
+        || !input.starts_with(project_root)
+        || in_go_workspace(input)
+    {
+        return None;
+    }
+    let mut dir = input;
+    loop {
+        if dir.join("go.mod").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir == project_root {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Whether a Go workspace governs `input`, which puts modules outside the enclosing one in scope.
+///
+/// In workspace mode `go` resolves imports across every module the workspace lists, so the input
+/// surface is no longer bounded by one module directory. gnr8 looks for the workspace exactly where
+/// `go` does — `GOWORK`, then `go.work` in the directory and its parents — and declines to cache when
+/// it finds one.
+fn in_go_workspace(input: &Path) -> bool {
+    match std::env::var("GOWORK") {
+        Ok(value) if value.trim() == "off" => return false,
+        Ok(value) if !value.trim().is_empty() => return true,
+        _ => {}
+    }
+    let mut dir = Some(input);
+    while let Some(current) = dir {
+        if current.join("go.work").is_file() {
+            return true;
+        }
+        dir = current.parent();
+    }
+    false
+}
+
+/// Whether a file name is part of what a Go build reads for the module's typed surface.
+///
+/// The extractor's facts come from compiled sources and the module manifests, so those are exactly
+/// what the key hashes. Everything else in the tree (generated SDK output, images, lockfiles of
+/// other ecosystems) is not an extraction input and must not churn the key.
+fn is_go_module_input(name: &str) -> bool {
+    if matches!(name, "go.mod" | "go.sum" | "go.work" | "go.work.sum") {
+        return true;
+    }
+    // vendor/modules.txt selects which vendored packages a vendored build compiles.
+    if name == "modules.txt" {
+        return true;
+    }
+    // The compiled-source extensions `go build` accepts, including the cgo ones.
+    matches!(
+        name.rsplit_once('.').map(|(_, extension)| extension),
+        Some("go" | "s" | "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "m" | "syso")
+    )
+}
+
+/// Every Go build input under `scope`, or `None` when the tree cannot be enumerated exactly.
+///
+/// An unreadable directory or an entry that cannot be classified makes the membership of the tree
+/// unprovable, and an unprovable input set must never key a cache entry. Symlinked directories are
+/// skipped because `go` does not follow them when matching package patterns either, so they are not
+/// part of the module's own source set; `.git`, `.gnr8`, and `node_modules` hold no Go sources the
+/// module compiles.
+fn go_gin_cache_scope_files(scope: &Path) -> Option<Vec<PathBuf>> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|name| name.to_str())?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_symlink() {
+                // A symlinked file is read like any other file; a symlinked directory is outside the
+                // module's own source set (`go` does not walk into one).
+                if path.is_file() && is_go_module_input(name) {
+                    out.push(path);
+                }
+                continue;
+            }
+            if kind.is_dir() {
+                if matches!(name, ".git" | ".gnr8" | "node_modules") {
+                    continue;
+                }
+                walk(&path, out)?;
+            } else if kind.is_file() {
+                if is_go_module_input(name) {
+                    out.push(path);
+                }
+            } else {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    let mut files = Vec::new();
+    walk(scope, &mut files)?;
+    files.sort();
+    Some(files)
+}
+
+/// The cache key for one Go source analysis, or `None` when the inputs cannot be proven.
+///
+/// The key covers the extractor's whole input surface: the enclosing Go module's file contents, the
+/// configured input dir and package scopes (which decide WHICH packages are loaded), the goextract
+/// source, and the gnr8 version. `None` means "no cache for this run" — the analysis is recomputed,
+/// which is the same single derivation, only slower.
 fn go_gin_cache_key(
     input: &Path,
     route_package_patterns: &[String],
     schema_package_patterns: &[String],
     helper_source_hash: &str,
     cx: &Cx,
-) -> String {
-    let mut files = Vec::new();
-    collect_cache_input_files(input, &mut files);
+) -> Option<String> {
+    let scope = go_gin_cache_scope(&cx.project_root, input)?;
+    let files = go_gin_cache_scope_files(&scope)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"gnr8-go-gin-source-cache-v4\n");
+    hasher.update(b"gnr8-go-gin-source-cache-v5\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(b"\n");
     hasher.update(b"helper\n");
     hasher.update(helper_source_hash.as_bytes());
+    hasher.update(b"\n");
+    // The loaded package set depends on the input dir and the scopes, so both are part of the key:
+    // two inputs inside ONE module hash the same tree and must not share an entry.
+    hasher.update(b"scope\n");
+    hasher.update(project_relative_key_path(&cx.project_root, &scope).as_bytes());
+    hasher.update(b"\n");
+    hasher.update(b"input\n");
+    hasher.update(project_relative_key_path(&cx.project_root, input).as_bytes());
     hasher.update(b"\n");
     hasher.update(b"routes\n");
     for pattern in route_package_patterns {
@@ -199,12 +354,30 @@ fn go_gin_cache_key(
         hasher.update(b"\0");
     }
     hasher.update(hash_files(&files, &cx.project_root).as_bytes());
-    hasher.finalize().to_hex().to_string()
+    Some(hasher.finalize().to_hex().to_string())
 }
 
+fn project_relative_key_path(project_root: &Path, path: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Read the stored analysis for `key`, discarding any entry that cannot prove it belongs to it.
+///
+/// A cache may only make a run faster. An entry whose recorded schema version or key does not match
+/// this run is untrusted input — it is deleted and the analysis is recomputed, never reported.
 fn load_go_gin_cache(cx: &Cx, key: &str) -> Option<ApiGraph> {
-    let bytes = std::fs::read(go_gin_cache_path(cx, key)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let path = go_gin_cache_path(cx, key);
+    let bytes = std::fs::read(&path).ok()?;
+    let entry = serde_json::from_slice::<GoGinSourceCacheEntry>(&bytes)
+        .ok()
+        .filter(|entry| entry.version == GO_GIN_SOURCE_CACHE_VERSION && entry.key == key);
+    if entry.is_none() {
+        let _ = std::fs::remove_file(&path);
+    }
+    entry.map(|entry| entry.graph)
 }
 
 fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
@@ -215,7 +388,12 @@ fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(bytes) = serde_json::to_vec(graph) else {
+    let record = GoGinSourceCacheRecord {
+        version: GO_GIN_SOURCE_CACHE_VERSION,
+        key,
+        graph,
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
     };
     let _ = std::fs::write(path, bytes);
@@ -6009,10 +6187,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        create_unique_postprocess_dir, go_gin_cache_key, sdk_package, ApiOverrides, ApplySecurity,
-        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask,
-        FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
-        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
+        create_unique_postprocess_dir, go_gin_cache_key, go_gin_cache_path, load_go_gin_cache,
+        save_go_gin_cache, sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination,
+        ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask, FormatCommand, GoGin,
+        GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json,
+        OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
         ParameterOverride, PostProcess, PySdk, RequestParameter, ResponseOverride,
         SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
@@ -6033,16 +6212,28 @@ mod tests {
         Cx::new(std::env::temp_dir())
     }
 
+    /// A throwaway project root that is also a Go module root.
+    fn go_module_cx(name: &str) -> Cx {
+        let root = std::env::temp_dir().join(format!("gnr8-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp project root");
+        std::fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n")
+            .expect("write go.mod");
+        Cx::new(root)
+    }
+
     #[test]
     fn go_gin_cache_key_changes_with_extractor_source() {
-        let cx = cx();
-        let input = cx.project_root.join("gnr8-cache-key-missing-input");
+        let cx = go_module_cx("cache-key-extractor-source");
+        let input = cx.project_root.clone();
         let routes = vec!["./routes".to_string()];
         let schemas = vec!["./schemas".to_string()];
 
         let first = go_gin_cache_key(&input, &routes, &schemas, "helper-a", &cx);
         let second = go_gin_cache_key(&input, &routes, &schemas, "helper-b", &cx);
 
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(first.is_some());
         assert_ne!(first, second);
     }
 
@@ -6054,12 +6245,8 @@ mod tests {
     /// comments existed — this test is what keeps it true.
     #[test]
     fn go_gin_cache_key_changes_when_only_a_doc_comment_changes() {
-        let cx = cx();
-        let dir = cx
-            .project_root
-            .join(format!("gnr8-doc-comment-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp input dir");
+        let cx = go_module_cx("doc-comment-cache");
+        let dir = cx.project_root.clone();
         let handler = dir.join("handlers.go");
         let routes = vec!["./...".to_string()];
         let schemas = vec!["./...".to_string()];
@@ -6080,10 +6267,183 @@ mod tests {
         let after = go_gin_cache_key(&dir, &routes, &schemas, "helper", &cx);
 
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(before.is_some());
         assert_ne!(
             before, after,
             "a doc-comment-only edit must invalidate the source cache"
         );
+    }
+
+    /// A shared package OUTSIDE the configured input dir is still an extraction input.
+    ///
+    /// `go/packages` type-checks the input packages together with everything they import, so a type
+    /// defined elsewhere in the module reaches the extracted schemas. Keying only on the input dir
+    /// made a stale entry survive an edit to that shared package, which surfaced as false drift on a
+    /// warm CI cache (issue #50). The key covers the whole enclosing module.
+    #[test]
+    fn go_gin_cache_key_covers_module_files_outside_the_input_dir() {
+        let cx = go_module_cx("cache-key-module-scope");
+        let input = cx.project_root.join("api");
+        let shared = cx.project_root.join("shared");
+        std::fs::create_dir_all(&input).expect("input dir");
+        std::fs::create_dir_all(&shared).expect("shared dir");
+        std::fs::write(input.join("routes.go"), "package api\n").expect("write routes");
+        let shared_types = shared.join("types.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+
+        std::fs::write(&shared_types, "package shared\n\ntype Widget struct{}\n")
+            .expect("write shared");
+        let before = go_gin_cache_key(&input, &routes, &schemas, "helper", &cx);
+
+        std::fs::write(
+            &shared_types,
+            "package shared\n\ntype Widget struct{ Name string }\n",
+        )
+        .expect("rewrite shared");
+        let after = go_gin_cache_key(&input, &routes, &schemas, "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(before.is_some());
+        assert_ne!(
+            before, after,
+            "an edit to an imported package outside the input dir must invalidate the source cache"
+        );
+    }
+
+    /// The key hashes the module's build inputs, not every byte in the tree.
+    ///
+    /// A file `go` never compiles is not an extraction input, so it must not churn the key — that is
+    /// what keeps the cache useful in a repository that also holds generated SDK output.
+    #[test]
+    fn go_gin_cache_key_ignores_files_go_never_compiles() {
+        let cx = go_module_cx("cache-key-non-go-files");
+        let input = cx.project_root.clone();
+        std::fs::write(input.join("handlers.go"), "package p\n").expect("write handler");
+        let generated = input.join("generated");
+        std::fs::create_dir_all(&generated).expect("generated dir");
+        let doc = generated.join("openapi.yaml");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+
+        std::fs::write(&doc, "openapi: 3.1.0\n").expect("write doc");
+        let before = go_gin_cache_key(&input, &routes, &schemas, "helper", &cx);
+
+        std::fs::write(&doc, "openapi: 3.1.0\ninfo: {}\n").expect("rewrite doc");
+        let after = go_gin_cache_key(&input, &routes, &schemas, "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(before.is_some());
+        assert_eq!(
+            before, after,
+            "a file the Go toolchain never compiles is not a source-analysis input"
+        );
+    }
+
+    /// Two input dirs inside ONE module hash the same tree, so the input must be part of the key.
+    #[test]
+    fn go_gin_cache_key_separates_two_inputs_in_one_module() {
+        let cx = go_module_cx("cache-key-two-inputs");
+        let first_input = cx.project_root.join("api");
+        let second_input = cx.project_root.join("admin");
+        std::fs::create_dir_all(&first_input).expect("first input dir");
+        std::fs::create_dir_all(&second_input).expect("second input dir");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+
+        let first = go_gin_cache_key(&first_input, &routes, &schemas, "helper", &cx);
+        let second = go_gin_cache_key(&second_input, &routes, &schemas, "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(first.is_some());
+        assert_ne!(first, second);
+    }
+
+    /// A Go workspace puts other modules in scope, so one module directory no longer bounds the
+    /// inputs ⇒ no cache at all.
+    #[test]
+    fn go_gin_cache_key_is_absent_inside_a_go_workspace() {
+        let cx = go_module_cx("cache-key-go-workspace");
+        let input = cx.project_root.clone();
+        std::fs::write(input.join("handlers.go"), "package p\n").expect("write handler");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+        assert!(go_gin_cache_key(&input, &routes, &schemas, "helper", &cx).is_some());
+
+        std::fs::write(input.join("go.work"), "go 1.22\n\nuse .\n").expect("write go.work");
+        let key = go_gin_cache_key(&input, &routes, &schemas, "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(
+            key.is_none(),
+            "workspace mode resolves imports across modules, so one module does not bound the inputs"
+        );
+    }
+
+    /// An input that can leave the project root is not a tree gnr8 can bound ⇒ no cache at all.
+    #[test]
+    fn go_gin_cache_key_is_absent_for_an_input_outside_the_project() {
+        let cx = go_module_cx("cache-key-escaping-input");
+        let escaping = cx.project_root.join("..").join("elsewhere");
+
+        let key = go_gin_cache_key(&escaping, &[], &[], "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(
+            key.is_none(),
+            "an input that escapes the project root must produce no cache key"
+        );
+    }
+
+    /// A module rooted above the project has inputs gnr8 cannot enumerate ⇒ no cache at all.
+    #[test]
+    fn go_gin_cache_key_is_absent_without_an_enclosing_module_in_the_project() {
+        let root =
+            std::env::temp_dir().join(format!("gnr8-cache-key-no-module-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp project root");
+        let cx = Cx::new(root.clone());
+
+        let key = go_gin_cache_key(&root, &[], &[], "helper", &cx);
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            key.is_none(),
+            "an unprovable input surface must produce no cache key"
+        );
+    }
+
+    /// An entry that does not record THIS run's key is untrusted input: discard it, never read it.
+    #[test]
+    fn go_gin_cache_entry_recorded_under_another_key_is_discarded() {
+        let cx = go_module_cx("cache-entry-foreign-key");
+        let key = "a".repeat(64);
+        let path = go_gin_cache_path(&cx, &key);
+        std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+        let graph = ApiGraph::default();
+        save_go_gin_cache(&cx, &"b".repeat(64), &graph);
+        let foreign = go_gin_cache_path(&cx, &"b".repeat(64));
+        std::fs::copy(&foreign, &path).expect("plant a foreign entry under this key");
+
+        let loaded = load_go_gin_cache(&cx, &key);
+
+        let missing = !path.exists();
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(loaded.is_none(), "a foreign entry must never be returned");
+        assert!(missing, "a foreign entry must be discarded from the cache");
+    }
+
+    /// A same-key entry round-trips, so the fix keeps the cache useful.
+    #[test]
+    fn go_gin_cache_entry_round_trips_under_its_own_key() {
+        let cx = go_module_cx("cache-entry-round-trip");
+        let key = "c".repeat(64);
+        save_go_gin_cache(&cx, &key, &ApiGraph::default());
+
+        let loaded = load_go_gin_cache(&cx, &key);
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(loaded.is_some(), "an entry must load under its own key");
     }
 
     fn span() -> SourceSpan {

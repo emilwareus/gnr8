@@ -73,7 +73,11 @@ reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
 
 Notes:
 - Missing local cache state is safe: generate adopts byte-identical outputs without rewriting and
-  reconstructs ownership; divergent outputs are preserved and make the command fail.
+  reconstructs ownership; divergent outputs are preserved and make the command fail. A **stale** cache
+  is safe too: a cache may only make a run faster, so an entry that cannot prove it belongs to this
+  run is discarded and recomputed rather than reported.
+- `gnr8 check -v` lists the stale and drifted paths behind the summary line; `-vv` adds the bulk
+  written/deleted/skipped lists to `generate`.
 - `--force` overwrites protected emitted paths (otherwise generate warns and skips them). It never
   recursively deletes unrelated files that share an output directory.
 - `inspect` is the ONLY command taking a target dir; the others derive inputs from the pipeline's `Source`.

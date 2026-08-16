@@ -102,6 +102,12 @@ an explicit script/program that performs discovery.
 | `.gnr8/cache/verified-noop.json` | reserved; ignored while pre-child skipping is disabled | no |
 
 Source cache hits may skip extraction inside a normal child run after validating their bounded inputs.
+For the Go source that bound is the **enclosing module**, not just the configured input dir, because
+`go/packages` type-checks the input packages together with everything they import; a module rooted
+above the project root, a Go workspace that puts other modules in scope, or a tree that cannot be
+enumerated exactly, is not cached at all. Every entry
+records the key it was computed under and is discarded when that recording does not match the current
+run, so a cache restored from another commit can only cost time, never change a verdict.
 Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:
 Rust code-as-config may read environment, time, network, or arbitrary files while constructing the
 pipeline, and the host cannot prove those inputs unchanged. Every command therefore runs the child;
@@ -142,7 +148,7 @@ Action inputs:
 | `extra-args` | empty | shell-split arguments passed to `gnr8 check` |
 | `cache` | `true` | cache `.gnr8/cache` and `.gnr8/target` |
 | `cache-key-prefix` | `gnr8` | cache-key prefix |
-| `setup-rust` / `rust-toolchain` | `true` / `stable` | generator toolchain |
+| `setup-rust` / `rust-toolchain` | `true` / `auto` | generator toolchain; `auto` honors a repository-root `rust-toolchain.toml` (or `rust-toolchain`) pin and installs `stable` when there is none |
 | `setup-go` / `go-version` | `false` / `stable` | Go source toolchain |
 | `setup-python` / `python-version` | `false` / `3.x` | Python source toolchain |
 | `setup-node` / `node-version` | `false` / `lts/*` | NestJS source toolchain |

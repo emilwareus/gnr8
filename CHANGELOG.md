@@ -9,6 +9,33 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **`gnr8 check` no longer reports false drift from a warm project cache.** The Go source-analysis
+  cache keyed only on the configured input directory, but `go/packages` type-checks the input
+  packages together with everything they import — a type defined in a sibling package reaches the
+  extracted schemas. An edit to such a package left the key unchanged, so a restored cache answered
+  with a stale graph and `check` reported drift against artifacts that were in fact up to date. The
+  key now covers the whole enclosing Go module (the nearest `go.mod` at or above the input dir,
+  resolved no higher than the project root), plus the input dir itself and the goextract sidecar
+  hash. When the module root sits above the project root, a Go workspace (`go.work` / `GOWORK`) puts
+  other modules in scope, or the module tree cannot be enumerated exactly, there is no cache at all —
+  slower, never wrong.
+- **A restored cache entry can no longer decide a verdict.** Each stored analysis now records the key
+  it was computed under. An entry whose recording does not match the current run is discarded and the
+  analysis is recomputed, so a cache directory restored from another commit only ever costs time.
+- **`gnr8 check -v` now prints the stale and drifted paths** its failure message promises. They
+  previously appeared only at `-vv`, which left a failing CI gate with a count and no paths.
+
+### Changed
+
+- The **`gnr8 check` action** now honors a repository-root `rust-toolchain.toml` (or `rust-toolchain`)
+  pin by default, so CI compiles the `.gnr8` crate with the same `rustc` as developer machines. The
+  new `rust-toolchain: auto` default resolves the pin and uses `stable` when there is none; passing
+  any other value overrides the repository pin as before.
+- The action's cache `restore-keys` no longer include a prefix-only fallback. Every fallback keeps the
+  `.gnr8` crate hash, so a restored entry cannot come from an unrelated pipeline crate.
+
 ## 0.5.0 — 2026-08-10
 
 ### Added

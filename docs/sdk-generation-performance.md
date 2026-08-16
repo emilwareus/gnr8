@@ -129,11 +129,24 @@ Changes in this iteration:
    The cache key includes:
 
    - gnr8-core version
-   - the configured package pattern list
-   - a stable hash of source input files
+   - the goextract sidecar source hash
+   - the configured input dir and package pattern list
+   - a stable content hash of the **enclosing Go module's build inputs** — its Go sources and module
+     manifests, under the nearest `go.mod` at or above the input dir, resolved no higher than the
+     project root
 
    This skips `go/packages` extraction when source inputs are unchanged while still rerunning transforms
    and target generation when `.gnr8` config changes.
+
+   The key covers the whole module, not just the configured input dir, because `go/packages`
+   type-checks the input packages together with everything they import: a type defined in a sibling
+   package reaches the extracted schemas. There is **no cache at all** when the module root sits above
+   the project root, when a Go workspace (`go.work` / `GOWORK`) puts other modules in scope, or when
+   the module tree cannot be enumerated exactly (an unreadable directory, a special file) — an input
+   surface gnr8 cannot prove is one it will not key on. Every
+   stored entry also records the key it was computed under and is discarded when that recording does
+   not match the current run, so a restored cache directory can only make a run faster, never change
+   its verdict.
 
 2. Added a content-keyed artifact cache under `.gnr8/cache/artifacts/`.
 

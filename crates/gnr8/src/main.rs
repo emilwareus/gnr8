@@ -67,7 +67,15 @@ impl Output {
     }
 
     fn verbose_paths(self, label: &str, paths: &[String]) {
-        if self.json || self.verbose < 2 || paths.is_empty() {
+        self.verbose_paths_at(2, label, paths);
+    }
+
+    /// Print a path list once verbosity reaches `level`.
+    ///
+    /// Actionable lists (the outputs that made `check` fail) are printed at `-v`, because the
+    /// failure message tells the user that is where the paths are. Bulk lists stay at `-vv`.
+    fn verbose_paths_at(self, level: u8, label: &str, paths: &[String]) {
+        if self.json || self.verbose < level || paths.is_empty() {
             return;
         }
         println!("  {label}:");
@@ -551,8 +559,9 @@ fn run_check(output: Output) -> Result<()> {
         output.verbose(format!("write plan: {}", fmt_duration(elapsed)));
     }
     output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
-    output.verbose_paths("stale", &stale);
-    output.verbose_paths("drifted", &drifted);
+    // The failure message promises these paths at `-v`, so print them at `-v`.
+    output.verbose_paths_at(1, "stale", &stale);
+    output.verbose_paths_at(1, "drifted", &drifted);
 
     if has_drift {
         // Deliberate non-zero exit so `gnr8 check` is a usable CI gate (RESEARCH Open Q 3).

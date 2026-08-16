@@ -359,10 +359,15 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         "source fixture replacement must match"
     );
     std::fs::write(&main_go, changed_source).expect("change source");
-    let (ok, out, err) = run_gnr8(&root, &["check"]);
+    let (ok, out, err) = run_gnr8(&root, &["check", "-v"]);
     assert!(
         !ok && out.contains("not up to date"),
         "gnr8 check must fail when source changes require regenerated artifacts.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    // The failure message points at `gnr8 check -v` for the paths, so `-v` must print them.
+    assert!(
+        out.contains("  stale:") && out.contains("    openapi.yaml"),
+        "gnr8 check -v must list the paths its failure message promises.\nstdout:\n{out}"
     );
 
     // 8. A protected generated-file edit makes generate fail rather than reporting false success.
