@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.5.2 — 2026-08-17
+
 ### Fixed
 
 - **Go fields tagged `json:",omitzero"` are now source-optional.** The Go extractor previously
