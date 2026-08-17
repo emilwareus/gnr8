@@ -9,6 +9,13 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **Go fields tagged `json:",omitzero"` are now source-optional.** The Go extractor previously
+  recognized only `omitempty`, so SDK targets could require JSON keys that `encoding/json`
+  intentionally omits. `omitzero` now carries the same key-presence meaning while remaining
+  independent from nullability.
+
 ## 0.5.1 — 2026-08-16
 
 ### Fixed
