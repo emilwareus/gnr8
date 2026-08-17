@@ -293,7 +293,7 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
 | required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. |
-| source-optional field | pointer `*T` and/or `json:",omitempty"` | source optionality signal; schema `required` still comes from required tags. |
+| source-optional field | pointer `*T` and/or `json:",omitempty"` / `json:",omitzero"` | source optionality signal; schema `required` still comes from required tags. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
 
@@ -342,6 +342,7 @@ To make documentation mandatory, add the opt-in `RequireOperationDocs` transform
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
 | `*T` | nullable, source-optional | `*T`; `,omitempty` only when optional | preserves JSON `null` separately from scalar zero values. |
 | `,omitempty` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability. |
+| `,omitzero` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability; SDKs preserve optional key presence. |
 | `[]T` | `array` | `[]T` | |
 | `map[string]T` | `object`,`additionalProperties:true` | `map[string]T` | free-form → diagnostic |
 | named-string+consts | string `enum` | typed newtype | |

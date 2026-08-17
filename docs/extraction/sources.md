@@ -47,6 +47,8 @@ Recognized route facts include:
 - `ShouldBindJSON`/`BindJSON`; generic bind variants for typed form, multipart, query, and header
   structs.
 - JSON responses, response status/media facts, Go structs, nested types, and string enums.
+- Independent optionality and nullability for Go fields: pointers admit `null`, while JSON
+  `omitempty` and `omitzero` options permit the key to be absent.
 
 Dynamic route strings are skipped with a diagnostic. A dynamic group prefix is omitted and reported.
 Dynamic parameter names, direct multipart map access, untraversable helpers, or ambiguous handlers are

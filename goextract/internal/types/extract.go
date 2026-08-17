@@ -148,7 +148,7 @@ func extractFields(
 			continue
 		}
 
-		jsonName, omitempty, skip := parsePayloadTag(tag, f.Name())
+		jsonName, optionalByTag, skip := parsePayloadTag(tag, f.Name())
 		if skip {
 			continue
 		}
@@ -166,9 +166,10 @@ func extractFields(
 		schema := mapType(f.Type(), ctx)
 		required := bindingHasRequired(tag.Get("binding")) || validateHasRequired(tag.Get("validate"))
 		// The two independent axes: optional = the key may be absent (a pointer or
-		// `,omitempty`); nullable = the value may be explicitly null (a pointer can
-		// hold nil). A non-pointer `,omitempty` field is optional-but-not-nullable.
-		optional := isPointer(f.Type()) || omitempty
+		// a JSON omission option); nullable = the value may be explicitly null (a
+		// pointer can hold nil). A non-pointer field tagged with `omitempty` or
+		// `omitzero` is optional-but-not-nullable.
+		optional := isPointer(f.Type()) || optionalByTag
 		nullable := isPointer(f.Type())
 		meta := fieldMetaFromTags(structName, f.Name(), tag, st.Tag(i), schema, file, line, diags)
 		description := optString(tag.Get("description"))
@@ -959,20 +960,21 @@ func isPointer(t gotypes.Type) bool {
 	return ok
 }
 
-// parsePayloadTag returns the effective payload field name, whether omitempty is
-// set, and whether the field is skipped. JSON tags win when present; form tags
-// let multipart/form DTOs participate in the same neutral schema extraction.
-func parsePayloadTag(tag reflect.StructTag, goName string) (name string, omitempty, skip bool) {
+// parsePayloadTag returns the effective payload field name, whether the tag
+// permits omission, and whether the field is skipped. JSON tags win when
+// present; form tags let multipart/form DTOs participate in the same neutral
+// schema extraction.
+func parsePayloadTag(tag reflect.StructTag, goName string) (name string, optional, skip bool) {
 	if raw, ok := tag.Lookup("json"); ok && raw != "" {
-		return parseWireTag(raw, goName)
+		return parseWireTag(raw, goName, true)
 	}
 	if raw, ok := tag.Lookup("form"); ok && raw != "" {
-		return parseWireTag(raw, goName)
+		return parseWireTag(raw, goName, false)
 	}
 	return goName, false, false
 }
 
-func parseWireTag(raw string, goName string) (name string, omitempty, skip bool) {
+func parseWireTag(raw string, goName string, allowOmitZero bool) (name string, optional, skip bool) {
 	parts := strings.Split(raw, ",")
 	wireName := parts[0]
 	if wireName == "-" && len(parts) == 1 {
@@ -982,11 +984,11 @@ func parseWireTag(raw string, goName string) (name string, omitempty, skip bool)
 		wireName = goName
 	}
 	for _, opt := range parts[1:] {
-		if opt == "omitempty" {
-			omitempty = true
+		if opt == "omitempty" || (allowOmitZero && opt == "omitzero") {
+			optional = true
 		}
 	}
-	return wireName, omitempty, false
+	return wireName, optional, false
 }
 
 func spanOf(fset *token.FileSet, pos token.Pos) facts.SourceSpan {

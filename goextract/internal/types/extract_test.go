@@ -264,6 +264,61 @@ type FileRef struct {
 	}
 }
 
+func TestJSONOmissionOptionsMarkNonPointerFieldsOptional(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/omissionfixture\n\ngo 1.22\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package omissionfixture
+
+type Payload struct {
+	EmptyValues []string          `+"`json:\"emptyValues,omitempty\"`"+`
+	ZeroValues  []string          `+"`json:\"zeroValues,omitzero\"`"+`
+	ZeroMap     map[string]string `+"`json:\"zeroMap,omitzero\"`"+`
+	FormZero    []string          `+"`form:\"formZero,omitzero\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load omission fixture: %v", err)
+	}
+	diags := diag.New()
+	schemas := types.Extract(res, diags)
+	s, ok := schemaByName(schemas, "Payload")
+	if !ok {
+		t.Fatal("Payload not found")
+	}
+
+	for _, name := range []string{"emptyValues", "zeroValues", "zeroMap"} {
+		field, found := fieldByJSON(s, name)
+		if !found {
+			t.Fatalf("field %q not found", name)
+		}
+		if !field.Optional || field.Nullable {
+			t.Fatalf("%s should be optional but not nullable, got optional=%v nullable=%v", name, field.Optional, field.Nullable)
+		}
+	}
+
+	formZero, ok := fieldByJSON(s, "formZero")
+	if !ok {
+		t.Fatal("field 'formZero' not found")
+	}
+	if formZero.Optional || formZero.Nullable {
+		t.Fatalf("form omitzero is not a JSON omission signal, got optional=%v nullable=%v", formZero.Optional, formZero.Nullable)
+	}
+}
+
 func TestFormDTOAndMultipartFileMetadata(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(
