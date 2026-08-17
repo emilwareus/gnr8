@@ -327,22 +327,29 @@ func constraintsFromTag(
 		return constraints
 	}
 	for _, tok := range tags.Scoped(value) {
-		if tok.Scope != tags.ScopeField {
-			// The token bounds the elements or map keys inside the field, and the neutral
-			// graph carries constraints only on the field itself (`FieldMeta.Constraints`)
-			// — there is no element schema to hang them on. Drop them, deliberately
-			// without a diagnostic: the tag is well-formed and understood, so reporting it
-			// would flag a source defect that does not exist. What gnr8 cannot represent
-			// it stays silent about; `unresolved` means the source was unreadable.
-			continue
-		}
 		token := tok.Text
-		if token == "required" || token == "omitempty" {
-			continue
-		}
 		name, value, hasValue := strings.Cut(token, "=")
 		name = strings.TrimSpace(name)
 		value = strings.TrimSpace(value)
+		if tok.Scope != tags.ScopeField {
+			// The rule bounds the elements or map keys inside the field, and the neutral
+			// graph carries constraints only on the field itself (`FieldMeta.Constraints`)
+			// — there is no element schema to hang them on. A rule gnr8 knows is dropped
+			// quietly, because the source is well-formed and understood; `unresolved`
+			// means gnr8 could not read the source, not that it chose not to carry it.
+			//
+			// Recognition is a separate question from scope, so an unknown rule is still
+			// reported here. gnr8 cannot tell what `dive,somevalidator` was meant to say
+			// or whether losing it matters, and silence would depend on where the author
+			// happened to write it.
+			if !recognizedTagRule(name) {
+				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+			}
+			continue
+		}
+		if token == "required" || token == "omitempty" {
+			continue
+		}
 		switch name {
 		case "min":
 			if !hasValue || !applyMinMaxConstraint(constraints, "min", value, schema) {
@@ -392,6 +399,25 @@ func constraintsFromTag(
 		}
 	}
 	return constraints
+}
+
+// recognizedTagRule reports whether gnr8 knows what a validation rule states: the
+// rules the switch above lowers to constraints, plus the two presence rules the
+// required/optional axes own.
+//
+// It exists so that scope decides where a rule applies while recognition decides
+// whether gnr8 can say anything about it — a rule it knows is dropped in silence
+// when the graph has nowhere to carry it, and a rule it has never heard of is
+// reported at every scope. Keep it in step with the switch above: a rule handled
+// there and missing here would be reported as unknown when it appears inside a
+// collection.
+func recognizedTagRule(name string) bool {
+	switch name {
+	case "required", "omitempty", "min", "max", "gte", "lte", "gt", "lt", "oneof":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyMinMaxConstraint(c *facts.Constraints, name string, value string, schema facts.Type) bool {

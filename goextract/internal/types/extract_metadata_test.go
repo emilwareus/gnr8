@@ -138,6 +138,76 @@ func TestFieldMetaFromTagsIgnoresMapKeyScopedTokens(t *testing.T) {
 	}
 }
 
+func TestFieldMetaFromTagsReportsUnknownRulesAtEveryScope(t *testing.T) {
+	// Scope decides where a rule applies; recognition decides whether gnr8 can say
+	// anything about it. `email` is a rule gnr8 does not lower, so it is reported
+	// wherever it is written — silence must not depend on the author's position.
+	cases := []struct {
+		name string
+		tag  string
+	}{
+		{"field scope", `json:"to" validate:"required,email"`},
+		{"element scope", `json:"to" validate:"omitempty,dive,email"`},
+		{"map key scope", `json:"to" validate:"omitempty,dive,keys,email,endkeys"`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tag := reflect.StructTag(tc.tag)
+			diags := diag.New()
+
+			fieldMetaFromTags(
+				"SendEmailProperties",
+				"To",
+				tag,
+				string(tag),
+				facts.ArrayType(facts.PrimitiveType(facts.StringPrim())),
+				"schema.go",
+				10,
+				diags,
+			)
+
+			if !hasMetadataDiag(diags.Items(), "unsupported validate tag", "email") {
+				t.Fatalf("an unknown rule must be reported at this scope, got %#v", diags.Items())
+			}
+		})
+	}
+}
+
+func TestRecognizedTagRulesStayInStepWithTheConstraintParser(t *testing.T) {
+	// The element-scope path asks recognizedTagRule whether to stay quiet, while the
+	// field-scope path asks the switch in constraintsFromTag. If the two drift, a rule
+	// gnr8 handles would be reported as unknown the moment it appears behind a `dive`.
+	// Every rule below must therefore be silent at both scopes.
+	rules := []string{"required", "omitempty", "min=1", "max=100", "gte=1", "lte=9", "gt=0", "lt=9", "oneof=a b"}
+
+	for _, rule := range rules {
+		if !recognizedTagRule(strings.Split(rule, "=")[0]) {
+			t.Errorf("%q is handled by the constraint parser but reads as unknown", rule)
+		}
+		for _, scope := range []string{rule, "dive," + rule} {
+			diags := diag.New()
+			constraintsFromTag(
+				"validate",
+				"ScopedRules",
+				"Field",
+				scope,
+				facts.PrimitiveType(facts.IntPrim(64, true)),
+				"dto.go",
+				14,
+				diags,
+			)
+			if len(diags.Items()) != 0 {
+				t.Errorf("%q must parse without a diagnostic: %#v", scope, diags.Items())
+			}
+		}
+	}
+
+	if recognizedTagRule("email") {
+		t.Error("a rule gnr8 does not lower must not read as recognized")
+	}
+}
+
 func TestBindingHasRequiredRequiresExactToken(t *testing.T) {
 	if !bindingHasRequired("omitempty,required") {
 		t.Fatal("expected exact required token to mark field required")

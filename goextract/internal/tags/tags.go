@@ -11,8 +11,17 @@
 // array's bound.
 //
 // Honouring the three scope markers therefore narrows what gnr8 reads rather than
-// widening it. Every reader of these tags goes through Scoped so the required axis
-// and the constraint parser cannot answer the same question differently.
+// widening it. The schema required axis, the constraint parser, and the request
+// parameter required axis all go through Scoped, so they cannot answer the same
+// question differently.
+//
+// One reader does not: handlers.parameterEnumValues takes the first `oneof=` rule at
+// any scope. For an array parameter that lands correctly either way, because the
+// enum is placed on the element; for a map parameter a post-`dive` `oneof` replaces
+// the whole schema. Routing it through Scoped means deciding where an element-scope
+// enum belongs in a map — the value schema, or the key schema after `keys` — which
+// is a design question, not a bug fix. Until that is settled it is the one scope
+// blind spot left, and it is tracked rather than quietly tolerated.
 package tags
 
 import "strings"

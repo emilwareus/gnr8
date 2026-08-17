@@ -315,9 +315,19 @@ each string rather than the slice, so they are not published as the array's cons
 The same rule applies to bound query, header, and form parameters: `binding:"omitempty,dive,required"`
 on a repeated parameter forbids empty entries, it does not make the parameter itself required.
 
-gnr8 records constraints on the field only. Rules written past a `dive` are read, understood, and
-dropped without a diagnostic — the neutral graph has no element schema to carry them, and a
-correctly written tag is not a source defect worth warning about.
+gnr8 records constraints on the field only, so a rule written past a `dive` reaches nothing it can
+bind. What happens next depends on whether gnr8 knows the rule, not on where it was written:
+
+| The rule | Behind a `dive` | At field scope |
+|---|---|---|
+| one gnr8 lowers (`required`, `min`, `max`, `gte`, `lte`, `gt`, `lt`, `oneof`) | dropped silently — the graph has no element schema to carry it | applied |
+| one gnr8 does not lower (`email`, `uuid`, any other validator) | `schema.metadata.unresolved` diagnostic | `schema.metadata.unresolved` diagnostic |
+
+So `validate:"dive,min=1"` is silent and `validate:"dive,email"` warns, exactly as `validate:"email"`
+does — gnr8 drops the rule in both cases, and you hear about it in both cases. The sharp edge to know
+is the first row: **`dive,min=1` does not become a per-item `minLength` in the emitted document, and
+says nothing when it disappears.** If you need element constraints in the spec, state them on the
+element's own named type, or add them with a `Transform` in your `.gnr8/` crate.
 
 ## Operation prose (all three languages)
 

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -223,6 +224,11 @@ type ScopedRules struct {
 	Elements []string          `+"`json:\"elements\" validate:\"dive,required\"`"+`
 	Segments []string          `+"`json:\"segments\" validate:\"required,dive,min=1,max=100\"`"+`
 	Nested   [][]string        `+"`json:\"nested\" validate:\"dive,dive,required\"`"+`
+	Kinds    []string          `+"`json:\"kinds\" validate:\"dive,oneof=alpha beta\"`"+`
+}
+
+type ElementRules struct {
+	Recipients []string `+"`json:\"recipients\" validate:\"omitempty,dive,email\"`"+`
 }
 `),
 		0o644,
@@ -297,21 +303,41 @@ type ScopedRules struct {
 		}
 	}
 
-	// The per-element bounds in `dive,min=1,max=100` describe each string, not the
-	// slice, so they must not reach the container's constraints.
-	segments, _ := fieldByJSON(scoped, "segments")
-	if segments.Meta != nil && segments.Meta.Constraints != nil {
-		c := segments.Meta.Constraints
-		t.Errorf("post-dive min/max must not bind the container, got %#v", c)
+	// The per-element rules in `dive,min=1,max=100` and `dive,oneof=alpha beta`
+	// describe each string, not the slice. Constraints lower onto the field's own
+	// schema object, so leaking them upward publishes an array whose own value must
+	// be 3 characters long or equal to "alpha" — neither of which the author wrote.
+	for _, jsonName := range []string{"segments", "kinds"} {
+		field, found := fieldByJSON(scoped, jsonName)
+		if !found {
+			t.Fatalf("field %q not found", jsonName)
+		}
+		if field.Meta != nil && field.Meta.Constraints != nil {
+			t.Errorf("%s: post-dive rules must not bind the container, got %#v", jsonName, field.Meta.Constraints)
+		}
 	}
 
-	// Every token in ScopedRules is well-formed and understood — the scope markers are
-	// structural and the rules behind them belong to values the graph does not carry.
-	// None of that is unresolved source, so the whole struct must extract quietly.
+	// Every rule in ScopedRules is one gnr8 knows — the scope markers are structural
+	// and the rest belong to values the graph does not carry. None of that is
+	// unresolved source, so the whole struct must extract quietly.
 	for _, d := range diags.Items() {
 		if d.Schema == "ScopedRules" {
 			t.Errorf("scoped tags must not produce a diagnostic: [%s] %s", d.Code, d.Message)
 		}
+	}
+
+	// Recognition is a separate question from scope. `email` is a rule gnr8 does not
+	// lower, so it is still reported behind a `dive` — the author loses the rule
+	// either way, and whether they hear about it must not depend on where they wrote
+	// it.
+	var reported bool
+	for _, d := range diags.Items() {
+		if d.Schema == "ElementRules" && strings.Contains(d.Message, "email") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("an unknown rule behind dive must still be reported, got %#v", diags.Items())
 	}
 }
 

@@ -51,7 +51,8 @@ Recognized route facts include:
   `omitempty` and `omitzero` options permit the key to be absent.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
-  neither makes the key required nor binds the container.
+  neither makes the key required nor binds the container. A rule gnr8 does not lower is still
+  reported at every scope — recognition and scope are separate questions.
 
 Dynamic route strings are skipped with a diagnostic. A dynamic group prefix is omitted and reported.
 Dynamic parameter names, direct multipart map access, untraversable helpers, or ambiguous handlers are

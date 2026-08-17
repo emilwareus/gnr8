@@ -23,6 +23,11 @@ must move the minor version.
   `endkeys` are recognized as scope markers rather than parsed as constraints, which also
   removes the spurious `schema.metadata.unresolved` warnings they produced.
 
+  Scope decides where a rule applies; it does not decide whether gnr8 reports one it cannot
+  read. A rule gnr8 lowers is dropped in silence when it belongs to an element the graph has
+  nowhere to carry, but an unrecognized rule such as `validate:"dive,email"` still raises
+  `schema.metadata.unresolved` — the same diagnostic `validate:"email"` has always raised.
+
 ## 0.5.2 — 2026-08-17
 
 ### Fixed
