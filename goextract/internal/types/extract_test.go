@@ -217,6 +217,13 @@ type FileRef struct {
 	Label    string  `+"`json:\"label,omitempty\"`"+`
 	Note     *string `+"`json:\"note\"`"+`
 }
+
+type ScopedRules struct {
+	Headers  map[string]string `+"`json:\"headers,omitzero\" binding:\"omitempty,dive,keys,required,endkeys,required\"`"+`
+	Elements []string          `+"`json:\"elements\" validate:\"dive,required\"`"+`
+	Segments []string          `+"`json:\"segments\" validate:\"required,dive,min=1,max=100\"`"+`
+	Nested   [][]string        `+"`json:\"nested\" validate:\"dive,dive,required\"`"+`
+}
 `),
 		0o644,
 	); err != nil {
@@ -261,6 +268,50 @@ type FileRef struct {
 	}
 	if !note.Nullable || note.Required {
 		t.Fatalf("pointer should be nullable without forcing required, got nullable=%v required=%v", note.Nullable, note.Required)
+	}
+
+	// `dive` and `keys`…`endkeys` move the rules that follow them off the field and
+	// onto what the field contains, so a `required` past either one says nothing
+	// about whether the key is present.
+	scoped, ok := schemaByName(schemas, "ScopedRules")
+	if !ok {
+		t.Fatal("ScopedRules not found")
+	}
+	scopedCases := []struct {
+		jsonName string
+		required bool
+		why      string
+	}{
+		{"headers", false, `required inside keys/endkeys constrains the map's keys and values`},
+		{"elements", false, `required after dive constrains the slice elements`},
+		{"segments", true, `the required before dive constrains the field itself`},
+		{"nested", false, `required behind nested dives constrains the innermost elements`},
+	}
+	for _, tc := range scopedCases {
+		field, found := fieldByJSON(scoped, tc.jsonName)
+		if !found {
+			t.Fatalf("field %q not found", tc.jsonName)
+		}
+		if field.Required != tc.required {
+			t.Errorf("%s: want required=%v, got %v — %s", tc.jsonName, tc.required, field.Required, tc.why)
+		}
+	}
+
+	// The per-element bounds in `dive,min=1,max=100` describe each string, not the
+	// slice, so they must not reach the container's constraints.
+	segments, _ := fieldByJSON(scoped, "segments")
+	if segments.Meta != nil && segments.Meta.Constraints != nil {
+		c := segments.Meta.Constraints
+		t.Errorf("post-dive min/max must not bind the container, got %#v", c)
+	}
+
+	// Every token in ScopedRules is well-formed and understood — the scope markers are
+	// structural and the rules behind them belong to values the graph does not carry.
+	// None of that is unresolved source, so the whole struct must extract quietly.
+	for _, d := range diags.Items() {
+		if d.Schema == "ScopedRules" {
+			t.Errorf("scoped tags must not produce a diagnostic: [%s] %s", d.Code, d.Message)
+		}
 	}
 }
 

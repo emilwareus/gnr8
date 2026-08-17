@@ -20,6 +20,7 @@ import (
 	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
+	"github.com/gnr8/goextract/internal/tags"
 )
 
 // well-known package paths for type mapping (RESEARCH Pattern 6).
@@ -203,13 +204,11 @@ func validateHasRequired(validate string) bool {
 	return tagHasRequired(validate)
 }
 
+// tagHasRequired reports whether a validation tag requires the field itself.
+// Only field-scope tokens count: a `required` reached through `dive` or `keys`
+// describes what lives inside the field, not whether its key is present.
 func tagHasRequired(value string) bool {
-	for _, token := range strings.Split(value, ",") {
-		if strings.TrimSpace(token) == "required" {
-			return true
-		}
-	}
-	return false
+	return tags.HasFieldToken(value, "required")
 }
 
 func fieldMetaFromTags(
@@ -327,9 +326,18 @@ func constraintsFromTag(
 	if value == "" {
 		return constraints
 	}
-	for _, token := range strings.Split(value, ",") {
-		token = strings.TrimSpace(token)
-		if token == "" || token == "required" || token == "omitempty" || token == "dive" {
+	for _, tok := range tags.Scoped(value) {
+		if tok.Scope != tags.ScopeField {
+			// The token bounds the elements or map keys inside the field, and the neutral
+			// graph carries constraints only on the field itself (`FieldMeta.Constraints`)
+			// — there is no element schema to hang them on. Drop them, deliberately
+			// without a diagnostic: the tag is well-formed and understood, so reporting it
+			// would flag a source defect that does not exist. What gnr8 cannot represent
+			// it stays silent about; `unresolved` means the source was unreadable.
+			continue
+		}
+		token := tok.Text
+		if token == "required" || token == "omitempty" {
 			continue
 		}
 		name, value, hasValue := strings.Cut(token, "=")

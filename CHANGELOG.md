@@ -9,6 +9,20 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **Go validation rules that apply *inside* a collection no longer bind the field.** The Go
+  extractor read a `binding:`/`validate:` tag as a flat token list, so everything after a `dive`
+  — or between `keys` and `endkeys` — was attributed to the field itself. A field tagged
+  `binding:"omitempty,dive,keys,required,endkeys,required"` was published as a required property
+  even though the tag only forbids empty map keys and values, and a per-element `min`/`max`
+  behind a `dive` was offered to the container's constraints. The same blind spot made a bound
+  query, header, or form parameter required when only its entries were. Schema fields,
+  constraints, and request parameters now read tags through one scope-aware tokenizer
+  (`goextract/internal/tags`), so they cannot answer the question differently. `keys` and
+  `endkeys` are recognized as scope markers rather than parsed as constraints, which also
+  removes the spurious `schema.metadata.unresolved` warnings they produced.
+
 ## 0.5.2 — 2026-08-17
 
 ### Fixed

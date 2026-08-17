@@ -36,6 +36,7 @@ import (
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
 	"github.com/gnr8/goextract/internal/routes"
+	"github.com/gnr8/goextract/internal/tags"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -3786,7 +3787,10 @@ func (a *Analyzer) parametersFromBoundType(
 		param := requestParameter(
 			name,
 			location,
-			tagContainsToken(tag.Get("binding"), "required") || tagContainsToken(tag.Get("validate"), "required"),
+			// Field scope only: a `required` behind `dive`/`keys` constrains the values
+			// inside a repeated parameter, not whether the parameter must be sent.
+			tags.HasFieldToken(tag.Get("binding"), "required") ||
+				tags.HasFieldToken(tag.Get("validate"), "required"),
 			schema,
 			fset,
 			field.Pos(),
@@ -3978,15 +3982,6 @@ func parameterEnumValues(tag reflect.StructTag) []string {
 		}
 	}
 	return nil
-}
-
-func tagContainsToken(value, expected string) bool {
-	for _, token := range strings.Split(value, ",") {
-		if strings.TrimSpace(token) == expected {
-			return true
-		}
-	}
-	return false
 }
 
 func parameterDefault(tag reflect.StructTag, options []string) (string, bool) {

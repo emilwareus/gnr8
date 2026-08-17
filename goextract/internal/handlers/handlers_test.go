@@ -1522,6 +1522,7 @@ type Server struct{ R *gin.Engine }
 
 type QueryInput struct {
 	Statuses []string  `+"`"+`form:"statuses" binding:"required"`+"`"+`
+	Tags     []string  `+"`"+`form:"tags" binding:"omitempty,dive,required"`+"`"+`
 	Force    bool      `+"`"+`form:"force"`+"`"+`
 	Limit    int       `+"`"+`form:"limit,default=25"`+"`"+`
 	State    string    `+"`"+`form:"state" binding:"oneof=active paused"`+"`"+`
@@ -1594,6 +1595,12 @@ func (s Server) search(c *gin.Context) {
 	statuses, ok := paramByName(code.Params, "statuses")
 	if !ok || !statuses.Required || statuses.Schema.Type != facts.TypeArray || statuses.Style != "form" || statuses.Explode == nil || !*statuses.Explode {
 		t.Fatalf("bound query array must preserve type/required/style/explode, got %+v", statuses)
+	}
+	// `dive,required` forbids empty entries in the list; it does not demand the
+	// parameter be sent, so the parameter itself stays optional.
+	scopedTags, ok := paramByName(code.Params, "tags")
+	if !ok || scopedTags.Required {
+		t.Fatalf("required behind dive must not make the parameter required, got %+v", scopedTags)
 	}
 	force, _ := paramByName(code.Params, "force")
 	if primName(force.Schema) != facts.PrimBool || force.Required {

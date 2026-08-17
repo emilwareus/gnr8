@@ -82,6 +82,62 @@ func TestFieldMetaFromTagsParsesNumericBindingsAndUnsupportedDiagnostics(t *test
 	}
 }
 
+func TestFieldMetaFromTagsScopesConstraintsToTheFieldItself(t *testing.T) {
+	// `min=3` bounds the field; everything past `dive` bounds each element. Before
+	// scope-awareness the trailing pair overwrote the field's own bound.
+	tag := reflect.StructTag(`json:"code" validate:"required,min=3,dive,min=1,max=100"`)
+	diags := diag.New()
+
+	meta := fieldMetaFromTags(
+		"ScopedRules",
+		"Code",
+		tag,
+		string(tag),
+		facts.PrimitiveType(facts.StringPrim()),
+		"dto.go",
+		12,
+		diags,
+	)
+
+	if meta == nil || meta.Constraints == nil {
+		t.Fatalf("expected the pre-dive constraint to survive, got %#v", meta)
+	}
+	if meta.Constraints.MinLength == nil || *meta.Constraints.MinLength != 3 {
+		t.Fatalf("pre-dive min must bind the field: %#v", meta.Constraints.MinLength)
+	}
+	if meta.Constraints.MaxLength != nil {
+		t.Fatalf("post-dive max must not bind the field: %#v", *meta.Constraints.MaxLength)
+	}
+	if len(diags.Items()) != 0 {
+		t.Fatalf("element-scope tokens are understood, not unresolved: %#v", diags.Items())
+	}
+}
+
+func TestFieldMetaFromTagsIgnoresMapKeyScopedTokens(t *testing.T) {
+	// `keys`/`endkeys` are structural markers, not constraint tokens: parsing them as
+	// constraints produced four bogus `schema.metadata.unresolved` diagnostics.
+	tag := reflect.StructTag(`json:"headers,omitzero" binding:"omitempty,dive,keys,required,endkeys,required"`)
+	diags := diag.New()
+
+	meta := fieldMetaFromTags(
+		"ScopedRules",
+		"Headers",
+		tag,
+		string(tag),
+		facts.MapTypeOf(facts.PrimitiveType(facts.StringPrim()), facts.PrimitiveType(facts.StringPrim())),
+		"dto.go",
+		13,
+		diags,
+	)
+
+	if meta != nil && meta.Constraints != nil {
+		t.Fatalf("nothing in the tag constrains the map itself, got %#v", meta.Constraints)
+	}
+	if len(diags.Items()) != 0 {
+		t.Fatalf("scope markers must not be reported as unsupported: %#v", diags.Items())
+	}
+}
+
 func TestBindingHasRequiredRequiresExactToken(t *testing.T) {
 	if !bindingHasRequired("omitempty,required") {
 		t.Fatal("expected exact required token to mark field required")
@@ -91,6 +147,18 @@ func TestBindingHasRequiredRequiresExactToken(t *testing.T) {
 	}
 	if bindingHasRequired("notrequired") {
 		t.Fatal("substring matches must not mark the field required")
+	}
+	if !bindingHasRequired("required,dive,required") {
+		t.Fatal("the required before dive still requires the field")
+	}
+	if bindingHasRequired("omitempty,dive,required") {
+		t.Fatal("required after dive constrains the elements, not the key")
+	}
+	if bindingHasRequired("omitempty,dive,keys,required,endkeys,required") {
+		t.Fatal("required inside keys/endkeys constrains the map's keys and values")
+	}
+	if bindingHasRequired("dive,dive,required") {
+		t.Fatal("nested dives descend further from the field, never back to it")
 	}
 }
 

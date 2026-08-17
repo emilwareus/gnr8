@@ -292,10 +292,32 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | response | `c.JSON(http.StatusXxx, v)` where `v: T` | status→T. Unresolved/dynamic → diagnostic. |
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
-| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. |
+| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. Only the field's own scope counts — see below. |
 | source-optional field | pointer `*T` and/or `json:",omitempty"` / `json:",omitzero"` | source optionality signal; schema `required` still comes from required tags. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
+
+### Validation rules apply at the scope they are written in
+
+A `binding:`/`validate:` tag can talk about the field or about what is *inside* it. `dive` steps
+into the field's elements and `keys`…`endkeys` selects a map's keys, so only the tokens **before
+the first `dive`** describe the field:
+
+```go
+Headers  map[string]string `json:"headers,omitzero" binding:"omitempty,dive,keys,required,endkeys,required"`
+Segments []string          `json:"segments" validate:"required,dive,min=1,max=100"`
+```
+
+`headers` is **optional** — the tag forbids empty map keys and values, it does not demand the key.
+`segments` is **required** because that `required` precedes the `dive`, and its `min`/`max` bound
+each string rather than the slice, so they are not published as the array's constraints.
+
+The same rule applies to bound query, header, and form parameters: `binding:"omitempty,dive,required"`
+on a repeated parameter forbids empty entries, it does not make the parameter itself required.
+
+gnr8 records constraints on the field only. Rules written past a `dive` are read, understood, and
+dropped without a diagnostic — the neutral graph has no element schema to carry them, and a
+correctly written tag is not a source defect worth warning about.
 
 ## Operation prose (all three languages)
 
