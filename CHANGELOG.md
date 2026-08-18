@@ -9,6 +9,49 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **A `oneof` on a bound Go parameter now lands on the value its scope names.** The parameter reader
+  took the first `oneof=` in a `binding:`/`validate:` tag regardless of scope and placed it on the
+  array element, which happened to be right for a `[]string` and destroyed a map: `Filters
+  map[string]string` tagged `binding:"dive,oneof=red green"` was published as a bare string enum
+  rather than a map, and writing the rule without the `dive` did not avoid it, because there was no
+  destination for an enum on a map at either scope. It was the last reader of these tags that did not
+  go through the scope-aware tokenizer added in 0.5.3 (#55).
+
+  Each scope now has exactly one destination. Field scope lands on a scalar parameter's own schema,
+  and on a container it lowers to what the container holds — a `facts.Type` array or map has no room
+  for an enum beside it, so the members can only be describing the values. `dive` lands on an array's
+  element or a map's **values**, leaving the key the plain string OpenAPI requires. A scope that
+  reaches no schema is dropped in silence, as it already is on a schema field: that covers a `dive` on
+  a scalar, and also `keys`…`endkeys`, since an OpenAPI object key is always an unconstrained string
+  and the lowering rejects any map key that is not one — applying an enum there would abort a whole
+  document over a single well-formed struct tag.
+
+  **Two rules landing on the same value are now a `request.parameter.ambiguous` ERROR** naming each
+  rule with the tag key that carries it, and neither is applied. That covers
+  `binding:"oneof=a b,dive,oneof=c d"` on a `[]string`, and it also covers the
+  same enum restated under a second tag key — `binding:` and `validate:` are read as peers now, where
+  `binding:` used to win in silence, and the `enums:`/`enum:` tag is a peer of both rather than a
+  fallback consulted only when no `oneof` was found. Restating a fact identically is reported too:
+  choosing between two statements would be a precedence rule, and gnr8 has no winner to pick.
+
+  **This changes emitted documents** for map parameters (previously replaced by an enum, now a map
+  whose values carry it) and for any parameter whose enum was stated twice (previously the first
+  spelling won, now no enum is applied and an ERROR is raised). The ERROR is reported, not fatal —
+  deny `request.parameter.ambiguous` with a `DiagnosticPolicy` to fail the build on it.
+
+### Breaking
+
+`TsSdk` generation now fails for a map query parameter that carries an enum rule. A TypeScript query
+parameter has a defined wire encoding only for scalars and one-dimensional scalar arrays, so `TsSdk`
+has always rejected a map-shaped one. The enum used to replace the parameter's whole schema, leaving a
+scalar that slipped past that check and emitted a `string` parameter for an API that takes a map; the
+corrected map reaches the check and raises `SdkGen`. The client was wrong before rather than right,
+but the failure is new and there is nothing to fall back on — a map query parameter has no TypeScript
+encoding at all, so the parameter's shape has to change. `GoSdk` (`map[string]string`) and `PySdk`
+(`dict[str, Literal[…]]`) are unaffected.
+
 ## 0.5.3 — 2026-08-18
 
 ### Fixed

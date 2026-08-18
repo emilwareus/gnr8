@@ -54,6 +54,10 @@ Recognized route facts include:
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose
   value it cannot read, is still reported at every scope — what gnr8 can read and where a rule
   applies are separate questions.
+- `oneof` on a bound parameter lands on the value its scope names: the parameter's own schema, or an
+  array's element or a map's values after `dive`. A `keys`…`endkeys` enum is discarded, because an
+  OpenAPI object key is always an unconstrained string. Two rules landing on the same value raise
+  `request.parameter.ambiguous` and neither is applied.
 
 Dynamic route strings are skipped with a diagnostic. A dynamic group prefix is omitted and reported.
 Dynamic parameter names, direct multipart map access, untraversable helpers, or ambiguous handlers are

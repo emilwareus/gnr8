@@ -11,17 +11,22 @@
 // array's bound.
 //
 // Honouring the three scope markers therefore narrows what gnr8 reads rather than
-// widening it. The schema required axis, the constraint parser, and the request
-// parameter required axis all go through Scoped, so they cannot answer the same
-// question differently.
+// widening it. Every reader of these tags goes through Scoped — the schema required
+// axis, the constraint parser, and both the required axis and the enum placement for
+// request parameters — so they cannot answer the same question differently.
 //
-// One reader does not: handlers.parameterEnumValues takes the first `oneof=` rule at
-// any scope. For an array parameter that lands correctly either way, because the
-// enum is placed on the element; for a map parameter a post-`dive` `oneof` replaces
-// the whole schema. Routing it through Scoped means deciding where an element-scope
-// enum belongs in a map — the value schema, or the key schema after `keys` — which
-// is a design question, not a bug fix. Until that is settled it is the one scope
-// blind spot left, and it is tracked rather than quietly tolerated.
+// What a reader does with a scope is its own business, because the two sides carry
+// different things. A schema field records constraints beside its type, so a rule
+// about the elements has nothing to bind and is dropped. A bound parameter has only
+// a schema, so the same rule replaces the element's schema instead.
+//
+// ScopeMapKey currently reaches nothing in either reader. An OpenAPI object key is
+// always an unconstrained string and gnr8 emits no `propertyNames`, so there is
+// nowhere to put a rule about keys — and the OpenAPI lowering rejects a map whose key
+// is not a plain string, which means building one would abort a whole document over a
+// single well-formed struct tag. The scope is still classified here rather than
+// folded into ScopeElement, because reading the marker correctly is what lets the
+// rules it guards be discarded instead of misattributed to the values.
 package tags
 
 import "strings"
