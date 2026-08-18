@@ -52,8 +52,10 @@ Recognized route facts include:
 
   On a `json:`-tagged field (or one with no payload tag), `encoding/json` owns it. Nullability is
   the declared type: a nil pointer, slice, map, or interface is what the marshaller writes as
-  `null`. Optionality is the tag's omission option — `,omitzero` on any type, `,omitempty` only on
-  the types it actually omits — and never the declared type, since a bare pointer keeps its key.
+  `null`, and what `json.Unmarshal` accepts a `null` into whatever the tag says — so it holds even
+  for an omission-tagged field, which can never write `null` but can still be sent one. Optionality
+  is the tag's omission option — `,omitzero` on any type, `,omitempty` only on the types it actually
+  omits — and never the declared type, since a bare pointer keeps its key.
 
   On a `form:`-tagged field a form/multipart binder owns it, and the rules differ: a part is present
   or absent with no `null` to write, so such a field is never nullable, and it is optional when the

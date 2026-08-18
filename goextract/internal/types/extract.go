@@ -1098,11 +1098,21 @@ func omitOptionOmits(t gotypes.Type, omitOpt string) bool {
 	}
 }
 
-// zeroMarshalsNull reports whether the type's zero value is written as JSON
-// `null` by `encoding/json`. A nil pointer, slice, map, and interface all are;
-// nothing else is. A named type is read through its underlying type, so
-// `json.RawMessage` ([]byte) is nullable while `time.Time` (a struct) and
-// `uuid.UUID` ([16]byte) are not.
+// zeroMarshalsNull reports whether `null` is a value this type can carry on the
+// JSON wire. A nil pointer, slice, map, and interface all can; nothing else can.
+// A named type is read through its underlying type, so `json.RawMessage`
+// ([]byte) is nullable while `time.Time` (a struct) and `uuid.UUID` ([16]byte)
+// are not.
+//
+// This is deliberately independent of the omission option, and that needs the
+// INBOUND direction to justify: an omission-tagged field never MARSHALS `null`
+// (a nil value is dropped before it can be written), but `json.Unmarshal`
+// accepts an explicit `null` into all four types whatever the tag says. So the
+// axis is exactly right for a request body and wider than a response body can
+// produce. Over-permissive is the safe side — a decoder that tolerates a `null`
+// it will never see costs nothing, while the reverse rejects valid payloads —
+// but narrowing it correctly means knowing which direction the schema is
+// reached from, which is the open question this does not settle.
 func zeroMarshalsNull(t gotypes.Type) bool {
 	unaliased := gotypes.Unalias(t)
 	if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
@@ -1110,6 +1120,13 @@ func zeroMarshalsNull(t gotypes.Type) bool {
 		// will be marshalled — `T any` would read as an interface and claim every
 		// generic field is nullable. What a `T` writes depends on the instantiation,
 		// which this declaration does not fix, and unknown is not null.
+		//
+		// omitOptionOmits resolves the same `T` the other way, and the two are not in
+		// conflict: there the author WROTE `,omitempty`, so there is a tag to read,
+		// while here the only evidence would be `T` itself and there is none. Note
+		// this is observable, not cosmetic — a `T` field maps to `Type::Any`, which
+		// lowers to `type: object` and `dict[str, Any]`, neither of which admits
+		// `null`. Widening it would need evidence about the instantiation.
 		return false
 	}
 	switch unaliased.Underlying().(type) {

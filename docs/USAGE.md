@@ -449,7 +449,9 @@ lists every diagnostic.
 - Optional and nullable are independent, and each reads exactly one thing. **Presence** (may the key be
   absent) comes from the `json` tag's omission option alone — never from the declared type. **Nullability**
   (may the value be `null`) comes from the declared type alone: a nil pointer, slice, map, or interface is
-  what `encoding/json` writes as `null`. So `[]T json:"k"` is nullable-but-always-present, and
+  what `encoding/json` writes as `null` — and what `json.Unmarshal` accepts a `null` into, whatever
+  the tag says, which is why an `,omitempty` field is nullable even though it can never *write*
+  `null`. So `[]T json:"k"` is nullable-but-always-present, and
   `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
   different wire with different rules: never nullable (a part has no `null`), and optional when the
   part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).

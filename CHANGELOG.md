@@ -79,6 +79,15 @@ must move the minor version.
   that binder is not `encoding/json` and this change does not speak for it — but loses the value
   axis, because a multipart part is present or absent and there is no `null` to write.
 
+  Nullability is applied whatever omission option the field carries, and that takes the **inbound**
+  direction to justify rather than "what the marshaller writes": an omission-tagged field never
+  marshals `null`, because a nil value is dropped before it can be written, but `json.Unmarshal`
+  accepts an explicit `null` into a pointer, slice, map, or interface whatever the tag says. So the
+  axis is exactly right for a request body and wider than a response body can produce. That is the
+  safe side of the failure this release fixes — tolerating a `null` that never arrives costs
+  nothing, while rejecting one that does breaks user code — but narrowing it means knowing which
+  direction a schema is reached from, which is the same open question as the one below.
+
   **This changes emitted documents and all three generated SDKs.** Every slice, map, and interface
   field gains `"null"` in its document type and `| None` / `| null` in generated Python and
   TypeScript models — nullability comes from the declared type alone, so this reaches the field
