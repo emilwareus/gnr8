@@ -451,8 +451,8 @@ lists every diagnostic.
   (may the value be `null`) comes from the declared type alone: a nil pointer, slice, map, or interface is
   what `encoding/json` writes as `null`. So `[]T json:"k"` is nullable-but-always-present, and
   `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
-  different wire with different rules: never nullable (a part has no `null`), and a pointer part
-  *is* optional.
+  different wire with different rules: never nullable (a part has no `null`), and optional when the
+  part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - The Go frontend recognizes Gin route registration, not arbitrary Go routers.

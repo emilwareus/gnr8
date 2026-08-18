@@ -1029,8 +1029,10 @@ func parseWireTag(raw string, goName string, wire payloadWire) (name string, omi
 		wireName = goName
 	}
 	for _, opt := range parts[1:] {
-		// `omitzero` is an `encoding/json` option; it is not an omission signal on
-		// a form wire, so it is not read as one there.
+		// Which options a wire reads is long-standing behavior, not a claim about which
+		// of them `encoding/json` owns — it owns both (see above). `,omitempty` has
+		// always been read on either wire; `,omitzero` was added for the json wire
+		// alone. This change neither extends nor narrows that.
 		if opt == optOmitEmpty || (opt == optOmitZero && wire == wireJSON) {
 			omitOpt = opt
 		}

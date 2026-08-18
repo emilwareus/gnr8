@@ -56,8 +56,8 @@ Recognized route facts include:
   the types it actually omits — and never the declared type, since a bare pointer keeps its key.
 
   On a `form:`-tagged field a form/multipart binder owns it, and the rules differ: a part is present
-  or absent with no `null` to write, so such a field is never nullable, and a pointer part *is* read
-  as optional.
+  or absent with no `null` to write, so such a field is never nullable, and it is optional when the
+  part is a pointer *or* the tag carries `,omitempty`. `,omitzero` is read on the `json` wire only.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose
