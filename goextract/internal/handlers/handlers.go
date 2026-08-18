@@ -3963,20 +3963,18 @@ func namedStringEnumMembers(named *gotypes.Named) []string {
 type enumTarget int
 
 const (
-	// enumTargetNone is a rule that names a value this parameter does not have.
+	// enumTargetNone is a rule that reaches no schema on this parameter.
 	enumTargetNone enumTarget = iota
 	// enumTargetSelf is the parameter's own schema.
 	enumTargetSelf
 	// enumTargetElement is an array's element or a map's value.
 	enumTargetElement
-	// enumTargetMapKey is a map's key.
-	enumTargetMapKey
 )
 
 // enumTargets fixes the order targets are applied and reported in, so a tag that
 // states rules at several scopes yields the same schema and the same diagnostics on
 // every run.
-var enumTargets = [...]enumTarget{enumTargetSelf, enumTargetElement, enumTargetMapKey}
+var enumTargets = [...]enumTarget{enumTargetSelf, enumTargetElement}
 
 func (t enumTarget) label() string {
 	switch t {
@@ -3984,15 +3982,14 @@ func (t enumTarget) label() string {
 		return "the parameter itself"
 	case enumTargetElement:
 		return "the values inside the parameter"
-	case enumTargetMapKey:
-		return "the parameter's map keys"
 	}
 	return "nothing"
 }
 
 // parameterEnumRule is one enum a bound parameter's tag states, paired with the
-// scope it was written at. text is the rule as the author spelled it, so a
-// diagnostic can quote the source rather than gnr8's reading of it.
+// scope it was written at. text quotes the rule the way the author wrote it, tag key
+// included, so a diagnostic about two of them points at two distinct places in the
+// source even when the rules themselves are spelled identically.
 type parameterEnumRule struct {
 	scope  tags.Scope
 	values []string
@@ -4003,9 +4000,14 @@ type parameterEnumRule struct {
 // Every scope has a single destination: nothing is attempted twice and nothing is
 // recovered on failure, so the tag's own shape decides where its members land.
 //
-// A scope that names a value the parameter does not have — a `dive` on a scalar,
-// `keys` on something that is not a map — reaches nothing and is dropped in silence,
-// which is already what a post-`dive` rule gets on a schema field.
+// A scope that reaches no schema is dropped in silence, which is already what a
+// post-`dive` rule gets on a schema field. Two scopes reach nothing here. A `dive`
+// on a scalar names a value the parameter does not have. `keys`…`endkeys` names one
+// it does have, but an OpenAPI object key is a string and gnr8 does not yet emit
+// `propertyNames` to constrain it, so lowering rejects a map whose key is anything
+// but a plain string (`lower::is_openapi_map_key`) — a well-formed tag must not
+// abort generation, so the rule is read and discarded until the document can carry
+// it.
 //
 // Field scope on a container lowers to what the container holds. That is a rule
 // rather than a rescue: `facts.Type` has no room for an enum beside an array or a
@@ -4023,10 +4025,6 @@ func enumTargetOf(schema facts.Type, scope tags.Scope) enumTarget {
 		if container {
 			return enumTargetElement
 		}
-	case tags.ScopeMapKey:
-		if schema.Type == facts.TypeMap {
-			return enumTargetMapKey
-		}
 	}
 	return enumTargetNone
 }
@@ -4041,10 +4039,6 @@ func schemaWithEnum(schema facts.Type, values []string, target enumTarget) facts
 		}
 		if mapped, ok := schema.Of.(*facts.MapType); ok && mapped != nil {
 			return facts.MapTypeOf(mapped.Key, facts.EnumType(values))
-		}
-	case enumTargetMapKey:
-		if mapped, ok := schema.Of.(*facts.MapType); ok && mapped != nil {
-			return facts.MapTypeOf(facts.EnumType(values), mapped.Value)
 		}
 	}
 	return schema
@@ -4104,14 +4098,14 @@ func schemaWithParameterEnums(
 // than a preference.
 func parameterEnumRules(tag reflect.StructTag) []parameterEnumRule {
 	rules := []parameterEnumRule{}
-	for _, source := range []string{tag.Get("binding"), tag.Get("validate")} {
-		for _, token := range tags.Scoped(source) {
+	for _, key := range []string{"binding", "validate"} {
+		for _, token := range tags.Scoped(tag.Get(key)) {
 			value, ok := strings.CutPrefix(token.Text, "oneof=")
 			if !ok {
 				continue
 			}
 			if values := strings.Fields(strings.ReplaceAll(value, "|", " ")); len(values) > 0 {
-				rules = append(rules, parameterEnumRule{scope: token.Scope, values: values, text: token.Text})
+				rules = append(rules, parameterEnumRule{scope: token.Scope, values: values, text: quoteTagRule(key, token.Text)})
 			}
 		}
 	}
@@ -4122,10 +4116,16 @@ func parameterEnumRules(tag reflect.StructTag) []parameterEnumRule {
 		}
 		values := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '|' || r == ' ' })
 		if len(values) > 0 {
-			rules = append(rules, parameterEnumRule{scope: tags.ScopeField, values: values, text: key + `:"` + value + `"`})
+			rules = append(rules, parameterEnumRule{scope: tags.ScopeField, values: values, text: quoteTagRule(key, value)})
 		}
 	}
 	return rules
+}
+
+// quoteTagRule renders one rule as the author wrote it — `binding:"oneof=a b"` — so
+// two rules that differ only in which tag key carries them still read as two.
+func quoteTagRule(key, rule string) string {
+	return key + `:"` + rule + `"`
 }
 
 func renderEnumRules(rules []parameterEnumRule) string {

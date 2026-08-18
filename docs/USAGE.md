@@ -341,18 +341,25 @@ parameter at any scope — so `oneof` is stated by replacing a schema, and the s
 | `binding:"oneof=…"` on a scalar | the parameter's own schema |
 | `binding:"oneof=…"` on an array or map | what the container holds — an array or map has no room for an enum beside it |
 | `binding:"dive,oneof=…"` | the array's element, or the map's **values** |
-| `binding:"dive,keys,oneof=…,endkeys"` | the map's **keys** |
+| `binding:"dive,keys,oneof=…,endkeys"` | nowhere — see below |
 | a scope the parameter has no value for (`dive` on a scalar, `keys` on an array) | nowhere — dropped in silence, as on a schema field |
 
-So `Labels map[string]string` tagged `binding:"dive,keys,oneof=x y,endkeys,oneof=v1 v2"` publishes a
-map whose keys and values are each their own enum, and the two rules do not compete because they name
-different values.
+So `Filters map[string]string` tagged `binding:"dive,oneof=red green"` publishes a map whose values
+are an enum, with the key left as the plain string OpenAPI requires.
+
+**A `keys`…`endkeys` enum is read and discarded.** An OpenAPI object key is always a string, and gnr8
+does not emit `propertyNames` to constrain it, so there is nowhere to put the members — and lowering
+*rejects* a map whose key is not a plain string, which would abort generation for the whole document
+rather than drop one rule. A well-formed tag must never do that, so the rule is dropped in silence
+like any other gnr8 understands but cannot carry. Constrain map keys with a `Transform` in your
+`.gnr8/` crate if you need them in the document.
 
 **Two rules that land on the same value are an error, not a contest.** `binding:"oneof=a b,dive,oneof=c d"`
 on a `[]string` states the element's enum twice; so does `binding:"oneof=a b" validate:"oneof=a b"` on
-a string, even though both spellings agree. gnr8 emits a `request.parameter.ambiguous` **ERROR**,
-applies neither, and leaves the parameter's schema as the source types it — picking a winner would be
-a precedence rule, and a fact stated twice has no winner. State it once.
+a string, even though both spellings agree. gnr8 emits a `request.parameter.ambiguous` **ERROR**
+naming each rule with the tag key that carries it, applies neither, and leaves the parameter's schema
+as the source types it — picking a winner would be a precedence rule, and a fact stated twice has no
+winner. State it once.
 
 ## Operation prose (all three languages)
 

@@ -19,6 +19,14 @@
 // different things. A schema field records constraints beside its type, so a rule
 // about the elements has nothing to bind and is dropped. A bound parameter has only
 // a schema, so the same rule replaces the element's schema instead.
+//
+// ScopeMapKey currently reaches nothing in either reader. An OpenAPI object key is
+// always an unconstrained string and gnr8 emits no `propertyNames`, so there is
+// nowhere to put a rule about keys — and the OpenAPI lowering rejects a map whose key
+// is not a plain string, which means building one would abort a whole document over a
+// single well-formed struct tag. The scope is still classified here rather than
+// folded into ScopeElement, because reading the marker correctly is what lets the
+// rules it guards be discarded instead of misattributed to the values.
 package tags
 
 import "strings"

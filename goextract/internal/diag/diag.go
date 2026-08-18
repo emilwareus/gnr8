@@ -102,8 +102,8 @@ func (a *Accumulator) RequestParameterAmbiguous(subject, method, route, reason, 
 		Severity: severityError,
 		Category: categoryRequestParameter,
 		Message: "contradictory tags on parameter " + subject + " on " + method + " " + route +
-			": " + reason + "; gnr8 does not choose between them — state the rule once, or move one " +
-			"to the scope it belongs to (`dive` for elements, `keys`…`endkeys` for map keys)",
+			": " + reason + "; gnr8 does not choose between them — delete all but one, at the scope " +
+			"it belongs to (`dive` for what a collection holds)",
 		File:      file,
 		Line:      line,
 		EndLine:   line,

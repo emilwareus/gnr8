@@ -1899,10 +1899,13 @@ type facts2Diag struct {
 //     `facts.Type` array or map has no room for an enum beside it;
 //   - `dive` lands on an array's element or a map's VALUE, leaving the key intact —
 //     the defect this test exists for, where a map parameter used to be replaced
-//     wholesale by a bare string enum;
-//   - `keys`…`endkeys` lands on the map's KEY; and
-//   - a scope the parameter does not have reaches nothing and is dropped in silence,
-//     as a post-`dive` rule already is on a schema field.
+//     wholesale by a bare string enum; and
+//   - a scope that reaches no schema is dropped in silence, as a post-`dive` rule
+//     already is on a schema field. That covers `dive` on a scalar, which names a
+//     value the parameter does not have, and `keys`…`endkeys`, which names one it
+//     does: an enum map key lowers to nothing OpenAPI can express until gnr8 emits
+//     `propertyNames`, and `lower::is_openapi_map_key` REJECTS a non-string key, so
+//     applying it would abort generation on a well-formed tag.
 //
 // The last case is the invariant-3 one: two rules landing on one value are reported
 // and both dropped, because choosing between them would be a precedence rule and a
@@ -1991,17 +1994,20 @@ func (s Server) search(c *gin.Context) {
 	if primName(buckets.Key) != facts.PrimString {
 		t.Fatalf("field-scope enum on a map must leave the key a string, got %+v", buckets.Key)
 	}
+	// A map key stays a plain string: an enum key is not representable in OpenAPI, and
+	// lowering rejects a non-string key outright, so applying it would abort generation.
 	labels := mapOf(t, paramSchema(t, code, "labels"))
-	assertEnum(t, labels.Key, "x", "y")
-	if primName(labels.Value) != facts.PrimString {
-		t.Fatalf("keys enum must leave the map value a string, got %+v", labels.Value)
+	if primName(labels.Key) != facts.PrimString || primName(labels.Value) != facts.PrimString {
+		t.Fatalf("a keys enum must reach nothing, got %+v", labels)
 	}
-	// Key and value scopes name different values, so both apply without contradiction.
+	// A discarded key rule does not contend with the value rule that follows it.
 	sides := mapOf(t, paramSchema(t, code, "sides"))
-	assertEnum(t, sides.Key, "k1", "k2")
+	if primName(sides.Key) != facts.PrimString {
+		t.Fatalf("a keys enum must reach nothing, got %+v", sides.Key)
+	}
 	assertEnum(t, sides.Value, "v1", "v2")
 
-	// A scope the parameter has no value for reaches nothing.
+	// A scope the parameter has no value for reaches nothing either.
 	if primName(paramSchema(t, code, "plain")) != facts.PrimString {
 		t.Fatalf("dive on a scalar has nothing to bind, got %+v", paramSchema(t, code, "plain"))
 	}
@@ -2016,17 +2022,23 @@ func (s Server) search(c *gin.Context) {
 	if primName(paramSchema(t, code, "restated")) != facts.PrimString {
 		t.Fatalf("enum restated under a second tag key must not be applied, got %+v", paramSchema(t, code, "restated"))
 	}
-	ambiguous := map[string]facts.DiagnosticFact{}
+	// Collected as a slice, not keyed by subject: one contradiction must raise exactly
+	// one diagnostic, and a map would hide a second report for the same parameter.
+	ambiguous := []facts.DiagnosticFact{}
 	for _, item := range diags.Items() {
 		if item.Code == "request.parameter.ambiguous" {
-			ambiguous[item.Subject] = item
+			ambiguous = append(ambiguous, item)
 		}
 	}
 	if len(ambiguous) != 2 {
-		t.Fatalf("want one ambiguity per contradicted parameter, got %+v", diags.Items())
+		t.Fatalf("want exactly one ambiguity per contradicted parameter, got %+v", diags.Items())
+	}
+	bySubject := map[string]facts.DiagnosticFact{}
+	for _, item := range ambiguous {
+		bySubject[item.Subject] = item
 	}
 	for _, subject := range []string{"twice", "restated"} {
-		item, ok := ambiguous[subject]
+		item, ok := bySubject[subject]
 		if !ok || item.Severity != "ERROR" || item.Category != "request_parameter" {
 			t.Fatalf("%s must raise an ERROR request_parameter ambiguity, got %+v", subject, item)
 		}
@@ -2034,8 +2046,13 @@ func (s Server) search(c *gin.Context) {
 			t.Fatalf("%s ambiguity must carry operation and position, got %+v", subject, item)
 		}
 	}
-	if !strings.Contains(ambiguous["twice"].Message, "oneof=a b, oneof=c d") {
-		t.Fatalf("ambiguity must quote both rules as written, got %q", ambiguous["twice"].Message)
+	if !strings.Contains(bySubject["twice"].Message, `binding:"oneof=a b", binding:"oneof=c d"`) {
+		t.Fatalf("ambiguity must quote both rules as written, got %q", bySubject["twice"].Message)
+	}
+	// Two identically spelled rules are told apart by the tag key that carries them,
+	// which is the only thing distinguishing them in the source.
+	if !strings.Contains(bySubject["restated"].Message, `binding:"oneof=a b", validate:"oneof=a b"`) {
+		t.Fatalf("ambiguity must name the tag key of each rule, got %q", bySubject["restated"].Message)
 	}
 }
 

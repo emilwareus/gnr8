@@ -1786,6 +1786,46 @@ mod tests {
         );
     }
 
+    /// The other half of the gate above, from the parameter side. A Go map parameter
+    /// tagged `binding:"dive,oneof=…"` reaches this lowering as `Map { key: String,
+    /// value: Enum }`, which is representable: the key stays a plain string and the
+    /// enum lands on `additionalProperties`.
+    ///
+    /// The pairing is the point. `is_openapi_map_key` REJECTS a non-string key, so an
+    /// extractor that put that same enum on the key would abort `to_openapi` instead
+    /// of emitting a document — a whole-document failure provoked by one struct tag.
+    /// `goextract` therefore discards a `keys`…`endkeys` enum rather than building a
+    /// map this function cannot lower, and this test is what makes that contract
+    /// visible from the Rust side.
+    #[test]
+    fn map_parameters_carry_an_enum_on_the_value_not_the_key() {
+        use crate::graph::{Prim, Type};
+        let mut graph = sample_graph();
+        let param = graph
+            .operations
+            .iter_mut()
+            .find_map(|op| op.params.first_mut())
+            .expect("the sample graph has a parameter");
+        param.schema = Type::Map {
+            key: Box::new(Type::Primitive(Prim::String)),
+            value: Box::new(Type::Enum(vec!["red".to_string(), "green".to_string()])),
+        };
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config())
+            .expect("a string-keyed map with an enum value must lower");
+        // The key contributes nothing but `type: object` — an unconstrained string, as
+        // OpenAPI requires — and the members sit on the value schema.
+        assert!(
+            yaml.contains(concat!(
+                "        schema:\n",
+                "          type: object\n",
+                "          additionalProperties:\n",
+                "            type: string\n",
+                "            enum: [red, green]\n",
+            )),
+            "{yaml}"
+        );
+    }
+
     #[test]
     fn well_known_uuid_field_lowers_to_string_with_uuid_format() {
         // A WellKnown(Uuid) field lowers NEUTRALLY to `type: string` + `format: uuid` — no language

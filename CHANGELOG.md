@@ -22,12 +22,15 @@ must move the minor version.
   Each scope now has exactly one destination. Field scope lands on a scalar parameter's own schema,
   and on a container it lowers to what the container holds — a `facts.Type` array or map has no room
   for an enum beside it, so the members can only be describing the values. `dive` lands on an array's
-  element or a map's **values**, leaving the key intact; `keys`…`endkeys` lands on the map's **keys**.
-  A scope the parameter has no value for — a `dive` on a scalar, `keys` on an array — reaches nothing
-  and is dropped in silence, as it already is on a schema field.
+  element or a map's **values**, leaving the key the plain string OpenAPI requires. A scope that
+  reaches no schema is dropped in silence, as it already is on a schema field: that covers a `dive` on
+  a scalar, and also `keys`…`endkeys`, since an OpenAPI object key is always an unconstrained string
+  and the lowering rejects any map key that is not one — applying an enum there would abort a whole
+  document over a single well-formed struct tag.
 
-  **Two rules landing on the same value are now a `request.parameter.ambiguous` ERROR**, and neither
-  is applied. That covers `binding:"oneof=a b,dive,oneof=c d"` on a `[]string`, and it also covers the
+  **Two rules landing on the same value are now a `request.parameter.ambiguous` ERROR** naming each
+  rule with the tag key that carries it, and neither is applied. That covers
+  `binding:"oneof=a b,dive,oneof=c d"` on a `[]string`, and it also covers the
   same enum restated under a second tag key — `binding:` and `validate:` are read as peers now, where
   `binding:` used to win in silence, and the `enums:`/`enum:` tag is a peer of both rather than a
   fallback consulted only when no `oneof` was found. Restating a fact identically is reported too:
