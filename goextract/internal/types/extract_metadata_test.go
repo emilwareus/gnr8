@@ -174,37 +174,31 @@ func TestFieldMetaFromTagsReportsUnknownRulesAtEveryScope(t *testing.T) {
 	}
 }
 
-func TestRecognizedTagRulesStayInStepWithTheConstraintParser(t *testing.T) {
-	// The element-scope path asks recognizedTagRule whether to stay quiet, while the
-	// field-scope path asks the switch in constraintsFromTag. If the two drift, a rule
-	// gnr8 handles would be reported as unknown the moment it appears behind a `dive`.
-	// Every rule below must therefore be silent at both scopes.
+func TestKnownRulesParseIdenticallyAtEveryScope(t *testing.T) {
+	// One switch decides both whether gnr8 knows a rule and whether it can apply it,
+	// so a rule with a case is silent at every scope and a rule without one is
+	// reported at every scope — by construction, not by keeping two lists in step.
+	// These cases document that; they cannot enumerate the switch, and a list that
+	// looked like it could would be worse than none.
 	rules := []string{"required", "omitempty", "min=1", "max=100", "gte=1", "lte=9", "gt=0", "lt=9", "oneof=a b"}
 
 	for _, rule := range rules {
-		if !recognizedTagRule(strings.Split(rule, "=")[0]) {
-			t.Errorf("%q is handled by the constraint parser but reads as unknown", rule)
-		}
-		for _, scope := range []string{rule, "dive," + rule} {
+		for _, tag := range []string{rule, "dive," + rule, "dive,keys," + rule + ",endkeys"} {
 			diags := diag.New()
 			constraintsFromTag(
 				"validate",
 				"ScopedRules",
 				"Field",
-				scope,
+				tag,
 				facts.PrimitiveType(facts.IntPrim(64, true)),
 				"dto.go",
 				14,
 				diags,
 			)
 			if len(diags.Items()) != 0 {
-				t.Errorf("%q must parse without a diagnostic: %#v", scope, diags.Items())
+				t.Errorf("%q must parse without a diagnostic: %#v", tag, diags.Items())
 			}
 		}
-	}
-
-	if recognizedTagRule("email") {
-		t.Error("a rule gnr8 does not lower must not read as recognized")
 	}
 }
 
