@@ -41,6 +41,22 @@ must move the minor version.
   spelling won, now no enum is applied and an ERROR is raised). The ERROR is reported, not fatal —
   deny `request.parameter.ambiguous` with a `DiagnosticPolicy` to fail the build on it.
 
+- **Generated Python dataclass models no longer crash on a `null` they document.** `from_dict`
+  decoded every non-optional field unconditionally, so a required-but-nullable field whose decode
+  dereferences the value — a list of nested models, or a nested model — raised
+  `TypeError: 'NoneType' object is not iterable` (or failed inside `from_dict(None)`) when the
+  server sent the `null` the document permits. The model's own hint said `Optional[...]`, so the SDK
+  promised a tolerance it did not implement.
+
+  The decode is now guarded the way the optional branch already was. The guard tests the **value**,
+  not presence: a missing key still raises `KeyError`, because that is a real protocol error for a
+  field the document requires. A passthrough decode is left alone — it already yields `None` — so
+  nullable scalars gain no noise.
+
+  Pydantic models (the default) and the TypeScript SDK were already correct. This defect predates
+  the field-derivation fix below, but that fix makes required-but-nullable the common shape for
+  every bare slice, map, and interface, so it is what turns a latent crash into a likely one.
+
 - **Go field presence and nullability now say what `encoding/json` actually does.** Both axes were
   derived partly from the declared type, which is evidence for neither. A field was marked optional
   when it was a pointer and nullable only when it was a pointer, so three shapes came out wrong:

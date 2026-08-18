@@ -450,7 +450,9 @@ lists every diagnostic.
   absent) comes from the `json` tag's omission option alone — never from the declared type. **Nullability**
   (may the value be `null`) comes from the declared type alone: a nil pointer, slice, map, or interface is
   what `encoding/json` writes as `null`. So `[]T json:"k"` is nullable-but-always-present, and
-  `*T json:"k"` is too — neither is optional until the tag says so.
+  `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
+  different wire with different rules: never nullable (a part has no `null`), and a pointer part
+  *is* optional.
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - The Go frontend recognizes Gin route registration, not arbitrary Go routers.

@@ -876,8 +876,22 @@ fn emit_dataclass(
             )
             .map_err(sink)?;
         } else {
-            let decoded = decode_expr(&field.schema, graph, &format!("_data[\"{wire}\"]"));
-            writeln!(out, "            {ident}={decoded},").map_err(sink)?;
+            let accessor = format!("_data[\"{wire}\"]");
+            let decoded = decode_expr(&field.schema, graph, &accessor);
+            if field.nullable && decoded != accessor {
+                // Required-but-nullable: the key is always present (a missing one is a real protocol
+                // error → KeyError), but the value may be `null` and THIS decode dereferences it — a
+                // list comprehension over None raises TypeError, and a nested `from_dict(None)` fails
+                // inside. Guard it the way the optional branch does. A passthrough decode needs no
+                // guard: it already yields None.
+                writeln!(
+                    out,
+                    "            {ident}=({decoded}) if {accessor} is not None else None,"
+                )
+                .map_err(sink)?;
+            } else {
+                writeln!(out, "            {ident}={decoded},").map_err(sink)?;
+            }
         }
     }
     writeln!(out, "        )").map_err(sink)?;
@@ -3180,7 +3194,7 @@ mod tests {
     }
 
     mod models {
-        use super::{emit_models, emit_models_with_style, sample_graph, PyModelStyle};
+        use super::{emit_models, emit_models_with_style, sample_graph, ApiGraph, PyModelStyle};
 
         #[test]
         fn named_enum_emits_str_enum_class_with_screaming_snake_members() {
@@ -3195,6 +3209,85 @@ mod tests {
             let h = out.find("HARDCOVER").unwrap();
             let p = out.find("PAPERBACK").unwrap();
             assert!(h < p, "enum members must be in graph order:\n{out}");
+        }
+
+        /// A required-but-nullable field whose decode DEREFERENCES the value must be
+        /// guarded against an actual `null`.
+        ///
+        /// This is the shape the Go extractor now publishes for every bare slice, map,
+        /// and interface: the document says `[array, "null"]` and the model hints
+        /// `Optional[list[Item]]`, so a server may legitimately send `null`. Unguarded,
+        /// `[Item.from_dict(_item) for _item in _data["items"]]` raises
+        /// `TypeError: 'NoneType' object is not iterable`, and `Item.from_dict(None)`
+        /// fails inside — the SDK would promise a None-tolerance it does not implement.
+        ///
+        /// The guard tests the VALUE, not presence: a missing key is still a protocol
+        /// error (`KeyError`), which is what distinguishes this from the optional branch.
+        #[test]
+        fn dataclass_from_dict_guards_a_required_nullable_decode() {
+            // Purpose-built graph rather than SAMPLE: this needs a required + nullable
+            // field at each decode shape, and SAMPLE has none.
+            const FACTS: &[u8] = br#"{
+              "module": "app",
+              "routes": [],
+              "diagnostics": [],
+              "schemas": [
+                {
+                  "id": "app.models.Item",
+                  "name": "Item",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "name", "required": true, "optional": false, "nullable": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 1, "end_line": 1}
+                },
+                {
+                  "id": "app.models.Bag",
+                  "name": "Bag",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "items", "required": true, "optional": false, "nullable": true,
+                     "schema": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}},
+                     "description": null, "example": null},
+                    {"json_name": "lead", "required": true, "optional": false, "nullable": true,
+                     "schema": {"type": "named", "of": "app.models.Item"},
+                     "description": null, "example": null},
+                    {"json_name": "note", "required": true, "optional": false, "nullable": true,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 2, "end_line": 2}
+                }
+              ]
+            }"#;
+            let graph = ApiGraph::from_facts(serde_json::from_slice(FACTS).unwrap(), "/root");
+            let out = emit_models_with_style(&graph, "app", PyModelStyle::Dataclass).unwrap();
+
+            // A list of nested models: guarded, and the recursion is preserved.
+            assert!(
+                out.contains(
+                    "items=([Item.from_dict(_item) for _item in _data[\"items\"]]) if _data[\"items\"] is not None else None,"
+                ),
+                "nullable list-of-models decode must be null-guarded:\n{out}"
+            );
+            // A single nested model: same shape, `from_dict(None)` would fail inside.
+            assert!(
+                out.contains(
+                    "lead=(Item.from_dict(_data[\"lead\"])) if _data[\"lead\"] is not None else None,"
+                ),
+                "nullable nested-model decode must be null-guarded:\n{out}"
+            );
+            // A passthrough decode already yields None, so it stays unguarded — the fix
+            // must not add noise to every nullable scalar, which this branch makes common.
+            assert!(
+                out.contains("note=_data[\"note\"],"),
+                "passthrough decode needs no guard:\n{out}"
+            );
+            // Presence is untouched: none of these use `.get` or an `in _data` test.
+            assert!(
+                !out.contains("\"items\" in _data"),
+                "a required key must still raise KeyError when absent:\n{out}"
+            );
         }
 
         #[test]
