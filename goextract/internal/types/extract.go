@@ -980,10 +980,10 @@ func deref(t gotypes.Type) gotypes.Type {
 	return t
 }
 
-// payloadWire is the serializer that owns a struct field's wire form. Presence
-// and nullability are both properties of that serializer, so both are derived
-// from it: `encoding/json` writes `null` and honours the omission options, a
-// form/multipart binder does neither.
+// payloadWire is the serializer that owns a struct field's wire form. What a
+// field's two axes mean is a property of that serializer, so the wire selects
+// the rule: only `encoding/json` writes `null`, and only it defines what the
+// omission options drop.
 type payloadWire int
 
 const (
@@ -1039,17 +1039,29 @@ func parseWireTag(raw string, goName string, wire payloadWire) (name string, omi
 }
 
 // presenceAndNullability derives the two axes from the serializer that writes
-// the field. Each axis has exactly one source (CLAUDE.md rule 3): presence comes
-// from the omission option alone, nullability from the type alone. The declared
-// type is never evidence for presence — `encoding/json` keeps a bare pointer's
-// key and writes `null` into it.
+// the field. Each wire has exactly one rule per axis (CLAUDE.md rule 3) — these
+// are two serializers, not a primary source and a fallback.
+//
+// On the `encoding/json` wire the declared type is evidence for nullability
+// only: the marshaller keeps a bare pointer's key and writes `null` into it, so
+// presence comes from the omission option alone.
+//
+// The form/multipart wire is left as it was. Its binder is not `encoding/json`
+// and nothing here has established what it does with a bare pointer, so this
+// change does not speak for it.
 func presenceAndNullability(wire payloadWire, omitOpt string, t gotypes.Type) (optional, nullable bool) {
 	if wire == wireForm {
-		// A form/multipart binder, not `encoding/json`: a part is present or absent
-		// and there is no `null` to write, so the value axis does not apply.
-		return omitOpt != "", false
+		// A part is present or absent; there is no `null` to write, so the value axis
+		// does not apply. Presence keeps its long-standing rule: a pointer part or an
+		// omission option means the part may be missing.
+		return isPointer(t) || omitOpt != "", false
 	}
 	return omitOptionOmits(t, omitOpt), zeroMarshalsNull(t)
+}
+
+func isPointer(t gotypes.Type) bool {
+	_, ok := t.(*gotypes.Pointer)
+	return ok
 }
 
 // omitOptionOmits reports whether a json omission option actually causes

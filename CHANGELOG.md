@@ -58,16 +58,19 @@ must move the minor version.
     publishes it as always-present and raises `schema.omit_option.ineffective` (`INFO`) naming the
     field and pointing at `,omitzero`, which does omit the zero value of any type.
 
-  Each axis now has exactly one source: presence from the `json` tag's omission option, nullability
-  from the declared type. A `form:`-tagged field is read as the multipart wire it is — a part is
-  present or absent and there is no `null` to write — so the value axis no longer applies there.
+  On the `encoding/json` wire each axis now has exactly one source: presence from the tag's omission
+  option, nullability from the declared type. A `form:`-tagged field keeps its own presence rule —
+  that binder is not `encoding/json` and this change does not speak for it — but loses the value
+  axis, because a multipart part is present or absent and there is no `null` to write.
 
-  **This changes emitted documents and SDKs.** Bare and `,omitempty` slice/map/interface fields gain
-  `"null"` in their document type and `| None` / `| null` in generated Python and TypeScript models;
-  bare pointer fields and ineffectively-tagged struct/`time.Time` fields stop being optional in all
-  three SDKs. Generated Go SDKs are unaffected — a nil slice already round-trips `null`. All of these
-  are corrections, but a client generated from the new document accepts responses the old one
-  rejected and requires keys the old one did not, so review the regenerated output before publishing.
+  **This changes emitted documents and all three generated SDKs.** Bare and `,omitempty`
+  slice/map/interface fields gain `"null"` in their document type and `| None` / `| null` in
+  generated Python and TypeScript models; the Go SDK is unchanged by that half, since a nil slice
+  already round-trips `null`. Bare pointer fields and ineffectively-tagged struct/`time.Time` fields
+  stop being optional everywhere, which does reach the Go SDK: `*T json:"k"` now emits
+  `json:"k"` where it previously emitted `json:"k,omitempty"`. All of these are corrections, but a
+  client generated from the new document accepts responses the old one rejected and requires keys the
+  old one did not, so review the regenerated output before publishing.
 
   The document and the SDKs still answer "must this field be present?" from different axes
   (`required` from `binding`/`validate`, presence from the `json` tag). That disagreement is

@@ -293,7 +293,7 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
 | required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. Only the field's own scope counts — see below. |
-| source-optional field | pointer `*T` and/or `json:",omitempty"` / `json:",omitzero"` | source optionality signal; schema `required` still comes from required tags. |
+| source-optional field | `json:",omitempty"` / `json:",omitzero"` — **not** pointer `*T` | source optionality signal; schema `required` still comes from required tags. A bare `*T` keeps its key (`encoding/json` writes `null` into it), so it is nullable, not optional. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
 

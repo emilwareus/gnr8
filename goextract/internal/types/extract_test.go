@@ -404,13 +404,17 @@ type Payload struct {
 // `encoding/json` actually does, for every shape it distinguishes.
 //
 // The expectations are not derived from the extractor's rules — they are the
-// observed output of `json.Marshal` on the zero value of each field, so the test
-// fails if the extractor and the marshaller ever disagree again:
+// observed output of `json.Marshal(Matrix{})` on go1.26.5, verbatim and in
+// declaration order, so the test fails if the extractor and the marshaller ever
+// disagree again. A key below is `optional`; a `null` value is `nullable`:
 //
-//	{"bare_ptr":null,"bare_slice":null,"bare_map":null,"bare_iface":null,
-//	 "bare_struct":{"a":0},"omit_struct":{"a":0},
+//	{"bare_str":"","bare_ptr":null,"bare_slice":null,"bare_map":null,
+//	 "bare_iface":null,"bare_struct":{"a":0},"omit_struct":{"a":0},
 //	 "bare_time":"0001-01-01T00:00:00Z","omit_time":"0001-01-01T00:00:00Z",
-//	 "bare_str":"","bare_arr":["",""],"omit_arr":["",""]}
+//	 "bare_arr":["",""],"omit_arr":["",""],"req_ptr":null}
+//
+// The six keys absent from that object — omit_str, omit_ptr, omit_slice,
+// omit_map, zero_struct, zero_time — are the only optional fields.
 //
 // Two families of mistake are pinned by construction. The DECLARED TYPE is not
 // evidence for presence: a bare pointer keeps its key, so `*T` alone never makes
@@ -572,9 +576,15 @@ type UploadForm struct {
 		t.Fatal("field 'file' not found")
 	}
 	// A multipart part is present or absent; there is no `null` to write, so the
-	// value axis does not apply on a form wire even for a pointer field.
-	if !file.Required || file.Nullable || primName(file.Schema) != facts.PrimBytes {
-		t.Fatalf("file should be required non-nullable bytes, got required=%v nullable=%v schema=%+v", file.Required, file.Nullable, file.Schema)
+	// VALUE axis does not apply on a form wire even for a pointer field. The
+	// PRESENCE axis is asserted here too: a pointer part stays optional, which is
+	// the form binder's rule and not `encoding/json`'s. Leaving it unasserted once
+	// let it flip silently.
+	if !file.Required || !file.Optional || file.Nullable || primName(file.Schema) != facts.PrimBytes {
+		t.Fatalf(
+			"file should be required optional non-nullable bytes, got required=%v optional=%v nullable=%v schema=%+v",
+			file.Required, file.Optional, file.Nullable, file.Schema,
+		)
 	}
 	if file.Description == nil || *file.Description != "CSV upload" {
 		t.Fatalf("description tag not preserved: %#v", file.Description)
