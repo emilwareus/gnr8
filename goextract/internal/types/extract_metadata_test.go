@@ -115,7 +115,8 @@ func TestFieldMetaFromTagsScopesConstraintsToTheFieldItself(t *testing.T) {
 
 func TestFieldMetaFromTagsIgnoresMapKeyScopedTokens(t *testing.T) {
 	// `keys`/`endkeys` are structural markers, not constraint tokens: parsing them as
-	// constraints produced four bogus `schema.metadata.unresolved` diagnostics.
+	// constraints reported each of them as an unsupported rule, so this one tag raised
+	// two bogus `schema.metadata.unresolved` diagnostics.
 	tag := reflect.StructTag(`json:"headers,omitzero" binding:"omitempty,dive,keys,required,endkeys,required"`)
 	diags := diag.New()
 

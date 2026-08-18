@@ -315,8 +315,9 @@ each string rather than the slice, so they are not published as the array's cons
 The same rule applies to bound query, header, and form parameters: `binding:"omitempty,dive,required"`
 on a repeated parameter forbids empty entries, it does not make the parameter itself required.
 
-gnr8 records constraints on the field only, so a rule written past a `dive` reaches nothing it can
-bind. What happens next depends on whether gnr8 knows the rule, not on where it was written:
+For a schema field, gnr8 records constraints on the field only, so a rule written past a `dive`
+reaches nothing it can bind. What happens next depends on whether gnr8 knows the rule, not on where
+it was written:
 
 | The rule | Behind a `dive` | At field scope |
 |---|---|---|
@@ -328,6 +329,14 @@ does — gnr8 drops the rule in both cases, and you hear about it in both cases.
 is the first row: **`dive,min=1` does not become a per-item `minLength` in the emitted document, and
 says nothing when it disappears.** If you need element constraints in the spec, state them on the
 element's own named type, or add them with a `Transform` in your `.gnr8/` crate.
+
+`oneof` on a **bound parameter** is the one rule whose scope gnr8 does not yet read. A repeated
+parameter's element is a schema gnr8 can reach, so the enum is placed there wherever the rule is
+written — `binding:"oneof=alpha beta"` and `binding:"dive,oneof=alpha beta"` produce the same
+parameter. For an array that is the right destination either way; on a map parameter a post-`dive`
+`oneof` replaces the parameter's whole schema, because where an element-scope enum belongs on a map —
+the value schema, or the key schema after `keys` — is still open. State the enum as a named string
+type on the element to stay clear of it.
 
 ## Operation prose (all three languages)
 
