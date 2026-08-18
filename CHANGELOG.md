@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.5.3 — 2026-08-18
+
 ### Fixed
 
 - **Go validation rules that apply *inside* a collection no longer bind the field.** The Go
