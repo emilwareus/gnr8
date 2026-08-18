@@ -149,7 +149,7 @@ func extractFields(
 			continue
 		}
 
-		jsonName, optionalByTag, skip := parsePayloadTag(tag, f.Name())
+		jsonName, wire, omitOpt, skip := parsePayloadTag(tag, f.Name())
 		if skip {
 			continue
 		}
@@ -166,12 +166,10 @@ func extractFields(
 		}
 		schema := mapType(f.Type(), ctx)
 		required := bindingHasRequired(tag.Get("binding")) || validateHasRequired(tag.Get("validate"))
-		// The two independent axes: optional = the key may be absent (a pointer or
-		// a JSON omission option); nullable = the value may be explicitly null (a
-		// pointer can hold nil). A non-pointer field tagged with `omitempty` or
-		// `omitzero` is optional-but-not-nullable.
-		optional := isPointer(f.Type()) || optionalByTag
-		nullable := isPointer(f.Type())
+		optional, nullable := presenceAndNullability(wire, omitOpt, f.Type())
+		if wire == wireJSON && omitOpt == optOmitEmpty && !optional {
+			diags.IneffectiveOmitEmpty(structName, f.Name(), typeString(f.Type()), file, line)
+		}
 		meta := fieldMetaFromTags(structName, f.Name(), tag, st.Tag(i), schema, file, line, diags)
 		description := optString(tag.Get("description"))
 		if description == nil {
@@ -982,40 +980,130 @@ func deref(t gotypes.Type) gotypes.Type {
 	return t
 }
 
-func isPointer(t gotypes.Type) bool {
-	_, ok := t.(*gotypes.Pointer)
-	return ok
-}
+// payloadWire is the serializer that owns a struct field's wire form. Presence
+// and nullability are both properties of that serializer, so both are derived
+// from it: `encoding/json` writes `null` and honours the omission options, a
+// form/multipart binder does neither.
+type payloadWire int
 
-// parsePayloadTag returns the effective payload field name, whether the tag
-// permits omission, and whether the field is skipped. JSON tags win when
-// present; form tags let multipart/form DTOs participate in the same neutral
-// schema extraction.
-func parsePayloadTag(tag reflect.StructTag, goName string) (name string, optional, skip bool) {
+const (
+	// wireJSON: `encoding/json` governs — either a `json:` tag or no payload tag
+	// at all (an untagged field is still marshalled, under its Go name).
+	wireJSON payloadWire = iota
+	// wireForm: a form/multipart binder governs. There is no `null` on that wire.
+	wireForm
+)
+
+// The `json` tag's two omission options. They differ in WHICH values they drop:
+// `omitempty` drops encoding/json's "empty" set, `omitzero` drops a type's zero
+// value. Both are first-class `encoding/json` options (CLAUDE.md rule 0.1
+// category 1) — neither is a marker any generator invented.
+const (
+	optOmitEmpty = "omitempty"
+	optOmitZero  = "omitzero"
+)
+
+// parsePayloadTag returns the effective payload field name, the serializer that
+// owns the field, the json omission option it carries (empty when none), and
+// whether the field is skipped. JSON tags win when present; form tags let
+// multipart/form DTOs participate in the same neutral schema extraction.
+func parsePayloadTag(tag reflect.StructTag, goName string) (name string, wire payloadWire, omitOpt string, skip bool) {
 	if raw, ok := tag.Lookup("json"); ok && raw != "" {
-		return parseWireTag(raw, goName, true)
+		name, omitOpt, skip = parseWireTag(raw, goName, wireJSON)
+		return name, wireJSON, omitOpt, skip
 	}
 	if raw, ok := tag.Lookup("form"); ok && raw != "" {
-		return parseWireTag(raw, goName, false)
+		name, omitOpt, skip = parseWireTag(raw, goName, wireForm)
+		return name, wireForm, omitOpt, skip
 	}
-	return goName, false, false
+	return goName, wireJSON, "", false
 }
 
-func parseWireTag(raw string, goName string, allowOmitZero bool) (name string, optional, skip bool) {
+func parseWireTag(raw string, goName string, wire payloadWire) (name string, omitOpt string, skip bool) {
 	parts := strings.Split(raw, ",")
 	wireName := parts[0]
 	if wireName == "-" && len(parts) == 1 {
-		return "", false, true
+		return "", "", true
 	}
 	if wireName == "" {
 		wireName = goName
 	}
 	for _, opt := range parts[1:] {
-		if opt == "omitempty" || (allowOmitZero && opt == "omitzero") {
-			optional = true
+		// `omitzero` is an `encoding/json` option; it is not an omission signal on
+		// a form wire, so it is not read as one there.
+		if opt == optOmitEmpty || (opt == optOmitZero && wire == wireJSON) {
+			omitOpt = opt
 		}
 	}
-	return wireName, optional, false
+	return wireName, omitOpt, false
+}
+
+// presenceAndNullability derives the two axes from the serializer that writes
+// the field. Each axis has exactly one source (CLAUDE.md rule 3): presence comes
+// from the omission option alone, nullability from the type alone. The declared
+// type is never evidence for presence — `encoding/json` keeps a bare pointer's
+// key and writes `null` into it.
+func presenceAndNullability(wire payloadWire, omitOpt string, t gotypes.Type) (optional, nullable bool) {
+	if wire == wireForm {
+		// A form/multipart binder, not `encoding/json`: a part is present or absent
+		// and there is no `null` to write, so the value axis does not apply.
+		return omitOpt != "", false
+	}
+	return omitOptionOmits(t, omitOpt), zeroMarshalsNull(t)
+}
+
+// omitOptionOmits reports whether a json omission option actually causes
+// `encoding/json` to drop the key for this type.
+//
+//   - `omitzero` drops the type's zero value, for every type.
+//   - `omitempty` drops only encoding/json's "empty" set: false, 0, "", a nil
+//     pointer, a nil interface, and a zero-length array/slice/map/string. It is a
+//     NO-OP on a struct, on a `time.Time`, and on an array of non-zero length —
+//     those keys are always written, whatever the author intended.
+func omitOptionOmits(t gotypes.Type, omitOpt string) bool {
+	switch omitOpt {
+	case optOmitZero:
+		return true
+	case optOmitEmpty:
+		unaliased := gotypes.Unalias(t)
+		if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
+			// Whether `omitempty` bites depends on the instantiation. Take the tag at
+			// its word: a key that may be absent is the safe answer for a decoder.
+			return true
+		}
+		switch u := unaliased.Underlying().(type) {
+		case *gotypes.Basic, *gotypes.Pointer, *gotypes.Interface, *gotypes.Slice, *gotypes.Map:
+			return true
+		case *gotypes.Array:
+			return u.Len() == 0
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+// zeroMarshalsNull reports whether the type's zero value is written as JSON
+// `null` by `encoding/json`. A nil pointer, slice, map, and interface all are;
+// nothing else is. A named type is read through its underlying type, so
+// `json.RawMessage` ([]byte) is nullable while `time.Time` (a struct) and
+// `uuid.UUID` ([16]byte) are not.
+func zeroMarshalsNull(t gotypes.Type) bool {
+	unaliased := gotypes.Unalias(t)
+	if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
+		// A type parameter's underlying type is its CONSTRAINT, not the type that
+		// will be marshalled — `T any` would read as an interface and claim every
+		// generic field is nullable. What a `T` writes depends on the instantiation,
+		// which this declaration does not fix, and unknown is not null.
+		return false
+	}
+	switch unaliased.Underlying().(type) {
+	case *gotypes.Pointer, *gotypes.Slice, *gotypes.Map, *gotypes.Interface:
+		return true
+	default:
+		return false
+	}
 }
 
 func spanOf(fset *token.FileSet, pos token.Pos) facts.SourceSpan {

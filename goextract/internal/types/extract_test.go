@@ -3,6 +3,7 @@ package types_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -377,13 +378,16 @@ type Payload struct {
 		t.Fatal("Payload not found")
 	}
 
+	// All three are optional (the option omits the key for a slice/map) AND nullable:
+	// the axes are independent, and a nil slice or map is written as `null` whether or
+	// not the key can also be dropped.
 	for _, name := range []string{"emptyValues", "zeroValues", "zeroMap"} {
 		field, found := fieldByJSON(s, name)
 		if !found {
 			t.Fatalf("field %q not found", name)
 		}
-		if !field.Optional || field.Nullable {
-			t.Fatalf("%s should be optional but not nullable, got optional=%v nullable=%v", name, field.Optional, field.Nullable)
+		if !field.Optional || !field.Nullable {
+			t.Fatalf("%s should be optional and nullable, got optional=%v nullable=%v", name, field.Optional, field.Nullable)
 		}
 	}
 
@@ -393,6 +397,135 @@ type Payload struct {
 	}
 	if formZero.Optional || formZero.Nullable {
 		t.Fatalf("form omitzero is not a JSON omission signal, got optional=%v nullable=%v", formZero.Optional, formZero.Nullable)
+	}
+}
+
+// TestPresenceAndNullabilityMatchEncodingJSON pins both axes to what
+// `encoding/json` actually does, for every shape it distinguishes.
+//
+// The expectations are not derived from the extractor's rules — they are the
+// observed output of `json.Marshal` on the zero value of each field, so the test
+// fails if the extractor and the marshaller ever disagree again:
+//
+//	{"bare_ptr":null,"bare_slice":null,"bare_map":null,"bare_iface":null,
+//	 "bare_struct":{"a":0},"omit_struct":{"a":0},
+//	 "bare_time":"0001-01-01T00:00:00Z","omit_time":"0001-01-01T00:00:00Z",
+//	 "bare_str":"","bare_arr":["",""],"omit_arr":["",""]}
+//
+// Two families of mistake are pinned by construction. The DECLARED TYPE is not
+// evidence for presence: a bare pointer keeps its key, so `*T` alone never makes
+// a field optional. And the OMISSION OPTION is not evidence on its own:
+// `,omitempty` drops only encoding/json's "empty" set, so it is a no-op on a
+// struct, a `time.Time`, and an array of non-zero length.
+func TestPresenceAndNullabilityMatchEncodingJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/matrixfixture\n\ngo 1.24\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package matrixfixture
+
+import "time"
+
+type Inner struct {
+	A int `+"`json:\"a\"`"+`
+}
+
+type Matrix struct {
+	BareStr    string            `+"`json:\"bare_str\"`"+`
+	OmitStr    string            `+"`json:\"omit_str,omitempty\"`"+`
+	BarePtr    *int              `+"`json:\"bare_ptr\"`"+`
+	OmitPtr    *int              `+"`json:\"omit_ptr,omitempty\"`"+`
+	BareSlice  []string          `+"`json:\"bare_slice\"`"+`
+	OmitSlice  []string          `+"`json:\"omit_slice,omitempty\"`"+`
+	BareMap    map[string]string `+"`json:\"bare_map\"`"+`
+	OmitMap    map[string]string `+"`json:\"omit_map,omitempty\"`"+`
+	BareIface  any               `+"`json:\"bare_iface\"`"+`
+	BareStruct Inner             `+"`json:\"bare_struct\"`"+`
+	OmitStruct Inner             `+"`json:\"omit_struct,omitempty\"`"+`
+	ZeroStruct Inner             `+"`json:\"zero_struct,omitzero\"`"+`
+	BareTime   time.Time         `+"`json:\"bare_time\"`"+`
+	OmitTime   time.Time         `+"`json:\"omit_time,omitempty\"`"+`
+	ZeroTime   time.Time         `+"`json:\"zero_time,omitzero\"`"+`
+	BareArr    [2]string         `+"`json:\"bare_arr\"`"+`
+	OmitArr    [2]string         `+"`json:\"omit_arr,omitempty\"`"+`
+	ReqPtr     *int              `+"`json:\"req_ptr\" binding:\"required\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load matrix fixture: %v", err)
+	}
+	diags := diag.New()
+	schemas := types.Extract(res, diags)
+	s, ok := schemaByName(schemas, "Matrix")
+	if !ok {
+		t.Fatal("Matrix not found")
+	}
+
+	for _, tc := range []struct {
+		field    string
+		optional bool // json.Marshal omits the key for the zero value
+		nullable bool // json.Marshal writes null for the zero value
+	}{
+		{"bare_str", false, false},
+		{"omit_str", true, false},
+		// A bare pointer keeps its key and holds null: NOT optional, nullable.
+		{"bare_ptr", false, true},
+		{"omit_ptr", true, true},
+		// A nil slice/map/interface is written as null even with no option.
+		{"bare_slice", false, true},
+		{"omit_slice", true, true},
+		{"bare_map", false, true},
+		{"omit_map", true, true},
+		{"bare_iface", false, true},
+		{"bare_struct", false, false},
+		// `,omitempty` is a no-op on a struct, a time.Time, and a [2]string.
+		{"omit_struct", false, false},
+		{"zero_struct", true, false},
+		{"bare_time", false, false},
+		{"omit_time", false, false},
+		{"zero_time", true, false},
+		{"bare_arr", false, false},
+		{"omit_arr", false, false},
+		// A validation tag governs the request direction; it does not change what
+		// the marshaller writes, so it moves neither axis.
+		{"req_ptr", false, true},
+	} {
+		field, found := fieldByJSON(s, tc.field)
+		if !found {
+			t.Fatalf("field %q not found", tc.field)
+		}
+		if field.Optional != tc.optional || field.Nullable != tc.nullable {
+			t.Errorf(
+				"%s: want optional=%v nullable=%v, got optional=%v nullable=%v",
+				tc.field, tc.optional, tc.nullable, field.Optional, field.Nullable,
+			)
+		}
+	}
+
+	// The three no-op `,omitempty` fields are the ones worth telling the author
+	// about; nothing else is.
+	var reported []string
+	for _, d := range diags.Items() {
+		if d.Code == "schema.omit_option.ineffective" {
+			reported = append(reported, d.Subject)
+		}
+	}
+	sort.Strings(reported)
+	want := []string{"OmitArr", "OmitStruct", "OmitTime"}
+	if !reflect.DeepEqual(reported, want) {
+		t.Errorf("ineffective-omitempty diagnostics: want %v, got %v", want, reported)
 	}
 }
 
@@ -438,8 +571,10 @@ type UploadForm struct {
 	if !ok {
 		t.Fatal("field 'file' not found")
 	}
-	if !file.Required || !file.Nullable || primName(file.Schema) != facts.PrimBytes {
-		t.Fatalf("file should be required nullable bytes, got required=%v nullable=%v schema=%+v", file.Required, file.Nullable, file.Schema)
+	// A multipart part is present or absent; there is no `null` to write, so the
+	// value axis does not apply on a form wire even for a pointer field.
+	if !file.Required || file.Nullable || primName(file.Schema) != facts.PrimBytes {
+		t.Fatalf("file should be required non-nullable bytes, got required=%v nullable=%v schema=%+v", file.Required, file.Nullable, file.Schema)
 	}
 	if file.Description == nil || *file.Description != "CSV upload" {
 		t.Fatalf("description tag not preserved: %#v", file.Description)

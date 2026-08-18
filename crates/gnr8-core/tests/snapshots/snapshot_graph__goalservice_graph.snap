@@ -262,7 +262,7 @@ schemas:
         - json_name: workflowChainIds
           required: false
           optional: true
-          nullable: false
+          nullable: true
           schema:
             type: array
             of:
@@ -351,7 +351,7 @@ schemas:
         - json_name: metadata
           required: false
           optional: true
-          nullable: false
+          nullable: true
           schema:
             type: any
             of: {}
@@ -408,7 +408,7 @@ schemas:
         - json_name: hints
           required: false
           optional: true
-          nullable: false
+          nullable: true
           schema:
             type: array
             of:
@@ -449,7 +449,7 @@ schemas:
         - json_name: goals
           required: false
           optional: false
-          nullable: false
+          nullable: true
           schema:
             type: array
             of:
@@ -565,7 +565,7 @@ schemas:
         - json_name: workflowChainIds
           required: false
           optional: true
-          nullable: false
+          nullable: true
           schema:
             type: array
             of:
