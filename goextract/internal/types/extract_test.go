@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -217,6 +218,18 @@ type FileRef struct {
 	Label    string  `+"`json:\"label,omitempty\"`"+`
 	Note     *string `+"`json:\"note\"`"+`
 }
+
+type ScopedRules struct {
+	Headers  map[string]string `+"`json:\"headers,omitzero\" binding:\"omitempty,dive,keys,required,endkeys,required\"`"+`
+	Elements []string          `+"`json:\"elements\" validate:\"dive,required\"`"+`
+	Segments []string          `+"`json:\"segments\" validate:\"required,dive,min=1,max=100\"`"+`
+	Nested   [][]string        `+"`json:\"nested\" validate:\"dive,dive,required\"`"+`
+	Kinds    []string          `+"`json:\"kinds\" validate:\"dive,oneof=alpha beta\"`"+`
+}
+
+type ElementRules struct {
+	Recipients []string `+"`json:\"recipients\" validate:\"omitempty,dive,email\"`"+`
+}
 `),
 		0o644,
 	); err != nil {
@@ -261,6 +274,70 @@ type FileRef struct {
 	}
 	if !note.Nullable || note.Required {
 		t.Fatalf("pointer should be nullable without forcing required, got nullable=%v required=%v", note.Nullable, note.Required)
+	}
+
+	// `dive` and `keys`…`endkeys` move the rules that follow them off the field and
+	// onto what the field contains, so a `required` past either one says nothing
+	// about whether the key is present.
+	scoped, ok := schemaByName(schemas, "ScopedRules")
+	if !ok {
+		t.Fatal("ScopedRules not found")
+	}
+	scopedCases := []struct {
+		jsonName string
+		required bool
+		why      string
+	}{
+		{"headers", false, `required inside keys/endkeys constrains the map's keys and values`},
+		{"elements", false, `required after dive constrains the slice elements`},
+		{"segments", true, `the required before dive constrains the field itself`},
+		{"nested", false, `required behind nested dives constrains the innermost elements`},
+	}
+	for _, tc := range scopedCases {
+		field, found := fieldByJSON(scoped, tc.jsonName)
+		if !found {
+			t.Fatalf("field %q not found", tc.jsonName)
+		}
+		if field.Required != tc.required {
+			t.Errorf("%s: want required=%v, got %v — %s", tc.jsonName, tc.required, field.Required, tc.why)
+		}
+	}
+
+	// The per-element rules in `dive,min=1,max=100` and `dive,oneof=alpha beta`
+	// describe each string, not the slice. Constraints lower onto the field's own
+	// schema object, so leaking them upward publishes an array whose own value must
+	// be 3 characters long or equal to "alpha" — neither of which the author wrote.
+	for _, jsonName := range []string{"segments", "kinds"} {
+		field, found := fieldByJSON(scoped, jsonName)
+		if !found {
+			t.Fatalf("field %q not found", jsonName)
+		}
+		if field.Meta != nil && field.Meta.Constraints != nil {
+			t.Errorf("%s: post-dive rules must not bind the container, got %#v", jsonName, field.Meta.Constraints)
+		}
+	}
+
+	// Every rule in ScopedRules is one gnr8 knows — the scope markers are structural
+	// and the rest belong to values the graph does not carry. None of that is
+	// unresolved source, so the whole struct must extract quietly.
+	for _, d := range diags.Items() {
+		if d.Schema == "ScopedRules" {
+			t.Errorf("scoped tags must not produce a diagnostic: [%s] %s", d.Code, d.Message)
+		}
+	}
+
+	// Recognition is a separate question from scope. `email` is a rule gnr8 does not
+	// lower, so it is still reported behind a `dive` — the author loses the rule
+	// either way, and whether they hear about it must not depend on where they wrote
+	// it.
+	var reported bool
+	for _, d := range diags.Items() {
+		if d.Schema == "ElementRules" && strings.Contains(d.Message, "email") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("an unknown rule behind dive must still be reported, got %#v", diags.Items())
 	}
 }
 

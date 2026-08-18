@@ -292,10 +292,53 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | response | `c.JSON(http.StatusXxx, v)` where `v: T` | status→T. Unresolved/dynamic → diagnostic. |
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
-| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. |
+| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. Only the field's own scope counts — see below. |
 | source-optional field | pointer `*T` and/or `json:",omitempty"` / `json:",omitzero"` | source optionality signal; schema `required` still comes from required tags. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
+
+### Validation rules apply at the scope they are written in
+
+A `binding:`/`validate:` tag can talk about the field or about what is *inside* it. `dive` steps
+into the field's elements and `keys`…`endkeys` selects a map's keys, so only the tokens **before
+the first `dive`** describe the field:
+
+```go
+Headers  map[string]string `json:"headers,omitzero" binding:"omitempty,dive,keys,required,endkeys,required"`
+Segments []string          `json:"segments" validate:"required,dive,min=1,max=100"`
+```
+
+`headers` is **optional** — the tag forbids empty map keys and values, it does not demand the key.
+`segments` is **required** because that `required` precedes the `dive`, and its `min`/`max` bound
+each string rather than the slice, so they are not published as the array's constraints.
+
+The same rule applies to bound query, header, and form parameters: `binding:"omitempty,dive,required"`
+on a repeated parameter forbids empty entries, it does not make the parameter itself required.
+
+For a schema field, gnr8 records constraints on the field only, so a rule written past a `dive`
+reaches nothing it can bind. What happens next depends on whether gnr8 knows the rule, not on where
+it was written:
+
+| The rule | Behind a `dive` | At field scope |
+|---|---|---|
+| one gnr8 lowers, with a value it can read (`required`, `min`, `max`, `gte`, `lte`, `gt`, `lt`, `oneof`) | dropped silently — the graph has no element schema to carry it | applied |
+| one gnr8 does not lower (`email`, `uuid`, any other validator) | `schema.metadata.unresolved` diagnostic | `schema.metadata.unresolved` diagnostic |
+| one gnr8 lowers, with a value it cannot read (`gte=abc`, a bare `oneof`) | `schema.metadata.unresolved` diagnostic | `schema.metadata.unresolved` diagnostic |
+
+So `validate:"dive,min=1"` is silent, while `validate:"dive,email"` and `validate:"dive,gte=abc"` warn
+exactly as `validate:"email"` and `validate:"gte=abc"` do — gnr8 drops the rule in every case, and you
+hear about it whenever it could not read what you wrote. The sharp edge to know is the first row:
+**`dive,min=1` does not become a per-item `minLength` in the emitted document, and says nothing when
+it disappears.** If you need element constraints in the spec, state them on the element's own named
+type, or add them with a `Transform` in your `.gnr8/` crate.
+
+`oneof` on a **bound parameter** is the one rule whose scope gnr8 does not yet read. A repeated
+parameter's element is a schema gnr8 can reach, so the enum is placed there wherever the rule is
+written — `binding:"oneof=alpha beta"` and `binding:"dive,oneof=alpha beta"` produce the same
+parameter. For an array that is the right destination either way; on a map parameter `oneof` replaces
+the parameter's whole schema **at any scope**, because where an element-scope enum belongs on a map —
+the value schema, or the key schema after `keys` — is still open. Writing it without a `dive` does not
+avoid that. State the enum as a named string type on the element to stay clear of it.
 
 ## Operation prose (all three languages)
 

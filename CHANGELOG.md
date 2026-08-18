@@ -9,6 +9,33 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **Go validation rules that apply *inside* a collection no longer bind the field.** The Go
+  extractor read a `binding:`/`validate:` tag as a flat token list, so everything after a `dive`
+  — or between `keys` and `endkeys` — was attributed to the field itself. A field tagged
+  `binding:"omitempty,dive,keys,required,endkeys,required"` was published as a required property
+  even though the tag only forbids empty map keys and values, and a per-element `min`/`max`
+  behind a `dive` was offered to the container's constraints. The same blind spot made a bound
+  query, header, or form parameter required when only its entries were. Schema fields,
+  constraints, and request parameters now read tags through one scope-aware tokenizer
+  (`goextract/internal/tags`), so they cannot answer the question differently. `keys` and
+  `endkeys` are recognized as scope markers rather than parsed as constraints, which also
+  removes the spurious `schema.metadata.unresolved` warnings they produced.
+
+  Scope decides where a rule applies; it does not decide whether gnr8 reports one it cannot
+  read. A rule gnr8 lowers is dropped in silence when it belongs to an element the graph has
+  nowhere to carry, but an unrecognized rule such as `validate:"dive,email"` — or a recognized
+  one whose value is missing or malformed, such as `validate:"dive,gte=abc"` — still raises
+  `schema.metadata.unresolved`, the same diagnostic each has always raised without the `dive`.
+
+  **This changes emitted documents.** A field whose only `required` sits behind a `dive` leaves
+  the schema's `required` array, and a parameter of that shape stops being a required parameter.
+  Both are corrections — the tag never said what gnr8 read it to say — but a client generated
+  from the new document will accept requests the old one rejected, so review the regenerated
+  document before publishing. The affected fields are the ones whose only `required` sits behind
+  a `dive` or between `keys` and `endkeys`.
+
 ## 0.5.2 — 2026-08-17
 
 ### Fixed

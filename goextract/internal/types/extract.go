@@ -20,6 +20,7 @@ import (
 	"github.com/gnr8/goextract/internal/diag"
 	"github.com/gnr8/goextract/internal/facts"
 	"github.com/gnr8/goextract/internal/load"
+	"github.com/gnr8/goextract/internal/tags"
 )
 
 // well-known package paths for type mapping (RESEARCH Pattern 6).
@@ -203,13 +204,11 @@ func validateHasRequired(validate string) bool {
 	return tagHasRequired(validate)
 }
 
+// tagHasRequired reports whether a validation tag requires the field itself.
+// Only field-scope tokens count: a `required` reached through `dive` or `keys`
+// describes what lives inside the field, not whether its key is present.
 func tagHasRequired(value string) bool {
-	for _, token := range strings.Split(value, ",") {
-		if strings.TrimSpace(token) == "required" {
-			return true
-		}
-	}
-	return false
+	return tags.HasFieldToken(value, "required")
 }
 
 func fieldMetaFromTags(
@@ -327,47 +326,72 @@ func constraintsFromTag(
 	if value == "" {
 		return constraints
 	}
-	for _, token := range strings.Split(value, ",") {
-		token = strings.TrimSpace(token)
-		if token == "" || token == "required" || token == "omitempty" || token == "dive" {
+	for _, tok := range tags.Scoped(value) {
+		token := tok.Text
+		if token == "required" || token == "omitempty" {
+			// Presence, not shape: owned by the required and optional axes, at every scope.
 			continue
 		}
 		name, value, hasValue := strings.Cut(token, "=")
 		name = strings.TrimSpace(name)
 		value = strings.TrimSpace(value)
+
+		// This switch answers both questions a rule raises, which is what keeps the
+		// answers consistent. Reaching a case means gnr8 knows the rule; reaching
+		// `default` means it does not, at any scope. Scope then decides only whether the
+		// rule can be applied — a rule about the elements or map keys inside the field
+		// has nothing to bind, because the neutral graph carries constraints on the
+		// field itself (`FieldMeta.Constraints`) and there is no element schema to hang
+		// them on.
+		//
+		// So a rule gnr8 knows is dropped in silence past a `dive`: the source is
+		// well-formed and understood, and `unresolved` means gnr8 could not read the
+		// source, not that it chose not to carry it. A rule gnr8 has never heard of is
+		// reported wherever it appears — it cannot tell what `dive,somevalidator` was
+		// meant to say or whether losing it matters, and silence should not depend on
+		// where the author happened to write it.
+		//
+		// A rule's value obeys the same split. Silence is for the rule gnr8 read and
+		// cannot carry, never for one it could not read, so each case judges the value
+		// before it consults scope: `dive,gte=abc` is as unreadable as `gte=abc` and is
+		// reported the same way. Only the part of the judgement that needs the element's
+		// type can stop at a `dive`, because this function is handed the field's schema
+		// and there is nothing below it to ask.
+		fieldScope := tok.Scope == tags.ScopeField
 		switch name {
-		case "min":
-			if !hasValue || !applyMinMaxConstraint(constraints, "min", value, schema) {
+		case "min", "max":
+			if !fieldScope {
+				// Whether `min=1` is a length or a bound depends on the element's type,
+				// which is out of reach. What does not depend on it: every value either
+				// spelling accepts is a number, a length being the unsigned case of one.
+				// So a value no element type could accept is still reportable.
+				if !hasValue || !validNumber(value) {
+					unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+				}
+				continue
+			}
+			if !hasValue || !applyMinMaxConstraint(constraints, name, value, schema) {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 			}
-		case "max":
-			if !hasValue || !applyMinMaxConstraint(constraints, "max", value, schema) {
-				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
-			}
-		case "gte":
+		case "gte", "lte", "gt", "lt":
 			if !hasValue || !validNumber(value) {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
 			}
-			constraints.Minimum = stringPtr(value)
-		case "lte":
-			if !hasValue || !validNumber(value) {
-				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+			if !fieldScope {
 				continue
 			}
-			constraints.Maximum = stringPtr(value)
-		case "gt":
-			if !hasValue || !validNumber(value) {
-				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
-				continue
+			bound := stringPtr(value)
+			switch name {
+			case "gte":
+				constraints.Minimum = bound
+			case "lte":
+				constraints.Maximum = bound
+			case "gt":
+				constraints.ExclusiveMinimum = bound
+			case "lt":
+				constraints.ExclusiveMaximum = bound
 			}
-			constraints.ExclusiveMinimum = stringPtr(value)
-		case "lt":
-			if !hasValue || !validNumber(value) {
-				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
-				continue
-			}
-			constraints.ExclusiveMaximum = stringPtr(value)
 		case "oneof":
 			if !hasValue {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
@@ -376,6 +400,9 @@ func constraintsFromTag(
 			values := strings.Fields(value)
 			if len(values) == 0 {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+				continue
+			}
+			if !fieldScope {
 				continue
 			}
 			constraints.EnumValues = values
