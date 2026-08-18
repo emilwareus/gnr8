@@ -47,8 +47,11 @@ Recognized route facts include:
 - `ShouldBindJSON`/`BindJSON`; generic bind variants for typed form, multipart, query, and header
   structs.
 - JSON responses, response status/media facts, Go structs, nested types, and string enums.
-- Independent optionality and nullability for Go fields: pointers admit `null`, while JSON
-  `omitempty` and `omitzero` options permit the key to be absent.
+- Independent optionality and nullability for Go fields, each read from exactly one thing.
+  Nullability is the declared type: a nil pointer, slice, map, or interface is what `encoding/json`
+  writes as `null`. Optionality is the `json` tag's omission option: `,omitzero` on any type, and
+  `,omitempty` only on the types it actually omits — never the declared type, since a bare pointer
+  keeps its key.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose

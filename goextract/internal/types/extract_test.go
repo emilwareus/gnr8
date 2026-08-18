@@ -406,7 +406,7 @@ type Payload struct {
 // The expectations are not derived from the extractor's rules — they are the
 // observed output of `json.Marshal(Matrix{})` on go1.26.5, verbatim and in
 // declaration order, so the test fails if the extractor and the marshaller ever
-// disagree again. A key below is `optional`; a `null` value is `nullable`:
+// disagree again. An ABSENT key below is `optional`; a `null` value is `nullable`:
 //
 //	{"bare_str":"","bare_ptr":null,"bare_slice":null,"bare_map":null,
 //	 "bare_iface":null,"bare_struct":{"a":0},"omit_struct":{"a":0},

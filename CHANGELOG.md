@@ -63,14 +63,15 @@ must move the minor version.
   that binder is not `encoding/json` and this change does not speak for it — but loses the value
   axis, because a multipart part is present or absent and there is no `null` to write.
 
-  **This changes emitted documents and all three generated SDKs.** Bare and `,omitempty`
-  slice/map/interface fields gain `"null"` in their document type and `| None` / `| null` in
-  generated Python and TypeScript models; the Go SDK is unchanged by that half, since a nil slice
-  already round-trips `null`. Bare pointer fields and ineffectively-tagged struct/`time.Time` fields
-  stop being optional everywhere, which does reach the Go SDK: `*T json:"k"` now emits
-  `json:"k"` where it previously emitted `json:"k,omitempty"`. All of these are corrections, but a
-  client generated from the new document accepts responses the old one rejected and requires keys the
-  old one did not, so review the regenerated output before publishing.
+  **This changes emitted documents and all three generated SDKs.** Every slice, map, and interface
+  field gains `"null"` in its document type and `| None` / `| null` in generated Python and
+  TypeScript models — nullability comes from the declared type alone, so this reaches the field
+  whether it carries `,omitempty`, `,omitzero`, or no option at all. The Go SDK is unchanged by that
+  half, since a nil slice already round-trips `null`. Bare pointer fields and ineffectively-tagged
+  struct/`time.Time` fields stop being optional everywhere, which does reach the Go SDK: `*T
+  json:"k"` now emits `json:"k"` where it previously emitted `json:"k,omitempty"`. All of these are
+  corrections, but a client generated from the new document accepts responses the old one rejected
+  and requires keys the old one did not, so review the regenerated output before publishing.
 
   The document and the SDKs still answer "must this field be present?" from different axes
   (`required` from `binding`/`validate`, presence from the `json` tag). That disagreement is
