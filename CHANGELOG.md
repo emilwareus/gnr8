@@ -9,6 +9,34 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **A `oneof` on a bound Go parameter now lands on the value its scope names.** The parameter reader
+  took the first `oneof=` in a `binding:`/`validate:` tag regardless of scope and placed it on the
+  array element, which happened to be right for a `[]string` and destroyed a map: `Filters
+  map[string]string` tagged `binding:"dive,oneof=red green"` was published as a bare string enum
+  rather than a map, and writing the rule without the `dive` did not avoid it, because there was no
+  destination for an enum on a map at either scope. It was the last reader of these tags that did not
+  go through the scope-aware tokenizer added in 0.5.3 (#55).
+
+  Each scope now has exactly one destination. Field scope lands on a scalar parameter's own schema,
+  and on a container it lowers to what the container holds — a `facts.Type` array or map has no room
+  for an enum beside it, so the members can only be describing the values. `dive` lands on an array's
+  element or a map's **values**, leaving the key intact; `keys`…`endkeys` lands on the map's **keys**.
+  A scope the parameter has no value for — a `dive` on a scalar, `keys` on an array — reaches nothing
+  and is dropped in silence, as it already is on a schema field.
+
+  **Two rules landing on the same value are now a `request.parameter.ambiguous` ERROR**, and neither
+  is applied. That covers `binding:"oneof=a b,dive,oneof=c d"` on a `[]string`, and it also covers the
+  same enum restated under a second tag key — `binding:` and `validate:` are read as peers now, where
+  `binding:` used to win in silence, and the `enums:`/`enum:` tag is a peer of both rather than a
+  fallback consulted only when no `oneof` was found. Restating a fact identically is reported too:
+  choosing between two statements would be a precedence rule, and gnr8 has no winner to pick.
+
+  **This changes emitted documents** for map parameters (previously replaced by an enum, now a map
+  with an enum key or value) and for any parameter whose enum was stated twice (previously the first
+  spelling won, now no enum is applied and an ERROR is raised).
+
 ## 0.5.3 — 2026-08-18
 
 ### Fixed

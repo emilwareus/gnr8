@@ -51,6 +51,7 @@ keys; message is explanatory text. Results are deterministically sorted.
 | `source.handler.ambiguous` | route handler identity was not unique | register a statically resolvable handler |
 | `source.openapi.unrepresentable` | imported OpenAPI fact has no lossless graph representation | keep exact spec gate or add explicit graph policy |
 | `request.parameter.unresolved` | name/location/type/default/serialization was incomplete | add source typing or typed parameter override |
+| `request.parameter.ambiguous` | the source stated one parameter fact twice (`ERROR`) | state the rule once, or move one to the scope it belongs to |
 | `request.body.unresolved` | request body schema/media/requiredness was incomplete | use typed request-body override |
 | `response.status.unresolved` | response status was dynamic/unknown | set an exact response override |
 | `response.schema.unresolved` | response schema was unknown or ambiguous | set success/response schema explicitly |

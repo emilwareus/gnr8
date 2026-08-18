@@ -3781,9 +3781,7 @@ func (a *Analyzer) parametersFromBoundType(
 			}
 			continue
 		}
-		if enumValues := parameterEnumValues(tag); len(enumValues) > 0 {
-			schema = schemaWithEnum(schema, enumValues)
-		}
+		schema = schemaWithParameterEnums(schema, tag, name, route, diags, file, line)
 		param := requestParameter(
 			name,
 			location,
@@ -3958,30 +3956,184 @@ func namedStringEnumMembers(named *gotypes.Named) []string {
 	return out
 }
 
-func schemaWithEnum(schema facts.Type, values []string) facts.Type {
-	if schema.Type == facts.TypeArray {
-		if element, ok := schema.Of.(*facts.Type); ok && element != nil {
-			return facts.ArrayType(facts.EnumType(values))
-		}
+// enumTarget names the one schema an enum replaces. A bound parameter carries its
+// facts in `facts.ParamFact.Schema` and nowhere else — unlike a schema field there
+// is no constraint object standing beside it — so stating an enum means replacing a
+// schema, and a rule that cannot name which schema it replaces cannot be applied.
+type enumTarget int
+
+const (
+	// enumTargetNone is a rule that names a value this parameter does not have.
+	enumTargetNone enumTarget = iota
+	// enumTargetSelf is the parameter's own schema.
+	enumTargetSelf
+	// enumTargetElement is an array's element or a map's value.
+	enumTargetElement
+	// enumTargetMapKey is a map's key.
+	enumTargetMapKey
+)
+
+// enumTargets fixes the order targets are applied and reported in, so a tag that
+// states rules at several scopes yields the same schema and the same diagnostics on
+// every run.
+var enumTargets = [...]enumTarget{enumTargetSelf, enumTargetElement, enumTargetMapKey}
+
+func (t enumTarget) label() string {
+	switch t {
+	case enumTargetSelf:
+		return "the parameter itself"
+	case enumTargetElement:
+		return "the values inside the parameter"
+	case enumTargetMapKey:
+		return "the parameter's map keys"
 	}
-	return facts.EnumType(values)
+	return "nothing"
 }
 
-func parameterEnumValues(tag reflect.StructTag) []string {
+// parameterEnumRule is one enum a bound parameter's tag states, paired with the
+// scope it was written at. text is the rule as the author spelled it, so a
+// diagnostic can quote the source rather than gnr8's reading of it.
+type parameterEnumRule struct {
+	scope  tags.Scope
+	values []string
+	text   string
+}
+
+// enumTargetOf resolves the one schema a rule written at the given scope replaces.
+// Every scope has a single destination: nothing is attempted twice and nothing is
+// recovered on failure, so the tag's own shape decides where its members land.
+//
+// A scope that names a value the parameter does not have — a `dive` on a scalar,
+// `keys` on something that is not a map — reaches nothing and is dropped in silence,
+// which is already what a post-`dive` rule gets on a schema field.
+//
+// Field scope on a container lowers to what the container holds. That is a rule
+// rather than a rescue: `facts.Type` has no room for an enum beside an array or a
+// map, so the members can only be describing the values, and reading them that way
+// is one deterministic answer, not a choice between two.
+func enumTargetOf(schema facts.Type, scope tags.Scope) enumTarget {
+	container := schema.Type == facts.TypeArray || schema.Type == facts.TypeMap
+	switch scope {
+	case tags.ScopeField:
+		if container {
+			return enumTargetElement
+		}
+		return enumTargetSelf
+	case tags.ScopeElement:
+		if container {
+			return enumTargetElement
+		}
+	case tags.ScopeMapKey:
+		if schema.Type == facts.TypeMap {
+			return enumTargetMapKey
+		}
+	}
+	return enumTargetNone
+}
+
+func schemaWithEnum(schema facts.Type, values []string, target enumTarget) facts.Type {
+	switch target {
+	case enumTargetSelf:
+		return facts.EnumType(values)
+	case enumTargetElement:
+		if schema.Type == facts.TypeArray {
+			return facts.ArrayType(facts.EnumType(values))
+		}
+		if mapped, ok := schema.Of.(*facts.MapType); ok && mapped != nil {
+			return facts.MapTypeOf(mapped.Key, facts.EnumType(values))
+		}
+	case enumTargetMapKey:
+		if mapped, ok := schema.Of.(*facts.MapType); ok && mapped != nil {
+			return facts.MapTypeOf(facts.EnumType(values), mapped.Value)
+		}
+	}
+	return schema
+}
+
+// schemaWithParameterEnums places each enum a bound parameter's tag states onto the
+// value that tag says it constrains.
+//
+// Two rules that land on the same value are a contradiction the extractor refuses to
+// settle. Choosing between them would be a precedence rule, and a fact stated twice
+// has no winner even when both spellings agree, so both are dropped and the
+// parameter is reported rather than published with a guess.
+func schemaWithParameterEnums(
+	schema facts.Type,
+	tag reflect.StructTag,
+	name string,
+	route routes.Route,
+	diags *diag.Accumulator,
+	file string,
+	line uint32,
+) facts.Type {
+	stated := map[enumTarget][]parameterEnumRule{}
+	for _, rule := range parameterEnumRules(tag) {
+		target := enumTargetOf(schema, rule.scope)
+		if target == enumTargetNone {
+			continue
+		}
+		stated[target] = append(stated[target], rule)
+	}
+	for _, target := range enumTargets {
+		rules := stated[target]
+		switch {
+		case len(rules) == 0:
+			continue
+		case len(rules) > 1:
+			if diags != nil {
+				diags.RequestParameterAmbiguous(
+					name,
+					route.Method,
+					untypedRouteLabel(route),
+					"enum stated more than once for "+target.label()+" ("+renderEnumRules(rules)+")",
+					file,
+					line,
+				)
+			}
+		default:
+			schema = schemaWithEnum(schema, rules[0].values, target)
+		}
+	}
+	return schema
+}
+
+// parameterEnumRules reads every enum a bound parameter's tag states. `binding` and
+// `validate` are one validation vocabulary written under two keys and the `enums`
+// tag states the same fact a third way, so all three are read as peers: none of them
+// outranks another, and stating the enum in two of them is a contradiction rather
+// than a preference.
+func parameterEnumRules(tag reflect.StructTag) []parameterEnumRule {
+	rules := []parameterEnumRule{}
 	for _, source := range []string{tag.Get("binding"), tag.Get("validate")} {
-		for _, token := range strings.Split(source, ",") {
-			token = strings.TrimSpace(token)
-			if value, ok := strings.CutPrefix(token, "oneof="); ok {
-				return strings.Fields(strings.ReplaceAll(value, "|", " "))
+		for _, token := range tags.Scoped(source) {
+			value, ok := strings.CutPrefix(token.Text, "oneof=")
+			if !ok {
+				continue
+			}
+			if values := strings.Fields(strings.ReplaceAll(value, "|", " ")); len(values) > 0 {
+				rules = append(rules, parameterEnumRule{scope: token.Scope, values: values, text: token.Text})
 			}
 		}
 	}
 	for _, key := range []string{"enums", "enum"} {
-		if value := tag.Get(key); value != "" {
-			return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '|' || r == ' ' })
+		value := tag.Get(key)
+		if value == "" {
+			continue
+		}
+		values := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == '|' || r == ' ' })
+		if len(values) > 0 {
+			rules = append(rules, parameterEnumRule{scope: tags.ScopeField, values: values, text: key + `:"` + value + `"`})
 		}
 	}
-	return nil
+	return rules
+}
+
+func renderEnumRules(rules []parameterEnumRule) string {
+	spellings := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		spellings = append(spellings, rule.text)
+	}
+	return strings.Join(spellings, ", ")
 }
 
 func parameterDefault(tag reflect.StructTag, options []string) (string, bool) {

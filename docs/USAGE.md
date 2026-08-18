@@ -332,13 +332,27 @@ hear about it whenever it could not read what you wrote. The sharp edge to know 
 it disappears.** If you need element constraints in the spec, state them on the element's own named
 type, or add them with a `Transform` in your `.gnr8/` crate.
 
-`oneof` on a **bound parameter** is the one rule whose scope gnr8 does not yet read. A repeated
-parameter's element is a schema gnr8 can reach, so the enum is placed there wherever the rule is
-written — `binding:"oneof=alpha beta"` and `binding:"dive,oneof=alpha beta"` produce the same
-parameter. For an array that is the right destination either way; on a map parameter `oneof` replaces
-the parameter's whole schema **at any scope**, because where an element-scope enum belongs on a map —
-the value schema, or the key schema after `keys` — is still open. Writing it without a `dive` does not
-avoid that. State the enum as a named string type on the element to stay clear of it.
+`oneof` on a **bound parameter** is the one rule a `dive` does not discard. A parameter carries a
+schema and nothing beside it — there is no constraint object, which is why `min`/`max` never reach a
+parameter at any scope — so `oneof` is stated by replacing a schema, and the scope says which one:
+
+| Written on a bound parameter | Where the enum lands |
+|---|---|
+| `binding:"oneof=…"` on a scalar | the parameter's own schema |
+| `binding:"oneof=…"` on an array or map | what the container holds — an array or map has no room for an enum beside it |
+| `binding:"dive,oneof=…"` | the array's element, or the map's **values** |
+| `binding:"dive,keys,oneof=…,endkeys"` | the map's **keys** |
+| a scope the parameter has no value for (`dive` on a scalar, `keys` on an array) | nowhere — dropped in silence, as on a schema field |
+
+So `Labels map[string]string` tagged `binding:"dive,keys,oneof=x y,endkeys,oneof=v1 v2"` publishes a
+map whose keys and values are each their own enum, and the two rules do not compete because they name
+different values.
+
+**Two rules that land on the same value are an error, not a contest.** `binding:"oneof=a b,dive,oneof=c d"`
+on a `[]string` states the element's enum twice; so does `binding:"oneof=a b" validate:"oneof=a b"` on
+a string, even though both spellings agree. gnr8 emits a `request.parameter.ambiguous` **ERROR**,
+applies neither, and leaves the parameter's schema as the source types it — picking a winner would be
+a precedence rule, and a fact stated twice has no winner. State it once.
 
 ## Operation prose (all three languages)
 

@@ -91,6 +91,27 @@ func (a *Accumulator) RequestParameterUnresolved(subject, method, route, reason,
 	})
 }
 
+// RequestParameterAmbiguous records a bound parameter whose tags state one fact
+// about it twice. This is an error rather than a warning because gnr8 read the
+// source perfectly well and refused to settle it: choosing a winner would be a
+// precedence rule, so the contradicted fact is dropped, and a parameter published
+// without a rule its author wrote must not look like a complete extraction.
+func (a *Accumulator) RequestParameterAmbiguous(subject, method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "request.parameter.ambiguous",
+		Severity: severityError,
+		Category: categoryRequestParameter,
+		Message: "contradictory tags on parameter " + subject + " on " + method + " " + route +
+			": " + reason + "; gnr8 does not choose between them — state the rule once, or move one " +
+			"to the scope it belongs to (`dive` for elements, `keys`…`endkeys` for map keys)",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   subject,
+	})
+}
+
 // RequestBodyUnresolved records a request-body shape or media type that Gin
 // accepts at runtime but the extractor cannot represent faithfully. The stable
 // code is intentionally distinct from request-parameter failures so callers can

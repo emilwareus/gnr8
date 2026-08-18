@@ -1889,6 +1889,194 @@ type facts2Diag struct {
 	line      uint32
 }
 
+// TestBoundParameterEnumsLandOnTheValueTheirScopeNames pins where a `oneof` on a
+// bound parameter puts its members. A parameter's only carrier is its schema —
+// `facts.ParamFact` has no constraint object — so an enum is stated by replacing a
+// schema, and the tag's scope has to say which one:
+//
+//   - field scope on a scalar replaces the parameter's schema;
+//   - field scope on a container lowers to what the container holds, since a
+//     `facts.Type` array or map has no room for an enum beside it;
+//   - `dive` lands on an array's element or a map's VALUE, leaving the key intact —
+//     the defect this test exists for, where a map parameter used to be replaced
+//     wholesale by a bare string enum;
+//   - `keys`…`endkeys` lands on the map's KEY; and
+//   - a scope the parameter does not have reaches nothing and is dropped in silence,
+//     as a post-`dive` rule already is on a schema field.
+//
+// The last case is the invariant-3 one: two rules landing on one value are reported
+// and both dropped, because choosing between them would be a precedence rule and a
+// fact stated twice has no winner.
+func TestBoundParameterEnumsLandOnTheValueTheirScopeNames(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/paramenums
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct{}
+
+func (e *Engine) GET(string, HandlerFunc) {}
+func (c *Context) ShouldBindQuery(any) error { return nil }
+func (c *Context) JSON(int, any) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package paramenums
+
+import "github.com/gin-gonic/gin"
+
+type Server struct{ R *gin.Engine }
+
+type Query struct {
+	State    string            `+"`"+`form:"state" binding:"oneof=active paused"`+"`"+`
+	Listed   string            `+"`"+`form:"listed" enums:"private,public"`+"`"+`
+	Tags     []string          `+"`"+`form:"tags" binding:"oneof=red green"`+"`"+`
+	Kinds    []string          `+"`"+`form:"kinds" binding:"dive,oneof=alpha beta"`+"`"+`
+	Filters  map[string]string `+"`"+`form:"filters" binding:"dive,oneof=red green"`+"`"+`
+	Buckets  map[string]string `+"`"+`form:"buckets" binding:"oneof=hot cold"`+"`"+`
+	Labels   map[string]string `+"`"+`form:"labels" binding:"dive,keys,oneof=x y,endkeys"`+"`"+`
+	Sides    map[string]string `+"`"+`form:"sides" binding:"dive,keys,oneof=k1 k2,endkeys,oneof=v1 v2"`+"`"+`
+	Plain    string            `+"`"+`form:"plain" binding:"dive,oneof=a b"`+"`"+`
+	Scoped   []string          `+"`"+`form:"scoped" binding:"keys,oneof=a b,endkeys"`+"`"+`
+	Twice    []string          `+"`"+`form:"twice" binding:"oneof=a b,dive,oneof=c d"`+"`"+`
+	Restated string            `+"`"+`form:"restated" binding:"oneof=a b" validate:"oneof=a b"`+"`"+`
+}
+
+type Result struct { OK bool `+"`"+`json:"ok"`+"`"+` }
+
+func (s Server) Register() { s.R.GET("/search", s.search) }
+
+func (s Server) search(c *gin.Context) {
+	var query Query
+	_ = c.ShouldBindQuery(&query)
+	c.JSON(200, Result{})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load param enum fixture: %v", err)
+	}
+	diags := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/paramenums", diags)
+	var code handlers.CodeFacts
+	for _, route := range routes.Recognize(res) {
+		code = analyzer.Analyze(route, diags)
+	}
+
+	assertEnum(t, paramSchema(t, code, "state"), "active", "paused")
+	assertEnum(t, paramSchema(t, code, "listed"), "private", "public")
+	assertEnum(t, arrayElement(t, paramSchema(t, code, "tags")), "red", "green")
+	assertEnum(t, arrayElement(t, paramSchema(t, code, "kinds")), "alpha", "beta")
+
+	// The defect: `dive` names the map's values, and the key must survive it.
+	filters := mapOf(t, paramSchema(t, code, "filters"))
+	assertEnum(t, filters.Value, "red", "green")
+	if primName(filters.Key) != facts.PrimString {
+		t.Fatalf("dive enum must leave the map key a string, got %+v", filters.Key)
+	}
+	// Field scope on a map lowers to the same place, since a map cannot be an enum.
+	buckets := mapOf(t, paramSchema(t, code, "buckets"))
+	assertEnum(t, buckets.Value, "hot", "cold")
+	if primName(buckets.Key) != facts.PrimString {
+		t.Fatalf("field-scope enum on a map must leave the key a string, got %+v", buckets.Key)
+	}
+	labels := mapOf(t, paramSchema(t, code, "labels"))
+	assertEnum(t, labels.Key, "x", "y")
+	if primName(labels.Value) != facts.PrimString {
+		t.Fatalf("keys enum must leave the map value a string, got %+v", labels.Value)
+	}
+	// Key and value scopes name different values, so both apply without contradiction.
+	sides := mapOf(t, paramSchema(t, code, "sides"))
+	assertEnum(t, sides.Key, "k1", "k2")
+	assertEnum(t, sides.Value, "v1", "v2")
+
+	// A scope the parameter has no value for reaches nothing.
+	if primName(paramSchema(t, code, "plain")) != facts.PrimString {
+		t.Fatalf("dive on a scalar has nothing to bind, got %+v", paramSchema(t, code, "plain"))
+	}
+	if primName(arrayElement(t, paramSchema(t, code, "scoped"))) != facts.PrimString {
+		t.Fatalf("map-key scope on an array has nothing to bind, got %+v", paramSchema(t, code, "scoped"))
+	}
+
+	// Two rules on one value: both dropped, contradiction reported.
+	if primName(arrayElement(t, paramSchema(t, code, "twice"))) != facts.PrimString {
+		t.Fatalf("contradicted enum must not be applied, got %+v", paramSchema(t, code, "twice"))
+	}
+	if primName(paramSchema(t, code, "restated")) != facts.PrimString {
+		t.Fatalf("enum restated under a second tag key must not be applied, got %+v", paramSchema(t, code, "restated"))
+	}
+	ambiguous := map[string]facts.DiagnosticFact{}
+	for _, item := range diags.Items() {
+		if item.Code == "request.parameter.ambiguous" {
+			ambiguous[item.Subject] = item
+		}
+	}
+	if len(ambiguous) != 2 {
+		t.Fatalf("want one ambiguity per contradicted parameter, got %+v", diags.Items())
+	}
+	for _, subject := range []string{"twice", "restated"} {
+		item, ok := ambiguous[subject]
+		if !ok || item.Severity != "ERROR" || item.Category != "request_parameter" {
+			t.Fatalf("%s must raise an ERROR request_parameter ambiguity, got %+v", subject, item)
+		}
+		if item.Operation != "GET /search" || item.Line == 0 {
+			t.Fatalf("%s ambiguity must carry operation and position, got %+v", subject, item)
+		}
+	}
+	if !strings.Contains(ambiguous["twice"].Message, "oneof=a b, oneof=c d") {
+		t.Fatalf("ambiguity must quote both rules as written, got %q", ambiguous["twice"].Message)
+	}
+}
+
+func paramSchema(t *testing.T, code handlers.CodeFacts, name string) facts.Type {
+	t.Helper()
+	param, ok := paramByName(code.Params, name)
+	if !ok {
+		t.Fatalf("missing parameter %q in %+v", name, code.Params)
+	}
+	return param.Schema
+}
+
+func arrayElement(t *testing.T, schema facts.Type) facts.Type {
+	t.Helper()
+	element, ok := schema.Of.(*facts.Type)
+	if schema.Type != facts.TypeArray || !ok || element == nil {
+		t.Fatalf("want an array schema, got %+v", schema)
+	}
+	return *element
+}
+
+func mapOf(t *testing.T, schema facts.Type) facts.MapType {
+	t.Helper()
+	mapped, ok := schema.Of.(*facts.MapType)
+	if schema.Type != facts.TypeMap || !ok || mapped == nil {
+		t.Fatalf("want a map schema, got %+v", schema)
+	}
+	return *mapped
+}
+
+func assertEnum(t *testing.T, schema facts.Type, want ...string) {
+	t.Helper()
+	members, ok := schema.Of.([]string)
+	if schema.Type != facts.TypeEnum || !ok {
+		t.Fatalf("want an enum schema, got %+v", schema)
+	}
+	if !equalStrings(members, want) {
+		t.Fatalf("want enum members %v, got %v", want, members)
+	}
+}
+
 func mustWrite(t *testing.T, path string, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
