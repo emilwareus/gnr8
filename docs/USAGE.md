@@ -333,10 +333,10 @@ element's own named type, or add them with a `Transform` in your `.gnr8/` crate.
 `oneof` on a **bound parameter** is the one rule whose scope gnr8 does not yet read. A repeated
 parameter's element is a schema gnr8 can reach, so the enum is placed there wherever the rule is
 written — `binding:"oneof=alpha beta"` and `binding:"dive,oneof=alpha beta"` produce the same
-parameter. For an array that is the right destination either way; on a map parameter a post-`dive`
-`oneof` replaces the parameter's whole schema, because where an element-scope enum belongs on a map —
-the value schema, or the key schema after `keys` — is still open. State the enum as a named string
-type on the element to stay clear of it.
+parameter. For an array that is the right destination either way; on a map parameter `oneof` replaces
+the parameter's whole schema **at any scope**, because where an element-scope enum belongs on a map —
+the value schema, or the key schema after `keys` — is still open. Writing it without a `dive` does not
+avoid that. State the enum as a named string type on the element to stay clear of it.
 
 ## Operation prose (all three languages)
 
