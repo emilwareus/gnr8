@@ -41,13 +41,16 @@ must move the minor version.
   spelling won, now no enum is applied and an ERROR is raised). The ERROR is reported, not fatal —
   deny `request.parameter.ambiguous` with a `DiagnosticPolicy` to fail the build on it.
 
-  **It also breaks `TsSdk` generation for a map query parameter carrying a `oneof`.** A TypeScript
-  query parameter has a defined wire encoding only for scalars and one-dimensional scalar arrays, so
-  `TsSdk` has always rejected a map-shaped one. The old bare enum was a scalar and slipped past that
-  check, emitting a `string` parameter for an API that takes a map; the corrected map reaches it and
-  raises `SdkGen`. The client was wrong before rather than right, but the failure is new and there is
-  nothing to fall back on — a map query parameter has no TypeScript encoding at all, so the
-  parameter's shape has to change. `GoSdk` (`map[string]string`) and `PySdk` are unaffected.
+### Breaking
+
+`TsSdk` generation now fails for a map query parameter that carries an enum rule. A TypeScript query
+parameter has a defined wire encoding only for scalars and one-dimensional scalar arrays, so `TsSdk`
+has always rejected a map-shaped one. The enum used to replace the parameter's whole schema, leaving a
+scalar that slipped past that check and emitted a `string` parameter for an API that takes a map; the
+corrected map reaches the check and raises `SdkGen`. The client was wrong before rather than right,
+but the failure is new and there is nothing to fall back on — a map query parameter has no TypeScript
+encoding at all, so the parameter's shape has to change. `GoSdk` (`map[string]string`) and `PySdk`
+(`dict[str, Literal[…]]`) are unaffected.
 
 ## 0.5.3 — 2026-08-18
 
