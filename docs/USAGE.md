@@ -351,8 +351,10 @@ are an enum, with the key left as the plain string OpenAPI requires.
 does not emit `propertyNames` to constrain it, so there is nowhere to put the members — and lowering
 *rejects* a map whose key is not a plain string, which would abort generation for the whole document
 rather than drop one rule. A well-formed tag must never do that, so the rule is dropped in silence
-like any other gnr8 understands but cannot carry. Constrain map keys with a `Transform` in your
-`.gnr8/` crate if you need them in the document.
+like any other gnr8 understands but cannot carry. A `Transform` cannot put it back either: writing the
+enum onto the parameter's schema reaches the same gate and fails the same way, and the graph has no
+other vocabulary for a constrained key. Constrain the map's values instead, or — when the key set is
+known and finite — model it as a named object type, whose keys are properties rather than map keys.
 
 **Two rules that land on the same value are an error, not a contest.** `binding:"oneof=a b,dive,oneof=c d"`
 on a `[]string` states the element's enum twice; so does `binding:"oneof=a b" validate:"oneof=a b"` on
