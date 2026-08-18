@@ -37,8 +37,9 @@ must move the minor version.
   choosing between two statements would be a precedence rule, and gnr8 has no winner to pick.
 
   **This changes emitted documents** for map parameters (previously replaced by an enum, now a map
-  with an enum key or value) and for any parameter whose enum was stated twice (previously the first
-  spelling won, now no enum is applied and an ERROR is raised).
+  whose values carry it) and for any parameter whose enum was stated twice (previously the first
+  spelling won, now no enum is applied and an ERROR is raised). The ERROR is reported, not fatal —
+  deny `request.parameter.ambiguous` with a `DiagnosticPolicy` to fail the build on it.
 
 ## 0.5.3 — 2026-08-18
 
