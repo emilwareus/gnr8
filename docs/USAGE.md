@@ -321,14 +321,16 @@ it was written:
 
 | The rule | Behind a `dive` | At field scope |
 |---|---|---|
-| one gnr8 lowers (`required`, `min`, `max`, `gte`, `lte`, `gt`, `lt`, `oneof`) | dropped silently — the graph has no element schema to carry it | applied |
+| one gnr8 lowers, with a value it can read (`required`, `min`, `max`, `gte`, `lte`, `gt`, `lt`, `oneof`) | dropped silently — the graph has no element schema to carry it | applied |
 | one gnr8 does not lower (`email`, `uuid`, any other validator) | `schema.metadata.unresolved` diagnostic | `schema.metadata.unresolved` diagnostic |
+| one gnr8 lowers, with a value it cannot read (`gte=abc`, a bare `oneof`) | `schema.metadata.unresolved` diagnostic | `schema.metadata.unresolved` diagnostic |
 
-So `validate:"dive,min=1"` is silent and `validate:"dive,email"` warns, exactly as `validate:"email"`
-does — gnr8 drops the rule in both cases, and you hear about it in both cases. The sharp edge to know
-is the first row: **`dive,min=1` does not become a per-item `minLength` in the emitted document, and
-says nothing when it disappears.** If you need element constraints in the spec, state them on the
-element's own named type, or add them with a `Transform` in your `.gnr8/` crate.
+So `validate:"dive,min=1"` is silent, while `validate:"dive,email"` and `validate:"dive,gte=abc"` warn
+exactly as `validate:"email"` and `validate:"gte=abc"` do — gnr8 drops the rule in every case, and you
+hear about it whenever it could not read what you wrote. The sharp edge to know is the first row:
+**`dive,min=1` does not become a per-item `minLength` in the emitted document, and says nothing when
+it disappears.** If you need element constraints in the spec, state them on the element's own named
+type, or add them with a `Transform` in your `.gnr8/` crate.
 
 `oneof` on a **bound parameter** is the one rule whose scope gnr8 does not yet read. A repeated
 parameter's element is a schema gnr8 can reach, so the enum is placed there wherever the rule is

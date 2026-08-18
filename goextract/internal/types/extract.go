@@ -350,18 +350,35 @@ func constraintsFromTag(
 		// reported wherever it appears — it cannot tell what `dive,somevalidator` was
 		// meant to say or whether losing it matters, and silence should not depend on
 		// where the author happened to write it.
+		//
+		// A rule's value obeys the same split. Silence is for the rule gnr8 read and
+		// cannot carry, never for one it could not read, so each case judges the value
+		// before it consults scope: `dive,gte=abc` is as unreadable as `gte=abc` and is
+		// reported the same way. Only the part of the judgement that needs the element's
+		// type can stop at a `dive`, because this function is handed the field's schema
+		// and there is nothing below it to ask.
 		fieldScope := tok.Scope == tags.ScopeField
 		switch name {
 		case "min", "max":
-			if fieldScope && (!hasValue || !applyMinMaxConstraint(constraints, name, value, schema)) {
+			if !fieldScope {
+				// Whether `min=1` is a length or a bound depends on the element's type,
+				// which is out of reach. What does not depend on it: every value either
+				// spelling accepts is a number, a length being the unsigned case of one.
+				// So a value no element type could accept is still reportable.
+				if !hasValue || !validNumber(value) {
+					unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+				}
+				continue
+			}
+			if !hasValue || !applyMinMaxConstraint(constraints, name, value, schema) {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 			}
 		case "gte", "lte", "gt", "lt":
-			if !fieldScope {
-				continue
-			}
 			if !hasValue || !validNumber(value) {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+				continue
+			}
+			if !fieldScope {
 				continue
 			}
 			bound := stringPtr(value)
@@ -376,9 +393,6 @@ func constraintsFromTag(
 				constraints.ExclusiveMaximum = bound
 			}
 		case "oneof":
-			if !fieldScope {
-				continue
-			}
 			if !hasValue {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
 				continue
@@ -386,6 +400,9 @@ func constraintsFromTag(
 			values := strings.Fields(value)
 			if len(values) == 0 {
 				unsupportedConstraintTag(diags, tagKind, structName, fieldName, token, file, line)
+				continue
+			}
+			if !fieldScope {
 				continue
 			}
 			constraints.EnumValues = values

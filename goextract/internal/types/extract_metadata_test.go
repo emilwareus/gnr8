@@ -203,6 +203,37 @@ func TestKnownRulesParseIdenticallyAtEveryScope(t *testing.T) {
 	}
 }
 
+func TestUnreadableRuleValuesAreReportedAtEveryScope(t *testing.T) {
+	// The silence past a `dive` is for a rule gnr8 read and cannot carry, not for one
+	// it could not read. A known rule whose value is missing or malformed is broken
+	// source at any scope, and `dive` is not a place for it to hide.
+	//
+	// `min`/`max` are judged loosely off the field's scope, because whether the value
+	// is a length or a bound depends on the element's type and this parser only holds
+	// the field's. Every value either spelling accepts is still a number, which is
+	// enough to catch one no element type could accept.
+	rules := []string{"min", "min=abc", "max=abc", "gte", "gte=abc", "lt=x", "oneof", "oneof="}
+
+	for _, rule := range rules {
+		for _, tag := range []string{rule, "dive," + rule, "dive,keys," + rule + ",endkeys"} {
+			diags := diag.New()
+			constraintsFromTag(
+				"validate",
+				"ScopedRules",
+				"Field",
+				tag,
+				facts.PrimitiveType(facts.IntPrim(64, true)),
+				"dto.go",
+				15,
+				diags,
+			)
+			if len(diags.Items()) != 1 {
+				t.Errorf("%q must be reported exactly once, got %#v", tag, diags.Items())
+			}
+		}
+	}
+}
+
 func TestBindingHasRequiredRequiresExactToken(t *testing.T) {
 	if !bindingHasRequired("omitempty,required") {
 		t.Fatal("expected exact required token to mark field required")

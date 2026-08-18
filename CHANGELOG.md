@@ -25,8 +25,9 @@ must move the minor version.
 
   Scope decides where a rule applies; it does not decide whether gnr8 reports one it cannot
   read. A rule gnr8 lowers is dropped in silence when it belongs to an element the graph has
-  nowhere to carry, but an unrecognized rule such as `validate:"dive,email"` still raises
-  `schema.metadata.unresolved` — the same diagnostic `validate:"email"` has always raised.
+  nowhere to carry, but an unrecognized rule such as `validate:"dive,email"` — or a recognized
+  one whose value is missing or malformed, such as `validate:"dive,gte=abc"` — still raises
+  `schema.metadata.unresolved`, the same diagnostic each has always raised without the `dive`.
 
   **This changes emitted documents.** A field whose only `required` sits behind a `dive` leaves
   the schema's `required` array, and a parameter of that shape stops being a required parameter.
