@@ -3971,9 +3971,12 @@ const (
 	enumTargetElement
 )
 
-// enumTargets fixes the order targets are applied and reported in, so a tag that
-// states rules at several scopes yields the same schema and the same diagnostics on
-// every run.
+// enumTargets is iterated instead of the grouping map, whose order Go randomizes.
+//
+// Only one of these can hold rules for any given parameter: enumTargetOf answers
+// Self only for a scalar and Element only for a container, and the schema is one or
+// the other. The loop does not lean on that, so a future target — a constrained map
+// key, once a document can carry one — needs a line here and nothing else.
 var enumTargets = [...]enumTarget{enumTargetSelf, enumTargetElement}
 
 func (t enumTarget) label() string {
