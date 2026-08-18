@@ -262,6 +262,29 @@ func (a *Accumulator) UnsupportedType(structName, fieldName, goType, file string
 	})
 }
 
+// IneffectiveOmitEmpty records a `json:",omitempty"` that `encoding/json` does
+// not act on. The option drops only encoding/json's "empty" set, so on a struct,
+// a `time.Time`, or a non-zero-length array the key is always written. gnr8
+// publishes what the marshaller does, which is not what the author asked for —
+// so it says which one it published and how to get the other.
+func (a *Accumulator) IneffectiveOmitEmpty(structName, fieldName, goType, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "schema.omit_option.ineffective",
+		Severity: severityInfo,
+		Category: categorySchema,
+		Message: "ineffective omission option: " + structName + "." + fieldName +
+			" (" + goType + ") is tagged ',omitempty', but encoding/json omits only " +
+			"false, 0, \"\", a nil pointer/interface, and a zero-length array/slice/map — " +
+			"this key is always written, so the field is published as always present; " +
+			"use ',omitzero' to omit the zero value",
+		File:    file,
+		Line:    line,
+		EndLine: line,
+		Schema:  structName,
+		Subject: fieldName,
+	})
+}
+
 // UnknownHandler records a recognized route whose handler declaration/body is
 // unavailable. This is an error because emitting empty request/response facts
 // would make extraction coverage look complete when it is not.

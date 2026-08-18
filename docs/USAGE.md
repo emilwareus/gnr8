@@ -293,7 +293,7 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
 | required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. Only the field's own scope counts — see below. |
-| source-optional field | pointer `*T` and/or `json:",omitempty"` / `json:",omitzero"` | source optionality signal; schema `required` still comes from required tags. |
+| source-optional field | `json:",omitempty"` / `json:",omitzero"` — **not** pointer `*T` | source optionality signal; schema `required` still comes from required tags. A bare `*T` keeps its key (`encoding/json` writes `null` into it), so it is nullable, not optional. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
 
@@ -408,11 +408,11 @@ To make documentation mandatory, add the opt-in `RequireOperationDocs` transform
 | `float64` | `number`/`double` | `float64` | width preserved |
 | `time.Time` | `string`/`date-time` | `time.Time` | |
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
-| `*T` | nullable, source-optional | `*T`; `,omitempty` only when optional | preserves JSON `null` separately from scalar zero values. |
-| `,omitempty` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability. |
-| `,omitzero` | source-optional | **value `T` + `,omitempty`** | omission signal, not nullability; SDKs preserve optional key presence. |
-| `[]T` | `array` | `[]T` | |
-| `map[string]T` | `object`,`additionalProperties:true` | `map[string]T` | free-form → diagnostic |
+| `*T` | nullable | `*T`; `,omitempty` only when optional | `encoding/json` writes `"k":null` and **keeps the key** — a bare pointer is nullable, not optional. |
+| `,omitzero` | source-optional | **value `T` + `,omitempty`** | omits the zero value of **any** type; the omission signal, not nullability. |
+| `,omitempty` | source-optional *for the types it omits* | **value `T` + `,omitempty`** | omits only `false`, `0`, `""`, nil pointer/interface, zero-length array/slice/map. A **no-op on a struct, a `time.Time`, or a non-zero-length array** → `schema.omit_option.ineffective`. |
+| `[]T` | `array`, nullable | `[]T` | a nil slice marshals to `null`, so the value axis is nullable whatever the tag says. |
+| `map[string]T` | `object`,`additionalProperties:true`, nullable | `map[string]T` | free-form → diagnostic; a nil map marshals to `null`. |
 | named-string+consts | string `enum` | typed newtype | |
 | nested struct | `$ref` | nested type | |
 | embedded struct | flattened fields | flattened | |
@@ -446,8 +446,15 @@ lists every diagnostic.
 ## Known quirks / limits (do not treat as bugs unless fixing them)
 - Static Gin group prefixes are folded only when they are literal strings. Dynamic route paths are
   skipped with diagnostics; dynamic group prefixes are omitted with diagnostics.
-- Optional and nullable are independent: optional fields use `,omitempty`; nullable scalar fields use
-  pointers so JSON `null` remains distinct from a scalar zero value.
+- Optional and nullable are independent, and each reads exactly one thing. **Presence** (may the key be
+  absent) comes from the `json` tag's omission option alone — never from the declared type. **Nullability**
+  (may the value be `null`) comes from the declared type alone: a nil pointer, slice, map, or interface is
+  what `encoding/json` writes as `null` — and what `json.Unmarshal` accepts a `null` into, whatever
+  the tag says, which is why an `,omitempty` field is nullable even though it can never *write*
+  `null`. So `[]T json:"k"` is nullable-but-always-present, and
+  `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
+  different wire with different rules: never nullable (a part has no `null`), and optional when the
+  part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - The Go frontend recognizes Gin route registration, not arbitrary Go routers.

@@ -154,7 +154,7 @@ components:
         targetValue:
           type: [number, 'null']
         workflowChainIds:
-          type: array
+          type: [array, 'null']
           items:
             type: string
             format: uuid
@@ -183,7 +183,7 @@ components:
         description:
           type: string
         metadata:
-          type: object
+          type: [object, 'null']
           additionalProperties: true
         name:
           type: string
@@ -201,7 +201,7 @@ components:
       required: [message]
       properties:
         hints:
-          type: array
+          type: [array, 'null']
           example: hint 1,hint 2
           items:
             type: string
@@ -215,7 +215,7 @@ components:
       type: object
       properties:
         goals:
-          type: array
+          type: [array, 'null']
           items:
             $ref: '#/components/schemas/GoalResponse'
         nextCursor:
@@ -248,7 +248,7 @@ components:
         targetValue:
           type: [number, 'null']
         workflowChainIds:
-          type: array
+          type: [array, 'null']
           items:
             type: string
             format: uuid

@@ -41,6 +41,68 @@ must move the minor version.
   spelling won, now no enum is applied and an ERROR is raised). The ERROR is reported, not fatal —
   deny `request.parameter.ambiguous` with a `DiagnosticPolicy` to fail the build on it.
 
+- **Generated Python dataclass models no longer crash on a `null` they document.** `from_dict`
+  decoded every non-optional field unconditionally, so a required-but-nullable field whose decode
+  dereferences the value — a list of nested models, or a nested model — raised
+  `TypeError: 'NoneType' object is not iterable` (or failed inside `from_dict(None)`) when the
+  server sent the `null` the document permits. The model's own hint said `Optional[...]`, so the SDK
+  promised a tolerance it did not implement.
+
+  The decode is now guarded the way the optional branch already was. The guard tests the **value**,
+  not presence: a missing key still raises `KeyError`, because that is a real protocol error for a
+  field the document requires. A passthrough decode is left alone — it already yields `None` — so
+  nullable scalars gain no noise.
+
+  Pydantic models (the default) and the TypeScript SDK were already correct. This defect predates
+  the field-derivation fix below, but that fix makes required-but-nullable the common shape for
+  every bare slice, map, and interface, so it is what turns a latent crash into a likely one.
+
+- **Go field presence and nullability now say what `encoding/json` actually does.** Both axes were
+  derived partly from the declared type, which is evidence for neither. A field was marked optional
+  when it was a pointer and nullable only when it was a pointer, so three shapes came out wrong:
+
+  - A **nil slice, map, or interface** marshals to `null`, but only a pointer was published as
+    nullable. A generated Python model hinted `list[X]` with no `| None`, and a documented response
+    containing `"logs": null` was rejected by `model_validate` before user code saw it. This is the
+    same failure as the `,omitzero` defect fixed in 0.5.2, reached through the value axis instead of
+    the presence axis.
+  - A **bare pointer** (`*T json:"k"`, no omission option) keeps its key — `encoding/json` writes
+    `"k":null`. It was published as optional, so every SDK let the key be absent when it never is.
+  - **`,omitempty` is a no-op on a struct, a `time.Time`, and a non-zero-length array.** The option
+    omits only `false`, `0`, `""`, a nil pointer/interface, and a zero-length array/slice/map, so on
+    those types the key is always written. The field was published as optional anyway. gnr8 now
+    publishes it as always-present and raises `schema.omit_option.ineffective` (`INFO`) naming the
+    field and pointing at `,omitzero`, which does omit the zero value of any type.
+
+  On the `encoding/json` wire each axis now has exactly one source: presence from the tag's omission
+  option, nullability from the declared type. A `form:`-tagged field keeps its own presence rule —
+  that binder is not `encoding/json` and this change does not speak for it — but loses the value
+  axis, because a multipart part is present or absent and there is no `null` to write.
+
+  Nullability is applied whatever omission option the field carries, and that takes the **inbound**
+  direction to justify rather than "what the marshaller writes": an omission-tagged field never
+  marshals `null`, because a nil value is dropped before it can be written, but `json.Unmarshal`
+  accepts an explicit `null` into a pointer, slice, map, or interface whatever the tag says. So the
+  axis is exactly right for a request body and wider than a response body can produce. That is the
+  safe side of the failure this release fixes — tolerating a `null` that never arrives costs
+  nothing, while rejecting one that does breaks user code — but narrowing it means knowing which
+  direction a schema is reached from, which is the same open question as the one below.
+
+  **This changes emitted documents and all three generated SDKs.** Every slice, map, and interface
+  field gains `"null"` in its document type and `| None` / `| null` in generated Python and
+  TypeScript models — nullability comes from the declared type alone, so this reaches the field
+  whether it carries `,omitempty`, `,omitzero`, or no option at all. The Go SDK is unchanged by that
+  half, since a nil slice already round-trips `null`. Bare pointer fields and ineffectively-tagged
+  struct/`time.Time` fields stop being optional everywhere, which does reach the Go SDK: `*T
+  json:"k"` now emits `json:"k"` where it previously emitted `json:"k,omitempty"`. All of these are
+  corrections, but a client generated from the new document accepts responses the old one rejected
+  and requires keys the old one did not, so review the regenerated output before publishing.
+
+  The document and the SDKs still answer "must this field be present?" from different axes
+  (`required` from `binding`/`validate`, presence from the `json` tag). That disagreement is
+  unchanged here and is tracked separately — it is a question about request-versus-response
+  direction, not about what the marshaller writes.
+
 ### Breaking
 
 `TsSdk` generation now fails for a map query parameter that carries an enum rule. A TypeScript query

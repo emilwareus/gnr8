@@ -145,7 +145,7 @@ components:
           type: string
           format: date-time
         labels:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         notes:
@@ -177,7 +177,7 @@ components:
         id:
           type: string
         labels:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         notes:
@@ -192,14 +192,14 @@ components:
       type: object
       properties:
         tasks:
-          type: array
+          type: [array, 'null']
           items:
             $ref: '#/components/schemas/Task'
     UpdateTaskRequest:
       type: object
       properties:
         labels:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         notes:

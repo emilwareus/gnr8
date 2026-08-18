@@ -60,6 +60,7 @@ keys; message is explanatory text. Results are deterministically sorted.
 | `schema.metadata.unresolved` | schema constraint/metadata could not be preserved | type source or add target patch |
 | `schema.numeric.narrowing` | numeric shape required a lossy narrowing | choose an explicit graph type |
 | `schema.free_form_map` | source contains a fully represented but unconstrained free-form map (`INFO`) | accept `additionalProperties: true` or model a narrower schema |
+| `schema.omit_option.ineffective` | Go field is tagged `,omitempty` on a type `encoding/json` never omits — a struct, a `time.Time`, or a non-zero-length array (`INFO`) | use `,omitzero`, or accept that the key is always present |
 | `security.unresolved` | security/auth fact was incomplete | use `ApplySecurity`/`SecurityOverride` |
 
 Not every source emits every code. The diagnostic message and span identify the exact unsupported

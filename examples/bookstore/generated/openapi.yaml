@@ -145,7 +145,7 @@ components:
         subtitle:
           type: [string, 'null']
         tags:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         title:
@@ -154,7 +154,7 @@ components:
       type: object
       properties:
         books:
-          type: array
+          type: [array, 'null']
           items:
             $ref: '#/components/schemas/Book'
     CreateBookRequest:
@@ -172,7 +172,7 @@ components:
         subtitle:
           type: [string, 'null']
         tags:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         title:
@@ -208,7 +208,7 @@ components:
         subtitle:
           type: [string, 'null']
         tags:
-          type: array
+          type: [array, 'null']
           items:
             type: string
         title:
