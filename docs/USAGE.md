@@ -345,7 +345,9 @@ parameter at any scope — so `oneof` is stated by replacing a schema, and the s
 | a scope the parameter has no value for (`dive` on a scalar, `keys` on an array) | nowhere — dropped in silence, as on a schema field |
 
 So `Filters map[string]string` tagged `binding:"dive,oneof=red green"` publishes a map whose values
-are an enum, with the key left as the plain string OpenAPI requires.
+are an enum, with the key left as the plain string OpenAPI requires. A map *query* parameter still
+has no TsSdk wire encoding, so that target rejects it with or without the enum — the enum used to
+collapse the parameter to a bare string and hide that, which is the bug, not the rejection.
 
 **A `keys`…`endkeys` enum is read and discarded.** An OpenAPI object key is always a string, and gnr8
 does not emit `propertyNames` to constrain it, so there is nowhere to put the members — and lowering
