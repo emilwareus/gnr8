@@ -28,6 +28,13 @@ must move the minor version.
   nowhere to carry, but an unrecognized rule such as `validate:"dive,email"` still raises
   `schema.metadata.unresolved` — the same diagnostic `validate:"email"` has always raised.
 
+  **This changes emitted documents.** A field whose only `required` sits behind a `dive` leaves
+  the schema's `required` array, and a parameter of that shape stops being a required parameter.
+  Both are corrections — the tag never said what gnr8 read it to say — but a client generated
+  from the new document will accept requests the old one rejected, so review the regenerated
+  document before publishing. The affected fields are the ones whose only `required` sits behind
+  a `dive` or between `keys` and `endkeys`.
+
 ## 0.5.2 — 2026-08-17
 
 ### Fixed
