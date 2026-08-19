@@ -1584,7 +1584,8 @@ impl ApiOverrides {
         Self::default()
     }
 
-    /// Force one schema field into the OpenAPI/schema required set.
+    /// State that one schema field's key is always present: it is in the schema's `required` array
+    /// in every direction, and no SDK model marks it omittable.
     #[must_use]
     pub fn force_required(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
         self.field_presence.push(FieldPresenceOverride {
@@ -1595,7 +1596,8 @@ impl ApiOverrides {
         self
     }
 
-    /// Force one schema field out of the OpenAPI/schema required set.
+    /// State that one schema field's key may be absent: it is out of the schema's `required` array
+    /// in every direction, and every SDK model marks it omittable.
     #[must_use]
     pub fn force_optional(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
         self.field_presence.push(FieldPresenceOverride {
@@ -2200,7 +2202,15 @@ fn apply_field_presence_override(
                 "field presence override did not find field {field_name:?} on schema {schema_match:?}"
             ),
         })?;
+    // Presence is ONE question, and the graph carries two code-derived answers to it: `required`
+    // (what request validation demands) and `!optional` (what the serializer always writes). Which
+    // one an artifact reads depends on where it looks — the OpenAPI `required` array picks by the
+    // direction the schema is reached from (`lower::SchemaDirections`), and every SDK model reads
+    // the presence axis. An override that moved one axis would therefore be silently dropped
+    // wherever the other one is read, so it states the corrected fact on both and means the same
+    // thing in every position — exactly what every non-Go source already records.
     field.required = required;
+    field.optional = !required;
     Ok(())
 }
 
@@ -8155,6 +8165,86 @@ mod tests {
             fields[0].schema,
             Type::Array(ref inner) if matches!(**inner, Type::Any {})
         ));
+    }
+
+    /// One field carrying nothing but the two presence axes, so a test states the case it means.
+    fn presence_schema(id: &str, name: &str, required: bool, optional: bool) -> Schema {
+        Schema {
+            id: id.to_string(),
+            name: name.to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "nickname".to_string(),
+                required,
+                optional,
+                nullable: false,
+                schema: Type::Primitive(Prim::String),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: span(),
+        }
+    }
+
+    fn presence_field(ir: &ApiGraph) -> &Field {
+        let Type::Object(fields) = &ir.schemas[0].body else {
+            panic!("expected object schema");
+        };
+        &fields[0]
+    }
+
+    #[test]
+    fn a_field_presence_override_states_presence_on_both_axes() {
+        // The source disagrees with itself the way only Go can: validation demands the key, the
+        // serializer may drop it. Either override has to leave ONE answer behind, or it lands in
+        // some artifacts and not others.
+        let mut ir = ApiGraph {
+            schemas: vec![presence_schema("dto.Profile", "Profile", true, true)],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .force_optional("Profile", "nickname")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(!presence_field(&ir).required);
+        assert!(presence_field(&ir).optional);
+
+        ApiOverrides::new()
+            .force_required("Profile", "nickname")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        assert!(presence_field(&ir).required);
+        assert!(!presence_field(&ir).optional);
+    }
+
+    #[test]
+    fn a_field_presence_override_reaches_a_response_only_schema() {
+        // `Profile` is only ever a response body, and there the `required` array is answered from
+        // the presence axis alone (`lower::SchemaDirections`) — so an override that moved only
+        // `required` would be silently dropped here.
+        let mut ir = ApiGraph {
+            operations: vec![grouped_test_operation(
+                "getProfile",
+                "GET",
+                "/profile",
+                None,
+                "profile.go",
+            )],
+            schemas: vec![presence_schema("dto.Profile", "Profile", false, true)],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .response(
+                OperationSelector::get("/profile"),
+                ResponseOverride::status(200).json_schema("dto.Profile"),
+            )
+            .force_required("Profile", "nickname")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let yaml = crate::lower::to_openapi(&ir, "profiles", "/", &ir.security).unwrap();
+        assert!(yaml.contains("required: [nickname]"), "{yaml}");
     }
 
     #[test]

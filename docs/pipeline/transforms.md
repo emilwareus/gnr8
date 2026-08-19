@@ -86,6 +86,12 @@ dynamic object arrays.
 )
 ```
 
+`force_required` / `force_optional` state a field's presence outright rather than correcting one of
+the two axes the graph carries, so the correction reads the same in every direction the schema is
+reached from (see
+[a component schema's `required` array](../openapi/generation.md#a-component-schemas-required-array))
+and in every generated SDK model.
+
 Typed body helpers create or replace the body, set its media type, and default to required. Chain
 `.optional()` immediately after the body it modifies. Plain `.request_body(method, path)` changes
 requiredness only and therefore requires an existing body.

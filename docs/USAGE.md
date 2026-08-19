@@ -237,13 +237,18 @@ TsSdk query serialization is explicit: scalar parameters use one key and one-dim
 arrays use repeated keys (`?tag=a&tag=b`). Object, map, union, nested-array, and unconstrained query
 shapes fail generation because the graph does not declare a wire encoding for them.
 
-Graph-level field requiredness overrides are available for explicit source corrections:
+Graph-level field presence overrides are available for explicit source corrections:
 
 ```rust
 ApiOverrides::new()
     .force_optional("User", "settings")
     .force_required("Event", "id")
 ```
+
+Each states presence outright — "this key may be absent" / "this key is always present" — rather than
+correcting one axis, so it reads the same in every direction the schema is reached from and in every
+generated SDK model. `force_optional` therefore also marks the field omittable in the SDKs
+(`,omitempty`, `?`, a default); `force_required` also removes that marking.
 
 Request-body overrides can also create or replace an operation body when the source graph lacks the
 required fact. Typed helpers default to required; `.optional()` applies to the most recently configured

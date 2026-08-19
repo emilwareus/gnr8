@@ -137,6 +137,27 @@ must move the minor version.
   axes, so their documents are byte-identical either way. Generated SDKs are unaffected: they read
   the presence axis, which has not moved.
 
+- **`ApiOverrides::force_required` / `force_optional` now state presence instead of correcting one
+  axis of it.** Both wrote the graph's `required` field and nothing else. That was already half a
+  correction — every SDK model reads the presence axis, so neither override had ever reached
+  generated Go, Python, or TypeScript, against `ApiOverrides`' own promise that "OpenAPI and every
+  SDK target read the same corrected API facts". The entry above would have made it less than half:
+  on a schema reached only from responses the document reads the presence axis too, so both
+  overrides would have become silent no-ops there — `force_required("Book", "subtitle")` against
+  `examples/bookstore`, where `Book` is only ever a response body, would have left `Book.required`
+  untouched and reported success.
+
+  Each override now states the fact outright — `force_required` means "this key is always present",
+  `force_optional` means "this key may be absent" — and writes both axes, which is how every non-Go
+  source already records presence. One statement, the same answer in every direction and in every
+  artifact, with nothing left to be dropped on the side that was not written.
+
+  **This changes generated SDKs for pipelines that use either override.** A `force_optional` field
+  becomes omittable in the generated models (`,omitempty` in Go, `?` in TypeScript, a default in
+  Python) and a `force_required` field stops being omittable; previously neither reached the SDKs at
+  all. Emitted documents change only for schemas reached from responses, where the overrides now
+  take effect rather than being discarded.
+
 ### Breaking
 
 `TsSdk` generation now fails for a map query parameter that carries an enum rule. A TypeScript query
