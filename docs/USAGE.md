@@ -312,6 +312,7 @@ depends on which side of the exchange the payload is on:
 | requests only (a request body, a parameter, or a schema one of those reaches) | the `binding:`/`validate:` `required` rules | that is what the server rejects a request for lacking |
 | responses only | every field with **no** `json` omission option | that is what `encoding/json` writes unconditionally; nothing validates a response |
 | both | only the fields that satisfy **both** rules | one component describes both payloads, so it can only promise what holds in each |
+| no route at all | the `binding:`/`validate:` `required` rules | a DTO struct is a component schema whether or not a route uses it, and an unwired one occupies no position to be read from |
 
 The direction is a property of your routes, not a setting. A DTO used in one direction gets an exact
 answer; a struct shared between a request body and a response body gets the narrower one, because a

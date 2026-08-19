@@ -139,9 +139,9 @@ must move the minor version.
 
 - **`ApiOverrides::force_required` / `force_optional` now state presence instead of correcting one
   axis of it.** Both wrote the graph's `required` field and nothing else. That was already half a
-  correction — every SDK model reads the presence axis, so neither override had ever reached
-  generated Go, Python, or TypeScript, against `ApiOverrides`' own promise that "OpenAPI and every
-  SDK target read the same corrected API facts". The entry above would have made it less than half:
+  correction — generated models read the presence axis, so no Go, Python, or TypeScript model had
+  ever seen either override, against `ApiOverrides`' own promise that "OpenAPI and every SDK target
+  read the same corrected API facts". The entry above would have made it less than half:
   on a schema reached only from responses the document reads the presence axis too, so both
   overrides would have become silent no-ops there — `force_required("Book", "subtitle")` against
   `examples/bookstore`, where `Book` is only ever a response body, would have left `Book.required`
@@ -154,9 +154,10 @@ must move the minor version.
 
   **This changes generated SDKs for pipelines that use either override.** A `force_optional` field
   becomes omittable in the generated models (`,omitempty` in Go, `?` in TypeScript, a default in
-  Python) and a `force_required` field stops being omittable; previously neither reached the SDKs at
-  all. Emitted documents change only for schemas reached from responses, where the overrides now
-  take effect rather than being discarded.
+  Python) and a `force_required` field stops being omittable. The one model-adjacent surface that
+  already read both axes — a TypeScript multipart body's inline part type — is unchanged in meaning,
+  since the two axes now agree by construction. Emitted documents change only for schemas reached
+  from responses, where the overrides now take effect rather than being discarded.
 
 ### Breaking
 
