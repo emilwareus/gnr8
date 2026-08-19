@@ -321,20 +321,31 @@ the serializer may omit is not something a client can count on receiving. **If y
 answer in each direction, use a separate type for each** — that is the only thing that makes the two
 questions separately answerable.
 
-Generated SDK models — Go's `,omitempty`, TypeScript's `?:`, Python's `= None` — read the same walk:
+Generated SDK models read the same walk:
 
 | The schema is reached from | The model may leave the key out when | Because |
 |---|---|---|
-| requests only | **no** `binding:`/`validate:` `required` rule demands it | `,omitempty` governs marshalling, and your server unmarshals a request DTO — it never marshals one, so the tag says nothing about what a client may omit |
+| requests only | **no** `binding:`/`validate:` `required` rule demands it | an omission option governs marshalling, and your server unmarshals a request DTO — it never marshals one, so the tag says nothing about what a client may omit |
 | responses only, both, or no route at all | the field carries a `json` omission option | the model is (or may be) the decode side, where the key's absence is your server's choice and not the caller's |
 
 The first row is the one that keeps a caller from building a request the server rejects: a field
-written `json:"name,omitempty" binding:"required"` is required in a request model, and the SDK will
-not let it be omitted. The second row is what keeps a response model decodable, so a field the
+written `json:"name,omitempty"` with `binding:"required"` is required in a request model, and the SDK
+will not let it be omitted. The second row is what keeps a response model decodable, so a field the
 serializer may drop is never demanded — which is also why a type used in **both** directions keeps
 the response answer: over-requiring it would break decoding a payload your server is entitled to
 send. On such a type a validated-and-omittable field stays omittable in the model, and the document
 publishes it as not required too; splitting the type in two is what makes both directions exact.
+
+**Go renders that answer with one restriction.** TypeScript's `?:` and Python's `= None` say "the
+caller may leave this key out" and nothing else, so they follow the table exactly. `,omitempty` says
+something different — "drop this key when the value is the zero value" — so gnr8 only ever takes it
+**away**, never adds it. A `binding:"required"` field tagged `,omitempty` loses the option, which is
+the fix the first row exists for; a request field with no validation rule keeps whatever the source
+wrote, because adding `,omitempty` there would cost you `"price": 0` and `"tags": []` without buying
+absence (Go needs a pointer for that, and gnr8 spends pointers on nullability), and on a struct, a
+`time.Time`, or a non-zero-length array it would do nothing at all — that is the tag gnr8 reports as
+`schema.omit_option.ineffective`. So a Go request model can be stricter than its Python and
+TypeScript twins, and both are correct against the document.
 
 ### Validation rules apply at the scope they are written in
 

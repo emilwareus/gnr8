@@ -13,7 +13,7 @@ type CommandMessageWithUUID struct {
 
 type CreateGoalInput struct {
 	AnalyticsQuery   GoalAnalyticsQuery `json:"analyticsQuery"`
-	Description      string             `json:"description,omitempty"`
+	Description      string             `json:"description"`
 	Name             string             `json:"name"`
 	TargetDirection  *TargetDirection   `json:"targetDirection,omitempty"`
 	TargetValue      *float64           `json:"targetValue,omitempty"`

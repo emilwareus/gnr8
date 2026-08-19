@@ -162,21 +162,21 @@ must move the minor version.
 
 - **A generated request model no longer lets a caller omit a key the server rejects the request for
   lacking.** `GoSdk`, `PySdk`, and `TsSdk` each read the presence axis unconditionally, so a request
-  DTO written the ordinary Go way — `Name string \`json:"name,omitempty" binding:"required"\`` —
-  emitted `json:"name,omitempty"`, `name: Optional[str] = None`, and `name?: string`. The document
-  said the key was required and every SDK said it was not; in Go the caller did not even have to try,
-  since setting `Name = ""` explicitly still sent nothing. This is the mirror of the entry above:
-  that one was the document being right for requests and wrong for responses, this one is the SDK
-  being right for responses and wrong for requests, and both came of answering a directional question
-  with a non-directional fact.
+  DTO written the ordinary Go way — a field tagged `json:"name,omitempty"` alongside
+  `binding:"required"` — emitted `json:"name,omitempty"`, `name: Optional[str] = None`, and
+  `name?: string`. The document said the key was required and every SDK said it was not; in Go the
+  caller did not even have to try, since setting the field to its zero value explicitly still sent
+  nothing. This is the mirror of the entry above: that one was the document being right for requests
+  and wrong for responses, this one is the SDK being right for responses and wrong for requests, and
+  both came of answering a directional question with a non-directional fact.
 
   Models now read the same walk the document reads, which moved out of the lowering so there is one
   implementation of it rather than two:
 
-  - a schema reached from **requests only** → the validation rules. `,omitempty` governs marshalling
-    and a server unmarshals a request DTO rather than marshalling one, so the tag describes nothing
-    about what a client may leave out; the `binding:`/`validate:` rules state exactly what the server
-    demands, and they are the only fact in the source that does.
+  - a schema reached from **requests only** → the validation rules. An omission option governs
+    marshalling and a server unmarshals a request DTO rather than marshalling one, so the tag
+    describes nothing about what a client may leave out; the `binding:`/`validate:` rules state
+    exactly what the server demands, and they are the only fact in the source that does.
   - a schema reached from **responses only, from both, or from no operation** → the presence axis,
     unchanged. There the model is, or may be, the decode side, and demanding a key the serializer may
     drop fails on a payload the server is entitled to send.
@@ -191,18 +191,29 @@ must move the minor version.
   intersection instead would also have marked optional every field of a both-ways type that carries
   no validation rule at all, which is most of them.
 
-  **This changes generated SDKs for Go sources.** For every schema reached only from requests, the
-  model's required set is now exactly the document's `required` array — the two artifacts agree in
-  all four axis combinations, where they used to disagree in two. In this repo that means
-  `CreateGoalInput.description`, `CreateBookRequest.{price, publisher, tags}`, and
-  `CreateTaskRequest.{assignee, dueAt, labels, priority}` become omittable, each a field the server
-  states no rule for and the document already published as not required. In the other direction, a
-  validated field carrying an omission option stops being omittable, which is a compile error for a
-  Python or TypeScript caller who was omitting it — the call it replaces was a 4xx. One shape needs a
-  closer look before publishing: `PySdk::dataclasses()` orders defaulted fields last, so a field
-  changing sides moves in the constructor's positional order; keyword construction is unaffected.
-  FastAPI, Flask, NestJS, and OpenAPI-imported sources state presence once, so their SDKs are
-  byte-identical either way.
+  **In Go the direction may only take an omission option away, never add one.** `?:` and `= None` say
+  "the caller may leave this key out" and nothing else, so they read the direction straight.
+  `encoding/json` has no such spelling: `,omitempty` says "drop this key when the value is the zero
+  value", which only coincides with may-omit where the source already chose it. Writing it where the
+  source did not would cost a caller `"price": 0` and `"tags": []` without buying absence — Go needs a
+  pointer for that, and gnr8 spends pointers on the nullable axis — and on a struct, a `time.Time`, or
+  a non-zero-length array it does nothing at all, which is the tag gnr8 reads in user source as
+  `schema.omit_option.ineffective`. So the Go tag omits what the source's own tag omits, narrowed by
+  the direction: a `binding:"required"` field tagged `,omitempty` loses the option, and nothing gains
+  one.
+
+  **This changes generated SDKs for Go sources**, in one direction for `GoSdk` and both for the other
+  two. A validated field carrying an omission option stops being omittable everywhere — a compile
+  error for a Python or TypeScript caller who was omitting it, where the call it replaces was a 4xx.
+  For `PySdk` and `TsSdk` a request-only field that carries no validation rule additionally becomes
+  omittable, matching what the document already published; `GoSdk` leaves those alone for the reason
+  above, so a request-only schema's Go model is exactly what it was and its Python and TypeScript
+  twins are laxer than before. One shape needs a closer look before publishing:
+  `PySdk::dataclasses()` orders defaulted fields last, so a field changing sides moves in the
+  constructor's positional order; keyword construction is unaffected. FastAPI, Flask, NestJS, and
+  OpenAPI-imported sources state presence once, so their SDKs are byte-identical either way — as is
+  every artifact committed in this repository, whose fixtures and examples contain no field carrying
+  both a validation rule and an omission option.
 
 ### Breaking
 

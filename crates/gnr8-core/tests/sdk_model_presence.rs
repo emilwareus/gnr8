@@ -95,8 +95,8 @@ fn graph() -> ApiGraph {
 /// Whether each field's key may be left out of the model, for a schema reached ONLY from a request.
 ///
 /// The server's validation is the whole of what an omission is accepted or rejected against here:
-/// `,omitempty` governs marshalling and the server never marshals a request DTO, so the presence axis
-/// describes nothing about what a client may send.
+/// an omission option governs marshalling and the server never marshals a request DTO, so the presence
+/// axis describes nothing about what a client may send.
 const REQUEST_ONLY: [(&str, bool); 4] = [
     ("loose", true),
     ("mandatory", false),
@@ -117,17 +117,36 @@ const PRESENCE_AXIS: [(&str, bool); 4] = [
     ("validated", true),
 ];
 
-/// The declaration lines of one emitted model: everything between `header` and `terminator`, trimmed
-/// and with inner whitespace runs collapsed, so a formatter's column alignment never decides an
-/// assertion.
-fn declaration_lines(out: &str, header: &str, terminator: &str) -> Vec<String> {
+/// Whether each field carries `,omitempty` on a schema reached ONLY from a request.
+///
+/// This is NOT [`REQUEST_ONLY`], and the one row that differs is the point: `plain` may be left out of
+/// a request as far as the server is concerned, but `,omitempty` does not spell "may be left out" — it
+/// drops the zero value, so writing it where the source did not would cost the caller `"plain": ""`
+/// without buying absence. The direction may only take the option away, so Go's request answer is the
+/// source's own option narrowed by [`REQUEST_ONLY`], and only `validated` loses it.
+const GO_REQUEST_ONLY: [(&str, bool); 4] = [
+    ("loose", true),
+    ("mandatory", false),
+    ("plain", false),
+    ("validated", false),
+];
+
+/// The lines of one emitted model declaration: everything after `header` up to the next line at column
+/// zero, which is what closes a Go struct, a TypeScript interface, and a Python class body alike.
+///
+/// Lines are trimmed and their inner whitespace runs collapsed, so a formatter's column alignment never
+/// decides an assertion. Bounding on indentation rather than on a per-language terminator means there
+/// is no terminator to get wrong: a mismatched one used to silently widen the slice to the rest of the
+/// bundle and let an assertion pass on a line some other model emitted.
+fn declaration_lines(out: &str, header: &str) -> Vec<String> {
     let start = out
         .find(header)
         .unwrap_or_else(|| panic!("{header:?} missing from:\n{out}"));
     let rest = &out[start + header.len()..];
-    let end = rest.find(terminator).unwrap_or(rest.len());
-    rest[..end]
-        .lines()
+    rest.lines()
+        // A blank line does not end a declaration (Python puts one before `@classmethod`); a non-blank
+        // line that starts at column zero does.
+        .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|line| !line.is_empty())
         .collect()
@@ -146,15 +165,15 @@ fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
     let out = gnr8::gosdk::generate(&graph(), "presence", "/api")
         .expect("Go SDK generation must succeed (requires gofmt)");
     for (model, table) in [
-        ("CreateInput", REQUEST_ONLY),
+        ("CreateInput", GO_REQUEST_ONLY),
         ("Payload", PRESENCE_AXIS),
         ("Shared", PRESENCE_AXIS),
         ("Unwired", PRESENCE_AXIS),
     ] {
-        let lines = declaration_lines(&out, &format!("type {model} struct {{"), "}");
-        for (field, omittable) in table {
+        let lines = declaration_lines(&out, &format!("type {model} struct {{"));
+        for (field, omit_empty) in table {
             let exported = format!("{}{}", field[..1].to_uppercase(), &field[1..]);
-            let tag = if omittable {
+            let tag = if omit_empty {
                 format!("`json:\"{field},omitempty\"`")
             } else {
                 format!("`json:\"{field}\"`")
@@ -174,7 +193,7 @@ fn typescript_interfaces_mark_optional_from_the_direction_the_schema_is_reached_
         ("Shared", PRESENCE_AXIS),
         ("Unwired", PRESENCE_AXIS),
     ] {
-        let lines = declaration_lines(&out, &format!("export interface {model} {{"), "}");
+        let lines = declaration_lines(&out, &format!("export interface {model} {{"));
         for (field, omittable) in table {
             let mark = if omittable { "?" } else { "" };
             assert_declares(&lines, &format!("{field}{mark}: string;"), model);
@@ -192,7 +211,7 @@ fn pydantic_models_default_from_the_direction_the_schema_is_reached_from() {
         ("Shared", PRESENCE_AXIS),
         ("Unwired", PRESENCE_AXIS),
     ] {
-        let lines = declaration_lines(&out, &format!("class {model}(BaseModel):"), "@classmethod");
+        let lines = declaration_lines(&out, &format!("class {model}(BaseModel):"));
         for (field, omittable) in table {
             let declaration = if omittable {
                 format!("{field}: Optional[str] = Field(default=None)")
@@ -220,7 +239,7 @@ fn dataclass_models_and_their_decoders_agree_on_the_direction() {
         ("Shared", PRESENCE_AXIS),
         ("Unwired", PRESENCE_AXIS),
     ] {
-        let lines = declaration_lines(&out, &format!("class {model}:"), "@classmethod");
+        let lines = declaration_lines(&out, &format!("class {model}:"));
         for (field, omittable) in table {
             let declaration = if omittable {
                 format!("{field}: Optional[str] = None")
@@ -233,7 +252,18 @@ fn dataclass_models_and_their_decoders_agree_on_the_direction() {
     // A `@dataclass` whose declaration and whose `from_dict` disagreed would raise at construction or
     // decode, so the decoder has to move with the declaration: a required attribute is bound from the
     // key directly, and an omittable one only when the key is there.
-    let decoder = declaration_lines(&out, "class CreateInput:", "def to_dict");
+    let decoder = declaration_lines(&out, "class CreateInput:");
+    // The slice covers this one class and stops: over-running into the next would bring three more
+    // decoders with it, and the assertions below could then pass on a line CreateInput never emitted.
+    assert_eq!(
+        decoder
+            .iter()
+            .filter(|line| line.starts_with("validated="))
+            .count(),
+        1,
+        "the decoder slice must cover exactly one class:\n{}",
+        decoder.join("\n")
+    );
     assert!(
         decoder
             .iter()
@@ -262,7 +292,6 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
             gnr8::gosdk::generate_with_layout(&graph(), "presence", "/api", &split)
                 .expect("Go split SDK generation must succeed (requires gofmt)"),
             "type {model} struct {",
-            "}",
             "Validated string `json:\"validated\"`",
             "Loose string `json:\"loose,omitempty\"`",
         ),
@@ -271,7 +300,6 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
             gnr8::tssdk::generate_with_layout(&graph(), "presence", "/api", &split)
                 .expect("TypeScript split SDK generation must succeed"),
             "export interface {model} {",
-            "}",
             "validated: string;",
             "loose?: string;",
         ),
@@ -286,20 +314,17 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
             )
             .expect("Python split SDK generation must succeed"),
             "class {model}(BaseModel):",
-            "@classmethod",
             "validated: str",
             "loose: Optional[str] = Field(default=None)",
         ),
     ];
-    for (language, out, header, terminator, required, omittable) in outputs {
+    for (language, out, header, required, omittable) in outputs {
         // The request-only model demands the validated key and lets the unvalidated one go...
-        let request_only =
-            declaration_lines(&out, &header.replace("{model}", "CreateInput"), terminator);
+        let request_only = declaration_lines(&out, &header.replace("{model}", "CreateInput"));
         assert_declares(&request_only, required, &format!("{language} CreateInput"));
         assert_declares(&request_only, omittable, &format!("{language} CreateInput"));
         // ...and the response-only model, split into its own file, still reads the presence axis.
-        let response_only =
-            declaration_lines(&out, &header.replace("{model}", "Payload"), terminator);
+        let response_only = declaration_lines(&out, &header.replace("{model}", "Payload"));
         assert_declares(&response_only, omittable, &format!("{language} Payload"));
     }
 }

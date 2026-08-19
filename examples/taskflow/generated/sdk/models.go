@@ -10,11 +10,11 @@ type Assignee struct {
 }
 
 type CreateTaskRequest struct {
-	Assignee Assignee  `json:"assignee,omitempty"`
-	DueAt    time.Time `json:"dueAt,omitempty"`
-	Labels   []string  `json:"labels,omitempty"`
+	Assignee Assignee  `json:"assignee"`
+	DueAt    time.Time `json:"dueAt"`
+	Labels   []string  `json:"labels"`
 	Notes    *string   `json:"notes,omitempty"`
-	Priority int64     `json:"priority,omitempty"`
+	Priority int64     `json:"priority"`
 	Status   Status    `json:"status"`
 	Title    string    `json:"title"`
 }

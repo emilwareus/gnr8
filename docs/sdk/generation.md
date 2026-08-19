@@ -43,8 +43,8 @@ metadata. `without_docs()` disables docs only; `package_metadata(bool)` controls
 
 ## Field presence in generated models
 
-Whether a model lets a key be left out — Go's `,omitempty`, TypeScript's `?:`, Python's `= None` —
-is answered from the direction its schema is reached from, the same walk that answers the OpenAPI
+Whether a model lets a key be left out is answered from the direction its schema is reached from, the
+same walk that answers the OpenAPI
 [`required` array](../openapi/generation.md#a-component-schemas-required-array).
 
 | The schema is reached from | The model may leave the key out when |
@@ -53,16 +53,31 @@ is answered from the direction its schema is reached from, the same walk that an
 | responses only, both, or no operation at all | the source's serializer may leave the key out |
 
 A validation rule says what your server rejects an inbound payload for lacking, so a model reads it
-exactly where the model is inbound and only inbound. In Go that matters most: `,omitempty` governs
-marshalling and a server unmarshals a request DTO rather than marshalling one, so a field written
-`json:"name,omitempty" binding:"required"` is required in the request model — previously a caller who
-set it to the zero value sent nothing and the server rejected the call.
+exactly where the model is inbound and only inbound. In Go that matters most: an omission option
+governs marshalling and a server unmarshals a request DTO rather than marshalling one, so a field
+written `json:"name,omitempty"` with `binding:"required"` is required in the request model —
+previously a caller who set it to the zero value sent nothing and the server rejected the call.
 
 Everywhere else the model is, or may be, the decode side, and demanding a key the server may leave
 out would fail on a payload it is entitled to send. That is also the answer a type reached from both
 directions keeps: one Go struct, one Python model, one TypeScript interface cannot be exact for two
 contracts, and the safe half is the one that cannot break a decode. Use a separate type per direction
 to get the exact answer in both.
+
+### How each language spells it
+
+`TsSdk` uses `?:` and `PySdk` a `= None` default; both mean "the caller may leave this key out" and
+nothing else, so they follow the table exactly.
+
+`GoSdk` uses `,omitempty`, which means something narrower — "drop this key when the value is the zero
+value" — so the direction only ever takes the option **away**, never adds it. A `binding:"required"`
+field tagged `,omitempty` loses it, which is the case this rule exists for. A request field with no
+validation rule keeps whatever the source wrote: adding `,omitempty` would cost the caller
+`"price": 0` and `"tags": []` without buying absence (Go needs a pointer for that, and gnr8 spends
+pointers on nullability), and on a struct, a `time.Time`, or a non-zero-length array it would do
+nothing at all — that is the tag gnr8 reports as `schema.omit_option.ineffective`. A Go request model
+can therefore be stricter than its Python and TypeScript twins; both send payloads the document
+permits.
 
 Non-Go sources are unaffected: FastAPI, Flask, NestJS, and an imported OpenAPI document each state
 presence once, so both readings give the same answer.

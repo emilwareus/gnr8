@@ -237,14 +237,41 @@ fn maybe_pointer(base: String, nullable: bool, is_value: bool) -> String {
     }
 }
 
-/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field is OPTIONAL
-/// (the presence axis — the key may be absent). Independent of nullability (RESEARCH Pitfall 4).
-fn json_tag(json_name: &str, optional: bool) -> String {
-    if optional {
+/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field OMITS ON
+/// MARSHAL ([`omits_when_empty`]). Independent of nullability (RESEARCH Pitfall 4).
+fn json_tag(json_name: &str, omit_empty: bool) -> String {
+    if omit_empty {
         format!("`json:\"{json_name},omitempty\"`")
     } else {
         format!("`json:\"{json_name}\"`")
     }
+}
+
+/// Whether the emitted json tag carries `,omitempty`.
+///
+/// **`,omitempty` is not a presence marker.** TypeScript's `?:` and Python's `= None` say "the caller
+/// may leave this key out" and nothing else, so they can read
+/// [`SchemaDirections::model_field_is_optional`] straight. `encoding/json` has no such spelling: the
+/// option says "drop this key when the value is the zero value", which is a different statement that
+/// only *coincides* with "may omit" where the source already chose it. Writing it anywhere the source
+/// did not would therefore be a change of wire behavior wearing a presence marker's clothes:
+///
+/// - On a value type it costs the caller the zero value. `Price float64` gains no way to be absent —
+///   Go needs a pointer for that, and gnr8 spends pointers on the NULLABLE axis (RESEARCH Pitfall 4) —
+///   it merely loses the ability to send `"price": 0`. Same for `"tags": []` and, on a bare `*T`, the
+///   explicit `null` that #59 established such a field always writes.
+/// - On a struct, a `time.Time`, or a non-zero-length array the option does nothing at all —
+///   `encoding/json` never considers those empty. gnr8 reads that exact tag in user source as a defect
+///   and raises `schema.omit_option.ineffective`, so emitting it would put gnr8's own diagnostic into
+///   gnr8's own output.
+///
+/// So the direction may only ever take the option AWAY, never add it: the tag omits what the source's
+/// own tag omits, and only where the position permits an omission at all. That still fixes the case
+/// this rule exists for — a `binding:"required"` field tagged `,omitempty`, where a caller setting the
+/// zero value sent nothing and the server rejected the call — because there the direction says the
+/// server demands the key and the option comes off.
+fn omits_when_empty(field: &Field, directions: SchemaDirections) -> bool {
+    field.optional && directions.model_field_is_optional(field)
 }
 
 /// Whether emitting a field of neutral [`Type`] requires the `time` import (a `time.Time` value
@@ -472,11 +499,10 @@ fn emit_type_alias(
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
 ///
-/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads whether the model may leave the
-/// key out — the two are distinct (RESEARCH Pitfall 4): an omittable-not-nullable value stays a
-/// non-pointer `T` with omitempty; a nullable value becomes `*T`. Which graph fact answers omittability
-/// depends on where the struct sits in an exchange, so it comes from
-/// [`SchemaDirections::model_field_is_optional`] rather than straight off the presence axis.
+/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads what the field omits on
+/// marshal — the two are distinct (RESEARCH Pitfall 4): an omitting-not-nullable value stays a
+/// non-pointer `T` with omitempty; a nullable value becomes `*T`. The direction the struct is reached
+/// from can take the option off but never put it on — see [`omits_when_empty`].
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
@@ -490,7 +516,7 @@ fn emit_struct_field(
     } else {
         go_type(&field.schema, field.nullable, graph)?
     };
-    let tag = json_tag(&field.json_name, directions.model_field_is_optional(field));
+    let tag = json_tag(&field.json_name, omits_when_empty(field, directions));
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
 }
@@ -3755,10 +3781,9 @@ mod tests {
             let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // uuid → string.
             assert!(out.contains("UUID string `json:\"uuid\"`"), "{out}");
-            // date-time → time.Time. `createdAt` sits on the request-only CreateGoalInput and carries
-            // no validation rule, so the server accepts a payload without it and the tag says so.
+            // date-time → time.Time.
             assert!(
-                out.contains("CreatedAt time.Time `json:\"createdAt,omitempty\"`"),
+                out.contains("CreatedAt time.Time `json:\"createdAt\"`"),
                 "{out}"
             );
             // []uuid → []string.
