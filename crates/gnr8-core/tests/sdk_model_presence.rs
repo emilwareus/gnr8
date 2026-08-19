@@ -7,8 +7,7 @@
 //! is inbound and only inbound; everywhere else the presence axis stands. See
 //! `graph::direction::SchemaDirections::model_field_is_optional`.
 //!
-//! One graph puts the same four fields in each of the four positions, so the only thing that differs
-//! between the expectations below is where the schema sits:
+//! One graph puts the same four fields in each of the four positions:
 //!
 //! | schema       | reached from        |
 //! |--------------|---------------------|
@@ -16,6 +15,12 @@
 //! | `Payload`    | a response body     |
 //! | `Shared`     | both                |
 //! | `Unwired`    | no operation        |
+//!
+//! Two things vary across the expectations below, not one. Where the schema sits decides the answer,
+//! and the target decides how much of that answer it can spell: `?:` and `= None` mean "may be left
+//! out" and take it whole, while Go's `,omitempty` means "drop the zero value" and can only ever have
+//! the option taken away — which is why [`GO_REQUEST_ONLY`] exists beside [`REQUEST_ONLY`] rather than
+//! reusing it.
 //!
 //! The Go SDK path pipes each file through `gofmt`, so this test needs the Go toolchain — the same
 //! prerequisite `snapshot_sdk` already carries.
@@ -326,5 +331,72 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
         // ...and the response-only model, split into its own file, still reads the presence axis.
         let response_only = declaration_lines(&out, &header.replace("{model}", "Payload"));
         assert_declares(&response_only, omittable, &format!("{language} Payload"));
+    }
+}
+
+/// A multipart request body whose schema is ALSO a response body, so the walk reports both directions
+/// for it while the inline argument still occupies only the request position.
+fn multipart_both_ways_graph() -> ApiGraph {
+    let json = format!(
+        r#"{{
+          "module": "multipart.test",
+          "operations": [
+            {{
+              "id": "upload", "method": "POST", "path": "/uploads", "handler": "upload",
+              "params": [],
+              "request_body": {{ "ref_id": "dto.Upload" }},
+              "request_body_content_type": "multipart/form-data",
+              "responses": [
+                {{ "status": 200, "body": {{ "ref_id": "dto.Upload" }},
+                   "content_types": ["application/json"] }}
+              ],
+              "provenance": {{ "file": "upload.go", "start_line": 1, "end_line": 1 }}
+            }}
+          ],
+          "schemas": [
+            {{ "id": "dto.Upload", "name": "Upload",
+               "body": {{ "type": "object", "of": {FIELDS} }},
+               "provenance": {{ "file": "dto.go", "start_line": 1, "end_line": 1 }} }}
+          ],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "Multipart",
+          "security": []
+        }}"#
+    );
+    serde_json::from_str(&json).expect("multipart graph must deserialize")
+}
+
+/// A multipart body's inline argument type takes the REQUEST answer even when the schema it comes from
+/// is reached from both directions, and the named interface for that same schema does not.
+///
+/// The two are different positions, not two answers to one question: the argument is only ever built
+/// to be sent, so narrowing it to what the server accepts costs the caller nothing; `models.Upload`
+/// has to survive a decode as well, so it keeps the answer that cannot break one.
+#[test]
+fn a_multipart_argument_is_a_request_even_when_its_schema_is_also_a_response() {
+    let out = gnr8::tssdk::generate(&multipart_both_ways_graph(), "multipart", "/api")
+        .expect("TypeScript multipart SDK generation must succeed");
+
+    // The inline argument: `validated` is demanded, `plain` and `loose` are not.
+    let argument = out
+        .split("body: {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .unwrap_or_else(|| panic!("no inline multipart argument in:\n{out}"));
+    for (field, omittable) in REQUEST_ONLY {
+        let mark = if omittable { "?" } else { "" };
+        assert!(
+            argument.contains(&format!("{field}{mark}: ")),
+            "the multipart argument must declare `{field}{mark}:`, got:\n{argument}"
+        );
+    }
+
+    // The named interface for the same schema is reached from both directions and keeps the presence
+    // axis, so `validated` is marked `?:` there while the argument above demands it.
+    let interface = declaration_lines(&out, "export interface Upload {");
+    for (field, omittable) in PRESENCE_AXIS {
+        let mark = if omittable { "?" } else { "" };
+        assert_declares(&interface, &format!("{field}{mark}: string;"), "Upload");
     }
 }

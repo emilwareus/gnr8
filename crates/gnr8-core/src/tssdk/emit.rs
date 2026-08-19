@@ -3076,8 +3076,15 @@ fn ts_multipart_request_body_arg_type(
         } else {
             ts_string_literal(&field.json_name)
         };
-        // This inline shape is a request body argument and nothing else, so it is on the request side
-        // by construction — no walk needed to know that, and the same answer a walk would give.
+        // This inline shape is the argument a caller builds a multipart request from and is used for
+        // nothing else, so it occupies the request position by construction and takes the request
+        // answer — not the one the walk would return for the schema as a whole.
+        //
+        // Those differ when the same type is also a response body: the walk then reports both
+        // directions and `models.X` marks a validated-and-omittable field `?:`, because that interface
+        // has to survive a decode too. This argument never decodes anything, so narrowing it to what
+        // the server accepts costs the caller nothing and is the whole point of the rule. One position,
+        // one answer, in both places.
         let optional = if SchemaDirections::REQUEST.model_field_is_optional(field) {
             "?"
         } else {

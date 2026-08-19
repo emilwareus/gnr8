@@ -5,8 +5,9 @@
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
-//!   json tags carry `,omitempty` for a key the model may leave out (which side of an exchange the
-//!   struct is on decides that — [`crate::graph::direction`]), types follow TARGET-API.md §4.
+//!   json tags carry `,omitempty` where the source's own tag does and the side of the exchange the
+//!   struct is on permits it ([`omits_when_empty`] — the direction can take the option away but never
+//!   put one on), types follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
