@@ -78,10 +78,13 @@ setting for it. A schema shared between a request body and a response body gets 
 use a separate type for each direction to get the exact one in both. An imported OpenAPI document
 states presence once, so its `required` arrays re-emit unchanged whichever way its schemas are used.
 
-Generated SDK models read the same walk and answer the same question, which is why a request-only
-schema's model and its `required` array now always agree — see
+Generated SDK models read the same walk and answer the same question, so on a request-only schema a
+`PySdk` or `TsSdk` model requires exactly what this array lists. A `GoSdk` model can require more:
+`,omitempty` is the only omission spelling Go has and it drops the zero value rather than marking
+absence, so gnr8 never adds one the source did not write, and a field this array omits may still be a
+key the Go struct always sends. See
 [field presence in generated models](../sdk/generation.md#field-presence-in-generated-models) for
-where the two artifacts deliberately differ.
+that restriction and for where the two artifacts deliberately differ.
 
 ## Metadata
 

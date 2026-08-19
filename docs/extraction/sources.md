@@ -63,9 +63,11 @@ Recognized route facts include:
   Both axes reach every artifact. Which of them answers "must this key be present?" depends on the
   direction that schema is reached from — validation rules on a request, the presence axis on a
   response — in the document's `required` array
-  ([OpenAPI generation](../openapi/generation.md#a-component-schemas-required-array)) and in each
-  generated model's `,omitempty` / `?:` / `= None`
-  ([SDK generation](../sdk/generation.md#field-presence-in-generated-models)).
+  ([OpenAPI generation](../openapi/generation.md#a-component-schemas-required-array)) and in a
+  generated model's `?:` or `= None`
+  ([SDK generation](../sdk/generation.md#field-presence-in-generated-models)). A Go model spells
+  omission with `,omitempty`, which drops the zero value rather than marking absence, so there the
+  validation rules can only take the option away — never put one on a field whose tag carries none.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose

@@ -52,8 +52,12 @@ impl SchemaDirections {
         }
     }
 
-    /// Whether a generated SDK model may leave `field`'s key out — Go's `,omitempty`, TypeScript's
-    /// `?:`, Python's `= None`.
+    /// Whether a generated SDK model may leave `field`'s key out.
+    ///
+    /// This is the neutral answer. `TsSdk` and `PySdk` render it directly, since `?:` and `= None`
+    /// mean "may be left out" and nothing else. `GoSdk` narrows it again on the way to a struct tag:
+    /// `,omitempty` drops the zero value rather than marking absence, so the direction may only ever
+    /// take one away (`gosdk::emit::omits_when_empty`).
     ///
     /// **This is not the negation of [`Self::field_is_required`], and it is not meant to be.** That
     /// method answers what the document may *claim* about a payload, where the weakest true statement
@@ -82,8 +86,8 @@ impl SchemaDirections {
     pub(crate) fn model_field_is_optional(self, field: &Field) -> bool {
         match (self.request, self.response) {
             // Inbound and only inbound: the server's validation is the whole of what an omission is
-            // accepted or rejected against. `,omitempty` governs marshalling, and the server never
-            // marshals a request DTO, so the presence axis says nothing here.
+            // accepted or rejected against. An omission option governs marshalling, and the server
+            // never marshals a request DTO, so the presence axis says nothing here.
             (true, false) => !field.required,
             // Reached from a response, from both, or from no operation at all: the model is (or may
             // be) the decode side, where the key's absence is the server's choice and not the
@@ -318,8 +322,10 @@ mod tests {
         // The two answers are the same question asked of two artifacts, so where they diverge is worth
         // pinning: a later "simplification" of one into the other has to fail here rather than in a
         // user's generated code. Note what is NOT in the list: no request-only row survives, so for
-        // every schema an operation only ever sends, the `required` array and the model now say the
-        // same thing about the same key.
+        // every schema an operation only ever sends, the `required` array and this method say the same
+        // thing about the same key. That is the answer, not necessarily what a target emits — `GoSdk`
+        // narrows it again, since `,omitempty` drops the zero value rather than marking absence and
+        // may only ever be taken away (`gosdk::emit::omits_when_empty`).
         let divergent: Vec<(bool, bool, bool, bool)> = every_case()
             .into_iter()
             .filter(|(directions, field)| {
