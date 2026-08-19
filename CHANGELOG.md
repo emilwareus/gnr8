@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.6.0 — 2026-08-20
+
 ### Fixed
 
 - **A `oneof` on a bound Go parameter now lands on the value its scope names.** The parameter reader
