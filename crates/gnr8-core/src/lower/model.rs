@@ -270,7 +270,9 @@ pub(crate) struct SchemaObject {
     pub example: Option<LiteralValue>,
     /// Vendor extension values.
     pub extensions: Vec<Extension>,
-    /// Required field names for object schemas, in sorted order; empty otherwise.
+    /// Required field names for object schemas, in sorted order; empty otherwise. Which graph fact
+    /// answers "must this key be present?" depends on the positions the schema is reached from —
+    /// see `lower::SchemaDirections`.
     pub required: Vec<String>,
     /// Object properties, keyed by json name, in sorted order; empty otherwise.
     pub properties: Vec<(String, SchemaObject)>,
@@ -288,7 +290,7 @@ pub(crate) struct SchemaObject {
     pub one_of: Vec<SchemaObject>,
     /// Whether the value may be explicitly `null`. When set, the writer renders `type` as the 3.1
     /// array form `["<type_name>", "null"]` instead of the scalar `type: <type_name>`. Independent of
-    /// the owning object's `required` list (which carries the optionality axis).
+    /// the owning object's `required` list (which carries the presence axis).
     pub nullable: bool,
 }
 

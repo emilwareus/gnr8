@@ -128,6 +128,7 @@ components:
   schemas:
     Book:
       type: object
+      required: [author, genre, id, price, publishedAt, publisher, tags, title]
       properties:
         author:
           type: string
@@ -152,6 +153,7 @@ components:
           type: string
     BookList:
       type: object
+      required: [books]
       properties:
         books:
           type: [array, 'null']
@@ -179,6 +181,7 @@ components:
           type: string
     ErrorResponse:
       type: object
+      required: [code, message]
       properties:
         code:
           type: string

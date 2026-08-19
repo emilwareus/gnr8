@@ -60,6 +60,9 @@ Recognized route facts include:
   On a `form:`-tagged field a form/multipart binder owns it, and the rules differ: a part is present
   or absent with no `null` to write, so such a field is never nullable, and it is optional when the
   part is a pointer *or* the tag carries `,omitempty`. `,omitzero` is read on the `json` wire only.
+  Both axes reach the emitted document. Which of them answers a schema's `required` array depends on
+  the direction that schema is reached from — validation rules on a request, the presence axis on a
+  response; see [OpenAPI generation](../openapi/generation.md#a-component-schemas-required-array).
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose

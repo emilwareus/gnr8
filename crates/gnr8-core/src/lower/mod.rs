@@ -17,6 +17,15 @@
 //! `/goal/list`, `/goal/{uuid}` (never `/goal//list` and never a dropped prefix). A multi-group
 //! generalization is deferred (D-02).
 //!
+//! ## A component schema's `required` array
+//!
+//! `required` asks "must this key be present?", and the graph carries two code-derived facts that
+//! answer it on opposite sides of an exchange: `field.required` (what the server's validation rejects
+//! a request for lacking) and `!field.optional` (what the serializer unconditionally writes). Which
+//! one applies is decided by the positions a schema is reached from, computed here by walking the
+//! graph from each operation — see [`SchemaDirections`]. That is one answer per position rather than
+//! a precedence between two candidates, so there is no fallback and nothing to configure (rule 3).
+//!
 //! ## Diagnostics (OAPI-03)
 //!
 //! Lowering does NOT re-derive diagnostics. The graph already carries the byte-locked Phase-2
@@ -116,7 +125,8 @@ pub(crate) fn build_openapi_doc(
         .map(|schema| (schema.id.as_str(), schema.name.as_str()))
         .collect();
 
-    let schemas = build_component_schemas(&graph.schemas, &ref_to_name)?;
+    let directions = schema_directions(graph);
+    let schemas = build_component_schemas(&graph.schemas, &ref_to_name, &directions)?;
     let security = build_security(security, &graph.security_requirements)?;
     ensure_operation_security_refs(graph, &security)?;
     // Named global schemes only: the anonymous alternative carries no scheme to inherit.
@@ -512,7 +522,7 @@ fn lower_parameter(
     param: &crate::graph::Param,
     ref_to_name: &BTreeMap<&str, &str>,
 ) -> Result<Parameter, crate::CoreError> {
-    let mut schema = lower_schema_type(&param.schema, ref_to_name)?;
+    let mut schema = lower_schema_type(&param.schema, ref_to_name, SchemaDirections::REQUEST)?;
     schema.default_value.clone_from(&param.default);
     let mut openapi_content = param.openapi_content.clone();
     if let Some(content) = &mut openapi_content {
@@ -561,12 +571,19 @@ fn rewrite_parameter_local_refs(value: &mut serde_json::Value, refs: &BTreeMap<&
     }
 }
 
-fn rewrite_local_component_ref(reference: &str, refs: &BTreeMap<&str, &str>) -> Option<String> {
+/// Split a local component `$ref` into its decoded component id and any JSON-Pointer suffix, or
+/// `None` when the reference does not name a local component schema. The single definition of that
+/// grammar, so the reader that resolves refs and the walk that classifies them cannot disagree.
+fn split_local_component_ref(reference: &str) -> Option<(String, Option<&str>)> {
     let tail = reference.strip_prefix("#/components/schemas/")?;
     let (raw_name, suffix) = tail
         .split_once('/')
         .map_or((tail, None), |(name, suffix)| (name, Some(suffix)));
-    let name = raw_name.replace("~1", "/").replace("~0", "~");
+    Some((raw_name.replace("~1", "/").replace("~0", "~"), suffix))
+}
+
+fn rewrite_local_component_ref(reference: &str, refs: &BTreeMap<&str, &str>) -> Option<String> {
+    let (name, suffix) = split_local_component_ref(reference)?;
     let public_name = refs.get(name.as_str())?;
     let public_name = public_name.replace('~', "~0").replace('/', "~1");
     Some(suffix.map_or_else(
@@ -790,15 +807,194 @@ where
     out
 }
 
+/// The HTTP positions a component schema is reached from.
+///
+/// `required` asks one question — "must this key be present?" — and the graph answers it with a
+/// different field depending on which side of the exchange the payload is on. On a request the answer
+/// is `field.required`: what the server's own validation rejects a payload for lacking. On a response
+/// no validation rule applies (a handler does not validate what it marshals), and the answer is
+/// `!field.optional`: what the serializer unconditionally writes. Both are code-derived facts already
+/// on the graph, and which one applies is decided by reachability, not by preference — so this is one
+/// source per fact per position, not a precedence chain between two candidate answers (CLAUDE.md rule
+/// 3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SchemaDirections {
+    /// Reached from a request body, a parameter, or a schema one of those reaches.
+    request: bool,
+    /// Reached from a response body, or a schema one of those reaches.
+    response: bool,
+}
+
+impl SchemaDirections {
+    /// A parameter is a request, and so is every schema inline within one.
+    const REQUEST: Self = Self {
+        request: true,
+        response: false,
+    };
+
+    /// Whether `field`'s key must be present in every payload this schema describes.
+    fn field_is_required(self, field: &Field) -> bool {
+        match (self.request, self.response) {
+            // Reached from both directions: ONE component has to describe both payloads, so publish
+            // only what holds in every position it occupies. Anything else states as mandatory
+            // something one of the two sides may legitimately omit.
+            (true, true) => field.required && !field.optional,
+            // Response-only: what the serializer always writes.
+            (false, true) => !field.optional,
+            // Request-only — and a schema no operation reaches, which has no position to be read
+            // from, so the source's own statement about the field stands.
+            (_, false) => field.required,
+        }
+    }
+}
+
+/// Map every component schema id to the positions it is reached from ([`SchemaDirections`]).
+///
+/// Roots are an operation's request body and parameters (request) and its response bodies (response);
+/// from each root the walk follows `$ref`s through schema bodies, so a nested type is reached from
+/// wherever the type carrying it is. A `$ref` is a leaf of the walk — what lies beyond it is reached
+/// from that schema's own body, which is how a type shared between a request DTO and a response DTO
+/// comes out marked as both.
+fn schema_directions(graph: &ApiGraph) -> BTreeMap<&str, SchemaDirections> {
+    let bodies: BTreeMap<&str, &Type> = graph
+        .schemas
+        .iter()
+        .map(|schema| (schema.id.as_str(), &schema.body))
+        .collect();
+    let mut request_roots: Vec<&str> = Vec::new();
+    let mut response_roots: Vec<&str> = Vec::new();
+    for op in &graph.operations {
+        if let Some(body) = &op.request_body {
+            request_roots.push(body.ref_id.as_str());
+        }
+        for param in &op.params {
+            collect_named_refs(&param.schema, &mut request_roots);
+            // A parameter also carries imported `OpenAPI` fragments verbatim, and those can reference
+            // a component the typed schema does not — the same `$ref`s `rewrite_parameter_local_refs`
+            // rewrites on the way out. They are parameters, so they are requests.
+            for value in param
+                .openapi_content
+                .iter()
+                .chain(param.openapi_fields.iter().map(|(_, value)| value))
+            {
+                collect_json_component_refs(value, &bodies, &mut request_roots);
+            }
+        }
+        for response in &op.responses {
+            if let Some(body) = &response.body {
+                response_roots.push(body.ref_id.as_str());
+            }
+        }
+    }
+    let by_request = reachable_schemas(request_roots, &bodies);
+    let by_response = reachable_schemas(response_roots, &bodies);
+    bodies
+        .keys()
+        .map(|id| {
+            (
+                *id,
+                SchemaDirections {
+                    request: by_request.contains(id),
+                    response: by_response.contains(id),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The transitive closure of `roots` over the `$ref`s in each reached schema's body.
+///
+/// A root naming no known schema is skipped: a dangling `$ref` is [`resolve_ref`]'s error to report,
+/// and reporting it twice from two places would give one defect two messages.
+fn reachable_schemas<'a>(
+    mut queue: Vec<&'a str>,
+    bodies: &BTreeMap<&'a str, &'a Type>,
+) -> BTreeSet<&'a str> {
+    let mut reached = BTreeSet::new();
+    while let Some(id) = queue.pop() {
+        let Some(body) = bodies.get(id).copied() else {
+            continue;
+        };
+        if !reached.insert(id) {
+            continue;
+        }
+        collect_named_refs(body, &mut queue);
+    }
+    reached
+}
+
+/// Push every component schema id `ty` references. The match is exhaustive (no `_ =>` arm) so a new
+/// [`Type`] variant fails to compile here until its reachability is stated (T-03).
+fn collect_named_refs<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
+    match ty {
+        Type::Named(ref_id) => out.push(ref_id.as_str()),
+        Type::Object(fields) => {
+            for field in fields {
+                collect_named_refs(&field.schema, out);
+            }
+        }
+        Type::Array(items) => collect_named_refs(items, out),
+        Type::Map { key, value } => {
+            collect_named_refs(key, out);
+            collect_named_refs(value, out);
+        }
+        Type::Union(variants) => {
+            for variant in variants {
+                collect_named_refs(variant, out);
+            }
+        }
+        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) | Type::Any {} => {}
+    }
+}
+
+/// Push every known component schema id referenced by a local `$ref` anywhere inside an imported
+/// `OpenAPI` fragment. Ids are looked up in `bodies` so the borrow outlives the decoded name and an
+/// unknown reference is skipped rather than invented.
+fn collect_json_component_refs<'a>(
+    value: &serde_json::Value,
+    bodies: &BTreeMap<&'a str, &'a Type>,
+    out: &mut Vec<&'a str>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some((id, _)) = object
+                .get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(split_local_component_ref)
+                .and_then(|(name, _)| bodies.get_key_value(name.as_str()))
+            {
+                out.push(id);
+            }
+            for child in object.values() {
+                collect_json_component_refs(child, bodies, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_component_refs(item, bodies, out);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
 /// Map each graph [`Schema`] to a component [`SchemaObject`], keyed by its bare local name.
 fn build_component_schemas(
     schemas: &[Schema],
     ref_to_name: &BTreeMap<&str, &str>,
+    directions: &BTreeMap<&str, SchemaDirections>,
 ) -> Result<Vec<(String, SchemaObject)>, crate::CoreError> {
     schemas
         .iter()
         .map(|schema| {
-            let object = lower_named_schema(schema, ref_to_name)?;
+            let reached = directions
+                .get(schema.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let object = lower_named_schema(schema, ref_to_name, reached)?;
             Ok((schema.name.clone(), object))
         })
         .collect()
@@ -811,6 +1007,7 @@ fn build_component_schemas(
 fn lower_named_schema(
     schema: &Schema,
     ref_to_name: &BTreeMap<&str, &str>,
+    directions: SchemaDirections,
 ) -> Result<SchemaObject, crate::CoreError> {
     match &schema.body {
         Type::Enum(members) => Ok(SchemaObject {
@@ -818,7 +1015,7 @@ fn lower_named_schema(
             enum_values: members.clone(),
             ..SchemaObject::default()
         }),
-        Type::Object(fields) => lower_object(fields, ref_to_name),
+        Type::Object(fields) => lower_object(fields, ref_to_name, directions),
         // Named aliases lower exactly like inline field schemas, but live under components so other
         // schemas and SDK model split layouts can reference them by name.
         Type::Primitive(_)
@@ -827,28 +1024,31 @@ fn lower_named_schema(
         | Type::Map { .. }
         | Type::Union(_)
         | Type::Named(_)
-        | Type::Any {} => lower_schema_type(&schema.body, ref_to_name),
+        | Type::Any {} => lower_schema_type(&schema.body, ref_to_name, directions),
     }
 }
 
 /// Lower an object's fields into an `object` [`SchemaObject`] with a sorted `required` list and sorted
-/// properties. Optionality is the `required`-omission axis (a field is `required` iff `field.required`);
-/// nullability is rendered independently on each property's schema (the 3.1 `[T,"null"]` array form).
+/// properties. Presence is the `required`-omission axis, answered for the positions this schema is
+/// reached from ([`SchemaDirections::field_is_required`]); nullability is rendered independently on
+/// each property's schema (the 3.1 `[T,"null"]` array form).
 fn lower_object(
     fields: &[Field],
     ref_to_name: &BTreeMap<&str, &str>,
+    directions: SchemaDirections,
 ) -> Result<SchemaObject, crate::CoreError> {
     let mut required: Vec<String> = fields
         .iter()
-        .filter(|field| field.required)
+        .filter(|field| directions.field_is_required(field))
         .map(|field| field.json_name.clone())
         .collect();
     required.sort();
     let mut properties: Vec<(String, SchemaObject)> = fields
         .iter()
         .map(|field| {
-            // The NULLABLE axis (independent of optional) renders on the property schema.
-            let mut prop = lower_field_schema(&field.schema, field.nullable, ref_to_name)?;
+            // The NULLABLE axis (independent of presence) renders on the property schema.
+            let mut prop =
+                lower_field_schema(&field.schema, field.nullable, ref_to_name, directions)?;
             // Attach field-owned keywords when the schema is not a bare `$ref`. A composed schema
             // (`oneOf`, including nullable references) may carry sibling JSON Schema keywords such
             // as `description`, `default`, and vendor extensions, so do not drop metadata there.
@@ -905,8 +1105,9 @@ fn lower_field_schema(
     ty: &Type,
     nullable: bool,
     ref_to_name: &BTreeMap<&str, &str>,
+    directions: SchemaDirections,
 ) -> Result<SchemaObject, crate::CoreError> {
-    let lowered = lower_schema_type(ty, ref_to_name)?;
+    let lowered = lower_schema_type(ty, ref_to_name, directions)?;
     if !nullable {
         return Ok(lowered);
     }
@@ -941,6 +1142,7 @@ fn null_schema() -> SchemaObject {
 fn lower_schema_type(
     ty: &Type,
     ref_to_name: &BTreeMap<&str, &str>,
+    directions: SchemaDirections,
 ) -> Result<SchemaObject, crate::CoreError> {
     match ty {
         Type::Primitive(prim) => Ok(SchemaObject::primitive(
@@ -955,7 +1157,7 @@ fn lower_schema_type(
         )),
         Type::Array(items) => Ok(SchemaObject {
             type_name: Some("array".to_string()),
-            items: Some(Box::new(lower_schema_type(items, ref_to_name)?)),
+            items: Some(Box::new(lower_schema_type(items, ref_to_name, directions)?)),
             ..SchemaObject::default()
         }),
         // OpenAPI object keys are strings. Reject maps whose source key cannot be represented rather
@@ -974,13 +1176,15 @@ fn lower_schema_type(
                 additional_properties_schema: Some(Box::new(lower_schema_type(
                     value,
                     ref_to_name,
+                    directions,
                 )?)),
                 ..SchemaObject::default()
             })
         }
         Type::Named(ref_id) => Ok(SchemaObject::reference(resolve_ref(ref_id, ref_to_name)?)),
-        // An inline (anonymous) object lowers to a full object schema with its own properties.
-        Type::Object(fields) => lower_object(fields, ref_to_name),
+        // An inline (anonymous) object lowers to a full object schema with its own properties, in the
+        // same positions as the schema that carries it.
+        Type::Object(fields) => lower_object(fields, ref_to_name, directions),
         Type::Enum(members) => Ok(SchemaObject {
             type_name: Some("string".to_string()),
             enum_values: members.clone(),
@@ -990,7 +1194,7 @@ fn lower_schema_type(
         Type::Union(variants) => {
             let one_of = variants
                 .iter()
-                .map(|variant| lower_schema_type(variant, ref_to_name))
+                .map(|variant| lower_schema_type(variant, ref_to_name, directions))
                 .collect::<Result<Vec<_>, crate::CoreError>>()?;
             Ok(SchemaObject {
                 one_of,
@@ -1120,7 +1324,7 @@ mod tests {
 
     use super::{join_base, to_openapi, to_openapi_json};
     use crate::analyze::facts::{Constraints, Extension, FieldMeta, LiteralValue};
-    use crate::graph::{ApiGraph, SecurityScheme};
+    use crate::graph::{ApiGraph, Prim, SecurityScheme, Type};
 
     /// The fixture's security schemes (the SINGLE source of truth for security — CLAUDE.md rule 4):
     /// one `ApiKeyAuth` / `X-API-Key` scheme applied to all operations. Graph-owned `SecurityScheme`s,
@@ -1364,6 +1568,157 @@ mod tests {
         assert!(
             !list_block.contains("enum:"),
             "no enum on query param:\n{list_block}"
+        );
+    }
+
+    /// A field carrying nothing but the two presence axes, so a test can state the case it means and
+    /// nothing else. `SAMPLE`'s schemas index as `CommandMessage` 0, `CreateGoalInput` 1,
+    /// `GoalResponse` 2, `TargetDirection` 3 (sorted by id) — `CreateGoalInput` is the only one a
+    /// request reaches, and the other three are reached from responses.
+    fn presence_field(json_name: &str, required: bool, optional: bool) -> crate::graph::Field {
+        crate::graph::Field {
+            json_name: json_name.to_string(),
+            required,
+            optional,
+            nullable: false,
+            schema: Type::Primitive(Prim::String),
+            description: None,
+            example: None,
+            meta: FieldMeta::default(),
+        }
+    }
+
+    /// The `required` array of one component, or `None` when the component publishes none.
+    fn required_of(yaml: &str, component: &str) -> Option<String> {
+        let block = yaml
+            .split(&format!("    {component}:\n"))
+            .nth(1)
+            .expect("component present");
+        block
+            .lines()
+            .take_while(|line| line.starts_with("      "))
+            .find_map(|line| line.trim().strip_prefix("required: ").map(str::to_string))
+    }
+
+    /// The two axes on one pair of fields, so the only thing that changes between this test and
+    /// `a_request_only_schema_requires_what_the_validation_rules_demand` is which side of the
+    /// exchange the schema is reached from.
+    fn presence_pair() -> Vec<crate::graph::Field> {
+        vec![
+            // Validated on the way in; the serializer may drop the key on the way out.
+            presence_field("validated", true, true),
+            // No validation rule; the serializer writes the key unconditionally.
+            presence_field("written", false, false),
+        ]
+    }
+
+    #[test]
+    fn a_response_only_schema_requires_what_the_serializer_always_writes() {
+        let mut graph = sample_graph();
+        graph.schemas[2].body = Type::Object(presence_pair());
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        // Nothing validates a response, so `validated` carries no claim about one, and the key the
+        // serializer always writes is the one a client can count on.
+        assert_eq!(
+            required_of(&yaml, "GoalResponse").as_deref(),
+            Some("[written]"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_request_only_schema_requires_what_the_validation_rules_demand() {
+        let mut graph = sample_graph();
+        graph.schemas[1].body = Type::Object(presence_pair());
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        // The same two fields, answered the other way: a request is rejected for lacking `validated`,
+        // and `written` describes what the server sends, which says nothing about what it accepts.
+        assert_eq!(
+            required_of(&yaml, "CreateGoalInput").as_deref(),
+            Some("[validated]"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_schema_reached_from_both_directions_requires_only_what_holds_in_both() {
+        let mut graph = sample_graph();
+        // Reach the request body from a response too, so ONE component has to describe both payloads.
+        graph.schemas[2].body = Type::Object(vec![crate::graph::Field {
+            schema: Type::Named("internal/dto.CreateGoalInput".to_string()),
+            ..presence_field("input", false, false)
+        }]);
+        graph.schemas[1].body = Type::Object(vec![
+            presence_field("mandatory", true, false),
+            presence_field("validated", true, true),
+            presence_field("written", false, false),
+        ]);
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        // `validated` may be absent from a response and `written` may be absent from a request, so
+        // publishing either would state as mandatory something one of the two sides omits.
+        assert_eq!(
+            required_of(&yaml, "CreateGoalInput").as_deref(),
+            Some("[mandatory]"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn presence_answers_a_nested_schema_the_direction_of_what_reaches_it() {
+        let mut graph = sample_graph();
+        // TargetDirection is reached only through GoalResponse's `direction` field, and GoalResponse
+        // is only ever a response body — so the nested schema is on the response side too.
+        graph.schemas[3].body = Type::Object(presence_pair());
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        assert_eq!(
+            required_of(&yaml, "TargetDirection").as_deref(),
+            Some("[written]"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_puts_the_schema_it_names_on_the_request_side() {
+        let mut graph = sample_graph();
+        // TargetDirection already arrives from a response through GoalResponse.direction; naming it
+        // on a query parameter reaches it from a request as well, which narrows its answer to the
+        // fields both sides carry.
+        graph.schemas[3].body = Type::Object(vec![
+            presence_field("mandatory", true, false),
+            presence_field("validated", true, true),
+            presence_field("written", false, false),
+        ]);
+        graph.operations[1].params[0].schema =
+            Type::Named("internal/dto.TargetDirection".to_string());
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        assert_eq!(
+            required_of(&yaml, "TargetDirection").as_deref(),
+            Some("[mandatory]"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn a_schema_no_operation_reaches_keeps_its_source_requiredness() {
+        let mut graph = sample_graph();
+        // A registered-but-unwired schema occupies no position in an exchange, so there is no
+        // direction to read it from and the source's own statement about the field stands.
+        graph.schemas.push(crate::graph::Schema {
+            id: "internal/dto.Unwired".to_string(),
+            name: "Unwired".to_string(),
+            body: Type::Object(presence_pair()),
+            enum_source_order: Vec::new(),
+            provenance: crate::graph::SourceSpan {
+                file: "dto.go".to_string(),
+                start_line: 9,
+                end_line: 9,
+            },
+        });
+        let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
+        assert_eq!(
+            required_of(&yaml, "Unwired").as_deref(),
+            Some("[validated]"),
+            "{yaml}"
         );
     }
 

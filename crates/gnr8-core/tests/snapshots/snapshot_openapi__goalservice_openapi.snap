@@ -1,5 +1,6 @@
 ---
 source: crates/gnr8-core/tests/snapshot_openapi.rs
+assertion_line: 40
 expression: openapi
 ---
 openapi: 3.1.0
@@ -173,7 +174,7 @@ components:
           description: Rolling window size in days
     GoalResponse:
       type: object
-      required: [name, uuid]
+      required: [analyticsQuery, createdAt, name, uuid]
       properties:
         analyticsQuery:
           $ref: '#/components/schemas/GoalAnalyticsQuery'
@@ -213,6 +214,7 @@ components:
           example: error-slug
     ListGoalsOutput:
       type: object
+      required: [goals, pageSize, total]
       properties:
         goals:
           type: [array, 'null']

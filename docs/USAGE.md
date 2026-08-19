@@ -292,10 +292,28 @@ Resolution is via `go/types` (alias/import-robust), not string matching.
 | response | `c.JSON(http.StatusXxx, v)` where `v: T` | status→T. Unresolved/dynamic → diagnostic. |
 | operationId | handler func/method name | overridable via a `RenameOperation` transform. |
 | summary / description | the handler's own **doc comment**, as plain prose | first sentence → `summary`, remainder → `description`. Only routed handlers are read. No marker or grammar of any kind; a comment can carry nothing else. |
-| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required`. Only the field's own scope counts — see below. |
-| source-optional field | `json:",omitempty"` / `json:",omitzero"` — **not** pointer `*T` | source optionality signal; schema `required` still comes from required tags. A bare `*T` keeps its key (`encoding/json` writes `null` into it), so it is nullable, not optional. |
+| required field | struct tag `binding:"required"` or `validate:"required"` | → schema `required` **on a request**. Only the field's own scope counts — see below. |
+| source-optional field | `json:",omitempty"` / `json:",omitzero"` — **not** pointer `*T` | the presence axis, which is what keeps a field **out of** schema `required` **on a response** — a field with no omission option is written on every response, so it is always present. A bare `*T` keeps its key (`encoding/json` writes `null` into it), so it is nullable, not optional. |
 | enum | named `string` type + `const` set | → OpenAPI string enum + Go typed newtype. |
 | from config (not source) | security schemes, base/mount path, title | not expressible in typed source — set by transforms (`ApplySecurity`/`SetBasePath`/`SetTitle`) in the `.gnr8/` crate. |
+
+### `required` is answered from the direction the schema is reached from
+
+`required` asks one question — must this key be present? — and which source code fact answers it
+depends on which side of the exchange the payload is on:
+
+| The schema is reached from | `required` is | Because |
+|---|---|---|
+| requests only (a request body, a parameter, or a schema one of those reaches) | the `binding:`/`validate:` `required` rules | that is what the server rejects a request for lacking |
+| responses only | every field with **no** `json` omission option | that is what `encoding/json` writes unconditionally; nothing validates a response |
+| both | only the fields that satisfy **both** rules | one component describes both payloads, so it can only promise what holds in each |
+
+The direction is a property of your routes, not a setting. A DTO used in one direction gets an exact
+answer; a struct shared between a request body and a response body gets the narrower one, because a
+field the request does not demand may legitimately be absent from what a client sends, and a field
+the serializer may omit is not something a client can count on receiving. **If you want the exact
+answer in each direction, use a separate type for each** — that is the only thing that makes the two
+questions separately answerable.
 
 ### Validation rules apply at the scope they are written in
 
@@ -455,6 +473,10 @@ lists every diagnostic.
   `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
   different wire with different rules: never nullable (a part has no `null`), and optional when the
   part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).
+- A schema's `required` array is answered from the direction the schema is reached from, so the same
+  struct fields can publish different `required` sets in a request DTO and a response DTO. A struct
+  shared between the two publishes only what holds in both — see
+  [`required` is answered from the direction the schema is reached from](#required-is-answered-from-the-direction-the-schema-is-reached-from).
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.
 - The Go frontend recognizes Gin route registration, not arbitrary Go routers.
