@@ -22,10 +22,10 @@ type BookList struct {
 type CreateBookRequest struct {
 	Author    string    `json:"author"`
 	Genre     Genre     `json:"genre"`
-	Price     float64   `json:"price"`
-	Publisher Publisher `json:"publisher"`
+	Price     float64   `json:"price,omitempty"`
+	Publisher Publisher `json:"publisher,omitempty"`
 	Subtitle  *string   `json:"subtitle,omitempty"`
-	Tags      []string  `json:"tags"`
+	Tags      []string  `json:"tags,omitempty"`
 	Title     string    `json:"title"`
 }
 

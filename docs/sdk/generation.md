@@ -41,6 +41,32 @@ derive the generated package name unless package metadata supplies a registry na
 Package metadata defaults to version `0.1.0`. `source_only()` disables generated docs and package
 metadata. `without_docs()` disables docs only; `package_metadata(bool)` controls metadata files.
 
+## Field presence in generated models
+
+Whether a model lets a key be left out — Go's `,omitempty`, TypeScript's `?:`, Python's `= None` —
+is answered from the direction its schema is reached from, the same walk that answers the OpenAPI
+[`required` array](../openapi/generation.md#a-component-schemas-required-array).
+
+| The schema is reached from | The model may leave the key out when |
+|---|---|
+| requests only (a request body, a parameter, or a schema one of those reaches) | the source states no validation rule requiring it |
+| responses only, both, or no operation at all | the source's serializer may leave the key out |
+
+A validation rule says what your server rejects an inbound payload for lacking, so a model reads it
+exactly where the model is inbound and only inbound. In Go that matters most: `,omitempty` governs
+marshalling and a server unmarshals a request DTO rather than marshalling one, so a field written
+`json:"name,omitempty" binding:"required"` is required in the request model — previously a caller who
+set it to the zero value sent nothing and the server rejected the call.
+
+Everywhere else the model is, or may be, the decode side, and demanding a key the server may leave
+out would fail on a payload it is entitled to send. That is also the answer a type reached from both
+directions keeps: one Go struct, one Python model, one TypeScript interface cannot be exact for two
+contracts, and the safe half is the one that cannot break a decode. Use a separate type per direction
+to get the exact answer in both.
+
+Non-Go sources are unaffected: FastAPI, Flask, NestJS, and an imported OpenAPI document each state
+presence once, so both readings give the same answer.
+
 ## File layouts
 
 ```rust

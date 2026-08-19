@@ -78,6 +78,11 @@ setting for it. A schema shared between a request body and a response body gets 
 use a separate type for each direction to get the exact one in both. An imported OpenAPI document
 states presence once, so its `required` arrays re-emit unchanged whichever way its schemas are used.
 
+Generated SDK models read the same walk and answer the same question, which is why a request-only
+schema's model and its `required` array now always agree — see
+[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models) for
+where the two artifacts deliberately differ.
+
 ## Metadata
 
 `OpenApiMetadata` sets title, version, description, terms of service, contact, license, and one or more

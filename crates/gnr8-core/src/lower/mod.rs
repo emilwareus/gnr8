@@ -22,9 +22,10 @@
 //! `required` asks "must this key be present?", and the graph carries two code-derived facts that
 //! answer it on opposite sides of an exchange: `field.required` (what the server's validation rejects
 //! a request for lacking) and `!field.optional` (what the serializer unconditionally writes). Which
-//! one applies is decided by the positions a schema is reached from, computed here by walking the
-//! graph from each operation — see [`SchemaDirections`]. That is one answer per position rather than
-//! a precedence between two candidates, so there is no fallback and nothing to configure (rule 3).
+//! one applies is decided by the positions a schema is reached from, computed by walking the graph
+//! from each operation — see [`crate::graph::direction`], which the SDK model emitters read too. That
+//! is one answer per position rather than a precedence between two candidates, so there is no fallback
+//! and nothing to configure (rule 3).
 //!
 //! ## Diagnostics (OAPI-03)
 //!
@@ -40,9 +41,10 @@ pub(crate) mod model;
 mod yaml;
 
 use crate::analyze::facts::LiteralValue;
+use crate::graph::direction::{directions_of, schema_directions, SchemaDirections};
 use crate::graph::{
-    ApiGraph, Field, Operation as GraphOp, OperationDocsPolicy, Prim, Schema,
-    SecurityScheme as GraphSecurityScheme, Type, WellKnown,
+    split_local_component_ref, ApiGraph, Field, Operation as GraphOp, OperationDocsPolicy, Prim,
+    Schema, SecurityScheme as GraphSecurityScheme, Type, WellKnown,
 };
 use model::{
     Components, Info, MediaExample, OpenApiDoc, Operation, Parameter, PathItem, RequestBody,
@@ -574,14 +576,6 @@ fn rewrite_parameter_local_refs(value: &mut serde_json::Value, refs: &BTreeMap<&
 /// Split a local component `$ref` into its decoded component id and any JSON-Pointer suffix, or
 /// `None` when the reference does not name a local component schema. The single definition of that
 /// grammar, so the reader that resolves refs and the walk that classifies them cannot disagree.
-fn split_local_component_ref(reference: &str) -> Option<(String, Option<&str>)> {
-    let tail = reference.strip_prefix("#/components/schemas/")?;
-    let (raw_name, suffix) = tail
-        .split_once('/')
-        .map_or((tail, None), |(name, suffix)| (name, Some(suffix)));
-    Some((raw_name.replace("~1", "/").replace("~0", "~"), suffix))
-}
-
 fn rewrite_local_component_ref(reference: &str, refs: &BTreeMap<&str, &str>) -> Option<String> {
     let (name, suffix) = split_local_component_ref(reference)?;
     let public_name = refs.get(name.as_str())?;
@@ -807,180 +801,6 @@ where
     out
 }
 
-/// The HTTP positions a component schema is reached from.
-///
-/// `required` asks one question — "must this key be present?" — and the graph answers it with a
-/// different field depending on which side of the exchange the payload is on. On a request the answer
-/// is `field.required`: what the server's own validation rejects a payload for lacking. On a response
-/// no validation rule applies (a handler does not validate what it marshals), and the answer is
-/// `!field.optional`: what the serializer unconditionally writes. Both are code-derived facts already
-/// on the graph, and which one applies is decided by reachability, not by preference — so this is one
-/// source per fact per position, not a precedence chain between two candidate answers (CLAUDE.md rule
-/// 3).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct SchemaDirections {
-    /// Reached from a request body, a parameter, or a schema one of those reaches.
-    request: bool,
-    /// Reached from a response body, or a schema one of those reaches.
-    response: bool,
-}
-
-impl SchemaDirections {
-    /// A parameter is a request, and so is every schema inline within one.
-    const REQUEST: Self = Self {
-        request: true,
-        response: false,
-    };
-
-    /// Whether `field`'s key must be present in every payload this schema describes.
-    fn field_is_required(self, field: &Field) -> bool {
-        match (self.request, self.response) {
-            // Reached from both directions: ONE component has to describe both payloads, so publish
-            // only what holds in every position it occupies. Anything else states as mandatory
-            // something one of the two sides may legitimately omit.
-            (true, true) => field.required && !field.optional,
-            // Response-only: what the serializer always writes.
-            (false, true) => !field.optional,
-            // Request-only — and a schema no operation reaches, which has no position to be read
-            // from, so the source's own statement about the field stands.
-            (_, false) => field.required,
-        }
-    }
-}
-
-/// Map every component schema id to the positions it is reached from ([`SchemaDirections`]).
-///
-/// Roots are an operation's request body and parameters (request) and its response bodies (response);
-/// from each root the walk follows `$ref`s through schema bodies, so a nested type is reached from
-/// wherever the type carrying it is. A `$ref` is a leaf of the walk — what lies beyond it is reached
-/// from that schema's own body, which is how a type shared between a request DTO and a response DTO
-/// comes out marked as both.
-fn schema_directions(graph: &ApiGraph) -> BTreeMap<&str, SchemaDirections> {
-    let bodies: BTreeMap<&str, &Type> = graph
-        .schemas
-        .iter()
-        .map(|schema| (schema.id.as_str(), &schema.body))
-        .collect();
-    let mut request_roots: Vec<&str> = Vec::new();
-    let mut response_roots: Vec<&str> = Vec::new();
-    for op in &graph.operations {
-        if let Some(body) = &op.request_body {
-            request_roots.push(body.ref_id.as_str());
-        }
-        for param in &op.params {
-            collect_named_refs(&param.schema, &mut request_roots);
-            // A parameter also carries imported `OpenAPI` fragments verbatim, and those can reference
-            // a component the typed schema does not — the same `$ref`s `rewrite_parameter_local_refs`
-            // rewrites on the way out. They are parameters, so they are requests.
-            for value in param
-                .openapi_content
-                .iter()
-                .chain(param.openapi_fields.iter().map(|(_, value)| value))
-            {
-                collect_json_component_refs(value, &bodies, &mut request_roots);
-            }
-        }
-        for response in &op.responses {
-            if let Some(body) = &response.body {
-                response_roots.push(body.ref_id.as_str());
-            }
-        }
-    }
-    let by_request = reachable_schemas(request_roots, &bodies);
-    let by_response = reachable_schemas(response_roots, &bodies);
-    bodies
-        .keys()
-        .map(|id| {
-            (
-                *id,
-                SchemaDirections {
-                    request: by_request.contains(id),
-                    response: by_response.contains(id),
-                },
-            )
-        })
-        .collect()
-}
-
-/// The transitive closure of `roots` over the `$ref`s in each reached schema's body.
-///
-/// A root naming no known schema is skipped: a dangling `$ref` is [`resolve_ref`]'s error to report,
-/// and reporting it twice from two places would give one defect two messages.
-fn reachable_schemas<'a>(
-    mut queue: Vec<&'a str>,
-    bodies: &BTreeMap<&'a str, &'a Type>,
-) -> BTreeSet<&'a str> {
-    let mut reached = BTreeSet::new();
-    while let Some(id) = queue.pop() {
-        let Some(body) = bodies.get(id).copied() else {
-            continue;
-        };
-        if !reached.insert(id) {
-            continue;
-        }
-        collect_named_refs(body, &mut queue);
-    }
-    reached
-}
-
-/// Push every component schema id `ty` references. The match is exhaustive (no `_ =>` arm) so a new
-/// [`Type`] variant fails to compile here until its reachability is stated (T-03).
-fn collect_named_refs<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
-    match ty {
-        Type::Named(ref_id) => out.push(ref_id.as_str()),
-        Type::Object(fields) => {
-            for field in fields {
-                collect_named_refs(&field.schema, out);
-            }
-        }
-        Type::Array(items) => collect_named_refs(items, out),
-        Type::Map { key, value } => {
-            collect_named_refs(key, out);
-            collect_named_refs(value, out);
-        }
-        Type::Union(variants) => {
-            for variant in variants {
-                collect_named_refs(variant, out);
-            }
-        }
-        Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) | Type::Any {} => {}
-    }
-}
-
-/// Push every known component schema id referenced by a local `$ref` anywhere inside an imported
-/// `OpenAPI` fragment. Ids are looked up in `bodies` so the borrow outlives the decoded name and an
-/// unknown reference is skipped rather than invented.
-fn collect_json_component_refs<'a>(
-    value: &serde_json::Value,
-    bodies: &BTreeMap<&'a str, &'a Type>,
-    out: &mut Vec<&'a str>,
-) {
-    match value {
-        serde_json::Value::Object(object) => {
-            if let Some((id, _)) = object
-                .get("$ref")
-                .and_then(serde_json::Value::as_str)
-                .and_then(split_local_component_ref)
-                .and_then(|(name, _)| bodies.get_key_value(name.as_str()))
-            {
-                out.push(id);
-            }
-            for child in object.values() {
-                collect_json_component_refs(child, bodies, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_json_component_refs(item, bodies, out);
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-}
-
 /// Map each graph [`Schema`] to a component [`SchemaObject`], keyed by its bare local name.
 fn build_component_schemas(
     schemas: &[Schema],
@@ -990,10 +810,7 @@ fn build_component_schemas(
     schemas
         .iter()
         .map(|schema| {
-            let reached = directions
-                .get(schema.id.as_str())
-                .copied()
-                .unwrap_or_default();
+            let reached = directions_of(directions, &schema.id);
             let object = lower_named_schema(schema, ref_to_name, reached)?;
             Ok((schema.name.clone(), object))
         })

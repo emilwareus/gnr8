@@ -16,6 +16,7 @@ mod gofmt;
 
 use std::collections::BTreeMap;
 
+use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
@@ -140,8 +141,16 @@ pub(crate) fn generate_files_with_layout(
         if let Some(raw) = emit::emit_facades(graph, package, &ops)? {
             files.push(raw_go_file("facades.go", raw));
         }
+        // One walk for the whole bundle: the positions a schema is reached from are a property of the
+        // graph, not of the file it lands in.
+        let directions = schema_directions(graph);
         for schema in &graph.schemas {
-            let raw = emit::emit_model_schema(graph, package, schema)?;
+            let raw = emit::emit_model_schema(
+                graph,
+                package,
+                schema,
+                directions_of(&directions, &schema.id),
+            )?;
             let name = model_file_name(
                 layout,
                 schema,

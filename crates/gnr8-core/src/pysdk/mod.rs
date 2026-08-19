@@ -16,6 +16,7 @@ mod emit;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
@@ -207,6 +208,9 @@ pub(crate) fn generate_files_with_options(
             name: model_init_name,
             contents: emit::emit_models_init(&model_imports),
         });
+        // One walk for the whole bundle: the positions a schema is reached from are a property of the
+        // graph, not of the file it lands in.
+        let directions = schema_directions(graph);
         for schema in &graph.schemas {
             let name = schema_file_names
                 .get(&schema.name)
@@ -223,7 +227,13 @@ pub(crate) fn generate_files_with_options(
                 .collect();
             files.push(SdkFile {
                 name,
-                contents: emit::emit_model_schema(graph, schema, model_style, &dep_modules)?,
+                contents: emit::emit_model_schema(
+                    graph,
+                    schema,
+                    model_style,
+                    &dep_modules,
+                    directions_of(&directions, &schema.id),
+                )?,
             });
         }
     } else {

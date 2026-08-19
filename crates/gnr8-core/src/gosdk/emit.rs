@@ -5,7 +5,8 @@
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
-//!   json tags carry `,omitempty` for optional fields, types follow TARGET-API.md §4.
+//!   json tags carry `,omitempty` for a key the model may leave out (which side of an exchange the
+//!   struct is on decides that — [`crate::graph::direction`]), types follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
@@ -23,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::graph::direction::{directions_of, schema_directions, SchemaDirections};
 use crate::graph::{
     ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Prim,
     RuntimePolicy, Schema, Type, WellKnown,
@@ -296,6 +298,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
 
     let mut body = String::new();
     let mut needs_time = false;
+    let directions = schema_directions(graph);
 
     let mut first = true;
     for schema in &graph.schemas {
@@ -319,6 +322,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
                     fields,
                     graph,
                     is_multipart_request_schema(graph, &schema.id)?,
+                    directions_of(&directions, &schema.id),
                 )?;
             }
             Type::Primitive(_)
@@ -351,6 +355,7 @@ pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     package: &str,
     schema: &Schema,
+    directions: SchemaDirections,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
@@ -368,6 +373,7 @@ pub(crate) fn emit_model_schema(
                 fields,
                 graph,
                 is_multipart_request_schema(graph, &schema.id)?,
+                directions,
             )?;
         }
         Type::Primitive(_)
@@ -401,11 +407,19 @@ fn emit_struct(
     fields: &[Field],
     graph: &ApiGraph,
     multipart_request: bool,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     let fields = go_field_emissions(fields)?;
     writeln!(body, "type {name} struct {{").map_err(sink)?;
     for field in &fields {
-        emit_struct_field(body, field.field, &field.go_name, graph, multipart_request)?;
+        emit_struct_field(
+            body,
+            field.field,
+            &field.go_name,
+            graph,
+            multipart_request,
+            directions,
+        )?;
     }
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -458,22 +472,25 @@ fn emit_type_alias(
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
 ///
-/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads the OPTIONAL axis — the two are
-/// distinct (RESEARCH Pitfall 4): an optional-not-nullable value stays a non-pointer `T` with omitempty;
-/// a nullable value becomes `*T`.
+/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads whether the model may leave the
+/// key out — the two are distinct (RESEARCH Pitfall 4): an omittable-not-nullable value stays a
+/// non-pointer `T` with omitempty; a nullable value becomes `*T`. Which graph fact answers omittability
+/// depends on where the struct sits in an exchange, so it comes from
+/// [`SchemaDirections::model_field_is_optional`] rather than straight off the presence axis.
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
     go_name: &str,
     graph: &ApiGraph,
     multipart_request: bool,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     let go_ty = if multipart_request {
         go_multipart_field_type(&field.schema, field.nullable, graph)?
     } else {
         go_type(&field.schema, field.nullable, graph)?
     };
-    let tag = json_tag(&field.json_name, field.optional);
+    let tag = json_tag(&field.json_name, directions.model_field_is_optional(field));
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
 }
@@ -3738,9 +3755,10 @@ mod tests {
             let out = emit_models(&sample_graph(), "goalservice").unwrap();
             // uuid → string.
             assert!(out.contains("UUID string `json:\"uuid\"`"), "{out}");
-            // date-time → time.Time.
+            // date-time → time.Time. `createdAt` sits on the request-only CreateGoalInput and carries
+            // no validation rule, so the server accepts a payload without it and the tag says so.
             assert!(
-                out.contains("CreatedAt time.Time `json:\"createdAt\"`"),
+                out.contains("CreatedAt time.Time `json:\"createdAt,omitempty\"`"),
                 "{out}"
             );
             // []uuid → []string.

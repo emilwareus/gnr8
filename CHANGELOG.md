@@ -134,8 +134,9 @@ must move the minor version.
   `pageSize`, and `total`), and a response field that carried a stray `binding:"required"` next to an
   omission option leaves the array — the case where the document demanded a key the SDKs let you
   omit. Python, TypeScript, and OpenAPI-imported sources state presence once and record it on both
-  axes, so their documents are byte-identical either way. Generated SDKs are unaffected: they read
-  the presence axis, which has not moved.
+  axes, so their documents are byte-identical either way. Generated SDKs are untouched by this
+  entry — they read the presence axis, which has not moved here; the entry below moves them onto the
+  same walk.
 
 - **`ApiOverrides::force_required` / `force_optional` now state presence instead of correcting one
   axis of it.** Both wrote the graph's `required` field and nothing else. That was already half a
@@ -158,6 +159,50 @@ must move the minor version.
   already read both axes — a TypeScript multipart body's inline part type — is unchanged in meaning,
   since the two axes now agree by construction. Emitted documents change only for schemas reached
   from responses, where the overrides now take effect rather than being discarded.
+
+- **A generated request model no longer lets a caller omit a key the server rejects the request for
+  lacking.** `GoSdk`, `PySdk`, and `TsSdk` each read the presence axis unconditionally, so a request
+  DTO written the ordinary Go way — `Name string \`json:"name,omitempty" binding:"required"\`` —
+  emitted `json:"name,omitempty"`, `name: Optional[str] = None`, and `name?: string`. The document
+  said the key was required and every SDK said it was not; in Go the caller did not even have to try,
+  since setting `Name = ""` explicitly still sent nothing. This is the mirror of the entry above:
+  that one was the document being right for requests and wrong for responses, this one is the SDK
+  being right for responses and wrong for requests, and both came of answering a directional question
+  with a non-directional fact.
+
+  Models now read the same walk the document reads, which moved out of the lowering so there is one
+  implementation of it rather than two:
+
+  - a schema reached from **requests only** → the validation rules. `,omitempty` governs marshalling
+    and a server unmarshals a request DTO rather than marshalling one, so the tag describes nothing
+    about what a client may leave out; the `binding:`/`validate:` rules state exactly what the server
+    demands, and they are the only fact in the source that does.
+  - a schema reached from **responses only, from both, or from no operation** → the presence axis,
+    unchanged. There the model is, or may be, the decode side, and demanding a key the serializer may
+    drop fails on a payload the server is entitled to send.
+
+  The **both** arm is a deliberate choice rather than the document's rule carried over. A document
+  publishes the weakest true claim, which is always safe; a model *behaves*, and its optionality is a
+  permission on the way out and a tolerance on the way in, so weakest is not safest. Where one type
+  carries both contracts and a field is validated *and* omittable, no marking is safe, and the model
+  keeps the response answer: the residual failure is then a request the caller can see rejected and
+  fix by passing the value, rather than a legal response the SDK cannot decode — the over-required
+  response model the presence-axis entry above exists to prevent. Applying the document's
+  intersection instead would also have marked optional every field of a both-ways type that carries
+  no validation rule at all, which is most of them.
+
+  **This changes generated SDKs for Go sources.** For every schema reached only from requests, the
+  model's required set is now exactly the document's `required` array — the two artifacts agree in
+  all four axis combinations, where they used to disagree in two. In this repo that means
+  `CreateGoalInput.description`, `CreateBookRequest.{price, publisher, tags}`, and
+  `CreateTaskRequest.{assignee, dueAt, labels, priority}` become omittable, each a field the server
+  states no rule for and the document already published as not required. In the other direction, a
+  validated field carrying an omission option stops being omittable, which is a compile error for a
+  Python or TypeScript caller who was omitting it — the call it replaces was a 4xx. One shape needs a
+  closer look before publishing: `PySdk::dataclasses()` orders defaulted fields last, so a field
+  changing sides moves in the constructor's positional order; keyword construction is unaffected.
+  FastAPI, Flask, NestJS, and OpenAPI-imported sources state presence once, so their SDKs are
+  byte-identical either way.
 
 ### Breaking
 
