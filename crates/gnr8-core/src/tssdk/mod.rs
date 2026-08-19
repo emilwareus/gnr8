@@ -16,6 +16,7 @@
 
 mod emit;
 
+use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
@@ -139,40 +140,7 @@ pub(crate) fn generate_files_with_layout(
     }
 
     if layout.is_split() {
-        let model_index_name = file_in_dir(Some(model_dir), "index.ts");
-        let mut model_exports = Vec::new();
-        let mut schema_file_names = BTreeMap::new();
-        for schema in &graph.schemas {
-            let default_name =
-                file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
-            let name = if layout.model_file_template_ref().is_some() {
-                ts_model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
-            } else {
-                default_name
-            };
-            model_exports.push(ts_relative_module(&model_index_name, &name));
-            schema_file_names.insert(schema.name.clone(), name);
-        }
-        files.push(SdkFile {
-            name: model_index_name.clone(),
-            contents: emit_ts_models_index(&model_exports),
-        });
-        for schema in &graph.schemas {
-            let name = schema_file_names
-                .get(&schema.name)
-                .ok_or_else(|| crate::CoreError::SdkGen {
-                    message: format!(
-                        "schema {} did not have a precomputed TypeScript file",
-                        schema.name
-                    ),
-                })?
-                .clone();
-            let models_module = ts_relative_module(&name, &model_index_name);
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_schema(graph, schema, &models_module)?,
-            });
-        }
+        files.extend(generate_model_files(graph, layout, model_dir)?);
     } else {
         files.push(SdkFile {
             name: "models.ts".to_string(),
@@ -182,6 +150,56 @@ pub(crate) fn generate_files_with_layout(
 
     check_unique_file_names(&files, "TypeScript SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(files)
+}
+
+/// The split-layout model files: one per schema, plus the barrel `index.ts` that re-exports them.
+fn generate_model_files(
+    graph: &ApiGraph,
+    layout: &SdkFileLayout,
+    model_dir: &str,
+) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let model_index_name = file_in_dir(Some(model_dir), "index.ts");
+    let mut model_exports = Vec::new();
+    let mut schema_file_names = BTreeMap::new();
+    for schema in &graph.schemas {
+        let default_name = file_in_dir(Some(model_dir), &format!("{}.ts", file_stem(&schema.name)));
+        let name = if layout.model_file_template_ref().is_some() {
+            ts_model_file_name(layout, schema, &format!("{}.ts", file_stem(&schema.name)))?
+        } else {
+            default_name
+        };
+        model_exports.push(ts_relative_module(&model_index_name, &name));
+        schema_file_names.insert(schema.name.clone(), name);
+    }
+    let mut files = vec![SdkFile {
+        name: model_index_name.clone(),
+        contents: emit_ts_models_index(&model_exports),
+    }];
+    // One walk for the whole bundle: the positions a schema is reached from are a property of the
+    // graph, not of the file it lands in.
+    let directions = schema_directions(graph);
+    for schema in &graph.schemas {
+        let name = schema_file_names
+            .get(&schema.name)
+            .ok_or_else(|| crate::CoreError::SdkGen {
+                message: format!(
+                    "schema {} did not have a precomputed TypeScript file",
+                    schema.name
+                ),
+            })?
+            .clone();
+        let models_module = ts_relative_module(&name, &model_index_name);
+        files.push(SdkFile {
+            name,
+            contents: emit::emit_model_schema(
+                graph,
+                schema,
+                &models_module,
+                directions_of(&directions, &schema.id),
+            )?,
+        });
+    }
     Ok(files)
 }
 

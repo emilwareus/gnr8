@@ -15,6 +15,8 @@
 //! Provenance (D-07): every operation, param, and schema carries a [`SourceSpan`] (file + line range,
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
+pub(crate) mod direction;
+
 use crate::analyze::facts::{
     DiagnosticCategoryFact, DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact,
     ResponseFact, RouteFact, SchemaFact, TypeRef,
@@ -24,6 +26,21 @@ use crate::analyze::facts::{
 // mirrors the wire contract byte-for-byte; a single source of truth prevents drift). Consumers of the
 // graph match these variants exhaustively.
 pub use crate::analyze::facts::{FieldFact as Field, Prim, Type, WellKnown};
+
+/// Split a local component `$ref` into its decoded schema name and any trailing pointer segment.
+///
+/// The graph carries imported `OpenAPI` fragments verbatim ([`Param::openapi_content`] and
+/// [`Param::openapi_fields`]), so reading the `$ref`s inside one is a graph-level concern: both the
+/// `OpenAPI` target (rewriting them to public names) and [`direction`] (following them to decide which
+/// side of an exchange a component is reached from) need the same parse, and one parse is one answer.
+/// Returns `None` for anything that is not a local `#/components/schemas/...` reference.
+pub(crate) fn split_local_component_ref(reference: &str) -> Option<(String, Option<&str>)> {
+    let tail = reference.strip_prefix("#/components/schemas/")?;
+    let (raw_name, suffix) = tail
+        .split_once('/')
+        .map_or((tail, None), |(name, suffix)| (name, Some(suffix)));
+    Some((raw_name.replace("~1", "/").replace("~0", "~"), suffix))
+}
 
 /// The language-neutral API graph extracted from one analyzed module (D-07).
 ///

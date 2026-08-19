@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::graph::direction::{directions_of, schema_directions, SchemaDirections};
 use crate::graph::{
     ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
     Prim, RuntimePolicy, Type,
@@ -273,6 +274,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
 
     check_unique_schema_names(graph, "TypeScript SDK")?;
 
+    let directions = schema_directions(graph);
     for (i, schema) in graph.schemas.iter().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -281,7 +283,14 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
             // A named enum exposes both runtime values and its exact wire-value union.
             Type::Enum(members) => emit_enum_alias(&mut out, &schema.name, members)?,
             // A named object → an `interface`.
-            Type::Object(fields) => emit_interface(&mut out, &schema.name, fields, graph, "")?,
+            Type::Object(fields) => emit_interface(
+                &mut out,
+                &schema.name,
+                fields,
+                graph,
+                "",
+                directions_of(&directions, &schema.id),
+            )?,
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Book | OutOfStock`, or a
             // scalar/array/map alias) → a plain `type` alias. This is the load-bearing divergence from
             // the Go twin, which rejected named unions outright (Go has no sum types). `ts_type` maps
@@ -311,12 +320,22 @@ pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     schema: &crate::graph::Schema,
     models_module: &str,
+    directions: SchemaDirections,
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut body = String::new();
     match &schema.body {
         Type::Enum(members) => emit_enum_alias(&mut body, &schema.name, members)?,
-        Type::Object(fields) => emit_interface(&mut body, &schema.name, fields, graph, "models.")?,
+        Type::Object(fields) => {
+            emit_interface(
+                &mut body,
+                &schema.name,
+                fields,
+                graph,
+                "models.",
+                directions,
+            )?;
+        }
         Type::Primitive(_)
         | Type::WellKnown(_)
         | Type::Array(_)
@@ -397,14 +416,17 @@ fn pascal_identifier(value: &str) -> String {
 ///
 /// Unlike the Python `@dataclass` twin there is NO required-first partition (TS `?:` is order-free —
 /// RESEARCH Pitfall 6). The runtime response decoder validates media type, presence, and JSON syntax
-/// before casting into these zero-runtime interfaces. The two independent axes are: `optional` → `?:` at the field site;
-/// `nullable` → `| null` inside [`ts_type`]. All four combinations are representable.
+/// before casting into these zero-runtime interfaces. The two independent axes are: whether the model
+/// may leave the key out → `?:` at the field site (answered from the direction the schema is reached
+/// from — [`SchemaDirections::model_field_is_optional`]); `nullable` → `| null` inside [`ts_type`]. All
+/// four combinations are representable.
 fn emit_interface(
     out: &mut String,
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
     ns: &str,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     if fields.is_empty() {
         // eslint/tsc dislikes `{}` as a type; an empty record is the precise zero-field shape.
@@ -425,7 +447,11 @@ fn emit_interface(
             ts_string_literal(&field.json_name)
         };
         let hint = ts_field_type(field, graph, ns)?;
-        let opt = if field.optional { "?" } else { "" };
+        let opt = if directions.model_field_is_optional(field) {
+            "?"
+        } else {
+            ""
+        };
         writeln!(out, "  {key}{opt}: {hint};").map_err(sink)?;
     }
     writeln!(out, "}}").map_err(sink)?;
@@ -3050,10 +3076,19 @@ fn ts_multipart_request_body_arg_type(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let optional = if field.required && !field.optional {
-            ""
-        } else {
+        // This inline shape is the argument a caller builds a multipart request from and is used for
+        // nothing else, so it occupies the request position by construction and takes the request
+        // answer — not the one the walk would return for the schema as a whole.
+        //
+        // Those differ when the same type is also a response body: the walk then reports both
+        // directions and `models.X` marks a validated-and-omittable field `?:`, because that interface
+        // has to survive a decode too. This argument never decodes anything, so narrowing it to what
+        // the server accepts costs the caller nothing and is the whole point of the rule. One position,
+        // one answer, in both places.
+        let optional = if SchemaDirections::REQUEST.model_field_is_optional(field) {
             "?"
+        } else {
+            ""
         };
         let ty = ts_multipart_field_type(&field.schema, field.nullable, graph)?;
         parts.push(format!("{key}{optional}: {ty}"));

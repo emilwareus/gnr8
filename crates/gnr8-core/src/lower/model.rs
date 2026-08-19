@@ -272,7 +272,7 @@ pub(crate) struct SchemaObject {
     pub extensions: Vec<Extension>,
     /// Required field names for object schemas, in sorted order; empty otherwise. Which graph fact
     /// answers "must this key be present?" depends on the positions the schema is reached from —
-    /// see `lower::SchemaDirections`.
+    /// see `graph::direction::SchemaDirections`.
     pub required: Vec<String>,
     /// Object properties, keyed by json name, in sorted order; empty otherwise.
     pub properties: Vec<(String, SchemaObject)>,

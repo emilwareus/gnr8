@@ -5,7 +5,9 @@
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
-//!   json tags carry `,omitempty` for optional fields, types follow TARGET-API.md §4.
+//!   json tags carry `,omitempty` where the source's own tag does and the side of the exchange the
+//!   struct is on permits it ([`omits_when_empty`] — the direction can take the option away but never
+//!   put one on), types follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
@@ -23,6 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::graph::direction::{directions_of, schema_directions, SchemaDirections};
 use crate::graph::{
     ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Prim,
     RuntimePolicy, Schema, Type, WellKnown,
@@ -235,14 +238,41 @@ fn maybe_pointer(base: String, nullable: bool, is_value: bool) -> String {
     }
 }
 
-/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field is OPTIONAL
-/// (the presence axis — the key may be absent). Independent of nullability (RESEARCH Pitfall 4).
-fn json_tag(json_name: &str, optional: bool) -> String {
-    if optional {
+/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field OMITS ON
+/// MARSHAL ([`omits_when_empty`]). Independent of nullability (RESEARCH Pitfall 4).
+fn json_tag(json_name: &str, omit_empty: bool) -> String {
+    if omit_empty {
         format!("`json:\"{json_name},omitempty\"`")
     } else {
         format!("`json:\"{json_name}\"`")
     }
+}
+
+/// Whether the emitted json tag carries `,omitempty`.
+///
+/// **`,omitempty` is not a presence marker.** TypeScript's `?:` and Python's `= None` say "the caller
+/// may leave this key out" and nothing else, so they can read
+/// [`SchemaDirections::model_field_is_optional`] straight. `encoding/json` has no such spelling: the
+/// option says "drop this key when the value is the zero value", which is a different statement that
+/// only *coincides* with "may omit" where the source already chose it. Writing it anywhere the source
+/// did not would therefore be a change of wire behavior wearing a presence marker's clothes:
+///
+/// - On a value type it costs the caller the zero value. `Price float64` gains no way to be absent —
+///   Go needs a pointer for that, and gnr8 spends pointers on the NULLABLE axis (RESEARCH Pitfall 4) —
+///   it merely loses the ability to send `"price": 0`. Same for `"tags": []` and, on a bare `*T`, the
+///   explicit `null` that #59 established such a field always writes.
+/// - On a struct, a `time.Time`, or a non-zero-length array the option does nothing at all —
+///   `encoding/json` never considers those empty. gnr8 reads that exact tag in user source as a defect
+///   and raises `schema.omit_option.ineffective`, so emitting it would put gnr8's own diagnostic into
+///   gnr8's own output.
+///
+/// So the direction may only ever take the option AWAY, never add it: the tag omits what the source's
+/// own tag omits, and only where the position permits an omission at all. That still fixes the case
+/// this rule exists for — a `binding:"required"` field tagged `,omitempty`, where a caller setting the
+/// zero value sent nothing and the server rejected the call — because there the direction says the
+/// server demands the key and the option comes off.
+fn omits_when_empty(field: &Field, directions: SchemaDirections) -> bool {
+    field.optional && directions.model_field_is_optional(field)
 }
 
 /// Whether emitting a field of neutral [`Type`] requires the `time` import (a `time.Time` value
@@ -296,6 +326,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
 
     let mut body = String::new();
     let mut needs_time = false;
+    let directions = schema_directions(graph);
 
     let mut first = true;
     for schema in &graph.schemas {
@@ -319,6 +350,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
                     fields,
                     graph,
                     is_multipart_request_schema(graph, &schema.id)?,
+                    directions_of(&directions, &schema.id),
                 )?;
             }
             Type::Primitive(_)
@@ -351,6 +383,7 @@ pub(crate) fn emit_model_schema(
     graph: &ApiGraph,
     package: &str,
     schema: &Schema,
+    directions: SchemaDirections,
 ) -> Result<String, CoreError> {
     let mut body = String::new();
     let mut needs_time = false;
@@ -368,6 +401,7 @@ pub(crate) fn emit_model_schema(
                 fields,
                 graph,
                 is_multipart_request_schema(graph, &schema.id)?,
+                directions,
             )?;
         }
         Type::Primitive(_)
@@ -401,11 +435,19 @@ fn emit_struct(
     fields: &[Field],
     graph: &ApiGraph,
     multipart_request: bool,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     let fields = go_field_emissions(fields)?;
     writeln!(body, "type {name} struct {{").map_err(sink)?;
     for field in &fields {
-        emit_struct_field(body, field.field, &field.go_name, graph, multipart_request)?;
+        emit_struct_field(
+            body,
+            field.field,
+            &field.go_name,
+            graph,
+            multipart_request,
+            directions,
+        )?;
     }
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -458,22 +500,24 @@ fn emit_type_alias(
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
 ///
-/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads the OPTIONAL axis — the two are
-/// distinct (RESEARCH Pitfall 4): an optional-not-nullable value stays a non-pointer `T` with omitempty;
-/// a nullable value becomes `*T`.
+/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads what the field omits on
+/// marshal — the two are distinct (RESEARCH Pitfall 4): an omitting-not-nullable value stays a
+/// non-pointer `T` with omitempty; a nullable value becomes `*T`. The direction the struct is reached
+/// from can take the option off but never put it on — see [`omits_when_empty`].
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
     go_name: &str,
     graph: &ApiGraph,
     multipart_request: bool,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     let go_ty = if multipart_request {
         go_multipart_field_type(&field.schema, field.nullable, graph)?
     } else {
         go_type(&field.schema, field.nullable, graph)?
     };
-    let tag = json_tag(&field.json_name, field.optional);
+    let tag = json_tag(&field.json_name, omits_when_empty(field, directions));
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
 }

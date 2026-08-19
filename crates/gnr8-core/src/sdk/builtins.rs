@@ -2204,11 +2204,11 @@ fn apply_field_presence_override(
         })?;
     // Presence is ONE question, and the graph carries two code-derived answers to it: `required`
     // (what request validation demands) and `!optional` (what the serializer always writes). Which
-    // one an artifact reads depends on where it looks — the OpenAPI `required` array picks by the
-    // direction the schema is reached from (`lower::SchemaDirections`), and every SDK model reads
-    // the presence axis. An override that moved one axis would therefore be silently dropped
-    // wherever the other one is read, so it states the corrected fact on both and means the same
-    // thing in every position — exactly what every non-Go source already records.
+    // one an artifact reads depends on the direction the schema is reached from
+    // (`graph::direction::SchemaDirections`), and the OpenAPI document and the SDK models pick
+    // differently in some positions. An override that moved one axis would therefore be silently
+    // dropped wherever the other one is read, so it states the corrected fact on both and means the
+    // same thing in every position — exactly what every non-Go source already records.
     field.required = required;
     field.optional = !required;
     Ok(())
@@ -8220,9 +8220,9 @@ mod tests {
 
     #[test]
     fn a_field_presence_override_reaches_a_response_only_schema() {
-        // `Profile` is only ever a response body, and there the `required` array is answered from
-        // the presence axis alone (`lower::SchemaDirections`) — so an override that moved only
-        // `required` would be silently dropped here.
+        // `Profile` is only ever a response body, and there both the `required` array and the SDK
+        // models are answered from the presence axis alone (`graph::direction::SchemaDirections`) —
+        // so an override that moved only `required` would be silently dropped here.
         let mut ir = ApiGraph {
             operations: vec![grouped_test_operation(
                 "getProfile",

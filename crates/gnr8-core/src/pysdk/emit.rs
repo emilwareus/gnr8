@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::graph::direction::{directions_of, schema_directions, SchemaDirections};
 use crate::graph::{
     ApiGraph, Field, Operation, PaginationMode, PaginationPolicy, PaginationTermination, Param,
     Prim, RuntimePolicy, Type,
@@ -152,21 +153,29 @@ fn accumulate_type_imports(schema: &Type, m: &mut ModelImports) {
 /// `if TYPE_CHECKING:` block. A NON-object/NON-enum schema body is emitted as a module-level string alias
 /// (`X = "Union[..]"`) whose type names live only inside an opaque string literal — `ruff` does not read
 /// them, so it contributes NO `typing` import (importing `Union` for it would be an F401).
-fn compute_model_imports(schemas: &[&crate::graph::Schema], type_checking: bool) -> ModelImports {
+fn compute_model_imports(
+    schemas: &[(&crate::graph::Schema, SchemaDirections)],
+    type_checking: bool,
+) -> ModelImports {
     let mut m = ModelImports {
         type_checking,
         ..ModelImports::default()
     };
-    for schema in schemas {
+    for (schema, reached) in schemas {
+        let reached = *reached;
         match &schema.body {
             Type::Enum(_) => m.enum_class = true,
             Type::Object(fields) => {
                 m.object_model = true;
                 for field in fields {
-                    if field.optional || field.nullable {
+                    // Omittability drives `Optional[..]` and the `Field(default=None)` right-hand
+                    // side, so it has to be the SAME answer the emitters below reach — an import set
+                    // computed off a different question lands an unused (F401) or a missing one.
+                    let omittable = reached.model_field_is_optional(field);
+                    if omittable || field.nullable {
                         m.optional = true;
                     }
-                    if needs_alias(field) || field.optional {
+                    if needs_alias(field) || omittable {
                         m.field = true;
                     }
                     accumulate_type_imports(&field.schema, &mut m);
@@ -479,7 +488,12 @@ pub(crate) fn emit_models_with_style(
 ) -> Result<String, CoreError> {
     check_unique_schema_names(graph, "Python SDK")?;
 
-    let schema_refs: Vec<&crate::graph::Schema> = graph.schemas.iter().collect();
+    let directions = schema_directions(graph);
+    let schema_refs: Vec<(&crate::graph::Schema, SchemaDirections)> = graph
+        .schemas
+        .iter()
+        .map(|schema| (schema, directions_of(&directions, &schema.id)))
+        .collect();
     let mut out = model_header(&compute_model_imports(&schema_refs, false), model_style);
 
     // The first top-level item is separated from the import block by isort's `lines-after-imports`: two
@@ -496,7 +510,14 @@ pub(crate) fn emit_models_with_style(
             // `json.dumps` serialize the member value as its string — the twin of Go's `type X string`.
             Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
             Type::Object(fields) => {
-                emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
+                emit_model_class(
+                    &mut out,
+                    &schema.name,
+                    fields,
+                    graph,
+                    model_style,
+                    directions_of(&directions, &schema.id),
+                )?;
             }
             // A named NON-object/NON-enum schema (e.g. `BookOrError = Union[Book, OutOfStock]`, or a
             // scalar/array/map alias) → a module-level type alias. This is the load-bearing divergence
@@ -541,6 +562,7 @@ pub(crate) fn emit_model_schema(
     schema: &crate::graph::Schema,
     model_style: PyModelStyle,
     dep_modules: &BTreeMap<String, String>,
+    directions: SchemaDirections,
 ) -> Result<String, CoreError> {
     // Forward-ref imports are needed ONLY for an object model's field types; an enum has none, and an
     // alias body is a string literal whose names `ruff` never reads (so importing them would be F401).
@@ -548,7 +570,7 @@ pub(crate) fn emit_model_schema(
         Type::Object(_) => model_dependencies(&schema.body, graph, &schema.name),
         _ => Vec::new(),
     };
-    let imports = compute_model_imports(&[schema], !deps.is_empty());
+    let imports = compute_model_imports(&[(schema, directions)], !deps.is_empty());
     let mut out = model_header(&imports, model_style);
     if deps.is_empty() {
         // No forward-ref block: separate the class/enum from the imports by two blank lines, but a bare
@@ -574,7 +596,14 @@ pub(crate) fn emit_model_schema(
     match &schema.body {
         Type::Enum(members) => emit_enum_class(&mut out, &schema.name, members)?,
         Type::Object(fields) => {
-            emit_model_class(&mut out, &schema.name, fields, graph, model_style)?;
+            emit_model_class(
+                &mut out,
+                &schema.name,
+                fields,
+                graph,
+                model_style,
+                directions,
+            )?;
         }
         Type::Primitive(_)
         | Type::WellKnown(_)
@@ -757,10 +786,11 @@ fn emit_model_class(
     fields: &[Field],
     graph: &ApiGraph,
     model_style: PyModelStyle,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     match model_style {
-        PyModelStyle::Pydantic => emit_pydantic_model(out, name, fields, graph),
-        PyModelStyle::Dataclass => emit_dataclass(out, name, fields, graph),
+        PyModelStyle::Pydantic => emit_pydantic_model(out, name, fields, graph, directions),
+        PyModelStyle::Dataclass => emit_dataclass(out, name, fields, graph, directions),
     }
 }
 
@@ -770,6 +800,7 @@ fn emit_pydantic_model(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     writeln!(out, "class {name}(BaseModel):").map_err(sink)?;
     writeln!(
@@ -779,7 +810,7 @@ fn emit_pydantic_model(
     .map_err(sink)?;
     for field in fields {
         let ident = pydantic_field_ident(field);
-        let suffix = if field.optional {
+        let suffix = if directions.model_field_is_optional(field) {
             pydantic_default_suffix(field, graph)?
         } else {
             pydantic_required_suffix(field, graph)?
@@ -809,6 +840,7 @@ fn emit_dataclass(
     name: &str,
     fields: &[Field],
     graph: &ApiGraph,
+    directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     writeln!(out, "@dataclass").map_err(sink)?;
     writeln!(out, "class {name}:").map_err(sink)?;
@@ -824,8 +856,10 @@ fn emit_dataclass(
         return Ok(());
     }
     // Partition preserving each group's (already-sorted) relative order: required (no default) first,
-    // optional (defaulted) last — so defaulted fields are contiguous at the end (PITFALL 1).
-    let (required, optional): (Vec<&Field>, Vec<&Field>) = fields.iter().partition(|f| !f.optional);
+    // omittable (defaulted) last — so defaulted fields are contiguous at the end (PITFALL 1).
+    let (required, optional): (Vec<&Field>, Vec<&Field>) = fields
+        .iter()
+        .partition(|f| !directions.model_field_is_optional(f));
     for field in required {
         // The Python attribute name is keyword/digit-safe (CR-02); the wire key (`json_name`) is
         // preserved verbatim — only a keyword/leading-digit name is renamed, and the from-dict decode
@@ -836,9 +870,9 @@ fn emit_dataclass(
     }
     for field in optional {
         let ident = safe_ident(&field.json_name);
-        // An optional field (the key may be absent) defaults to None so the class imports and a caller
+        // An omittable field (the key may be absent) defaults to None so the class imports and a caller
         // may omit it. Widen the hint to Optional[..] for the defaulted form so `= None` is not a
-        // type-lie against a non-nullable value type (WR-02): the `optional` (key-absent) axis is
+        // type-lie against a non-nullable value type (WR-02): the key-absent axis is
         // modeled in the hint, not only the default. A nullable field is already Optional[..]; wrapping
         // an already-Optional hint again is avoided by py_type carrying nullable, so only widen when the
         // value is not itself nullable.
@@ -854,8 +888,8 @@ fn emit_dataclass(
     // A forward-compatible from_dict (CR-04): construct only from declared fields (ignore-unknown — a
     // newer server adding a response key no longer crashes the SDK), bind each by its ORIGINAL wire key
     // (json_name), and decode nested dataclasses recursively. Required fields read with `_data["key"]`
-    // (a missing required key is a real protocol error → KeyError); optional fields use `.get` so an
-    // absent key keeps the None default.
+    // (a missing required key is a real protocol error → KeyError); omittable fields test for the key
+    // so an absent one keeps the None default.
     writeln!(out, "    @classmethod").map_err(sink)?;
     writeln!(
         out,
@@ -866,8 +900,8 @@ fn emit_dataclass(
     for field in fields {
         let ident = safe_ident(&field.json_name);
         let wire = &field.json_name;
-        if field.optional {
-            // Optional: only decode when present (and non-null), else keep the None default. The
+        if directions.model_field_is_optional(field) {
+            // Omittable: only decode when present (and non-null), else keep the None default. The
             // conditional expression evaluates the decode lazily so a nested model still recurses.
             let decoded_present = decode_expr(&field.schema, graph, &format!("_data[\"{wire}\"]"));
             writeln!(
