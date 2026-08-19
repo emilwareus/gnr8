@@ -173,7 +173,7 @@ components:
           description: Rolling window size in days
     GoalResponse:
       type: object
-      required: [name, uuid]
+      required: [analyticsQuery, createdAt, name, uuid]
       properties:
         analyticsQuery:
           $ref: '#/components/schemas/GoalAnalyticsQuery'
@@ -213,6 +213,7 @@ components:
           example: error-slug
     ListGoalsOutput:
       type: object
+      required: [goals, pageSize, total]
       properties:
         goals:
           type: [array, 'null']

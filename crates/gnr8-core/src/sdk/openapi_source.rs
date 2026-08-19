@@ -3378,6 +3378,72 @@ components:
     }
 
     #[test]
+    fn re_emits_an_imported_required_array_unchanged_in_every_direction() {
+        // An imported document states presence once, in `required`, and the importer records it on
+        // both axes. Re-emitting must give the same array back whichever side a schema is reached
+        // from — including `Shared`, which arrives from both — or importing a document and writing it
+        // straight back out would move a fact nobody edited.
+        let text = r"
+openapi: 3.1.0
+info: { title: Books API, version: 1.0.0 }
+paths:
+  /books:
+    post:
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookInput' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookOutput' }
+components:
+  schemas:
+    BookInput:
+      type: object
+      required: [title]
+      properties: { title: { type: string }, note: { type: string }, shared: { $ref: '#/components/schemas/Shared' } }
+    BookOutput:
+      type: object
+      required: [id]
+      properties: { id: { type: string }, note: { type: string }, shared: { $ref: '#/components/schemas/Shared' } }
+    Shared:
+      type: object
+      required: [kind]
+      properties: { kind: { type: string }, detail: { type: string } }
+";
+        let graph = import_openapi_document(
+            std::path::Path::new("."),
+            std::path::PathBuf::from("openapi.yaml"),
+            text,
+        )
+        .unwrap();
+        let yaml = to_openapi(&graph, "Books API", "/", &graph.security).unwrap();
+        validate_openapi_artifact(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
+        let required = |component: &str| {
+            emitted
+                .pointer(&format!("/components/schemas/{component}/required"))
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(required("BookInput"), vec!["title".to_string()]);
+        assert_eq!(required("BookOutput"), vec!["id".to_string()]);
+        assert_eq!(required("Shared"), vec!["kind".to_string()]);
+    }
+
+    #[test]
     fn preserves_request_media_types_that_share_a_schema() {
         let text = r"
 openapi: 3.1.0

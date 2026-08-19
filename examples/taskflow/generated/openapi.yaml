@@ -158,6 +158,7 @@ components:
           type: string
     ErrorResponse:
       type: object
+      required: [code, message]
       properties:
         code:
           type: string
@@ -168,6 +169,7 @@ components:
       enum: [done, in_progress, open]
     Task:
       type: object
+      required: [assignee, dueAt, id, labels, priority, status, title]
       properties:
         assignee:
           $ref: '#/components/schemas/Assignee'
@@ -190,6 +192,7 @@ components:
           type: string
     TaskList:
       type: object
+      required: [tasks]
       properties:
         tasks:
           type: [array, 'null']

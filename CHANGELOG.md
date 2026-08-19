@@ -86,7 +86,9 @@ must move the minor version.
   axis is exactly right for a request body and wider than a response body can produce. That is the
   safe side of the failure this release fixes — tolerating a `null` that never arrives costs
   nothing, while rejecting one that does breaks user code — but narrowing it means knowing which
-  direction a schema is reached from, which is the same open question as the one below.
+  direction a schema is reached from. The entry below establishes that direction where the document
+  is written; the extractor that decides this axis is upstream of it and still cannot see it, so
+  narrowing the value axis by direction is a separate change this release does not make.
 
   **This changes emitted documents and all three generated SDKs.** Every slice, map, and interface
   field gains `"null"` in its document type and `| None` / `| null` in generated Python and
@@ -98,10 +100,64 @@ must move the minor version.
   corrections, but a client generated from the new document accepts responses the old one rejected
   and requires keys the old one did not, so review the regenerated output before publishing.
 
-  The document and the SDKs still answer "must this field be present?" from different axes
-  (`required` from `binding`/`validate`, presence from the `json` tag). That disagreement is
-  unchanged here and is tracked separately — it is a question about request-versus-response
-  direction, not about what the marshaller writes.
+  The document and the SDKs used to answer "must this field be present?" from different axes
+  (`required` from `binding`/`validate`, presence from the `json` tag). That was a
+  request-versus-response direction question rather than one about what the marshaller writes, and
+  the entry below answers it.
+
+- **A response schema's `required` array is no longer derived from request validation tags.**
+  `required` was always the set of fields carrying a `binding:`/`validate:` `required` rule — a fact
+  about what the server rejects a *request* for lacking. Nothing in a validation tag describes a
+  response, so on a response schema that array carried almost no information: in this repo's own
+  fixture, `ListGoalsOutput` published no `required` at all, though three of its four keys are
+  written on every response and only `nextCursor` is genuinely omittable. The answer was already on
+  the graph one field over — the presence axis the entry above made exact — and unused.
+
+  `required` is now answered from the direction the schema is reached from. The lowering walks the
+  graph from each operation's request body and parameters on one side and its response bodies on the
+  other, following `$ref`s so a nested type is on whichever side the type carrying it is on:
+
+  - reached from **requests only** → the validation rules, unchanged;
+  - reached from **responses only** → every field the serializer writes unconditionally;
+  - reached from **both** → only the fields that satisfy both, because one component has to describe
+    both payloads and can promise only what holds in each;
+  - reached from **no operation** → the validation rules, there being no position to read it from.
+
+  This is one answer per position, not a preference between two candidates, so there is no setting
+  for it and no precedence to configure. A struct shared between a request body and a response body
+  — `Publisher` in `examples/bookstore`, reached from `Book` and from `CreateBookRequest` — gets the
+  narrower answer; splitting it into a type per direction is what makes both questions separately
+  answerable.
+
+  **This changes emitted documents for Go sources.** Response schemas gain the keys they always
+  contain (`GoalResponse` gains `analyticsQuery` and `createdAt`; `ListGoalsOutput` gains `goals`,
+  `pageSize`, and `total`), and a response field that carried a stray `binding:"required"` next to an
+  omission option leaves the array — the case where the document demanded a key the SDKs let you
+  omit. Python, TypeScript, and OpenAPI-imported sources state presence once and record it on both
+  axes, so their documents are byte-identical either way. Generated SDKs are unaffected: they read
+  the presence axis, which has not moved.
+
+- **`ApiOverrides::force_required` / `force_optional` now state presence instead of correcting one
+  axis of it.** Both wrote the graph's `required` field and nothing else. That was already half a
+  correction — generated models read the presence axis, so no Go, Python, or TypeScript model had
+  ever seen either override, against `ApiOverrides`' own promise that "OpenAPI and every SDK target
+  read the same corrected API facts". The entry above would have made it less than half:
+  on a schema reached only from responses the document reads the presence axis too, so both
+  overrides would have become silent no-ops there — `force_required("Book", "subtitle")` against
+  `examples/bookstore`, where `Book` is only ever a response body, would have left `Book.required`
+  untouched and reported success.
+
+  Each override now states the fact outright — `force_required` means "this key is always present",
+  `force_optional` means "this key may be absent" — and writes both axes, which is how every non-Go
+  source already records presence. One statement, the same answer in every direction and in every
+  artifact, with nothing left to be dropped on the side that was not written.
+
+  **This changes generated SDKs for pipelines that use either override.** A `force_optional` field
+  becomes omittable in the generated models (`,omitempty` in Go, `?` in TypeScript, a default in
+  Python) and a `force_required` field stops being omittable. The one model-adjacent surface that
+  already read both axes — a TypeScript multipart body's inline part type — is unchanged in meaning,
+  since the two axes now agree by construction. Emitted documents change only for schemas reached
+  from responses, where the overrides now take effect rather than being discarded.
 
 ### Breaking
 
