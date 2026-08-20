@@ -180,6 +180,8 @@ CI is the thing that is wrong.
    written `go.mod` floor (e.g. `sdk_compile.rs`'s hermetic `go 1.26` module) alone — those are floors,
    not toolchains.
 3. Run `make check` on the new toolchain. `fixture-build`, `goextract-build`, and `examples-check` all
-   shell out to the local `go`, so a local run is a genuine rehearsal of CI.
+   shell out to the local `go`, so a local run is a genuine rehearsal of CI. It needs `PyYAML`, which
+   CI installs as its own step but `make` does not — without it `lower::yaml`'s round-trip test
+   hard-fails on a missing module rather than skipping.
 4. Leave `goextract/go.mod`, the `GoSdk` default, and `docs/demo.md` untouched. `demo.md` records the
    toolchain a captured demo run actually used; it changes only when the demo is re-captured.
