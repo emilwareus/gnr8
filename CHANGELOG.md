@@ -9,6 +9,22 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **Upgrading the Go toolchain no longer leaves a stale `goextract` binary behind.** The compiled
+  helper was cached under a key covering only its own source, so a user who upgraded Go kept running
+  the binary their PREVIOUS toolchain built. `go/types` admits only the language version the
+  application was built with, so that binary then reported every dependency file gated on the new
+  release as a `source.load.failed` load error — on Go 1.27 a stock Gin project fails this way through
+  `golang.org/x/text`, which ships `//go:build go1.27` tables. Nothing in the project changed, and no
+  amount of re-running fixed it; only clearing a temp directory nobody knows about did.
+
+  The cache key now covers the toolchain identity as well as the source. This is the same fact
+  `sdk::builtins::go_toolchain_identity` already folds into the extracted-facts cache key, for the
+  same reason: the selected toolchain decides which build constraints pick which files and what
+  stdlib type information the extractor sees, which makes it an extraction input like any source
+  file. The binary cache was the one place that had not accounted for it.
+
 ## 0.6.1 — 2026-08-20
 
 ### Fixed

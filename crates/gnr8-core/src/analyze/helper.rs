@@ -143,12 +143,51 @@ fn run_goextract_with(
     Ok(parsed)
 }
 
+/// The identity of the Go toolchain that compiles — and is compiled into — the `goextract` binary.
+///
+/// `sdk::builtins::go_toolchain_identity` reads the same fact for the extracted-facts cache key,
+/// because the selected toolchain decides which build constraints pick which files and what stdlib
+/// type information the extractor sees. That reasoning applies twice over to the compiled binary:
+/// `go/types` admits only the language version the application was BUILT with, so a binary produced
+/// by an older toolchain rejects any dependency file gated on a newer release.
+fn goextract_toolchain_identity(go_bin: &str, dir: &std::path::Path) -> Result<String, CoreError> {
+    let output = Command::new(go_bin)
+        .args(["env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS"])
+        .current_dir(dir)
+        .output()
+        .map_err(|source| CoreError::GoToolchainMissing { source })?;
+    if !output.status.success() {
+        return Err(CoreError::HelperExit {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The cache directory name for one compiled `goextract` binary, over both facts that decide its
+/// behavior. Pure so the source/toolchain sensitivity is testable without a real toolchain.
+fn goextract_binary_cache_dir_name(source_hash: &str, toolchain: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gnr8-goextract-binary-cache-v2\n");
+    hasher.update(source_hash.as_bytes());
+    hasher.update(b"\ntoolchain\n");
+    hasher.update(toolchain.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
     let root = checked_sidecar_dir("goextract", goextract_dir()?)?;
-    let source_hash = goextract_source_hash(&root)?;
+    // The binary is goextract's source AND the toolchain that compiled it: a Go upgrade changes the
+    // binary's behavior without moving one byte of source. Keying on source alone hands a user who
+    // just upgraded Go the binary their PREVIOUS toolchain built, which then reports every dependency
+    // file gated on the new release as a `source.load.failed` load error.
     let dir = std::env::temp_dir()
         .join("gnr8-goextract")
-        .join(source_hash);
+        .join(goextract_binary_cache_dir_name(
+            &goextract_source_hash(&root)?,
+            &goextract_toolchain_identity(go_bin, &root)?,
+        ));
     let binary = dir.join(if cfg!(windows) {
         "goextract.exe"
     } else {
@@ -369,10 +408,44 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        goextract_dir, pyextract_dir, resolve_target, run_goextract_with, run_pyextract_with,
-        run_tsextract_with, tsextract_dir, typescript_toolchain_present,
+        goextract_binary_cache_dir_name, goextract_dir, pyextract_dir, resolve_target,
+        run_goextract_with, run_pyextract_with, run_tsextract_with, tsextract_dir,
+        typescript_toolchain_present,
     };
     use crate::CoreError;
+
+    mod goextract_binary_cache_dir_name {
+        use super::goextract_binary_cache_dir_name;
+
+        #[test]
+        fn a_toolchain_upgrade_invalidates_a_binary_built_from_identical_source() {
+            // The regression: keying on source alone reused a go1.26-built binary under a go1.27
+            // toolchain, which then reported every dependency file gated on go1.27 as a load error.
+            let before = goextract_binary_cache_dir_name("same-source", "go1.26.5 darwin arm64");
+            let after = goextract_binary_cache_dir_name("same-source", "go1.27.0 darwin arm64");
+            assert_ne!(
+                before, after,
+                "identical goextract source under a different Go toolchain must not share a binary"
+            );
+        }
+
+        #[test]
+        fn source_edits_still_invalidate_under_one_toolchain() {
+            let toolchain = "go1.27.0 darwin arm64";
+            assert_ne!(
+                goextract_binary_cache_dir_name("source-a", toolchain),
+                goextract_binary_cache_dir_name("source-b", toolchain)
+            );
+        }
+
+        #[test]
+        fn the_same_source_and_toolchain_reuse_one_binary() {
+            assert_eq!(
+                goextract_binary_cache_dir_name("source-a", "go1.27.0 darwin arm64"),
+                goextract_binary_cache_dir_name("source-a", "go1.27.0 darwin arm64")
+            );
+        }
+    }
 
     #[test]
     fn missing_target_is_an_explicit_error() {
