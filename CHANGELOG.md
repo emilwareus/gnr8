@@ -9,6 +9,40 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **A generated model no longer demands a key whose value it lets you leave null.** 0.6.0 made a bare
+  Go pointer and a nil slice/map/interface what they are on the `encoding/json` wire — a key the
+  serializer always writes, holding a value that may be `null` — and generated models read the presence
+  axis straight, so every one of those fields became mandatory at construction while still being hinted
+  `Optional[...]` / `T | null`. `PySdk` emitted `userUuid: Optional[str] = Field(..., alias="userUuid")`
+  and `TsSdk` emitted `userUuid: string | null`, where 0.5.3 had emitted a default and a `?`. Callers
+  who never wrote `userUuid=None, namespaceId=None, uniqueKey=None` got a `ValidationError` counting
+  every null-valued key they had left implicit.
+
+  The demand bought the reading side nothing. A nullable key's hint carries the absent case either way
+  and the value a reader ends up with is `None`/`null` either way, so presence changed nothing about
+  reading it and only added a value the writing side had to spell — one `PySdk`'s own `to_dict` then
+  dropped, since `exclude_none` omits exactly the null-valued keys such a declaration demanded back. A
+  model could not decode its own output: `DtoEvent.from_dict(event.to_dict())` raised.
+
+  A nullable field is now omittable in a generated model wherever no validation rule demands its key,
+  which is every position the model is not the inbound side of — reached from a response, or from no
+  operation at all — and the both-directions position for a field no `binding:`/`validate:` rule
+  covers. Where such a rule does cover it, the key stays demanded in every position the model is
+  inbound from: that demand is a fact about what the server rejects a request for lacking, not about
+  what the model can express, and dropping it there would reopen the request-side defect 0.6.0 fixed.
+
+  **This changes `PySdk` and `TsSdk` output for Go sources**, and restores 0.5.3's construction
+  behavior for nullable fields while keeping 0.6.0's for non-nullable ones: a non-nullable key the
+  server writes on every response stays required (`eventTypeIdentifier: str`), and a nullable one
+  regains its default (`userUuid: Optional[str] = Field(default=None)`, `userUuid?: string | null`).
+  In this repository that reaches three committed models — `ListBooksResponse.nextCursor` in the
+  FastAPI and NestJS examples and `OrderConfirmation.message` in the Flask one. **`GoSdk` output and
+  emitted documents are unchanged.** Go has no spelling for "may be left out" and the direction may
+  only ever take `,omitempty` away, which this rule never does; and `required` describes the payload,
+  where a bare pointer's key genuinely is written every time.
+
 ## 0.6.0 — 2026-08-20
 
 ### Fixed

@@ -15,7 +15,7 @@ class OrderConfirmation(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     availability: Availability
     lines: list[Price]
-    message: Optional[str]
+    message: Optional[str] = Field(default=None)
     order_id: int
 
     @classmethod

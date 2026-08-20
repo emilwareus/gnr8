@@ -4,8 +4,8 @@
 //! sides of an exchange, and the graph answers them with different facts: `field.required` is what the
 //! server's own validation rejects an INBOUND payload for lacking, `field.optional` is what the
 //! serializer may leave out of a payload it WRITES. A model reads the validation rules exactly where it
-//! is inbound and only inbound; everywhere else the presence axis stands. See
-//! `graph::direction::SchemaDirections::model_field_is_optional`.
+//! is inbound and only inbound; everywhere else the presence axis stands, widened by the value axis.
+//! See `graph::direction::SchemaDirections::model_field_is_optional`.
 //!
 //! One graph puts the same four fields in each of the four positions:
 //!
@@ -19,8 +19,12 @@
 //! Two things vary across the expectations below, not one. Where the schema sits decides the answer,
 //! and the target decides how much of that answer it can spell: `?:` and `= None` mean "may be left
 //! out" and take it whole, while Go's `,omitempty` means "drop the zero value" and can only ever have
-//! the option taken away — which is why [`GO_REQUEST_ONLY`] exists beside [`REQUEST_ONLY`] rather than
-//! reusing it.
+//! the option taken away — which is why [`GO_REQUEST_ONLY`] and [`GO_SOURCE_OPTION`] exist beside
+//! [`REQUEST_ONLY`], [`NEVER_INBOUND`], and [`BOTH_WAYS`] rather than reusing them.
+//!
+//! A third axis rides along: a nullable key may be left out wherever no validation rule demands it,
+//! because the `null` a caller would otherwise spell and the absent key say the same thing to
+//! everything that reads the model — and to `PySdk`'s own `to_dict`, which drops both.
 //!
 //! The Go SDK path pipes each file through `gofmt`, so this test needs the Go toolchain — the same
 //! prerequisite `snapshot_sdk` already carries.
@@ -32,19 +36,37 @@ use gnr8::graph::ApiGraph;
 use gnr8::sdk::layout::SdkFileLayout;
 use gnr8::sdk::model_style::PyModelStyle;
 
-/// The four axis combinations a Go struct tag can produce, in one object body. `validated` is the pair
-/// the source can state and the two artifacts used to disagree about: `binding:"required"` alongside
-/// `json:",omitempty"`, which is ordinary Go.
+/// Every axis combination a Go struct tag can produce, in one object body: the four presence pairs, and
+/// each of them again with the value axis set. `validated` is the pair the source can state and the two
+/// artifacts used to disagree about: `binding:"required"` alongside `json:",omitempty"`, which is
+/// ordinary Go. `plainnull` is the shape a bare pointer produces — `*T json:"k"` writes `"k":null`, so
+/// the key is always present and the value may be absent.
 const FIELDS: &str = r#"[
   { "json_name": "loose", "required": false, "optional": true, "nullable": false,
     "schema": { "type": "primitive", "of": { "prim": "string" } } },
+  { "json_name": "loosenull", "required": false, "optional": true, "nullable": true,
+    "schema": { "type": "primitive", "of": { "prim": "string" } } },
   { "json_name": "mandatory", "required": true, "optional": false, "nullable": false,
+    "schema": { "type": "primitive", "of": { "prim": "string" } } },
+  { "json_name": "mandatorynull", "required": true, "optional": false, "nullable": true,
     "schema": { "type": "primitive", "of": { "prim": "string" } } },
   { "json_name": "plain", "required": false, "optional": false, "nullable": false,
     "schema": { "type": "primitive", "of": { "prim": "string" } } },
+  { "json_name": "plainnull", "required": false, "optional": false, "nullable": true,
+    "schema": { "type": "primitive", "of": { "prim": "string" } } },
   { "json_name": "validated", "required": true, "optional": true, "nullable": false,
+    "schema": { "type": "primitive", "of": { "prim": "string" } } },
+  { "json_name": "validatednull", "required": true, "optional": true, "nullable": true,
     "schema": { "type": "primitive", "of": { "prim": "string" } } }
 ]"#;
+
+/// Whether a field of [`FIELDS`] carries the value axis. Each nullable twin is its plain field's name
+/// with `null` appended, so the tables below stay a list of names and one answer each. The names are
+/// single lowercase words on purpose: identical in all three targets, so no alias or export-name
+/// mapping stands between a table row and the line it asserts.
+fn is_nullable(field: &str) -> bool {
+    field.ends_with("null")
+}
 
 fn graph() -> ApiGraph {
     let json = format!(
@@ -101,39 +123,94 @@ fn graph() -> ApiGraph {
 ///
 /// The server's validation is the whole of what an omission is accepted or rejected against here:
 /// an omission option governs marshalling and the server never marshals a request DTO, so the presence
-/// axis describes nothing about what a client may send.
-const REQUEST_ONLY: [(&str, bool); 4] = [
+/// axis describes nothing about what a client may send. Neither does the value axis — a nullable key
+/// the server demands is still a key the server demands.
+const REQUEST_ONLY: [(&str, bool); 8] = [
     ("loose", true),
+    ("loosenull", true),
     ("mandatory", false),
+    ("mandatorynull", false),
     ("plain", true),
+    ("plainnull", true),
     // The reported defect: a caller could omit a key the server rejects the request for lacking.
     ("validated", false),
+    ("validatednull", false),
 ];
 
-/// Whether each field's key may be left out of the model everywhere else — reached from a response,
-/// from both directions, or from no operation at all.
+/// Whether each field's key may be left out of the model where the model is never the inbound side —
+/// reached from a response, or from no operation at all.
 ///
 /// The model is (or may be) the decode side, where the key's absence is the server's choice and not
-/// the caller's, and demanding it breaks a payload the server is entitled to send.
-const PRESENCE_AXIS: [(&str, bool); 4] = [
+/// the caller's, and demanding it breaks a payload the server is entitled to send. No validation rule
+/// reaches a model in either position, so every nullable key is omittable here as well: the null a
+/// caller would otherwise have to spell says the same thing to a reader as the absent key does.
+const NEVER_INBOUND: [(&str, bool); 8] = [
     ("loose", true),
+    ("loosenull", true),
     ("mandatory", false),
+    ("mandatorynull", true),
     ("plain", false),
+    ("plainnull", true),
     ("validated", true),
+    ("validatednull", true),
+];
+
+/// Whether each field's key may be left out of the model for a schema reached from BOTH directions.
+///
+/// One row separates this from [`NEVER_INBOUND`], and it is the whole of what the both-ways arm buys:
+/// `mandatorynull` is a key the server rejects the request for lacking, so the model keeps demanding
+/// it even though its value may be `null` — the demand is the server's, not the declaration's
+/// convenience. Every other row matches, `validated` included, because there the response answer is
+/// what cannot break a decode.
+const BOTH_WAYS: [(&str, bool); 8] = [
+    ("loose", true),
+    ("loosenull", true),
+    ("mandatory", false),
+    ("mandatorynull", false),
+    ("plain", false),
+    ("plainnull", true),
+    ("validated", true),
+    ("validatednull", true),
 ];
 
 /// Whether each field carries `,omitempty` on a schema reached ONLY from a request.
 ///
-/// This is NOT [`REQUEST_ONLY`], and the one row that differs is the point: `plain` may be left out of
+/// This is NOT [`REQUEST_ONLY`], and the rows that differ are the point: `plain` may be left out of
 /// a request as far as the server is concerned, but `,omitempty` does not spell "may be left out" — it
 /// drops the zero value, so writing it where the source did not would cost the caller `"plain": ""`
 /// without buying absence. The direction may only take the option away, so Go's request answer is the
-/// source's own option narrowed by [`REQUEST_ONLY`], and only `validated` loses it.
-const GO_REQUEST_ONLY: [(&str, bool); 4] = [
+/// source's own option narrowed by [`REQUEST_ONLY`], and only `validated`/`validatednull` lose it.
+const GO_REQUEST_ONLY: [(&str, bool); 8] = [
     ("loose", true),
+    ("loosenull", true),
     ("mandatory", false),
+    ("mandatorynull", false),
     ("plain", false),
+    ("plainnull", false),
     ("validated", false),
+    ("validatednull", false),
+];
+
+/// Whether each field carries `,omitempty` in every other position — the source's own option, kept.
+///
+/// Go has no spelling for "may be left out", so nothing the direction says can ADD the option; it can
+/// only take one away, and only where the model's answer is that the key may not be left out. That
+/// never lands on a tagged field in these three positions: `Payload` and `Unwired` are never the
+/// inbound side, and `Shared` keeps the response answer for exactly the field a validation rule would
+/// otherwise strip it from (`validated`). What is left is the source's own option, verbatim.
+///
+/// That is also why the nullable rows read `false` here while their [`NEVER_INBOUND`] twins read
+/// `true`: a `*string` with no `,omitempty` writes `"k":null`, which is exactly the absence the other
+/// two targets let a caller spell — Go spells it `nil` in a field that is always written.
+const GO_SOURCE_OPTION: [(&str, bool); 8] = [
+    ("loose", true),
+    ("loosenull", true),
+    ("mandatory", false),
+    ("mandatorynull", false),
+    ("plain", false),
+    ("plainnull", false),
+    ("validated", true),
+    ("validatednull", true),
 ];
 
 /// The lines of one emitted model declaration: everything after `header` up to the next line at column
@@ -171,9 +248,9 @@ fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
         .expect("Go SDK generation must succeed (requires gofmt)");
     for (model, table) in [
         ("CreateInput", GO_REQUEST_ONLY),
-        ("Payload", PRESENCE_AXIS),
-        ("Shared", PRESENCE_AXIS),
-        ("Unwired", PRESENCE_AXIS),
+        ("Payload", GO_SOURCE_OPTION),
+        ("Shared", GO_SOURCE_OPTION),
+        ("Unwired", GO_SOURCE_OPTION),
     ] {
         let lines = declaration_lines(&out, &format!("type {model} struct {{"));
         for (field, omit_empty) in table {
@@ -183,7 +260,13 @@ fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
             } else {
                 format!("`json:\"{field}\"`")
             };
-            assert_declares(&lines, &format!("{exported} string {tag}"), model);
+            // gnr8 spends pointers on the value axis, so a nullable field is `*string` (Pitfall 4).
+            let go_type = if is_nullable(field) {
+                "*string"
+            } else {
+                "string"
+            };
+            assert_declares(&lines, &format!("{exported} {go_type} {tag}"), model);
         }
     }
 }
@@ -194,14 +277,19 @@ fn typescript_interfaces_mark_optional_from_the_direction_the_schema_is_reached_
         .expect("TypeScript SDK generation must succeed");
     for (model, table) in [
         ("CreateInput", REQUEST_ONLY),
-        ("Payload", PRESENCE_AXIS),
-        ("Shared", PRESENCE_AXIS),
-        ("Unwired", PRESENCE_AXIS),
+        ("Payload", NEVER_INBOUND),
+        ("Shared", BOTH_WAYS),
+        ("Unwired", NEVER_INBOUND),
     ] {
         let lines = declaration_lines(&out, &format!("export interface {model} {{"));
         for (field, omittable) in table {
             let mark = if omittable { "?" } else { "" };
-            assert_declares(&lines, &format!("{field}{mark}: string;"), model);
+            let hint = if is_nullable(field) {
+                "string | null"
+            } else {
+                "string"
+            };
+            assert_declares(&lines, &format!("{field}{mark}: {hint};"), model);
         }
     }
 }
@@ -212,19 +300,35 @@ fn pydantic_models_default_from_the_direction_the_schema_is_reached_from() {
         .expect("Python SDK generation must succeed");
     for (model, table) in [
         ("CreateInput", REQUEST_ONLY),
-        ("Payload", PRESENCE_AXIS),
-        ("Shared", PRESENCE_AXIS),
-        ("Unwired", PRESENCE_AXIS),
+        ("Payload", NEVER_INBOUND),
+        ("Shared", BOTH_WAYS),
+        ("Unwired", NEVER_INBOUND),
     ] {
         let lines = declaration_lines(&out, &format!("class {model}(BaseModel):"));
         for (field, omittable) in table {
+            // A nullable field's hint is `Optional[..]` on both sides of the answer, so the default is
+            // the whole of what omittability adds to it — and the whole of what keeps `to_dict`'s
+            // `exclude_none` output decodable by the same model's `from_dict`.
             let declaration = if omittable {
                 format!("{field}: Optional[str] = Field(default=None)")
+            } else if is_nullable(field) {
+                format!("{field}: Optional[str]")
             } else {
                 format!("{field}: str")
             };
             assert_declares(&lines, &declaration, model);
         }
+    }
+
+    // A model that demanded a key its own `to_dict` drops could not decode its own output: the dump
+    // excludes every `None`, so an `Optional[..]` field with no default is a round trip that raises.
+    // Assert the shape here rather than the exception, since the exception needs real Pydantic —
+    // `tests/pysdk_compile.rs` runs the round trip itself against the stub.
+    for line in declaration_lines(&out, "class Payload(BaseModel):") {
+        assert!(
+            !line.contains(": Optional[") || line.contains("default=None"),
+            "a decode-side model must default every Optional field, got `{line}`"
+        );
     }
 }
 
@@ -240,14 +344,16 @@ fn dataclass_models_and_their_decoders_agree_on_the_direction() {
     .expect("Python dataclass SDK generation must succeed");
     for (model, table) in [
         ("CreateInput", REQUEST_ONLY),
-        ("Payload", PRESENCE_AXIS),
-        ("Shared", PRESENCE_AXIS),
-        ("Unwired", PRESENCE_AXIS),
+        ("Payload", NEVER_INBOUND),
+        ("Shared", BOTH_WAYS),
+        ("Unwired", NEVER_INBOUND),
     ] {
         let lines = declaration_lines(&out, &format!("class {model}:"));
         for (field, omittable) in table {
             let declaration = if omittable {
                 format!("{field}: Optional[str] = None")
+            } else if is_nullable(field) {
+                format!("{field}: Optional[str]")
             } else {
                 format!("{field}: str")
             };
@@ -392,11 +498,18 @@ fn a_multipart_argument_is_a_request_even_when_its_schema_is_also_a_response() {
         );
     }
 
-    // The named interface for the same schema is reached from both directions and keeps the presence
-    // axis, so `validated` is marked `?:` there while the argument above demands it.
+    // The named interface for the same schema is reached from both directions and keeps the answer
+    // that cannot break a decode, so `validated` is marked `?:` there while the argument above demands
+    // it. `mandatorynull` goes the other way: both positions demand it, because the rule that demands
+    // it is the server's validation and that reaches the interface too.
     let interface = declaration_lines(&out, "export interface Upload {");
-    for (field, omittable) in PRESENCE_AXIS {
+    for (field, omittable) in BOTH_WAYS {
         let mark = if omittable { "?" } else { "" };
-        assert_declares(&interface, &format!("{field}{mark}: string;"), "Upload");
+        let hint = if is_nullable(field) {
+            "string | null"
+        } else {
+            "string"
+        };
+        assert_declares(&interface, &format!("{field}{mark}: {hint};"), "Upload");
     }
 }

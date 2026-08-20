@@ -3257,13 +3257,25 @@ mod tests {
         ///
         /// The guard tests the VALUE, not presence: a missing key is still a protocol
         /// error (`KeyError`), which is what distinguishes this from the optional branch.
+        ///
+        /// `Bag` is a REQUEST body here, and it has to be: a nullable key is demanded
+        /// only where the server's own validation demands it, so the request position is
+        /// where a required-and-nullable model field still exists to be decoded.
         #[test]
         fn dataclass_from_dict_guards_a_required_nullable_decode() {
             // Purpose-built graph rather than SAMPLE: this needs a required + nullable
             // field at each decode shape, and SAMPLE has none.
             const FACTS: &[u8] = br#"{
               "module": "app",
-              "routes": [],
+              "routes": [
+                {
+                  "method": "POST", "path": "/bags", "handler": "createBag",
+                  "operation_id": "createBag", "params": [],
+                  "request_body": { "ref_id": "app.models.Bag" },
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": {"file": "/root/main.py", "start_line": 1, "end_line": 1}
+                }
+              ],
               "diagnostics": [],
               "schemas": [
                 {
@@ -3326,32 +3338,47 @@ mod tests {
 
         #[test]
         fn dataclass_style_emits_required_fields_before_optional_fields() {
-            // BookFilters: genre (required), in_stock (optional), published (required-but-nullable),
-            // sort (optional). Alphabetical graph order interleaves defaults; the emitter must put both
-            // required fields (genre, published) before both optional ones (in_stock, sort).
+            // BookFilters: genre (the only key the model must carry), then in_stock, published, and
+            // sort, each of which may be left out. Alphabetical graph order interleaves the defaults,
+            // and a no-default field after a defaulted one is a class-definition-time TypeError
+            // (PITFALL 1), so the emitter partitions them.
             let out = emit_models_with_style(&sample_graph(), "bookstore", PyModelStyle::Dataclass)
                 .unwrap();
             let genre = out.find("    genre:").expect("genre field");
-            let published = out.find("    published:").expect("published field");
-            let in_stock = out.find("    in_stock:").expect("in_stock field");
-            let sort = out.find("    sort:").expect("sort field");
-            assert!(
-                genre < in_stock && genre < sort,
-                "required `genre` must precede optionals:\n{out}"
-            );
-            assert!(
-                published < in_stock && published < sort,
-                "required-but-nullable `published` must precede optionals:\n{out}"
-            );
+            for defaulted in ["    in_stock:", "    published:", "    sort:"] {
+                let at = out.find(defaulted).expect("defaulted field");
+                assert!(
+                    genre < at,
+                    "required `genre` must precede `{defaulted}`:\n{out}"
+                );
+            }
+            // The ordering rule holds for every class, not just the one read above: within a body, no
+            // field without a default may follow one that has it, whatever the graph order was.
+            for body in out.split("\n@dataclass\n").skip(1) {
+                let mut seen_default = false;
+                for line in body.lines().take_while(|line| line.starts_with("    ")) {
+                    let Some((_, declaration)) = line.split_once(": ") else {
+                        continue;
+                    };
+                    if declaration.contains(" = ") {
+                        seen_default = true;
+                    } else {
+                        assert!(
+                            !seen_default,
+                            "`{line}` has no default and follows one that does:\n{out}"
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
-        fn optional_fields_get_a_none_default_required_do_not() {
+        fn a_default_marks_exactly_the_keys_the_model_may_leave_out() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
-            // required (no default).
+            // A key the model must carry: no default, and no `Optional[..]` widening either.
             assert!(
                 out.contains("    genre: str\n"),
-                "required has no default:\n{out}"
+                "a key the model must carry has no default:\n{out}"
             );
             // optional non-nullable bool → defaulted and widened so generated wrappers can pass None
             // before dumping with exclude_none.
@@ -3359,10 +3386,12 @@ mod tests {
                 out.contains("    in_stock: Optional[bool] = Field(default=None)\n"),
                 "optional non-nullable field must accept None at wrapper boundaries:\n{out}"
             );
-            // required-but-nullable → Optional hint, NO default (it is required/present).
+            // Nullable, and no validation rule reaches this model, so the key may be left out: the hint
+            // was `Optional[str]` either way and the default is the whole of what changes. Without it
+            // the model could not decode its own `to_dict()`, which excludes every None.
             assert!(
-                out.contains("    published: Optional[str]\n"),
-                "nullable-required must be Optional without a default:\n{out}"
+                out.contains("    published: Optional[str] = Field(default=None)\n"),
+                "a nullable key no rule demands must carry a default:\n{out}"
             );
         }
 
