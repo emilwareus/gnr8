@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.6.1 — 2026-08-20
+
 ### Fixed
 
 - **A generated model no longer demands a key whose value it lets you leave null.** 0.6.0 made a bare
