@@ -15,7 +15,7 @@ must move the minor version.
   Go pointer and a nil slice/map/interface what they are on the `encoding/json` wire — a key the
   serializer always writes, holding a value that may be `null` — and generated models read the presence
   axis straight, so every one of those fields became mandatory at construction while still being hinted
-  `Optional[...]` / `T | null`. `PySdk` emitted `userUuid: Optional[str] = Field(..., alias="userUuid")`
+  `Optional[...]` / `T | null`. `PySdk` emitted `user_uuid: Optional[str] = Field(..., alias="userUuid")`
   and `TsSdk` emitted `userUuid: string | null`, where 0.5.3 had emitted a default and a `?`. Callers
   who never wrote `userUuid=None, namespaceId=None, uniqueKey=None` got a `ValidationError` counting
   every null-valued key they had left implicit.
@@ -35,13 +35,14 @@ must move the minor version.
 
   **This changes `PySdk` and `TsSdk` output for Go sources**, and restores 0.5.3's construction
   behavior for nullable fields while keeping 0.6.0's for non-nullable ones: a non-nullable key the
-  server writes on every response stays required (`eventTypeIdentifier: str`), and a nullable one
-  regains its default (`userUuid: Optional[str] = Field(default=None)`, `userUuid?: string | null`).
-  In this repository that reaches three committed models — `ListBooksResponse.nextCursor` in the
-  FastAPI and NestJS examples and `OrderConfirmation.message` in the Flask one. **`GoSdk` output and
-  emitted documents are unchanged.** Go has no spelling for "may be left out" and the direction may
-  only ever take `,omitempty` away, which this rule never does; and `required` describes the payload,
-  where a bare pointer's key genuinely is written every time.
+  server writes on every response stays required
+  (`event_type_identifier: str = Field(..., alias="eventTypeIdentifier")`), and a nullable one regains
+  its default (`user_uuid: Optional[str] = Field(default=None, alias="userUuid")`,
+  `userUuid?: string | null`). In this repository that reaches three committed models —
+  `ListBooksResponse.nextCursor` in the FastAPI and NestJS examples and `OrderConfirmation.message`
+  in the Flask one. **`GoSdk` output and emitted documents are unchanged.** Go has no spelling for "may
+  be left out" and the direction may only ever take `,omitempty` away, which this rule never does; and
+  `required` describes the payload, where a bare pointer's key genuinely is written every time.
 
 ## 0.6.0 — 2026-08-20
 

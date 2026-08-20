@@ -40,7 +40,7 @@ use gnr8::sdk::model_style::PyModelStyle;
 /// each of them again with the value axis set. `validated` is the pair the source can state and the two
 /// artifacts used to disagree about: `binding:"required"` alongside `json:",omitempty"`, which is
 /// ordinary Go. `plainnull` is the shape a bare pointer produces — `*T json:"k"` writes `"k":null`, so
-/// the key is always present and the value may be absent.
+/// the key is always present and the value may be `null`.
 const FIELDS: &str = r#"[
   { "json_name": "loose", "required": false, "optional": true, "nullable": false,
     "schema": { "type": "primitive", "of": { "prim": "string" } } },
@@ -199,9 +199,11 @@ const GO_REQUEST_ONLY: [(&str, bool); 8] = [
 /// inbound side, and `Shared` keeps the response answer for exactly the field a validation rule would
 /// otherwise strip it from (`validated`). What is left is the source's own option, verbatim.
 ///
-/// That is also why the nullable rows read `false` here while their [`NEVER_INBOUND`] twins read
-/// `true`: a `*string` with no `,omitempty` writes `"k":null`, which is exactly the absence the other
-/// two targets let a caller spell — Go spells it `nil` in a field that is always written.
+/// That is also why `mandatorynull` and `plainnull` read `false` here while their [`NEVER_INBOUND`]
+/// twins read `true`: a `*string` with no `,omitempty` writes `"k":null`, which is exactly the absence
+/// the other two targets let a caller spell — Go spells it `nil` in a field that is always written.
+/// (`loosenull` and `validatednull` agree with their twins only because the source already wrote the
+/// option.)
 const GO_SOURCE_OPTION: [(&str, bool); 8] = [
     ("loose", true),
     ("loosenull", true),

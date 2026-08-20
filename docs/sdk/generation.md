@@ -90,8 +90,11 @@ nothing at all — that is the tag gnr8 reports as `schema.omit_option.ineffecti
 can therefore be stricter than its Python and TypeScript twins; both send payloads the document
 permits.
 
-Non-Go sources are unaffected: FastAPI, Flask, NestJS, and an imported OpenAPI document each state
-presence once, so both readings give the same answer.
+The **presence** rows never split a non-Go source: FastAPI, Flask, NestJS, and an imported OpenAPI
+document each state presence once, so a validation rule and an omission option give the same answer
+and the direction cannot change it. The **value** rows still apply to every source — a field declared
+`Optional[str]` with no default is required and nullable, so a model reached from a response leaves
+its key out while a model reached only from a request keeps demanding it.
 
 ## File layouts
 

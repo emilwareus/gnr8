@@ -3344,22 +3344,34 @@ mod tests {
             // (PITFALL 1), so the emitter partitions them.
             let out = emit_models_with_style(&sample_graph(), "bookstore", PyModelStyle::Dataclass)
                 .unwrap();
+            let defaulted = ["    in_stock:", "    published:", "    sort:"];
             let genre = out.find("    genre:").expect("genre field");
-            for defaulted in ["    in_stock:", "    published:", "    sort:"] {
-                let at = out.find(defaulted).expect("defaulted field");
+            for field in defaulted {
+                let at = out.find(field).expect("defaulted field");
                 assert!(
                     genre < at,
-                    "required `genre` must precede `{defaulted}`:\n{out}"
+                    "required `genre` must precede `{field}`:\n{out}"
                 );
             }
             // The ordering rule holds for every class, not just the one read above: within a body, no
             // field without a default may follow one that has it, whatever the graph order was.
+            //
+            // A chunk begins at `class X:`, which is not indented, and its field block ends at
+            // `@classmethod` with no blank line in between, so the scan is bounded at BOTH ends — and a
+            // scan bounded wrong reads no lines and passes without asserting anything. `scanned` is
+            // what keeps that from happening silently.
+            let mut scanned: Vec<&str> = Vec::new();
             for body in out.split("\n@dataclass\n").skip(1) {
                 let mut seen_default = false;
-                for line in body.lines().take_while(|line| line.starts_with("    ")) {
+                for line in body
+                    .lines()
+                    .skip(1)
+                    .take_while(|line| line.starts_with("    ") && !line.starts_with("    @"))
+                {
                     let Some((_, declaration)) = line.split_once(": ") else {
                         continue;
                     };
+                    scanned.push(line);
                     if declaration.contains(" = ") {
                         seen_default = true;
                     } else {
@@ -3369,6 +3381,12 @@ mod tests {
                         );
                     }
                 }
+            }
+            for field in ["    genre:"].iter().chain(defaulted.iter()) {
+                assert!(
+                    scanned.iter().any(|line| line.starts_with(field)),
+                    "the scan must have read `{field}`, or it asserted nothing:\n{out}"
+                );
             }
         }
 
