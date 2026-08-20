@@ -25,6 +25,13 @@ must move the minor version.
   stdlib type information the extractor sees, which makes it an extraction input like any source
   file. The binary cache was the one place that had not accounted for it.
 
+  Both now read that identity from the **analyzed module**, and the `goextract` build is pinned to it.
+  `go/packages` runs `go list` inside the target, so a service whose `go.mod` asks for a newer Go than
+  the machine's `PATH` carries is type-checked by that newer release — and building the helper from
+  its own directory, where `goextract/go.mod` selects the toolchain, produced exactly the same
+  too-old-`go/types` failure by a second route. The pin keeps `+auto`, so a machine below
+  `goextract/go.mod`'s floor still resolves upward the way an unpinned build did.
+
 ## 0.6.1 — 2026-08-20
 
 ### Fixed

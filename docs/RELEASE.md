@@ -146,14 +146,20 @@ bump turns into a breaking change.
 ### Why the `goextract` floor is user-facing
 
 `scripts/package-release.sh` ships `goextract/` to users **as source**, and `analyze::helper` compiles
-it with **the user's own `go`** (a cached `go build`, falling back to `go run`). The `go` directive in
-`goextract/go.mod` is therefore gnr8's published minimum supported Go version, not a developer
-convenience.
+it with **the user's own `go`** (one cached `go build`, keyed on the source and the toolchain). The
+`go` directive in `goextract/go.mod` is therefore gnr8's published minimum supported Go version, not a
+developer convenience.
 
-Raising it forces every user onto that release or triggers a toolchain download on their machine, and
-hard-fails outright under `GOTOOLCHAIN=local` — which is a configuration real users run, and which our
-own `crates/gnr8-core/tests/sdk_lint.rs` depends on. Treat a bump to this directive as a **breaking
-change**: it needs a CHANGELOG entry and a note in "Required User Toolchains" above.
+That build is pinned to the toolchain the *analyzed* module selects, not the one `goextract/go.mod`
+would pick on its own: `go/packages` runs `go list` inside the target, so a service declaring a newer
+Go than the machine's `PATH` carries is type-checked by that newer release, and a `go/types` older
+than the code it reads rejects every file gated on it. `+auto` stays on the pin so the floor above can
+still raise the toolchain on a machine below it.
+
+Raising that directive forces every user onto that release or triggers a toolchain download on their
+machine, and hard-fails outright under `GOTOOLCHAIN=local` — which is a configuration real users run,
+and which our own `crates/gnr8-core/tests/sdk_lint.rs` depends on. Treat a bump to this directive as a
+**breaking change**: it needs a CHANGELOG entry and a note in "Required User Toolchains" above.
 
 The asymmetry that makes this cheap to get right: Go is forward compatible. A module declaring
 `go 1.26` builds correctly under a 1.27 toolchain, so **CI can lead the floor indefinitely**. There is

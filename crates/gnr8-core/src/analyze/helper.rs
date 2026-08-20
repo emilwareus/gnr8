@@ -1,6 +1,6 @@
 //! Subprocess driver for the `goextract` Go helper (CONTEXT D-02/D-03).
 //!
-//! Runs `go run . <target_dir>` from the `goextract` module directory, capturing
+//! Runs a cached `goextract <target_dir>` build from the `goextract` module directory, capturing
 //! stdout/stderr/exit status, and deserializes stdout into [`facts::GoFacts`].
 //! Every failure mode maps to a typed [`CoreError`] and is propagated with `?` —
 //! there is no `unwrap`/`expect`/`panic` here, so a missing toolchain or malformed
@@ -110,7 +110,7 @@ fn run_goextract_with(
     schema_patterns: &[String],
 ) -> Result<facts::GoFacts, CoreError> {
     let mut cmd = if go_bin == "go" {
-        Command::new(goextract_binary(go_bin)?)
+        Command::new(goextract_binary(go_bin, target_dir)?)
     } else {
         let mut cmd = Command::new(go_bin);
         // Tests can pass a fake Go binary to exercise missing-toolchain categorization.
@@ -143,17 +143,28 @@ fn run_goextract_with(
     Ok(parsed)
 }
 
-/// The identity of the Go toolchain that compiles — and is compiled into — the `goextract` binary.
+/// The Go toolchain that will type-check the TARGET module.
 ///
-/// `sdk::builtins::go_toolchain_identity` reads the same fact for the extracted-facts cache key,
-/// because the selected toolchain decides which build constraints pick which files and what stdlib
-/// type information the extractor sees. That reasoning applies twice over to the compiled binary:
-/// `go/types` admits only the language version the application was BUILT with, so a binary produced
-/// by an older toolchain rejects any dependency file gated on a newer release.
-fn goextract_toolchain_identity(go_bin: &str, dir: &std::path::Path) -> Result<String, CoreError> {
+/// Read from `target_dir`, not from the `goextract` directory, because that is where the decision is
+/// made: `goextract/internal/load` hands `go/packages` a `Dir` of the analyzed module, so it is the
+/// TARGET's own toolchain selection — which Go resolves upward from that module's `go` directive, not
+/// merely whatever sits on `PATH` — that picks which files compile and which language version they
+/// declare. `go/types` in turn admits only the language version the application was BUILT with, so
+/// the binary has to be produced by at least that same toolchain.
+///
+/// `sdk::builtins::go_toolchain_identity` reads the same `go env` line from the same module scope for
+/// the extracted-facts cache key, for the same reason.
+struct GoToolchain {
+    /// `GOVERSION` alone — the toolchain name the `goextract` build is pinned to.
+    version: String,
+    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS` reading, which keys the binary cache.
+    identity: String,
+}
+
+fn go_toolchain(go_bin: &str, target_dir: &str) -> Result<GoToolchain, CoreError> {
     let output = Command::new(go_bin)
         .args(["env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS"])
-        .current_dir(dir)
+        .current_dir(target_dir)
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
     if !output.status.success() {
@@ -162,7 +173,23 @@ fn goextract_toolchain_identity(go_bin: &str, dir: &std::path::Path) -> Result<S
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let version = identity
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(GoToolchain { version, identity })
+}
+
+/// The `GOTOOLCHAIN` the `goextract` build runs under: the target module's own toolchain, keeping
+/// `+auto` so `goextract/go.mod`'s floor can still pull a newer one on a machine below it — which is
+/// what an unpinned build already did. Pinning can therefore only raise the toolchain, never lower
+/// it, and a newer `go/types` accepts an older language version, so the binary is always at least as
+/// new as the code it must type-check. Pure so the pin is testable without a real toolchain.
+fn goextract_build_toolchain(version: &str) -> String {
+    format!("{version}+auto")
 }
 
 /// The cache directory name for one compiled `goextract` binary, over both facts that decide its
@@ -176,17 +203,18 @@ fn goextract_binary_cache_dir_name(source_hash: &str, toolchain: &str) -> String
     hasher.finalize().to_hex().to_string()
 }
 
-fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
+fn goextract_binary(go_bin: &str, target_dir: &str) -> Result<PathBuf, CoreError> {
     let root = checked_sidecar_dir("goextract", goextract_dir()?)?;
     // The binary is goextract's source AND the toolchain that compiled it: a Go upgrade changes the
-    // binary's behavior without moving one byte of source. Keying on source alone hands a user who
-    // just upgraded Go the binary their PREVIOUS toolchain built, which then reports every dependency
-    // file gated on the new release as a `source.load.failed` load error.
+    // binary's behavior without moving one byte of source. Keying on source alone hands a user whose
+    // toolchain moved the binary the PREVIOUS one built, which then reports every dependency file
+    // gated on the new release as a `source.load.failed` load error.
+    let toolchain = go_toolchain(go_bin, target_dir)?;
     let dir = std::env::temp_dir()
         .join("gnr8-goextract")
         .join(goextract_binary_cache_dir_name(
             &goextract_source_hash(&root)?,
-            &goextract_toolchain_identity(go_bin, &root)?,
+            &toolchain.identity,
         ));
     let binary = dir.join(if cfg!(windows) {
         "goextract.exe"
@@ -207,6 +235,11 @@ fn goextract_binary(go_bin: &str) -> Result<PathBuf, CoreError> {
         .args(["build", "-o"])
         .arg(&binary)
         .arg(".")
+        // The build runs from `goextract/`, whose own `go.mod` would otherwise select the toolchain —
+        // leaving a binary older than the one `go list` picks inside the target module whenever that
+        // module asks for a newer Go than `PATH` carries. Pin the build to the target's toolchain so
+        // the key above and the compiler that honors it are the same fact.
+        .env("GOTOOLCHAIN", goextract_build_toolchain(&toolchain.version))
         .current_dir(&root)
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
@@ -408,11 +441,29 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        goextract_binary_cache_dir_name, goextract_dir, pyextract_dir, resolve_target,
-        run_goextract_with, run_pyextract_with, run_tsextract_with, tsextract_dir,
+        goextract_binary_cache_dir_name, goextract_build_toolchain, goextract_dir, pyextract_dir,
+        resolve_target, run_goextract_with, run_pyextract_with, run_tsextract_with, tsextract_dir,
         typescript_toolchain_present,
     };
     use crate::CoreError;
+
+    mod goextract_build_toolchain {
+        use super::goextract_build_toolchain;
+
+        #[test]
+        fn pins_the_build_to_the_toolchain_that_type_checks_the_target() {
+            // A target module asking for go1.27 resolves to go1.27 even on a go1.26 PATH, and the
+            // binary that must type-check it has to be built by go1.27 too.
+            assert!(goextract_build_toolchain("go1.27.0").starts_with("go1.27.0"));
+        }
+
+        #[test]
+        fn keeps_auto_so_the_goextract_floor_can_still_raise_it() {
+            // `+auto` is load-bearing: below `goextract/go.mod`'s floor an unpinned build already
+            // fetched a newer toolchain, and a bare pin would turn that into a hard failure.
+            assert_eq!(goextract_build_toolchain("go1.26.5"), "go1.26.5+auto");
+        }
+    }
 
     mod goextract_binary_cache_dir_name {
         use super::goextract_binary_cache_dir_name;
