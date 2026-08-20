@@ -416,10 +416,12 @@ fn pascal_identifier(value: &str) -> String {
 ///
 /// Unlike the Python `@dataclass` twin there is NO required-first partition (TS `?:` is order-free —
 /// RESEARCH Pitfall 6). The runtime response decoder validates media type, presence, and JSON syntax
-/// before casting into these zero-runtime interfaces. The two independent axes are: whether the model
-/// may leave the key out → `?:` at the field site (answered from the direction the schema is reached
-/// from — [`SchemaDirections::model_field_is_optional`]); `nullable` → `| null` inside [`ts_type`]. All
-/// four combinations are representable.
+/// before casting into these zero-runtime interfaces. The two axes are: whether the model may leave the
+/// key out → `?:` at the field site (answered from the direction the schema is reached from —
+/// [`SchemaDirections::model_field_is_optional`]); `nullable` → `| null` inside [`ts_type`]. All four
+/// combinations are representable, but they are not independent in one direction: a nullable key the
+/// server does not validate is also omittable, since `k?: T | null` and `k: T | null` leave a reader the
+/// same case to handle and only the second makes a caller spell the null out.
 fn emit_interface(
     out: &mut String,
     name: &str,
@@ -3815,24 +3817,31 @@ mod tests {
             );
         }
 
+        /// The `?:` and the `| null` are separate marks and the emitter puts each where it belongs.
+        ///
+        /// No operation reaches this sample, so no validation rule reaches these models either, and a
+        /// nullable key therefore carries both marks: `k?: T | null` and `k: T | null` leave a reader
+        /// the same case, and only the second makes a caller spell the null out. The `| null`-without-
+        /// `?` form is what a validated key keeps, which needs a routed graph —
+        /// `tests/sdk_model_presence.rs` pins it there.
         #[test]
-        fn object_emits_an_interface_with_the_two_independent_field_axes() {
+        fn object_emits_an_interface_with_a_mark_per_field_axis() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
             assert!(out.contains("export interface BookFilters {"), "{out}");
-            // required, non-nullable.
+            // A key the model must carry, non-nullable: neither mark.
             assert!(
                 out.contains("  genre: string;"),
                 "required non-nullable:\n{out}"
             );
-            // optional (`?:`), non-nullable.
+            // Omittable (`?:`), non-nullable.
             assert!(
                 out.contains("  in_stock?: boolean;"),
                 "optional non-nullable `?:`:\n{out}"
             );
-            // required, nullable (`| null`, no `?`).
+            // Nullable, and no rule demands the key: both marks.
             assert!(
-                out.contains("  published: string | null;"),
-                "required nullable `| null`:\n{out}"
+                out.contains("  published?: string | null;"),
+                "nullable with no rule demanding it takes both marks:\n{out}"
             );
             // optional inline enum field (`?:` + literal union).
             assert!(

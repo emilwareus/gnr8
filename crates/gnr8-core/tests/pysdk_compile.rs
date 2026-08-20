@@ -112,18 +112,34 @@ def Field(default=None, *args, **kwargs):
     return default
 
 
+class ValidationError(ValueError):
+    pass
+
+
 class BaseModel:
     def __init__(self, **kwargs):
         annotations = {}
         for cls in reversed(self.__class__.mro()):
             annotations.update(getattr(cls, "__annotations__", {}))
+        missing = []
         for name in annotations:
             if name in kwargs:
                 setattr(self, name, kwargs[name])
-            elif hasattr(self.__class__, name):
-                setattr(self, name, getattr(self.__class__, name))
+                continue
+            # A field with no assignment in the class body, and one assigned `Field(...)`, are the two
+            # spellings Pydantic reads as REQUIRED: leaving either out of the call is a ValidationError,
+            # not a None. Modelling that is what makes a `to_dict()` -> `from_dict()` round trip a real
+            # assertion rather than a shape check.
+            default = getattr(self.__class__, name, ...)
+            if default is ...:
+                missing.append(name)
             else:
-                setattr(self, name, None)
+                setattr(self, name, default)
+        if missing:
+            raise ValidationError(
+                "%d validation errors for %s: %s"
+                % (len(missing), self.__class__.__name__, ", ".join(sorted(missing)))
+            )
         for name, value in kwargs.items():
             setattr(self, name, value)
 
@@ -157,6 +173,7 @@ class BaseModel:
             key: dump(value)
             for key, value in self.__dict__.items()
             if not key.startswith("_")
+            and not (_kwargs.get("exclude_none") and value is None)
         }
 "#,
     )
@@ -480,6 +497,78 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
         idempotency_key_header: Some("Idempotency-Key".to_string()),
     }];
     graph
+}
+
+/// A response-only model carrying the shape a bare Go pointer and a nil map produce: a key the
+/// serializer writes on every response, holding a value that may be `null`. Every `json_name` is a
+/// single lowercase word, so no field needs a Pydantic alias and the stub's ignorance of aliases never
+/// stands between the driver below and what a real Pydantic would do.
+fn nullable_response_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(
+        r#"{
+          "module": "app",
+          "operations": [
+            {
+              "id": "getEvent",
+              "method": "GET",
+              "path": "/event",
+              "handler": "getEvent",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [
+                { "status": 200, "body": { "ref_id": "dto.Event" },
+                  "content_types": ["application/json"] }
+              ],
+              "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            }
+          ],
+          "schemas": [
+            {
+              "id": "dto.Event",
+              "name": "Event",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "identifier",
+                  "required": false,
+                  "optional": false,
+                  "nullable": false,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "properties",
+                  "required": false,
+                  "optional": false,
+                  "nullable": true,
+                  "schema": { "type": "map", "of": {
+                    "key": { "type": "primitive", "of": { "prim": "string" } },
+                    "value": { "type": "any", "of": {} }
+                  } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "userid",
+                  "required": false,
+                  "optional": false,
+                  "nullable": true,
+                  "schema": { "type": "primitive", "of": { "prim": "string" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            }
+          ],
+          "diagnostics": [],
+          "base_path": "/api",
+          "title": "Events",
+          "security": []
+        }"#,
+    )
+    .expect("nullable response graph json")
 }
 
 fn pagination_graph() -> gnr8::graph::ApiGraph {
@@ -1181,6 +1270,84 @@ fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_stdlib_http_
     assert!(
         result.is_ok(),
         "the stdlib runtime driver must pass (retries + idempotency + hooks): {result:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
+/// The model round trip a nullable key used to break: construct, `to_dict()`, `from_dict()` the dump.
+///
+/// No HTTP server — the subject is the model declaration itself, and the only two facts it needs are
+/// the ones `write_pydantic_stub` models faithfully: a field with no default is required, and
+/// `exclude_none` drops the null-valued keys.
+const NULLABLE_MODEL_DRIVER: &str = r#"import bookstore
+
+# The model is reached only from a response, so a nullable key it always receives is one the caller may
+# leave out: the `null` it would otherwise spell says the same thing to everything that reads the model.
+default_constructed = bookstore.Event(identifier="e")
+assert default_constructed.userid is None, default_constructed.userid
+assert default_constructed.properties is None, default_constructed.properties
+
+# The round trip itself. `to_dict()` excludes every None, so a declaration that demanded those keys back
+# could not read its own output — the two halves of the model would contradict each other.
+spelled = bookstore.Event(identifier="e", properties={}, userid=None)
+dumped = spelled.to_dict()
+assert dumped == {"identifier": "e", "properties": {}}, dumped
+decoded = bookstore.Event.from_dict(dumped)
+assert decoded.identifier == "e", decoded.identifier
+assert decoded.userid is None, decoded.userid
+assert decoded.properties == {}, decoded.properties
+
+# A present null still decodes to None, which is why letting the key go costs the reading side nothing:
+# both spellings land on the same attribute value.
+from_null = bookstore.Event.from_dict({"identifier": "e", "properties": None, "userid": None})
+assert from_null.userid is None, from_null.userid
+assert from_null.properties is None, from_null.properties
+
+# The other half of the rule, and the proof the assertions above are not vacuous: a key with no null to
+# stand in for it is still demanded, so the stub does enforce required-ness.
+try:
+    bookstore.Event()
+except Exception as error:
+    assert "identifier" in str(error), error
+else:
+    raise SystemExit("Event() must fail: `identifier` is not nullable and is written every time")
+"#;
+
+/// A nullable key on a response-reached model carries a default, so the model can decode its own
+/// `to_dict()` output (the 0.6.0 regression: `Field(...)` demanded back exactly the keys `exclude_none`
+/// had just dropped). The non-nullable key beside it stays required, which is the #59 fix intact.
+#[test]
+fn a_nullable_response_field_round_trips_through_its_own_to_dict() {
+    if !python_available() {
+        eprintln!("skipping pysdk_compile nullable round-trip: python3 toolchain unavailable");
+        return;
+    }
+    let graph = nullable_response_graph();
+    let dir = materialize_sdk_from_graph("nullable", &graph, &graph.base_path);
+
+    // Pin the declarations the driver depends on, so a failure below names the emitted shape rather
+    // than only the Python assertion that tripped over it.
+    let models = std::fs::read_to_string(dir.join(PACKAGE).join("models.py")).expect("read models");
+    for declaration in [
+        "    identifier: str\n",
+        "    properties: Optional[dict[str, Any]] = Field(default=None)\n",
+        "    userid: Optional[str] = Field(default=None)\n",
+    ] {
+        assert!(
+            models.contains(declaration),
+            "models.py must declare `{}`:\n{models}",
+            declaration.trim_end()
+        );
+    }
+
+    let driver = dir.join("nullable_driver.py");
+    std::fs::write(&driver, NULLABLE_MODEL_DRIVER).expect("write nullable driver");
+    let driver_str = driver.to_str().expect("utf-8 path");
+    let result = run_python(&[driver_str], &dir);
+    assert!(
+        result.is_ok(),
+        "a model must decode its own to_dict() output: {result:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup

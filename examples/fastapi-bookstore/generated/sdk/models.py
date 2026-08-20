@@ -75,7 +75,7 @@ class CreatedMessage(BaseModel):
 class ListBooksResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     books: list[Book]
-    next_cursor: Optional[str]
+    next_cursor: Optional[str] = Field(default=None)
     total: int
 
     @classmethod

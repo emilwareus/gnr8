@@ -12,6 +12,13 @@
 //! rule 3). [`schema_directions`] computes those positions once, by walking the graph from every
 //! operation; [`SchemaDirections::field_is_required`] and [`SchemaDirections::model_field_is_optional`]
 //! are what the `OpenAPI` document and the generated SDK models respectively read off the result.
+//!
+//! The two artifacts do not read the same set of facts, which is why the two answers are separate
+//! methods rather than one negated. A document describes a payload, so the presence axes are all it
+//! has to say. A model is also a thing a caller builds, and there `field.nullable` bears on the same
+//! question: a key whose value may be `null` says nothing more by being present than the `null` did,
+//! so [`SchemaDirections::model_field_is_optional`] reads the value axis too and
+//! [`SchemaDirections::field_is_required`] does not.
 
 use super::{ApiGraph, Field, Type};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,12 +73,14 @@ impl SchemaDirections {
     /// So a model is safe in a position when
     ///
     /// - it does not permit omitting a key the server rejects the request for lacking
-    ///   (`field.required` ⟹ not optional), and
+    ///   (`field.required` ⟹ not optional),
     /// - it does not demand a key the server may leave out of what it writes
-    ///   (`field.optional` ⟹ optional).
+    ///   (`field.optional` ⟹ optional), and
+    /// - it does not demand a key that buys the reading side nothing by being there
+    ///   (`field.nullable` ⟹ optional, where the first rule leaves it free).
     ///
-    /// Those hold together everywhere except on a field that is both validated and omittable, and the
-    /// rule below follows from one sentence: **a validation rule states what the server rejects an
+    /// The first two hold together everywhere except on a field that is both validated and omittable,
+    /// and they follow from one sentence: **a validation rule states what the server rejects an
     /// INBOUND payload for lacking, so a model reads it exactly where the model is inbound and only
     /// inbound; everywhere else the presence axis — what the serializer does with the value, which is
     /// true of the type wherever it appears — stands.**
@@ -83,16 +92,33 @@ impl SchemaDirections {
     /// model does not get to crash on data the caller does not control. Publishing the document's
     /// intersection here instead would also mark optional every field of a both-ways type that carries
     /// no validation rule at all — which is most of them — for no gain in either direction.
+    ///
+    /// The third rule is about the value axis rather than either presence axis, and it is the only one
+    /// of the three that costs a caller nothing to obey. **A nullable key gives the reading side no
+    /// case by being present that it was not already handling.** The hint is `Optional[T]` / `T | null`
+    /// whether or not the key may be absent, and the value the reader ends up with is `None`/`null`
+    /// either way, so demanding presence changes nothing about reading it and only adds a value the
+    /// writing side has to spell — one that `PySdk`'s own `to_dict` then drops, since `exclude_none`
+    /// omits exactly the null-valued keys such a declaration would demand back. The demand still pays
+    /// in one place, and the first rule is where: a validation rule is a fact about what the server
+    /// rejects an inbound payload for lacking, not about what the model can express, so a validated
+    /// key stays demanded in every position the model is inbound from.
     pub(crate) fn model_field_is_optional(self, field: &Field) -> bool {
         match (self.request, self.response) {
             // Inbound and only inbound: the server's validation is the whole of what an omission is
             // accepted or rejected against. An omission option governs marshalling, and the server
-            // never marshals a request DTO, so the presence axis says nothing here.
+            // never marshals a request DTO, so the presence axis says nothing here — and a nullable
+            // key the server validates is one it demands, so nullability adds nothing either.
             (true, false) => !field.required,
-            // Reached from a response, from both, or from no operation at all: the model is (or may
-            // be) the decode side, where the key's absence is the server's choice and not the
-            // caller's, and demanding it breaks a payload the server is entitled to send.
-            (true, true) | (false, _) => field.optional,
+            // Reached from both: the model is the decode side too, so it keeps the response answer
+            // (above), widened by a null the caller may state as an absence — except on a key the
+            // server validates, where the model is also inbound and the demand is the server's.
+            (true, true) => field.optional || (field.nullable && !field.required),
+            // Reached from a response, or from no operation at all: the model is (or may be) the
+            // decode side and never the inbound one, where the key's absence is the server's choice
+            // and not the caller's, and demanding it breaks a payload the server is entitled to send.
+            // No validation rule reaches a model here, so a nullable key is free to be left out.
+            (false, _) => field.optional || field.nullable,
         }
     }
 }
@@ -249,14 +275,14 @@ mod tests {
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{Field, Prim, Type};
 
-    /// A field carrying nothing but the two presence axes, so a case states what it means and nothing
-    /// else.
-    fn presence_field(required: bool, optional: bool) -> Field {
+    /// A field carrying nothing but the two presence axes and the value axis, so a case states what it
+    /// means and nothing else.
+    fn presence_field(required: bool, optional: bool, nullable: bool) -> Field {
         Field {
             json_name: "value".to_string(),
             required,
             optional,
-            nullable: false,
+            nullable,
             schema: Type::Primitive(Prim::String),
             description: None,
             example: None,
@@ -264,17 +290,19 @@ mod tests {
         }
     }
 
-    /// The four positions, and every axis pair a source can state about a field in one of them.
+    /// The four positions, and every axis triple a source can state about a field in one of them.
     fn every_case() -> Vec<(SchemaDirections, Field)> {
         let mut cases = Vec::new();
         for request in [false, true] {
             for response in [false, true] {
                 for required in [false, true] {
                     for optional in [false, true] {
-                        cases.push((
-                            SchemaDirections { request, response },
-                            presence_field(required, optional),
-                        ));
+                        for nullable in [false, true] {
+                            cases.push((
+                                SchemaDirections { request, response },
+                                presence_field(required, optional, nullable),
+                            ));
+                        }
                     }
                 }
             }
@@ -294,6 +322,25 @@ mod tests {
                 assert!(
                     !directions.model_field_is_optional(&field),
                     "{directions:?} + required={} optional={} must not let a caller omit the key",
+                    field.required,
+                    field.optional
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_demands_a_nullable_key_only_where_the_server_validates_it() {
+        for (directions, field) in every_case() {
+            // Presence buys a reader nothing on a key whose value may be `null` — the hint carries the
+            // absent case either way — so the only reason left to demand one is the server's own
+            // validation rule, and that reason exists only where the model is inbound.
+            let validated_inbound = directions.request && field.required;
+            if field.nullable && !validated_inbound {
+                assert!(
+                    directions.model_field_is_optional(&field),
+                    "{directions:?} + required={} optional={} nullable must let a caller state the \
+                     null as an absence",
                     field.required,
                     field.optional
                 );
@@ -326,7 +373,7 @@ mod tests {
         // thing about the same key. That is the answer, not necessarily what a target emits — `GoSdk`
         // narrows it again, since `,omitempty` drops the zero value rather than marking absence and
         // may only ever be taken away (`gosdk::emit::omits_when_empty`).
-        let divergent: Vec<(bool, bool, bool, bool)> = every_case()
+        let divergent: Vec<(bool, bool, bool, bool, bool)> = every_case()
             .into_iter()
             .filter(|(directions, field)| {
                 directions.field_is_required(field) == directions.model_field_is_optional(field)
@@ -337,6 +384,7 @@ mod tests {
                     directions.response,
                     field.required,
                     field.optional,
+                    field.nullable,
                 )
             })
             .collect();
@@ -344,13 +392,23 @@ mod tests {
             divergent,
             vec![
                 // No operation reaches it, so the document keeps the source's own `required` while the
-                // model keeps the presence axis — the two facts, and the two answers, are unrelated.
-                (false, false, false, false),
-                (false, false, true, true),
+                // model keeps the presence and value axes — the two facts, and the two answers, are
+                // unrelated.
+                (false, false, false, false, false),
+                (false, false, true, false, true),
+                (false, false, true, true, false),
+                (false, false, true, true, true),
+                // Reached from a response, with a key the serializer always writes and a value that
+                // may be `null`. The document says what the wire carries, which is the key every time;
+                // the model lets the caller leave it out, because the null it would otherwise have to
+                // spell says the same thing to everything that reads the model. The two answers are
+                // about the payload and about the caller, and only here do they part over one key.
+                (false, true, false, false, true),
+                (false, true, true, false, true),
                 // Reached from both: the document publishes only what holds in every position, the
                 // model keeps the answer that cannot break a decode. Here the document under-claims a
                 // key the model always writes, which costs nothing on either side of the wire.
-                (true, true, false, false),
+                (true, true, false, false, false),
             ],
             "the two answers may agree or diverge, but only in the documented cases"
         );

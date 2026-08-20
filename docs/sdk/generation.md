@@ -51,6 +51,8 @@ same walk that answers the OpenAPI
 |---|---|
 | requests only (a request body, a parameter, or a schema one of those reaches) | the source states no validation rule requiring it |
 | responses only, both, or no operation at all | the source's serializer may leave the key out |
+| responses only, or no operation at all | **also** whenever the field's value may be `null` |
+| both | **also** when the field's value may be `null` and no validation rule requires the key |
 
 A validation rule says what your server rejects an inbound payload for lacking, so a model reads it
 exactly where the model is inbound and only inbound. In Go that matters most: an omission option
@@ -63,6 +65,15 @@ out would fail on a payload it is entitled to send. That is also the answer a ty
 directions keeps: one Go struct, one Python model, one TypeScript interface cannot be exact for two
 contracts, and the safe half is the one that cannot break a decode. Use a separate type per direction
 to get the exact answer in both.
+
+The last two rows read the value axis rather than either presence axis, and they cost nothing to
+obey. A nullable key gives a reader no case by being present that the `null` did not already give
+them — the hint is `Optional[str]` / `string | null` whether or not the key may be absent — so
+demanding it changes nothing about reading the value and only makes the caller spell one out.
+`PySdk`'s `to_dict` then drops that key again (`exclude_none` omits every null-valued key), so a
+model that demanded it could not decode its own output. A bare `*T` — the key your server writes on
+every response, holding a value that may be `null` — is the shape this reaches. The OpenAPI document
+is unaffected: `required` describes the payload, and that key is written every time.
 
 ### How each language spells it
 
@@ -79,8 +90,11 @@ nothing at all — that is the tag gnr8 reports as `schema.omit_option.ineffecti
 can therefore be stricter than its Python and TypeScript twins; both send payloads the document
 permits.
 
-Non-Go sources are unaffected: FastAPI, Flask, NestJS, and an imported OpenAPI document each state
-presence once, so both readings give the same answer.
+The **presence** rows never split a non-Go source: FastAPI, Flask, NestJS, and an imported OpenAPI
+document each state presence once, so a validation rule and an omission option give the same answer
+and the direction cannot change it. The **value** rows still apply to every source — a field declared
+`Optional[str]` with no default is required and nullable, so a model reached from a response leaves
+its key out while a model reached only from a request keeps demanding it.
 
 ## File layouts
 

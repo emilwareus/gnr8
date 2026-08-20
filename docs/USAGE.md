@@ -327,6 +327,8 @@ Generated SDK models read the same walk:
 |---|---|---|
 | requests only | **no** `binding:`/`validate:` `required` rule demands it | an omission option governs marshalling, and your server unmarshals a request DTO — it never marshals one, so the tag says nothing about what a client may omit |
 | responses only, both, or no route at all | the field carries a `json` omission option | the model is (or may be) the decode side, where the key's absence is your server's choice and not the caller's |
+| responses only, or no route at all — **also** when the field is nullable | its value may be `null`, and no rule reaches the model here to demand the key | a nullable key gives a reader no case by being present that the `null` did not already give them, so demanding it only costs the caller a value to spell |
+| both — **also** when the field is nullable | its value may be `null` **and** no `binding:`/`validate:` `required` rule demands it | same reason, except where such a rule does demand it: there the model is the inbound side too, and the demand is your server's |
 
 The first row is the one that keeps a caller from building a request the server rejects: a field
 written `json:"name,omitempty"` with `binding:"required"` is required in a request model, and the SDK
@@ -335,6 +337,14 @@ serializer may drop is never demanded — which is also why a type used in **bot
 the response answer: over-requiring it would break decoding a payload your server is entitled to
 send. On such a type a validated-and-omittable field stays omittable in the model, and the document
 publishes it as not required too; splitting the type in two is what makes both directions exact.
+
+The last two rows are about the value axis rather than presence, and they are why a bare `*T` — a key
+your server writes on every response, holding a value that may be `null` — is not something a caller
+has to spell out. The model hints `Optional[str]` / `string | null` whether or not the key may be
+absent, so demanding it changes nothing about reading the value and only makes the caller write
+`userUuid=None`; `PySdk`'s `to_dict` then drops that key again (`exclude_none`), so a model that
+demanded it could not decode its own output. **The document is unaffected**: `required` describes the
+payload, and that key genuinely is written every time.
 
 **Go renders that answer with one restriction.** TypeScript's `?:` and Python's `= None` say "the
 caller may leave this key out" and nothing else, so they follow the table exactly. `,omitempty` says

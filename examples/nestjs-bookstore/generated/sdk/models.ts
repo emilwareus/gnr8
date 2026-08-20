@@ -34,7 +34,7 @@ export interface CreatedMessage {
 
 export interface ListBooksResponse {
   books: BookDto[];
-  nextCursor: string | null;
+  nextCursor?: string | null;
   total: number;
 }
 
