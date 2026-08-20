@@ -16,7 +16,7 @@
 //! maps to a captured
 //! stderr failure (or `CoreError::GoBuild` in the harness helper), never a panic (threat T-03-03-04).
 //!
-//! Requires the Go toolchain (present on dev + CI, go 1.26); skips gracefully (early return) if it is
+//! Requires the Go toolchain (present on dev + CI, go 1.27); skips gracefully (early return) if it is
 //! absent so a non-Go environment never hard-fails the suite (mirrors `tests/determinism.rs`).
 
 // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4 + ch.5); scope the allow to

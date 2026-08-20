@@ -9,7 +9,7 @@
 //! (Pitfall 2 — reconcile, not byte-copy). The snapshot uses `assert_snapshot!` (plain text).
 //!
 //! This test runs the Go toolchain (it builds the graph AND pipes each file through `gofmt`), present
-//! on dev + CI (go 1.26).
+//! on dev + CI (go 1.27).
 
 // Tests legitimately use unwrap/expect (skill ch.4 + ch.5); scoped allow keeps RUST-04 intact
 // for production code (Pitfall 2).

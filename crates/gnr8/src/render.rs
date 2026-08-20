@@ -216,7 +216,7 @@ mod tests {
     const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
     /// Build the real graph once. Returns `None` (skip) if the Go toolchain is unavailable so the
-    /// test never fails for a missing dependency — but on dev + CI (go 1.26) it runs.
+    /// test never fails for a missing dependency — but on dev + CI (go 1.27) it runs.
     fn graph_or_skip() -> Option<gnr8::graph::ApiGraph> {
         build_graph(FIXTURE_DIR).ok()
     }

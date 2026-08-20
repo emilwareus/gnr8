@@ -129,3 +129,51 @@ can configure `PySdk::new().dataclasses()` in `.gnr8/src/main.rs`.
 The extractor contract is static and deliberately bounded. Dynamic route prefixes/paths, unresolved
 handlers or response shapes, and types without a declared wire representation are diagnosed or fail
 explicitly. See [USAGE.md](USAGE.md) for the current per-frontend envelope.
+
+## Go Toolchain Policy
+
+A Go version appears in four places in this repository, and they mean four different things. They are
+bumped on different schedules, for different reasons, and conflating them is how a routine version
+bump turns into a breaking change.
+
+| Surface | Where | What it means | Bump when |
+|---|---|---|---|
+| **CI + dev toolchain** | `go-version:` in `.github/workflows/ci.yml` and `generated-sdk-check.yml` | Which compiler runs our own gates | Every stable Go release |
+| **`goextract` floor** | `go` directive in `goextract/go.mod` | **The minimum Go a gnr8 user must have to analyze a Go service** | Only when goextract needs a newer language or stdlib feature |
+| **Generated-SDK floor** | `GoSdk::go_version` default (`crates/gnr8-core/src/sdk/builtins.rs`) | The minimum Go a *consumer of a generated SDK* must have | Almost never — deliberately conservative |
+| **Examples + fixtures** | `go` directive in `examples/*/go.mod`, `fixtures/*/go.mod` | Demo/test modules only; no user-facing meaning | Opportunistically, or never |
+
+### Why the `goextract` floor is user-facing
+
+`scripts/package-release.sh` ships `goextract/` to users **as source**, and `analyze::helper` compiles
+it with **the user's own `go`** (a cached `go build`, falling back to `go run`). The `go` directive in
+`goextract/go.mod` is therefore gnr8's published minimum supported Go version, not a developer
+convenience.
+
+Raising it forces every user onto that release or triggers a toolchain download on their machine, and
+hard-fails outright under `GOTOOLCHAIN=local` — which is a configuration real users run, and which our
+own `crates/gnr8-core/tests/sdk_lint.rs` depends on. Treat a bump to this directive as a **breaking
+change**: it needs a CHANGELOG entry and a note in "Required User Toolchains" above.
+
+The asymmetry that makes this cheap to get right: Go is forward compatible. A module declaring
+`go 1.26` builds correctly under a 1.27 toolchain, so **CI can lead the floor indefinitely**. There is
+no reason to move the floor just because a new Go shipped.
+
+### The action defaults to `stable`
+
+`action.yml` sets `go-version: "stable"`, so consumers of the gnr8 GitHub Action build `goextract` with
+whatever Go is current on the day their workflow runs. Our CI pin should track the latest stable
+release so that our gates are not testing an *older* Go than our users are given. When these two drift,
+CI is the thing that is wrong.
+
+### Bump checklist (CI/dev toolchain)
+
+1. Update `go-version:` in `.github/workflows/ci.yml` (both jobs) and `generated-sdk-check.yml`.
+2. Update the "present on dev + CI (go X.Y)" comments in `crates/gnr8-core/tests/{determinism,
+   sdk_compile,snapshot_sdk}.rs` and `crates/gnr8/src/render.rs`. Leave comments that describe a
+   written `go.mod` floor (e.g. `sdk_compile.rs`'s hermetic `go 1.26` module) alone — those are floors,
+   not toolchains.
+3. Run `make check` on the new toolchain. `fixture-build`, `goextract-build`, and `examples-check` all
+   shell out to the local `go`, so a local run is a genuine rehearsal of CI.
+4. Leave `goextract/go.mod`, the `GoSdk` default, and `docs/demo.md` untouched. `demo.md` records the
+   toolchain a captured demo run actually used; it changes only when the demo is re-captured.

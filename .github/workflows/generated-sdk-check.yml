@@ -96,7 +96,7 @@ jobs:
           working-directories: examples/${{ matrix.project }}
           gnr8-binary: ${{ github.workspace }}/target/release/gnr8
           setup-go: ${{ matrix.setup_go }}
-          go-version: "1.26"
+          go-version: "1.27"
           setup-python: ${{ matrix.setup_python }}
           python-version: "3.13"
           setup-node: "false"
