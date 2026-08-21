@@ -27,7 +27,7 @@ use crate::CoreError;
 /// the host (the `gnr8` binary) rejects a bundle whose `protocol_version` differs from this, so a `.gnr8/`
 /// crate built against a skewed `gnr8-core` fails with an actionable error instead of a confusing
 /// parse error or silently-wrong output (forward/back-compat across the boundary).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Whether the host may skip starting the Rust code-as-config child from a prior local stamp.
 ///
 /// Disabled because arbitrary Rust used to construct a pipeline may read non-file runtime inputs

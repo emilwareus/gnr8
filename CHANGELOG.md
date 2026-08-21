@@ -21,6 +21,9 @@ must move the minor version.
   value can be null (`field: T | null`, not `field?: T | null`). A field with a JSON omission option
   is optional on output and, for ordinary pointer/slice/map values, non-null when present. Required
   request slices reject null; `json.RawMessage` keeps its distinct ability to hold literal JSON null.
+  On input, `encoding/json` accepts explicit null for ordinary value fields as well as nilable ones by
+  leaving a non-nilable destination unchanged; a field-level required validator may then reject the
+  resulting zero value.
 
   When one source type is used in both directions and those contracts differ, generation now emits
   distinct `TypeInput` and `TypeOutput` schemas/models and rewrites transitive references. Non-HTTP
@@ -28,8 +31,10 @@ must move the minor version.
   checked `force_nullable` / `force_non_nullable` overrides take an explicit `SchemaUse`.
 
   Go SDK optional value fields now use pointers with `omitempty`, preserving both absence and an
-  explicit zero value; required nullable value fields remain pointers without an omission tag.
-  Python `to_dict()` retains null for required-nullable keys so its own output remains decodable.
+  explicit zero value; required nullable value fields remain pointers without an omission tag. A
+  field that is both optional and nullable uses one additional pointer layer, so callers can choose
+  omitted, explicit null, or a concrete value. Python `to_dict()` retains null for required-nullable
+  keys so its own output remains decodable.
 
   **Upgrade note for 0.6.x consumers:** regenerate committed SDKs and review constructor call sites,
   component names, and schema assertions. In particular, nullable response fields that 0.6.1 made

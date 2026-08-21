@@ -144,7 +144,7 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
             return Ok(maybe_pointer(
                 target.name.clone(),
                 nullable,
-                is_value_ref(target),
+                is_value_ref(target, graph),
             ));
         }
         // An inline (anonymous) object is not emitted as a Go type in this PoC (every object is a
@@ -207,22 +207,32 @@ fn go_well_known(well_known: &WellKnown) -> &'static str {
 
 /// Whether a referenced schema lowers to a Go *value* type that needs a pointer to be nullable.
 ///
-/// Enum newtypes are string-backed value types (`*TargetDirection` when nullable, per `expected/sdk`);
-/// object refs are structs and are pointer-wrapped only when nullable too. The match over the named
-/// schema's neutral body is exhaustive (T-03).
-fn is_value_ref(target: &Schema) -> bool {
-    match &target.body {
-        // Both enums and structs are value types in Go; a nullable field is a pointer either way.
-        Type::Enum(_) | Type::Object(_) => true,
-        // A named schema whose body is a scalar/array/map/union/any is not a Go struct/enum newtype;
-        // it is not pointer-wrapped on the named-ref path (its own mapping handles nilability).
+/// Enum newtypes and object refs are Go values, as are aliases whose transitive body is a scalar.
+/// Array, map, `any`, and byte-slice aliases already have a native nil representation. The match over
+/// the named schema's neutral body is exhaustive (T-03).
+fn is_value_ref(target: &Schema, graph: &ApiGraph) -> bool {
+    let mut visited = BTreeSet::new();
+    go_type_is_value(&target.body, graph, &mut visited)
+}
+
+fn go_type_is_value(ty: &Type, graph: &ApiGraph, visited: &mut BTreeSet<String>) -> bool {
+    match ty {
+        Type::Primitive(Prim::Bytes) | Type::Array(_) | Type::Map { .. } | Type::Any {} => false,
         Type::Primitive(_)
         | Type::WellKnown(_)
-        | Type::Array(_)
-        | Type::Map { .. }
-        | Type::Named(_)
-        | Type::Union(_)
-        | Type::Any {} => false,
+        | Type::Enum(_)
+        | Type::Object(_)
+        | Type::Union(_) => true,
+        Type::Named(id) => {
+            if !visited.insert(id.clone()) {
+                return true;
+            }
+            graph
+                .schemas
+                .iter()
+                .find(|schema| schema.id == *id)
+                .is_none_or(|schema| go_type_is_value(&schema.body, graph, visited))
+        }
     }
 }
 
@@ -472,7 +482,8 @@ fn emit_type_alias(
 ///
 /// Go value types use a pointer when either absence or null must be represented. `,omitempty` follows
 /// only absence: `*T` plus the tag preserves an explicit zero value for an optional non-null field,
-/// while `*T` without the tag represents a required nullable field.
+/// while `*T` without the tag represents a required nullable field. When both axes apply, one more
+/// pointer level keeps an explicit-null value distinct from an omitted field.
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
@@ -481,17 +492,31 @@ fn emit_struct_field(
     multipart_request: bool,
     directions: SchemaDirections,
 ) -> Result<(), CoreError> {
+    let go_ty = go_struct_field_type(field, graph, multipart_request, directions)?;
+    let optional = directions.model_field_is_optional(field);
+    let tag = json_tag(&field.json_name, optional);
+    writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
+    Ok(())
+}
+
+fn go_struct_field_type(
+    field: &Field,
+    graph: &ApiGraph,
+    multipart_request: bool,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
     let nullable = directions.field_is_nullable(field);
     let optional = directions.model_field_is_optional(field);
     let pointer_representation = nullable || optional;
-    let go_ty = if multipart_request {
+    let mut go_ty = if multipart_request {
         go_multipart_field_type(&field.schema, pointer_representation, graph)?
     } else {
         go_type(&field.schema, pointer_representation, graph)?
     };
-    let tag = json_tag(&field.json_name, optional);
-    writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
-    Ok(())
+    if optional && nullable {
+        go_ty.insert(0, '*');
+    }
+    Ok(go_ty)
 }
 
 fn is_multipart_request_schema(graph: &ApiGraph, schema_id: &str) -> Result<bool, CoreError> {
@@ -1639,7 +1664,7 @@ struct GoPaginationInfo {
     item_type: String,
     items_field: String,
     next_cursor_field: Option<String>,
-    next_cursor_pointer: bool,
+    next_cursor_pointer_depth: usize,
 }
 
 fn emit_pagination_helpers(
@@ -1769,17 +1794,30 @@ fn emit_go_pagination_advance(
             let param = go_query_param(op, cursor_param)?;
             let param_field = exported(&param.name);
             writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
-            if info.next_cursor_pointer {
-                writeln!(body, "if nextCursor == nil || *nextCursor == \"\" {{").map_err(sink)?;
-            } else {
-                writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
-            }
+            let mut terminal_conditions = (0..info.next_cursor_pointer_depth)
+                .map(|depth| format!("{}nextCursor == nil", "*".repeat(depth)))
+                .collect::<Vec<_>>();
+            terminal_conditions.push(format!(
+                "{}nextCursor == \"\"",
+                "*".repeat(info.next_cursor_pointer_depth)
+            ));
+            writeln!(body, "if {} {{", terminal_conditions.join(" || ")).map_err(sink)?;
             writeln!(body, "{terminate}").map_err(sink)?;
             writeln!(body, "}}").map_err(sink)?;
-            if param.required && info.next_cursor_pointer {
-                writeln!(body, "params.{param_field} = *nextCursor").map_err(sink)?;
-            } else if param.required || info.next_cursor_pointer {
-                writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
+            if param.required {
+                writeln!(
+                    body,
+                    "params.{param_field} = {}nextCursor",
+                    "*".repeat(info.next_cursor_pointer_depth)
+                )
+                .map_err(sink)?;
+            } else if info.next_cursor_pointer_depth > 0 {
+                writeln!(
+                    body,
+                    "params.{param_field} = {}nextCursor",
+                    "*".repeat(info.next_cursor_pointer_depth - 1)
+                )
+                .map_err(sink)?;
             } else {
                 writeln!(body, "params.{param_field} = &nextCursor").map_err(sink)?;
             }
@@ -1948,7 +1986,7 @@ fn go_pagination_info(
     };
     let schema_directions = schema_directions(graph);
     let directions = directions_of(&schema_directions, &schema.id);
-    let (next_cursor_field, next_cursor_pointer) = if let Some(next_cursor) =
+    let (next_cursor_field, next_cursor_pointer_depth) = if let Some(next_cursor) =
         policy.next_cursor_field.as_deref()
     {
         let field = fields
@@ -1960,19 +1998,18 @@ fn go_pagination_info(
                     op.id, next_cursor
                 ),
             })?;
-        let pointer =
-            directions.model_field_is_optional(field) || directions.field_is_nullable(field);
-        let pointer = go_type(&field.schema, pointer, graph)?.starts_with('*');
-        (Some(exported(&field.json_name)), pointer)
+        let field_type = go_struct_field_type(field, graph, false, directions)?;
+        let pointer_depth = field_type.bytes().take_while(|byte| *byte == b'*').count();
+        (Some(exported(&field.json_name)), pointer_depth)
     } else {
-        (None, false)
+        (None, 0)
     };
     Ok(GoPaginationInfo {
         page_type,
         item_type: go_type(item_schema, false, graph)?,
         items_field: exported(&items.json_name),
         next_cursor_field,
-        next_cursor_pointer,
+        next_cursor_pointer_depth,
     })
 }
 
@@ -3701,12 +3738,12 @@ mod tests {
         use crate::graph::{Field, Prim, Type};
 
         #[test]
-        fn optional_field_is_pointer_with_omitempty_required_is_plain() {
+        fn optional_nullable_field_has_two_pointers_and_required_is_plain() {
             let out = emit_models(&sample_graph(), "goalservice").unwrap();
-            // Optional number → *float32 + omitempty.
+            // Optional + nullable number → **float32 + omitempty.
             assert!(
-                out.contains("TargetValue *float32 `json:\"targetValue,omitempty\"`"),
-                "optional number must be *float32 omitempty:\n{out}"
+                out.contains("TargetValue **float32 `json:\"targetValue,omitempty\"`"),
+                "optional nullable number must be **float32 omitempty:\n{out}"
             );
             // Required string → no omitempty, no pointer.
             assert!(
@@ -3807,10 +3844,10 @@ mod tests {
                 out.contains("AnalyticsQuery GoalAnalyticsQuery `json:\"analyticsQuery\"`"),
                 "{out}"
             );
-            // optional enum ref → *TargetDirection.
+            // optional + nullable enum ref → **TargetDirection.
             assert!(
                 out.contains(
-                    "TargetDirection *TargetDirection `json:\"targetDirection,omitempty\"`"
+                    "TargetDirection **TargetDirection `json:\"targetDirection,omitempty\"`"
                 ),
                 "{out}"
             );
@@ -4415,6 +4452,14 @@ mod tests {
 
         /// A one-object graph with a single value field carrying the given optional/nullable axes.
         fn graph_with_field(optional: bool, nullable: bool) -> ApiGraph {
+            graph_with_typed_field(
+                optional,
+                nullable,
+                Type::Primitive(Prim::Float { bits: 32 }),
+            )
+        }
+
+        fn graph_with_typed_field(optional: bool, nullable: bool, schema: Type) -> ApiGraph {
             let mut graph = ApiGraph::default();
             graph.schemas.push(crate::graph::Schema {
                 id: "dto.S".to_string(),
@@ -4427,8 +4472,7 @@ mod tests {
                     serializer_may_emit_null: nullable,
                     validator_requires_presence: !optional,
                     validator_rejects_null: false,
-                    // a float is a Go value type (float32) — pointer-eligible when nullable.
-                    schema: Type::Primitive(Prim::Float { bits: 32 }),
+                    schema,
                     description: None,
                     example: None,
                     meta: FieldMeta::default(),
@@ -4436,6 +4480,23 @@ mod tests {
                 enum_source_order: Vec::new(),
                 provenance: crate::graph::SourceSpan {
                     file: "s.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            });
+            graph
+        }
+
+        fn graph_with_named_alias(optional: bool, nullable: bool, body: Type) -> ApiGraph {
+            let mut graph =
+                graph_with_typed_field(optional, nullable, Type::Named("dto.Alias".to_string()));
+            graph.schemas.push(crate::graph::Schema {
+                id: "dto.Alias".to_string(),
+                name: "Alias".to_string(),
+                body,
+                enum_source_order: Vec::new(),
+                provenance: crate::graph::SourceSpan {
+                    file: "alias.go".to_string(),
                     start_line: 1,
                     end_line: 1,
                 },
@@ -4462,11 +4523,45 @@ mod tests {
         }
 
         #[test]
-        fn nullable_and_optional_value_is_pointer_with_omitempty() {
+        fn nullable_and_optional_value_has_distinct_absent_and_null_states() {
             let out = emit_models(&graph_with_field(true, true), "svc").unwrap();
             assert!(
-                out.contains("Value *float32 `json:\"value,omitempty\"`"),
-                "nullable-and-optional value must be *T WITH omitempty:\n{out}"
+                out.contains("Value **float32 `json:\"value,omitempty\"`"),
+                "nullable-and-optional value must be **T WITH omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn nullable_and_optional_container_has_distinct_absent_and_null_states() {
+            let graph = graph_with_typed_field(
+                true,
+                true,
+                Type::Array(Box::new(Type::Primitive(Prim::String))),
+            );
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value *[]string `json:\"value,omitempty\"`"),
+                "nullable-and-optional container must be *[]T WITH omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_scalar_alias_preserves_every_presence_and_null_state() {
+            let graph = graph_with_named_alias(true, true, Type::Primitive(Prim::String));
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value **Alias `json:\"value,omitempty\"`"),
+                "a named scalar alias needs the same pointer depth as its value type:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_byte_slice_alias_keeps_its_native_nil_representation() {
+            let graph = graph_with_named_alias(true, false, Type::Primitive(Prim::Bytes));
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value Alias `json:\"value,omitempty\"`"),
+                "a named byte-slice alias must not gain a pointer for optionality alone:\n{out}"
             );
         }
     }

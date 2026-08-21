@@ -18,7 +18,7 @@ gnr8 host
   └─ write/check plan
 ```
 
-The current bundle protocol is version 4 and carries:
+The current bundle protocol is version 5 and carries:
 
 - protocol, host CLI, child core version, and capability fingerprint;
 - sorted artifacts with producer/ownership/rewrite history;

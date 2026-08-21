@@ -14,7 +14,8 @@ Base path: `/`
 
 ## Schemas
 
-- `Assignee` (object)
+- `AssigneeInput` (object)
+- `AssigneeOutput` (object)
 - `CreateTaskRequest` (object)
 - `ErrorResponse` (object)
 - `Status` (enum)

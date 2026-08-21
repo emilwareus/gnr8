@@ -117,6 +117,11 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 | `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
 | `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
+Before the first target runs, the pipeline projects the frozen source facts into their canonical
+input/output schemas. Built-in and custom targets therefore see the same split names and transitive
+references. `build_ir` and `__inspect` deliberately retain the unsplit extraction facts for inspection;
+direct artifact tooling can call `ApiGraph::project_for_generation()` at the same boundary.
+
 - `Pipeline::new().source(..).transform(..).target(..).post(..)` — builder, stages kept in call order.
 - `Cx { project_root }` — the root relative paths resolve against. `Artifacts::create(path, text)` adds
   a generated file with explicit ownership and rejects collisions.
@@ -328,14 +333,16 @@ Generated SDK models read the same walk:
 
 Nullability never changes these answers. A bare `*T`, slice, or map with no omission option is a
 required nullable response property. With `omitempty`/`omitzero`, a nil value is omitted; when present,
-an ordinary pointer/slice/map is non-null. Request nullability is selected independently: a required
-validator rejects the nil produced by explicit null for ordinary nilable values, while
-`json.RawMessage` retains literal null as non-nil bytes and is not narrowed by that rule.
+an ordinary pointer/slice/map is non-null. Request nullability is selected independently:
+`encoding/json` accepts null into ordinary destinations, and a required validator rejects the
+resulting zero or nil value where its rule applies. `json.RawMessage` instead retains literal null as
+non-nil bytes and is not narrowed by that rule.
 
 Go value types use a pointer when the projected model must represent absence or null. Optional value
 types pair that pointer with `,omitempty`, preserving explicit zero values; required nullable value
-types omit the tag, so nil is serialized as a present null. Slices and maps already carry nil, and
-their direction-selected `,omitempty` tag controls whether nil means omission or a present null.
+types omit the tag, so nil is serialized as a present null. When both axes apply, an additional
+pointer distinguishes an omitted field from a caller-selected explicit null; the same rule wraps a
+slice or map so its nil value can mean null rather than omission.
 
 Non-HTTP roots and checked static-knowledge corrections live in the `.gnr8/` crate:
 
@@ -461,9 +468,9 @@ To make documentation mandatory, add the opt-in `RequireOperationDocs` transform
 | `float64` | `number`/`double` | `float64` | width preserved |
 | `time.Time` | `string`/`date-time` | `time.Time` | |
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
-| `*T` | nullable without an omission option; optional/non-null on output with one | `*T`; `,omitempty` only when optional | `encoding/json` writes `"k":null` and **keeps the key** for a bare pointer. |
-| `,omitzero` | source-optional | optional value types use `*T` + `,omitempty`; containers use their native type | omits the zero value of **any** type; the omission signal, not nullability. |
-| `,omitempty` | source-optional *for the types it omits* | optional value types use `*T` + `,omitempty`; containers use their native type | omits only `false`, `0`, `""`, nil pointer/interface, zero-length array/slice/map. A **no-op on a struct, a `time.Time`, or a non-zero-length array** → `schema.omit_option.ineffective`. |
+| `*T` | nullable without an omission option; optional/non-null on output with one | `*T`; `,omitempty` only when optional; `**T` when both axes apply | `encoding/json` writes `"k":null` and **keeps the key** for a bare pointer. |
+| `,omitzero` | source-optional | optional value types use `*T` + `,omitempty`; containers use their native type unless also nullable | omits the zero value of **any** type; the omission signal, not nullability. |
+| `,omitempty` | source-optional *for the types it omits* | optional value types use `*T` + `,omitempty`; containers use their native type unless also nullable | omits only `false`, `0`, `""`, nil pointer/interface, zero-length array/slice/map. A **no-op on a struct, a `time.Time`, or a non-zero-length array** → `schema.omit_option.ineffective`. |
 | `[]T` | required/nullable without omission; optional/non-null on output with omission | `[]T` | a nil slice marshals to null when its key is retained and is omitted when the tag applies. |
 | `map[string]T` | required/nullable without omission; optional/non-null on output with omission | `map[string]T` | free-form → diagnostic; a nil map follows the same directional rule. |
 | named-string+consts | string `enum` | typed newtype | |
@@ -501,9 +508,11 @@ lists every diagnostic.
   skipped with diagnostics; dynamic group prefixes are omitted with diagnostics.
 - Presence and null behavior are independent in both directions. **Outbound presence** comes from the
   `json` omission option. **Outbound nullability** records whether a present value can be null, so an
-  omission-tagged ordinary pointer/slice/map is optional and non-null when present. **Inbound
-  nullability** records decoding and validation separately; a required validator can reject explicit
-  null without changing the response contract. A `form:`-tagged field is a
+  omission-tagged ordinary pointer/slice/map is optional and non-null when present. A correctly-shaped
+  custom `MarshalJSON` method can emit null independently of the declared Go representation.
+  **Inbound nullability** records decoding and validation separately: `encoding/json` accepts null
+  for ordinary value destinations by leaving them unchanged, while a required validator can reject
+  the resulting zero value without changing the response contract. A `form:`-tagged field is a
   different wire with different rules: never nullable (a part has no `null`), and optional when the
   part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).
 - Field presence and nullability are answered from the direction the schema is reached from, in the

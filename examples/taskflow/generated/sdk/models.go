@@ -4,9 +4,9 @@ package sdk
 import "time"
 
 type AssigneeInput struct {
-	Email *string `json:"email,omitempty"`
-	ID    *string `json:"id,omitempty"`
-	Name  *string `json:"name,omitempty"`
+	Email **string `json:"email,omitempty"`
+	ID    **string `json:"id,omitempty"`
+	Name  **string `json:"name,omitempty"`
 }
 
 type AssigneeOutput struct {
@@ -16,13 +16,13 @@ type AssigneeOutput struct {
 }
 
 type CreateTaskRequest struct {
-	Assignee *AssigneeInput `json:"assignee,omitempty"`
-	DueAt    *time.Time     `json:"dueAt,omitempty"`
-	Labels   []string       `json:"labels,omitempty"`
-	Notes    *string        `json:"notes,omitempty"`
-	Priority *int64         `json:"priority,omitempty"`
-	Status   Status         `json:"status"`
-	Title    string         `json:"title"`
+	Assignee **AssigneeInput `json:"assignee,omitempty"`
+	DueAt    **time.Time     `json:"dueAt,omitempty"`
+	Labels   *[]string       `json:"labels,omitempty"`
+	Notes    **string        `json:"notes,omitempty"`
+	Priority **int64         `json:"priority,omitempty"`
+	Status   Status          `json:"status"`
+	Title    string          `json:"title"`
 }
 
 type ErrorResponse struct {
@@ -54,9 +54,9 @@ type TaskList struct {
 }
 
 type UpdateTaskRequest struct {
-	Labels   []string `json:"labels,omitempty"`
-	Notes    *string  `json:"notes,omitempty"`
-	Priority *int64   `json:"priority,omitempty"`
-	Status   *Status  `json:"status,omitempty"`
-	Title    *string  `json:"title,omitempty"`
+	Labels   *[]string `json:"labels,omitempty"`
+	Notes    **string  `json:"notes,omitempty"`
+	Priority **int64   `json:"priority,omitempty"`
+	Status   **Status  `json:"status,omitempty"`
+	Title    **string  `json:"title,omitempty"`
 }

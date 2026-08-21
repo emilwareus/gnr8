@@ -136,7 +136,7 @@ See [SDK generation](../sdk/generation.md).
 | `gnr8::runner::run` | required `.gnr8` child entry point |
 | `gnr8::runner::ArtifactBundle` | versioned child/host wire envelope |
 | `gnr8::runner::PROTOCOL_VERSION` | current host/child protocol number |
-| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph |
+| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph; `project_for_generation()` returns the canonical input/output artifact view |
 | `gnr8::CoreError` | typed core error enum |
 | `gnr8::sdk::validate_openapi_artifact` | generated OpenAPI readiness validation |
 

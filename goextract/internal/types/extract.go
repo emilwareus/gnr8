@@ -1048,8 +1048,11 @@ func parseWireTag(raw string, goName string, wire payloadWire) (name string, omi
 // presenceAndNullability derives serializer omission and deserializer null acceptance.
 // Each wire has exactly one rule per fact (CLAUDE.md rule 3).
 //
-// On the `encoding/json` wire the declared type is evidence for accepting null;
-// serializer presence comes from the omission option alone.
+// `encoding/json` accepts a JSON null for every ordinary Go destination. Nilable values become nil;
+// non-nilable values are left unchanged. A custom unmarshaler may reject null, but its method body is
+// not a typed fact the extractor can prove; `force_non_nullable(..., SchemaUse::Input)` is the checked
+// correction for that application-specific behavior. Serializer presence remains independently
+// derived from the omission option.
 //
 // The form/multipart wire is left as it was. Its binder is not `encoding/json`
 // and nothing here has established what it does with a bare pointer, so this
@@ -1061,7 +1064,7 @@ func presenceAndNullability(wire payloadWire, omitOpt string, t gotypes.Type) (o
 		// omission option means the part may be missing.
 		return isPointer(t) || omitOpt != "", false
 	}
-	return omitOptionOmits(t, omitOpt), zeroMarshalsNull(t)
+	return omitOptionOmits(t, omitOpt), true
 }
 
 func isPointer(t gotypes.Type) bool {
@@ -1101,21 +1104,10 @@ func omitOptionOmits(t gotypes.Type, omitOpt string) bool {
 	}
 }
 
-// zeroMarshalsNull reports whether `null` is a value this type can carry on the
-// JSON wire. A nil pointer, slice, map, and interface all can; nothing else can.
-// A named type is read through its underlying type, so `json.RawMessage`
-// ([]byte) is nullable while `time.Time` (a struct) and `uuid.UUID` ([16]byte)
-// are not.
-//
-// This is deliberately independent of the omission option, and that needs the
-// INBOUND direction to justify: an omission-tagged field never MARSHALS `null`
-// (a nil value is dropped before it can be written), but `json.Unmarshal`
-// accepts an explicit `null` into all four types whatever the tag says. So the
-// axis is exactly right for a request body and wider than a response body can
-// produce. Over-permissive is the safe side — a decoder that tolerates a `null`
-// it will never see costs nothing, while the reverse rejects valid payloads —
-// but narrowing it correctly means knowing which direction the schema is
-// reached from, which is the open question this does not settle.
+// zeroMarshalsNull reports whether this type's zero value marshals as JSON null.
+// A nil pointer, slice, map, and interface all do; nothing else does. A named
+// type is read through its underlying type, so `json.RawMessage` ([]byte) has a
+// null zero while `time.Time` (a struct) and `uuid.UUID` ([16]byte) do not.
 func zeroMarshalsNull(t gotypes.Type) bool {
 	unaliased := gotypes.Unalias(t)
 	if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
@@ -1151,9 +1143,9 @@ func outputMayEmitNull(wire payloadWire, omitOpt string, t gotypes.Type) bool {
 		return false
 	}
 	if omitOpt == "" {
-		return zeroMarshalsNull(t)
+		return zeroMarshalsNull(t) || customMarshalerMayEmitNull(t)
 	}
-	if isJSONRawMessage(t) {
+	if isJSONRawMessage(t) || customMarshalerMayEmitNull(t) {
 		return true
 	}
 	unaliased := gotypes.Unalias(t)
@@ -1161,22 +1153,36 @@ func outputMayEmitNull(wire payloadWire, omitOpt string, t gotypes.Type) bool {
 	case *gotypes.Interface:
 		return true
 	case *gotypes.Pointer:
-		return zeroMarshalsNull(underlying.Elem())
+		return zeroMarshalsNull(underlying.Elem()) || customMarshalerMayEmitNull(underlying.Elem())
 	default:
 		return false
 	}
 }
 
-// validationRejectsNull is deliberately narrower than Go nilability. A required
-// validator rejects the nil value produced for an ordinary pointer/slice/map or
-// interface, but RawMessage retains literal `null` as non-nil bytes and a custom
-// unmarshaler owns its representation. Those shapes therefore carry no inferred
-// rejection fact.
+// validationRejectsNull reports whether a required validator rejects the value
+// left by decoding null. Ordinary scalars, arrays, pointers, slices, maps, and
+// interfaces are zero/nil and fail `required`; a non-pointer struct's required
+// rule is not enforced by the validator version Gin uses. RawMessage retains the
+// non-empty bytes `null`, while a custom unmarshaler owns the resulting value, so
+// neither carries an inferred rejection fact.
 func validationRejectsNull(t gotypes.Type) bool {
+	unaliased := gotypes.Unalias(t)
+	if _, isPointer := unaliased.(*gotypes.Pointer); isPointer {
+		// encoding/json stops at the settable field pointer when decoding null and
+		// sets it to nil, without invoking the pointee's UnmarshalJSON method.
+		return true
+	}
+	if isNamedType(t, timePkgPath, "Time") {
+		return true
+	}
 	if isJSONRawMessage(t) || hasJSONUnmarshaler(t) {
 		return false
 	}
-	return zeroMarshalsNull(t)
+	if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
+		return false
+	}
+	_, isStruct := unaliased.Underlying().(*gotypes.Struct)
+	return !isStruct
 }
 
 func isJSONRawMessage(t gotypes.Type) bool {
@@ -1195,6 +1201,27 @@ func hasJSONUnmarshaler(t gotypes.Type) bool {
 	return hasJSONMethod(t, "UnmarshalJSON")
 }
 
+func hasJSONMarshaler(t gotypes.Type) bool {
+	return hasJSONMethod(t, "MarshalJSON")
+}
+
+// customMarshalerMayEmitNull is conservative for user-defined MarshalJSON
+// implementations: the method owns the wire bytes, so null is possible. The
+// standard-library time.Time implementation is a closed, known exception and
+// always emits a quoted timestamp.
+func customMarshalerMayEmitNull(t gotypes.Type) bool {
+	return hasJSONMarshaler(t) && !isNamedType(t, timePkgPath, "Time")
+}
+
+func isNamedType(t gotypes.Type, pkgPath string, name string) bool {
+	unaliased := gotypes.Unalias(t)
+	if pointer, ok := unaliased.(*gotypes.Pointer); ok {
+		unaliased = gotypes.Unalias(pointer.Elem())
+	}
+	named, ok := unaliased.(*gotypes.Named)
+	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == pkgPath && named.Obj().Name() == name
+}
+
 func hasJSONMethod(t gotypes.Type, name string) bool {
 	if methodSetHas(t, name) {
 		return true
@@ -1209,11 +1236,35 @@ func hasJSONMethod(t gotypes.Type, name string) bool {
 func methodSetHas(t gotypes.Type, name string) bool {
 	methodSet := gotypes.NewMethodSet(t)
 	for index := 0; index < methodSet.Len(); index++ {
-		if methodSet.At(index).Obj().Name() == name {
+		method, ok := methodSet.At(index).Obj().(*gotypes.Func)
+		if ok && method.Name() == name && hasJSONMethodSignature(method, name) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasJSONMethodSignature(method *gotypes.Func, name string) bool {
+	signature, ok := method.Type().(*gotypes.Signature)
+	if !ok {
+		return false
+	}
+	bytesType := gotypes.NewSlice(gotypes.Typ[gotypes.Byte])
+	errorType := gotypes.Universe.Lookup("error").Type()
+	switch name {
+	case "MarshalJSON":
+		return signature.Params().Len() == 0 &&
+			signature.Results().Len() == 2 &&
+			gotypes.Identical(signature.Results().At(0).Type(), bytesType) &&
+			gotypes.Identical(signature.Results().At(1).Type(), errorType)
+	case "UnmarshalJSON":
+		return signature.Params().Len() == 1 &&
+			signature.Results().Len() == 1 &&
+			gotypes.Identical(signature.Params().At(0).Type(), bytesType) &&
+			gotypes.Identical(signature.Results().At(0).Type(), errorType)
+	default:
+		return false
+	}
 }
 
 func spanOf(fset *token.FileSet, pos token.Pos) facts.SourceSpan {

@@ -140,9 +140,11 @@ components:
       required: [analyticsQuery, name]
       properties:
         analyticsQuery:
-          $ref: '#/components/schemas/GoalAnalyticsQueryInput'
+          oneOf:
+          - $ref: '#/components/schemas/GoalAnalyticsQueryInput'
+          - type: null
         description:
-          type: string
+          type: [string, 'null']
           description: Longer explanation
         name:
           type: string
@@ -163,13 +165,13 @@ components:
       required: [metric]
       properties:
         includePast:
-          type: boolean
+          type: [boolean, 'null']
           description: Whether to include historical data points
         metric:
           type: string
           description: Analytics metric to evaluate
         windowDays:
-          type: integer
+          type: [integer, 'null']
           description: Rolling window size in days
     GoalAnalyticsQueryOutput:
       type: object
@@ -248,10 +250,10 @@ components:
           - $ref: '#/components/schemas/GoalAnalyticsQueryInput'
           - type: null
         description:
-          type: string
+          type: [string, 'null']
           description: Updated explanation
         name:
-          type: string
+          type: [string, 'null']
           description: Updated goal name
         targetDirection:
           oneOf:

@@ -267,8 +267,8 @@ type ElementRules struct {
 	if !ok {
 		t.Fatal("field 'label' not found")
 	}
-	if !label.SerializerMayOmit || label.DeserializerAcceptsNull {
-		t.Fatalf("omitempty should be optional but not nullable, got optional=%v nullable=%v", label.SerializerMayOmit, label.DeserializerAcceptsNull)
+	if !label.SerializerMayOmit || !label.DeserializerAcceptsNull || label.SerializerMayEmitNull {
+		t.Fatalf("omitempty should make output optional/non-null while encoding/json still accepts inbound null, got omit=%v accepts-null=%v emits-null=%v", label.SerializerMayOmit, label.DeserializerAcceptsNull, label.SerializerMayEmitNull)
 	}
 	note, ok := fieldByJSON(s, "note")
 	if !ok {
@@ -407,16 +407,22 @@ type Payload struct {
 // The expectations are not derived from the extractor's rules — they are the
 // observed output of `json.Marshal(Matrix{})` on go1.26.5, verbatim and in
 // declaration order, so the test fails if the extractor and the marshaller ever
-// disagree again. An ABSENT key below is `optional`; a `null` value is `nullable`:
+// disagree again. An ABSENT key below is serializer-optional; a `null` value is
+// output-nullable. Independently, `json.Unmarshal` accepts an explicit null for
+// every field below, including ordinary value fields, by leaving non-nilable
+// destinations unchanged:
 //
 //	{"bare_str":"","bare_ptr":null,"bare_slice":null,"bare_map":null,
 //	 "bare_iface":null,"bare_struct":{"a":0},"omit_struct":{"a":0},
 //	 "bare_time":"0001-01-01T00:00:00Z","omit_time":"0001-01-01T00:00:00Z",
-//	 "bare_arr":["",""],"omit_arr":["",""],"req_ptr":null,
-//	 "req_slice":null,"req_raw":null}
+//	 "bare_arr":["",""],"omit_arr":["",""],"bare_custom":null,
+//	 "fake_custom":"","req_str":"","req_time":"0001-01-01T00:00:00Z",
+//	 "req_struct":{"a":0},"req_custom":"","req_custom_ptr":null,
+//	 "req_ptr":null,"req_slice":null,"req_raw":null,"req_raw_ptr":null}
 //
-// The seven keys absent from that object — omit_str, omit_ptr, omit_slice,
-// omit_map, zero_map, zero_struct, zero_time — are the only optional fields.
+// The eight keys absent from that object — omit_str, omit_ptr, omit_slice,
+// omit_map, zero_map, zero_struct, zero_time, omit_custom — are the only
+// serializer-optional fields.
 //
 // Two families of mistake are pinned by construction. The DECLARED TYPE is not
 // evidence for presence: a bare pointer keeps its key, so `*T` alone never makes
@@ -445,6 +451,20 @@ type Inner struct {
 	A int `+"`json:\"a\"`"+`
 }
 
+type NullString string
+
+func (NullString) MarshalJSON() ([]byte, error) {
+	return []byte("null"), nil
+}
+
+type FakeCustom string
+
+func (FakeCustom) MarshalJSON() {}
+
+type CustomInput string
+
+func (*CustomInput) UnmarshalJSON([]byte) error { return nil }
+
 type Matrix struct {
 	BareStr    string            `+"`json:\"bare_str\"`"+`
 	OmitStr    string            `+"`json:\"omit_str,omitempty\"`"+`
@@ -464,9 +484,18 @@ type Matrix struct {
 	ZeroTime   time.Time         `+"`json:\"zero_time,omitzero\"`"+`
 	BareArr    [2]string         `+"`json:\"bare_arr\"`"+`
 	OmitArr    [2]string         `+"`json:\"omit_arr,omitempty\"`"+`
+	BareCustom NullString        `+"`json:\"bare_custom\"`"+`
+	OmitCustom NullString        `+"`json:\"omit_custom,omitempty\"`"+`
+	FakeCustom FakeCustom        `+"`json:\"fake_custom\"`"+`
+	ReqStr     string            `+"`json:\"req_str\" binding:\"required\"`"+`
+	ReqTime    time.Time         `+"`json:\"req_time\" binding:\"required\"`"+`
+	ReqStruct  Inner             `+"`json:\"req_struct\" binding:\"required\"`"+`
+	ReqCustom  CustomInput       `+"`json:\"req_custom\" binding:\"required\"`"+`
+	ReqCustPtr *CustomInput      `+"`json:\"req_custom_ptr\" binding:\"required\"`"+`
 	ReqPtr     *int              `+"`json:\"req_ptr\" binding:\"required\"`"+`
 	ReqSlice   []string          `+"`json:\"req_slice\" binding:\"required\"`"+`
 	ReqRaw     json.RawMessage   `+"`json:\"req_raw\" binding:\"required\"`"+`
+	ReqRawPtr  *json.RawMessage  `+"`json:\"req_raw_ptr\" binding:\"required\"`"+`
 }
 `),
 		0o644,
@@ -488,44 +517,54 @@ type Matrix struct {
 	for _, tc := range []struct {
 		field          string
 		optional       bool // json.Marshal omits the key for the zero value
-		nullable       bool // json.Marshal writes null for the zero value
 		outputNullable bool // a present outbound key can carry null
 	}{
-		{"bare_str", false, false, false},
-		{"omit_str", true, false, false},
+		{"bare_str", false, false},
+		{"omit_str", true, false},
 		// A bare pointer keeps its key and holds null: NOT optional, nullable.
-		{"bare_ptr", false, true, true},
-		{"omit_ptr", true, true, false},
+		{"bare_ptr", false, true},
+		{"omit_ptr", true, false},
 		// A nil slice/map/interface is written as null even with no option.
-		{"bare_slice", false, true, true},
-		{"omit_slice", true, true, false},
-		{"bare_map", false, true, true},
-		{"omit_map", true, true, false},
-		{"zero_map", true, true, false},
-		{"bare_iface", false, true, true},
-		{"bare_struct", false, false, false},
+		{"bare_slice", false, true},
+		{"omit_slice", true, false},
+		{"bare_map", false, true},
+		{"omit_map", true, false},
+		{"zero_map", true, false},
+		{"bare_iface", false, true},
+		{"bare_struct", false, false},
 		// `,omitempty` is a no-op on a struct, a time.Time, and a [2]string.
-		{"omit_struct", false, false, false},
-		{"zero_struct", true, false, false},
-		{"bare_time", false, false, false},
-		{"omit_time", false, false, false},
-		{"zero_time", true, false, false},
-		{"bare_arr", false, false, false},
-		{"omit_arr", false, false, false},
+		{"omit_struct", false, false},
+		{"zero_struct", true, false},
+		{"bare_time", false, false},
+		{"omit_time", false, false},
+		{"zero_time", true, false},
+		{"bare_arr", false, false},
+		{"omit_arr", false, false},
+		// A correctly-shaped custom marshaler can emit null from a non-zero value;
+		// a same-named method with the wrong signature is not the JSON interface.
+		{"bare_custom", false, true},
+		{"omit_custom", true, true},
+		{"fake_custom", false, false},
 		// A validation tag governs the request direction; it does not change what
 		// the marshaller writes, so it moves neither axis.
-		{"req_ptr", false, true, true},
-		{"req_slice", false, true, true},
-		{"req_raw", false, true, true},
+		{"req_str", false, false},
+		{"req_time", false, false},
+		{"req_struct", false, false},
+		{"req_custom", false, false},
+		{"req_custom_ptr", false, true},
+		{"req_ptr", false, true},
+		{"req_slice", false, true},
+		{"req_raw", false, true},
+		{"req_raw_ptr", false, true},
 	} {
 		field, found := fieldByJSON(s, tc.field)
 		if !found {
 			t.Fatalf("field %q not found", tc.field)
 		}
-		if field.SerializerMayOmit != tc.optional || field.DeserializerAcceptsNull != tc.nullable {
+		if field.SerializerMayOmit != tc.optional || !field.DeserializerAcceptsNull {
 			t.Errorf(
-				"%s: want optional=%v nullable=%v, got optional=%v nullable=%v",
-				tc.field, tc.optional, tc.nullable, field.SerializerMayOmit, field.DeserializerAcceptsNull,
+				"%s: want serializer optional=%v and deserializer null acceptance, got optional=%v accepts-null=%v",
+				tc.field, tc.optional, field.SerializerMayOmit, field.DeserializerAcceptsNull,
 			)
 		}
 		if field.SerializerMayEmitNull != tc.outputNullable {
@@ -533,6 +572,26 @@ type Matrix struct {
 		}
 	}
 
+	reqStr, _ := fieldByJSON(s, "req_str")
+	if !reqStr.ValidatorRequiresPresence || !reqStr.ValidatorRejectsNull {
+		t.Fatalf("required scalar must reject the zero value left by explicit null: %+v", reqStr)
+	}
+	reqTime, _ := fieldByJSON(s, "req_time")
+	if !reqTime.ValidatorRequiresPresence || !reqTime.ValidatorRejectsNull {
+		t.Fatalf("required time.Time must reject the zero value left by explicit null: %+v", reqTime)
+	}
+	reqStruct, _ := fieldByJSON(s, "req_struct")
+	if !reqStruct.ValidatorRequiresPresence || reqStruct.ValidatorRejectsNull {
+		t.Fatalf("Gin's validator skips required on a non-pointer nested struct: %+v", reqStruct)
+	}
+	reqCustom, _ := fieldByJSON(s, "req_custom")
+	if !reqCustom.ValidatorRequiresPresence || reqCustom.ValidatorRejectsNull {
+		t.Fatalf("a value custom unmarshaler owns explicit-null behavior: %+v", reqCustom)
+	}
+	reqCustomPtr, _ := fieldByJSON(s, "req_custom_ptr")
+	if !reqCustomPtr.ValidatorRequiresPresence || !reqCustomPtr.ValidatorRejectsNull {
+		t.Fatalf("encoding/json sets a pointer field to nil before a custom unmarshaler can run: %+v", reqCustomPtr)
+	}
 	reqSlice, _ := fieldByJSON(s, "req_slice")
 	if !reqSlice.ValidatorRequiresPresence || !reqSlice.ValidatorRejectsNull {
 		t.Fatalf("required slice must retain presence and explicit-null rejection: %+v", reqSlice)
@@ -540,6 +599,10 @@ type Matrix struct {
 	reqRaw, _ := fieldByJSON(s, "req_raw")
 	if !reqRaw.ValidatorRequiresPresence || reqRaw.ValidatorRejectsNull {
 		t.Fatalf("RawMessage literal null remains non-nil and must not gain a rejection fact: %+v", reqRaw)
+	}
+	reqRawPtr, _ := fieldByJSON(s, "req_raw_ptr")
+	if !reqRawPtr.ValidatorRequiresPresence || !reqRawPtr.ValidatorRejectsNull {
+		t.Fatalf("a pointer to RawMessage is set to nil for explicit null: %+v", reqRawPtr)
 	}
 
 	// The three no-op `,omitempty` fields are the ones worth telling the author

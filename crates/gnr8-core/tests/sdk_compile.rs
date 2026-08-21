@@ -545,7 +545,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
                 },
                 {
                   "json_name": "nextCursor",
-                  "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -1278,7 +1278,10 @@ import (
 	"time"
 )
 
-func stringPointer(value string) *string {{ return &value }}
+func optionalNullableString(value string) **string {{
+	inner := &value
+	return &inner
+}}
 
 func TestPaginationHelpers(t *testing.T) {{
 	seen := []string{{}}
@@ -1298,12 +1301,12 @@ func TestPaginationHelpers(t *testing.T) {{
 		case "":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "a"}}}},
-				NextCursor: stringPointer("n2"),
+				NextCursor: optionalNullableString("n2"),
 			}})
 		case "n2":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "b"}}}},
-				NextCursor: stringPointer(""),
+				NextCursor: optionalNullableString(""),
 			}})
 		default:
 			t.Errorf("cursor = %q, want empty or n2", cursor)

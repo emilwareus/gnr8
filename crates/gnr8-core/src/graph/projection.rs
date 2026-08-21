@@ -69,9 +69,9 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
         }
         let reached = directions_of(&directions, &schema.id);
         let use_ = match (reached.request, reached.response) {
-            (true, false) => Some(SchemaUse::Input),
+            (_, false) => Some(SchemaUse::Input),
             (false, true) => Some(SchemaUse::Output),
-            _ => None,
+            (true, true) => None,
         };
         let mut unchanged = schema.clone();
         unchanged.body = rewrite_type(&schema.body, use_, &split)?;
@@ -318,5 +318,102 @@ fn type_references_any(ty: &Type, ids: &BTreeSet<String>) -> bool {
             .iter()
             .any(|variant| type_references_any(variant, ids)),
         Type::Primitive(_) | Type::WellKnown(_) | Type::Enum(_) | Type::Any {} => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic, clippy::unwrap_used)]
+
+    use super::ApiGraph;
+    use crate::graph::Type;
+
+    fn graph_with_unwired_parent() -> ApiGraph {
+        let facts = serde_json::from_slice(
+            br#"{
+              "module": "app",
+              "routes": [
+                {
+                  "method": "POST", "path": "/input", "handler": "input",
+                  "operation_id": "input", "params": [],
+                  "request_body": { "ref_id": "app.Child" },
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": { "file": "/root/http.go", "start_line": 1, "end_line": 1 }
+                },
+                {
+                  "method": "GET", "path": "/output", "handler": "output",
+                  "operation_id": "output", "params": [], "request_body": null,
+                  "responses": [ { "status": 200, "body": { "ref_id": "app.Child" } } ],
+                  "span": { "file": "/root/http.go", "start_line": 2, "end_line": 2 }
+                }
+              ],
+              "schemas": [
+                {
+                  "id": "app.Child", "name": "Child",
+                  "body": { "type": "object", "of": [
+                    {
+                      "json_name": "value",
+                      "serializer_may_omit": true,
+                      "deserializer_accepts_absent": false,
+                      "deserializer_accepts_null": false,
+                      "serializer_may_emit_null": false,
+                      "validator_requires_presence": false,
+                      "validator_rejects_null": false,
+                      "schema": { "type": "primitive", "of": { "prim": "string" } },
+                      "description": null, "example": null
+                    }
+                  ] },
+                  "span": { "file": "/root/models.go", "start_line": 1, "end_line": 1 }
+                },
+                {
+                  "id": "app.Parent", "name": "Parent",
+                  "body": { "type": "object", "of": [
+                    {
+                      "json_name": "child",
+                      "serializer_may_omit": false,
+                      "deserializer_accepts_absent": false,
+                      "deserializer_accepts_null": false,
+                      "serializer_may_emit_null": false,
+                      "validator_requires_presence": false,
+                      "validator_rejects_null": false,
+                      "schema": { "type": "named", "of": "app.Child" },
+                      "description": null, "example": null
+                    }
+                  ] },
+                  "span": { "file": "/root/models.go", "start_line": 2, "end_line": 2 }
+                }
+              ],
+              "diagnostics": []
+            }"#,
+        )
+        .unwrap();
+        ApiGraph::from_facts(facts, "/root")
+    }
+
+    #[test]
+    fn an_unwired_parent_uses_input_references_when_its_child_splits_elsewhere() {
+        let projected = graph_with_unwired_parent()
+            .project_for_generation()
+            .unwrap();
+        let parent = projected
+            .schemas
+            .iter()
+            .find(|schema| schema.id == "app.Parent")
+            .unwrap();
+        let Type::Object(fields) = &parent.body else {
+            panic!("parent must remain an object")
+        };
+        assert!(matches!(
+            fields.as_slice(),
+            [field] if field.schema == Type::Named("app.Child::input".to_string())
+        ));
+        assert!(projected
+            .schemas
+            .iter()
+            .any(|schema| schema.id == "app.Child::input"));
+        assert!(projected
+            .schemas
+            .iter()
+            .any(|schema| schema.id == "app.Child::output"));
     }
 }

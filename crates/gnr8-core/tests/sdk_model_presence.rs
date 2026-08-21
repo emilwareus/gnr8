@@ -15,7 +15,8 @@
 //!
 //! Requiredness never changes merely because a value is nullable. TypeScript and Python express both
 //! axes directly. Go uses a pointer for either a nullable value or an optional value whose explicit
-//! zero must remain distinguishable from omission, and uses `omitempty` only for optional fields.
+//! zero must remain distinguishable from omission, a second pointer when both axes apply, and
+//! `omitempty` only for optional fields.
 //!
 //! The Go SDK path pipes each file through `gofmt`, so this test needs the Go toolchain — the same
 //! prerequisite `snapshot_sdk` already carries.
@@ -184,8 +185,10 @@ fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
                 format!("`json:\"{field}\"`")
             };
             // A nullable value needs a pointer. An optional non-null value also needs one so an
-            // explicit zero value does not disappear through `omitempty`.
-            let go_type = if is_nullable(field) || omit_empty {
+            // explicit zero value does not disappear through `omitempty`; both axes need two.
+            let go_type = if is_nullable(field) && omit_empty {
+                "**string"
+            } else if is_nullable(field) || omit_empty {
                 "*string"
             } else {
                 "string"

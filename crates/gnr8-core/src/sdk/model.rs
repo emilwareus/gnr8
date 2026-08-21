@@ -293,6 +293,8 @@ impl SdkModel {
         base_path: impl Into<String>,
         layout: &SdkFileLayout,
     ) -> Result<Self, CoreError> {
+        let projected = graph.project_for_generation()?;
+        let graph = &projected;
         let package = package.into();
         let base_path = base_path.into();
         let api_key_headers = api_key_header_names(graph)?;
@@ -558,7 +560,7 @@ fn schema_kind(ty: &Type) -> SdkSchemaKind {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::{SdkModel, SdkSchemaKind};
     use crate::analyze::facts::FieldMeta;
@@ -673,6 +675,41 @@ mod tests {
         assert_eq!(a.operations[0].request_schema.as_deref(), Some("Book"));
         assert_eq!(a.schemas[0].kind, SdkSchemaKind::Object);
         assert_eq!(a.file_plan.model_dir.as_deref(), Some("models"));
+    }
+
+    #[test]
+    fn sdk_model_uses_directional_schema_names_everywhere() {
+        let mut graph = graph();
+        let Type::Object(fields) = &mut graph.schemas[0].body else {
+            panic!("book schema must be an object")
+        };
+        fields[0].serializer_may_omit = true;
+
+        let model = SdkModel::build(&graph, "books", "/api", &SdkFileLayout::compact()).unwrap();
+
+        assert_eq!(
+            model.operations[0].request_schema.as_deref(),
+            Some("BookInput")
+        );
+        assert_eq!(model.operations[0].response_schemas[0].1, "BookOutput");
+        assert!(model
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "BookInput"));
+        assert!(model
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "BookOutput"));
+        assert!(model
+            .docs_metadata
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "BookInput"));
+        assert!(model
+            .docs_metadata
+            .schemas
+            .iter()
+            .any(|schema| schema.name == "BookOutput"));
     }
 
     #[test]

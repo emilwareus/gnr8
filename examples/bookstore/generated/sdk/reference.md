@@ -50,7 +50,8 @@ Fields omitted from the payload keep their current values.
 | `CreateBookRequest` | object |
 | `ErrorResponse` | object |
 | `Genre` | enum |
-| `Publisher` | object |
+| `PublisherInput` | object |
+| `PublisherOutput` | object |
 | `UpdateBookRequest` | object |
 
 ## Diagnostics

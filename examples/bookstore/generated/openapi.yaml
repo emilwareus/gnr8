@@ -168,9 +168,11 @@ components:
         genre:
           $ref: '#/components/schemas/Genre'
         price:
-          type: number
+          type: [number, 'null']
         publisher:
-          $ref: '#/components/schemas/PublisherInput'
+          oneOf:
+          - $ref: '#/components/schemas/PublisherInput'
+          - type: null
         subtitle:
           type: [string, 'null']
         tags:
@@ -194,9 +196,9 @@ components:
       type: object
       properties:
         country:
-          type: string
+          type: [string, 'null']
         name:
-          type: string
+          type: [string, 'null']
     PublisherOutput:
       type: object
       required: [country, name]

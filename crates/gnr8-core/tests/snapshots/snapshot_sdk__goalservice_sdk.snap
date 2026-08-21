@@ -531,18 +531,18 @@ type CommandMessageWithUUID struct {
 }
 
 type CreateGoalInput struct {
-	AnalyticsQuery   GoalAnalyticsQueryInput `json:"analyticsQuery"`
-	Description      *string                 `json:"description,omitempty"`
-	Name             string                  `json:"name"`
-	TargetDirection  *TargetDirection        `json:"targetDirection,omitempty"`
-	TargetValue      *float64                `json:"targetValue,omitempty"`
-	WorkflowChainIDs []string                `json:"workflowChainIds,omitempty"`
+	AnalyticsQuery   *GoalAnalyticsQueryInput `json:"analyticsQuery"`
+	Description      **string                 `json:"description,omitempty"`
+	Name             string                   `json:"name"`
+	TargetDirection  **TargetDirection        `json:"targetDirection,omitempty"`
+	TargetValue      **float64                `json:"targetValue,omitempty"`
+	WorkflowChainIDs *[]string                `json:"workflowChainIds,omitempty"`
 }
 
 type GoalAnalyticsQueryInput struct {
-	IncludePast *bool  `json:"includePast,omitempty"`
-	Metric      string `json:"metric"`
-	WindowDays  *int64 `json:"windowDays,omitempty"`
+	IncludePast **bool  `json:"includePast,omitempty"`
+	Metric      string  `json:"metric"`
+	WindowDays  **int64 `json:"windowDays,omitempty"`
 }
 
 type GoalAnalyticsQueryOutput struct {
@@ -583,12 +583,12 @@ const (
 )
 
 type UpdateGoalInput struct {
-	AnalyticsQuery   *GoalAnalyticsQueryInput `json:"analyticsQuery,omitempty"`
-	Description      *string                  `json:"description,omitempty"`
-	Name             *string                  `json:"name,omitempty"`
-	TargetDirection  *TargetDirection         `json:"targetDirection,omitempty"`
-	TargetValue      *float64                 `json:"targetValue,omitempty"`
-	WorkflowChainIDs []string                 `json:"workflowChainIds,omitempty"`
+	AnalyticsQuery   **GoalAnalyticsQueryInput `json:"analyticsQuery,omitempty"`
+	Description      **string                  `json:"description,omitempty"`
+	Name             **string                  `json:"name,omitempty"`
+	TargetDirection  **TargetDirection         `json:"targetDirection,omitempty"`
+	TargetValue      **float64                 `json:"targetValue,omitempty"`
+	WorkflowChainIDs *[]string                 `json:"workflowChainIds,omitempty"`
 }
 // ==== gnr8:file operations.go ====
 package goalservice

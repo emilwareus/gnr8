@@ -76,9 +76,10 @@ decoding accepts after validation, independently of what the same source type ca
 
 `GoSdk` combines a pointer representation with `,omitempty` for an optional value type. Nil means the
 key is absent, while a non-nil pointer preserves an explicit zero value such as `0`, `""`, or a zero
-struct. A required nullable value type is also a pointer but has no omission tag. Slices and maps are
-already nil-capable, so their direction-selected tag supplies the presence behavior without another
-pointer layer.
+struct. A required nullable value type is also a pointer but has no omission tag. When a field is both
+optional and nullable, one additional pointer level preserves three caller-selectable states: omitted,
+explicit null, and a concrete value. This also wraps a nil-capable slice or map because its nil value
+must mean null rather than omission in that case.
 
 FastAPI, Flask, NestJS, and an imported OpenAPI document normally state the same contract in both
 directions, so they do not split unless configured facts make the uses differ.

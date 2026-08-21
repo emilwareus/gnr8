@@ -52,9 +52,11 @@ Recognized route facts include:
   On a `json:`-tagged field (or one with no payload tag), outbound presence is the omission option —
   `,omitzero` on any type, `,omitempty` only on the types it actually omits. A bare nilable field with
   no option is required and can emit null. An omission-tagged ordinary pointer/slice/map is optional
-  and non-null when present. Inbound null acceptance is recorded separately, as is a validator's
-  null rejection; required `json.RawMessage` is the important exception because literal null becomes
-  non-nil bytes.
+  and non-null when present. Inbound null acceptance is recorded separately: `encoding/json` accepts
+  null for every ordinary destination, leaving a non-nilable value unchanged. A field-level required
+  validator can reject the resulting zero/nil value; required `json.RawMessage` is the important
+  exception because literal null becomes non-nil bytes. A custom unmarshaler owns its behavior, so an
+  application that rejects null there states that checked correction with `force_non_nullable`.
 
   On a `form:`-tagged field a form/multipart binder owns it, and the rules differ: a part is present
   or absent with no `null` to write, so such a field is never nullable, and it is optional when the
@@ -62,10 +64,10 @@ Recognized route facts include:
   These facts reach every artifact. Direction selects request decoding/validation or response
   serialization in the document's `required` array and property nullability
   ([OpenAPI generation](../openapi/generation.md#a-component-schemas-required-array)) and in a
-  generated model's `?:`, `| null`, or Python default/type hint
+  generated model's `?:`, `| null`, Python default/type hint, or Go pointer depth
   ([SDK generation](../sdk/generation.md#field-presence-in-generated-models)). A Go model spells
-  omission with `,omitempty`, which drops the zero value rather than marking absence, so there the
-  validation rules can only take the option away — never put one on a field whose tag carries none.
+  omission with `,omitempty`. A value type uses `*T` to preserve optional zero values; a field that is
+  both optional and nullable adds one more pointer level so an explicit null remains constructible.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose

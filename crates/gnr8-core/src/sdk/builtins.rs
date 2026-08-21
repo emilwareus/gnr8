@@ -4988,6 +4988,8 @@ impl Target for GoSdk {
                     .to_string(),
             });
         }
+        let projected = ir.project_for_generation()?;
+        let ir = &projected;
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
@@ -5196,6 +5198,8 @@ impl Target for PySdk {
                 message: "PySdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
+        let projected = ir.project_for_generation()?;
+        let ir = &projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk uses, and
         // generate via the existing deterministic Python SDK generator — never a re-derivation, never
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
@@ -5516,6 +5520,8 @@ impl Target for TsSdk {
                 message: "TsSdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
+        let projected = ir.project_for_generation()?;
+        let ir = &projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk/PySdk use,
         // and generate via the existing deterministic TypeScript SDK generator — never a re-derivation,
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
@@ -6413,7 +6419,7 @@ mod tests {
         ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask, FormatCommand, GoGin,
         GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json,
         OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
-        ParameterOverride, PostProcess, PySdk, RequestParameter, ResponseOverride,
+        ParameterOverride, PostProcess, PySdk, RenameType, RequestParameter, ResponseOverride,
         SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
         Transform, TsSdk,
@@ -8436,6 +8442,46 @@ mod tests {
             py.contains("    value: Optional[str] = Field(default=None)"),
             "{py}"
         );
+
+        let mut artifacts = Artifacts::new();
+        TsSdk::new()
+            .module("example.com/tool/sdk")
+            .to("generated/ts")
+            .package_metadata(false)
+            .generate(&ir, &mut artifacts, &cx())
+            .unwrap();
+        let reference = artifacts
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "generated/ts/reference.md")
+            .map(|artifact| artifact.text.as_str())
+            .unwrap();
+        assert!(reference.contains("`PayloadInput`"), "{reference}");
+        assert!(reference.contains("`PayloadOutput`"), "{reference}");
+    }
+
+    #[test]
+    fn type_renames_keep_registered_direction_roots_attached() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .register_input_schema("Payload")
+            .register_output_schema("Payload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        RenameType::new("Payload", "PublicPayload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert!(ir
+            .schema_uses
+            .iter()
+            .all(|root| root.schema_id == "PublicPayload"));
+        let ts = crate::tssdk::generate(&ir, "tool", "/").unwrap();
+        assert!(ts.contains("export interface PublicPayloadInput"), "{ts}");
+        assert!(ts.contains("export interface PublicPayloadOutput"), "{ts}");
     }
 
     #[test]

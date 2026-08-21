@@ -2147,8 +2147,9 @@ pub struct NamingOverrides {
 /// - Each `operation.id` present in `naming.operations` is remapped to its new value (the operationId
 ///   the OpenAPI/SDK output uses).
 /// - Each schema matched by `naming.types` (by `id` OR bare `name`) is renamed: BOTH its `id` and
-///   `name` become the new value, AND **every** `SchemaRef.ref_id` / neutral [`crate::graph::Type::Named`]
-///   that pointed at the old id is rewritten to the new value. This is MANDATORY (PLAN-CHECK W2): a
+///   `name` become the new value, AND **every** `SchemaRef.ref_id`, schema-use root, and neutral
+///   [`crate::graph::Type::Named`] that pointed at the old id is rewritten to the new value. This is
+///   MANDATORY (PLAN-CHECK W2): a
 ///   referenced type renamed without updating its $refs would dangle and make `to_openapi` fail with
 ///   `CoreError::Lowering`. By keeping `id == name == new value` and rewriting every ref, the
 ///   component key, the resolved `$ref` name, and the references all stay consistent.
@@ -2261,6 +2262,11 @@ pub fn apply_naming(
         }
         for schema in &mut graph.schemas {
             rewrite_schema_type_ref(&mut schema.body, old_id, new_name);
+        }
+        for root in &mut graph.schema_uses {
+            if &root.schema_id == old_id {
+                root.schema_id.clone_from(new_name);
+            }
         }
         for op in &mut graph.operations {
             if let Some(body) = op.request_body.as_mut() {

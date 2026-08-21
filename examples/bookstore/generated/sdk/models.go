@@ -20,13 +20,13 @@ type BookList struct {
 }
 
 type CreateBookRequest struct {
-	Author    string          `json:"author"`
-	Genre     Genre           `json:"genre"`
-	Price     *float64        `json:"price,omitempty"`
-	Publisher *PublisherInput `json:"publisher,omitempty"`
-	Subtitle  *string         `json:"subtitle,omitempty"`
-	Tags      []string        `json:"tags,omitempty"`
-	Title     string          `json:"title"`
+	Author    string           `json:"author"`
+	Genre     Genre            `json:"genre"`
+	Price     **float64        `json:"price,omitempty"`
+	Publisher **PublisherInput `json:"publisher,omitempty"`
+	Subtitle  **string         `json:"subtitle,omitempty"`
+	Tags      *[]string        `json:"tags,omitempty"`
+	Title     string           `json:"title"`
 }
 
 type ErrorResponse struct {
@@ -45,8 +45,8 @@ const (
 )
 
 type PublisherInput struct {
-	Country *string `json:"country,omitempty"`
-	Name    *string `json:"name,omitempty"`
+	Country **string `json:"country,omitempty"`
+	Name    **string `json:"name,omitempty"`
 }
 
 type PublisherOutput struct {
@@ -55,10 +55,10 @@ type PublisherOutput struct {
 }
 
 type UpdateBookRequest struct {
-	Author   *string  `json:"author,omitempty"`
-	Genre    *Genre   `json:"genre,omitempty"`
-	Price    *float64 `json:"price,omitempty"`
-	Subtitle *string  `json:"subtitle,omitempty"`
-	Tags     []string `json:"tags,omitempty"`
-	Title    *string  `json:"title,omitempty"`
+	Author   **string  `json:"author,omitempty"`
+	Genre    **Genre   `json:"genre,omitempty"`
+	Price    **float64 `json:"price,omitempty"`
+	Subtitle **string  `json:"subtitle,omitempty"`
+	Tags     *[]string `json:"tags,omitempty"`
+	Title    **string  `json:"title,omitempty"`
 }

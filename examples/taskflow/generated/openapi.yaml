@@ -130,11 +130,11 @@ components:
       type: object
       properties:
         email:
-          type: string
+          type: [string, 'null']
         id:
-          type: string
+          type: [string, 'null']
         name:
-          type: string
+          type: [string, 'null']
     AssigneeOutput:
       type: object
       required: [email, id, name]
@@ -150,9 +150,11 @@ components:
       required: [status, title]
       properties:
         assignee:
-          $ref: '#/components/schemas/AssigneeInput'
+          oneOf:
+          - $ref: '#/components/schemas/AssigneeInput'
+          - type: null
         dueAt:
-          type: string
+          type: [string, 'null']
           format: date-time
         labels:
           type: [array, 'null']
@@ -161,7 +163,7 @@ components:
         notes:
           type: [string, 'null']
         priority:
-          type: integer
+          type: [integer, 'null']
         status:
           $ref: '#/components/schemas/Status'
         title:

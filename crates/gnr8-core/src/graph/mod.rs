@@ -136,6 +136,22 @@ impl Default for ApiGraph {
     }
 }
 
+impl ApiGraph {
+    /// Build the canonical direction-specific graph consumed by artifact targets.
+    ///
+    /// Source inspection retains the unsplit observations above. Target generation uses this
+    /// projection so a schema whose input and output contracts differ becomes distinct public
+    /// models with every transitive reference rewritten consistently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CoreError::Config`] when directional public names collide or a reference
+    /// cannot be assigned its canonical payload direction.
+    pub fn project_for_generation(&self) -> Result<Self, crate::CoreError> {
+        projection::for_generation(self)
+    }
+}
+
 /// A payload position in which a schema is used.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,

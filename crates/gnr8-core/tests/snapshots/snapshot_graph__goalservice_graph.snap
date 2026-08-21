@@ -166,10 +166,10 @@ schemas:
         - json_name: message
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -188,10 +188,10 @@ schemas:
         - json_name: message
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -201,10 +201,10 @@ schemas:
         - json_name: uuid
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: well_known
             of: uuid
@@ -222,7 +222,7 @@ schemas:
         - json_name: analyticsQuery
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
           validator_rejects_null: false
@@ -234,7 +234,7 @@ schemas:
         - json_name: description
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -247,10 +247,10 @@ schemas:
         - json_name: name
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -309,7 +309,7 @@ schemas:
         - json_name: includePast
           serializer_may_omit: true
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -322,10 +322,10 @@ schemas:
         - json_name: metric
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -335,7 +335,7 @@ schemas:
         - json_name: windowDays
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -359,7 +359,7 @@ schemas:
         - json_name: analyticsQuery
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -371,7 +371,7 @@ schemas:
         - json_name: createdAt
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -383,7 +383,7 @@ schemas:
         - json_name: description
           serializer_may_omit: true
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -408,10 +408,10 @@ schemas:
         - json_name: name
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -447,10 +447,10 @@ schemas:
         - json_name: uuid
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: well_known
             of: uuid
@@ -483,10 +483,10 @@ schemas:
         - json_name: message
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: true
-          validator_rejects_null: false
+          validator_rejects_null: true
           schema:
             type: primitive
             of:
@@ -496,7 +496,7 @@ schemas:
         - json_name: slug
           serializer_may_omit: true
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -544,7 +544,7 @@ schemas:
         - json_name: pageSize
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -559,7 +559,7 @@ schemas:
         - json_name: total
           serializer_may_omit: false
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -609,7 +609,7 @@ schemas:
         - json_name: description
           serializer_may_omit: true
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
@@ -622,7 +622,7 @@ schemas:
         - json_name: name
           serializer_may_omit: true
           deserializer_accepts_absent: true
-          deserializer_accepts_null: false
+          deserializer_accepts_null: true
           serializer_may_emit_null: false
           validator_requires_presence: false
           validator_rejects_null: false
