@@ -119,7 +119,7 @@ func TestEmptySlicesMarshalAsArrays(t *testing.T) {
 // canonicalFieldNames is the EXACT set of json field names (struct tags + adjacent
 // enum tag/content keys + Prim/Map payload keys) the Rust serde DTO in
 // crates/gnr8-core/src/analyze/facts.rs emits. The drift guard below marshals a
-// fully-populated facts value exercising every neutral Type variant + both axes, then
+// fully-populated facts value exercising every neutral Type variant + all contract facts, then
 // asserts the emitted key set equals this list. A renamed/added/dropped Go json tag
 // fails INSIDE 01-01 rather than surfacing as a deny_unknown_fields rejection in 01-02.
 var canonicalFieldNames = []string{
@@ -135,7 +135,10 @@ var canonicalFieldNames = []string{
 	// SchemaFact (id/name/body/span)
 	"id",
 	// FieldFact
-	"json_name", "optional", "nullable", "description", "example", "meta",
+	"json_name", "serializer_may_omit", "deserializer_accepts_absent",
+	"deserializer_accepts_null", "serializer_may_emit_null",
+	"validator_requires_presence", "validator_rejects_null",
+	"description", "example", "meta",
 	// FieldMeta / Constraints / Extension / LiteralValue
 	"constraints", "default", "format", "extensions", "min_length", "max_length", "minimum", "maximum",
 	"exclusive_minimum", "exclusive_maximum", "pattern", "enum_values",
@@ -155,7 +158,7 @@ var canonicalFieldNames = []string{
 
 // fullyPopulatedDoc constructs a facts value touching EVERY neutral Type variant
 // (primitive incl. sized int/float, well_known, array, map, named, object, enum,
-// union, any) and both the optional and nullable field axes set, plus a populated
+// union, any) and every presence/nullability fact, plus a populated
 // route. Used by the drift guard to harvest the complete emitted key set.
 func fullyPopulatedDoc() facts.GoFacts {
 	desc, ex := "a description", "an example"
@@ -166,7 +169,7 @@ func fullyPopulatedDoc() facts.GoFacts {
 	pattern := "^[a-z]+$"
 	objectFields := []facts.FieldFact{
 		{
-			JSONName: "ratio", Required: true, Optional: true, Nullable: true,
+			JSONName: "ratio", SerializerMayOmit: true, DeserializerAcceptsAbsent: false, DeserializerAcceptsNull: true, SerializerMayEmitNull: true, ValidatorRequiresPresence: true, ValidatorRejectsNull: false,
 			Schema:      facts.PrimitiveType(facts.FloatPrim(32)),
 			Description: &desc, Example: &ex,
 			Meta: &facts.FieldMeta{
@@ -188,15 +191,15 @@ func fullyPopulatedDoc() facts.GoFacts {
 			},
 		},
 		{
-			JSONName: "count", Required: true, Optional: false, Nullable: false,
+			JSONName: "count", SerializerMayOmit: false, DeserializerAcceptsAbsent: false, DeserializerAcceptsNull: false, SerializerMayEmitNull: false, ValidatorRequiresPresence: true, ValidatorRejectsNull: false,
 			Schema: facts.PrimitiveType(facts.IntPrim(64, true)),
 		},
 		{
-			JSONName: "name", Required: false, Optional: false, Nullable: true,
+			JSONName: "name", SerializerMayOmit: false, DeserializerAcceptsAbsent: true, DeserializerAcceptsNull: true, SerializerMayEmitNull: true, ValidatorRequiresPresence: false, ValidatorRejectsNull: false,
 			Schema: facts.PrimitiveType(facts.StringPrim()),
 		},
 		{
-			JSONName: "flag", Required: false, Optional: true, Nullable: false,
+			JSONName: "flag", SerializerMayOmit: true, DeserializerAcceptsAbsent: true, DeserializerAcceptsNull: false, SerializerMayEmitNull: false, ValidatorRequiresPresence: false, ValidatorRejectsNull: false,
 			Schema: facts.PrimitiveType(facts.BoolPrim()),
 		},
 		{JSONName: "raw", Schema: facts.PrimitiveType(facts.BytesPrim())},

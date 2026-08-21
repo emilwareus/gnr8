@@ -75,6 +75,8 @@ pub(crate) fn generate_files_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let graph = &projected;
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
     check_unique_model_file_names(graph, "Go SDK", layout, |schema| {
@@ -252,7 +254,7 @@ mod tests {
         {
           "id": "dto.CommandMessage", "name": "CommandMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -261,10 +263,10 @@ mod tests {
         {
           "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetDirection", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null }
           ] },
@@ -273,7 +275,7 @@ mod tests {
         {
           "id": "dto.HttpError", "name": "HttpError",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -282,7 +284,7 @@ mod tests {
         {
           "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput",
           "body": { "type": "object", "of": [
-            { "json_name": "total", "required": false, "optional": false, "nullable": false,
+            { "json_name": "total", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },
@@ -296,7 +298,7 @@ mod tests {
         {
           "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": false, "optional": true, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },

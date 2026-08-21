@@ -68,15 +68,16 @@ operation — request body and parameters on one side, response bodies on the ot
 
 | The schema is reached from | `required` is | Because |
 |---|---|---|
-| requests only | the fields the source's validation rules demand | that is what the server rejects a request for lacking |
+| requests only | fields whose deserializer rejects absence or whose validator requires presence | that is what the server rejects a request for lacking |
 | responses only | the fields the serializer always writes | nothing validates a response; a handler does not validate what it marshals |
-| both | the fields that satisfy both | one component describes both payloads, so it can only promise what holds in each |
-| no operation at all | the fields the source's validation rules demand | a registered-but-unwired schema occupies no position to be read from |
+| both | the corresponding input and output answers | differing contracts become separate `TypeInput` and `TypeOutput` components |
+| registered non-HTTP root | the explicitly selected input or output answer | `register_input_schema` / `register_output_schema` supplies direction without a fake route |
+| no root | the input answer | an unwired declaration has no serializer-facing payload position |
 
-This is one answer per position rather than a preference between two candidates, so there is no
-setting for it. A schema shared between a request body and a response body gets the narrower answer;
-use a separate type for each direction to get the exact one in both. An imported OpenAPI document
-states presence once, so its `required` arrays re-emit unchanged whichever way its schemas are used.
+The walk is transitive through named fields. If a shared schema, or a nested schema it references,
+has different presence or null behavior by direction, artifact projection creates separate input and
+output components and rewrites every directional reference. An imported OpenAPI document states one
+presence/null contract, so its schemas ordinarily remain shared.
 
 Generated SDK models read the same walk and answer the same question, so on a request-only schema a
 `PySdk` or `TsSdk` model requires exactly what this array lists. A `GoSdk` model can require more:
@@ -132,5 +133,5 @@ gnr8 doctor
 gnr8 check
 ```
 
-For a migration with a reference specification, review the generated document with the same
+When replacing a reference specification, review the generated document with the same
 repository-level schema and consumer checks used for the existing contract.

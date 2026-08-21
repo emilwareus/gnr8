@@ -3,20 +3,26 @@ package sdk
 
 import "time"
 
-type Assignee struct {
+type AssigneeInput struct {
+	Email *string `json:"email,omitempty"`
+	ID    *string `json:"id,omitempty"`
+	Name  *string `json:"name,omitempty"`
+}
+
+type AssigneeOutput struct {
 	Email string `json:"email"`
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 }
 
 type CreateTaskRequest struct {
-	Assignee Assignee  `json:"assignee"`
-	DueAt    time.Time `json:"dueAt"`
-	Labels   []string  `json:"labels"`
-	Notes    *string   `json:"notes,omitempty"`
-	Priority int64     `json:"priority"`
-	Status   Status    `json:"status"`
-	Title    string    `json:"title"`
+	Assignee *AssigneeInput `json:"assignee,omitempty"`
+	DueAt    *time.Time     `json:"dueAt,omitempty"`
+	Labels   []string       `json:"labels,omitempty"`
+	Notes    *string        `json:"notes,omitempty"`
+	Priority *int64         `json:"priority,omitempty"`
+	Status   Status         `json:"status"`
+	Title    string         `json:"title"`
 }
 
 type ErrorResponse struct {
@@ -33,14 +39,14 @@ const (
 )
 
 type Task struct {
-	Assignee Assignee  `json:"assignee"`
-	DueAt    time.Time `json:"dueAt"`
-	ID       string    `json:"id"`
-	Labels   []string  `json:"labels"`
-	Notes    *string   `json:"notes,omitempty"`
-	Priority int64     `json:"priority"`
-	Status   Status    `json:"status"`
-	Title    string    `json:"title"`
+	Assignee AssigneeOutput `json:"assignee"`
+	DueAt    time.Time      `json:"dueAt"`
+	ID       string         `json:"id"`
+	Labels   []string       `json:"labels"`
+	Notes    *string        `json:"notes,omitempty"`
+	Priority int64          `json:"priority"`
+	Status   Status         `json:"status"`
+	Title    string         `json:"title"`
 }
 
 type TaskList struct {

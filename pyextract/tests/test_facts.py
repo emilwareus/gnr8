@@ -26,9 +26,12 @@ DOC_KEYS = {"module", "routes", "schemas", "diagnostics"}
 SCHEMA_KEYS = {"id", "name", "body", "span"}
 FIELD_KEYS = {
     "json_name",
-    "required",
-    "optional",
-    "nullable",
+    "serializer_may_omit",
+    "deserializer_accepts_absent",
+    "deserializer_accepts_null",
+    "serializer_may_emit_null",
+    "validator_requires_presence",
+    "validator_rejects_null",
     "schema",
     "description",
     "example",
@@ -56,18 +59,24 @@ def _sample_doc():
                     "of": [
                         {
                             "json_name": "y",
-                            "required": True,
-                            "optional": False,
-                            "nullable": False,
+                            "serializer_may_omit": False,
+                            "deserializer_accepts_absent": False,
+                            "deserializer_accepts_null": False,
+                            "serializer_may_emit_null": False,
+                            "validator_requires_presence": False,
+                            "validator_rejects_null": False,
                             "schema": {"type": "primitive", "of": {"prim": "string"}},
                             "description": None,
                             "example": None,
                         },
                         {
                             "json_name": "x",
-                            "required": True,
-                            "optional": False,
-                            "nullable": False,
+                            "serializer_may_omit": False,
+                            "deserializer_accepts_absent": False,
+                            "deserializer_accepts_null": False,
+                            "serializer_may_emit_null": False,
+                            "validator_requires_presence": False,
+                            "validator_rejects_null": False,
                             "schema": {"type": "primitive", "of": {"prim": "bool"}},
                             "description": None,
                             "example": None,
@@ -203,18 +212,18 @@ class FixtureEndToEndTests(unittest.TestCase):
             f["json_name"]: f for f in by["app.models.BookFilters"]["body"]["of"]
         }
         self.assertEqual(
-            (fields["genre"]["optional"], fields["genre"]["nullable"]), (False, False)
+            (fields["genre"]["serializer_may_omit"], fields["genre"]["deserializer_accepts_null"]), (False, False)
         )
         self.assertEqual(
-            (fields["in_stock"]["optional"], fields["in_stock"]["nullable"]),
+            (fields["in_stock"]["serializer_may_omit"], fields["in_stock"]["deserializer_accepts_null"]),
             (True, False),
         )
         self.assertEqual(
-            (fields["published"]["optional"], fields["published"]["nullable"]),
+            (fields["published"]["serializer_may_omit"], fields["published"]["deserializer_accepts_null"]),
             (False, True),
         )
         self.assertEqual(
-            (fields["sort"]["optional"], fields["sort"]["nullable"]), (True, True)
+            (fields["sort"]["serializer_may_omit"], fields["sort"]["deserializer_accepts_null"]), (True, True)
         )
         self.assertEqual(
             fields["sort"]["schema"], {"type": "enum", "of": ["asc", "desc"]}

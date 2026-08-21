@@ -15,7 +15,7 @@ class OrderConfirmation(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     availability: Availability
     lines: list[Price]
-    message: Optional[str] = Field(default=None)
+    message: Optional[str]
     order_id: int
 
     @classmethod
@@ -23,7 +23,10 @@ class OrderConfirmation(BaseModel):
         return cls.model_validate(_data)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if self.message is None:
+            _data["message"] = None
+        return _data
 
 
 class OrderInput(BaseModel):

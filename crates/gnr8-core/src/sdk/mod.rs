@@ -1778,7 +1778,7 @@ pub mod prelude {
     };
     pub use crate::graph::{
         DiagnosticCategory, OpenApiContact, OpenApiLicense, OpenApiServer, PaginationMode,
-        PaginationTermination, RuntimeHookKind, SecurityScheme, Type,
+        PaginationTermination, RuntimeHookKind, SchemaUse, SecurityScheme, Type,
     };
 }
 

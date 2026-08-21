@@ -163,9 +163,7 @@ fn response_graph() -> gnr8::graph::ApiGraph {
               "type": "object",
               "of": [{
                 "json_name": "value",
-                "required": true,
-                "optional": false,
-                "nullable": false,
+                "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                 "schema": { "type": "primitive", "of": { "prim": "string" } }
               }]
             },

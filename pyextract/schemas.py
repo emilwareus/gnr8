@@ -4,7 +4,7 @@ The Python twin of ``goextract/internal/types/extract.go``. It walks every parse
 module and emits one SchemaFact per:
 
   * a model class (a ``BaseModel`` subclass) or a ``@dataclass`` -> an ``object`` body
-    of FieldFacts carrying the four optional/nullable axes.
+    of FieldFacts carrying independent inbound/outbound presence and nullability facts.
   * an ``enum.Enum`` subclass -> an ``enum`` body of SORTED member VALUES.
   * a top-level alias whose value is a ``Literal[...]`` (-> inline ``enum``) or a
     ``Union[...]`` / ``A | B`` (-> a ``union`` body of mapped members).
@@ -14,14 +14,14 @@ ending in ``Enum`` / a ``@dataclass`` decorator name. The target's pydantic /
 dataclasses / enum are never imported to introspect.
 
 A SchemaFact has keys ``id, name, body, span``. ``id`` = ``<dotted-module>.<Name>``.
-A FieldFact has EXACTLY ``json_name, required, optional, nullable, schema,
-description, example`` — ``description`` / ``example`` are always ``None`` here. The
-four axes (RESEARCH Pitfall 3):
+A FieldFact carries independent inbound/outbound presence and null facts plus
+``schema, description, example`` — ``description`` / ``example`` are always
+``None`` here:
 
-  * ``optional`` = the field has a default (``= x`` / ``field(default=..)`` /
+  * serializer/deserializer absence = the field has a default (``= x`` / ``field(default=..)`` /
     ``field(default_factory=..)``).
-  * ``nullable`` = the type admits ``None`` (``Optional[T]`` / ``T | None``).
-  * ``required`` = ``not optional`` (nullable does NOT affect required).
+  * inbound/outbound null = the type admits ``None`` (``Optional[T]`` / ``T | None``).
+  * source validation contributes no separate rule in this extractor.
 """
 
 import ast
@@ -107,9 +107,12 @@ def _build_field(stmt, in_module, table, diags):
     optional = _has_default(stmt)
     return {
         "json_name": json_name,
-        "required": not optional,
-        "optional": optional,
-        "nullable": nullable,
+        "serializer_may_omit": optional,
+        "deserializer_accepts_absent": optional,
+        "deserializer_accepts_null": nullable,
+        "serializer_may_emit_null": nullable,
+        "validator_requires_presence": False,
+        "validator_rejects_null": False,
         "schema": schema,
         "description": None,
         "example": None,

@@ -58,7 +58,10 @@ fn run_pipeline() -> Option<gnr8::sdk::RunOutcome> {
     Some(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
+            .transform(ApiOverrides::new().sse_response("GET", "/v1/items/raw-stream"))
+            .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(TsSdk::new().module("@example/sdk").to("generated/ts"))
+            .target(PySdk::new().module("example_sdk").to("generated/py"))
             .target(GoSdk::new().module("example.com/sdk").to("generated/go"))
             .run(&Cx::new(&fixture))
             .expect("gin contract pipeline must generate SDKs"),
@@ -94,13 +97,7 @@ fn artifact<'a>(outcome: &'a gnr8::sdk::RunOutcome, path: &str) -> &'a str {
         .as_str()
 }
 
-#[test]
-fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
-    let Some(outcome) = run_pipeline() else {
-        return;
-    };
-
-    let ts_client = artifact(&outcome, "generated/ts/client.ts");
+fn assert_typescript_client(ts_client: &str) {
     assert!(
         ts_client.contains("headers[\"Content-Type\"] = \"application/json\";"),
         "{ts_client}"
@@ -128,8 +125,9 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
         ts_client.contains("encodeURIComponent(String(childId))"),
         "{ts_client}"
     );
+}
 
-    let ts_models = artifact(&outcome, "generated/ts/models.ts");
+fn assert_typescript_models(ts_models: &str) {
     assert!(
         ts_models.contains("export type ListSavedViews200Response = models.SavedViewResponse[];")
             || ts_models.contains("export type ListSavedViews200Response = SavedViewResponse[];"),
@@ -139,8 +137,104 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
         ts_models.contains("export interface CreateJob202Response"),
         "{ts_models}"
     );
+    assert!(
+        ts_models.contains("  userUuid: string | null;"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("  items: ItemResponse[] | null;"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("  metadata: Record<string, string> | null;"),
+        "{ts_models}"
+    );
+    assert!(ts_models.contains("  nickname?: string;"), "{ts_models}");
+    assert!(ts_models.contains("  tags?: string[];"), "{ts_models}");
+    assert!(
+        ts_models.contains("  result?: Record<string, string>;"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("  zero?: Record<string, string>;"),
+        "{ts_models}"
+    );
+    assert!(ts_models.contains("  ids: string[];"), "{ts_models}");
+    assert!(
+        ts_models.contains("  raw: Record<string, unknown> | null;"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("export interface SharedPayloadInput"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("export interface SharedPayloadOutput"),
+        "{ts_models}"
+    );
+    assert!(
+        ts_models.contains("  data?: string[] | null;"),
+        "{ts_models}"
+    );
+    assert!(ts_models.contains("  data?: string[];"), "{ts_models}");
+}
 
-    let go_ops = artifact(&outcome, "generated/go/operations.go");
+fn assert_python_models(py_models: &str) {
+    assert!(
+        py_models.contains("user_uuid: Optional[str] = Field(..., alias=\"userUuid\")"),
+        "{py_models}"
+    );
+    assert!(py_models.contains("ids: list[str]"), "{py_models}");
+    assert!(
+        py_models.contains("raw: Optional[dict[str, Any]]"),
+        "{py_models}"
+    );
+}
+
+fn assert_openapi(openapi: &str) {
+    let directional = openapi
+        .split("    DirectionalResponse:\n")
+        .nth(1)
+        .expect("DirectionalResponse component");
+    let directional = directional
+        .split("    ItemResponse:\n")
+        .next()
+        .unwrap_or(directional);
+    assert!(
+        directional.contains("required: [items, metadata, userUuid]"),
+        "{directional}"
+    );
+    let result = directional
+        .split("        result:\n")
+        .nth(1)
+        .expect("result property")
+        .split("        userUuid:\n")
+        .next()
+        .expect("bounded result property");
+    assert!(!result.contains("null"), "{result}");
+    assert!(
+        directional.contains(
+            "        zero:\n          type: object\n          additionalProperties:\n            type: string"
+        ),
+        "{directional}"
+    );
+
+    let validated = openapi
+        .split("    ValidatedRequest:\n")
+        .nth(1)
+        .expect("ValidatedRequest component");
+    assert!(validated.contains("required: [ids, raw]"), "{validated}");
+    let ids = validated
+        .split("        ids:\n")
+        .nth(1)
+        .expect("ids property")
+        .split("        raw:\n")
+        .next()
+        .expect("bounded ids property");
+    assert!(!ids.contains("null"), "{ids}");
+}
+
+fn assert_go_operations(go_ops: &str) {
     assert!(go_ops.contains("\"PATCH\""), "{go_ops}");
     assert!(go_ops.contains("[]byte"), "{go_ops}");
     assert!(go_ops.contains("io.ReadAll(resp.Body)"), "{go_ops}");
@@ -151,6 +245,19 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
     );
     assert!(go_ops.contains("type FilesAPI struct"), "{go_ops}");
     assert!(go_ops.contains("type ItemsAPI struct"), "{go_ops}");
+}
+
+#[test]
+fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
+    let Some(outcome) = run_pipeline() else {
+        return;
+    };
+
+    assert_typescript_client(artifact(&outcome, "generated/ts/client.ts"));
+    assert_typescript_models(artifact(&outcome, "generated/ts/models.ts"));
+    assert_python_models(artifact(&outcome, "generated/py/models.py"));
+    assert_openapi(artifact(&outcome, "generated/openapi.yaml"));
+    assert_go_operations(artifact(&outcome, "generated/go/operations.go"));
 
     for file in outcome.artifacts.files() {
         assert!(

@@ -16,7 +16,10 @@ class Author(BaseModel):
         return cls.model_validate(_data)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if self.bio is None:
+            _data["bio"] = None
+        return _data
 
 
 class Book(BaseModel):
@@ -48,7 +51,10 @@ class BookFilters(BaseModel):
         return cls.model_validate(_data)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if self.published is None:
+            _data["published"] = None
+        return _data
 
 
 class BookFormat(str, enum.Enum):
@@ -75,7 +81,7 @@ class CreatedMessage(BaseModel):
 class ListBooksResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     books: list[Book]
-    next_cursor: Optional[str] = Field(default=None)
+    next_cursor: Optional[str]
     total: int
 
     @classmethod
@@ -83,7 +89,10 @@ class ListBooksResponse(BaseModel):
         return cls.model_validate(_data)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if self.next_cursor is None:
+            _data["next_cursor"] = None
+        return _data
 
 
 class OutOfStock(BaseModel):

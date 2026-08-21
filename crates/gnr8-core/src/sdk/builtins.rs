@@ -20,8 +20,8 @@ use crate::graph::{
     ApiGraph, DiagnosticCategory, MediaExample, OpenApiContact, OpenApiLicense,
     OpenApiMetadataPolicy, OpenApiServer, OperationDocsPolicy, OperationRuntimePolicy,
     PaginationMode, PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy,
-    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SecurityRequirementGroup, SecurityScheme,
-    Type,
+    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SchemaUse, SchemaUseRoot,
+    SecurityRequirementGroup, SecurityScheme, Type,
 };
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
@@ -1253,6 +1253,8 @@ impl Transform for SetSchemaFieldType {
 #[derive(Debug, Clone, Default)]
 pub struct ApiOverrides {
     field_presence: Vec<FieldPresenceOverride>,
+    field_nullability: Vec<FieldNullabilityOverride>,
+    schema_uses: Vec<(String, SchemaUse)>,
     parameters: Vec<(OperationSelector, ParameterOverride)>,
     security_overrides: Vec<(OperationSelector, SecurityOverride)>,
     request_bodies: Vec<RequestBodyOverride>,
@@ -1266,6 +1268,14 @@ struct FieldPresenceOverride {
     schema: String,
     field: String,
     required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FieldNullabilityOverride {
+    schema: String,
+    field: String,
+    use_: SchemaUse,
+    nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1608,6 +1618,56 @@ impl ApiOverrides {
         self
     }
 
+    /// Register a non-HTTP schema as an input root for transitive direction analysis.
+    #[must_use]
+    pub fn register_input_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema_uses.push((schema.into(), SchemaUse::Input));
+        self
+    }
+
+    /// Register a non-HTTP schema as an output root for transitive direction analysis.
+    #[must_use]
+    pub fn register_output_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema_uses.push((schema.into(), SchemaUse::Output));
+        self
+    }
+
+    /// Assert that a field which extraction currently marks nullable is non-null in one direction.
+    /// The transform fails if the schema/field disappears or the correction is already redundant.
+    #[must_use]
+    pub fn force_non_nullable(
+        mut self,
+        schema: impl Into<String>,
+        field: impl Into<String>,
+        use_: SchemaUse,
+    ) -> Self {
+        self.field_nullability.push(FieldNullabilityOverride {
+            schema: schema.into(),
+            field: field.into(),
+            use_,
+            nullable: false,
+        });
+        self
+    }
+
+    /// Assert that a field which extraction currently marks non-null is nullable in one direction.
+    /// The transform fails if the schema/field disappears or the correction is already redundant.
+    #[must_use]
+    pub fn force_nullable(
+        mut self,
+        schema: impl Into<String>,
+        field: impl Into<String>,
+        use_: SchemaUse,
+    ) -> Self {
+        self.field_nullability.push(FieldNullabilityOverride {
+            schema: schema.into(),
+            field: field.into(),
+            use_,
+            nullable: true,
+        });
+        self
+    }
+
     /// Apply a checked, fully typed request parameter override to exactly one selected operation.
     #[must_use]
     pub fn parameter(mut self, selector: OperationSelector, override_: ParameterOverride) -> Self {
@@ -1793,14 +1853,8 @@ impl Transform for ApiOverrides {
                 message: message.clone(),
             });
         }
-        for override_ in &self.field_presence {
-            apply_field_presence_override(
-                ir,
-                &override_.schema,
-                &override_.field,
-                override_.required,
-            )?;
-        }
+        apply_field_contract_overrides(ir, &self.field_presence, &self.field_nullability)?;
+        apply_schema_use_roots(ir, &self.schema_uses)?;
         let mut touched = BTreeSet::new();
         for (selector, override_) in &self.parameters {
             let op_index = find_selected_operation_index(ir, selector, "parameter override")?;
@@ -1861,6 +1915,60 @@ impl Transform for ApiOverrides {
         }
         Ok(())
     }
+}
+
+fn apply_field_contract_overrides(
+    ir: &mut ApiGraph,
+    presence: &[FieldPresenceOverride],
+    nullability: &[FieldNullabilityOverride],
+) -> Result<(), CoreError> {
+    for override_ in presence {
+        apply_field_presence_override(ir, &override_.schema, &override_.field, override_.required)?;
+    }
+
+    let mut targets = BTreeSet::new();
+    for override_ in nullability {
+        let key = (
+            override_.schema.as_str(),
+            override_.field.as_str(),
+            override_.use_,
+        );
+        if !targets.insert(key) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "conflicting nullability overrides target {:?}.{:?} in {:?}",
+                    override_.schema, override_.field, override_.use_
+                ),
+            });
+        }
+        apply_field_nullability_override(ir, override_)?;
+    }
+    Ok(())
+}
+
+fn apply_schema_use_roots(
+    ir: &mut ApiGraph,
+    schema_uses: &[(String, SchemaUse)],
+) -> Result<(), CoreError> {
+    for (schema, use_) in schema_uses {
+        let schema_id = resolve_schema_ref(ir, schema, "schema-use root")?;
+        let root = SchemaUseRoot {
+            schema_id,
+            use_: *use_,
+        };
+        if ir.schema_uses.contains(&root) {
+            return Err(CoreError::Config {
+                message: format!("redundant {use_:?} schema-use root {schema:?}"),
+            });
+        }
+        ir.schema_uses.push(root);
+    }
+    ir.schema_uses.sort_by(|left, right| {
+        left.schema_id
+            .cmp(&right.schema_id)
+            .then_with(|| left.use_.cmp(&right.use_))
+    });
+    Ok(())
 }
 
 fn apply_security_override(
@@ -2206,11 +2314,88 @@ fn apply_field_presence_override(
     // (what request validation demands) and `!optional` (what the serializer always writes). Which
     // one an artifact reads depends on the direction the schema is reached from
     // (`graph::direction::SchemaDirections`), and the OpenAPI document and the SDK models pick
-    // differently in some positions. An override that moved one axis would therefore be silently
-    // dropped wherever the other one is read, so it states the corrected fact on both and means the
-    // same thing in every position — exactly what every non-Go source already records.
-    field.required = required;
-    field.optional = !required;
+    // differently in some positions. State the corrected effective input and output presence so the
+    // override means the same thing in every position.
+    field.deserializer_accepts_absent = !required;
+    field.serializer_may_omit = !required;
+    field.validator_requires_presence = required;
+    Ok(())
+}
+
+fn apply_field_nullability_override(
+    ir: &mut ApiGraph,
+    override_: &FieldNullabilityOverride,
+) -> Result<(), CoreError> {
+    let matches: Vec<usize> = ir
+        .schemas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            (schema.id == override_.schema || schema.name == override_.schema).then_some(index)
+        })
+        .collect();
+    let schema_index = match matches.as_slice() {
+        [single] => *single,
+        [] => {
+            return Err(CoreError::Config {
+                message: format!(
+                    "nullability override schema {:?} does not match any graph schema id or name",
+                    override_.schema
+                ),
+            });
+        }
+        many => {
+            return Err(CoreError::Config {
+                message: format!(
+                    "nullability override schema {:?} matches {} schemas; use the full schema id",
+                    override_.schema,
+                    many.len()
+                ),
+            });
+        }
+    };
+    let schema = &mut ir.schemas[schema_index];
+    let Type::Object(fields) = &mut schema.body else {
+        return Err(CoreError::Config {
+            message: format!(
+                "nullability override schema {:?} is not an object schema",
+                override_.schema
+            ),
+        });
+    };
+    let field = fields
+        .iter_mut()
+        .find(|field| field.json_name == override_.field)
+        .ok_or_else(|| CoreError::Config {
+            message: format!(
+                "nullability override did not find field {:?} on schema {:?}",
+                override_.field, override_.schema
+            ),
+        })?;
+    let current = match override_.use_ {
+        SchemaUse::Input => field.deserializer_accepts_null && !field.validator_rejects_null,
+        SchemaUse::Output => field.serializer_may_emit_null,
+    };
+    if current == override_.nullable {
+        return Err(CoreError::Config {
+            message: format!(
+                "redundant {:?} nullability override on {:?}.{:?}: extracted field is already {}nullable",
+                override_.use_,
+                override_.schema,
+                override_.field,
+                if current { "" } else { "non-" }
+            ),
+        });
+    }
+    match override_.use_ {
+        SchemaUse::Input => {
+            field.deserializer_accepts_null = override_.nullable;
+            if override_.nullable {
+                field.validator_rejects_null = false;
+            }
+        }
+        SchemaUse::Output => field.serializer_may_emit_null = override_.nullable,
+    }
     Ok(())
 }
 
@@ -6237,7 +6422,7 @@ mod tests {
     use crate::graph::{
         ApiGraph, Diagnostic, DiagnosticCategory, Field, Operation, PaginationMode,
         PaginationTermination, Param, Prim, Response, RuntimeHookKind, Schema, SchemaRef,
-        SourceSpan, Type,
+        SchemaUse, SourceSpan, Type,
     };
 
     use crate::sdk::layout::SdkFileLayout;
@@ -7635,9 +7820,12 @@ mod tests {
                     name: "ErrorResponse".to_string(),
                     body: Type::Object(vec![Field {
                         json_name: "message".to_string(),
-                        required: true,
-                        optional: false,
-                        nullable: false,
+                        serializer_may_omit: false,
+                        deserializer_accepts_absent: false,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: true,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: None,
                         example: None,
@@ -8140,9 +8328,12 @@ mod tests {
                 name: "DocumentBody".to_string(),
                 body: Type::Object(vec![Field {
                     json_name: "blocks".to_string(),
-                    required: true,
-                    optional: false,
-                    nullable: false,
+                    serializer_may_omit: false,
+                    deserializer_accepts_absent: false,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: true,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -8174,9 +8365,12 @@ mod tests {
             name: name.to_string(),
             body: Type::Object(vec![Field {
                 json_name: "nickname".to_string(),
-                required,
-                optional,
-                nullable: false,
+                serializer_may_omit: optional,
+                deserializer_accepts_absent: !required,
+                deserializer_accepts_null: false,
+                serializer_may_emit_null: false,
+                validator_requires_presence: required,
+                validator_rejects_null: false,
                 schema: Type::Primitive(Prim::String),
                 description: None,
                 example: None,
@@ -8194,6 +8388,113 @@ mod tests {
         &fields[0]
     }
 
+    fn directional_schema() -> Schema {
+        Schema {
+            id: "tool.Payload".to_string(),
+            name: "Payload".to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "value".to_string(),
+                serializer_may_omit: true,
+                deserializer_accepts_absent: false,
+                deserializer_accepts_null: true,
+                serializer_may_emit_null: false,
+                validator_requires_presence: false,
+                validator_rejects_null: false,
+                schema: Type::Primitive(Prim::String),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: span(),
+        }
+    }
+
+    #[test]
+    fn registered_non_http_roots_project_input_and_output_models() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .register_input_schema("Payload")
+            .register_output_schema("Payload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let ts = crate::tssdk::generate(&ir, "tool", "/").unwrap();
+        assert!(ts.contains("export interface PayloadInput"), "{ts}");
+        assert!(ts.contains("  value: string | null;"), "{ts}");
+        assert!(ts.contains("export interface PayloadOutput"), "{ts}");
+        assert!(ts.contains("  value?: string;"), "{ts}");
+
+        let py = crate::pysdk::generate(&ir, "tool", "/").unwrap();
+        assert!(py.contains("class PayloadInput(BaseModel):"), "{py}");
+        assert!(py.contains("    value: Optional[str]\n"), "{py}");
+        assert!(py.contains("class PayloadOutput(BaseModel):"), "{py}");
+        assert!(
+            py.contains("    value: Optional[str] = Field(default=None)"),
+            "{py}"
+        );
+    }
+
+    #[test]
+    fn directional_nullability_overrides_are_checked_and_scoped() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .force_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(field.deserializer_accepts_null);
+        assert!(field.serializer_may_emit_null);
+
+        let redundant = ApiOverrides::new()
+            .force_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(redundant.to_string().contains("redundant"), "{redundant}");
+
+        ApiOverrides::new()
+            .force_non_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(field.deserializer_accepts_null);
+        assert!(!field.serializer_may_emit_null);
+
+        ApiOverrides::new()
+            .force_non_nullable("Payload", "value", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(!field.deserializer_accepts_null);
+        assert!(!field.serializer_may_emit_null);
+
+        let stale_field = ApiOverrides::new()
+            .force_non_nullable("Payload", "missing", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(
+            stale_field.to_string().contains("did not find field"),
+            "{stale_field}"
+        );
+
+        let stale_schema = ApiOverrides::new()
+            .force_non_nullable("Missing", "value", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(
+            stale_schema
+                .to_string()
+                .contains("does not match any graph schema"),
+            "{stale_schema}"
+        );
+    }
+
     #[test]
     fn a_field_presence_override_states_presence_on_both_axes() {
         // The source disagrees with itself the way only Go can: validation demands the key, the
@@ -8207,15 +8508,17 @@ mod tests {
             .force_optional("Profile", "nickname")
             .apply(&mut ir, &cx())
             .unwrap();
-        assert!(!presence_field(&ir).required);
-        assert!(presence_field(&ir).optional);
+        assert!(presence_field(&ir).deserializer_accepts_absent);
+        assert!(presence_field(&ir).serializer_may_omit);
+        assert!(!presence_field(&ir).validator_requires_presence);
 
         ApiOverrides::new()
             .force_required("Profile", "nickname")
             .apply(&mut ir, &cx())
             .unwrap();
-        assert!(presence_field(&ir).required);
-        assert!(!presence_field(&ir).optional);
+        assert!(!presence_field(&ir).deserializer_accepts_absent);
+        assert!(!presence_field(&ir).serializer_may_omit);
+        assert!(presence_field(&ir).validator_requires_presence);
     }
 
     #[test]
@@ -8299,9 +8602,12 @@ mod tests {
                     name: "Filter".to_string(),
                     body: Type::Object(vec![Field {
                         json_name: "sort".to_string(),
-                        required: false,
-                        optional: true,
-                        nullable: false,
+                        serializer_may_omit: true,
+                        deserializer_accepts_absent: true,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: false,
+                        validator_rejects_null: false,
                         schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
                         description: None,
                         example: None,
@@ -8348,9 +8654,12 @@ mod tests {
                 body: Type::Object(vec![
                     Field {
                         json_name: "title".to_string(),
-                        required: true,
-                        optional: false,
-                        nullable: false,
+                        serializer_may_omit: false,
+                        deserializer_accepts_absent: false,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: true,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: None,
                         example: None,
@@ -8358,9 +8667,12 @@ mod tests {
                     },
                     Field {
                         json_name: "source".to_string(),
-                        required: false,
-                        optional: true,
-                        nullable: false,
+                        serializer_may_omit: true,
+                        deserializer_accepts_absent: true,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: false,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: Some("Source description".to_string()),
                         example: Some("source-example".to_string()),
@@ -8468,9 +8780,12 @@ mod tests {
     fn openapi_field_patch_examples_support_primitive_literals() {
         let field = |json_name: &str, schema: Type| Field {
             json_name: json_name.to_string(),
-            required: false,
-            optional: true,
-            nullable: false,
+            serializer_may_omit: true,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema,
             description: None,
             example: None,

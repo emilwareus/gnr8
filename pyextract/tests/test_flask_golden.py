@@ -103,7 +103,7 @@ class FlaskGoldenLineTests(unittest.TestCase):
             for f in self.schemas["app.dto.OrderConfirmation"]["body"]["of"]
         }
         axes = {
-            (f["optional"], f["nullable"])
+            (f["serializer_may_omit"], f["deserializer_accepts_null"])
             for f in list(order_input.values()) + list(confirmation.values())
         }
         self.assertEqual(
@@ -111,7 +111,7 @@ class FlaskGoldenLineTests(unittest.TestCase):
         )
         # The "nullable only" axis is specifically OrderConfirmation.message.
         self.assertEqual(
-            (confirmation["message"]["optional"], confirmation["message"]["nullable"]),
+            (confirmation["message"]["serializer_may_omit"], confirmation["message"]["deserializer_accepts_null"]),
             (False, True),
         )
         self.assertEqual(

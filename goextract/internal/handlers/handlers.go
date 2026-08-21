@@ -2486,11 +2486,14 @@ func explicitBindingName(info *gotypes.Info, call *ast.CallExpr) string {
 
 func formField(name string, schema facts.Type, required bool) facts.FieldFact {
 	return facts.FieldFact{
-		JSONName: name,
-		Required: required,
-		Optional: !required,
-		Nullable: false,
-		Schema:   schema,
+		JSONName:                  name,
+		SerializerMayOmit:         !required,
+		DeserializerAcceptsAbsent: !required,
+		DeserializerAcceptsNull:   false,
+		SerializerMayEmitNull:     false,
+		ValidatorRequiresPresence: required,
+		ValidatorRejectsNull:      false,
+		Schema:                    schema,
 	}
 }
 
@@ -2539,8 +2542,9 @@ func (a *Analyzer) addBoundFormFields(
 				}
 			}
 		}
-		existing.Required = existing.Required || field.Required
-		existing.Optional = !existing.Required
+		existing.ValidatorRequiresPresence = existing.ValidatorRequiresPresence || field.ValidatorRequiresPresence
+		existing.DeserializerAcceptsAbsent = !existing.ValidatorRequiresPresence
+		existing.SerializerMayOmit = existing.DeserializerAcceptsAbsent
 		if existing.Meta == nil {
 			existing.Meta = field.Meta
 		}
@@ -3307,11 +3311,14 @@ func ginHLiteralFields(lit *ast.CompositeLit) ([]facts.FieldFact, bool) {
 			return nil, false
 		}
 		fields = append(fields, facts.FieldFact{
-			JSONName: key,
-			Required: true,
-			Optional: false,
-			Nullable: false,
-			Schema:   schema,
+			JSONName:                  key,
+			SerializerMayOmit:         false,
+			DeserializerAcceptsAbsent: false,
+			DeserializerAcceptsNull:   false,
+			SerializerMayEmitNull:     false,
+			ValidatorRequiresPresence: false,
+			ValidatorRejectsNull:      false,
+			Schema:                    schema,
 		})
 	}
 	return fields, true

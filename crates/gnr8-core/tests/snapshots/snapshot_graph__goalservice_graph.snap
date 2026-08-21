@@ -164,9 +164,12 @@ schemas:
       type: object
       of:
         - json_name: message
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -183,9 +186,12 @@ schemas:
       type: object
       of:
         - json_name: message
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -193,9 +199,12 @@ schemas:
           description: ~
           example: ~
         - json_name: uuid
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: well_known
             of: uuid
@@ -211,18 +220,24 @@ schemas:
       type: object
       of:
         - json_name: analyticsQuery
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.GoalAnalyticsQuery
           description: ~
           example: ~
         - json_name: description
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -230,9 +245,12 @@ schemas:
           description: Longer explanation
           example: ~
         - json_name: name
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -240,18 +258,24 @@ schemas:
           description: Short human-readable goal name
           example: ~
         - json_name: targetDirection
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.TargetDirection
           description: ~
           example: ~
         - json_name: targetValue
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -260,9 +284,12 @@ schemas:
           description: ~
           example: ~
         - json_name: workflowChainIds
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -280,9 +307,12 @@ schemas:
       type: object
       of:
         - json_name: includePast
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -290,9 +320,12 @@ schemas:
           description: Whether to include historical data points
           example: ~
         - json_name: metric
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -300,9 +333,12 @@ schemas:
           description: Analytics metric to evaluate
           example: ~
         - json_name: windowDays
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -321,27 +357,36 @@ schemas:
       type: object
       of:
         - json_name: analyticsQuery
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.GoalAnalyticsQuery
           description: ~
           example: ~
         - json_name: createdAt
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: well_known
             of: date_time
           description: ~
           example: ~
         - json_name: description
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -349,18 +394,24 @@ schemas:
           description: ~
           example: ~
         - json_name: metadata
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: any
             of: {}
           description: ~
           example: ~
         - json_name: name
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -368,18 +419,24 @@ schemas:
           description: ~
           example: ~
         - json_name: targetDirection
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.TargetDirection
           description: ~
           example: ~
         - json_name: targetValue
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -388,9 +445,12 @@ schemas:
           description: ~
           example: ~
         - json_name: uuid
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: well_known
             of: uuid
@@ -406,9 +466,12 @@ schemas:
       type: object
       of:
         - json_name: hints
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -418,9 +481,12 @@ schemas:
           description: ~
           example: "hint 1,hint 2"
         - json_name: message
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: true
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -428,9 +494,12 @@ schemas:
           description: ~
           example: error message
         - json_name: slug
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -447,9 +516,12 @@ schemas:
       type: object
       of:
         - json_name: goals
-          required: false
-          optional: false
-          nullable: true
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -458,18 +530,24 @@ schemas:
           description: ~
           example: ~
         - json_name: nextCursor
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: well_known
             of: uuid
           description: ~
           example: ~
         - json_name: pageSize
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -479,9 +557,12 @@ schemas:
           description: ~
           example: ~
         - json_name: total
-          required: false
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -514,18 +595,24 @@ schemas:
       type: object
       of:
         - json_name: analyticsQuery
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.GoalAnalyticsQuery
           description: ~
           example: ~
         - json_name: description
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -533,9 +620,12 @@ schemas:
           description: Updated explanation
           example: ~
         - json_name: name
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -543,18 +633,24 @@ schemas:
           description: Updated goal name
           example: ~
         - json_name: targetDirection
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: internal/common/dto.TargetDirection
           description: ~
           example: ~
         - json_name: targetValue
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -563,9 +659,12 @@ schemas:
           description: ~
           example: ~
         - json_name: workflowChainIds
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:

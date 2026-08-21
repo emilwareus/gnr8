@@ -172,7 +172,7 @@ fn compute_model_imports(
                     // side, so it has to be the SAME answer the emitters below reach — an import set
                     // computed off a different question lands an unused (F401) or a missing one.
                     let omittable = reached.model_field_is_optional(field);
-                    if omittable || field.nullable {
+                    if omittable || reached.field_is_nullable(field) {
                         m.optional = true;
                     }
                     if needs_alias(field) || omittable {
@@ -336,27 +336,40 @@ fn pydantic_field_rhs(field: &Field, has_default: bool) -> String {
 }
 
 /// Keep nullability in the type hint while using the default solely for key absence.
-fn optional_default_hint(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
-    let hint = py_type(&field.schema, field.nullable, graph)?;
-    if field.nullable {
+fn optional_default_hint(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
+    let nullable = directions.field_is_nullable(field);
+    let hint = py_type(&field.schema, nullable, graph)?;
+    if nullable {
         Ok(hint)
     } else {
         Ok(format!("Optional[{hint}]"))
     }
 }
 
-fn pydantic_default_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+fn pydantic_default_suffix(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
     Ok(format!(
         "{}{}",
-        optional_default_hint(field, graph)?,
+        optional_default_hint(field, graph, directions)?,
         pydantic_field_rhs(field, true)
     ))
 }
 
-fn pydantic_required_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+fn pydantic_required_suffix(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
     Ok(format!(
         "{}{}",
-        py_type(&field.schema, field.nullable, graph)?,
+        py_type(&field.schema, directions.field_is_nullable(field), graph,)?,
         pydantic_field_rhs(field, false)
     ))
 }
@@ -811,9 +824,9 @@ fn emit_pydantic_model(
     for field in fields {
         let ident = pydantic_field_ident(field);
         let suffix = if directions.model_field_is_optional(field) {
-            pydantic_default_suffix(field, graph)?
+            pydantic_default_suffix(field, graph, directions)?
         } else {
-            pydantic_required_suffix(field, graph)?
+            pydantic_required_suffix(field, graph, directions)?
         };
         writeln!(out, "    {ident}: {suffix}").map_err(sink)?;
     }
@@ -827,11 +840,32 @@ fn emit_pydantic_model(
     writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
     writeln!(out).map_err(sink)?;
     writeln!(out, "    def to_dict(self) -> dict[str, Any]:").map_err(sink)?;
-    writeln!(
-        out,
-        "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
-    )
-    .map_err(sink)?;
+    let required_nullable: Vec<&Field> = fields
+        .iter()
+        .filter(|field| {
+            !directions.model_field_is_optional(field) && directions.field_is_nullable(field)
+        })
+        .collect();
+    if required_nullable.is_empty() {
+        writeln!(
+            out,
+            "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "        _data = self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
+        )
+        .map_err(sink)?;
+        for field in required_nullable {
+            let ident = pydantic_field_ident(field);
+            let wire = py_string_literal(&field.json_name);
+            writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
+            writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+        }
+        writeln!(out, "        return _data").map_err(sink)?;
+    }
     Ok(())
 }
 
@@ -865,7 +899,7 @@ fn emit_dataclass(
         // preserved verbatim — only a keyword/leading-digit name is renamed, and the from-dict decode
         // (CR-04) maps the original JSON key onto the (possibly renamed) attribute by position.
         let ident = safe_ident(&field.json_name);
-        let hint = py_type(&field.schema, field.nullable, graph)?;
+        let hint = py_type(&field.schema, directions.field_is_nullable(field), graph)?;
         writeln!(out, "    {ident}: {hint}").map_err(sink)?;
     }
     for field in optional {
@@ -876,8 +910,9 @@ fn emit_dataclass(
         // modeled in the hint, not only the default. A nullable field is already Optional[..]; wrapping
         // an already-Optional hint again is avoided by py_type carrying nullable, so only widen when the
         // value is not itself nullable.
-        let hint = py_type(&field.schema, field.nullable, graph)?;
-        let defaulted_hint = if field.nullable {
+        let nullable = directions.field_is_nullable(field);
+        let hint = py_type(&field.schema, nullable, graph)?;
+        let defaulted_hint = if nullable {
             hint
         } else {
             format!("Optional[{hint}]")
@@ -912,7 +947,7 @@ fn emit_dataclass(
         } else {
             let accessor = format!("_data[\"{wire}\"]");
             let decoded = decode_expr(&field.schema, graph, &accessor);
-            if field.nullable && decoded != accessor {
+            if directions.field_is_nullable(field) && decoded != accessor {
                 // Required-but-nullable: the key is always present (a missing one is a real protocol
                 // error → KeyError), but the value may be `null` and THIS decode dereferences it — a
                 // list comprehension over None raises TypeError, and a nested `from_dict(None)` fails
@@ -2983,7 +3018,7 @@ mod tests {
         {
           "id": "app.models.Author", "name": "Author",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -2992,16 +3027,16 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "author", "required": true, "optional": false, "nullable": false,
+            { "json_name": "author", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "app.models.Author" },
               "description": null, "example": null },
-            { "json_name": "rating", "required": false, "optional": true, "nullable": true,
+            { "json_name": "rating", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "union", "of": [
                 { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                 { "type": "primitive", "of": { "prim": "float", "bits": 64 } }
               ] },
               "description": null, "example": null },
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3010,16 +3045,16 @@ mod tests {
         {
           "id": "app.models.BookFilters", "name": "BookFilters",
           "body": { "type": "object", "of": [
-            { "json_name": "genre", "required": true, "optional": false, "nullable": false,
+            { "json_name": "genre", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "in_stock", "required": false, "optional": true, "nullable": false,
+            { "json_name": "in_stock", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "bool" } },
               "description": null, "example": null },
-            { "json_name": "published", "required": true, "optional": false, "nullable": true,
+            { "json_name": "published", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "sort", "required": false, "optional": true, "nullable": false,
+            { "json_name": "sort", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "enum", "of": ["asc", "desc"] },
               "description": null, "example": null }
           ] },
@@ -3041,7 +3076,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3282,7 +3317,7 @@ mod tests {
                   "id": "app.models.Item",
                   "name": "Item",
                   "body": {"type": "object", "of": [
-                    {"json_name": "name", "required": true, "optional": false, "nullable": false,
+                    {"json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                      "schema": {"type": "primitive", "of": {"prim": "string"}},
                      "description": null, "example": null}
                   ]},
@@ -3292,13 +3327,13 @@ mod tests {
                   "id": "app.models.Bag",
                   "name": "Bag",
                   "body": {"type": "object", "of": [
-                    {"json_name": "items", "required": true, "optional": false, "nullable": true,
+                    {"json_name": "items", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
                      "schema": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}},
                      "description": null, "example": null},
-                    {"json_name": "lead", "required": true, "optional": false, "nullable": true,
+                    {"json_name": "lead", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
                      "schema": {"type": "named", "of": "app.models.Item"},
                      "description": null, "example": null},
-                    {"json_name": "note", "required": true, "optional": false, "nullable": true,
+                    {"json_name": "note", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
                      "schema": {"type": "primitive", "of": {"prim": "string"}},
                      "description": null, "example": null}
                   ]},
@@ -3404,12 +3439,10 @@ mod tests {
                 out.contains("    in_stock: Optional[bool] = Field(default=None)\n"),
                 "optional non-nullable field must accept None at wrapper boundaries:\n{out}"
             );
-            // Nullable, and no validation rule reaches this model, so the key may be left out: the hint
-            // was `Optional[str]` either way and the default is the whole of what changes. Without it
-            // the model could not decode its own `to_dict()`, which excludes every None.
+            // Required and nullable are independent: nullable changes the hint, not the default.
             assert!(
-                out.contains("    published: Optional[str] = Field(default=None)\n"),
-                "a nullable key no rule demands must carry a default:\n{out}"
+                out.contains("    published: Optional[str]\n"),
+                "a required nullable key must not gain an omission default:\n{out}"
             );
         }
 
@@ -3536,7 +3569,7 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3545,10 +3578,10 @@ mod tests {
         {
           "id": "app.models.CreatedMessage", "name": "CreatedMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+            { "json_name": "id", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null },
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3557,7 +3590,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -4138,10 +4171,10 @@ mod tests {
               "schemas": [
                 { "id": "app.models.Reserved", "name": "Reserved",
                   "body": { "type": "object", "of": [
-                    { "json_name": "from", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "from", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null },
-                    { "json_name": "class", "required": false, "optional": true, "nullable": false,
+                    { "json_name": "class", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null }
                   ] },
@@ -4215,17 +4248,17 @@ mod tests {
               "schemas": [
                 { "id": "app.models.Inner", "name": "Inner",
                   "body": { "type": "object", "of": [
-                    { "json_name": "v", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "v", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null }
                   ] },
                   "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } },
                 { "id": "app.models.Outer", "name": "Outer",
                   "body": { "type": "object", "of": [
-                    { "json_name": "inner", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "inner", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "named", "of": "app.models.Inner" },
                       "description": null, "example": null },
-                    { "json_name": "items", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "items", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "array", "of": { "type": "named", "of": "app.models.Inner" } },
                       "description": null, "example": null }
                   ] },

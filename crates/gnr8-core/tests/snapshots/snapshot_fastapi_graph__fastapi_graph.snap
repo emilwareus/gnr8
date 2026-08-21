@@ -156,9 +156,12 @@ schemas:
       type: object
       of:
         - json_name: bio
-          required: true
-          optional: false
-          nullable: true
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -166,9 +169,12 @@ schemas:
           description: ~
           example: ~
         - json_name: name
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -185,27 +191,36 @@ schemas:
       type: object
       of:
         - json_name: author
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: app.models.Author
           description: ~
           example: ~
         - json_name: format
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: app.models.BookFormat
           description: ~
           example: ~
         - json_name: id
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -215,9 +230,12 @@ schemas:
           description: ~
           example: ~
         - json_name: rating
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: union
             of:
@@ -233,9 +251,12 @@ schemas:
           description: ~
           example: ~
         - json_name: tags
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -245,9 +266,12 @@ schemas:
           description: ~
           example: ~
         - json_name: title
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -264,9 +288,12 @@ schemas:
       type: object
       of:
         - json_name: genre
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -274,9 +301,12 @@ schemas:
           description: ~
           example: ~
         - json_name: in_stock
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -284,9 +314,12 @@ schemas:
           description: ~
           example: ~
         - json_name: published
-          required: true
-          optional: false
-          nullable: true
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -296,9 +329,12 @@ schemas:
           description: ~
           example: ~
         - json_name: sort
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: enum
             of:
@@ -343,9 +379,12 @@ schemas:
       type: object
       of:
         - json_name: id
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -355,9 +394,12 @@ schemas:
           description: ~
           example: ~
         - json_name: message
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -374,9 +416,12 @@ schemas:
       type: object
       of:
         - json_name: books
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -385,9 +430,12 @@ schemas:
           description: ~
           example: ~
         - json_name: next_cursor
-          required: true
-          optional: false
-          nullable: true
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -395,9 +443,12 @@ schemas:
           description: ~
           example: ~
         - json_name: total
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -416,9 +467,12 @@ schemas:
       type: object
       of:
         - json_name: reason
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:

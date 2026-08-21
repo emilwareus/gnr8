@@ -165,9 +165,11 @@ func extractFields(
 			diags:        diags,
 		}
 		schema := mapType(f.Type(), ctx)
-		required := bindingHasRequired(tag.Get("binding")) || validateHasRequired(tag.Get("validate"))
-		optional, nullable := presenceAndNullability(wire, omitOpt, f.Type())
-		if wire == wireJSON && omitOpt == optOmitEmpty && !optional {
+		validatorRequiresPresence := bindingHasRequired(tag.Get("binding")) || validateHasRequired(tag.Get("validate"))
+		serializerMayOmit, deserializerAcceptsNull := presenceAndNullability(wire, omitOpt, f.Type())
+		serializerMayEmitNull := outputMayEmitNull(wire, omitOpt, f.Type())
+		validatorRejectsNull := validatorRequiresPresence && validationRejectsNull(f.Type())
+		if wire == wireJSON && omitOpt == optOmitEmpty && !serializerMayOmit {
 			diags.IneffectiveOmitEmpty(structName, f.Name(), typeString(f.Type()), file, line)
 		}
 		meta := fieldMetaFromTags(structName, f.Name(), tag, st.Tag(i), schema, file, line, diags)
@@ -181,14 +183,17 @@ func extractFields(
 		}
 
 		fields = append(fields, facts.FieldFact{
-			JSONName:    jsonName,
-			Required:    required,
-			Optional:    optional,
-			Nullable:    nullable,
-			Schema:      schema,
-			Description: description,
-			Example:     example,
-			Meta:        meta,
+			JSONName:                  jsonName,
+			SerializerMayOmit:         serializerMayOmit,
+			DeserializerAcceptsAbsent: true,
+			DeserializerAcceptsNull:   deserializerAcceptsNull,
+			SerializerMayEmitNull:     serializerMayEmitNull,
+			ValidatorRequiresPresence: validatorRequiresPresence,
+			ValidatorRejectsNull:      validatorRejectsNull,
+			Schema:                    schema,
+			Description:               description,
+			Example:                   example,
+			Meta:                      meta,
 		})
 	}
 	return fields
@@ -1040,13 +1045,11 @@ func parseWireTag(raw string, goName string, wire payloadWire) (name string, omi
 	return wireName, omitOpt, false
 }
 
-// presenceAndNullability derives the two axes from the serializer that writes
-// the field. Each wire has exactly one rule per axis (CLAUDE.md rule 3) — these
-// are two serializers, not a primary source and a fallback.
+// presenceAndNullability derives serializer omission and deserializer null acceptance.
+// Each wire has exactly one rule per fact (CLAUDE.md rule 3).
 //
-// On the `encoding/json` wire the declared type is evidence for nullability
-// only: the marshaller keeps a bare pointer's key and writes `null` into it, so
-// presence comes from the omission option alone.
+// On the `encoding/json` wire the declared type is evidence for accepting null;
+// serializer presence comes from the omission option alone.
 //
 // The form/multipart wire is left as it was. Its binder is not `encoding/json`
 // and nothing here has established what it does with a bare pointer, so this
@@ -1135,6 +1138,82 @@ func zeroMarshalsNull(t gotypes.Type) bool {
 	default:
 		return false
 	}
+}
+
+// outputMayEmitNull reports whether a present outbound key can carry JSON null.
+// An omission option removes the nil zero value before it reaches the encoder, so
+// ordinary pointers, slices, and maps become optional/non-null when present. Raw
+// JSON and custom marshalers remain nullable because a non-zero value can itself
+// encode the null token; interfaces can likewise hold a non-nil dynamic value
+// whose representation is null.
+func outputMayEmitNull(wire payloadWire, omitOpt string, t gotypes.Type) bool {
+	if wire == wireForm {
+		return false
+	}
+	if omitOpt == "" {
+		return zeroMarshalsNull(t)
+	}
+	if isJSONRawMessage(t) {
+		return true
+	}
+	unaliased := gotypes.Unalias(t)
+	switch underlying := unaliased.Underlying().(type) {
+	case *gotypes.Interface:
+		return true
+	case *gotypes.Pointer:
+		return zeroMarshalsNull(underlying.Elem())
+	default:
+		return false
+	}
+}
+
+// validationRejectsNull is deliberately narrower than Go nilability. A required
+// validator rejects the nil value produced for an ordinary pointer/slice/map or
+// interface, but RawMessage retains literal `null` as non-nil bytes and a custom
+// unmarshaler owns its representation. Those shapes therefore carry no inferred
+// rejection fact.
+func validationRejectsNull(t gotypes.Type) bool {
+	if isJSONRawMessage(t) || hasJSONUnmarshaler(t) {
+		return false
+	}
+	return zeroMarshalsNull(t)
+}
+
+func isJSONRawMessage(t gotypes.Type) bool {
+	unaliased := gotypes.Unalias(t)
+	if pointer, ok := unaliased.(*gotypes.Pointer); ok {
+		unaliased = gotypes.Unalias(pointer.Elem())
+	}
+	named, ok := unaliased.(*gotypes.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return false
+	}
+	return named.Obj().Pkg().Path() == jsonPkgPath && named.Obj().Name() == "RawMessage"
+}
+
+func hasJSONUnmarshaler(t gotypes.Type) bool {
+	return hasJSONMethod(t, "UnmarshalJSON")
+}
+
+func hasJSONMethod(t gotypes.Type, name string) bool {
+	if methodSetHas(t, name) {
+		return true
+	}
+	unaliased := gotypes.Unalias(t)
+	if _, ok := unaliased.(*gotypes.Pointer); ok {
+		return false
+	}
+	return methodSetHas(gotypes.NewPointer(t), name)
+}
+
+func methodSetHas(t gotypes.Type, name string) bool {
+	methodSet := gotypes.NewMethodSet(t)
+	for index := 0; index < methodSet.Len(); index++ {
+		if methodSet.At(index).Obj().Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func spanOf(fset *token.FileSet, pos token.Pos) facts.SourceSpan {

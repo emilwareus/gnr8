@@ -370,26 +370,26 @@ class SchemaBuilderTests(unittest.TestCase):
         }
         # genre: neither
         self.assertEqual(
-            (fields["genre"]["optional"], fields["genre"]["nullable"]), (False, False)
+            (fields["genre"]["serializer_may_omit"], fields["genre"]["deserializer_accepts_null"]), (False, False)
         )
-        self.assertTrue(fields["genre"]["required"])
+        self.assertFalse(fields["genre"]["deserializer_accepts_absent"])
         # in_stock: optional only
         self.assertEqual(
-            (fields["in_stock"]["optional"], fields["in_stock"]["nullable"]),
+            (fields["in_stock"]["serializer_may_omit"], fields["in_stock"]["deserializer_accepts_null"]),
             (True, False),
         )
-        self.assertFalse(fields["in_stock"]["required"])
+        self.assertTrue(fields["in_stock"]["deserializer_accepts_absent"])
         # published: nullable only
         self.assertEqual(
-            (fields["published"]["optional"], fields["published"]["nullable"]),
+            (fields["published"]["serializer_may_omit"], fields["published"]["deserializer_accepts_null"]),
             (False, True),
         )
-        self.assertTrue(fields["published"]["required"])
+        self.assertFalse(fields["published"]["deserializer_accepts_absent"])
         # sort: both
         self.assertEqual(
-            (fields["sort"]["optional"], fields["sort"]["nullable"]), (True, True)
+            (fields["sort"]["serializer_may_omit"], fields["sort"]["deserializer_accepts_null"]), (True, True)
         )
-        self.assertFalse(fields["sort"]["required"])
+        self.assertTrue(fields["sort"]["deserializer_accepts_absent"])
 
     def test_inline_literal_alias_field_is_inline_enum(self):
         schemas, _ = self._schemas()
@@ -427,9 +427,12 @@ class SchemaBuilderTests(unittest.TestCase):
             set(f.keys()),
             {
                 "json_name",
-                "required",
-                "optional",
-                "nullable",
+                "serializer_may_omit",
+                "deserializer_accepts_absent",
+                "deserializer_accepts_null",
+                "serializer_may_emit_null",
+                "validator_requires_presence",
+                "validator_rejects_null",
                 "schema",
                 "description",
                 "example",

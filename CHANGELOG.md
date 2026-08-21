@@ -9,6 +9,32 @@ must move the minor version.
 
 ## Unreleased
 
+### Breaking
+
+- **Presence and nullability are now modeled independently for input and output payloads.** The
+  extraction contract records serializer omission, deserializer absence/null acceptance, serializer
+  null emission, and validator presence/null rejection as separate facts. OpenAPI, Go, Python, and
+  TypeScript generation all derive their field shape from the payload direction instead of treating
+  null as permission to omit a key.
+
+  Consequently, a response field whose serializer always writes the key is required even when its
+  value can be null (`field: T | null`, not `field?: T | null`). A field with a JSON omission option
+  is optional on output and, for ordinary pointer/slice/map values, non-null when present. Required
+  request slices reject null; `json.RawMessage` keeps its distinct ability to hold literal JSON null.
+
+  When one source type is used in both directions and those contracts differ, generation now emits
+  distinct `TypeInput` and `TypeOutput` schemas/models and rewrites transitive references. Non-HTTP
+  payloads can declare their direction with `register_input_schema` or `register_output_schema`, and
+  checked `force_nullable` / `force_non_nullable` overrides take an explicit `SchemaUse`.
+
+  Go SDK optional value fields now use pointers with `omitempty`, preserving both absence and an
+  explicit zero value; required nullable value fields remain pointers without an omission tag.
+  Python `to_dict()` retains null for required-nullable keys so its own output remains decodable.
+
+  **Upgrade note for 0.6.x consumers:** regenerate committed SDKs and review constructor call sites,
+  component names, and schema assertions. In particular, nullable response fields that 0.6.1 made
+  omittable become required again, while omitted ordinary container fields no longer advertise null.
+
 ### Fixed
 
 - **Upgrading the Go toolchain no longer leaves a stale `goextract` binary behind.** The compiled

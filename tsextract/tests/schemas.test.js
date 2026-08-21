@@ -52,9 +52,12 @@ const byId = Object.fromEntries(schemas.map((s) => [s.id, s]));
   const bio = fields.find((f) => f.json_name === "bio");
   assert.deepStrictEqual(bio, {
     json_name: "bio",
-    required: true,
-    optional: false,
-    nullable: true,
+    serializer_may_omit: false,
+    deserializer_accepts_absent: false,
+    deserializer_accepts_null: true,
+    serializer_may_emit_null: true,
+    validator_requires_presence: false,
+    validator_rejects_null: false,
     schema: { type: "primitive", of: { prim: "string" } },
     description: null,
     example: null,
@@ -76,9 +79,12 @@ const byId = Object.fromEntries(schemas.map((s) => [s.id, s]));
   });
   assert.deepStrictEqual(fields.rating, {
     json_name: "rating",
-    required: false,
-    optional: true,
-    nullable: true,
+    serializer_may_omit: true,
+    deserializer_accepts_absent: true,
+    deserializer_accepts_null: true,
+    serializer_may_emit_null: true,
+    validator_requires_presence: false,
+    validator_rejects_null: false,
     schema: { type: "primitive", of: { prim: "float", bits: 64 } },
     description: null,
     example: null,
@@ -96,16 +102,19 @@ const byId = Object.fromEntries(schemas.map((s) => [s.id, s]));
   );
   assert.deepStrictEqual(fields.sort, {
     json_name: "sort",
-    required: false,
-    optional: true,
-    nullable: true,
+    serializer_may_omit: true,
+    deserializer_accepts_absent: true,
+    deserializer_accepts_null: true,
+    serializer_may_emit_null: true,
+    validator_requires_presence: false,
+    validator_rejects_null: false,
     schema: { type: "enum", of: ["asc", "desc"] },
     description: null,
     example: null,
   });
-  assert.strictEqual(fields.published.nullable, true);
-  assert.strictEqual(fields.published.optional, false);
-  assert.strictEqual(fields.published.required, true);
+  assert.strictEqual(fields.published.deserializer_accepts_null, true);
+  assert.strictEqual(fields.published.serializer_may_omit, false);
+  assert.strictEqual(fields.published.deserializer_accepts_absent, false);
 })();
 
 // BookFormat -> enum schema, sorted.

@@ -101,6 +101,8 @@ pub(crate) fn generate_files_with_options(
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let graph = &projected;
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Python SDK")?;
     check_unique_model_file_names(graph, "Python SDK", layout, |schema| {
@@ -604,10 +606,10 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "format", "required": false, "optional": true, "nullable": false,
+            { "json_name": "format", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "app.models.BookFormat" },
               "description": null, "example": null },
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -621,7 +623,7 @@ mod tests {
         {
           "id": "app.models.CreatedMessage", "name": "CreatedMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+            { "json_name": "id", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },

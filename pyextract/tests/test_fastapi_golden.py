@@ -94,7 +94,7 @@ class FastapiGoldenLineTests(unittest.TestCase):
             f["json_name"]: f
             for f in self.schemas["app.models.BookFilters"]["body"]["of"]
         }
-        axes = {(f["optional"], f["nullable"]) for f in filters.values()}
+        axes = {(f["serializer_may_omit"], f["deserializer_accepts_null"]) for f in filters.values()}
         self.assertEqual(
             axes, {(False, False), (True, False), (False, True), (True, True)}
         )

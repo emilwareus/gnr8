@@ -4,15 +4,15 @@ package sdk
 import "time"
 
 type Book struct {
-	Author      string    `json:"author"`
-	Genre       Genre     `json:"genre"`
-	ID          string    `json:"id"`
-	Price       float64   `json:"price"`
-	PublishedAt time.Time `json:"publishedAt"`
-	Publisher   Publisher `json:"publisher"`
-	Subtitle    *string   `json:"subtitle,omitempty"`
-	Tags        []string  `json:"tags"`
-	Title       string    `json:"title"`
+	Author      string          `json:"author"`
+	Genre       Genre           `json:"genre"`
+	ID          string          `json:"id"`
+	Price       float64         `json:"price"`
+	PublishedAt time.Time       `json:"publishedAt"`
+	Publisher   PublisherOutput `json:"publisher"`
+	Subtitle    *string         `json:"subtitle,omitempty"`
+	Tags        []string        `json:"tags"`
+	Title       string          `json:"title"`
 }
 
 type BookList struct {
@@ -20,13 +20,13 @@ type BookList struct {
 }
 
 type CreateBookRequest struct {
-	Author    string    `json:"author"`
-	Genre     Genre     `json:"genre"`
-	Price     float64   `json:"price"`
-	Publisher Publisher `json:"publisher"`
-	Subtitle  *string   `json:"subtitle,omitempty"`
-	Tags      []string  `json:"tags"`
-	Title     string    `json:"title"`
+	Author    string          `json:"author"`
+	Genre     Genre           `json:"genre"`
+	Price     *float64        `json:"price,omitempty"`
+	Publisher *PublisherInput `json:"publisher,omitempty"`
+	Subtitle  *string         `json:"subtitle,omitempty"`
+	Tags      []string        `json:"tags,omitempty"`
+	Title     string          `json:"title"`
 }
 
 type ErrorResponse struct {
@@ -44,7 +44,12 @@ const (
 	GenreScifi      Genre = "scifi"
 )
 
-type Publisher struct {
+type PublisherInput struct {
+	Country *string `json:"country,omitempty"`
+	Name    *string `json:"name,omitempty"`
+}
+
+type PublisherOutput struct {
 	Country string `json:"country"`
 	Name    string `json:"name"`
 }

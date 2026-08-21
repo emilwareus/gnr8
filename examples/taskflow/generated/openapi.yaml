@@ -126,8 +126,18 @@ components:
       in: header
       name: X-API-Key
   schemas:
-    Assignee:
+    AssigneeInput:
       type: object
+      properties:
+        email:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+    AssigneeOutput:
+      type: object
+      required: [email, id, name]
       properties:
         email:
           type: string
@@ -140,7 +150,7 @@ components:
       required: [status, title]
       properties:
         assignee:
-          $ref: '#/components/schemas/Assignee'
+          $ref: '#/components/schemas/AssigneeInput'
         dueAt:
           type: string
           format: date-time
@@ -172,7 +182,7 @@ components:
       required: [assignee, dueAt, id, labels, priority, status, title]
       properties:
         assignee:
-          $ref: '#/components/schemas/Assignee'
+          $ref: '#/components/schemas/AssigneeOutput'
         dueAt:
           type: string
           format: date-time
@@ -183,7 +193,7 @@ components:
           items:
             type: string
         notes:
-          type: [string, 'null']
+          type: string
         priority:
           type: integer
         status:

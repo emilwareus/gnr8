@@ -140,9 +140,7 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "lastId",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -173,18 +171,14 @@ fn precision_and_nullable_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "amount",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "float", "bits": 64 } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "label",
-                  "required": true,
-                  "optional": false,
-                  "nullable": true,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -359,27 +353,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "count",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "name",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "tags",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
                   "description": null,
                   "example": null
@@ -394,27 +382,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "file",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "bytes" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "title",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "files",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
@@ -541,9 +523,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "id",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -558,18 +538,14 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "items",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "nextCursor",
-                  "required": false,
-                  "optional": true,
-                  "nullable": false,
+                  "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -646,6 +622,8 @@ import (
 	"testing"
 )
 
+func stringPointer(value string) *string { return &value }
+
 // SDK-05: CreateGoal sends POST /goal/ with the marshaled body and decodes the 201 response.
 func TestCreateGoalSmoke(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -690,7 +668,7 @@ func TestDeleteGoalBadRequestAPIError(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Request-ID", "req-400")
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: "bad_request"})
+		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: stringPointer("bad_request")})
 	}))
 	defer srv.Close()
 
@@ -725,8 +703,8 @@ func TestDeleteGoalBadRequestAPIError(t *testing.T) {
 	if !ok {
 		t.Fatalf("Body type = %T, want HttpError", apiErr.Body)
 	}
-	if typed.Slug != "bad_request" {
-		t.Fatalf("Body.Slug = %q, want bad_request", typed.Slug)
+	if typed.Slug == nil || *typed.Slug != "bad_request" {
+		t.Fatalf("Body.Slug = %v, want bad_request", typed.Slug)
 	}
 	if apiErr.Message != "bad request" {
 		t.Fatalf("Message = %q, want bad request", apiErr.Message)
@@ -1300,6 +1278,8 @@ import (
 	"time"
 )
 
+func stringPointer(value string) *string {{ return &value }}
+
 func TestPaginationHelpers(t *testing.T) {{
 	seen := []string{{}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
@@ -1318,12 +1298,12 @@ func TestPaginationHelpers(t *testing.T) {{
 		case "":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "a"}}}},
-				NextCursor: "n2",
+				NextCursor: stringPointer("n2"),
 			}})
 		case "n2":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "b"}}}},
-				NextCursor: "",
+				NextCursor: stringPointer(""),
 			}})
 		default:
 			t.Errorf("cursor = %q, want empty or n2", cursor)

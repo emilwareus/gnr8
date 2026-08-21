@@ -3,8 +3,8 @@
 // Schema builder: DTO class / type-alias -> neutral SchemaFact — the TypeScript
 // twin of `pyextract/schemas.py`. It emits one SchemaFact per:
 //
-//   * a class -> an `object` body of FieldFacts carrying the four optional/nullable
-//     axes (each property's type mapped via types.mapType);
+//   * a class -> an `object` body of FieldFacts carrying independent inbound/outbound
+//     presence and nullability facts (each property's type mapped via types.mapType);
 //   * a string-literal-union alias used as a named ref (e.g. `BookFormat`) -> an
 //     `enum` body of SORTED member values;
 //   * an object-union alias (e.g. `BookOrError = BookDto | OutOfStockDto`) -> a
@@ -21,10 +21,8 @@
 // roots for THIS wave are the DIRECT exported DTO classes/aliases (routes, which
 // provide the real roots, land in 04-03).
 //
-// A SchemaFact has keys `id, name, body, span`. A FieldFact has EXACTLY
-// `json_name, required, optional, nullable, schema, description, example` —
-// `description`/`example` always null. `required = !optional` (nullable does NOT
-// affect required — RESEARCH Pitfall 3).
+// A SchemaFact has keys `id, name, body, span`. A FieldFact carries independent
+// inbound/outbound presence and null facts plus `schema, description, example`.
 
 const ts = require("./ts");
 
@@ -286,9 +284,12 @@ function _buildClassSchema(loaded, entry, diags, registry) {
     }
     fields.push({
       json_name: jsonName,
-      required: !mapped.optional,
-      optional: mapped.optional,
-      nullable: mapped.nullable,
+      serializer_may_omit: mapped.optional,
+      deserializer_accepts_absent: mapped.optional,
+      deserializer_accepts_null: mapped.nullable,
+      serializer_may_emit_null: mapped.nullable,
+      validator_requires_presence: false,
+      validator_rejects_null: false,
       schema: mapped.schema,
       description: null,
       example: null,

@@ -326,16 +326,16 @@ fn body_encoding_graph(content_type: &str, required: bool) -> gnr8::graph::ApiGr
         r#"{"type":"primitive","of":{"prim":"string"}}"#
     } else if content_type == "multipart/form-data" {
         r#"{"type":"object","of":[
-             {"json_name":"name","required":true,"optional":false,"nullable":false,
+             {"json_name":"name","serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema":{"type":"primitive","of":{"prim":"string"}},
               "description":null,"example":null},
-             {"json_name":"file","required":true,"optional":false,"nullable":false,
+             {"json_name":"file","serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema":{"type":"primitive","of":{"prim":"bytes"}},
               "description":null,"example":null}
            ]}"#
     } else {
         r#"{"type":"object","of":[
-             {"json_name":"name","required":true,"optional":false,"nullable":false,
+             {"json_name":"name","serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema":{"type":"primitive","of":{"prim":"string"}},
               "description":null,"example":null}
            ]}"#

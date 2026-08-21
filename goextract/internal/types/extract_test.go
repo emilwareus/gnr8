@@ -1,6 +1,7 @@
 package types_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -149,8 +150,8 @@ func TestCreateGoalInputFields(t *testing.T) {
 	if !ok {
 		t.Fatal("field 'name' not found")
 	}
-	if !name.Required || name.Optional {
-		t.Errorf("name: want required=true optional=false, got required=%v optional=%v", name.Required, name.Optional)
+	if !name.ValidatorRequiresPresence || name.SerializerMayOmit {
+		t.Errorf("name: want required=true optional=false, got required=%v optional=%v", name.ValidatorRequiresPresence, name.SerializerMayOmit)
 	}
 	if got := primName(name.Schema); got != facts.PrimString {
 		t.Errorf("name type: want primitive string, got %q (%+v)", got, name.Schema)
@@ -161,11 +162,11 @@ func TestCreateGoalInputFields(t *testing.T) {
 	if !ok {
 		t.Fatal("field 'targetValue' not found")
 	}
-	if !tv.Optional || tv.Required {
-		t.Errorf("targetValue: want optional=true required=false, got optional=%v required=%v", tv.Optional, tv.Required)
+	if !tv.SerializerMayOmit || tv.ValidatorRequiresPresence {
+		t.Errorf("targetValue: want optional=true required=false, got optional=%v required=%v", tv.SerializerMayOmit, tv.ValidatorRequiresPresence)
 	}
-	if !tv.Nullable {
-		t.Errorf("targetValue: a pointer field must be nullable, got nullable=%v", tv.Nullable)
+	if !tv.DeserializerAcceptsNull {
+		t.Errorf("targetValue: a pointer field must be nullable, got nullable=%v", tv.DeserializerAcceptsNull)
 	}
 	if got := primName(tv.Schema); got != facts.PrimFloat {
 		t.Errorf("targetValue type: want primitive float, got %q (%+v)", got, tv.Schema)
@@ -252,29 +253,29 @@ type ElementRules struct {
 	if !ok {
 		t.Fatal("field 'fileId' not found")
 	}
-	if !fileID.Required {
+	if !fileID.ValidatorRequiresPresence {
 		t.Fatal("validate:\"required\" should mark fileId required")
 	}
 	filename, ok := fieldByJSON(s, "filename")
 	if !ok {
 		t.Fatal("field 'filename' not found")
 	}
-	if !filename.Required {
+	if !filename.ValidatorRequiresPresence {
 		t.Fatal("validate:\"required,email\" should mark filename required")
 	}
 	label, ok := fieldByJSON(s, "label")
 	if !ok {
 		t.Fatal("field 'label' not found")
 	}
-	if !label.Optional || label.Nullable {
-		t.Fatalf("omitempty should be optional but not nullable, got optional=%v nullable=%v", label.Optional, label.Nullable)
+	if !label.SerializerMayOmit || label.DeserializerAcceptsNull {
+		t.Fatalf("omitempty should be optional but not nullable, got optional=%v nullable=%v", label.SerializerMayOmit, label.DeserializerAcceptsNull)
 	}
 	note, ok := fieldByJSON(s, "note")
 	if !ok {
 		t.Fatal("field 'note' not found")
 	}
-	if !note.Nullable || note.Required {
-		t.Fatalf("pointer should be nullable without forcing required, got nullable=%v required=%v", note.Nullable, note.Required)
+	if !note.DeserializerAcceptsNull || note.ValidatorRequiresPresence {
+		t.Fatalf("pointer should be nullable without forcing required, got nullable=%v required=%v", note.DeserializerAcceptsNull, note.ValidatorRequiresPresence)
 	}
 
 	// `dive` and `keys`…`endkeys` move the rules that follow them off the field and
@@ -299,8 +300,8 @@ type ElementRules struct {
 		if !found {
 			t.Fatalf("field %q not found", tc.jsonName)
 		}
-		if field.Required != tc.required {
-			t.Errorf("%s: want required=%v, got %v — %s", tc.jsonName, tc.required, field.Required, tc.why)
+		if field.ValidatorRequiresPresence != tc.required {
+			t.Errorf("%s: want required=%v, got %v — %s", tc.jsonName, tc.required, field.ValidatorRequiresPresence, tc.why)
 		}
 	}
 
@@ -386,8 +387,8 @@ type Payload struct {
 		if !found {
 			t.Fatalf("field %q not found", name)
 		}
-		if !field.Optional || !field.Nullable {
-			t.Fatalf("%s should be optional and nullable, got optional=%v nullable=%v", name, field.Optional, field.Nullable)
+		if !field.SerializerMayOmit || !field.DeserializerAcceptsNull {
+			t.Fatalf("%s should be optional and nullable, got optional=%v nullable=%v", name, field.SerializerMayOmit, field.DeserializerAcceptsNull)
 		}
 	}
 
@@ -395,8 +396,8 @@ type Payload struct {
 	if !ok {
 		t.Fatal("field 'formZero' not found")
 	}
-	if formZero.Optional || formZero.Nullable {
-		t.Fatalf("form omitzero is not a JSON omission signal, got optional=%v nullable=%v", formZero.Optional, formZero.Nullable)
+	if formZero.SerializerMayOmit || formZero.DeserializerAcceptsNull {
+		t.Fatalf("form omitzero is not a JSON omission signal, got optional=%v nullable=%v", formZero.SerializerMayOmit, formZero.DeserializerAcceptsNull)
 	}
 }
 
@@ -411,10 +412,11 @@ type Payload struct {
 //	{"bare_str":"","bare_ptr":null,"bare_slice":null,"bare_map":null,
 //	 "bare_iface":null,"bare_struct":{"a":0},"omit_struct":{"a":0},
 //	 "bare_time":"0001-01-01T00:00:00Z","omit_time":"0001-01-01T00:00:00Z",
-//	 "bare_arr":["",""],"omit_arr":["",""],"req_ptr":null}
+//	 "bare_arr":["",""],"omit_arr":["",""],"req_ptr":null,
+//	 "req_slice":null,"req_raw":null}
 //
-// The six keys absent from that object — omit_str, omit_ptr, omit_slice,
-// omit_map, zero_struct, zero_time — are the only optional fields.
+// The seven keys absent from that object — omit_str, omit_ptr, omit_slice,
+// omit_map, zero_map, zero_struct, zero_time — are the only optional fields.
 //
 // Two families of mistake are pinned by construction. The DECLARED TYPE is not
 // evidence for presence: a bare pointer keeps its key, so `*T` alone never makes
@@ -434,7 +436,10 @@ func TestPresenceAndNullabilityMatchEncodingJSON(t *testing.T) {
 		filepath.Join(dir, "models.go"),
 		[]byte(`package matrixfixture
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Inner struct {
 	A int `+"`json:\"a\"`"+`
@@ -449,6 +454,7 @@ type Matrix struct {
 	OmitSlice  []string          `+"`json:\"omit_slice,omitempty\"`"+`
 	BareMap    map[string]string `+"`json:\"bare_map\"`"+`
 	OmitMap    map[string]string `+"`json:\"omit_map,omitempty\"`"+`
+	ZeroMap    map[string]string `+"`json:\"zero_map,omitzero\"`"+`
 	BareIface  any               `+"`json:\"bare_iface\"`"+`
 	BareStruct Inner             `+"`json:\"bare_struct\"`"+`
 	OmitStruct Inner             `+"`json:\"omit_struct,omitempty\"`"+`
@@ -459,6 +465,8 @@ type Matrix struct {
 	BareArr    [2]string         `+"`json:\"bare_arr\"`"+`
 	OmitArr    [2]string         `+"`json:\"omit_arr,omitempty\"`"+`
 	ReqPtr     *int              `+"`json:\"req_ptr\" binding:\"required\"`"+`
+	ReqSlice   []string          `+"`json:\"req_slice\" binding:\"required\"`"+`
+	ReqRaw     json.RawMessage   `+"`json:\"req_raw\" binding:\"required\"`"+`
 }
 `),
 		0o644,
@@ -478,44 +486,60 @@ type Matrix struct {
 	}
 
 	for _, tc := range []struct {
-		field    string
-		optional bool // json.Marshal omits the key for the zero value
-		nullable bool // json.Marshal writes null for the zero value
+		field          string
+		optional       bool // json.Marshal omits the key for the zero value
+		nullable       bool // json.Marshal writes null for the zero value
+		outputNullable bool // a present outbound key can carry null
 	}{
-		{"bare_str", false, false},
-		{"omit_str", true, false},
+		{"bare_str", false, false, false},
+		{"omit_str", true, false, false},
 		// A bare pointer keeps its key and holds null: NOT optional, nullable.
-		{"bare_ptr", false, true},
-		{"omit_ptr", true, true},
+		{"bare_ptr", false, true, true},
+		{"omit_ptr", true, true, false},
 		// A nil slice/map/interface is written as null even with no option.
-		{"bare_slice", false, true},
-		{"omit_slice", true, true},
-		{"bare_map", false, true},
-		{"omit_map", true, true},
-		{"bare_iface", false, true},
-		{"bare_struct", false, false},
+		{"bare_slice", false, true, true},
+		{"omit_slice", true, true, false},
+		{"bare_map", false, true, true},
+		{"omit_map", true, true, false},
+		{"zero_map", true, true, false},
+		{"bare_iface", false, true, true},
+		{"bare_struct", false, false, false},
 		// `,omitempty` is a no-op on a struct, a time.Time, and a [2]string.
-		{"omit_struct", false, false},
-		{"zero_struct", true, false},
-		{"bare_time", false, false},
-		{"omit_time", false, false},
-		{"zero_time", true, false},
-		{"bare_arr", false, false},
-		{"omit_arr", false, false},
+		{"omit_struct", false, false, false},
+		{"zero_struct", true, false, false},
+		{"bare_time", false, false, false},
+		{"omit_time", false, false, false},
+		{"zero_time", true, false, false},
+		{"bare_arr", false, false, false},
+		{"omit_arr", false, false, false},
 		// A validation tag governs the request direction; it does not change what
 		// the marshaller writes, so it moves neither axis.
-		{"req_ptr", false, true},
+		{"req_ptr", false, true, true},
+		{"req_slice", false, true, true},
+		{"req_raw", false, true, true},
 	} {
 		field, found := fieldByJSON(s, tc.field)
 		if !found {
 			t.Fatalf("field %q not found", tc.field)
 		}
-		if field.Optional != tc.optional || field.Nullable != tc.nullable {
+		if field.SerializerMayOmit != tc.optional || field.DeserializerAcceptsNull != tc.nullable {
 			t.Errorf(
 				"%s: want optional=%v nullable=%v, got optional=%v nullable=%v",
-				tc.field, tc.optional, tc.nullable, field.Optional, field.Nullable,
+				tc.field, tc.optional, tc.nullable, field.SerializerMayOmit, field.DeserializerAcceptsNull,
 			)
 		}
+		if field.SerializerMayEmitNull != tc.outputNullable {
+			t.Errorf("%s: want output nullable=%v, got %v", tc.field, tc.outputNullable, field.SerializerMayEmitNull)
+		}
+	}
+
+	reqSlice, _ := fieldByJSON(s, "req_slice")
+	if !reqSlice.ValidatorRequiresPresence || !reqSlice.ValidatorRejectsNull {
+		t.Fatalf("required slice must retain presence and explicit-null rejection: %+v", reqSlice)
+	}
+	reqRaw, _ := fieldByJSON(s, "req_raw")
+	if !reqRaw.ValidatorRequiresPresence || reqRaw.ValidatorRejectsNull {
+		t.Fatalf("RawMessage literal null remains non-nil and must not gain a rejection fact: %+v", reqRaw)
 	}
 
 	// The three no-op `,omitempty` fields are the ones worth telling the author
@@ -530,6 +554,28 @@ type Matrix struct {
 	want := []string{"OmitArr", "OmitStruct", "OmitTime"}
 	if !reflect.DeepEqual(reported, want) {
 		t.Errorf("ineffective-omitempty diagnostics: want %v, got %v", want, reported)
+	}
+}
+
+func TestOmitZeroMapOmitsNilButEmitsAllocatedEmpty(t *testing.T) {
+	type Payload struct {
+		Value map[string]string `json:"value,omitzero"`
+	}
+
+	nilValue, err := json.Marshal(Payload{})
+	if err != nil {
+		t.Fatalf("marshal nil map: %v", err)
+	}
+	if string(nilValue) != `{}` {
+		t.Fatalf("nil map should be omitted, got %s", nilValue)
+	}
+
+	allocated, err := json.Marshal(Payload{Value: map[string]string{}})
+	if err != nil {
+		t.Fatalf("marshal allocated empty map: %v", err)
+	}
+	if string(allocated) != `{"value":{}}` {
+		t.Fatalf("allocated empty map should be emitted non-null, got %s", allocated)
 	}
 }
 
@@ -580,10 +626,10 @@ type UploadForm struct {
 	// PRESENCE axis is asserted here too: a pointer part stays optional, which is
 	// the form binder's rule and not `encoding/json`'s. Leaving it unasserted once
 	// let it flip silently.
-	if !file.Required || !file.Optional || file.Nullable || primName(file.Schema) != facts.PrimBytes {
+	if !file.ValidatorRequiresPresence || !file.SerializerMayOmit || file.DeserializerAcceptsNull || primName(file.Schema) != facts.PrimBytes {
 		t.Fatalf(
 			"file should be required optional non-nullable bytes, got required=%v optional=%v nullable=%v schema=%+v",
-			file.Required, file.Optional, file.Nullable, file.Schema,
+			file.ValidatorRequiresPresence, file.SerializerMayOmit, file.DeserializerAcceptsNull, file.Schema,
 		)
 	}
 	if file.Description == nil || *file.Description != "CSV upload" {
@@ -594,7 +640,7 @@ type UploadForm struct {
 	if !ok {
 		t.Fatal("field 'title' not found")
 	}
-	if !title.Required || title.Meta == nil || title.Meta.Constraints == nil || title.Meta.Constraints.MinLength == nil || *title.Meta.Constraints.MinLength != 3 {
+	if !title.ValidatorRequiresPresence || title.Meta == nil || title.Meta.Constraints == nil || title.Meta.Constraints.MinLength == nil || *title.Meta.Constraints.MinLength != 3 {
 		t.Fatalf("validate min/required metadata not preserved: %+v", title)
 	}
 	if title.Example == nil || *title.Example != "June report" {
@@ -619,8 +665,8 @@ type UploadForm struct {
 	if !ok {
 		t.Fatal("field 'attachments' not found")
 	}
-	if !attachments.Optional || attachments.Nullable {
-		t.Fatalf("omitempty file slice should be optional but not nullable, got optional=%v nullable=%v", attachments.Optional, attachments.Nullable)
+	if !attachments.SerializerMayOmit || attachments.DeserializerAcceptsNull {
+		t.Fatalf("omitempty file slice should be optional but not nullable, got optional=%v nullable=%v", attachments.SerializerMayOmit, attachments.DeserializerAcceptsNull)
 	}
 	if attachments.Schema.Type != facts.TypeArray {
 		t.Fatalf("attachments should be an array, got %+v", attachments.Schema)

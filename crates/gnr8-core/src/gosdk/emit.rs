@@ -5,9 +5,8 @@
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
-//!   json tags carry `,omitempty` where the source's own tag does and the side of the exchange the
-//!   struct is on permits it ([`omits_when_empty`] — the direction can take the option away but never
-//!   put one on), types follow TARGET-API.md §4.
+//!   json tags and pointer representations carry the direction-selected presence/null contract;
+//!   types otherwise follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
@@ -227,52 +226,23 @@ fn is_value_ref(target: &Schema) -> bool {
     }
 }
 
-/// Wrap `base` in a Go pointer when the field's value may be explicitly null AND the underlying Go type
-/// is a value type. Pointer-wrapping reads the NULLABLE axis (a nilable `*T`), NOT the optional axis
-/// (which drives `,omitempty` in [`json_tag`]) — the two are distinct (RESEARCH Pitfall 4).
-fn maybe_pointer(base: String, nullable: bool, is_value: bool) -> String {
-    if nullable && is_value {
+/// Wrap `base` in a Go pointer when the caller needs a nil representation and the underlying Go type
+/// is a value type. Field emission requests it independently for absence or nullability.
+fn maybe_pointer(base: String, pointer: bool, is_value: bool) -> String {
+    if pointer && is_value {
         format!("*{base}")
     } else {
         base
     }
 }
 
-/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field OMITS ON
-/// MARSHAL ([`omits_when_empty`]). Independent of nullability (RESEARCH Pitfall 4).
+/// Build the Go json struct tag, adding `,omitempty` exactly when the projected key may be absent.
 fn json_tag(json_name: &str, omit_empty: bool) -> String {
     if omit_empty {
         format!("`json:\"{json_name},omitempty\"`")
     } else {
         format!("`json:\"{json_name}\"`")
     }
-}
-
-/// Whether the emitted json tag carries `,omitempty`.
-///
-/// **`,omitempty` is not a presence marker.** TypeScript's `?:` and Python's `= None` say "the caller
-/// may leave this key out" and nothing else, so they can read
-/// [`SchemaDirections::model_field_is_optional`] straight. `encoding/json` has no such spelling: the
-/// option says "drop this key when the value is the zero value", which is a different statement that
-/// only *coincides* with "may omit" where the source already chose it. Writing it anywhere the source
-/// did not would therefore be a change of wire behavior wearing a presence marker's clothes:
-///
-/// - On a value type it costs the caller the zero value. `Price float64` gains no way to be absent —
-///   Go needs a pointer for that, and gnr8 spends pointers on the NULLABLE axis (RESEARCH Pitfall 4) —
-///   it merely loses the ability to send `"price": 0`. Same for `"tags": []` and, on a bare `*T`, the
-///   explicit `null` that #59 established such a field always writes.
-/// - On a struct, a `time.Time`, or a non-zero-length array the option does nothing at all —
-///   `encoding/json` never considers those empty. gnr8 reads that exact tag in user source as a defect
-///   and raises `schema.omit_option.ineffective`, so emitting it would put gnr8's own diagnostic into
-///   gnr8's own output.
-///
-/// So the direction may only ever take the option AWAY, never add it: the tag omits what the source's
-/// own tag omits, and only where the position permits an omission at all. That still fixes the case
-/// this rule exists for — a `binding:"required"` field tagged `,omitempty`, where a caller setting the
-/// zero value sent nothing and the server rejected the call — because there the direction says the
-/// server demands the key and the option comes off.
-fn omits_when_empty(field: &Field, directions: SchemaDirections) -> bool {
-    field.optional && directions.model_field_is_optional(field)
 }
 
 /// Whether emitting a field of neutral [`Type`] requires the `time` import (a `time.Time` value
@@ -500,10 +470,9 @@ fn emit_type_alias(
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
 ///
-/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads what the field omits on
-/// marshal — the two are distinct (RESEARCH Pitfall 4): an omitting-not-nullable value stays a
-/// non-pointer `T` with omitempty; a nullable value becomes `*T`. The direction the struct is reached
-/// from can take the option off but never put it on — see [`omits_when_empty`].
+/// Go value types use a pointer when either absence or null must be represented. `,omitempty` follows
+/// only absence: `*T` plus the tag preserves an explicit zero value for an optional non-null field,
+/// while `*T` without the tag represents a required nullable field.
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
@@ -512,12 +481,15 @@ fn emit_struct_field(
     multipart_request: bool,
     directions: SchemaDirections,
 ) -> Result<(), CoreError> {
+    let nullable = directions.field_is_nullable(field);
+    let optional = directions.model_field_is_optional(field);
+    let pointer_representation = nullable || optional;
     let go_ty = if multipart_request {
-        go_multipart_field_type(&field.schema, field.nullable, graph)?
+        go_multipart_field_type(&field.schema, pointer_representation, graph)?
     } else {
-        go_type(&field.schema, field.nullable, graph)?
+        go_type(&field.schema, pointer_representation, graph)?
     };
-    let tag = json_tag(&field.json_name, omits_when_empty(field, directions));
+    let tag = json_tag(&field.json_name, optional);
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
 }
@@ -1667,6 +1639,7 @@ struct GoPaginationInfo {
     item_type: String,
     items_field: String,
     next_cursor_field: Option<String>,
+    next_cursor_pointer: bool,
 }
 
 fn emit_pagination_helpers(
@@ -1796,10 +1769,16 @@ fn emit_go_pagination_advance(
             let param = go_query_param(op, cursor_param)?;
             let param_field = exported(&param.name);
             writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
-            writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
+            if info.next_cursor_pointer {
+                writeln!(body, "if nextCursor == nil || *nextCursor == \"\" {{").map_err(sink)?;
+            } else {
+                writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
+            }
             writeln!(body, "{terminate}").map_err(sink)?;
             writeln!(body, "}}").map_err(sink)?;
-            if param.required {
+            if param.required && info.next_cursor_pointer {
+                writeln!(body, "params.{param_field} = *nextCursor").map_err(sink)?;
+            } else if param.required || info.next_cursor_pointer {
                 writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
             } else {
                 writeln!(body, "params.{param_field} = &nextCursor").map_err(sink)?;
@@ -1967,7 +1946,11 @@ fn go_pagination_info(
             ),
         });
     };
-    let next_cursor_field = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+    let schema_directions = schema_directions(graph);
+    let directions = directions_of(&schema_directions, &schema.id);
+    let (next_cursor_field, next_cursor_pointer) = if let Some(next_cursor) =
+        policy.next_cursor_field.as_deref()
+    {
         let field = fields
             .iter()
             .find(|field| field.json_name == next_cursor)
@@ -1977,15 +1960,19 @@ fn go_pagination_info(
                     op.id, next_cursor
                 ),
             })?;
-        Some(exported(&field.json_name))
+        let pointer =
+            directions.model_field_is_optional(field) || directions.field_is_nullable(field);
+        let pointer = go_type(&field.schema, pointer, graph)?.starts_with('*');
+        (Some(exported(&field.json_name)), pointer)
     } else {
-        None
+        (None, false)
     };
     Ok(GoPaginationInfo {
         page_type,
         item_type: go_type(item_schema, false, graph)?,
         items_field: exported(&items.json_name),
         next_cursor_field,
+        next_cursor_pointer,
     })
 }
 
@@ -3353,7 +3340,7 @@ mod tests {
         {
           "id": "dto.CommandMessage", "name": "CommandMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3362,22 +3349,22 @@ mod tests {
         {
           "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "analyticsQuery", "required": true, "optional": false, "nullable": false,
+            { "json_name": "analyticsQuery", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.GoalAnalyticsQuery" },
               "description": null, "example": null },
-            { "json_name": "createdAt", "required": false, "optional": false, "nullable": false,
+            { "json_name": "createdAt", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "well_known", "of": "date_time" },
               "description": null, "example": null },
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetDirection", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null },
-            { "json_name": "targetValue", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetValue", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "float", "bits": 32 } },
               "description": null, "example": null },
-            { "json_name": "workflowChainIds", "required": false, "optional": true, "nullable": false,
+            { "json_name": "workflowChainIds", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "array", "of": { "type": "well_known", "of": "uuid" } },
               "description": null, "example": null }
           ] },
@@ -3386,7 +3373,7 @@ mod tests {
         {
           "id": "dto.GoalAnalyticsQuery", "name": "GoalAnalyticsQuery",
           "body": { "type": "object", "of": [
-            { "json_name": "windowDays", "required": false, "optional": false, "nullable": false,
+            { "json_name": "windowDays", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },
@@ -3395,10 +3382,10 @@ mod tests {
         {
           "id": "dto.GoalResponse", "name": "GoalResponse",
           "body": { "type": "object", "of": [
-            { "json_name": "metadata", "required": false, "optional": true, "nullable": false,
+            { "json_name": "metadata", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "any", "of": {} },
               "description": null, "example": null },
-            { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+            { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "well_known", "of": "uuid" },
               "description": null, "example": null }
           ] },
@@ -3407,7 +3394,7 @@ mod tests {
         {
           "id": "dto.HttpError", "name": "HttpError",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3450,7 +3437,7 @@ mod tests {
                 {{
                   "id": "dto.GoalResponse", "name": "GoalResponse",
                   "body": {{ "type": "object", "of": [
-                    {{ "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                    {{ "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": {{ "type": "well_known", "of": "uuid" }},
                       "description": null, "example": null }}
                   ] }},
@@ -3459,10 +3446,10 @@ mod tests {
                 {{
                   "id": "dto.{error_name}", "name": "{error_name}",
                   "body": {{ "type": "object", "of": [
-                    {{ "json_name": "message", "required": true, "optional": false, "nullable": false,
+                    {{ "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }},
-                    {{ "json_name": "slug", "required": false, "optional": true, "nullable": false,
+                    {{ "json_name": "slug", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                       "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }}
                   ] }},
@@ -3552,7 +3539,7 @@ mod tests {
             {
               "id": "dto.GoalResponse", "name": "GoalResponse",
               "body": { "type": "object", "of": [
-                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
               ] },
@@ -3608,7 +3595,7 @@ mod tests {
             {
               "id": "dto.MarkReadRequest", "name": "MarkReadRequest",
               "body": { "type": "object", "of": [
-                { "json_name": "lastId", "required": true, "optional": false, "nullable": false,
+                { "json_name": "lastId", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null, "example": null }
               ] },
@@ -3641,7 +3628,7 @@ mod tests {
             {
               "id": "dto.GoalResponse", "name": "GoalResponse",
               "body": { "type": "object", "of": [
-                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
               ] },
@@ -3733,9 +3720,12 @@ mod tests {
             let fields = vec![
                 Field {
                     json_name: "authorizedByWorkspaceMemberId".to_string(),
-                    required: false,
-                    optional: true,
-                    nullable: false,
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: true,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -3743,9 +3733,12 @@ mod tests {
                 },
                 Field {
                     json_name: "authorized_by_workspace_member_id".to_string(),
-                    required: false,
-                    optional: true,
-                    nullable: false,
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: true,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -3784,7 +3777,7 @@ mod tests {
             assert!(out.contains("UUID string `json:\"uuid\"`"), "{out}");
             // date-time → time.Time.
             assert!(
-                out.contains("CreatedAt time.Time `json:\"createdAt\"`"),
+                out.contains("CreatedAt *time.Time `json:\"createdAt,omitempty\"`"),
                 "{out}"
             );
             // []uuid → []string.
@@ -4350,9 +4343,7 @@ mod tests {
         }
 
         #[test]
-        fn value_types_get_a_pointer_only_when_nullable() {
-            // Pointer-wrapping reads the NULLABLE axis (RESEARCH Pitfall 4): a nullable value type is
-            // `*T`, a non-nullable value type is `T`.
+        fn value_types_get_a_pointer_when_requested() {
             let graph = sample_graph();
             let number = Type::Primitive(Prim::Float { bits: 32 });
             assert_eq!(go_type(&number, true, &graph).unwrap(), "*float32");
@@ -4430,9 +4421,12 @@ mod tests {
                 name: "S".to_string(),
                 body: Type::Object(vec![Field {
                     json_name: "value".to_string(),
-                    required: !optional,
-                    optional,
-                    nullable,
+                    serializer_may_omit: optional,
+                    deserializer_accepts_absent: optional,
+                    deserializer_accepts_null: nullable,
+                    serializer_may_emit_null: nullable,
+                    validator_requires_presence: !optional,
+                    validator_rejects_null: false,
                     // a float is a Go value type (float32) — pointer-eligible when nullable.
                     schema: Type::Primitive(Prim::Float { bits: 32 }),
                     description: None,
@@ -4450,11 +4444,11 @@ mod tests {
         }
 
         #[test]
-        fn optional_not_nullable_value_is_non_pointer_with_omitempty() {
+        fn optional_not_nullable_value_is_pointer_with_omitempty() {
             let out = emit_models(&graph_with_field(true, false), "svc").unwrap();
             assert!(
-                out.contains("Value float32 `json:\"value,omitempty\"`"),
-                "optional-not-nullable value must be a non-pointer T WITH omitempty:\n{out}"
+                out.contains("Value *float32 `json:\"value,omitempty\"`"),
+                "optional-not-nullable value must preserve absence and explicit zero:\n{out}"
             );
         }
 
