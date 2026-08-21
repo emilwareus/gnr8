@@ -153,8 +153,9 @@ developer convenience.
 That build is pinned to the toolchain the *analyzed* module selects, not the one `goextract/go.mod`
 would pick on its own: `go/packages` runs `go list` inside the target, so a service declaring a newer
 Go than the machine's `PATH` carries is type-checked by that newer release, and a `go/types` older
-than the code it reads rejects every file gated on it. `+auto` stays on the pin so the floor above can
-still raise the toolchain on a machine below it.
+than the code it reads rejects every file gated on it. The pin preserves the caller's `GOTOOLCHAIN`
+mode: `auto` may raise the build to the floor above, `path` can raise it only from `PATH`, and `local`
+or an exact selection remains fixed.
 
 Raising that directive forces every user onto that release or triggers a toolchain download on their
 machine, and hard-fails outright under `GOTOOLCHAIN=local` — which is a configuration real users run,

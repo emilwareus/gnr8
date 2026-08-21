@@ -157,13 +157,24 @@ fn run_goextract_with(
 struct GoToolchain {
     /// `GOVERSION` alone — the toolchain name the `goextract` build is pinned to.
     version: String,
-    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS` reading, which keys the binary cache.
+    /// The caller's effective `GOTOOLCHAIN` selection policy.
+    selection: String,
+    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS`/`GOTOOLCHAIN` reading, which keys the binary
+    /// cache. The policy is part of the key so a binary built while downloads were allowed cannot
+    /// bypass a later `local` or `path` run.
     identity: String,
 }
 
 fn go_toolchain(go_bin: &str, target_dir: &str) -> Result<GoToolchain, CoreError> {
     let output = Command::new(go_bin)
-        .args(["env", "GOVERSION", "GOOS", "GOARCH", "GOFLAGS"])
+        .args([
+            "env",
+            "GOVERSION",
+            "GOOS",
+            "GOARCH",
+            "GOFLAGS",
+            "GOTOOLCHAIN",
+        ])
         .current_dir(target_dir)
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
@@ -180,16 +191,32 @@ fn go_toolchain(go_bin: &str, target_dir: &str) -> Result<GoToolchain, CoreError
         .unwrap_or_default()
         .trim()
         .to_string();
-    Ok(GoToolchain { version, identity })
+    let selection = identity
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Ok(GoToolchain {
+        version,
+        selection,
+        identity,
+    })
 }
 
-/// The `GOTOOLCHAIN` the `goextract` build runs under: the target module's own toolchain, keeping
-/// `+auto` so `goextract/go.mod`'s floor can still pull a newer one on a machine below it — which is
-/// what an unpinned build already did. Pinning can therefore only raise the toolchain, never lower
-/// it, and a newer `go/types` accepts an older language version, so the binary is always at least as
-/// new as the code it must type-check. Pure so the pin is testable without a real toolchain.
-fn goextract_build_toolchain(version: &str) -> String {
-    format!("{version}+auto")
+/// The `GOTOOLCHAIN` the `goextract` build runs under: the target module's selected version while
+/// preserving the caller's switching policy. `auto` may raise that version to `goextract/go.mod`'s
+/// floor, `path` may do so only from `PATH`, and `local` or a fixed toolchain remains fixed. A newer
+/// `go/types` accepts an older language version, so an allowed raise is safe; silently broadening the
+/// caller's download policy is not. Pure so every policy arm is testable without a real toolchain.
+fn goextract_build_toolchain(version: &str, selection: &str) -> String {
+    if selection == "auto" || selection.ends_with("+auto") {
+        format!("{version}+auto")
+    } else if selection == "path" || selection.ends_with("+path") {
+        format!("{version}+path")
+    } else {
+        selection.to_string()
+    }
 }
 
 /// The cache directory name for one compiled `goextract` binary, over both facts that decide its
@@ -239,7 +266,10 @@ fn goextract_binary(go_bin: &str, target_dir: &str) -> Result<PathBuf, CoreError
         // leaving a binary older than the one `go list` picks inside the target module whenever that
         // module asks for a newer Go than `PATH` carries. Pin the build to the target's toolchain so
         // the key above and the compiler that honors it are the same fact.
-        .env("GOTOOLCHAIN", goextract_build_toolchain(&toolchain.version))
+        .env(
+            "GOTOOLCHAIN",
+            goextract_build_toolchain(&toolchain.version, &toolchain.selection),
+        )
         .current_dir(&root)
         .output()
         .map_err(|source| CoreError::GoToolchainMissing { source })?;
@@ -454,14 +484,39 @@ mod tests {
         fn pins_the_build_to_the_toolchain_that_type_checks_the_target() {
             // A target module asking for go1.27 resolves to go1.27 even on a go1.26 PATH, and the
             // binary that must type-check it has to be built by go1.27 too.
-            assert!(goextract_build_toolchain("go1.27.0").starts_with("go1.27.0"));
+            assert_eq!(
+                goextract_build_toolchain("go1.27.0", "auto"),
+                "go1.27.0+auto"
+            );
         }
 
         #[test]
-        fn keeps_auto_so_the_goextract_floor_can_still_raise_it() {
-            // `+auto` is load-bearing: below `goextract/go.mod`'s floor an unpinned build already
-            // fetched a newer toolchain, and a bare pin would turn that into a hard failure.
-            assert_eq!(goextract_build_toolchain("go1.26.5"), "go1.26.5+auto");
+        fn keeps_auto_when_the_caller_allows_downloads() {
+            assert_eq!(
+                goextract_build_toolchain("go1.26.5", "go1.24.0+auto"),
+                "go1.26.5+auto"
+            );
+        }
+
+        #[test]
+        fn keeps_path_download_free() {
+            assert_eq!(
+                goextract_build_toolchain("go1.27.0", "go1.26.5+path"),
+                "go1.27.0+path"
+            );
+        }
+
+        #[test]
+        fn keeps_local_fixed() {
+            assert_eq!(goextract_build_toolchain("go1.26.5", "local"), "local");
+        }
+
+        #[test]
+        fn keeps_an_exact_toolchain_fixed() {
+            assert_eq!(
+                goextract_build_toolchain("go1.26.5-custom", "go1.26.5-custom"),
+                "go1.26.5-custom"
+            );
         }
     }
 
@@ -478,6 +533,15 @@ mod tests {
                 before, after,
                 "identical goextract source under a different Go toolchain must not share a binary"
             );
+        }
+
+        #[test]
+        fn a_selection_policy_change_does_not_reuse_an_auto_built_binary() {
+            let auto =
+                goextract_binary_cache_dir_name("same-source", "go1.26.5\ndarwin\narm64\n\nauto");
+            let local =
+                goextract_binary_cache_dir_name("same-source", "go1.26.5\ndarwin\narm64\n\nlocal");
+            assert_ne!(auto, local);
         }
 
         #[test]
