@@ -491,6 +491,10 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
 /// serializer writes on every response, holding a value that may be `null`. Every `json_name` is a
 /// single lowercase word, so no field needs a Pydantic alias and the stub's ignorance of aliases never
 /// stands between the driver below and what a real Pydantic would do.
+///
+/// A second model carries the same type NESTED — once directly and once through a list. `model_dump`
+/// walks the nesting itself, so the required-null repair only holds if it composes rather than
+/// applying to the outermost model alone.
 fn nullable_response_graph() -> gnr8::graph::ApiGraph {
     serde_json::from_str(
         r#"{
@@ -509,6 +513,20 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
                   "content_types": ["application/json"] }
               ],
               "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "getEventPage",
+              "method": "GET",
+              "path": "/events",
+              "handler": "getEventPage",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [
+                { "status": 200, "body": { "ref_id": "dto.EventPage" },
+                  "content_types": ["application/json"] }
+              ],
+              "provenance": { "file": "main.py", "start_line": 3, "end_line": 3 }
             }
           ],
           "schemas": [
@@ -542,6 +560,27 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
                 }
               ] },
               "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.EventPage",
+              "name": "EventPage",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "event",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "named", "of": "dto.Event" },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "events",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "array", "of": { "type": "named", "of": "dto.Event" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "provenance": { "file": "main.py", "start_line": 4, "end_line": 4 }
             }
           ],
           "diagnostics": [],
@@ -1286,6 +1325,17 @@ except Exception as error:
     assert "identifier" in str(error), error
 else:
     raise SystemExit("identifier must remain required")
+
+# `model_dump` walks nested models itself and drops their nulls with the same rule, so the repair has
+# to reach them too — otherwise only the outermost model can read back what it wrote.
+nested = {"identifier": "e", "properties": {}, "userid": None}
+page = bookstore.EventPage(event=spelled, events=[spelled])
+dumped_page = page.to_dict()
+assert dumped_page == {"event": nested, "events": [nested]}, dumped_page
+
+# The point of that: every nested payload is still decodable by the model that wrote it.
+bookstore.Event.from_dict(dumped_page["event"])
+bookstore.Event.from_dict(dumped_page["events"][0])
 "#;
 
 /// Required-nullable response keys carry no omission default and survive a convenience round trip.
@@ -1305,6 +1355,8 @@ fn a_nullable_response_field_round_trips_through_its_own_to_dict() {
         "    identifier: str\n",
         "    properties: Optional[dict[str, Any]]\n",
         "    userid: Optional[str]\n",
+        "    event: Event\n",
+        "    events: list[Event]\n",
     ] {
         assert!(
             models.contains(declaration),

@@ -1149,6 +1149,14 @@ func outputMayEmitNull(wire payloadWire, omitOpt string, t gotypes.Type) bool {
 		return true
 	}
 	unaliased := gotypes.Unalias(t)
+	if _, isTypeParam := unaliased.(*gotypes.TypeParam); isTypeParam {
+		// A type parameter's underlying type is its CONSTRAINT, so `T any` would read
+		// as an interface below and claim every generic field emits null. What a `T`
+		// writes depends on the instantiation, and unknown is not null — the same
+		// answer zeroMarshalsNull gives on the no-option path, so an omission option
+		// never widens nullability.
+		return false
+	}
 	switch underlying := unaliased.Underlying().(type) {
 	case *gotypes.Interface:
 		return true

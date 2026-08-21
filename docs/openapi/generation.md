@@ -79,13 +79,12 @@ has different presence or null behavior by direction, artifact projection create
 output components and rewrites every directional reference. An imported OpenAPI document states one
 presence/null contract, so its schemas ordinarily remain shared.
 
-Generated SDK models read the same walk and answer the same question, so on a request-only schema a
-`PySdk` or `TsSdk` model requires exactly what this array lists. A `GoSdk` model can require more:
-`,omitempty` is the only omission spelling Go has and it drops the zero value rather than marking
-absence, so gnr8 never adds one the source did not write, and a field this array omits may still be a
-key the Go struct always sends. See
-[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models) for
-that restriction and for where the two artifacts deliberately differ.
+Generated SDK models read the same walk and answer the same question, so a key this array lists is one
+every generated model demands, and a key it omits is one every generated model may leave out. The
+three targets only differ in how they spell that: `TsSdk` uses `?:`, `PySdk` a `= None` default, and
+`GoSdk` a pointer plus `,omitempty` — the pointer being what keeps an omitted key distinct from an
+explicit zero value. See
+[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models).
 
 ## Metadata
 

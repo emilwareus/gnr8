@@ -36,7 +36,9 @@ class Book(BaseModel):
         return cls.model_validate(_data)
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data["author"] = self.author.to_dict()
+        return _data
 
 
 class BookFilters(BaseModel):
@@ -90,6 +92,7 @@ class ListBooksResponse(BaseModel):
 
     def to_dict(self) -> dict[str, Any]:
         _data = self.model_dump(mode="json", by_alias=True, exclude_none=True)
+        _data["books"] = [_item.to_dict() for _item in self.books]
         if self.next_cursor is None:
             _data["next_cursor"] = None
         return _data

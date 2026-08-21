@@ -577,6 +577,86 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
     graph
 }
 
+/// The same page, with an items field the serializer may both omit AND write `null` into, read by
+/// every site that reads one: the empty-items termination count, the item loop, and offset mode's
+/// advance step.
+///
+/// That pair is the one combination that makes the Go field a POINTER to the slice
+/// (`gosdk::emit::go_struct_field_type`), and neither `len` nor `range` applies to one. It is
+/// unreachable from Go source — `encoding/json` cannot both drop a nil slice and write its null — but
+/// an imported `OpenAPI` document, a Python/TypeScript source, and a `force_nullable` override all
+/// state it, so the helper has to read the field through its declared pointer depth.
+fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
+    let mut graph = pagination_graph();
+    graph.pagination[0].termination = gnr8::graph::PaginationTermination::EmptyItems;
+
+    // A second helper over the same page, in offset mode: its advance step is the third read site.
+    let mut by_offset = graph.operations[0].clone();
+    by_offset.id = "listItemsByOffset".to_string();
+    by_offset.handler = "listItemsByOffset".to_string();
+    by_offset.path = "/items/offset".to_string();
+    by_offset.params[0].name = "offset".to_string();
+    by_offset.params[0].schema = gnr8::graph::Type::Primitive(gnr8::graph::Prim::Int {
+        bits: 64,
+        signed: true,
+    });
+    graph.operations.push(by_offset);
+    graph.pagination.push(gnr8::graph::PaginationPolicy {
+        operation_id: "listItemsByOffset".to_string(),
+        mode: gnr8::graph::PaginationMode::Offset,
+        items_field: "items".to_string(),
+        cursor_param: None,
+        next_cursor_field: None,
+        page_param: None,
+        page_size_param: None,
+        offset_param: Some("offset".to_string()),
+        limit_param: None,
+        termination: gnr8::graph::PaginationTermination::EmptyItems,
+    });
+
+    let page = graph
+        .schemas
+        .iter_mut()
+        .find(|schema| schema.id == "dto.ItemPage")
+        .expect("the page schema");
+    let gnr8::graph::Type::Object(fields) = &mut page.body else {
+        panic!("the page schema is an object")
+    };
+    let items = fields
+        .iter_mut()
+        .find(|field| field.json_name == "items")
+        .expect("the items field");
+    items.serializer_may_omit = true;
+    items.serializer_may_emit_null = true;
+    graph
+}
+
+/// A pointer-to-slice items field is read through its indirection, so the helpers still compile.
+#[test]
+fn generated_sdk_pagination_helpers_build_over_an_optional_nullable_items_field() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile nullable-items pagination: go toolchain unavailable");
+        return;
+    }
+    let dir = materialize_sdk_from_graph(
+        "nullable-items-pagination",
+        &nullable_items_pagination_graph(),
+        "/api",
+    );
+    // gofmt aligns the field column, so match the type alone rather than the spacing.
+    let models = std::fs::read_to_string(dir.join("models.go")).expect("read models.go");
+    assert!(
+        models.contains("*[]Item"),
+        "the fixture must actually produce a pointer-to-slice items field:\n{models}"
+    );
+    let build = run_go(&["build", "./..."], &dir);
+    assert!(
+        build.is_ok(),
+        "go build ./... must accept the pagination helpers: {build:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
+}
+
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
 /// exits 0 (it genuinely compiles).
 #[test]

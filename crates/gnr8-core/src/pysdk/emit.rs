@@ -785,6 +785,31 @@ fn decode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> String {
     }
 }
 
+/// The mirror of [`decode_expr`]: the Python expression that re-encodes a nested model through its own
+/// `to_dict`, or `None` when nothing below this field owns a rule of its own.
+///
+/// `model_dump` walks nested models itself, so [`emit_pydantic_model`]'s `to_dict` would otherwise
+/// apply its required-nullable repair only at the top level and hand back a dict its own `from_dict`
+/// rejects one level down. Routing a nested model through `to_dict` composes the repair instead —
+/// the same shapes `decode_expr` recurses into, so one encode has one matching decode.
+fn encode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> Option<String> {
+    match schema {
+        Type::Named(_) => match resolve_named(schema, graph) {
+            Some(target) if matches!(target.body, Type::Object(_)) => {
+                Some(format!("{value_var}.to_dict()"))
+            }
+            _ => None,
+        },
+        Type::Array(items) => match resolve_named(items, graph) {
+            Some(target) if matches!(target.body, Type::Object(_)) => {
+                Some(format!("[_item.to_dict() for _item in {value_var}]"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Emit a `@dataclass` for an object schema, partitioning fields required-first / optional-last.
 ///
 /// PITFALL 1 (RESEARCH): `@dataclass` raises `TypeError: non-default argument follows default argument`
@@ -840,32 +865,65 @@ fn emit_pydantic_model(
     writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
     writeln!(out).map_err(sink)?;
     writeln!(out, "    def to_dict(self) -> dict[str, Any]:").map_err(sink)?;
+    emit_pydantic_to_dict_body(out, fields, graph, directions)?;
+    Ok(())
+}
+
+/// Emit the body of a Pydantic model's `to_dict`.
+///
+/// `model_dump(exclude_none=True)` is the whole rule for an omittable key, and it is the whole of what
+/// most models need. Two repairs ride on top, and both exist so a model can read back what it wrote:
+///
+/// - a REQUIRED nullable key is one the payload always carries, so its `null` is restored after the
+///   dump drops it; and
+/// - a nested model is re-encoded through its OWN `to_dict`, because `model_dump` walks the nesting
+///   itself and would otherwise apply the first repair only to the outermost model.
+///
+/// A model needing neither keeps the single-expression form.
+fn emit_pydantic_to_dict_body(
+    out: &mut String,
+    fields: &[Field],
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<(), CoreError> {
+    const DUMP: &str = "self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)";
+    let nested: Vec<(&Field, String)> = fields
+        .iter()
+        .filter_map(|field| {
+            let ident = pydantic_field_ident(field);
+            encode_expr(&field.schema, graph, &format!("self.{ident}")).map(|expr| (field, expr))
+        })
+        .collect();
     let required_nullable: Vec<&Field> = fields
         .iter()
         .filter(|field| {
             !directions.model_field_is_optional(field) && directions.field_is_nullable(field)
         })
         .collect();
-    if required_nullable.is_empty() {
-        writeln!(
-            out,
-            "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
-        )
-        .map_err(sink)?;
-    } else {
-        writeln!(
-            out,
-            "        _data = self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
-        )
-        .map_err(sink)?;
-        for field in required_nullable {
-            let ident = pydantic_field_ident(field);
-            let wire = py_string_literal(&field.json_name);
-            writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
-            writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
-        }
-        writeln!(out, "        return _data").map_err(sink)?;
+    if nested.is_empty() && required_nullable.is_empty() {
+        writeln!(out, "        return {DUMP}").map_err(sink)?;
+        return Ok(());
     }
+    writeln!(out, "        _data = {DUMP}").map_err(sink)?;
+    for (field, expr) in nested {
+        let ident = pydantic_field_ident(field);
+        let wire = py_string_literal(&field.json_name);
+        if directions.model_field_is_optional(field) || directions.field_is_nullable(field) {
+            // An absent or null nested value has nothing to re-encode: the dump already dropped the
+            // key, and the repair below restores the `null` where the payload carries one.
+            writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
+            writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
+        } else {
+            writeln!(out, "        _data[{wire}] = {expr}").map_err(sink)?;
+        }
+    }
+    for field in required_nullable {
+        let ident = pydantic_field_ident(field);
+        let wire = py_string_literal(&field.json_name);
+        writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
+        writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+    }
+    writeln!(out, "        return _data").map_err(sink)?;
     Ok(())
 }
 

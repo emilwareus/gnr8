@@ -1663,8 +1663,47 @@ struct GoPaginationInfo {
     page_type: String,
     item_type: String,
     items_field: String,
+    items_pointer_depth: usize,
     next_cursor_field: Option<String>,
     next_cursor_pointer_depth: usize,
+}
+
+/// The local name a pagination helper reads its page's items from when the field is behind a pointer.
+const GO_PAGE_ITEMS_LOCAL: &str = "pageItems";
+
+/// Whether the PAGE-collecting helper reads the items field at all: the empty-items termination rule
+/// counts them, and offset mode advances by how many there were. Cursor and page mode with any other
+/// termination never look, and binding a local there would be one Go rejects as unused. (The
+/// item-iterating helper always reads them — it is the thing that ranges.)
+fn go_pagination_reads_items(policy: &PaginationPolicy) -> bool {
+    policy.termination == PaginationTermination::EmptyItems || policy.mode == PaginationMode::Offset
+}
+
+/// Emit the slice expression a pagination helper reads items from, ONCE per helper body.
+///
+/// A page field that is both optional and nullable is a pointer to the slice
+/// ([`go_struct_field_type`]), and neither `len` nor `range` applies to one. Binding a plain slice
+/// keeps every read site the same statement it is for a bare `[]T`, and makes an absent-or-null page
+/// terminate the walk exactly as an empty one does. A field at depth zero already IS the slice, so it
+/// is named directly and the generated helper is unchanged.
+fn emit_go_pagination_items(
+    body: &mut String,
+    info: &GoPaginationInfo,
+) -> Result<String, CoreError> {
+    let field = format!("page.{}", info.items_field);
+    if info.items_pointer_depth == 0 {
+        return Ok(field);
+    }
+    let indirections = "*".repeat(info.items_pointer_depth);
+    let reachable = (0..info.items_pointer_depth)
+        .map(|depth| format!("{}{field} != nil", "*".repeat(depth)))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    writeln!(body, "var {GO_PAGE_ITEMS_LOCAL} []{}", info.item_type).map_err(sink)?;
+    writeln!(body, "if {reachable} {{").map_err(sink)?;
+    writeln!(body, "{GO_PAGE_ITEMS_LOCAL} = {indirections}{field}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(GO_PAGE_ITEMS_LOCAL.to_string())
 }
 
 fn emit_pagination_helpers(
@@ -1706,13 +1745,19 @@ fn emit_pagination_helpers(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return nil, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    // Unbound when nothing below reads it; the expression is then never written out.
+    let items = if go_pagination_reads_items(policy) {
+        emit_go_pagination_items(body, &info)?
+    } else {
+        format!("page.{}", info.items_field)
+    };
     if policy.termination == PaginationTermination::EmptyItems {
-        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "if len({items}) == 0 {{").map_err(sink)?;
         writeln!(body, "break").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
     writeln!(body, "pages = append(pages, page)").map_err(sink)?;
-    emit_go_pagination_advance(body, op, policy, &info, "break")?;
+    emit_go_pagination_advance(body, op, policy, &info, "break", &items)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "return pages, nil").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
@@ -1749,17 +1794,18 @@ fn emit_pagination_helpers(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    let items = emit_go_pagination_items(body, &info)?;
     if policy.termination == PaginationTermination::EmptyItems {
-        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "if len({items}) == 0 {{").map_err(sink)?;
         writeln!(body, "return nil").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
-    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
+    writeln!(body, "for _, item := range {items} {{").map_err(sink)?;
     writeln!(body, "if !yield(item) {{").map_err(sink)?;
     writeln!(body, "return nil").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    emit_go_pagination_advance(body, op, policy, &info, "return nil")?;
+    emit_go_pagination_advance(body, op, policy, &info, "return nil", &items)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -1771,6 +1817,7 @@ fn emit_go_pagination_advance(
     policy: &PaginationPolicy,
     info: &GoPaginationInfo,
     terminate: &str,
+    items: &str,
 ) -> Result<(), CoreError> {
     match policy.mode {
         PaginationMode::Cursor => {
@@ -1852,7 +1899,7 @@ fn emit_go_pagination_advance(
                 })?;
             let param = go_query_param(op, offset_param)?;
             let field = exported(&param.name);
-            writeln!(body, "itemCount := int64(len(page.{}))", info.items_field).map_err(sink)?;
+            writeln!(body, "itemCount := int64(len({items}))").map_err(sink)?;
             if param.required {
                 writeln!(body, "params.{field} += itemCount").map_err(sink)?;
             } else {
@@ -1986,6 +2033,8 @@ fn go_pagination_info(
     };
     let schema_directions = schema_directions(graph);
     let directions = directions_of(&schema_directions, &schema.id);
+    let items_pointer_depth =
+        go_pointer_depth(&go_struct_field_type(items, graph, false, directions)?);
     let (next_cursor_field, next_cursor_pointer_depth) = if let Some(next_cursor) =
         policy.next_cursor_field.as_deref()
     {
@@ -1998,8 +2047,8 @@ fn go_pagination_info(
                     op.id, next_cursor
                 ),
             })?;
-        let field_type = go_struct_field_type(field, graph, false, directions)?;
-        let pointer_depth = field_type.bytes().take_while(|byte| *byte == b'*').count();
+        let pointer_depth =
+            go_pointer_depth(&go_struct_field_type(field, graph, false, directions)?);
         (Some(exported(&field.json_name)), pointer_depth)
     } else {
         (None, 0)
@@ -2008,9 +2057,16 @@ fn go_pagination_info(
         page_type,
         item_type: go_type(item_schema, false, graph)?,
         items_field: exported(&items.json_name),
+        items_pointer_depth,
         next_cursor_field,
         next_cursor_pointer_depth,
     })
+}
+
+/// How many pointer layers a generated struct field type carries, so a helper that reads the field
+/// can spell the same number of indirections.
+fn go_pointer_depth(go_type: &str) -> usize {
+    go_type.bytes().take_while(|byte| *byte == b'*').count()
 }
 
 fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {

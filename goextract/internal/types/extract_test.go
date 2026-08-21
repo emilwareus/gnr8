@@ -620,6 +620,57 @@ type Matrix struct {
 	}
 }
 
+// An omission option narrows what a present key can carry; it must never widen it.
+// A type parameter's underlying type is its constraint, so reading that constraint
+// would make `,omitempty` the only thing that turns a generic field nullable.
+func TestOmissionOptionDoesNotMakeATypeParameterNullable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "go.mod"),
+		[]byte("module example.com/genericfixture\n\ngo 1.22\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(dir, "models.go"),
+		[]byte(`package genericfixture
+
+type Box[T any] struct {
+	Tagged   T `+"`json:\"tagged,omitempty\"`"+`
+	Untagged T `+"`json:\"untagged\"`"+`
+}
+`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write models.go: %v", err)
+	}
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load generic fixture: %v", err)
+	}
+	schemas := types.Extract(res, diag.New())
+	s, ok := schemaByName(schemas, "Box")
+	if !ok {
+		t.Fatal("Box not found")
+	}
+	tagged, ok := fieldByJSON(s, "tagged")
+	if !ok {
+		t.Fatal("field 'tagged' not found")
+	}
+	if !tagged.SerializerMayOmit {
+		t.Errorf("`,omitempty` on a type parameter is taken at its word: %+v", tagged)
+	}
+	if tagged.SerializerMayEmitNull {
+		t.Errorf("what a `T` writes depends on the instantiation, so it is not null: %+v", tagged)
+	}
+	untagged, _ := fieldByJSON(s, "untagged")
+	if untagged.SerializerMayEmitNull {
+		t.Errorf("the untagged twin must agree: %+v", untagged)
+	}
+}
+
 func TestOmitZeroMapOmitsNilButEmitsAllocatedEmpty(t *testing.T) {
 	type Payload struct {
 		Value map[string]string `json:"value,omitzero"`

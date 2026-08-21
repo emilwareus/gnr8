@@ -34,7 +34,8 @@ must move the minor version.
   explicit zero value; required nullable value fields remain pointers without an omission tag. A
   field that is both optional and nullable uses one additional pointer layer, so callers can choose
   omitted, explicit null, or a concrete value. Python `to_dict()` retains null for required-nullable
-  keys so its own output remains decodable.
+  keys, and routes a nested model through that model's own `to_dict()`, so its output stays decodable
+  at every level.
 
   **Upgrade note for 0.6.x consumers:** regenerate committed SDKs and review constructor call sites,
   component names, and schema assertions. In particular, nullable response fields that 0.6.1 made
