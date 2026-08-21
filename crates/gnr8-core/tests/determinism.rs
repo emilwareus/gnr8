@@ -9,7 +9,7 @@
 //!
 //! Requires the Go toolchain (the tests invoke the helper via `go run`, and `gosdk::generate` pipes each
 //! file through `gofmt`). They skip gracefully — return early rather than failing — if the toolchain is
-//! unavailable, but on dev + CI (go 1.26) they run.
+//! unavailable, but on dev + CI (go 1.27) they run.
 
 // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow to
 // this test target so the workspace-wide RUST-04 deny stays intact for production code (Pitfall 2).
