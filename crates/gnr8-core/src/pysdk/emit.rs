@@ -879,7 +879,9 @@ fn emit_pydantic_model(
 /// - a nested model is re-encoded through its OWN `to_dict`, because `model_dump` walks the nesting
 ///   itself and would otherwise apply the first repair only to the outermost model.
 ///
-/// A model needing neither keeps the single-expression form.
+/// A model needing neither keeps the single-expression form. Both repairs can land on ONE key — a
+/// required nullable nested model is the case — so a field is emitted once, as a single statement or a
+/// single `if`/`else`, rather than once per repair.
 fn emit_pydantic_to_dict_body(
     out: &mut String,
     fields: &[Field],
@@ -887,44 +889,77 @@ fn emit_pydantic_to_dict_body(
     directions: SchemaDirections,
 ) -> Result<(), CoreError> {
     const DUMP: &str = "self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)";
-    let nested: Vec<(&Field, String)> = fields
+    let repairs: Vec<ToDictRepair<'_>> = fields
         .iter()
-        .filter_map(|field| {
-            let ident = pydantic_field_ident(field);
-            encode_expr(&field.schema, graph, &format!("self.{ident}")).map(|expr| (field, expr))
-        })
+        .filter_map(|field| ToDictRepair::of(field, graph, directions))
         .collect();
-    let required_nullable: Vec<&Field> = fields
-        .iter()
-        .filter(|field| {
-            !directions.model_field_is_optional(field) && directions.field_is_nullable(field)
-        })
-        .collect();
-    if nested.is_empty() && required_nullable.is_empty() {
+    if repairs.is_empty() {
         writeln!(out, "        return {DUMP}").map_err(sink)?;
         return Ok(());
     }
     writeln!(out, "        _data = {DUMP}").map_err(sink)?;
-    for (field, expr) in nested {
-        let ident = pydantic_field_ident(field);
-        let wire = py_string_literal(&field.json_name);
-        if directions.model_field_is_optional(field) || directions.field_is_nullable(field) {
-            // An absent or null nested value has nothing to re-encode: the dump already dropped the
-            // key, and the repair below restores the `null` where the payload carries one.
-            writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
-            writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
-        } else {
-            writeln!(out, "        _data[{wire}] = {expr}").map_err(sink)?;
+    for repair in repairs {
+        let ident = pydantic_field_ident(repair.field);
+        let wire = py_string_literal(&repair.field.json_name);
+        match (
+            repair.encode,
+            repair.dump_may_drop_key,
+            repair.dropped_key_may_be_null,
+        ) {
+            // The dump kept the key, so the re-encode is unconditional.
+            (Some(expr), false, _) => {
+                writeln!(out, "        _data[{wire}] = {expr}").map_err(sink)?;
+            }
+            // A dropped key is a key the caller may legitimately leave out, so there is nothing to
+            // re-encode and no `null` to put back in its place.
+            (Some(expr), true, false) => {
+                writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
+            }
+            // Both repairs land on one key: re-encode what is there, restore the `null` when it is not.
+            (Some(expr), true, true) => {
+                writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
+                writeln!(out, "        else:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+            }
+            // Nothing nested below this key, so the restored `null` is the whole repair.
+            (None, _, _) => {
+                writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+            }
         }
-    }
-    for field in required_nullable {
-        let ident = pydantic_field_ident(field);
-        let wire = py_string_literal(&field.json_name);
-        writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
-        writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
     }
     writeln!(out, "        return _data").map_err(sink)?;
     Ok(())
+}
+
+/// What one key needs putting back after `model_dump(exclude_none=True)`, or `None` for a key the dump
+/// already states correctly.
+struct ToDictRepair<'a> {
+    field: &'a Field,
+    /// The nested re-encode, when something below this key owns a `to_dict` rule of its own.
+    encode: Option<String>,
+    /// Whether `exclude_none` can drop this key, so a re-encode has to ask before touching it.
+    dump_may_drop_key: bool,
+    /// Whether a dropped key is one the payload carries as an explicit `null`.
+    dropped_key_may_be_null: bool,
+}
+
+impl<'a> ToDictRepair<'a> {
+    fn of(field: &'a Field, graph: &ApiGraph, directions: SchemaDirections) -> Option<Self> {
+        let ident = pydantic_field_ident(field);
+        let encode = encode_expr(&field.schema, graph, &format!("self.{ident}"));
+        let optional = directions.model_field_is_optional(field);
+        let nullable = directions.field_is_nullable(field);
+        let repair = Self {
+            field,
+            encode,
+            dump_may_drop_key: optional || nullable,
+            dropped_key_may_be_null: !optional && nullable,
+        };
+        (repair.encode.is_some() || repair.dropped_key_may_be_null).then_some(repair)
+    }
 }
 
 fn emit_dataclass(
@@ -3323,42 +3358,10 @@ mod tests {
     mod models {
         use super::{emit_models, emit_models_with_style, sample_graph, ApiGraph, PyModelStyle};
 
-        #[test]
-        fn named_enum_emits_str_enum_class_with_screaming_snake_members() {
-            let out = emit_models(&sample_graph(), "bookstore").unwrap();
-            assert!(
-                out.contains("class BookFormat(str, enum.Enum):"),
-                "named enum must be a str enum class:\n{out}"
-            );
-            assert!(out.contains("    HARDCOVER = \"hardcover\""), "{out}");
-            assert!(out.contains("    PAPERBACK = \"paperback\""), "{out}");
-            // graph order: hardcover before paperback.
-            let h = out.find("HARDCOVER").unwrap();
-            let p = out.find("PAPERBACK").unwrap();
-            assert!(h < p, "enum members must be in graph order:\n{out}");
-        }
-
-        /// A required-but-nullable field whose decode DEREFERENCES the value must be
-        /// guarded against an actual `null`.
-        ///
-        /// This is the shape the Go extractor now publishes for every bare slice, map,
-        /// and interface: the document says `[array, "null"]` and the model hints
-        /// `Optional[list[Item]]`, so a server may legitimately send `null`. Unguarded,
-        /// `[Item.from_dict(_item) for _item in _data["items"]]` raises
-        /// `TypeError: 'NoneType' object is not iterable`, and `Item.from_dict(None)`
-        /// fails inside — the SDK would promise a None-tolerance it does not implement.
-        ///
-        /// The guard tests the VALUE, not presence: a missing key is still a protocol
-        /// error (`KeyError`), which is what distinguishes this from the optional branch.
-        ///
-        /// `Bag` is a REQUEST body here, and it has to be: a nullable key is demanded
-        /// only where the server's own validation demands it, so the request position is
-        /// where a required-and-nullable model field still exists to be decoded.
-        #[test]
-        fn dataclass_from_dict_guards_a_required_nullable_decode() {
-            // Purpose-built graph rather than SAMPLE: this needs a required + nullable
-            // field at each decode shape, and SAMPLE has none.
-            const FACTS: &[u8] = br#"{
+        /// A request body with a required + nullable field at each nesting shape: a list of models, a
+        /// single model, and a scalar. Purpose-built rather than SAMPLE, which has none — and shared
+        /// by the decode and the encode test so both halves of the round trip read one graph.
+        const NULLABLE_NESTED_FACTS: &[u8] = br#"{
               "module": "app",
               "routes": [
                 {
@@ -3399,8 +3402,50 @@ mod tests {
                 }
               ]
             }"#;
-            let graph = ApiGraph::from_facts(serde_json::from_slice(FACTS).unwrap(), "/root");
-            let out = emit_models_with_style(&graph, "app", PyModelStyle::Dataclass).unwrap();
+
+        fn nullable_nested_graph() -> ApiGraph {
+            ApiGraph::from_facts(
+                serde_json::from_slice(NULLABLE_NESTED_FACTS).unwrap(),
+                "/root",
+            )
+        }
+
+        #[test]
+        fn named_enum_emits_str_enum_class_with_screaming_snake_members() {
+            let out = emit_models(&sample_graph(), "bookstore").unwrap();
+            assert!(
+                out.contains("class BookFormat(str, enum.Enum):"),
+                "named enum must be a str enum class:\n{out}"
+            );
+            assert!(out.contains("    HARDCOVER = \"hardcover\""), "{out}");
+            assert!(out.contains("    PAPERBACK = \"paperback\""), "{out}");
+            // graph order: hardcover before paperback.
+            let h = out.find("HARDCOVER").unwrap();
+            let p = out.find("PAPERBACK").unwrap();
+            assert!(h < p, "enum members must be in graph order:\n{out}");
+        }
+
+        /// A required-but-nullable field whose decode DEREFERENCES the value must be
+        /// guarded against an actual `null`.
+        ///
+        /// This is the shape the Go extractor now publishes for every bare slice, map,
+        /// and interface: the document says `[array, "null"]` and the model hints
+        /// `Optional[list[Item]]`, so a server may legitimately send `null`. Unguarded,
+        /// `[Item.from_dict(_item) for _item in _data["items"]]` raises
+        /// `TypeError: 'NoneType' object is not iterable`, and `Item.from_dict(None)`
+        /// fails inside — the SDK would promise a None-tolerance it does not implement.
+        ///
+        /// The guard tests the VALUE, not presence: a missing key is still a protocol
+        /// error (`KeyError`), which is what distinguishes this from the optional branch.
+        ///
+        /// `Bag` is a REQUEST body here, and it has to be: a nullable key is demanded
+        /// only where the server's own validation demands it, so the request position is
+        /// where a required-and-nullable model field still exists to be decoded.
+        #[test]
+        fn dataclass_from_dict_guards_a_required_nullable_decode() {
+            let out =
+                emit_models_with_style(&nullable_nested_graph(), "app", PyModelStyle::Dataclass)
+                    .unwrap();
 
             // A list of nested models: guarded, and the recursion is preserved.
             assert!(
@@ -3426,6 +3471,58 @@ mod tests {
             assert!(
                 !out.contains("\"items\" in _data"),
                 "a required key must still raise KeyError when absent:\n{out}"
+            );
+        }
+
+        /// The encode half of the same round trip: both `to_dict` repairs can land on ONE key, and a
+        /// key gets ONE statement either way.
+        ///
+        /// `items` and `lead` need both — a nested model to re-encode when the value is there, and the
+        /// `null` `exclude_none` dropped when it is not — so they are one `if`/`else`. Emitting the two
+        /// repairs as two independent `if`s would be correct and would read as generated slop: an
+        /// `if x is not None:` immediately followed by `if x is None:` on the same attribute.
+        #[test]
+        fn pydantic_to_dict_writes_one_statement_per_repaired_key() {
+            let out = emit_models(&nullable_nested_graph(), "app").unwrap();
+            for (ident, wire, expr) in [
+                (
+                    "items",
+                    "items",
+                    "[_item.to_dict() for _item in self.items]",
+                ),
+                ("lead", "lead", "self.lead.to_dict()"),
+            ] {
+                assert!(
+                    out.contains(&format!(
+                        "        if self.{ident} is not None:\n            _data[\"{wire}\"] = \
+                         {expr}\n        else:\n            _data[\"{wire}\"] = None\n"
+                    )),
+                    "a required nullable nested key needs one if/else:\n{out}"
+                );
+                assert!(
+                    !out.contains(&format!("        if self.{ident} is None:")),
+                    "the `else` replaces the second `if`, it does not join it:\n{out}"
+                );
+            }
+            // A scalar has nothing to re-encode, so it keeps the bare null repair.
+            assert!(
+                out.contains(
+                    "        if self.note is None:\n            _data[\"note\"] = None\n        return _data\n"
+                ),
+                "a required nullable scalar restores its null and nothing else:\n{out}"
+            );
+            // `Item` needs neither repair, so its own `to_dict` keeps the single-expression form —
+            // which is also what makes the re-encodes above worth writing.
+            let item = out
+                .split("class Item(BaseModel):")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\n\n").next())
+                .unwrap_or_else(|| panic!("no Item class in:\n{out}"));
+            assert!(
+                item.contains(
+                    "    def to_dict(self) -> dict[str, Any]:\n        return self.model_dump("
+                ),
+                "a model with nothing to repair keeps one expression:\n{item}"
             );
         }
 

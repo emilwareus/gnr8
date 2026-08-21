@@ -1194,15 +1194,7 @@ func validationRejectsNull(t gotypes.Type) bool {
 }
 
 func isJSONRawMessage(t gotypes.Type) bool {
-	unaliased := gotypes.Unalias(t)
-	if pointer, ok := unaliased.(*gotypes.Pointer); ok {
-		unaliased = gotypes.Unalias(pointer.Elem())
-	}
-	named, ok := unaliased.(*gotypes.Named)
-	if !ok || named.Obj().Pkg() == nil {
-		return false
-	}
-	return named.Obj().Pkg().Path() == jsonPkgPath && named.Obj().Name() == "RawMessage"
+	return isNamedType(t, jsonPkgPath, "RawMessage")
 }
 
 func hasJSONUnmarshaler(t gotypes.Type) bool {

@@ -4,11 +4,18 @@
 //! identical. When presence/null behavior differs on the schema or on a referenced schema, this pass
 //! creates input/output components and rewrites roots and references accordingly. Targets therefore
 //! consume one unambiguous graph instead of each inventing its own split policy.
+//!
+//! A split id stops naming a schema, so EVERY place the graph carries one has to be rewritten here or
+//! the projected graph hands a target a dangling `$ref`. That is the complete set: a schema body and a
+//! parameter type ([`rewrite_type`], whose match over [`Type`] is exhaustive so a new variant fails to
+//! compile until it is stated), an operation's request and response bodies ([`rewrite_schema_ref`]), a
+//! parameter's imported `OpenAPI` fragments ([`rewrite_preserved_refs`]), and a registered schema-use
+//! root. A future graph field that carries a schema id belongs in that list.
 
 use super::direction::{directions_of, schema_directions, SchemaDirections};
 use super::{ApiGraph, Schema, SchemaRef, SchemaUse, Type};
 use crate::CoreError;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 const INPUT_ID_SUFFIX: &str = "::input";
 const OUTPUT_ID_SUFFIX: &str = "::output";
@@ -18,12 +25,6 @@ const OUTPUT_NAME_SUFFIX: &str = "Output";
 /// Clone `graph` into the exact directional contract artifact generators consume.
 pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
     let directions = schema_directions(graph);
-    let by_id: BTreeMap<&str, &Schema> = graph
-        .schemas
-        .iter()
-        .map(|schema| (schema.id.as_str(), schema))
-        .collect();
-
     let mut split = BTreeSet::new();
     for schema in &graph.schemas {
         let reached = directions_of(&directions, &schema.id);
@@ -106,23 +107,6 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
         }
     }
 
-    // Ensure every rewritten id still names a schema. This also catches an unexpected dangling
-    // reference introduced by a future graph shape at the projection boundary.
-    let projected_ids: BTreeSet<&str> = projected
-        .schemas
-        .iter()
-        .map(|schema| schema.id.as_str())
-        .collect();
-    for id in split {
-        if !by_id.contains_key(id.as_str())
-            || !projected_ids.contains(directional_id(&id, SchemaUse::Input).as_str())
-            || !projected_ids.contains(directional_id(&id, SchemaUse::Output).as_str())
-        {
-            return Err(CoreError::Config {
-                message: format!("could not project directional schema {id:?}"),
-            });
-        }
-    }
     Ok(projected)
 }
 

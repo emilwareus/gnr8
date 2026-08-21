@@ -17,7 +17,7 @@ use super::{
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
-    ApiGraph, DiagnosticCategory, MediaExample, OpenApiContact, OpenApiLicense,
+    ApiGraph, DiagnosticCategory, Field, MediaExample, OpenApiContact, OpenApiLicense,
     OpenApiMetadataPolicy, OpenApiServer, OperationDocsPolicy, OperationRuntimePolicy,
     PaginationMode, PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy,
     RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SchemaUse, SchemaUseRoot,
@@ -2260,12 +2260,18 @@ fn request_parameter_matches(existing: &crate::graph::Param, requested: &Request
         && existing.allow_reserved == requested.allow_reserved
 }
 
-fn apply_field_presence_override(
-    ir: &mut ApiGraph,
+/// Resolve the ONE graph field a checked field-level override targets.
+///
+/// Every field-level override asks the same four questions — does the schema exist, is a bare name
+/// unambiguous, is the body an object, does the field exist — so they are asked once here rather than
+/// once per override kind (CLAUDE.md rule 3). `label` names the override in each message, so a
+/// correction that has gone stale still says which one it was.
+fn override_target_field<'a>(
+    ir: &'a mut ApiGraph,
     schema_match: &str,
     field_name: &str,
-    required: bool,
-) -> Result<(), CoreError> {
+    label: &str,
+) -> Result<&'a mut Field, CoreError> {
     let matches: Vec<usize> = ir
         .schemas
         .iter()
@@ -2279,14 +2285,14 @@ fn apply_field_presence_override(
         [] => {
             return Err(CoreError::Config {
                 message: format!(
-                    "field presence override schema {schema_match:?} does not match any graph schema id or name"
+                    "{label} schema {schema_match:?} does not match any graph schema id or name"
                 ),
             });
         }
         many => {
             return Err(CoreError::Config {
                 message: format!(
-                    "field presence override schema {schema_match:?} matches {} schemas; use the full schema id",
+                    "{label} schema {schema_match:?} matches {} schemas; use the full schema id",
                     many.len()
                 ),
             });
@@ -2296,20 +2302,27 @@ fn apply_field_presence_override(
     let schema = &mut ir.schemas[schema_index];
     let Type::Object(fields) = &mut schema.body else {
         return Err(CoreError::Config {
-            message: format!(
-                "field presence override schema {schema_match:?} is not an object schema"
-            ),
+            message: format!("{label} schema {schema_match:?} is not an object schema"),
         });
     };
 
-    let field = fields
+    fields
         .iter_mut()
         .find(|field| field.json_name == field_name)
         .ok_or_else(|| CoreError::Config {
             message: format!(
-                "field presence override did not find field {field_name:?} on schema {schema_match:?}"
+                "{label} did not find field {field_name:?} on schema {schema_match:?}"
             ),
-        })?;
+        })
+}
+
+fn apply_field_presence_override(
+    ir: &mut ApiGraph,
+    schema_match: &str,
+    field_name: &str,
+    required: bool,
+) -> Result<(), CoreError> {
+    let field = override_target_field(ir, schema_match, field_name, "field presence override")?;
     // Presence is ONE question, and the graph carries two code-derived answers to it: `required`
     // (what request validation demands) and `!optional` (what the serializer always writes). Which
     // one an artifact reads depends on the direction the schema is reached from
@@ -2326,52 +2339,12 @@ fn apply_field_nullability_override(
     ir: &mut ApiGraph,
     override_: &FieldNullabilityOverride,
 ) -> Result<(), CoreError> {
-    let matches: Vec<usize> = ir
-        .schemas
-        .iter()
-        .enumerate()
-        .filter_map(|(index, schema)| {
-            (schema.id == override_.schema || schema.name == override_.schema).then_some(index)
-        })
-        .collect();
-    let schema_index = match matches.as_slice() {
-        [single] => *single,
-        [] => {
-            return Err(CoreError::Config {
-                message: format!(
-                    "nullability override schema {:?} does not match any graph schema id or name",
-                    override_.schema
-                ),
-            });
-        }
-        many => {
-            return Err(CoreError::Config {
-                message: format!(
-                    "nullability override schema {:?} matches {} schemas; use the full schema id",
-                    override_.schema,
-                    many.len()
-                ),
-            });
-        }
-    };
-    let schema = &mut ir.schemas[schema_index];
-    let Type::Object(fields) = &mut schema.body else {
-        return Err(CoreError::Config {
-            message: format!(
-                "nullability override schema {:?} is not an object schema",
-                override_.schema
-            ),
-        });
-    };
-    let field = fields
-        .iter_mut()
-        .find(|field| field.json_name == override_.field)
-        .ok_or_else(|| CoreError::Config {
-            message: format!(
-                "nullability override did not find field {:?} on schema {:?}",
-                override_.field, override_.schema
-            ),
-        })?;
+    let field = override_target_field(
+        ir,
+        &override_.schema,
+        &override_.field,
+        "nullability override",
+    )?;
     let current = match override_.use_ {
         SchemaUse::Input => field.deserializer_accepts_null && !field.validator_rejects_null,
         SchemaUse::Output => field.serializer_may_emit_null,

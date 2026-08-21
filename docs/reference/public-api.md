@@ -67,7 +67,8 @@ See [Transforms and overrides](../pipeline/transforms.md).
 | Symbol | Use |
 |---|---|
 | `OperationSelector` | reusable exact/prefix/method/middleware/boolean selector |
-| `ApiOverrides` | checked field, parameter, body, response, and security corrections |
+| `ApiOverrides` | checked field presence/nullability, schema-use root, parameter, body, response, and security corrections |
+| `SchemaUse` | name the input or output payload position a correction or root applies to |
 | `RequestParameter` | typed query/header/path/cookie parameter builder |
 | `ParameterOverride` | add-if-missing, correct-existing, or replace semantics |
 | `ResponseOverride` | exact status/body/media response replacement |
