@@ -4961,8 +4961,8 @@ impl Target for GoSdk {
                     .to_string(),
             });
         }
-        let projected = ir.project_for_generation()?;
-        let ir = &projected;
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
@@ -5171,8 +5171,8 @@ impl Target for PySdk {
                 message: "PySdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
-        let projected = ir.project_for_generation()?;
-        let ir = &projected;
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk uses, and
         // generate via the existing deterministic Python SDK generator — never a re-derivation, never
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
@@ -5493,8 +5493,8 @@ impl Target for TsSdk {
                 message: "TsSdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
-        let projected = ir.project_for_generation()?;
-        let ir = &projected;
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk/PySdk use,
         // and generate via the existing deterministic TypeScript SDK generator — never a re-derivation,
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth

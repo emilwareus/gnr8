@@ -15,6 +15,7 @@
 use super::direction::{directions_of, schema_directions, SchemaDirections};
 use super::{ApiGraph, Schema, SchemaRef, SchemaUse, Type};
 use crate::CoreError;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 const INPUT_ID_SUFFIX: &str = "::input";
@@ -22,8 +23,14 @@ const OUTPUT_ID_SUFFIX: &str = "::output";
 const INPUT_NAME_SUFFIX: &str = "Input";
 const OUTPUT_NAME_SUFFIX: &str = "Output";
 
-/// Clone `graph` into the exact directional contract artifact generators consume.
-pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
+/// The exact directional contract artifact generators consume.
+///
+/// Borrows when nothing splits, which is both the common shape and what an ALREADY-projected graph
+/// looks like: the split ids each name one direction, so the walk reaches them from one position and
+/// there is nothing left to divide. Every public entry point projects, and several of them nest (a
+/// `Target` calls [`crate::sdk::model::SdkModel::build`], and a `Pipeline` calls the target), so the
+/// repeat has to cost a walk rather than a copy of the whole graph.
+pub(crate) fn for_generation(graph: &ApiGraph) -> Result<Cow<'_, ApiGraph>, CoreError> {
     let directions = schema_directions(graph);
     let mut split = BTreeSet::new();
     for schema in &graph.schemas {
@@ -52,7 +59,7 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
     }
 
     if split.is_empty() {
-        return Ok(graph.clone());
+        return Ok(Cow::Borrowed(graph));
     }
 
     validate_projected_identities(graph, &split)?;
@@ -107,7 +114,7 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<ApiGraph, CoreError> {
         }
     }
 
-    Ok(projected)
+    Ok(Cow::Owned(projected))
 }
 
 fn own_contract_differs(schema: &Schema) -> bool {

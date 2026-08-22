@@ -148,7 +148,7 @@ impl ApiGraph {
     /// Returns [`crate::CoreError::Config`] when directional public names collide or a reference
     /// cannot be assigned its canonical payload direction.
     pub fn project_for_generation(&self) -> Result<Self, crate::CoreError> {
-        projection::for_generation(self)
+        Ok(projection::for_generation(self)?.into_owned())
     }
 }
 

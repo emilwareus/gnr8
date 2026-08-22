@@ -64,19 +64,23 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_layout(graph, package, base_path, layout)?;
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let files = generate_files_with_layout(&projected, package, base_path, layout)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
 
+/// Emit the Go SDK files from a graph that is ALREADY direction-projected.
+///
+/// The projection belongs to the entry point rather than to this function: every caller is one
+/// ([`generate_with_layout`] above, and the `GoSdk` target, which needs the same projected graph for
+/// its docs), so doing it here as well would walk the graph a second time for one bundle.
 pub(crate) fn generate_files_with_layout(
     graph: &ApiGraph,
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
-    let projected = crate::graph::projection::for_generation(graph)?;
-    let graph = &projected;
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Go SDK")?;
     check_unique_model_file_names(graph, "Go SDK", layout, |schema| {

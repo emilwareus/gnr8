@@ -1019,7 +1019,7 @@ impl Pipeline {
             // Every target, including a user-defined one, receives the same canonical directional
             // graph. `build_ir` and `__inspect` intentionally retain the unsplit source facts; the
             // projection belongs at the artifact boundary.
-            let generation_ir = ir.project_for_generation()?;
+            let generation_ir = crate::graph::projection::for_generation(&ir)?;
             for (index, target) in self.targets.iter().enumerate() {
                 artifacts.begin_stage(format!("target[{index}]:{}", target.producer()));
                 target.generate(&generation_ir, &mut artifacts, cx)?;

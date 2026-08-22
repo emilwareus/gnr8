@@ -117,7 +117,7 @@ pub(crate) fn build_openapi_doc(
     security: &[GraphSecurityScheme],
 ) -> Result<OpenApiDoc, crate::CoreError> {
     let projected = crate::graph::projection::for_generation(graph)?;
-    let graph = &projected;
+    let graph = &*projected;
     validate_base_path(base_path)?;
     ensure_unique_component_names(&graph.schemas)?;
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.

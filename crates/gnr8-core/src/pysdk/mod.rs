@@ -85,11 +85,14 @@ pub fn generate_with_options(
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_options(graph, package, base_path, layout, model_style)?;
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let files = generate_files_with_options(&projected, package, base_path, layout, model_style)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
 
+/// Emit the Python SDK files from a graph that is ALREADY direction-projected — the twin of
+/// [`crate::gosdk::generate_files_with_layout`], and projected by its caller for the same reason.
 #[expect(
     clippy::too_many_lines,
     reason = "SDK generation orchestration keeps file ordering, split layout, and metadata in one deterministic pass"
@@ -101,8 +104,6 @@ pub(crate) fn generate_files_with_options(
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
-    let projected = crate::graph::projection::for_generation(graph)?;
-    let graph = &projected;
     validate_sdk_base_path(base_path)?;
     check_unique_schema_names(graph, "Python SDK")?;
     check_unique_model_file_names(graph, "Python SDK", layout, |schema| {

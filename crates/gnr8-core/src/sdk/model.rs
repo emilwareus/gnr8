@@ -293,8 +293,8 @@ impl SdkModel {
         base_path: impl Into<String>,
         layout: &SdkFileLayout,
     ) -> Result<Self, CoreError> {
-        let projected = graph.project_for_generation()?;
-        let graph = &projected;
+        let projected = crate::graph::projection::for_generation(graph)?;
+        let graph = &*projected;
         let package = package.into();
         let base_path = base_path.into();
         let api_key_headers = api_key_header_names(graph)?;
