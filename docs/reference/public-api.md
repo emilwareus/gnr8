@@ -99,7 +99,7 @@ See [Transforms and overrides](../pipeline/transforms.md).
 |---|---|
 | `OpenApi31` | deterministic OpenAPI 3.1 YAML target |
 | `OpenApi31Json` | deterministic pretty OpenAPI 3.1 JSON target |
-| `OpenApiSchemaPatch` | collect field patches for one schema |
+| `OpenApiSchemaPatch` | collect field patches for one published component (`TypeInput`/`TypeOutput` when a type splits) |
 | `OpenApiFieldPatch` | constraints, enum order, docs, default/example/extensions for one field |
 
 See [OpenAPI generation](../openapi/generation.md).

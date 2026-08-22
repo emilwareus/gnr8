@@ -137,10 +137,7 @@ fn validate_projected_identities(
     let mut ids = BTreeSet::new();
     for schema in &graph.schemas {
         let name_candidates = if split.contains(&schema.id) {
-            vec![
-                format!("{}{INPUT_NAME_SUFFIX}", schema.name),
-                format!("{}{OUTPUT_NAME_SUFFIX}", schema.name),
-            ]
+            directional_names(&schema.name).to_vec()
         } else {
             vec![schema.name.clone()]
         };
@@ -181,10 +178,7 @@ fn project_schema(
 ) -> Result<Schema, CoreError> {
     let mut projected = schema.clone();
     projected.id = directional_id(&schema.id, use_);
-    projected.name = match use_ {
-        SchemaUse::Input => format!("{}{INPUT_NAME_SUFFIX}", schema.name),
-        SchemaUse::Output => format!("{}{OUTPUT_NAME_SUFFIX}", schema.name),
-    };
+    projected.name = directional_name(&schema.name, use_);
     projected.body = rewrite_type(&schema.body, Some(use_), split)?;
     Ok(projected)
 }
@@ -194,6 +188,25 @@ fn directional_id(id: &str, use_: SchemaUse) -> String {
         SchemaUse::Input => format!("{id}{INPUT_ID_SUFFIX}"),
         SchemaUse::Output => format!("{id}{OUTPUT_ID_SUFFIX}"),
     }
+}
+
+/// The public name a split publishes for one direction.
+pub(crate) fn directional_name(name: &str, use_: SchemaUse) -> String {
+    match use_ {
+        SchemaUse::Input => format!("{name}{INPUT_NAME_SUFFIX}"),
+        SchemaUse::Output => format!("{name}{OUTPUT_NAME_SUFFIX}"),
+    }
+}
+
+/// Both public names a split publishes in place of `name`.
+///
+/// ONE spelling of the suffixes, so a diagnostic that has to name them — a component-keyed patch
+/// whose target has since split, say — cannot drift from what the projection actually emitted.
+pub(crate) fn directional_names(name: &str) -> [String; 2] {
+    [
+        directional_name(name, SchemaUse::Input),
+        directional_name(name, SchemaUse::Output),
+    ]
 }
 
 fn rewrite_schema_ref(reference: &mut SchemaRef, use_: SchemaUse, split: &BTreeSet<String>) {
@@ -379,6 +392,160 @@ mod tests {
         )
         .unwrap();
         ApiGraph::from_facts(facts, "/root")
+    }
+
+    /// One schema an operation both sends and receives, whose contract differs by direction, plus
+    /// whatever `extra_schemas` adds beside it.
+    fn both_direction_graph(extra_schemas: &str) -> ApiGraph {
+        let json = format!(
+            r#"{{
+              "module": "app",
+              "routes": [
+                {{
+                  "method": "PUT", "path": "/shared", "handler": "put",
+                  "operation_id": "put", "params": [],
+                  "request_body": {{ "ref_id": "app.Shared" }},
+                  "responses": [ {{ "status": 204, "body": null }} ],
+                  "span": {{ "file": "/root/http.go", "start_line": 1, "end_line": 1 }}
+                }},
+                {{
+                  "method": "GET", "path": "/shared", "handler": "get",
+                  "operation_id": "get", "params": [], "request_body": null,
+                  "responses": [ {{ "status": 200, "body": {{ "ref_id": "app.Shared" }} }} ],
+                  "span": {{ "file": "/root/http.go", "start_line": 2, "end_line": 2 }}
+                }}
+              ],
+              "schemas": [
+                {{
+                  "id": "app.Shared", "name": "Shared",
+                  "body": {{ "type": "object", "of": [
+                    {{
+                      "json_name": "value",
+                      "serializer_may_omit": true,
+                      "deserializer_accepts_absent": false,
+                      "deserializer_accepts_null": false,
+                      "serializer_may_emit_null": false,
+                      "validator_requires_presence": false,
+                      "validator_rejects_null": false,
+                      "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
+                      "description": null, "example": null
+                    }}
+                  ] }},
+                  "span": {{ "file": "/root/models.go", "start_line": 1, "end_line": 1 }}
+                }}{extra_schemas}
+              ],
+              "diagnostics": []
+            }}"#
+        );
+        ApiGraph::from_facts(serde_json::from_str(&json).unwrap(), "/root")
+    }
+
+    /// A split renames a schema, so it can land on a name the source already uses. That has to be a
+    /// hard error: the alternative is two source types sharing one component, which silently drops
+    /// whichever the emitters reach second.
+    #[test]
+    fn a_directional_name_that_collides_with_a_source_type_is_a_hard_error() {
+        let graph = both_direction_graph(
+            r#",
+                {
+                  "id": "app.Other", "name": "SharedInput",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/models.go", "start_line": 2, "end_line": 2 }
+                }"#,
+        );
+        let error = graph.project_for_generation().unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate public name \"SharedInput\""),
+            "the collision has to name the schema a rename would fix: {error}"
+        );
+    }
+
+    /// The same guard on the INTERNAL id, which an imported `OpenAPI` document can spell freely — a
+    /// component literally named `Shared::input` is a legal spec and an illegal projection.
+    #[test]
+    fn a_directional_id_that_collides_with_a_source_type_is_a_hard_error() {
+        let graph = both_direction_graph(
+            r#",
+                {
+                  "id": "app.Shared::input", "name": "Imported",
+                  "body": { "type": "object", "of": [] },
+                  "span": { "file": "/root/models.go", "start_line": 2, "end_line": 2 }
+                }"#,
+        );
+        let error = graph.project_for_generation().unwrap_err().to_string();
+        assert!(
+            error.contains("duplicate internal id \"app.Shared::input\""),
+            "the collision has to name the id a rename would fix: {error}"
+        );
+    }
+
+    /// A parameter carries imported `OpenAPI` fragments verbatim, and a `$ref` inside one names a
+    /// component the typed schema does not. A parameter is a REQUEST, so those follow the schema into
+    /// its input component — otherwise the projected document hands a reader a `$ref` to a name that
+    /// no longer exists.
+    ///
+    /// The id here carries a `/`, so the round trip through JSON-Pointer escaping is exercised too:
+    /// the fragment spells it `~1`, the split has to decode it to match and re-encode what it writes.
+    #[test]
+    fn a_preserved_parameter_ref_follows_its_schema_into_the_request_component() {
+        let mut graph = both_direction_graph("");
+        for schema in &mut graph.schemas {
+            schema.id = "internal/dto.Shared".to_string();
+        }
+        for operation in &mut graph.operations {
+            if let Some(body) = &mut operation.request_body {
+                body.ref_id = "internal/dto.Shared".to_string();
+            }
+            for response in &mut operation.responses {
+                if let Some(body) = &mut response.body {
+                    body.ref_id = "internal/dto.Shared".to_string();
+                }
+            }
+        }
+        let reference = serde_json::json!({ "$ref": "#/components/schemas/internal~1dto.Shared" });
+        let put = graph
+            .operations
+            .iter_mut()
+            .find(|operation| operation.method == "PUT")
+            .unwrap();
+        put.params.push(super::super::Param {
+            name: "filter".to_string(),
+            location: "query".to_string(),
+            required: false,
+            schema: Type::Primitive(crate::graph::Prim::String),
+            default: None,
+            style: None,
+            explode: None,
+            allow_reserved: false,
+            openapi_content: Some(serde_json::json!({
+                "application/json": { "schema": reference }
+            })),
+            openapi_fields: vec![("schema".to_string(), reference)],
+            provenance: crate::graph::SourceSpan {
+                file: "/root/http.go".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        });
+
+        let projected = graph.project_for_generation().unwrap();
+        let param = projected
+            .operations
+            .iter()
+            .flat_map(|operation| operation.params.iter())
+            .find(|param| param.name == "filter")
+            .unwrap();
+        let expected = "#/components/schemas/internal~1dto.Shared::input";
+        assert_eq!(
+            param.openapi_content.as_ref().unwrap()["application/json"]["schema"]["$ref"],
+            serde_json::json!(expected),
+            "a preserved `content` ref is a request ref"
+        );
+        assert_eq!(
+            param.openapi_fields[0].1["$ref"],
+            serde_json::json!(expected),
+            "a preserved `schema` field carries refs too and is rewritten with it"
+        );
     }
 
     #[test]

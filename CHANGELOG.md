@@ -40,6 +40,9 @@ must move the minor version.
   **Upgrade note for 0.6.x consumers:** regenerate committed SDKs and review constructor call sites,
   component names, and schema assertions. In particular, nullable response fields that 0.6.1 made
   omittable become required again, while omitted ordinary container fields no longer advertise null.
+  An `OpenApiSchemaPatch` is keyed by the public component name, so one aimed at a type that now
+  splits fails with the two names it became — retarget it at `TypeInput` or `TypeOutput`, whichever
+  direction the change belongs to.
 
 ### Fixed
 

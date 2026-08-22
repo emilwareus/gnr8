@@ -4457,6 +4457,11 @@ fn apply_openapi_schema_patch(
     doc: &mut OpenApiDoc,
     patch: &OpenApiSchemaPatch,
 ) -> Result<(), CoreError> {
+    // Read what the projection published for this name BEFORE taking the mutable borrow, so a miss
+    // can say where the component went rather than only that it is gone. A patch is keyed by the
+    // PUBLIC component name, and that name changes when a type's two directional contracts diverge —
+    // the one case where "unknown schema" is a stale target rather than a typo.
+    let split_into = directional_components(doc, &patch.schema);
     let Some((_, schema)) = doc
         .components
         .schemas
@@ -4464,16 +4469,41 @@ fn apply_openapi_schema_patch(
         .find(|(name, _)| name == &patch.schema)
     else {
         return Err(CoreError::Config {
-            message: format!(
-                "OpenAPI schema patch references unknown schema {:?}",
-                patch.schema
-            ),
+            message: if split_into.is_empty() {
+                format!(
+                    "OpenAPI schema patch references unknown schema {:?}",
+                    patch.schema
+                )
+            } else {
+                format!(
+                    "OpenAPI schema patch references unknown schema {:?}: its input and output \
+                     contracts differ, so it is published as {} — patch the direction the change \
+                     belongs to",
+                    patch.schema,
+                    split_into.join(" and ")
+                )
+            },
         });
     };
     for field_patch in &patch.field_patches {
         apply_openapi_field_patch(&patch.schema, schema, field_patch)?;
     }
     Ok(())
+}
+
+/// The directional components the document carries in place of `name`, or empty when `name` was never
+/// split — an ordinary typo, which the caller reports as one.
+fn directional_components(doc: &OpenApiDoc, name: &str) -> Vec<String> {
+    crate::graph::projection::directional_names(name)
+        .into_iter()
+        .filter(|candidate| {
+            doc.components
+                .schemas
+                .iter()
+                .any(|(existing, _)| existing == candidate)
+        })
+        .map(|candidate| format!("{candidate:?}"))
+        .collect()
 }
 
 fn apply_openapi_field_patch(
@@ -8793,6 +8823,136 @@ mod tests {
         assert_eq!(title["x-rank"], 2);
         assert_eq!(title["x-visible"], true);
         assert_eq!(title["x-empty"], serde_json::Value::Null);
+    }
+
+    /// A schema used in both directions, whose contract differs, so the document publishes it as two
+    /// components.
+    fn split_component_graph() -> ApiGraph {
+        let json_body = |ref_id: &str| SchemaRef {
+            ref_id: ref_id.to_string(),
+        };
+        ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "put".to_string(),
+                    method: "PUT".to_string(),
+                    path: "/shared".to_string(),
+                    handler: "put".to_string(),
+                    summary: None,
+                    description: None,
+                    group: None,
+                    middleware: Vec::new(),
+                    params: Vec::new(),
+                    request_body: Some(json_body("dto.Shared")),
+                    request_body_required: true,
+                    request_body_content_type: Some("application/json".to_string()),
+                    responses: vec![Response {
+                        status: 204,
+                        body: None,
+                        body_kind: "empty".to_string(),
+                        content_type: None,
+                        content_types: Vec::new(),
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "get".to_string(),
+                    method: "GET".to_string(),
+                    path: "/shared".to_string(),
+                    handler: "get".to_string(),
+                    summary: None,
+                    description: None,
+                    group: None,
+                    middleware: Vec::new(),
+                    params: Vec::new(),
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![Response {
+                        status: 200,
+                        body: Some(json_body("dto.Shared")),
+                        body_kind: "json".to_string(),
+                        content_type: Some("application/json".to_string()),
+                        content_types: vec!["application/json".to_string()],
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            schemas: vec![Schema {
+                id: "dto.Shared".to_string(),
+                name: "Shared".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "value".to_string(),
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: false,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        }
+    }
+
+    /// A schema patch is keyed by the PUBLIC component name, and that name changes when a type's two
+    /// directional contracts diverge. "Unknown schema" is true but useless there, so the miss names
+    /// what the projection published instead — the one case where a stale patch target is not a typo.
+    #[test]
+    fn a_schema_patch_on_a_split_component_names_both_directions() {
+        let ir = split_component_graph();
+
+        let error = OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(
+                OpenApiSchemaPatch::new("Shared")
+                    .field(OpenApiFieldPatch::new("value").description("Some prose")),
+            )
+            .generate(&ir, &mut Artifacts::new(), &cx())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("\"SharedInput\" and \"SharedOutput\""),
+            "the miss has to name the two components a patch can target: {error}"
+        );
+
+        // A patch that names one of them lands, so the message points somewhere that works.
+        let mut out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(
+                OpenApiSchemaPatch::new("SharedInput")
+                    .field(OpenApiFieldPatch::new("value").description("Some prose")),
+            )
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let yaml = out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "openapi.yaml")
+            .unwrap()
+            .text
+            .clone();
+        assert!(yaml.contains("description: Some prose"), "{yaml}");
+
+        // A name that never split keeps the bare message: a typo is still a typo.
+        let typo = OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(OpenApiSchemaPatch::new("Nonexistent"))
+            .generate(&ir, &mut Artifacts::new(), &cx())
+            .unwrap_err()
+            .to_string();
+        assert!(typo.ends_with("unknown schema \"Nonexistent\""), "{typo}");
     }
 
     #[test]

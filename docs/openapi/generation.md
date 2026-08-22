@@ -45,6 +45,10 @@ Pipeline::new()
     );
 ```
 
+A patch names a **published component**, not a source type, so a type whose input and output
+contracts differ is patched as `TypeInput` or `TypeOutput` — one patch per direction, since the two
+components are two contracts. A patch left on the un-split name fails and names both.
+
 ## What is emitted
 
 The lowerer writes graph-backed OpenAPI facts including:
