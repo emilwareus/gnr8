@@ -495,9 +495,9 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
 /// A second model carries the same type NESTED — once directly and once through a list. `model_dump`
 /// walks the nesting itself, so the required-null repair only holds if it composes rather than
 /// applying to the outermost model alone.
-fn nullable_response_graph() -> gnr8::graph::ApiGraph {
-    serde_json::from_str(
-        r#"{
+/// A response graph whose nested model sits behind a `$ref`, a list, and a dict, so one round trip
+/// exercises every container `model_validate` rebuilds a model inside.
+const NULLABLE_RESPONSE_FACTS: &str = r#"{
           "module": "app",
           "operations": [
             {
@@ -566,6 +566,16 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
               "name": "EventPage",
               "body": { "type": "object", "of": [
                 {
+                  "json_name": "lookup",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "map", "of": {
+                    "key": { "type": "primitive", "of": { "prim": "string" } },
+                    "value": { "type": "named", "of": "dto.Event" }
+                  } },
+                  "description": null,
+                  "example": null
+                },
+                {
                   "json_name": "event",
                   "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "named", "of": "dto.Event" },
@@ -587,9 +597,10 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
           "base_path": "/api",
           "title": "Events",
           "security": []
-        }"#,
-    )
-    .expect("nullable response graph json")
+        }"#;
+
+fn nullable_response_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(NULLABLE_RESPONSE_FACTS).expect("nullable response graph json")
 }
 
 fn pagination_graph() -> gnr8::graph::ApiGraph {
@@ -1327,15 +1338,21 @@ else:
     raise SystemExit("identifier must remain required")
 
 # `model_dump` walks nested models itself and drops their nulls with the same rule, so the repair has
-# to reach them too — otherwise only the outermost model can read back what it wrote.
+# to reach them too — otherwise only the outermost model can read back what it wrote. It has to reach
+# them through EVERY container `model_validate` would rebuild one inside, a dict included.
 nested = {"identifier": "e", "properties": {}, "userid": None}
-page = bookstore.EventPage(event=spelled, events=[spelled])
+page = bookstore.EventPage(lookup={"k": spelled}, event=spelled, events=[spelled])
 dumped_page = page.to_dict()
-assert dumped_page == {"event": nested, "events": [nested]}, dumped_page
+assert dumped_page == {
+    "lookup": {"k": nested},
+    "event": nested,
+    "events": [nested],
+}, dumped_page
 
 # The point of that: every nested payload is still decodable by the model that wrote it.
 bookstore.Event.from_dict(dumped_page["event"])
 bookstore.Event.from_dict(dumped_page["events"][0])
+bookstore.Event.from_dict(dumped_page["lookup"]["k"])
 "#;
 
 /// Required-nullable response keys carry no omission default and survive a convenience round trip.
@@ -1355,6 +1372,7 @@ fn a_nullable_response_field_round_trips_through_its_own_to_dict() {
         "    identifier: str\n",
         "    properties: Optional[dict[str, Any]]\n",
         "    userid: Optional[str]\n",
+        "    lookup: dict[str, Event]\n",
         "    event: Event\n",
         "    events: list[Event]\n",
     ] {

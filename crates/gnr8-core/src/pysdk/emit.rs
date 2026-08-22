@@ -785,28 +785,86 @@ fn decode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> String {
     }
 }
 
-/// The mirror of [`decode_expr`]: the Python expression that re-encodes a nested model through its own
-/// `to_dict`, or `None` when nothing below this field owns a rule of its own.
+/// The Python expression that re-encodes every nested model below this field through its own
+/// `to_dict`, or `None` when nothing below it owns a rule of its own.
 ///
 /// `model_dump` walks nested models itself, so [`emit_pydantic_model`]'s `to_dict` would otherwise
 /// apply its required-nullable repair only at the top level and hand back a dict its own `from_dict`
-/// rejects one level down. Routing a nested model through `to_dict` composes the repair instead —
-/// the same shapes `decode_expr` recurses into, so one encode has one matching decode.
+/// rejects further down. What has to be reached is therefore whatever `model_validate` RECONSTRUCTS —
+/// `from_dict` is `model_validate` for a Pydantic model, and it builds nested models inside lists,
+/// dicts, and unions alike, so the encode has to descend through the same containers or the round trip
+/// stops being one. (This is not [`decode_expr`], which serves the dataclass style and stops where a
+/// hand-written constructor call stops.)
 fn encode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> Option<String> {
+    encode_expr_at(schema, graph, value_var, 0)
+}
+
+/// `depth` scopes the comprehension bindings, so a container nested in a container does not iterate
+/// over the name its parent bound.
+fn encode_expr_at(
+    schema: &Type,
+    graph: &ApiGraph,
+    value_var: &str,
+    depth: usize,
+) -> Option<String> {
     match schema {
-        Type::Named(_) => match resolve_named(schema, graph) {
-            Some(target) if matches!(target.body, Type::Object(_)) => {
-                Some(format!("{value_var}.to_dict()"))
-            }
-            _ => None,
-        },
-        Type::Array(items) => match resolve_named(items, graph) {
-            Some(target) if matches!(target.body, Type::Object(_)) => {
-                Some(format!("[_item.to_dict() for _item in {value_var}]"))
-            }
-            _ => None,
-        },
-        _ => None,
+        Type::Named(_) => is_model_ref(schema, graph).then(|| format!("{value_var}.to_dict()")),
+        Type::Array(items) => {
+            let item = comprehension_binding("_item", depth);
+            let encoded = encode_expr_at(items, graph, &item, depth + 1)?;
+            Some(format!("[{encoded} for {item} in {value_var}]"))
+        }
+        Type::Map { value, .. } => {
+            let key = comprehension_binding("_key", depth);
+            let item = comprehension_binding("_value", depth);
+            let encoded = encode_expr_at(value, graph, &item, depth + 1)?;
+            Some(format!(
+                "{{{key}: {encoded} for {key}, {item} in {value_var}.items()}}"
+            ))
+        }
+        // A union is the one shape whose STATIC type does not say which variant a value holds, so the
+        // discriminator has to be a runtime one — and `BaseModel` is exactly the set of variants that
+        // own a `to_dict` (an enum member and a string alias are not one), and the single name every
+        // Pydantic model file already imports (`model_header`), so it needs no schema name in scope
+        // that a split layout keeps behind `TYPE_CHECKING`. A container variant would need its own
+        // comprehension, which no single expression can select between, so a union carrying one is
+        // left alone rather than half-repaired.
+        Type::Union(variants) => {
+            let models = variants
+                .iter()
+                .filter(|variant| is_model_ref(variant, graph))
+                .count();
+            let encodable = variants
+                .iter()
+                .filter(|variant| encode_expr_at(variant, graph, value_var, depth).is_some())
+                .count();
+            (models > 0 && models == encodable).then(|| {
+                format!(
+                    "{value_var}.to_dict() if isinstance({value_var}, BaseModel) else {value_var}"
+                )
+            })
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Enum(_)
+        | Type::Object(_)
+        | Type::Any {} => None,
+    }
+}
+
+/// Whether `schema` is a `$ref` to an object schema — the shapes that get a generated model class, and
+/// so the only ones that own a `to_dict` of their own.
+fn is_model_ref(schema: &Type, graph: &ApiGraph) -> bool {
+    resolve_named(schema, graph).is_some_and(|target| matches!(target.body, Type::Object(_)))
+}
+
+/// The name a comprehension at `depth` binds. Depth zero keeps the bare name, so the common one-level
+/// list reads exactly as it did before nesting was expressible.
+fn comprehension_binding(base: &str, depth: usize) -> String {
+    if depth == 0 {
+        base.to_string()
+    } else {
+        format!("{base}{depth}")
     }
 }
 
@@ -3524,6 +3582,105 @@ mod tests {
                 ),
                 "a model with nothing to repair keeps one expression:\n{item}"
             );
+        }
+
+        /// A request body carrying a nested model behind every container `model_validate` rebuilds one
+        /// inside, plus the two union shapes.
+        const NESTED_CONTAINER_FACTS: &[u8] = br#"{
+              "module": "app",
+              "routes": [
+                {
+                  "method": "POST", "path": "/nest", "handler": "nest",
+                  "operation_id": "nest", "params": [],
+                  "request_body": {"ref_id": "app.models.Nest"},
+                  "responses": [{"status": 204, "body": null}],
+                  "span": {"file": "/root/main.py", "start_line": 1, "end_line": 1}
+                }
+              ],
+              "schemas": [
+                {
+                  "id": "app.models.Item", "name": "Item",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 1, "end_line": 1}
+                },
+                {
+                  "id": "app.models.Other", "name": "Other",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "code", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 2, "end_line": 2}
+                },
+                {
+                  "id": "app.models.Nest", "name": "Nest",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "choice", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "named", "of": "app.models.Other"}
+                     ]},
+                     "description": null, "example": null},
+                    {"json_name": "either", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "array", "of": {"type": "named", "of": "app.models.Item"}}
+                     ]},
+                     "description": null, "example": null},
+                    {"json_name": "lookup", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "map", "of": {
+                       "key": {"type": "primitive", "of": {"prim": "string"}},
+                       "value": {"type": "named", "of": "app.models.Item"}
+                     }},
+                     "description": null, "example": null},
+                    {"json_name": "matrix", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "array", "of": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}}},
+                     "description": null, "example": null},
+                    {"json_name": "mixed", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "primitive", "of": {"prim": "string"}}
+                     ]},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 3, "end_line": 3}
+                }
+              ],
+              "diagnostics": []
+            }"#;
+
+        /// `to_dict` reaches a nested model through every container `from_dict` rebuilds one inside.
+        ///
+        /// `from_dict` is `model_validate`, which rebuilds models inside dicts, lists of lists, and
+        /// unions alike, so a repair that stopped at a bare `$ref` and a one-level list would hand back
+        /// a payload its own decode rejects wherever a required-nullable key sits further down.
+        #[test]
+        fn pydantic_to_dict_reaches_a_nested_model_through_every_container() {
+            let graph = ApiGraph::from_facts(
+                serde_json::from_slice(NESTED_CONTAINER_FACTS).unwrap(),
+                "/root",
+            );
+            let out = emit_models(&graph, "app").unwrap();
+            for expected in [
+                // A dict value is rebuilt by `model_validate`, so it is re-encoded here.
+                "        _data[\"lookup\"] = {_key: _value.to_dict() for _key, _value in self.lookup.items()}\n",
+                // Depth scopes each comprehension binding, so the inner loop does not iterate the name
+                // its parent bound.
+                "        _data[\"matrix\"] = [[_item1.to_dict() for _item1 in _item] for _item in self.matrix]\n",
+                // A union's static type does not say which variant is held, so the test is a runtime
+                // one — and it reads the same whether every variant is a model or only some are.
+                "        _data[\"choice\"] = self.choice.to_dict() if isinstance(self.choice, BaseModel) else self.choice\n",
+                "        _data[\"mixed\"] = self.mixed.to_dict() if isinstance(self.mixed, BaseModel) else self.mixed\n",
+            ] {
+                assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
+            }
+            // A union with a CONTAINER variant needs a comprehension no single expression can select,
+            // so it is left alone rather than half-repaired by a test that would miss the list.
+            assert!(!out.contains("_data[\"either\"]"), "{out}");
         }
 
         #[test]
