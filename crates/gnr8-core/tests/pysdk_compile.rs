@@ -349,27 +349,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "count",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "name",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "tags",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
                   "description": null,
                   "example": null
@@ -384,27 +378,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "file",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "bytes" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "title",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "files",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
@@ -503,9 +491,13 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
 /// serializer writes on every response, holding a value that may be `null`. Every `json_name` is a
 /// single lowercase word, so no field needs a Pydantic alias and the stub's ignorance of aliases never
 /// stands between the driver below and what a real Pydantic would do.
-fn nullable_response_graph() -> gnr8::graph::ApiGraph {
-    serde_json::from_str(
-        r#"{
+///
+/// A second model carries the same type NESTED — once directly and once through a list. `model_dump`
+/// walks the nesting itself, so the required-null repair only holds if it composes rather than
+/// applying to the outermost model alone.
+/// A response graph whose nested model sits behind a `$ref`, a list, and a dict, so one round trip
+/// exercises every container `model_validate` rebuilds a model inside.
+const NULLABLE_RESPONSE_FACTS: &str = r#"{
           "module": "app",
           "operations": [
             {
@@ -521,6 +513,20 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
                   "content_types": ["application/json"] }
               ],
               "provenance": { "file": "main.py", "start_line": 1, "end_line": 1 }
+            },
+            {
+              "id": "getEventPage",
+              "method": "GET",
+              "path": "/events",
+              "handler": "getEventPage",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [
+                { "status": 200, "body": { "ref_id": "dto.EventPage" },
+                  "content_types": ["application/json"] }
+              ],
+              "provenance": { "file": "main.py", "start_line": 3, "end_line": 3 }
             }
           ],
           "schemas": [
@@ -530,18 +536,14 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "identifier",
-                  "required": false,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "properties",
-                  "required": false,
-                  "optional": false,
-                  "nullable": true,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "map", "of": {
                     "key": { "type": "primitive", "of": { "prim": "string" } },
                     "value": { "type": "any", "of": {} }
@@ -551,24 +553,54 @@ fn nullable_response_graph() -> gnr8::graph::ApiGraph {
                 },
                 {
                   "json_name": "userid",
-                  "required": false,
-                  "optional": false,
-                  "nullable": true,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 }
               ] },
               "provenance": { "file": "main.py", "start_line": 2, "end_line": 2 }
+            },
+            {
+              "id": "dto.EventPage",
+              "name": "EventPage",
+              "body": { "type": "object", "of": [
+                {
+                  "json_name": "lookup",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "map", "of": {
+                    "key": { "type": "primitive", "of": { "prim": "string" } },
+                    "value": { "type": "named", "of": "dto.Event" }
+                  } },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "event",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "named", "of": "dto.Event" },
+                  "description": null,
+                  "example": null
+                },
+                {
+                  "json_name": "events",
+                  "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
+                  "schema": { "type": "array", "of": { "type": "named", "of": "dto.Event" } },
+                  "description": null,
+                  "example": null
+                }
+              ] },
+              "provenance": { "file": "main.py", "start_line": 4, "end_line": 4 }
             }
           ],
           "diagnostics": [],
           "base_path": "/api",
           "title": "Events",
           "security": []
-        }"#,
-    )
-    .expect("nullable response graph json")
+        }"#;
+
+fn nullable_response_graph() -> gnr8::graph::ApiGraph {
+    serde_json::from_str(NULLABLE_RESPONSE_FACTS).expect("nullable response graph json")
 }
 
 fn pagination_graph() -> gnr8::graph::ApiGraph {
@@ -603,9 +635,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "id",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -620,18 +650,14 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "items",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "next_cursor",
-                  "required": false,
-                  "optional": true,
-                  "nullable": false,
+                  "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -1275,48 +1301,61 @@ fn generated_sdk_runtime_retries_idempotency_and_hooks_work_against_stdlib_http_
     let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }
 
-/// The model round trip a nullable key used to break: construct, `to_dict()`, `from_dict()` the dump.
-///
-/// No HTTP server — the subject is the model declaration itself, and the only two facts it needs are
-/// the ones `write_pydantic_stub` models faithfully: a field with no default is required, and
-/// `exclude_none` drops the null-valued keys.
+/// A required-nullable response key remains present through `to_dict()` / `from_dict()`.
 const NULLABLE_MODEL_DRIVER: &str = r#"import bookstore
 
-# The model is reached only from a response, so a nullable key it always receives is one the caller may
-# leave out: the `null` it would otherwise spell says the same thing to everything that reads the model.
-default_constructed = bookstore.Event(identifier="e")
-assert default_constructed.userid is None, default_constructed.userid
-assert default_constructed.properties is None, default_constructed.properties
+# The response serializer always writes all three keys. Nullability therefore changes the accepted
+# value but does not make either key omittable at construction.
+try:
+    bookstore.Event(identifier="e")
+except Exception as error:
+    assert "properties" in str(error), error
+    assert "userid" in str(error), error
+else:
+    raise SystemExit("required nullable response keys must not gain defaults")
 
-# The round trip itself. `to_dict()` excludes every None, so a declaration that demanded those keys back
-# could not read its own output — the two halves of the model would contradict each other.
+# `to_dict()` must retain a required null so its own `from_dict()` still sees every required key.
 spelled = bookstore.Event(identifier="e", properties={}, userid=None)
 dumped = spelled.to_dict()
-assert dumped == {"identifier": "e", "properties": {}}, dumped
+assert dumped == {"identifier": "e", "properties": {}, "userid": None}, dumped
 decoded = bookstore.Event.from_dict(dumped)
 assert decoded.identifier == "e", decoded.identifier
 assert decoded.userid is None, decoded.userid
 assert decoded.properties == {}, decoded.properties
 
-# A present null still decodes to None, which is why letting the key go costs the reading side nothing:
-# both spellings land on the same attribute value.
+# Both required fields also accept an explicit null value.
 from_null = bookstore.Event.from_dict({"identifier": "e", "properties": None, "userid": None})
 assert from_null.userid is None, from_null.userid
 assert from_null.properties is None, from_null.properties
+assert from_null.to_dict() == {"identifier": "e", "properties": None, "userid": None}
 
-# The other half of the rule, and the proof the assertions above are not vacuous: a key with no null to
-# stand in for it is still demanded, so the stub does enforce required-ness.
+# The non-nullable key is required too.
 try:
-    bookstore.Event()
+    bookstore.Event(properties=None, userid=None)
 except Exception as error:
     assert "identifier" in str(error), error
 else:
-    raise SystemExit("Event() must fail: `identifier` is not nullable and is written every time")
+    raise SystemExit("identifier must remain required")
+
+# `model_dump` walks nested models itself and drops their nulls with the same rule, so the repair has
+# to reach them too — otherwise only the outermost model can read back what it wrote. It has to reach
+# them through EVERY container `model_validate` would rebuild one inside, a dict included.
+nested = {"identifier": "e", "properties": {}, "userid": None}
+page = bookstore.EventPage(lookup={"k": spelled}, event=spelled, events=[spelled])
+dumped_page = page.to_dict()
+assert dumped_page == {
+    "lookup": {"k": nested},
+    "event": nested,
+    "events": [nested],
+}, dumped_page
+
+# The point of that: every nested payload is still decodable by the model that wrote it.
+bookstore.Event.from_dict(dumped_page["event"])
+bookstore.Event.from_dict(dumped_page["events"][0])
+bookstore.Event.from_dict(dumped_page["lookup"]["k"])
 "#;
 
-/// A nullable key on a response-reached model carries a default, so the model can decode its own
-/// `to_dict()` output (the 0.6.0 regression: `Field(...)` demanded back exactly the keys `exclude_none`
-/// had just dropped). The non-nullable key beside it stays required, which is the #59 fix intact.
+/// Required-nullable response keys carry no omission default and survive a convenience round trip.
 #[test]
 fn a_nullable_response_field_round_trips_through_its_own_to_dict() {
     if !python_available() {
@@ -1331,8 +1370,11 @@ fn a_nullable_response_field_round_trips_through_its_own_to_dict() {
     let models = std::fs::read_to_string(dir.join(PACKAGE).join("models.py")).expect("read models");
     for declaration in [
         "    identifier: str\n",
-        "    properties: Optional[dict[str, Any]] = Field(default=None)\n",
-        "    userid: Optional[str] = Field(default=None)\n",
+        "    properties: Optional[dict[str, Any]]\n",
+        "    userid: Optional[str]\n",
+        "    lookup: dict[str, Event]\n",
+        "    event: Event\n",
+        "    events: list[Event]\n",
     ] {
         assert!(
             models.contains(declaration),

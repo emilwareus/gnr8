@@ -142,6 +142,10 @@ For direct library tooling, `Pipeline::build_ir(&cx)` runs source plus transform
 `Pipeline::run(&cx)` also runs targets and post-processors. Normal `.gnr8` binaries must use
 `gnr8::runner::run`, which implements the versioned host/child boundary.
 
+`build_ir` returns the unsplit extraction facts. At generation time, `Pipeline` gives every target the
+canonical direction-projected graph, including custom targets. Direct artifact tooling that starts
+from `build_ir` can obtain the identical view with `ApiGraph::project_for_generation()`.
+
 `Artifacts::files` borrows sorted files, `into_files` consumes the set, and `from_files` restores a
 sorted set. Use `create`, `overlay`, or `rewrite` so ownership intent is explicit.
 

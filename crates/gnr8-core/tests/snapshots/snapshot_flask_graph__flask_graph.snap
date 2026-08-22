@@ -117,18 +117,24 @@ schemas:
       type: object
       of:
         - json_name: availability
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: app.dto.Availability
           description: ~
           example: ~
         - json_name: lines
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -137,9 +143,12 @@ schemas:
           description: ~
           example: ~
         - json_name: message
-          required: true
-          optional: false
-          nullable: true
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -147,9 +156,12 @@ schemas:
           description: ~
           example: ~
         - json_name: order_id
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -168,9 +180,12 @@ schemas:
       type: object
       of:
         - json_name: book_id
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -180,9 +195,12 @@ schemas:
           description: ~
           example: ~
         - json_name: coupon
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -190,9 +208,12 @@ schemas:
           description: ~
           example: ~
         - json_name: discount
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: union
             of:
@@ -208,9 +229,12 @@ schemas:
           description: ~
           example: ~
         - json_name: note
-          required: false
-          optional: true
-          nullable: true
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: true
+          serializer_may_emit_null: true
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -218,18 +242,24 @@ schemas:
           description: ~
           example: ~
         - json_name: price
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: named
             of: app.dto.Price
           description: ~
           example: ~
         - json_name: quantity
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -239,9 +269,12 @@ schemas:
           description: ~
           example: ~
         - json_name: tags
-          required: false
-          optional: true
-          nullable: false
+          serializer_may_omit: true
+          deserializer_accepts_absent: true
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: array
             of:
@@ -260,9 +293,12 @@ schemas:
       type: object
       of:
         - json_name: amount
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: primitive
             of:
@@ -271,9 +307,12 @@ schemas:
           description: ~
           example: ~
         - json_name: currency
-          required: true
-          optional: false
-          nullable: false
+          serializer_may_omit: false
+          deserializer_accepts_absent: false
+          deserializer_accepts_null: false
+          serializer_may_emit_null: false
+          validator_requires_presence: false
+          validator_rejects_null: false
           schema:
             type: enum
             of:

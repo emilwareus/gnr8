@@ -140,9 +140,7 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "lastId",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -173,18 +171,14 @@ fn precision_and_nullable_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "amount",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "float", "bits": 64 } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "label",
-                  "required": true,
-                  "optional": false,
-                  "nullable": true,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -359,27 +353,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "count",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "name",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "tags",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
                   "description": null,
                   "example": null
@@ -394,27 +382,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "file",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "bytes" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "title",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "files",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null
@@ -541,9 +523,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "id",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -558,18 +538,14 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "items",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "named", "of": "dto.Item" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "nextCursor",
-                  "required": false,
-                  "optional": true,
-                  "nullable": false,
+                  "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
@@ -599,6 +575,86 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
         termination: gnr8::graph::PaginationTermination::NoNextCursor,
     }];
     graph
+}
+
+/// The same page, with an items field the serializer may both omit AND write `null` into, read by
+/// every site that reads one: the empty-items termination count, the item loop, and offset mode's
+/// advance step.
+///
+/// That pair is the one combination that makes the Go field a POINTER to the slice
+/// (`gosdk::emit::go_struct_field_type`), and neither `len` nor `range` applies to one. It is
+/// unreachable from Go source — `encoding/json` cannot both drop a nil slice and write its null — but
+/// an imported `OpenAPI` document, a Python/TypeScript source, and a `force_nullable` override all
+/// state it, so the helper has to read the field through its declared pointer depth.
+fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
+    let mut graph = pagination_graph();
+    graph.pagination[0].termination = gnr8::graph::PaginationTermination::EmptyItems;
+
+    // A second helper over the same page, in offset mode: its advance step is the third read site.
+    let mut by_offset = graph.operations[0].clone();
+    by_offset.id = "listItemsByOffset".to_string();
+    by_offset.handler = "listItemsByOffset".to_string();
+    by_offset.path = "/items/offset".to_string();
+    by_offset.params[0].name = "offset".to_string();
+    by_offset.params[0].schema = gnr8::graph::Type::Primitive(gnr8::graph::Prim::Int {
+        bits: 64,
+        signed: true,
+    });
+    graph.operations.push(by_offset);
+    graph.pagination.push(gnr8::graph::PaginationPolicy {
+        operation_id: "listItemsByOffset".to_string(),
+        mode: gnr8::graph::PaginationMode::Offset,
+        items_field: "items".to_string(),
+        cursor_param: None,
+        next_cursor_field: None,
+        page_param: None,
+        page_size_param: None,
+        offset_param: Some("offset".to_string()),
+        limit_param: None,
+        termination: gnr8::graph::PaginationTermination::EmptyItems,
+    });
+
+    let page = graph
+        .schemas
+        .iter_mut()
+        .find(|schema| schema.id == "dto.ItemPage")
+        .expect("the page schema");
+    let gnr8::graph::Type::Object(fields) = &mut page.body else {
+        panic!("the page schema is an object")
+    };
+    let items = fields
+        .iter_mut()
+        .find(|field| field.json_name == "items")
+        .expect("the items field");
+    items.serializer_may_omit = true;
+    items.serializer_may_emit_null = true;
+    graph
+}
+
+/// A pointer-to-slice items field is read through its indirection, so the helpers still compile.
+#[test]
+fn generated_sdk_pagination_helpers_build_over_an_optional_nullable_items_field() {
+    if !go_available() {
+        eprintln!("skipping sdk_compile nullable-items pagination: go toolchain unavailable");
+        return;
+    }
+    let dir = materialize_sdk_from_graph(
+        "nullable-items-pagination",
+        &nullable_items_pagination_graph(),
+        "/api",
+    );
+    // gofmt aligns the field column, so match the type alone rather than the spacing.
+    let models = std::fs::read_to_string(dir.join("models.go")).expect("read models.go");
+    assert!(
+        models.contains("*[]Item"),
+        "the fixture must actually produce a pointer-to-slice items field:\n{models}"
+    );
+    let build = run_go(&["build", "./..."], &dir);
+    assert!(
+        build.is_ok(),
+        "go build ./... must accept the pagination helpers: {build:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup
 }
 
 /// SDK-05: the generated SDK materializes to a hermetic stdlib-only temp module and `go build ./...`
@@ -646,6 +702,8 @@ import (
 	"testing"
 )
 
+func stringPointer(value string) *string { return &value }
+
 // SDK-05: CreateGoal sends POST /goal/ with the marshaled body and decodes the 201 response.
 func TestCreateGoalSmoke(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -690,7 +748,7 @@ func TestDeleteGoalBadRequestAPIError(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Request-ID", "req-400")
 		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: "bad_request"})
+		_ = json.NewEncoder(w).Encode(HttpError{Message: "bad request", Slug: stringPointer("bad_request")})
 	}))
 	defer srv.Close()
 
@@ -725,8 +783,8 @@ func TestDeleteGoalBadRequestAPIError(t *testing.T) {
 	if !ok {
 		t.Fatalf("Body type = %T, want HttpError", apiErr.Body)
 	}
-	if typed.Slug != "bad_request" {
-		t.Fatalf("Body.Slug = %q, want bad_request", typed.Slug)
+	if typed.Slug == nil || *typed.Slug != "bad_request" {
+		t.Fatalf("Body.Slug = %v, want bad_request", typed.Slug)
 	}
 	if apiErr.Message != "bad request" {
 		t.Fatalf("Message = %q, want bad request", apiErr.Message)
@@ -1300,6 +1358,11 @@ import (
 	"time"
 )
 
+func optionalNullableString(value string) **string {{
+	inner := &value
+	return &inner
+}}
+
 func TestPaginationHelpers(t *testing.T) {{
 	seen := []string{{}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {{
@@ -1318,12 +1381,12 @@ func TestPaginationHelpers(t *testing.T) {{
 		case "":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "a"}}}},
-				NextCursor: "n2",
+				NextCursor: optionalNullableString("n2"),
 			}})
 		case "n2":
 			_ = json.NewEncoder(w).Encode(ItemPage{{
 				Items: []Item{{{{ID: "b"}}}},
-				NextCursor: "",
+				NextCursor: optionalNullableString(""),
 			}})
 		default:
 			t.Errorf("cursor = %q, want empty or n2", cursor)

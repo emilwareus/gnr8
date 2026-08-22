@@ -46,7 +46,8 @@ Fields omitted from the payload keep their current values.
 
 | Schema | Kind |
 |--|--|
-| `Assignee` | object |
+| `AssigneeInput` | object |
+| `AssigneeOutput` | object |
 | `CreateTaskRequest` | object |
 | `ErrorResponse` | object |
 | `Status` | enum |

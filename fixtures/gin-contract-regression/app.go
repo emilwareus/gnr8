@@ -1,6 +1,7 @@
 package gincontract
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,6 +57,25 @@ type MarkReadRequest struct {
 	LastID string `json:"lastId"`
 }
 
+type DirectionalResponse struct {
+	UserUUID *string           `json:"userUuid"`
+	Items    []ItemResponse    `json:"items"`
+	Metadata map[string]string `json:"metadata"`
+	Nickname *string           `json:"nickname,omitempty"`
+	Tags     []string          `json:"tags,omitempty"`
+	Result   map[string]string `json:"result,omitempty"`
+	Zero     map[string]string `json:"zero,omitzero"`
+}
+
+type ValidatedRequest struct {
+	IDs []string        `json:"ids" binding:"required"`
+	Raw json.RawMessage `json:"raw" binding:"required"`
+}
+
+type SharedPayload struct {
+	Data []string `json:"data,omitempty"`
+}
+
 type FileBytes []byte
 
 const (
@@ -92,6 +112,9 @@ func RegisterRoutes(r *gin.Engine, h *Handler) {
 	items.GET("/events", h.itemEvents)
 	items.GET("/raw-stream", h.rawStream)
 	items.POST("/jobs", h.createJob)
+	items.GET("/directional", h.directional)
+	items.POST("/validated", h.validated)
+	items.POST("/shared", h.shared)
 	items.DELETE("/:itemId", h.deleteItem)
 }
 
@@ -173,6 +196,28 @@ func (h *Handler) createJob(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{
 		"jobId": "job_123",
 	})
+}
+
+func (h *Handler) directional(c *gin.Context) {
+	c.JSON(http.StatusOK, DirectionalResponse{})
+}
+
+func (h *Handler) validated(c *gin.Context) {
+	var body ValidatedRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, MessageResponse{Message: "ok"})
+}
+
+func (h *Handler) shared(c *gin.Context) {
+	var body SharedPayload
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, body)
 }
 
 func (h *Handler) searchItems(c *gin.Context) {

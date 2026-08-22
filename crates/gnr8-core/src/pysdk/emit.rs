@@ -172,7 +172,7 @@ fn compute_model_imports(
                     // side, so it has to be the SAME answer the emitters below reach — an import set
                     // computed off a different question lands an unused (F401) or a missing one.
                     let omittable = reached.model_field_is_optional(field);
-                    if omittable || field.nullable {
+                    if omittable || reached.field_is_nullable(field) {
                         m.optional = true;
                     }
                     if needs_alias(field) || omittable {
@@ -336,27 +336,40 @@ fn pydantic_field_rhs(field: &Field, has_default: bool) -> String {
 }
 
 /// Keep nullability in the type hint while using the default solely for key absence.
-fn optional_default_hint(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
-    let hint = py_type(&field.schema, field.nullable, graph)?;
-    if field.nullable {
+fn optional_default_hint(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
+    let nullable = directions.field_is_nullable(field);
+    let hint = py_type(&field.schema, nullable, graph)?;
+    if nullable {
         Ok(hint)
     } else {
         Ok(format!("Optional[{hint}]"))
     }
 }
 
-fn pydantic_default_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+fn pydantic_default_suffix(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
     Ok(format!(
         "{}{}",
-        optional_default_hint(field, graph)?,
+        optional_default_hint(field, graph, directions)?,
         pydantic_field_rhs(field, true)
     ))
 }
 
-fn pydantic_required_suffix(field: &Field, graph: &ApiGraph) -> Result<String, CoreError> {
+fn pydantic_required_suffix(
+    field: &Field,
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
     Ok(format!(
         "{}{}",
-        py_type(&field.schema, field.nullable, graph)?,
+        py_type(&field.schema, directions.field_is_nullable(field), graph,)?,
         pydantic_field_rhs(field, false)
     ))
 }
@@ -772,6 +785,89 @@ fn decode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> String {
     }
 }
 
+/// The Python expression that re-encodes every nested model below this field through its own
+/// `to_dict`, or `None` when nothing below it owns a rule of its own.
+///
+/// `model_dump` walks nested models itself, so [`emit_pydantic_model`]'s `to_dict` would otherwise
+/// apply its required-nullable repair only at the top level and hand back a dict its own `from_dict`
+/// rejects further down. What has to be reached is therefore whatever `model_validate` RECONSTRUCTS —
+/// `from_dict` is `model_validate` for a Pydantic model, and it builds nested models inside lists,
+/// dicts, and unions alike, so the encode has to descend through the same containers or the round trip
+/// stops being one. (This is not [`decode_expr`], which serves the dataclass style and stops where a
+/// hand-written constructor call stops.)
+fn encode_expr(schema: &Type, graph: &ApiGraph, value_var: &str) -> Option<String> {
+    encode_expr_at(schema, graph, value_var, 0)
+}
+
+/// `depth` scopes the comprehension bindings, so a container nested in a container does not iterate
+/// over the name its parent bound.
+fn encode_expr_at(
+    schema: &Type,
+    graph: &ApiGraph,
+    value_var: &str,
+    depth: usize,
+) -> Option<String> {
+    match schema {
+        Type::Named(_) => is_model_ref(schema, graph).then(|| format!("{value_var}.to_dict()")),
+        Type::Array(items) => {
+            let item = comprehension_binding("_item", depth);
+            let encoded = encode_expr_at(items, graph, &item, depth + 1)?;
+            Some(format!("[{encoded} for {item} in {value_var}]"))
+        }
+        Type::Map { value, .. } => {
+            let key = comprehension_binding("_key", depth);
+            let item = comprehension_binding("_value", depth);
+            let encoded = encode_expr_at(value, graph, &item, depth + 1)?;
+            Some(format!(
+                "{{{key}: {encoded} for {key}, {item} in {value_var}.items()}}"
+            ))
+        }
+        // A union is the one shape whose STATIC type does not say which variant a value holds, so the
+        // discriminator has to be a runtime one — and `BaseModel` is exactly the set of variants that
+        // own a `to_dict` (an enum member and a string alias are not one), and the single name every
+        // Pydantic model file already imports (`model_header`), so it needs no schema name in scope
+        // that a split layout keeps behind `TYPE_CHECKING`. A container variant would need its own
+        // comprehension, which no single expression can select between, so a union carrying one is
+        // left alone rather than half-repaired.
+        Type::Union(variants) => {
+            let models = variants
+                .iter()
+                .filter(|variant| is_model_ref(variant, graph))
+                .count();
+            let encodable = variants
+                .iter()
+                .filter(|variant| encode_expr_at(variant, graph, value_var, depth).is_some())
+                .count();
+            (models > 0 && models == encodable).then(|| {
+                format!(
+                    "{value_var}.to_dict() if isinstance({value_var}, BaseModel) else {value_var}"
+                )
+            })
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Enum(_)
+        | Type::Object(_)
+        | Type::Any {} => None,
+    }
+}
+
+/// Whether `schema` is a `$ref` to an object schema — the shapes that get a generated model class, and
+/// so the only ones that own a `to_dict` of their own.
+fn is_model_ref(schema: &Type, graph: &ApiGraph) -> bool {
+    resolve_named(schema, graph).is_some_and(|target| matches!(target.body, Type::Object(_)))
+}
+
+/// The name a comprehension at `depth` binds. Depth zero keeps the bare name, so the common one-level
+/// list reads exactly as it did before nesting was expressible.
+fn comprehension_binding(base: &str, depth: usize) -> String {
+    if depth == 0 {
+        base.to_string()
+    } else {
+        format!("{base}{depth}")
+    }
+}
+
 /// Emit a `@dataclass` for an object schema, partitioning fields required-first / optional-last.
 ///
 /// PITFALL 1 (RESEARCH): `@dataclass` raises `TypeError: non-default argument follows default argument`
@@ -811,9 +907,9 @@ fn emit_pydantic_model(
     for field in fields {
         let ident = pydantic_field_ident(field);
         let suffix = if directions.model_field_is_optional(field) {
-            pydantic_default_suffix(field, graph)?
+            pydantic_default_suffix(field, graph, directions)?
         } else {
-            pydantic_required_suffix(field, graph)?
+            pydantic_required_suffix(field, graph, directions)?
         };
         writeln!(out, "    {ident}: {suffix}").map_err(sink)?;
     }
@@ -827,12 +923,101 @@ fn emit_pydantic_model(
     writeln!(out, "        return cls.model_validate(_data)").map_err(sink)?;
     writeln!(out).map_err(sink)?;
     writeln!(out, "    def to_dict(self) -> dict[str, Any]:").map_err(sink)?;
-    writeln!(
-        out,
-        "        return self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)"
-    )
-    .map_err(sink)?;
+    emit_pydantic_to_dict_body(out, fields, graph, directions)?;
     Ok(())
+}
+
+/// Emit the body of a Pydantic model's `to_dict`.
+///
+/// `model_dump(exclude_none=True)` is the whole rule for an omittable key, and it is the whole of what
+/// most models need. Two repairs ride on top, and both exist so a model can read back what it wrote:
+///
+/// - a REQUIRED nullable key is one the payload always carries, so its `null` is restored after the
+///   dump drops it; and
+/// - a nested model is re-encoded through its OWN `to_dict`, because `model_dump` walks the nesting
+///   itself and would otherwise apply the first repair only to the outermost model.
+///
+/// A model needing neither keeps the single-expression form. Both repairs can land on ONE key — a
+/// required nullable nested model is the case — so a field is emitted once, as a single statement or a
+/// single `if`/`else`, rather than once per repair.
+fn emit_pydantic_to_dict_body(
+    out: &mut String,
+    fields: &[Field],
+    graph: &ApiGraph,
+    directions: SchemaDirections,
+) -> Result<(), CoreError> {
+    const DUMP: &str = "self.model_dump(mode=\"json\", by_alias=True, exclude_none=True)";
+    let repairs: Vec<ToDictRepair<'_>> = fields
+        .iter()
+        .filter_map(|field| ToDictRepair::of(field, graph, directions))
+        .collect();
+    if repairs.is_empty() {
+        writeln!(out, "        return {DUMP}").map_err(sink)?;
+        return Ok(());
+    }
+    writeln!(out, "        _data = {DUMP}").map_err(sink)?;
+    for repair in repairs {
+        let ident = pydantic_field_ident(repair.field);
+        let wire = py_string_literal(&repair.field.json_name);
+        match (
+            repair.encode,
+            repair.dump_may_drop_key,
+            repair.dropped_key_may_be_null,
+        ) {
+            // The dump kept the key, so the re-encode is unconditional.
+            (Some(expr), false, _) => {
+                writeln!(out, "        _data[{wire}] = {expr}").map_err(sink)?;
+            }
+            // A dropped key is a key the caller may legitimately leave out, so there is nothing to
+            // re-encode and no `null` to put back in its place.
+            (Some(expr), true, false) => {
+                writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
+            }
+            // Both repairs land on one key: re-encode what is there, restore the `null` when it is not.
+            (Some(expr), true, true) => {
+                writeln!(out, "        if self.{ident} is not None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = {expr}").map_err(sink)?;
+                writeln!(out, "        else:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+            }
+            // Nothing nested below this key, so the restored `null` is the whole repair.
+            (None, _, _) => {
+                writeln!(out, "        if self.{ident} is None:").map_err(sink)?;
+                writeln!(out, "            _data[{wire}] = None").map_err(sink)?;
+            }
+        }
+    }
+    writeln!(out, "        return _data").map_err(sink)?;
+    Ok(())
+}
+
+/// What one key needs putting back after `model_dump(exclude_none=True)`, or `None` for a key the dump
+/// already states correctly.
+struct ToDictRepair<'a> {
+    field: &'a Field,
+    /// The nested re-encode, when something below this key owns a `to_dict` rule of its own.
+    encode: Option<String>,
+    /// Whether `exclude_none` can drop this key, so a re-encode has to ask before touching it.
+    dump_may_drop_key: bool,
+    /// Whether a dropped key is one the payload carries as an explicit `null`.
+    dropped_key_may_be_null: bool,
+}
+
+impl<'a> ToDictRepair<'a> {
+    fn of(field: &'a Field, graph: &ApiGraph, directions: SchemaDirections) -> Option<Self> {
+        let ident = pydantic_field_ident(field);
+        let encode = encode_expr(&field.schema, graph, &format!("self.{ident}"));
+        let optional = directions.model_field_is_optional(field);
+        let nullable = directions.field_is_nullable(field);
+        let repair = Self {
+            field,
+            encode,
+            dump_may_drop_key: optional || nullable,
+            dropped_key_may_be_null: !optional && nullable,
+        };
+        (repair.encode.is_some() || repair.dropped_key_may_be_null).then_some(repair)
+    }
 }
 
 fn emit_dataclass(
@@ -865,7 +1050,7 @@ fn emit_dataclass(
         // preserved verbatim — only a keyword/leading-digit name is renamed, and the from-dict decode
         // (CR-04) maps the original JSON key onto the (possibly renamed) attribute by position.
         let ident = safe_ident(&field.json_name);
-        let hint = py_type(&field.schema, field.nullable, graph)?;
+        let hint = py_type(&field.schema, directions.field_is_nullable(field), graph)?;
         writeln!(out, "    {ident}: {hint}").map_err(sink)?;
     }
     for field in optional {
@@ -876,8 +1061,9 @@ fn emit_dataclass(
         // modeled in the hint, not only the default. A nullable field is already Optional[..]; wrapping
         // an already-Optional hint again is avoided by py_type carrying nullable, so only widen when the
         // value is not itself nullable.
-        let hint = py_type(&field.schema, field.nullable, graph)?;
-        let defaulted_hint = if field.nullable {
+        let nullable = directions.field_is_nullable(field);
+        let hint = py_type(&field.schema, nullable, graph)?;
+        let defaulted_hint = if nullable {
             hint
         } else {
             format!("Optional[{hint}]")
@@ -912,7 +1098,7 @@ fn emit_dataclass(
         } else {
             let accessor = format!("_data[\"{wire}\"]");
             let decoded = decode_expr(&field.schema, graph, &accessor);
-            if field.nullable && decoded != accessor {
+            if directions.field_is_nullable(field) && decoded != accessor {
                 // Required-but-nullable: the key is always present (a missing one is a real protocol
                 // error → KeyError), but the value may be `null` and THIS decode dereferences it — a
                 // list comprehension over None raises TypeError, and a nested `from_dict(None)` fails
@@ -2983,7 +3169,7 @@ mod tests {
         {
           "id": "app.models.Author", "name": "Author",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -2992,16 +3178,16 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "author", "required": true, "optional": false, "nullable": false,
+            { "json_name": "author", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "app.models.Author" },
               "description": null, "example": null },
-            { "json_name": "rating", "required": false, "optional": true, "nullable": true,
+            { "json_name": "rating", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "union", "of": [
                 { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                 { "type": "primitive", "of": { "prim": "float", "bits": 64 } }
               ] },
               "description": null, "example": null },
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3010,16 +3196,16 @@ mod tests {
         {
           "id": "app.models.BookFilters", "name": "BookFilters",
           "body": { "type": "object", "of": [
-            { "json_name": "genre", "required": true, "optional": false, "nullable": false,
+            { "json_name": "genre", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "in_stock", "required": false, "optional": true, "nullable": false,
+            { "json_name": "in_stock", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "bool" } },
               "description": null, "example": null },
-            { "json_name": "published", "required": true, "optional": false, "nullable": true,
+            { "json_name": "published", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "sort", "required": false, "optional": true, "nullable": false,
+            { "json_name": "sort", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "enum", "of": ["asc", "desc"] },
               "description": null, "example": null }
           ] },
@@ -3041,7 +3227,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3230,6 +3416,58 @@ mod tests {
     mod models {
         use super::{emit_models, emit_models_with_style, sample_graph, ApiGraph, PyModelStyle};
 
+        /// A request body with a required + nullable field at each nesting shape: a list of models, a
+        /// single model, and a scalar. Purpose-built rather than SAMPLE, which has none — and shared
+        /// by the decode and the encode test so both halves of the round trip read one graph.
+        const NULLABLE_NESTED_FACTS: &[u8] = br#"{
+              "module": "app",
+              "routes": [
+                {
+                  "method": "POST", "path": "/bags", "handler": "createBag",
+                  "operation_id": "createBag", "params": [],
+                  "request_body": { "ref_id": "app.models.Bag" },
+                  "responses": [ { "status": 204, "body": null } ],
+                  "span": {"file": "/root/main.py", "start_line": 1, "end_line": 1}
+                }
+              ],
+              "diagnostics": [],
+              "schemas": [
+                {
+                  "id": "app.models.Item",
+                  "name": "Item",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 1, "end_line": 1}
+                },
+                {
+                  "id": "app.models.Bag",
+                  "name": "Bag",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "items", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}},
+                     "description": null, "example": null},
+                    {"json_name": "lead", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "named", "of": "app.models.Item"},
+                     "description": null, "example": null},
+                    {"json_name": "note", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 2, "end_line": 2}
+                }
+              ]
+            }"#;
+
+        fn nullable_nested_graph() -> ApiGraph {
+            ApiGraph::from_facts(
+                serde_json::from_slice(NULLABLE_NESTED_FACTS).unwrap(),
+                "/root",
+            )
+        }
+
         #[test]
         fn named_enum_emits_str_enum_class_with_screaming_snake_members() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
@@ -3263,51 +3501,9 @@ mod tests {
         /// where a required-and-nullable model field still exists to be decoded.
         #[test]
         fn dataclass_from_dict_guards_a_required_nullable_decode() {
-            // Purpose-built graph rather than SAMPLE: this needs a required + nullable
-            // field at each decode shape, and SAMPLE has none.
-            const FACTS: &[u8] = br#"{
-              "module": "app",
-              "routes": [
-                {
-                  "method": "POST", "path": "/bags", "handler": "createBag",
-                  "operation_id": "createBag", "params": [],
-                  "request_body": { "ref_id": "app.models.Bag" },
-                  "responses": [ { "status": 204, "body": null } ],
-                  "span": {"file": "/root/main.py", "start_line": 1, "end_line": 1}
-                }
-              ],
-              "diagnostics": [],
-              "schemas": [
-                {
-                  "id": "app.models.Item",
-                  "name": "Item",
-                  "body": {"type": "object", "of": [
-                    {"json_name": "name", "required": true, "optional": false, "nullable": false,
-                     "schema": {"type": "primitive", "of": {"prim": "string"}},
-                     "description": null, "example": null}
-                  ]},
-                  "span": {"file": "/root/m.py", "start_line": 1, "end_line": 1}
-                },
-                {
-                  "id": "app.models.Bag",
-                  "name": "Bag",
-                  "body": {"type": "object", "of": [
-                    {"json_name": "items", "required": true, "optional": false, "nullable": true,
-                     "schema": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}},
-                     "description": null, "example": null},
-                    {"json_name": "lead", "required": true, "optional": false, "nullable": true,
-                     "schema": {"type": "named", "of": "app.models.Item"},
-                     "description": null, "example": null},
-                    {"json_name": "note", "required": true, "optional": false, "nullable": true,
-                     "schema": {"type": "primitive", "of": {"prim": "string"}},
-                     "description": null, "example": null}
-                  ]},
-                  "span": {"file": "/root/m.py", "start_line": 2, "end_line": 2}
-                }
-              ]
-            }"#;
-            let graph = ApiGraph::from_facts(serde_json::from_slice(FACTS).unwrap(), "/root");
-            let out = emit_models_with_style(&graph, "app", PyModelStyle::Dataclass).unwrap();
+            let out =
+                emit_models_with_style(&nullable_nested_graph(), "app", PyModelStyle::Dataclass)
+                    .unwrap();
 
             // A list of nested models: guarded, and the recursion is preserved.
             assert!(
@@ -3334,6 +3530,157 @@ mod tests {
                 !out.contains("\"items\" in _data"),
                 "a required key must still raise KeyError when absent:\n{out}"
             );
+        }
+
+        /// The encode half of the same round trip: both `to_dict` repairs can land on ONE key, and a
+        /// key gets ONE statement either way.
+        ///
+        /// `items` and `lead` need both — a nested model to re-encode when the value is there, and the
+        /// `null` `exclude_none` dropped when it is not — so they are one `if`/`else`. Emitting the two
+        /// repairs as two independent `if`s would be correct and would read as generated slop: an
+        /// `if x is not None:` immediately followed by `if x is None:` on the same attribute.
+        #[test]
+        fn pydantic_to_dict_writes_one_statement_per_repaired_key() {
+            let out = emit_models(&nullable_nested_graph(), "app").unwrap();
+            for (ident, wire, expr) in [
+                (
+                    "items",
+                    "items",
+                    "[_item.to_dict() for _item in self.items]",
+                ),
+                ("lead", "lead", "self.lead.to_dict()"),
+            ] {
+                assert!(
+                    out.contains(&format!(
+                        "        if self.{ident} is not None:\n            _data[\"{wire}\"] = \
+                         {expr}\n        else:\n            _data[\"{wire}\"] = None\n"
+                    )),
+                    "a required nullable nested key needs one if/else:\n{out}"
+                );
+                assert!(
+                    !out.contains(&format!("        if self.{ident} is None:")),
+                    "the `else` replaces the second `if`, it does not join it:\n{out}"
+                );
+            }
+            // A scalar has nothing to re-encode, so it keeps the bare null repair.
+            assert!(
+                out.contains(
+                    "        if self.note is None:\n            _data[\"note\"] = None\n        return _data\n"
+                ),
+                "a required nullable scalar restores its null and nothing else:\n{out}"
+            );
+            // `Item` needs neither repair, so its own `to_dict` keeps the single-expression form —
+            // which is also what makes the re-encodes above worth writing.
+            let item = out
+                .split("class Item(BaseModel):")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\n\n").next())
+                .unwrap_or_else(|| panic!("no Item class in:\n{out}"));
+            assert!(
+                item.contains(
+                    "    def to_dict(self) -> dict[str, Any]:\n        return self.model_dump("
+                ),
+                "a model with nothing to repair keeps one expression:\n{item}"
+            );
+        }
+
+        /// A request body carrying a nested model behind every container `model_validate` rebuilds one
+        /// inside, plus the two union shapes.
+        const NESTED_CONTAINER_FACTS: &[u8] = br#"{
+              "module": "app",
+              "routes": [
+                {
+                  "method": "POST", "path": "/nest", "handler": "nest",
+                  "operation_id": "nest", "params": [],
+                  "request_body": {"ref_id": "app.models.Nest"},
+                  "responses": [{"status": 204, "body": null}],
+                  "span": {"file": "/root/main.py", "start_line": 1, "end_line": 1}
+                }
+              ],
+              "schemas": [
+                {
+                  "id": "app.models.Item", "name": "Item",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 1, "end_line": 1}
+                },
+                {
+                  "id": "app.models.Other", "name": "Other",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "code", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "primitive", "of": {"prim": "string"}},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 2, "end_line": 2}
+                },
+                {
+                  "id": "app.models.Nest", "name": "Nest",
+                  "body": {"type": "object", "of": [
+                    {"json_name": "choice", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "named", "of": "app.models.Other"}
+                     ]},
+                     "description": null, "example": null},
+                    {"json_name": "either", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "array", "of": {"type": "named", "of": "app.models.Item"}}
+                     ]},
+                     "description": null, "example": null},
+                    {"json_name": "lookup", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "map", "of": {
+                       "key": {"type": "primitive", "of": {"prim": "string"}},
+                       "value": {"type": "named", "of": "app.models.Item"}
+                     }},
+                     "description": null, "example": null},
+                    {"json_name": "matrix", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "array", "of": {"type": "array", "of": {"type": "named", "of": "app.models.Item"}}},
+                     "description": null, "example": null},
+                    {"json_name": "mixed", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
+                     "schema": {"type": "union", "of": [
+                       {"type": "named", "of": "app.models.Item"},
+                       {"type": "primitive", "of": {"prim": "string"}}
+                     ]},
+                     "description": null, "example": null}
+                  ]},
+                  "span": {"file": "/root/m.py", "start_line": 3, "end_line": 3}
+                }
+              ],
+              "diagnostics": []
+            }"#;
+
+        /// `to_dict` reaches a nested model through every container `from_dict` rebuilds one inside.
+        ///
+        /// `from_dict` is `model_validate`, which rebuilds models inside dicts, lists of lists, and
+        /// unions alike, so a repair that stopped at a bare `$ref` and a one-level list would hand back
+        /// a payload its own decode rejects wherever a required-nullable key sits further down.
+        #[test]
+        fn pydantic_to_dict_reaches_a_nested_model_through_every_container() {
+            let graph = ApiGraph::from_facts(
+                serde_json::from_slice(NESTED_CONTAINER_FACTS).unwrap(),
+                "/root",
+            );
+            let out = emit_models(&graph, "app").unwrap();
+            for expected in [
+                // A dict value is rebuilt by `model_validate`, so it is re-encoded here.
+                "        _data[\"lookup\"] = {_key: _value.to_dict() for _key, _value in self.lookup.items()}\n",
+                // Depth scopes each comprehension binding, so the inner loop does not iterate the name
+                // its parent bound.
+                "        _data[\"matrix\"] = [[_item1.to_dict() for _item1 in _item] for _item in self.matrix]\n",
+                // A union's static type does not say which variant is held, so the test is a runtime
+                // one — and it reads the same whether every variant is a model or only some are.
+                "        _data[\"choice\"] = self.choice.to_dict() if isinstance(self.choice, BaseModel) else self.choice\n",
+                "        _data[\"mixed\"] = self.mixed.to_dict() if isinstance(self.mixed, BaseModel) else self.mixed\n",
+            ] {
+                assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
+            }
+            // A union with a CONTAINER variant needs a comprehension no single expression can select,
+            // so it is left alone rather than half-repaired by a test that would miss the list.
+            assert!(!out.contains("_data[\"either\"]"), "{out}");
         }
 
         #[test]
@@ -3404,12 +3751,10 @@ mod tests {
                 out.contains("    in_stock: Optional[bool] = Field(default=None)\n"),
                 "optional non-nullable field must accept None at wrapper boundaries:\n{out}"
             );
-            // Nullable, and no validation rule reaches this model, so the key may be left out: the hint
-            // was `Optional[str]` either way and the default is the whole of what changes. Without it
-            // the model could not decode its own `to_dict()`, which excludes every None.
+            // Required and nullable are independent: nullable changes the hint, not the default.
             assert!(
-                out.contains("    published: Optional[str] = Field(default=None)\n"),
-                "a nullable key no rule demands must carry a default:\n{out}"
+                out.contains("    published: Optional[str]\n"),
+                "a required nullable key must not gain an omission default:\n{out}"
             );
         }
 
@@ -3536,7 +3881,7 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3545,10 +3890,10 @@ mod tests {
         {
           "id": "app.models.CreatedMessage", "name": "CreatedMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+            { "json_name": "id", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null },
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3557,7 +3902,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -4138,10 +4483,10 @@ mod tests {
               "schemas": [
                 { "id": "app.models.Reserved", "name": "Reserved",
                   "body": { "type": "object", "of": [
-                    { "json_name": "from", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "from", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null },
-                    { "json_name": "class", "required": false, "optional": true, "nullable": false,
+                    { "json_name": "class", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null }
                   ] },
@@ -4215,17 +4560,17 @@ mod tests {
               "schemas": [
                 { "id": "app.models.Inner", "name": "Inner",
                   "body": { "type": "object", "of": [
-                    { "json_name": "v", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "v", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null }
                   ] },
                   "span": { "file": "/root/m.py", "start_line": 1, "end_line": 1 } },
                 { "id": "app.models.Outer", "name": "Outer",
                   "body": { "type": "object", "of": [
-                    { "json_name": "inner", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "inner", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "named", "of": "app.models.Inner" },
                       "description": null, "example": null },
-                    { "json_name": "items", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "items", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "array", "of": { "type": "named", "of": "app.models.Inner" } },
                       "description": null, "example": null }
                   ] },

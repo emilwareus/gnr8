@@ -1015,9 +1015,15 @@ impl Pipeline {
         }
 
         let mut artifacts = Artifacts::new();
-        for (index, target) in self.targets.iter().enumerate() {
-            artifacts.begin_stage(format!("target[{index}]:{}", target.producer()));
-            target.generate(&ir, &mut artifacts, cx)?;
+        if !self.targets.is_empty() {
+            // Every target, including a user-defined one, receives the same canonical directional
+            // graph. `build_ir` and `__inspect` intentionally retain the unsplit source facts; the
+            // projection belongs at the artifact boundary.
+            let generation_ir = crate::graph::projection::for_generation(&ir)?;
+            for (index, target) in self.targets.iter().enumerate() {
+                artifacts.begin_stage(format!("target[{index}]:{}", target.producer()));
+                target.generate(&generation_ir, &mut artifacts, cx)?;
+            }
         }
         for (index, post) in self.posts.iter().enumerate() {
             artifacts.begin_stage(format!("post[{index}]:{}", post.producer()));
@@ -1778,7 +1784,7 @@ pub mod prelude {
     };
     pub use crate::graph::{
         DiagnosticCategory, OpenApiContact, OpenApiLicense, OpenApiServer, PaginationMode,
-        PaginationTermination, RuntimeHookKind, SecurityScheme, Type,
+        PaginationTermination, RuntimeHookKind, SchemaUse, SecurityScheme, Type,
     };
 }
 
@@ -1800,6 +1806,48 @@ mod tests {
     impl Source for StubSource {
         fn load(&self, _cx: &Cx) -> Result<ApiGraph, CoreError> {
             Ok(ApiGraph::default())
+        }
+    }
+
+    /// A non-HTTP schema used in both directions with deliberately different contracts.
+    struct DirectionalSource;
+    impl Source for DirectionalSource {
+        fn load(&self, _cx: &Cx) -> Result<ApiGraph, CoreError> {
+            let mut graph = ApiGraph::default();
+            graph.schemas.push(crate::graph::Schema {
+                id: "tool.Payload".to_string(),
+                name: "Payload".to_string(),
+                body: crate::graph::Type::Object(vec![crate::graph::Field {
+                    json_name: "value".to_string(),
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: false,
+                    deserializer_accepts_null: true,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
+                    schema: crate::graph::Type::Primitive(crate::graph::Prim::String),
+                    description: None,
+                    example: None,
+                    meta: crate::analyze::facts::FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance: crate::graph::SourceSpan {
+                    file: "tool.rs".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            });
+            graph.schema_uses.extend([
+                crate::graph::SchemaUseRoot {
+                    schema_id: "tool.Payload".to_string(),
+                    use_: crate::graph::SchemaUse::Input,
+                },
+                crate::graph::SchemaUseRoot {
+                    schema_id: "tool.Payload".to_string(),
+                    use_: crate::graph::SchemaUse::Output,
+                },
+            ]);
+            Ok(graph)
         }
     }
 
@@ -1856,6 +1904,21 @@ mod tests {
 
         fn readiness_targets(&self) -> Vec<ReadinessTarget> {
             vec![ReadinessTarget::new(self.kind, self.path)]
+        }
+    }
+
+    struct SchemaNamesTarget;
+
+    impl Target for SchemaNamesTarget {
+        fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+            let names = ir
+                .schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.create("schema-names.txt", names)?;
+            Ok(())
         }
     }
 
@@ -1952,6 +2015,19 @@ mod tests {
             .unwrap();
         // The later transform wins → ordered application.
         assert_eq!(ir.title, "Second");
+    }
+
+    #[test]
+    fn every_target_receives_the_canonical_directional_projection() {
+        let outcome = Pipeline::new()
+            .source(DirectionalSource)
+            .target(SchemaNamesTarget)
+            .run(&Cx::new(std::env::temp_dir()))
+            .unwrap();
+        assert_eq!(
+            outcome.artifacts.files()[0].text,
+            "PayloadInput\nPayloadOutput"
+        );
     }
 
     #[test]

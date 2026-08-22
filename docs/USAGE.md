@@ -117,6 +117,11 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 | `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
 | `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
+Before the first target runs, the pipeline projects the frozen source facts into their canonical
+input/output schemas. Built-in and custom targets therefore see the same split names and transitive
+references. `build_ir` and `__inspect` deliberately retain the unsplit extraction facts for inspection;
+direct artifact tooling can call `ApiGraph::project_for_generation()` at the same boundary.
+
 - `Pipeline::new().source(..).transform(..).target(..).post(..)` — builder, stages kept in call order.
 - `Cx { project_root }` — the root relative paths resolve against. `Artifacts::create(path, text)` adds
   a generated file with explicit ownership and rejects collisions.
@@ -311,51 +316,46 @@ side of the exchange the payload is on. The OpenAPI `required` array:
 |---|---|---|
 | requests only (a request body, a parameter, or a schema one of those reaches) | the `binding:`/`validate:` `required` rules | that is what the server rejects a request for lacking |
 | responses only | every field with **no** `json` omission option | that is what `encoding/json` writes unconditionally; nothing validates a response |
-| both | only the fields that satisfy **both** rules | one component describes both payloads, so it can only promise what holds in each |
-| no route at all | the `binding:`/`validate:` `required` rules | a DTO struct is a component schema whether or not a route uses it, and an unwired one occupies no position to be read from |
+| both | the request and response answers separately | gnr8 emits `TypeInput` and `TypeOutput` when presence or null behavior differs |
+| registered non-HTTP input/output | the corresponding request/response answer | `register_input_schema` and `register_output_schema` add roots without fake routes |
 
-The direction is a property of your routes, not a setting. A DTO used in one direction gets an exact
-answer; a struct shared between a request body and a response body gets the narrower one, because a
-field the request does not demand may legitimately be absent from what a client sends, and a field
-the serializer may omit is not something a client can count on receiving. **If you want the exact
-answer in each direction, use a separate type for each** — that is the only thing that makes the two
-questions separately answerable.
+The direction is derived from HTTP operations plus explicitly registered non-HTTP roots. The walk is
+transitive through named fields. If a shared schema or anything it references differs by direction,
+the artifact projection creates distinct input and output components/models and rewrites references.
 
 Generated SDK models read the same walk:
 
 | The schema is reached from | The model may leave the key out when | Because |
 |---|---|---|
 | requests only | **no** `binding:`/`validate:` `required` rule demands it | an omission option governs marshalling, and your server unmarshals a request DTO — it never marshals one, so the tag says nothing about what a client may omit |
-| responses only, both, or no route at all | the field carries a `json` omission option | the model is (or may be) the decode side, where the key's absence is your server's choice and not the caller's |
-| responses only, or no route at all — **also** when the field is nullable | its value may be `null`, and no rule reaches the model here to demand the key | a nullable key gives a reader no case by being present that the `null` did not already give them, so demanding it only costs the caller a value to spell |
-| both — **also** when the field is nullable | its value may be `null` **and** no `binding:`/`validate:` `required` rule demands it | same reason, except where such a rule does demand it: there the model is the inbound side too, and the demand is your server's |
+| responses only | the serializer may omit it | the response model must accept every payload the serializer can emit |
+| both | according to the exact input/output projection | distinct models are emitted when the answers differ |
 
-The first row is the one that keeps a caller from building a request the server rejects: a field
-written `json:"name,omitempty"` with `binding:"required"` is required in a request model, and the SDK
-will not let it be omitted. The second row is what keeps a response model decodable, so a field the
-serializer may drop is never demanded — which is also why a type used in **both** directions keeps
-the response answer: over-requiring it would break decoding a payload your server is entitled to
-send. On such a type a validated-and-omittable field stays omittable in the model, and the document
-publishes it as not required too; splitting the type in two is what makes both directions exact.
+Nullability never changes these answers. A bare `*T`, slice, or map with no omission option is a
+required nullable response property. With `omitempty`/`omitzero`, a nil value is omitted; when present,
+an ordinary pointer/slice/map is non-null. Request nullability is selected independently:
+`encoding/json` accepts null into ordinary destinations, and a required validator rejects the
+resulting zero or nil value where its rule applies. `json.RawMessage` instead retains literal null as
+non-nil bytes and is not narrowed by that rule.
 
-The last two rows are about the value axis rather than presence, and they are why a bare `*T` — a key
-your server writes on every response, holding a value that may be `null` — is not something a caller
-has to spell out. The model hints `Optional[str]` / `string | null` whether or not the key may be
-absent, so demanding it changes nothing about reading the value and only makes the caller write
-`userUuid=None`; `PySdk`'s `to_dict` then drops that key again (`exclude_none`), so a model that
-demanded it could not decode its own output. **The document is unaffected**: `required` describes the
-payload, and that key genuinely is written every time.
+Go value types use a pointer when the projected model must represent absence or null. Optional value
+types pair that pointer with `,omitempty`, preserving explicit zero values; required nullable value
+types omit the tag, so nil is serialized as a present null. When both axes apply, an additional
+pointer distinguishes an omitted field from a caller-selected explicit null; the same rule wraps a
+slice or map so its nil value can mean null rather than omission.
 
-**Go renders that answer with one restriction.** TypeScript's `?:` and Python's `= None` say "the
-caller may leave this key out" and nothing else, so they follow the table exactly. `,omitempty` says
-something different — "drop this key when the value is the zero value" — so gnr8 only ever takes it
-**away**, never adds it. A `binding:"required"` field tagged `,omitempty` loses the option, which is
-the fix the first row exists for; a request field with no validation rule keeps whatever the source
-wrote, because adding `,omitempty` there would cost you `"price": 0` and `"tags": []` without buying
-absence (Go needs a pointer for that, and gnr8 spends pointers on nullability), and on a struct, a
-`time.Time`, or a non-zero-length array it would do nothing at all — that is the tag gnr8 reports as
-`schema.omit_option.ineffective`. So a Go request model can be stricter than its Python and
-TypeScript twins, and both are correct against the document.
+Non-HTTP roots and checked static-knowledge corrections live in the `.gnr8/` crate:
+
+```rust
+ApiOverrides::new()
+    .register_input_schema("ToolInput")
+    .register_output_schema("ToolOutput")
+    .force_non_nullable("Response", "items", SchemaUse::Output)
+    .force_nullable("Envelope", "payload", SchemaUse::Output)
+```
+
+A nullability correction fails when its schema or field disappears, when the extracted pre-change
+shape no longer matches the assertion, or when it has become redundant.
 
 ### Validation rules apply at the scope they are written in
 
@@ -468,11 +468,11 @@ To make documentation mandatory, add the opt-in `RequireOperationDocs` transform
 | `float64` | `number`/`double` | `float64` | width preserved |
 | `time.Time` | `string`/`date-time` | `time.Time` | |
 | `uuid.UUID` | `string`/`uuid` | `string` | well-known |
-| `*T` | nullable | `*T`; `,omitempty` only when optional | `encoding/json` writes `"k":null` and **keeps the key** — a bare pointer is nullable, not optional. |
-| `,omitzero` | source-optional | **value `T` + `,omitempty`** | omits the zero value of **any** type; the omission signal, not nullability. |
-| `,omitempty` | source-optional *for the types it omits* | **value `T` + `,omitempty`** | omits only `false`, `0`, `""`, nil pointer/interface, zero-length array/slice/map. A **no-op on a struct, a `time.Time`, or a non-zero-length array** → `schema.omit_option.ineffective`. |
-| `[]T` | `array`, nullable | `[]T` | a nil slice marshals to `null`, so the value axis is nullable whatever the tag says. |
-| `map[string]T` | `object`,`additionalProperties:true`, nullable | `map[string]T` | free-form → diagnostic; a nil map marshals to `null`. |
+| `*T` | nullable without an omission option; optional/non-null on output with one | `*T`; `,omitempty` only when optional; `**T` when both axes apply | `encoding/json` writes `"k":null` and **keeps the key** for a bare pointer. |
+| `,omitzero` | source-optional | optional value types use `*T` + `,omitempty`; containers use their native type unless also nullable | omits the zero value of **any** type; the omission signal, not nullability. |
+| `,omitempty` | source-optional *for the types it omits* | optional value types use `*T` + `,omitempty`; containers use their native type unless also nullable | omits only `false`, `0`, `""`, nil pointer/interface, zero-length array/slice/map. A **no-op on a struct, a `time.Time`, or a non-zero-length array** → `schema.omit_option.ineffective`. |
+| `[]T` | required/nullable without omission; optional/non-null on output with omission | `[]T` | a nil slice marshals to null when its key is retained and is omitted when the tag applies. |
+| `map[string]T` | required/nullable without omission; optional/non-null on output with omission | `map[string]T` | free-form → diagnostic; a nil map follows the same directional rule. |
 | named-string+consts | string `enum` | typed newtype | |
 | nested struct | `$ref` | nested type | |
 | embedded struct | flattened fields | flattened | |
@@ -506,19 +506,18 @@ lists every diagnostic.
 ## Known quirks / limits (do not treat as bugs unless fixing them)
 - Static Gin group prefixes are folded only when they are literal strings. Dynamic route paths are
   skipped with diagnostics; dynamic group prefixes are omitted with diagnostics.
-- Optional and nullable are independent, and each reads exactly one thing. **Presence** (may the key be
-  absent) comes from the `json` tag's omission option alone — never from the declared type. **Nullability**
-  (may the value be `null`) comes from the declared type alone: a nil pointer, slice, map, or interface is
-  what `encoding/json` writes as `null` — and what `json.Unmarshal` accepts a `null` into, whatever
-  the tag says, which is why an `,omitempty` field is nullable even though it can never *write*
-  `null`. So `[]T json:"k"` is nullable-but-always-present, and
-  `*T json:"k"` is too — neither is optional until the tag says so. A `form:`-tagged field is a
+- Presence and null behavior are independent in both directions. **Outbound presence** comes from the
+  `json` omission option. **Outbound nullability** records whether a present value can be null, so an
+  omission-tagged ordinary pointer/slice/map is optional and non-null when present. A correctly-shaped
+  custom `MarshalJSON` method can emit null independently of the declared Go representation.
+  **Inbound nullability** records decoding and validation separately: `encoding/json` accepts null
+  for ordinary value destinations by leaving them unchanged, while a required validator can reject
+  the resulting zero value without changing the response contract. A `form:`-tagged field is a
   different wire with different rules: never nullable (a part has no `null`), and optional when the
   part is a pointer **or** the tag carries `,omitempty` (`,omitzero` is read on the `json` wire only).
-- Field presence is answered from the direction the schema is reached from, in the document and in
-  every generated SDK model, so the same struct fields can come out required in a request DTO and
-  omittable in a response DTO. A struct shared between the two keeps the response answer in its model
-  and publishes only what holds in both in its document — see
+- Field presence and nullability are answered from the direction the schema is reached from, in the
+  document and every generated SDK model. A shared struct is projected into input/output models when
+  those contracts differ — see
   [presence is answered from the direction the schema is reached from](#presence-is-answered-from-the-direction-the-schema-is-reached-from).
 - A handler whose success response is built dynamically may infer an odd response type (e.g. an error
   type), or emit a dynamic-response diagnostic.

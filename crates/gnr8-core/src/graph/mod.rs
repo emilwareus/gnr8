@@ -16,6 +16,7 @@
 //! the file path normalized relative to the analyzed module so the graph is portable across machines).
 
 pub(crate) mod direction;
+pub(crate) mod projection;
 
 use crate::analyze::facts::{
     DiagnosticCategoryFact, DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact,
@@ -55,7 +56,7 @@ pub(crate) fn split_local_component_ref(reference: &str) -> Option<(String, Opti
 /// plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads, then passes
 /// to the existing lowering and SDK emitters. They default to a root-mounted, untitled, unsecured API
 /// with no runtime helpers, so a bare `build_graph` graph still lowers.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiGraph {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub module: String,
@@ -96,6 +97,10 @@ pub struct ApiGraph {
     /// Operation documentation metadata, keyed by operation id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operation_docs: Vec<OperationDocsPolicy>,
+    /// Non-HTTP input/output roots configured by user code. These roots participate in the same
+    /// transitive payload-direction analysis as operation bodies without inventing HTTP routes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_uses: Vec<SchemaUseRoot>,
 }
 
 /// The default API base path (`"/"`, a root-mounted service) used when no transform sets one.
@@ -126,8 +131,46 @@ impl Default for ApiGraph {
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
             operation_docs: Vec::new(),
+            schema_uses: Vec::new(),
         }
     }
+}
+
+impl ApiGraph {
+    /// Build the canonical direction-specific graph consumed by artifact targets.
+    ///
+    /// Source inspection retains the unsplit observations above. Target generation uses this
+    /// projection so a schema whose input and output contracts differ becomes distinct public
+    /// models with every transitive reference rewritten consistently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CoreError::Config`] when directional public names collide or a reference
+    /// cannot be assigned its canonical payload direction.
+    pub fn project_for_generation(&self) -> Result<Self, crate::CoreError> {
+        Ok(projection::for_generation(self)?.into_owned())
+    }
+}
+
+/// A payload position in which a schema is used.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaUse {
+    /// Data accepted by an HTTP handler, tool, or other integration boundary.
+    Input,
+    /// Data emitted by an HTTP handler, tool, or other integration boundary.
+    Output,
+}
+
+/// One explicitly registered non-HTTP schema-use root.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchemaUseRoot {
+    /// Stable graph schema id.
+    pub schema_id: String,
+    /// Direction in which the schema is consumed.
+    pub use_: SchemaUse,
 }
 
 /// Public `OpenAPI` document metadata that cannot be inferred reliably from runtime source.
@@ -464,7 +507,7 @@ pub struct SecurityScheme {
 /// `summary`/`description` are the ONE non-structural pair, and they are still a source fact: they are
 /// the routed handler's own doc comment read as plain prose via the language's native synopsis
 /// convention (CLAUDE.md rule 0.1 category 2). They carry no grammar and can state nothing structural.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
     pub id: String,
@@ -518,7 +561,7 @@ pub struct Operation {
 /// One path or query parameter of an operation, derived purely from code. Path params are required;
 /// query params default to a string type and not required. There is no enum or description — those
 /// were annotation-only and have been removed (CLAUDE.md rules 1 & 3).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     /// The parameter name (e.g. `"uuid"`, `"cursor"`).
     pub name: String,
@@ -632,7 +675,7 @@ fn is_false(value: &bool) -> bool {
 /// [`Type::Object`], a string-enum becomes [`Type::Enum`]. There is no separate string discriminator —
 /// the [`Type`] variant *is* the discriminant, so a new kind of named type is a compile error in every
 /// consumer rather than a silently-mishandled magic string.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
     pub id: String,
@@ -876,6 +919,7 @@ impl ApiGraph {
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
             operation_docs: Vec::new(),
+            schema_uses: Vec::new(),
         }
     }
 }
@@ -1040,9 +1084,12 @@ fn normalize_fields(fields: Vec<FieldFact>) -> Vec<FieldFact> {
         .into_iter()
         .map(|f| FieldFact {
             json_name: f.json_name,
-            required: f.required,
-            optional: f.optional,
-            nullable: f.nullable,
+            serializer_may_omit: f.serializer_may_omit,
+            deserializer_accepts_absent: f.deserializer_accepts_absent,
+            deserializer_accepts_null: f.deserializer_accepts_null,
+            serializer_may_emit_null: f.serializer_may_emit_null,
+            validator_requires_presence: f.validator_requires_presence,
+            validator_rejects_null: f.validator_rejects_null,
             schema: normalize_type(f.schema),
             description: f.description,
             example: f.example,
@@ -1145,18 +1192,14 @@ mod tests {
             "of": [
               {
                 "json_name": "zeta",
-                "required": false,
-                "optional": true,
-                "nullable": true,
+                "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
                 "schema": { "type": "primitive", "of": { "prim": "string" } },
                 "description": null,
                 "example": null
               },
               {
                 "json_name": "name",
-                "required": true,
-                "optional": false,
-                "nullable": false,
+                "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                 "schema": { "type": "primitive", "of": { "prim": "string" } },
                 "description": null,
                 "example": null
@@ -1271,12 +1314,12 @@ mod tests {
         };
         // `name`: neither optional nor nullable.
         let name = fields.iter().find(|f| f.json_name == "name").unwrap();
-        assert!(!name.optional);
-        assert!(!name.nullable);
+        assert!(!name.serializer_may_omit);
+        assert!(!name.deserializer_accepts_null);
         // `zeta`: both optional and nullable — the two axes are carried independently.
         let zeta = fields.iter().find(|f| f.json_name == "zeta").unwrap();
-        assert!(zeta.optional);
-        assert!(zeta.nullable);
+        assert!(zeta.serializer_may_omit);
+        assert!(zeta.deserializer_accepts_null);
     }
 
     #[test]

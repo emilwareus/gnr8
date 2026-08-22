@@ -87,14 +87,57 @@ dynamic object arrays.
 ```
 
 `force_required` / `force_optional` state a field's presence outright rather than correcting one of
-the two axes the graph carries, so the correction reads the same in every direction the schema is
-reached from (see
+the separate decode/validate/serialize facts the graph carries, so the correction reads the same in
+every direction the schema is reached from (see
 [a component schema's `required` array](../openapi/generation.md#a-component-schemas-required-array))
 and in every generated SDK model.
 
 Typed body helpers create or replace the body, set its media type, and default to required. Chain
 `.optional()` immediately after the body it modifies. Plain `.request_body(method, path)` changes
 requiredness only and therefore requires an existing body.
+
+## Directional nullability and non-HTTP schema use
+
+Nullability is answered per direction, so a correction to it names the direction it applies to:
+
+```rust
+.transform(
+    ApiOverrides::new()
+        // The handler never marshals a nil slice into this key.
+        .force_non_nullable("Book", "tags", SchemaUse::Output)
+        // This field's own UnmarshalJSON rejects an explicit null.
+        .force_non_nullable("CreateBook", "publishedAt", SchemaUse::Input),
+)
+```
+
+`force_non_nullable` and its inverse `force_nullable` are checked assertions about static knowledge the
+source cannot state: a method body is not a typed fact, and neither is a handler's promise about what
+it writes. Each fails when its schema or field is gone, when a bare schema name is ambiguous, and when
+the extracted field already has the asserted nullability — so a correction the source has caught up
+with is an error rather than a silent no-op.
+
+Note which direction usually needs correcting. `encoding/json` accepts an explicit `null` into every
+ordinary Go destination, so input nullability is already true for most Go fields and asserting it again
+is the redundant case above; what a serializer can *write* is narrower, and that is where an assertion
+in either direction most often has something to say.
+
+A schema an HTTP operation never reaches has no payload position, and gets the input answer by default.
+Register the direction outright when a type is a payload for something other than a route — a tool
+call, a queue message, an event:
+
+```rust
+.transform(
+    ApiOverrides::new()
+        .register_input_schema("ToolInput")
+        .register_output_schema("ToolOutput"),
+)
+```
+
+A root participates in the same transitive walk an operation body does, so everything it reaches is
+reached in that direction too. Registering the same schema in the same direction twice is an error.
+Registering it in both is not: that is a type used both ways, and when its input and output contracts
+differ it is published as `TypeInput` and `TypeOutput` like any other (see
+[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models)).
 
 ## Typed parameters
 

@@ -45,6 +45,10 @@ Pipeline::new()
     );
 ```
 
+A patch names a **published component**, not a source type, so a type whose input and output
+contracts differ is patched as `TypeInput` or `TypeOutput` — one patch per direction, since the two
+components are two contracts. A patch left on the un-split name fails and names both.
+
 ## What is emitted
 
 The lowerer writes graph-backed OpenAPI facts including:
@@ -68,23 +72,23 @@ operation — request body and parameters on one side, response bodies on the ot
 
 | The schema is reached from | `required` is | Because |
 |---|---|---|
-| requests only | the fields the source's validation rules demand | that is what the server rejects a request for lacking |
+| requests only | fields whose deserializer rejects absence or whose validator requires presence | that is what the server rejects a request for lacking |
 | responses only | the fields the serializer always writes | nothing validates a response; a handler does not validate what it marshals |
-| both | the fields that satisfy both | one component describes both payloads, so it can only promise what holds in each |
-| no operation at all | the fields the source's validation rules demand | a registered-but-unwired schema occupies no position to be read from |
+| both | the corresponding input and output answers | differing contracts become separate `TypeInput` and `TypeOutput` components |
+| registered non-HTTP root | the explicitly selected input or output answer | `register_input_schema` / `register_output_schema` supplies direction without a fake route |
+| no root | the input answer | an unwired declaration has no serializer-facing payload position |
 
-This is one answer per position rather than a preference between two candidates, so there is no
-setting for it. A schema shared between a request body and a response body gets the narrower answer;
-use a separate type for each direction to get the exact one in both. An imported OpenAPI document
-states presence once, so its `required` arrays re-emit unchanged whichever way its schemas are used.
+The walk is transitive through named fields. If a shared schema, or a nested schema it references,
+has different presence or null behavior by direction, artifact projection creates separate input and
+output components and rewrites every directional reference. An imported OpenAPI document states one
+presence/null contract, so its schemas ordinarily remain shared.
 
-Generated SDK models read the same walk and answer the same question, so on a request-only schema a
-`PySdk` or `TsSdk` model requires exactly what this array lists. A `GoSdk` model can require more:
-`,omitempty` is the only omission spelling Go has and it drops the zero value rather than marking
-absence, so gnr8 never adds one the source did not write, and a field this array omits may still be a
-key the Go struct always sends. See
-[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models) for
-that restriction and for where the two artifacts deliberately differ.
+Generated SDK models read the same walk and answer the same question, so a key this array lists is one
+every generated model demands, and a key it omits is one every generated model may leave out. The
+three targets only differ in how they spell that: `TsSdk` uses `?:`, `PySdk` a `= None` default, and
+`GoSdk` a pointer plus `,omitempty` — the pointer being what keeps an omitted key distinct from an
+explicit zero value. See
+[field presence in generated models](../sdk/generation.md#field-presence-in-generated-models).
 
 ## Metadata
 
@@ -132,5 +136,5 @@ gnr8 doctor
 gnr8 check
 ```
 
-For a migration with a reference specification, review the generated document with the same
+When replacing a reference specification, review the generated document with the same
 repository-level schema and consumer checks used for the existing contract.

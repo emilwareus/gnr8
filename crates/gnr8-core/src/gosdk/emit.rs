@@ -5,9 +5,8 @@
 //!
 //! - [`emit_models`]   — one struct per object [`Schema`], one `type X string` newtype + const block
 //!   per enum [`Schema`]; Go field names are exported-CamelCase of the json tag (with Go initialisms),
-//!   json tags carry `,omitempty` where the source's own tag does and the side of the exchange the
-//!   struct is on permits it ([`omits_when_empty`] — the direction can take the option away but never
-//!   put one on), types follow TARGET-API.md §4.
+//!   json tags and pointer representations carry the direction-selected presence/null contract;
+//!   types otherwise follow TARGET-API.md §4.
 //! - [`emit_client`]   — the functional-options `Client` (`NewClient`, `WithHTTPClient`, `WithAPIKey`).
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
@@ -145,7 +144,7 @@ fn go_type(schema: &Type, nullable: bool, graph: &ApiGraph) -> Result<String, Co
             return Ok(maybe_pointer(
                 target.name.clone(),
                 nullable,
-                is_value_ref(target),
+                is_value_ref(target, graph),
             ));
         }
         // An inline (anonymous) object is not emitted as a Go type in this PoC (every object is a
@@ -208,71 +207,52 @@ fn go_well_known(well_known: &WellKnown) -> &'static str {
 
 /// Whether a referenced schema lowers to a Go *value* type that needs a pointer to be nullable.
 ///
-/// Enum newtypes are string-backed value types (`*TargetDirection` when nullable, per `expected/sdk`);
-/// object refs are structs and are pointer-wrapped only when nullable too. The match over the named
-/// schema's neutral body is exhaustive (T-03).
-fn is_value_ref(target: &Schema) -> bool {
-    match &target.body {
-        // Both enums and structs are value types in Go; a nullable field is a pointer either way.
-        Type::Enum(_) | Type::Object(_) => true,
-        // A named schema whose body is a scalar/array/map/union/any is not a Go struct/enum newtype;
-        // it is not pointer-wrapped on the named-ref path (its own mapping handles nilability).
+/// Enum newtypes and object refs are Go values, as are aliases whose transitive body is a scalar.
+/// Array, map, `any`, and byte-slice aliases already have a native nil representation. The match over
+/// the named schema's neutral body is exhaustive (T-03).
+fn is_value_ref(target: &Schema, graph: &ApiGraph) -> bool {
+    let mut visited = BTreeSet::new();
+    go_type_is_value(&target.body, graph, &mut visited)
+}
+
+fn go_type_is_value(ty: &Type, graph: &ApiGraph, visited: &mut BTreeSet<String>) -> bool {
+    match ty {
+        Type::Primitive(Prim::Bytes) | Type::Array(_) | Type::Map { .. } | Type::Any {} => false,
         Type::Primitive(_)
         | Type::WellKnown(_)
-        | Type::Array(_)
-        | Type::Map { .. }
-        | Type::Named(_)
-        | Type::Union(_)
-        | Type::Any {} => false,
+        | Type::Enum(_)
+        | Type::Object(_)
+        | Type::Union(_) => true,
+        Type::Named(id) => {
+            if !visited.insert(id.clone()) {
+                return true;
+            }
+            graph
+                .schemas
+                .iter()
+                .find(|schema| schema.id == *id)
+                .is_none_or(|schema| go_type_is_value(&schema.body, graph, visited))
+        }
     }
 }
 
-/// Wrap `base` in a Go pointer when the field's value may be explicitly null AND the underlying Go type
-/// is a value type. Pointer-wrapping reads the NULLABLE axis (a nilable `*T`), NOT the optional axis
-/// (which drives `,omitempty` in [`json_tag`]) — the two are distinct (RESEARCH Pitfall 4).
-fn maybe_pointer(base: String, nullable: bool, is_value: bool) -> String {
-    if nullable && is_value {
+/// Wrap `base` in a Go pointer when the caller needs a nil representation and the underlying Go type
+/// is a value type. Field emission requests it independently for absence or nullability.
+fn maybe_pointer(base: String, pointer: bool, is_value: bool) -> String {
+    if pointer && is_value {
         format!("*{base}")
     } else {
         base
     }
 }
 
-/// Build the Go json struct tag for a field, adding the `,omitempty` option when the field OMITS ON
-/// MARSHAL ([`omits_when_empty`]). Independent of nullability (RESEARCH Pitfall 4).
+/// Build the Go json struct tag, adding `,omitempty` exactly when the projected key may be absent.
 fn json_tag(json_name: &str, omit_empty: bool) -> String {
     if omit_empty {
         format!("`json:\"{json_name},omitempty\"`")
     } else {
         format!("`json:\"{json_name}\"`")
     }
-}
-
-/// Whether the emitted json tag carries `,omitempty`.
-///
-/// **`,omitempty` is not a presence marker.** TypeScript's `?:` and Python's `= None` say "the caller
-/// may leave this key out" and nothing else, so they can read
-/// [`SchemaDirections::model_field_is_optional`] straight. `encoding/json` has no such spelling: the
-/// option says "drop this key when the value is the zero value", which is a different statement that
-/// only *coincides* with "may omit" where the source already chose it. Writing it anywhere the source
-/// did not would therefore be a change of wire behavior wearing a presence marker's clothes:
-///
-/// - On a value type it costs the caller the zero value. `Price float64` gains no way to be absent —
-///   Go needs a pointer for that, and gnr8 spends pointers on the NULLABLE axis (RESEARCH Pitfall 4) —
-///   it merely loses the ability to send `"price": 0`. Same for `"tags": []` and, on a bare `*T`, the
-///   explicit `null` that #59 established such a field always writes.
-/// - On a struct, a `time.Time`, or a non-zero-length array the option does nothing at all —
-///   `encoding/json` never considers those empty. gnr8 reads that exact tag in user source as a defect
-///   and raises `schema.omit_option.ineffective`, so emitting it would put gnr8's own diagnostic into
-///   gnr8's own output.
-///
-/// So the direction may only ever take the option AWAY, never add it: the tag omits what the source's
-/// own tag omits, and only where the position permits an omission at all. That still fixes the case
-/// this rule exists for — a `binding:"required"` field tagged `,omitempty`, where a caller setting the
-/// zero value sent nothing and the server rejected the call — because there the direction says the
-/// server demands the key and the option comes off.
-fn omits_when_empty(field: &Field, directions: SchemaDirections) -> bool {
-    field.optional && directions.model_field_is_optional(field)
 }
 
 /// Whether emitting a field of neutral [`Type`] requires the `time` import (a `time.Time` value
@@ -500,10 +480,10 @@ fn emit_type_alias(
 
 /// Emit one struct field line: the exported Go name, its Go type, and the json struct tag.
 ///
-/// Pointer-wrapping reads the field's NULLABLE axis; `,omitempty` reads what the field omits on
-/// marshal — the two are distinct (RESEARCH Pitfall 4): an omitting-not-nullable value stays a
-/// non-pointer `T` with omitempty; a nullable value becomes `*T`. The direction the struct is reached
-/// from can take the option off but never put it on — see [`omits_when_empty`].
+/// Go value types use a pointer when either absence or null must be represented. `,omitempty` follows
+/// only absence: `*T` plus the tag preserves an explicit zero value for an optional non-null field,
+/// while `*T` without the tag represents a required nullable field. When both axes apply, one more
+/// pointer level keeps an explicit-null value distinct from an omitted field.
 fn emit_struct_field(
     body: &mut String,
     field: &Field,
@@ -512,14 +492,31 @@ fn emit_struct_field(
     multipart_request: bool,
     directions: SchemaDirections,
 ) -> Result<(), CoreError> {
-    let go_ty = if multipart_request {
-        go_multipart_field_type(&field.schema, field.nullable, graph)?
-    } else {
-        go_type(&field.schema, field.nullable, graph)?
-    };
-    let tag = json_tag(&field.json_name, omits_when_empty(field, directions));
+    let go_ty = go_struct_field_type(field, graph, multipart_request, directions)?;
+    let optional = directions.model_field_is_optional(field);
+    let tag = json_tag(&field.json_name, optional);
     writeln!(body, "{go_name} {go_ty} {tag}").map_err(sink)?;
     Ok(())
+}
+
+fn go_struct_field_type(
+    field: &Field,
+    graph: &ApiGraph,
+    multipart_request: bool,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
+    let nullable = directions.field_is_nullable(field);
+    let optional = directions.model_field_is_optional(field);
+    let pointer_representation = nullable || optional;
+    let mut go_ty = if multipart_request {
+        go_multipart_field_type(&field.schema, pointer_representation, graph)?
+    } else {
+        go_type(&field.schema, pointer_representation, graph)?
+    };
+    if optional && nullable {
+        go_ty.insert(0, '*');
+    }
+    Ok(go_ty)
 }
 
 fn is_multipart_request_schema(graph: &ApiGraph, schema_id: &str) -> Result<bool, CoreError> {
@@ -1666,7 +1663,47 @@ struct GoPaginationInfo {
     page_type: String,
     item_type: String,
     items_field: String,
+    items_pointer_depth: usize,
     next_cursor_field: Option<String>,
+    next_cursor_pointer_depth: usize,
+}
+
+/// The local name a pagination helper reads its page's items from when the field is behind a pointer.
+const GO_PAGE_ITEMS_LOCAL: &str = "pageItems";
+
+/// Whether the PAGE-collecting helper reads the items field at all: the empty-items termination rule
+/// counts them, and offset mode advances by how many there were. Cursor and page mode with any other
+/// termination never look, and binding a local there would be one Go rejects as unused. (The
+/// item-iterating helper always reads them — it is the thing that ranges.)
+fn go_pagination_reads_items(policy: &PaginationPolicy) -> bool {
+    policy.termination == PaginationTermination::EmptyItems || policy.mode == PaginationMode::Offset
+}
+
+/// Emit the slice expression a pagination helper reads items from, ONCE per helper body.
+///
+/// A page field that is both optional and nullable is a pointer to the slice
+/// ([`go_struct_field_type`]), and neither `len` nor `range` applies to one. Binding a plain slice
+/// keeps every read site the same statement it is for a bare `[]T`, and makes an absent-or-null page
+/// terminate the walk exactly as an empty one does. A field at depth zero already IS the slice, so it
+/// is named directly and the generated helper is unchanged.
+fn emit_go_pagination_items(
+    body: &mut String,
+    info: &GoPaginationInfo,
+) -> Result<String, CoreError> {
+    let field = format!("page.{}", info.items_field);
+    if info.items_pointer_depth == 0 {
+        return Ok(field);
+    }
+    let indirections = "*".repeat(info.items_pointer_depth);
+    let reachable = (0..info.items_pointer_depth)
+        .map(|depth| format!("{}{field} != nil", "*".repeat(depth)))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    writeln!(body, "var {GO_PAGE_ITEMS_LOCAL} []{}", info.item_type).map_err(sink)?;
+    writeln!(body, "if {reachable} {{").map_err(sink)?;
+    writeln!(body, "{GO_PAGE_ITEMS_LOCAL} = {indirections}{field}").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    Ok(GO_PAGE_ITEMS_LOCAL.to_string())
 }
 
 fn emit_pagination_helpers(
@@ -1708,13 +1745,19 @@ fn emit_pagination_helpers(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return nil, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    // Unbound when nothing below reads it; the expression is then never written out.
+    let items = if go_pagination_reads_items(policy) {
+        emit_go_pagination_items(body, &info)?
+    } else {
+        format!("page.{}", info.items_field)
+    };
     if policy.termination == PaginationTermination::EmptyItems {
-        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "if len({items}) == 0 {{").map_err(sink)?;
         writeln!(body, "break").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
     writeln!(body, "pages = append(pages, page)").map_err(sink)?;
-    emit_go_pagination_advance(body, op, policy, &info, "break")?;
+    emit_go_pagination_advance(body, op, policy, &info, "break", &items)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "return pages, nil").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
@@ -1751,17 +1794,18 @@ fn emit_pagination_helpers(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
+    let items = emit_go_pagination_items(body, &info)?;
     if policy.termination == PaginationTermination::EmptyItems {
-        writeln!(body, "if len(page.{}) == 0 {{", info.items_field).map_err(sink)?;
+        writeln!(body, "if len({items}) == 0 {{").map_err(sink)?;
         writeln!(body, "return nil").map_err(sink)?;
         writeln!(body, "}}").map_err(sink)?;
     }
-    writeln!(body, "for _, item := range page.{} {{", info.items_field).map_err(sink)?;
+    writeln!(body, "for _, item := range {items} {{").map_err(sink)?;
     writeln!(body, "if !yield(item) {{").map_err(sink)?;
     writeln!(body, "return nil").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    emit_go_pagination_advance(body, op, policy, &info, "return nil")?;
+    emit_go_pagination_advance(body, op, policy, &info, "return nil", &items)?;
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
     Ok(())
@@ -1773,6 +1817,7 @@ fn emit_go_pagination_advance(
     policy: &PaginationPolicy,
     info: &GoPaginationInfo,
     terminate: &str,
+    items: &str,
 ) -> Result<(), CoreError> {
     match policy.mode {
         PaginationMode::Cursor => {
@@ -1796,11 +1841,30 @@ fn emit_go_pagination_advance(
             let param = go_query_param(op, cursor_param)?;
             let param_field = exported(&param.name);
             writeln!(body, "nextCursor := page.{next_field}").map_err(sink)?;
-            writeln!(body, "if nextCursor == \"\" {{").map_err(sink)?;
+            let mut terminal_conditions = (0..info.next_cursor_pointer_depth)
+                .map(|depth| format!("{}nextCursor == nil", "*".repeat(depth)))
+                .collect::<Vec<_>>();
+            terminal_conditions.push(format!(
+                "{}nextCursor == \"\"",
+                "*".repeat(info.next_cursor_pointer_depth)
+            ));
+            writeln!(body, "if {} {{", terminal_conditions.join(" || ")).map_err(sink)?;
             writeln!(body, "{terminate}").map_err(sink)?;
             writeln!(body, "}}").map_err(sink)?;
             if param.required {
-                writeln!(body, "params.{param_field} = nextCursor").map_err(sink)?;
+                writeln!(
+                    body,
+                    "params.{param_field} = {}nextCursor",
+                    "*".repeat(info.next_cursor_pointer_depth)
+                )
+                .map_err(sink)?;
+            } else if info.next_cursor_pointer_depth > 0 {
+                writeln!(
+                    body,
+                    "params.{param_field} = {}nextCursor",
+                    "*".repeat(info.next_cursor_pointer_depth - 1)
+                )
+                .map_err(sink)?;
             } else {
                 writeln!(body, "params.{param_field} = &nextCursor").map_err(sink)?;
             }
@@ -1835,7 +1899,7 @@ fn emit_go_pagination_advance(
                 })?;
             let param = go_query_param(op, offset_param)?;
             let field = exported(&param.name);
-            writeln!(body, "itemCount := int64(len(page.{}))", info.items_field).map_err(sink)?;
+            writeln!(body, "itemCount := int64(len({items}))").map_err(sink)?;
             if param.required {
                 writeln!(body, "params.{field} += itemCount").map_err(sink)?;
             } else {
@@ -1967,7 +2031,13 @@ fn go_pagination_info(
             ),
         });
     };
-    let next_cursor_field = if let Some(next_cursor) = policy.next_cursor_field.as_deref() {
+    let schema_directions = schema_directions(graph);
+    let directions = directions_of(&schema_directions, &schema.id);
+    let items_pointer_depth =
+        go_pointer_depth(&go_struct_field_type(items, graph, false, directions)?);
+    let (next_cursor_field, next_cursor_pointer_depth) = if let Some(next_cursor) =
+        policy.next_cursor_field.as_deref()
+    {
         let field = fields
             .iter()
             .find(|field| field.json_name == next_cursor)
@@ -1977,16 +2047,26 @@ fn go_pagination_info(
                     op.id, next_cursor
                 ),
             })?;
-        Some(exported(&field.json_name))
+        let pointer_depth =
+            go_pointer_depth(&go_struct_field_type(field, graph, false, directions)?);
+        (Some(exported(&field.json_name)), pointer_depth)
     } else {
-        None
+        (None, 0)
     };
     Ok(GoPaginationInfo {
         page_type,
         item_type: go_type(item_schema, false, graph)?,
         items_field: exported(&items.json_name),
+        items_pointer_depth,
         next_cursor_field,
+        next_cursor_pointer_depth,
     })
+}
+
+/// How many pointer layers a generated struct field type carries, so a helper that reads the field
+/// can spell the same number of indirections.
+fn go_pointer_depth(go_type: &str) -> usize {
+    go_type.bytes().take_while(|byte| *byte == b'*').count()
 }
 
 fn pagination_policy_for<'a>(graph: &'a ApiGraph, op: &Operation) -> Option<&'a PaginationPolicy> {
@@ -3353,7 +3433,7 @@ mod tests {
         {
           "id": "dto.CommandMessage", "name": "CommandMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3362,22 +3442,22 @@ mod tests {
         {
           "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "analyticsQuery", "required": true, "optional": false, "nullable": false,
+            { "json_name": "analyticsQuery", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.GoalAnalyticsQuery" },
               "description": null, "example": null },
-            { "json_name": "createdAt", "required": false, "optional": false, "nullable": false,
+            { "json_name": "createdAt", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "well_known", "of": "date_time" },
               "description": null, "example": null },
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetDirection", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null },
-            { "json_name": "targetValue", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetValue", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "float", "bits": 32 } },
               "description": null, "example": null },
-            { "json_name": "workflowChainIds", "required": false, "optional": true, "nullable": false,
+            { "json_name": "workflowChainIds", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "array", "of": { "type": "well_known", "of": "uuid" } },
               "description": null, "example": null }
           ] },
@@ -3386,7 +3466,7 @@ mod tests {
         {
           "id": "dto.GoalAnalyticsQuery", "name": "GoalAnalyticsQuery",
           "body": { "type": "object", "of": [
-            { "json_name": "windowDays", "required": false, "optional": false, "nullable": false,
+            { "json_name": "windowDays", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },
@@ -3395,10 +3475,10 @@ mod tests {
         {
           "id": "dto.GoalResponse", "name": "GoalResponse",
           "body": { "type": "object", "of": [
-            { "json_name": "metadata", "required": false, "optional": true, "nullable": false,
+            { "json_name": "metadata", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "any", "of": {} },
               "description": null, "example": null },
-            { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+            { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "well_known", "of": "uuid" },
               "description": null, "example": null }
           ] },
@@ -3407,7 +3487,7 @@ mod tests {
         {
           "id": "dto.HttpError", "name": "HttpError",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3450,7 +3530,7 @@ mod tests {
                 {{
                   "id": "dto.GoalResponse", "name": "GoalResponse",
                   "body": {{ "type": "object", "of": [
-                    {{ "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                    {{ "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": {{ "type": "well_known", "of": "uuid" }},
                       "description": null, "example": null }}
                   ] }},
@@ -3459,10 +3539,10 @@ mod tests {
                 {{
                   "id": "dto.{error_name}", "name": "{error_name}",
                   "body": {{ "type": "object", "of": [
-                    {{ "json_name": "message", "required": true, "optional": false, "nullable": false,
+                    {{ "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }},
-                    {{ "json_name": "slug", "required": false, "optional": true, "nullable": false,
+                    {{ "json_name": "slug", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                       "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                       "description": null, "example": null }}
                   ] }},
@@ -3552,7 +3632,7 @@ mod tests {
             {
               "id": "dto.GoalResponse", "name": "GoalResponse",
               "body": { "type": "object", "of": [
-                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
               ] },
@@ -3608,7 +3688,7 @@ mod tests {
             {
               "id": "dto.MarkReadRequest", "name": "MarkReadRequest",
               "body": { "type": "object", "of": [
-                { "json_name": "lastId", "required": true, "optional": false, "nullable": false,
+                { "json_name": "lastId", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null, "example": null }
               ] },
@@ -3641,7 +3721,7 @@ mod tests {
             {
               "id": "dto.GoalResponse", "name": "GoalResponse",
               "body": { "type": "object", "of": [
-                { "json_name": "uuid", "required": true, "optional": false, "nullable": false,
+                { "json_name": "uuid", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "well_known", "of": "uuid" },
                   "description": null, "example": null }
               ] },
@@ -3714,12 +3794,12 @@ mod tests {
         use crate::graph::{Field, Prim, Type};
 
         #[test]
-        fn optional_field_is_pointer_with_omitempty_required_is_plain() {
+        fn optional_nullable_field_has_two_pointers_and_required_is_plain() {
             let out = emit_models(&sample_graph(), "goalservice").unwrap();
-            // Optional number → *float32 + omitempty.
+            // Optional + nullable number → **float32 + omitempty.
             assert!(
-                out.contains("TargetValue *float32 `json:\"targetValue,omitempty\"`"),
-                "optional number must be *float32 omitempty:\n{out}"
+                out.contains("TargetValue **float32 `json:\"targetValue,omitempty\"`"),
+                "optional nullable number must be **float32 omitempty:\n{out}"
             );
             // Required string → no omitempty, no pointer.
             assert!(
@@ -3733,9 +3813,12 @@ mod tests {
             let fields = vec![
                 Field {
                     json_name: "authorizedByWorkspaceMemberId".to_string(),
-                    required: false,
-                    optional: true,
-                    nullable: false,
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: true,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -3743,9 +3826,12 @@ mod tests {
                 },
                 Field {
                     json_name: "authorized_by_workspace_member_id".to_string(),
-                    required: false,
-                    optional: true,
-                    nullable: false,
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: true,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -3784,7 +3870,7 @@ mod tests {
             assert!(out.contains("UUID string `json:\"uuid\"`"), "{out}");
             // date-time → time.Time.
             assert!(
-                out.contains("CreatedAt time.Time `json:\"createdAt\"`"),
+                out.contains("CreatedAt *time.Time `json:\"createdAt,omitempty\"`"),
                 "{out}"
             );
             // []uuid → []string.
@@ -3814,10 +3900,10 @@ mod tests {
                 out.contains("AnalyticsQuery GoalAnalyticsQuery `json:\"analyticsQuery\"`"),
                 "{out}"
             );
-            // optional enum ref → *TargetDirection.
+            // optional + nullable enum ref → **TargetDirection.
             assert!(
                 out.contains(
-                    "TargetDirection *TargetDirection `json:\"targetDirection,omitempty\"`"
+                    "TargetDirection **TargetDirection `json:\"targetDirection,omitempty\"`"
                 ),
                 "{out}"
             );
@@ -4350,9 +4436,7 @@ mod tests {
         }
 
         #[test]
-        fn value_types_get_a_pointer_only_when_nullable() {
-            // Pointer-wrapping reads the NULLABLE axis (RESEARCH Pitfall 4): a nullable value type is
-            // `*T`, a non-nullable value type is `T`.
+        fn value_types_get_a_pointer_when_requested() {
             let graph = sample_graph();
             let number = Type::Primitive(Prim::Float { bits: 32 });
             assert_eq!(go_type(&number, true, &graph).unwrap(), "*float32");
@@ -4424,17 +4508,27 @@ mod tests {
 
         /// A one-object graph with a single value field carrying the given optional/nullable axes.
         fn graph_with_field(optional: bool, nullable: bool) -> ApiGraph {
+            graph_with_typed_field(
+                optional,
+                nullable,
+                Type::Primitive(Prim::Float { bits: 32 }),
+            )
+        }
+
+        fn graph_with_typed_field(optional: bool, nullable: bool, schema: Type) -> ApiGraph {
             let mut graph = ApiGraph::default();
             graph.schemas.push(crate::graph::Schema {
                 id: "dto.S".to_string(),
                 name: "S".to_string(),
                 body: Type::Object(vec![Field {
                     json_name: "value".to_string(),
-                    required: !optional,
-                    optional,
-                    nullable,
-                    // a float is a Go value type (float32) — pointer-eligible when nullable.
-                    schema: Type::Primitive(Prim::Float { bits: 32 }),
+                    serializer_may_omit: optional,
+                    deserializer_accepts_absent: optional,
+                    deserializer_accepts_null: nullable,
+                    serializer_may_emit_null: nullable,
+                    validator_requires_presence: !optional,
+                    validator_rejects_null: false,
+                    schema,
                     description: None,
                     example: None,
                     meta: FieldMeta::default(),
@@ -4449,12 +4543,29 @@ mod tests {
             graph
         }
 
+        fn graph_with_named_alias(optional: bool, nullable: bool, body: Type) -> ApiGraph {
+            let mut graph =
+                graph_with_typed_field(optional, nullable, Type::Named("dto.Alias".to_string()));
+            graph.schemas.push(crate::graph::Schema {
+                id: "dto.Alias".to_string(),
+                name: "Alias".to_string(),
+                body,
+                enum_source_order: Vec::new(),
+                provenance: crate::graph::SourceSpan {
+                    file: "alias.go".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                },
+            });
+            graph
+        }
+
         #[test]
-        fn optional_not_nullable_value_is_non_pointer_with_omitempty() {
+        fn optional_not_nullable_value_is_pointer_with_omitempty() {
             let out = emit_models(&graph_with_field(true, false), "svc").unwrap();
             assert!(
-                out.contains("Value float32 `json:\"value,omitempty\"`"),
-                "optional-not-nullable value must be a non-pointer T WITH omitempty:\n{out}"
+                out.contains("Value *float32 `json:\"value,omitempty\"`"),
+                "optional-not-nullable value must preserve absence and explicit zero:\n{out}"
             );
         }
 
@@ -4468,11 +4579,45 @@ mod tests {
         }
 
         #[test]
-        fn nullable_and_optional_value_is_pointer_with_omitempty() {
+        fn nullable_and_optional_value_has_distinct_absent_and_null_states() {
             let out = emit_models(&graph_with_field(true, true), "svc").unwrap();
             assert!(
-                out.contains("Value *float32 `json:\"value,omitempty\"`"),
-                "nullable-and-optional value must be *T WITH omitempty:\n{out}"
+                out.contains("Value **float32 `json:\"value,omitempty\"`"),
+                "nullable-and-optional value must be **T WITH omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn nullable_and_optional_container_has_distinct_absent_and_null_states() {
+            let graph = graph_with_typed_field(
+                true,
+                true,
+                Type::Array(Box::new(Type::Primitive(Prim::String))),
+            );
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value *[]string `json:\"value,omitempty\"`"),
+                "nullable-and-optional container must be *[]T WITH omitempty:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_scalar_alias_preserves_every_presence_and_null_state() {
+            let graph = graph_with_named_alias(true, true, Type::Primitive(Prim::String));
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value **Alias `json:\"value,omitempty\"`"),
+                "a named scalar alias needs the same pointer depth as its value type:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_byte_slice_alias_keeps_its_native_nil_representation() {
+            let graph = graph_with_named_alias(true, false, Type::Primitive(Prim::Bytes));
+            let out = emit_models(&graph, "svc").unwrap();
+            assert!(
+                out.contains("Value Alias `json:\"value,omitempty\"`"),
+                "a named byte-slice alias must not gain a pointer for optionality alone:\n{out}"
             );
         }
     }

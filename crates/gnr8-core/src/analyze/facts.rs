@@ -165,18 +165,24 @@ pub(crate) struct SchemaFact {
 /// because it appears inside [`Type::Object`], which the graph serializes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+// These are deliberately separate observations from the serializer, deserializer, and validator;
+// collapsing them into a state enum would recreate the direction-coupling this contract prevents.
+#[allow(clippy::struct_excessive_bools)]
 pub struct FieldFact {
     /// The effective serialized field name.
     pub json_name: String,
-    /// Whether the field is required (it must be present in a valid payload).
-    pub required: bool,
-    /// The *presence* axis: whether the key may be absent from the serialized
-    /// payload. Independent of [`Self::nullable`]; all four combinations are
-    /// representable (a field can be optional, nullable, both, or neither).
-    pub optional: bool,
-    /// The *value* axis: whether the value, when present, may be explicitly null.
-    /// Independent of [`Self::optional`].
-    pub nullable: bool,
+    /// Whether the serializer may leave the key out of an outbound payload.
+    pub serializer_may_omit: bool,
+    /// Whether decoding accepts an absent key before validation runs.
+    pub deserializer_accepts_absent: bool,
+    /// Whether decoding accepts an explicit null value before validation runs.
+    pub deserializer_accepts_null: bool,
+    /// Whether the serializer can emit a present key whose value is null.
+    pub serializer_may_emit_null: bool,
+    /// Whether source-declared validation requires the key to be present inbound.
+    pub validator_requires_presence: bool,
+    /// Whether source-declared validation rejects an explicitly null inbound value.
+    pub validator_rejects_null: bool,
     /// The field's type.
     pub schema: Type,
     /// Optional human description.
@@ -554,18 +560,14 @@ mod tests {
             "of": [
               {
                 "json_name": "name",
-                "required": true,
-                "optional": false,
-                "nullable": false,
+                "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                 "schema": { "type": "primitive", "of": { "prim": "string" } },
                 "description": "Short name",
                 "example": null
               },
               {
                 "json_name": "workflowChainIds",
-                "required": false,
-                "optional": true,
-                "nullable": false,
+                "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                 "schema": {
                   "type": "array",
                   "of": { "type": "well_known", "of": "uuid" }
@@ -615,7 +617,7 @@ mod tests {
             };
             let name = &fields[0];
             assert_eq!(name.json_name, "name");
-            assert!(name.required);
+            assert!(name.validator_requires_presence);
             // A string primitive deserializes into Type::Primitive(Prim::String).
             assert!(matches!(name.schema, Type::Primitive(Prim::String)));
 
@@ -649,22 +651,22 @@ mod tests {
                   "body": {
                     "type": "object",
                     "of": [
-                      { "json_name": "ref", "required": true, "optional": false, "nullable": false,
+                      { "json_name": "ref", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                         "schema": { "type": "named", "of": "other.Schema" },
                         "description": null, "example": null },
-                      { "json_name": "either", "required": true, "optional": false, "nullable": false,
+                      { "json_name": "either", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                         "schema": { "type": "union", "of": [
                           { "type": "primitive", "of": { "prim": "string" } },
                           { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } }
                         ] },
                         "description": null, "example": null },
-                      { "json_name": "lookup", "required": true, "optional": false, "nullable": false,
+                      { "json_name": "lookup", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                         "schema": { "type": "map", "of": {
                           "key": { "type": "primitive", "of": { "prim": "string" } },
                           "value": { "type": "primitive", "of": { "prim": "float", "bits": 32 } }
                         } },
                         "description": null, "example": null },
-                      { "json_name": "freeform", "required": true, "optional": false, "nullable": false,
+                      { "json_name": "freeform", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                         "schema": { "type": "any", "of": {} },
                         "description": null, "example": null }
                     ]
@@ -730,7 +732,7 @@ mod tests {
                 {
                   "id": "S", "name": "S",
                   "body": { "type": "object", "of": [
-                    { "json_name": "n", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "n", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null, "bogus": 1 }
                   ] },
@@ -781,7 +783,12 @@ mod tests {
                   "schemas": [
                     {{ "id": "S", "name": "S",
                        "body": {{ "type": "object", "of": [
-                         {{ "json_name": "f", "required": false, "optional": {optional}, "nullable": {nullable},
+                         {{ "json_name": "f", "serializer_may_omit": {optional},
+                            "deserializer_accepts_absent": true,
+                            "deserializer_accepts_null": {nullable},
+                            "serializer_may_emit_null": {nullable},
+                            "validator_requires_presence": false,
+                            "validator_rejects_null": false,
                             "schema": {{ "type": "primitive", "of": {{ "prim": "string" }} }},
                             "description": null, "example": null }}
                        ] }},
@@ -797,8 +804,8 @@ mod tests {
             fields
                 .into_iter()
                 .map(|f| FieldFactView {
-                    optional: f.optional,
-                    nullable: f.nullable,
+                    optional: f.serializer_may_omit,
+                    nullable: f.deserializer_accepts_null,
                 })
                 .collect()
         }

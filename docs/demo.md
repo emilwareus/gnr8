@@ -319,7 +319,7 @@ and **skipped** (the WATCH-01 no-op path: gnr8 never rewrites unchanged outputs)
 The new `benchField` now appears in the **OpenAPI schema**:
 
 ```bash
-grep -A8 'CreateGoalInput:' openapi.yaml
+grep -A12 'CreateGoalInput:' openapi.yaml
 ```
 
 ```yaml
@@ -328,13 +328,20 @@ grep -A8 'CreateGoalInput:' openapi.yaml
       required: [analyticsQuery, name]
       properties:
         analyticsQuery:
-          $ref: '#/components/schemas/GoalAnalyticsQuery'
+          oneOf:
+          - $ref: '#/components/schemas/GoalAnalyticsQueryInput'
+          - type: null
         benchField:                         # <-- NEW
-          type: string
+          type: [string, 'null']
           description: Demo field added to show regeneration
         description:
-          type: string
+          type: [string, 'null']
 ```
+
+(`GoalAnalyticsQuery` is used as both a request and a response type, and its two contracts differ, so
+it is published as `GoalAnalyticsQueryInput` and `GoalAnalyticsQueryOutput`. The `'null'` on a request
+property is what `encoding/json` accepts into that field; see
+[the `required` array](openapi/generation.md#a-component-schemas-required-array).)
 
 …and in the **generated Go SDK model**:
 
@@ -344,15 +351,20 @@ grep -A8 'type CreateGoalInput struct' sdk/models.go
 
 ```go
 type CreateGoalInput struct {
-	AnalyticsQuery   GoalAnalyticsQuery `json:"analyticsQuery"`
-	BenchField       string             `json:"benchField,omitempty"`   // <-- NEW
-	Description      string             `json:"description"`
-	Name             string             `json:"name"`
-	TargetDirection  *TargetDirection   `json:"targetDirection,omitempty"`
-	TargetValue      *float32           `json:"targetValue,omitempty"`
-	WorkflowChainIDs []string           `json:"workflowChainIds,omitempty"`
+	AnalyticsQuery   *GoalAnalyticsQueryInput `json:"analyticsQuery"`
+	BenchField       **string                 `json:"benchField,omitempty"`   // <-- NEW
+	Description      **string                 `json:"description,omitempty"`
+	Name             string                   `json:"name"`
+	TargetDirection  **TargetDirection        `json:"targetDirection,omitempty"`
+	TargetValue      **float64                `json:"targetValue,omitempty"`
+	WorkflowChainIDs *[]string                `json:"workflowChainIds,omitempty"`
 }
 ```
+
+(A request field the server does not validate may be omitted, sent as an explicit `null`, or sent with
+a value — three states, which is what the second pointer layer buys. `Name` carries `binding:"required"`
+and stays a plain `string`. See
+[field presence in generated models](sdk/generation.md#field-presence-in-generated-models).)
 
 That is the headline loop: **one Go source edit → updated OpenAPI document + updated, compiling Go
 SDK**, with only the affected outputs rewritten. (Fields are emitted in deterministic sorted order,

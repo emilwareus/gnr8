@@ -19,13 +19,11 @@
 //!
 //! ## A component schema's `required` array
 //!
-//! `required` asks "must this key be present?", and the graph carries two code-derived facts that
-//! answer it on opposite sides of an exchange: `field.required` (what the server's validation rejects
-//! a request for lacking) and `!field.optional` (what the serializer unconditionally writes). Which
-//! one applies is decided by the positions a schema is reached from, computed by walking the graph
-//! from each operation — see [`crate::graph::direction`], which the SDK model emitters read too. That
-//! is one answer per position rather than a precedence between two candidates, so there is no fallback
-//! and nothing to configure (rule 3).
+//! `required` asks "must this key be present?". Input positions read decoding plus validation;
+//! output positions read serializer omission. Nullability is selected independently from decoding
+//! acceptance/validation or serializer emission. The positions come from HTTP operations and
+//! explicitly registered non-HTTP roots — see [`crate::graph::direction`]. Shared schemas whose
+//! contracts differ are projected into exact input/output components before lowering.
 //!
 //! ## Diagnostics (OAPI-03)
 //!
@@ -118,6 +116,8 @@ pub(crate) fn build_openapi_doc(
     base_path: &str,
     security: &[GraphSecurityScheme],
 ) -> Result<OpenApiDoc, crate::CoreError> {
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let graph = &*projected;
     validate_base_path(base_path)?;
     ensure_unique_component_names(&graph.schemas)?;
     // ref_id (pkg-qualified) -> bare component name, for resolving $refs to local schema names.
@@ -863,9 +863,13 @@ fn lower_object(
     let mut properties: Vec<(String, SchemaObject)> = fields
         .iter()
         .map(|field| {
-            // The NULLABLE axis (independent of presence) renders on the property schema.
-            let mut prop =
-                lower_field_schema(&field.schema, field.nullable, ref_to_name, directions)?;
+            // The direction-selected null axis renders independently from presence.
+            let mut prop = lower_field_schema(
+                &field.schema,
+                directions.field_is_nullable(field),
+                ref_to_name,
+                directions,
+            )?;
             // Attach field-owned keywords when the schema is not a bare `$ref`. A composed schema
             // (`oneOf`, including nullable references) may carry sibling JSON Schema keywords such
             // as `description`, `default`, and vendor extensions, so do not drop metadata there.
@@ -1228,17 +1232,17 @@ mod tests {
           "id": "internal/dto.CreateGoalInput", "name": "CreateGoalInput",
           "body": { "type": "object", "of": [
             {
-              "json_name": "name", "required": true, "optional": false, "nullable": false,
+              "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": "Goal name", "example": null
             },
             {
-              "json_name": "metadata", "required": false, "optional": true, "nullable": false,
+              "json_name": "metadata", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "any", "of": {} },
               "description": null, "example": null
             },
             {
-              "json_name": "uuid", "required": false, "optional": true, "nullable": false,
+              "json_name": "uuid", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "well_known", "of": "uuid" },
               "description": null, "example": null
             }
@@ -1249,7 +1253,7 @@ mod tests {
           "id": "internal/dto.CommandMessage", "name": "CommandMessage",
           "body": { "type": "object", "of": [
             {
-              "json_name": "message", "required": true, "optional": false, "nullable": false,
+              "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null
             }
@@ -1260,7 +1264,7 @@ mod tests {
           "id": "internal/dto.GoalResponse", "name": "GoalResponse",
           "body": { "type": "object", "of": [
             {
-              "json_name": "direction", "required": false, "optional": true, "nullable": false,
+              "json_name": "direction", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "internal/dto.TargetDirection" },
               "description": null, "example": null
             }
@@ -1395,9 +1399,12 @@ mod tests {
     fn presence_field(json_name: &str, required: bool, optional: bool) -> crate::graph::Field {
         crate::graph::Field {
             json_name: json_name.to_string(),
-            required,
-            optional,
-            nullable: false,
+            serializer_may_omit: optional,
+            deserializer_accepts_absent: !required,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: required,
+            validator_rejects_null: false,
             schema: Type::Primitive(Prim::String),
             description: None,
             example: None,
@@ -1458,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_reached_from_both_directions_requires_only_what_holds_in_both() {
+    fn a_schema_reached_from_both_directions_gets_exact_directional_components() {
         let mut graph = sample_graph();
         // Reach the request body from a response too, so ONE component has to describe both payloads.
         graph.schemas[2].body = Type::Object(vec![crate::graph::Field {
@@ -1471,11 +1478,14 @@ mod tests {
             presence_field("written", false, false),
         ]);
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
-        // `validated` may be absent from a response and `written` may be absent from a request, so
-        // publishing either would state as mandatory something one of the two sides omits.
         assert_eq!(
-            required_of(&yaml, "CreateGoalInput").as_deref(),
-            Some("[mandatory]"),
+            required_of(&yaml, "CreateGoalInputInput").as_deref(),
+            Some("[mandatory, validated]"),
+            "{yaml}"
+        );
+        assert_eq!(
+            required_of(&yaml, "CreateGoalInputOutput").as_deref(),
+            Some("[mandatory, written]"),
             "{yaml}"
         );
     }
@@ -1509,8 +1519,13 @@ mod tests {
             Type::Named("internal/dto.TargetDirection".to_string());
         let yaml = to_openapi(&graph, "goalservice", "/goal", &security_config()).unwrap();
         assert_eq!(
-            required_of(&yaml, "TargetDirection").as_deref(),
-            Some("[mandatory]"),
+            required_of(&yaml, "TargetDirectionInput").as_deref(),
+            Some("[mandatory, validated]"),
+            "{yaml}"
+        );
+        assert_eq!(
+            required_of(&yaml, "TargetDirectionOutput").as_deref(),
+            Some("[mandatory, written]"),
             "{yaml}"
         );
     }
@@ -1612,9 +1627,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "label".to_string(),
-            required: true,
-            optional: false,
-            nullable: true,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: false,
+            deserializer_accepts_null: true,
+            serializer_may_emit_null: true,
+            validator_requires_presence: true,
+            validator_rejects_null: false,
             schema: Type::Primitive(crate::graph::Prim::String),
             description: None,
             example: None,
@@ -1641,9 +1659,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "note".to_string(),
-            required: false,
-            optional: true,
-            nullable: false,
+            serializer_may_omit: true,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema: Type::Primitive(crate::graph::Prim::String),
             description: None,
             example: None,
@@ -1676,9 +1697,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "direction".to_string(),
-            required: false,
-            optional: false,
-            nullable: true,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: true,
+            serializer_may_emit_null: true,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema: Type::Named("internal/dto.TargetDirection".to_string()),
             description: None,
             example: None,
@@ -1704,9 +1728,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "either".to_string(),
-            required: true,
-            optional: false,
-            nullable: false,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: false,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: true,
+            validator_rejects_null: false,
             schema: Type::Union(vec![
                 Type::Primitive(Prim::String),
                 Type::Primitive(Prim::Int {
@@ -1741,9 +1768,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "rating".to_string(),
-            required: true,
-            optional: false,
-            nullable: true,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: false,
+            deserializer_accepts_null: true,
+            serializer_may_emit_null: true,
+            validator_requires_presence: true,
+            validator_rejects_null: false,
             schema: Type::Union(vec![
                 Type::Primitive(Prim::Int {
                     bits: 64,
@@ -1777,9 +1807,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "sort".to_string(),
-            required: false,
-            optional: false,
-            nullable: true,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: true,
+            serializer_may_emit_null: true,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
             description: None,
             example: None,
@@ -1936,9 +1969,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "by_id".to_string(),
-            required: true,
-            optional: false,
-            nullable: false,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: false,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: true,
+            validator_rejects_null: false,
             schema: Type::Map {
                 key: Box::new(Type::Primitive(Prim::Int {
                     bits: 64,
@@ -2179,9 +2215,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "name".to_string(),
-            required: true,
-            optional: false,
-            nullable: false,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: false,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: true,
+            validator_rejects_null: false,
             schema: Type::Primitive(crate::graph::Prim::String),
             description: Some("Goal name".to_string()),
             example: Some("alpha example".to_string()),
@@ -2301,9 +2340,12 @@ mod tests {
         let mut graph = sample_graph();
         graph.schemas[1].body = Type::Object(vec![Field {
             json_name: "direction".to_string(),
-            required: false,
-            optional: false,
-            nullable: true,
+            serializer_may_omit: false,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: true,
+            serializer_may_emit_null: true,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema: Type::Named("internal/dto.TargetDirection".to_string()),
             description: Some("Preferred target direction".to_string()),
             example: None,
@@ -2346,9 +2388,12 @@ mod tests {
         graph.schemas[1].body = Type::Object(vec![
             Field {
                 json_name: "window".to_string(),
-                required: false,
-                optional: true,
-                nullable: false,
+                serializer_may_omit: true,
+                deserializer_accepts_absent: true,
+                deserializer_accepts_null: false,
+                serializer_may_emit_null: false,
+                validator_requires_presence: false,
+                validator_rejects_null: false,
                 schema: Type::Primitive(crate::graph::Prim::Int {
                     bits: 64,
                     signed: true,
@@ -2364,9 +2409,12 @@ mod tests {
             },
             Field {
                 json_name: "flag_text".to_string(),
-                required: false,
-                optional: true,
-                nullable: false,
+                serializer_may_omit: true,
+                deserializer_accepts_absent: true,
+                deserializer_accepts_null: false,
+                serializer_may_emit_null: false,
+                validator_requires_presence: false,
+                validator_rejects_null: false,
                 schema: Type::Primitive(crate::graph::Prim::String),
                 description: None,
                 example: None,

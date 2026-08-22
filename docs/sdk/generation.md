@@ -50,9 +50,9 @@ same walk that answers the OpenAPI
 | The schema is reached from | The model may leave the key out when |
 |---|---|
 | requests only (a request body, a parameter, or a schema one of those reaches) | the source states no validation rule requiring it |
-| responses only, both, or no operation at all | the source's serializer may leave the key out |
-| responses only, or no operation at all | **also** whenever the field's value may be `null` |
-| both | **also** when the field's value may be `null` and no validation rule requires the key |
+| responses only | the source's serializer may leave the key out |
+| both | the exact answer for each generated input/output model; gnr8 splits the model when they differ |
+| registered non-HTTP use | the corresponding input/output answer |
 
 A validation rule says what your server rejects an inbound payload for lacking, so a model reads it
 exactly where the model is inbound and only inbound. In Go that matters most: an omission option
@@ -60,41 +60,29 @@ governs marshalling and a server unmarshals a request DTO rather than marshallin
 written `json:"name,omitempty"` with `binding:"required"` is required in the request model —
 previously a caller who set it to the zero value sent nothing and the server rejected the call.
 
-Everywhere else the model is, or may be, the decode side, and demanding a key the server may leave
-out would fail on a payload it is entitled to send. That is also the answer a type reached from both
-directions keeps: one Go struct, one Python model, one TypeScript interface cannot be exact for two
-contracts, and the safe half is the one that cannot break a decode. Use a separate type per direction
-to get the exact answer in both.
+Everywhere else the model is the decode side, and demanding a key the server may omit would reject a
+valid response. A type reached from both directions is projected into distinct `TypeInput` and
+`TypeOutput` models whenever its own or a nested contract differs.
 
-The last two rows read the value axis rather than either presence axis, and they cost nothing to
-obey. A nullable key gives a reader no case by being present that the `null` did not already give
-them — the hint is `Optional[str]` / `string | null` whether or not the key may be absent — so
-demanding it changes nothing about reading the value and only makes the caller spell one out.
-`PySdk`'s `to_dict` then drops that key again (`exclude_none` omits every null-valued key), so a
-model that demanded it could not decode its own output. A bare `*T` — the key your server writes on
-every response, holding a value that may be `null` — is the shape this reaches. The OpenAPI document
-is unaffected: `required` describes the payload, and that key is written every time.
+Nullability is selected separately. It changes only the value hint: a required nullable response is
+`field: T | null` in TypeScript and an `Optional[T]` Python field with no omission default. An
+optional non-null response is `field?: T`; it does not gain `| null`. Request nullability reads what
+decoding accepts after validation, independently of what the same source type can serialize.
 
 ### How each language spells it
 
-`TsSdk` uses `?:` and `PySdk` a `= None` default; both mean "the caller may leave this key out" and
-nothing else, so they follow the table exactly.
+`TsSdk` uses `?:` and `PySdk` a `= None` default for absence. Nullable values use `| null` and
+`Optional[...]` respectively; those value hints do not add an absence default.
 
-`GoSdk` uses `,omitempty`, which means something narrower — "drop this key when the value is the zero
-value" — so the direction only ever takes the option **away**, never adds it. A `binding:"required"`
-field tagged `,omitempty` loses it, which is the case this rule exists for. A request field with no
-validation rule keeps whatever the source wrote: adding `,omitempty` would cost the caller
-`"price": 0` and `"tags": []` without buying absence (Go needs a pointer for that, and gnr8 spends
-pointers on nullability), and on a struct, a `time.Time`, or a non-zero-length array it would do
-nothing at all — that is the tag gnr8 reports as `schema.omit_option.ineffective`. A Go request model
-can therefore be stricter than its Python and TypeScript twins; both send payloads the document
-permits.
+`GoSdk` combines a pointer representation with `,omitempty` for an optional value type. Nil means the
+key is absent, while a non-nil pointer preserves an explicit zero value such as `0`, `""`, or a zero
+struct. A required nullable value type is also a pointer but has no omission tag. When a field is both
+optional and nullable, one additional pointer level preserves three caller-selectable states: omitted,
+explicit null, and a concrete value. This also wraps a nil-capable slice or map because its nil value
+must mean null rather than omission in that case.
 
-The **presence** rows never split a non-Go source: FastAPI, Flask, NestJS, and an imported OpenAPI
-document each state presence once, so a validation rule and an omission option give the same answer
-and the direction cannot change it. The **value** rows still apply to every source — a field declared
-`Optional[str]` with no default is required and nullable, so a model reached from a response leaves
-its key out while a model reached only from a request keeps demanding it.
+FastAPI, Flask, NestJS, and an imported OpenAPI document normally state the same contract in both
+directions, so they do not split unless configured facts make the uses differ.
 
 ## File layouts
 

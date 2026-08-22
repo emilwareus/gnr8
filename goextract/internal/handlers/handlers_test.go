@@ -281,10 +281,10 @@ func (s Server) uploadLoose(c *gin.Context) {
 	for _, field := range fields {
 		seen[field.JSONName] = field
 	}
-	if primName(seen["file"].Schema) != facts.PrimBytes || !seen["file"].Required {
+	if primName(seen["file"].Schema) != facts.PrimBytes || !seen["file"].ValidatorRequiresPresence {
 		t.Fatalf("synthetic file field should be required bytes, got %+v", seen["file"])
 	}
-	if primName(seen["name"].Schema) != facts.PrimString || seen["name"].Required {
+	if primName(seen["name"].Schema) != facts.PrimString || seen["name"].ValidatorRequiresPresence {
 		t.Fatalf("synthetic name field should be optional string, got %+v", seen["name"])
 	}
 }
@@ -1665,10 +1665,10 @@ func (s Server) search(c *gin.Context) {
 	for _, field := range fields {
 		byName[field.JSONName] = field
 	}
-	if primName(byName["attachment"].Schema) != facts.PrimBytes || !byName["attachment"].Required || primName(byName["title"].Schema) != facts.PrimString || primName(byName["note"].Schema) != facts.PrimString {
+	if primName(byName["attachment"].Schema) != facts.PrimBytes || !byName["attachment"].ValidatorRequiresPresence || primName(byName["title"].Schema) != facts.PrimString || primName(byName["note"].Schema) != facts.PrimString {
 		t.Fatalf("multipart fields mismatch: %+v", byName)
 	}
-	if primName(byName["boundFile"].Schema) != facts.PrimBytes || !byName["boundFile"].Required {
+	if primName(byName["boundFile"].Schema) != facts.PrimBytes || !byName["boundFile"].ValidatorRequiresPresence {
 		t.Fatalf("bound multipart file mismatch: %+v", byName["boundFile"])
 	}
 	if byName["metadata"].Schema.Type != facts.TypeNamed {

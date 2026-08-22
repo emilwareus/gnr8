@@ -85,11 +85,14 @@ pub fn generate_with_options(
     layout: &SdkFileLayout,
     model_style: PyModelStyle,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_options(graph, package, base_path, layout, model_style)?;
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let files = generate_files_with_options(&projected, package, base_path, layout, model_style)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
 
+/// Emit the Python SDK files from a graph that is ALREADY direction-projected — the twin of
+/// [`crate::gosdk::generate_files_with_layout`], and projected by its caller for the same reason.
 #[expect(
     clippy::too_many_lines,
     reason = "SDK generation orchestration keeps file ordering, split layout, and metadata in one deterministic pass"
@@ -604,10 +607,10 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "format", "required": false, "optional": true, "nullable": false,
+            { "json_name": "format", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "app.models.BookFormat" },
               "description": null, "example": null },
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -621,7 +624,7 @@ mod tests {
         {
           "id": "app.models.CreatedMessage", "name": "CreatedMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+            { "json_name": "id", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },

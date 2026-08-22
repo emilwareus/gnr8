@@ -64,11 +64,17 @@ pub fn generate_with_layout(
     base_path: &str,
     layout: &SdkFileLayout,
 ) -> Result<String, crate::CoreError> {
-    let files = generate_files_with_layout(graph, package, base_path, layout)?;
+    let projected = crate::graph::projection::for_generation(graph)?;
+    let files = generate_files_with_layout(&projected, package, base_path, layout)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
 
+/// Emit the Go SDK files from a graph that is ALREADY direction-projected.
+///
+/// The projection belongs to the entry point rather than to this function: every caller is one
+/// ([`generate_with_layout`] above, and the `GoSdk` target, which needs the same projected graph for
+/// its docs), so doing it here as well would walk the graph a second time for one bundle.
 pub(crate) fn generate_files_with_layout(
     graph: &ApiGraph,
     package: &str,
@@ -252,7 +258,7 @@ mod tests {
         {
           "id": "dto.CommandMessage", "name": "CommandMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -261,10 +267,10 @@ mod tests {
         {
           "id": "dto.CreateGoalInput", "name": "CreateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "targetDirection", "required": false, "optional": true, "nullable": true,
+            { "json_name": "targetDirection", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "dto.TargetDirection" },
               "description": null, "example": null }
           ] },
@@ -273,7 +279,7 @@ mod tests {
         {
           "id": "dto.HttpError", "name": "HttpError",
           "body": { "type": "object", "of": [
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -282,7 +288,7 @@ mod tests {
         {
           "id": "dto.ListGoalsOutput", "name": "ListGoalsOutput",
           "body": { "type": "object", "of": [
-            { "json_name": "total", "required": false, "optional": false, "nullable": false,
+            { "json_name": "total", "serializer_may_omit": false, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null }
           ] },
@@ -296,7 +302,7 @@ mod tests {
         {
           "id": "dto.UpdateGoalInput", "name": "UpdateGoalInput",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": false, "optional": true, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },

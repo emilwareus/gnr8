@@ -17,11 +17,11 @@ use super::{
 };
 use crate::analyze::facts::{Constraints, Extension, LiteralValue};
 use crate::graph::{
-    ApiGraph, DiagnosticCategory, MediaExample, OpenApiContact, OpenApiLicense,
+    ApiGraph, DiagnosticCategory, Field, MediaExample, OpenApiContact, OpenApiLicense,
     OpenApiMetadataPolicy, OpenApiServer, OperationDocsPolicy, OperationRuntimePolicy,
     PaginationMode, PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy,
-    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SecurityRequirementGroup, SecurityScheme,
-    Type,
+    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SchemaUse, SchemaUseRoot,
+    SecurityRequirementGroup, SecurityScheme, Type,
 };
 use crate::lower::model::{OpenApiDoc, SchemaObject};
 use crate::sdk::docs::{write_sdk_docs, SdkDocs};
@@ -1253,6 +1253,8 @@ impl Transform for SetSchemaFieldType {
 #[derive(Debug, Clone, Default)]
 pub struct ApiOverrides {
     field_presence: Vec<FieldPresenceOverride>,
+    field_nullability: Vec<FieldNullabilityOverride>,
+    schema_uses: Vec<(String, SchemaUse)>,
     parameters: Vec<(OperationSelector, ParameterOverride)>,
     security_overrides: Vec<(OperationSelector, SecurityOverride)>,
     request_bodies: Vec<RequestBodyOverride>,
@@ -1266,6 +1268,14 @@ struct FieldPresenceOverride {
     schema: String,
     field: String,
     required: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FieldNullabilityOverride {
+    schema: String,
+    field: String,
+    use_: SchemaUse,
+    nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1608,6 +1618,56 @@ impl ApiOverrides {
         self
     }
 
+    /// Register a non-HTTP schema as an input root for transitive direction analysis.
+    #[must_use]
+    pub fn register_input_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema_uses.push((schema.into(), SchemaUse::Input));
+        self
+    }
+
+    /// Register a non-HTTP schema as an output root for transitive direction analysis.
+    #[must_use]
+    pub fn register_output_schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema_uses.push((schema.into(), SchemaUse::Output));
+        self
+    }
+
+    /// Assert that a field which extraction currently marks nullable is non-null in one direction.
+    /// The transform fails if the schema/field disappears or the correction is already redundant.
+    #[must_use]
+    pub fn force_non_nullable(
+        mut self,
+        schema: impl Into<String>,
+        field: impl Into<String>,
+        use_: SchemaUse,
+    ) -> Self {
+        self.field_nullability.push(FieldNullabilityOverride {
+            schema: schema.into(),
+            field: field.into(),
+            use_,
+            nullable: false,
+        });
+        self
+    }
+
+    /// Assert that a field which extraction currently marks non-null is nullable in one direction.
+    /// The transform fails if the schema/field disappears or the correction is already redundant.
+    #[must_use]
+    pub fn force_nullable(
+        mut self,
+        schema: impl Into<String>,
+        field: impl Into<String>,
+        use_: SchemaUse,
+    ) -> Self {
+        self.field_nullability.push(FieldNullabilityOverride {
+            schema: schema.into(),
+            field: field.into(),
+            use_,
+            nullable: true,
+        });
+        self
+    }
+
     /// Apply a checked, fully typed request parameter override to exactly one selected operation.
     #[must_use]
     pub fn parameter(mut self, selector: OperationSelector, override_: ParameterOverride) -> Self {
@@ -1793,14 +1853,8 @@ impl Transform for ApiOverrides {
                 message: message.clone(),
             });
         }
-        for override_ in &self.field_presence {
-            apply_field_presence_override(
-                ir,
-                &override_.schema,
-                &override_.field,
-                override_.required,
-            )?;
-        }
+        apply_field_contract_overrides(ir, &self.field_presence, &self.field_nullability)?;
+        apply_schema_use_roots(ir, &self.schema_uses)?;
         let mut touched = BTreeSet::new();
         for (selector, override_) in &self.parameters {
             let op_index = find_selected_operation_index(ir, selector, "parameter override")?;
@@ -1861,6 +1915,60 @@ impl Transform for ApiOverrides {
         }
         Ok(())
     }
+}
+
+fn apply_field_contract_overrides(
+    ir: &mut ApiGraph,
+    presence: &[FieldPresenceOverride],
+    nullability: &[FieldNullabilityOverride],
+) -> Result<(), CoreError> {
+    for override_ in presence {
+        apply_field_presence_override(ir, &override_.schema, &override_.field, override_.required)?;
+    }
+
+    let mut targets = BTreeSet::new();
+    for override_ in nullability {
+        let key = (
+            override_.schema.as_str(),
+            override_.field.as_str(),
+            override_.use_,
+        );
+        if !targets.insert(key) {
+            return Err(CoreError::Config {
+                message: format!(
+                    "conflicting nullability overrides target {:?}.{:?} in {:?}",
+                    override_.schema, override_.field, override_.use_
+                ),
+            });
+        }
+        apply_field_nullability_override(ir, override_)?;
+    }
+    Ok(())
+}
+
+fn apply_schema_use_roots(
+    ir: &mut ApiGraph,
+    schema_uses: &[(String, SchemaUse)],
+) -> Result<(), CoreError> {
+    for (schema, use_) in schema_uses {
+        let schema_id = resolve_schema_ref(ir, schema, "schema-use root")?;
+        let root = SchemaUseRoot {
+            schema_id,
+            use_: *use_,
+        };
+        if ir.schema_uses.contains(&root) {
+            return Err(CoreError::Config {
+                message: format!("redundant {use_:?} schema-use root {schema:?}"),
+            });
+        }
+        ir.schema_uses.push(root);
+    }
+    ir.schema_uses.sort_by(|left, right| {
+        left.schema_id
+            .cmp(&right.schema_id)
+            .then_with(|| left.use_.cmp(&right.use_))
+    });
+    Ok(())
 }
 
 fn apply_security_override(
@@ -2152,12 +2260,18 @@ fn request_parameter_matches(existing: &crate::graph::Param, requested: &Request
         && existing.allow_reserved == requested.allow_reserved
 }
 
-fn apply_field_presence_override(
-    ir: &mut ApiGraph,
+/// Resolve the ONE graph field a checked field-level override targets.
+///
+/// Every field-level override asks the same four questions — does the schema exist, is a bare name
+/// unambiguous, is the body an object, does the field exist — so they are asked once here rather than
+/// once per override kind (CLAUDE.md rule 3). `label` names the override in each message, so a
+/// correction that has gone stale still says which one it was.
+fn override_target_field<'a>(
+    ir: &'a mut ApiGraph,
     schema_match: &str,
     field_name: &str,
-    required: bool,
-) -> Result<(), CoreError> {
+    label: &str,
+) -> Result<&'a mut Field, CoreError> {
     let matches: Vec<usize> = ir
         .schemas
         .iter()
@@ -2171,14 +2285,14 @@ fn apply_field_presence_override(
         [] => {
             return Err(CoreError::Config {
                 message: format!(
-                    "field presence override schema {schema_match:?} does not match any graph schema id or name"
+                    "{label} schema {schema_match:?} does not match any graph schema id or name"
                 ),
             });
         }
         many => {
             return Err(CoreError::Config {
                 message: format!(
-                    "field presence override schema {schema_match:?} matches {} schemas; use the full schema id",
+                    "{label} schema {schema_match:?} matches {} schemas; use the full schema id",
                     many.len()
                 ),
             });
@@ -2188,29 +2302,73 @@ fn apply_field_presence_override(
     let schema = &mut ir.schemas[schema_index];
     let Type::Object(fields) = &mut schema.body else {
         return Err(CoreError::Config {
-            message: format!(
-                "field presence override schema {schema_match:?} is not an object schema"
-            ),
+            message: format!("{label} schema {schema_match:?} is not an object schema"),
         });
     };
 
-    let field = fields
+    fields
         .iter_mut()
         .find(|field| field.json_name == field_name)
         .ok_or_else(|| CoreError::Config {
             message: format!(
-                "field presence override did not find field {field_name:?} on schema {schema_match:?}"
+                "{label} did not find field {field_name:?} on schema {schema_match:?}"
             ),
-        })?;
+        })
+}
+
+fn apply_field_presence_override(
+    ir: &mut ApiGraph,
+    schema_match: &str,
+    field_name: &str,
+    required: bool,
+) -> Result<(), CoreError> {
+    let field = override_target_field(ir, schema_match, field_name, "field presence override")?;
     // Presence is ONE question, and the graph carries two code-derived answers to it: `required`
     // (what request validation demands) and `!optional` (what the serializer always writes). Which
     // one an artifact reads depends on the direction the schema is reached from
     // (`graph::direction::SchemaDirections`), and the OpenAPI document and the SDK models pick
-    // differently in some positions. An override that moved one axis would therefore be silently
-    // dropped wherever the other one is read, so it states the corrected fact on both and means the
-    // same thing in every position — exactly what every non-Go source already records.
-    field.required = required;
-    field.optional = !required;
+    // differently in some positions. State the corrected effective input and output presence so the
+    // override means the same thing in every position.
+    field.deserializer_accepts_absent = !required;
+    field.serializer_may_omit = !required;
+    field.validator_requires_presence = required;
+    Ok(())
+}
+
+fn apply_field_nullability_override(
+    ir: &mut ApiGraph,
+    override_: &FieldNullabilityOverride,
+) -> Result<(), CoreError> {
+    let field = override_target_field(
+        ir,
+        &override_.schema,
+        &override_.field,
+        "nullability override",
+    )?;
+    let current = match override_.use_ {
+        SchemaUse::Input => field.deserializer_accepts_null && !field.validator_rejects_null,
+        SchemaUse::Output => field.serializer_may_emit_null,
+    };
+    if current == override_.nullable {
+        return Err(CoreError::Config {
+            message: format!(
+                "redundant {:?} nullability override on {:?}.{:?}: extracted field is already {}nullable",
+                override_.use_,
+                override_.schema,
+                override_.field,
+                if current { "" } else { "non-" }
+            ),
+        });
+    }
+    match override_.use_ {
+        SchemaUse::Input => {
+            field.deserializer_accepts_null = override_.nullable;
+            if override_.nullable {
+                field.validator_rejects_null = false;
+            }
+        }
+        SchemaUse::Output => field.serializer_may_emit_null = override_.nullable,
+    }
     Ok(())
 }
 
@@ -4299,6 +4457,11 @@ fn apply_openapi_schema_patch(
     doc: &mut OpenApiDoc,
     patch: &OpenApiSchemaPatch,
 ) -> Result<(), CoreError> {
+    // Read what the projection published for this name BEFORE taking the mutable borrow, so a miss
+    // can say where the component went rather than only that it is gone. A patch is keyed by the
+    // PUBLIC component name, and that name changes when a type's two directional contracts diverge —
+    // the one case where "unknown schema" is a stale target rather than a typo.
+    let split_into = directional_components(doc, &patch.schema);
     let Some((_, schema)) = doc
         .components
         .schemas
@@ -4306,16 +4469,41 @@ fn apply_openapi_schema_patch(
         .find(|(name, _)| name == &patch.schema)
     else {
         return Err(CoreError::Config {
-            message: format!(
-                "OpenAPI schema patch references unknown schema {:?}",
-                patch.schema
-            ),
+            message: if split_into.is_empty() {
+                format!(
+                    "OpenAPI schema patch references unknown schema {:?}",
+                    patch.schema
+                )
+            } else {
+                format!(
+                    "OpenAPI schema patch references unknown schema {:?}: its input and output \
+                     contracts differ, so it is published as {} — patch the direction the change \
+                     belongs to",
+                    patch.schema,
+                    split_into.join(" and ")
+                )
+            },
         });
     };
     for field_patch in &patch.field_patches {
         apply_openapi_field_patch(&patch.schema, schema, field_patch)?;
     }
     Ok(())
+}
+
+/// The directional components the document carries in place of `name`, or empty when `name` was never
+/// split — an ordinary typo, which the caller reports as one.
+fn directional_components(doc: &OpenApiDoc, name: &str) -> Vec<String> {
+    crate::graph::projection::directional_names(name)
+        .into_iter()
+        .filter(|candidate| {
+            doc.components
+                .schemas
+                .iter()
+                .any(|(existing, _)| existing == candidate)
+        })
+        .map(|candidate| format!("{candidate:?}"))
+        .collect()
 }
 
 fn apply_openapi_field_patch(
@@ -4803,6 +4991,8 @@ impl Target for GoSdk {
                     .to_string(),
             });
         }
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path (the single source of truth) and generate via the
         // existing deterministic SDK generator — never a re-implementation (CLAUDE.md rules 2 & 3).
         let package = sdk_package(&self.module)?;
@@ -5011,6 +5201,8 @@ impl Target for PySdk {
                 message: "PySdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk uses, and
         // generate via the existing deterministic Python SDK generator — never a re-derivation, never
         // a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth the
@@ -5331,6 +5523,8 @@ impl Target for TsSdk {
                 message: "TsSdk target has no output dir — call .to(\"sdk\")".to_string(),
             });
         }
+        let projected = crate::graph::projection::for_generation(ir)?;
+        let ir = &*projected;
         // Derive the package from the module path via the SAME single source of truth GoSdk/PySdk use,
         // and generate via the existing deterministic TypeScript SDK generator — never a re-derivation,
         // never a fallback (CLAUDE.md rules 2 & 3). `ir.base_path` is the same single source of truth
@@ -6228,7 +6422,7 @@ mod tests {
         ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, FastApi, Flask, FormatCommand, GoGin,
         GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json,
         OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
-        ParameterOverride, PostProcess, PySdk, RequestParameter, ResponseOverride,
+        ParameterOverride, PostProcess, PySdk, RenameType, RequestParameter, ResponseOverride,
         SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
         Transform, TsSdk,
@@ -6237,7 +6431,7 @@ mod tests {
     use crate::graph::{
         ApiGraph, Diagnostic, DiagnosticCategory, Field, Operation, PaginationMode,
         PaginationTermination, Param, Prim, Response, RuntimeHookKind, Schema, SchemaRef,
-        SourceSpan, Type,
+        SchemaUse, SourceSpan, Type,
     };
 
     use crate::sdk::layout::SdkFileLayout;
@@ -7635,9 +7829,12 @@ mod tests {
                     name: "ErrorResponse".to_string(),
                     body: Type::Object(vec![Field {
                         json_name: "message".to_string(),
-                        required: true,
-                        optional: false,
-                        nullable: false,
+                        serializer_may_omit: false,
+                        deserializer_accepts_absent: false,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: true,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: None,
                         example: None,
@@ -8140,9 +8337,12 @@ mod tests {
                 name: "DocumentBody".to_string(),
                 body: Type::Object(vec![Field {
                     json_name: "blocks".to_string(),
-                    required: true,
-                    optional: false,
-                    nullable: false,
+                    serializer_may_omit: false,
+                    deserializer_accepts_absent: false,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: true,
+                    validator_rejects_null: false,
                     schema: Type::Primitive(Prim::String),
                     description: None,
                     example: None,
@@ -8174,9 +8374,12 @@ mod tests {
             name: name.to_string(),
             body: Type::Object(vec![Field {
                 json_name: "nickname".to_string(),
-                required,
-                optional,
-                nullable: false,
+                serializer_may_omit: optional,
+                deserializer_accepts_absent: !required,
+                deserializer_accepts_null: false,
+                serializer_may_emit_null: false,
+                validator_requires_presence: required,
+                validator_rejects_null: false,
                 schema: Type::Primitive(Prim::String),
                 description: None,
                 example: None,
@@ -8194,6 +8397,153 @@ mod tests {
         &fields[0]
     }
 
+    fn directional_schema() -> Schema {
+        Schema {
+            id: "tool.Payload".to_string(),
+            name: "Payload".to_string(),
+            body: Type::Object(vec![Field {
+                json_name: "value".to_string(),
+                serializer_may_omit: true,
+                deserializer_accepts_absent: false,
+                deserializer_accepts_null: true,
+                serializer_may_emit_null: false,
+                validator_requires_presence: false,
+                validator_rejects_null: false,
+                schema: Type::Primitive(Prim::String),
+                description: None,
+                example: None,
+                meta: FieldMeta::default(),
+            }]),
+            enum_source_order: Vec::new(),
+            provenance: span(),
+        }
+    }
+
+    #[test]
+    fn registered_non_http_roots_project_input_and_output_models() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .register_input_schema("Payload")
+            .register_output_schema("Payload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        let ts = crate::tssdk::generate(&ir, "tool", "/").unwrap();
+        assert!(ts.contains("export interface PayloadInput"), "{ts}");
+        assert!(ts.contains("  value: string | null;"), "{ts}");
+        assert!(ts.contains("export interface PayloadOutput"), "{ts}");
+        assert!(ts.contains("  value?: string;"), "{ts}");
+
+        let py = crate::pysdk::generate(&ir, "tool", "/").unwrap();
+        assert!(py.contains("class PayloadInput(BaseModel):"), "{py}");
+        assert!(py.contains("    value: Optional[str]\n"), "{py}");
+        assert!(py.contains("class PayloadOutput(BaseModel):"), "{py}");
+        assert!(
+            py.contains("    value: Optional[str] = Field(default=None)"),
+            "{py}"
+        );
+
+        let mut artifacts = Artifacts::new();
+        TsSdk::new()
+            .module("example.com/tool/sdk")
+            .to("generated/ts")
+            .package_metadata(false)
+            .generate(&ir, &mut artifacts, &cx())
+            .unwrap();
+        let reference = artifacts
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "generated/ts/reference.md")
+            .map(|artifact| artifact.text.as_str())
+            .unwrap();
+        assert!(reference.contains("`PayloadInput`"), "{reference}");
+        assert!(reference.contains("`PayloadOutput`"), "{reference}");
+    }
+
+    #[test]
+    fn type_renames_keep_registered_direction_roots_attached() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .register_input_schema("Payload")
+            .register_output_schema("Payload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+        RenameType::new("Payload", "PublicPayload")
+            .apply(&mut ir, &cx())
+            .unwrap();
+
+        assert!(ir
+            .schema_uses
+            .iter()
+            .all(|root| root.schema_id == "PublicPayload"));
+        let ts = crate::tssdk::generate(&ir, "tool", "/").unwrap();
+        assert!(ts.contains("export interface PublicPayloadInput"), "{ts}");
+        assert!(ts.contains("export interface PublicPayloadOutput"), "{ts}");
+    }
+
+    #[test]
+    fn directional_nullability_overrides_are_checked_and_scoped() {
+        let mut ir = ApiGraph {
+            schemas: vec![directional_schema()],
+            ..ApiGraph::default()
+        };
+        ApiOverrides::new()
+            .force_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(field.deserializer_accepts_null);
+        assert!(field.serializer_may_emit_null);
+
+        let redundant = ApiOverrides::new()
+            .force_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(redundant.to_string().contains("redundant"), "{redundant}");
+
+        ApiOverrides::new()
+            .force_non_nullable("Payload", "value", SchemaUse::Output)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(field.deserializer_accepts_null);
+        assert!(!field.serializer_may_emit_null);
+
+        ApiOverrides::new()
+            .force_non_nullable("Payload", "value", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap();
+        let field = presence_field(&ir);
+        assert!(!field.deserializer_accepts_null);
+        assert!(!field.serializer_may_emit_null);
+
+        let stale_field = ApiOverrides::new()
+            .force_non_nullable("Payload", "missing", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(
+            stale_field.to_string().contains("did not find field"),
+            "{stale_field}"
+        );
+
+        let stale_schema = ApiOverrides::new()
+            .force_non_nullable("Missing", "value", SchemaUse::Input)
+            .apply(&mut ir, &cx())
+            .unwrap_err();
+        assert!(
+            stale_schema
+                .to_string()
+                .contains("does not match any graph schema"),
+            "{stale_schema}"
+        );
+    }
+
     #[test]
     fn a_field_presence_override_states_presence_on_both_axes() {
         // The source disagrees with itself the way only Go can: validation demands the key, the
@@ -8207,15 +8557,17 @@ mod tests {
             .force_optional("Profile", "nickname")
             .apply(&mut ir, &cx())
             .unwrap();
-        assert!(!presence_field(&ir).required);
-        assert!(presence_field(&ir).optional);
+        assert!(presence_field(&ir).deserializer_accepts_absent);
+        assert!(presence_field(&ir).serializer_may_omit);
+        assert!(!presence_field(&ir).validator_requires_presence);
 
         ApiOverrides::new()
             .force_required("Profile", "nickname")
             .apply(&mut ir, &cx())
             .unwrap();
-        assert!(presence_field(&ir).required);
-        assert!(!presence_field(&ir).optional);
+        assert!(!presence_field(&ir).deserializer_accepts_absent);
+        assert!(!presence_field(&ir).serializer_may_omit);
+        assert!(presence_field(&ir).validator_requires_presence);
     }
 
     #[test]
@@ -8299,9 +8651,12 @@ mod tests {
                     name: "Filter".to_string(),
                     body: Type::Object(vec![Field {
                         json_name: "sort".to_string(),
-                        required: false,
-                        optional: true,
-                        nullable: false,
+                        serializer_may_omit: true,
+                        deserializer_accepts_absent: true,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: false,
+                        validator_rejects_null: false,
                         schema: Type::Enum(vec!["asc".to_string(), "desc".to_string()]),
                         description: None,
                         example: None,
@@ -8348,9 +8703,12 @@ mod tests {
                 body: Type::Object(vec![
                     Field {
                         json_name: "title".to_string(),
-                        required: true,
-                        optional: false,
-                        nullable: false,
+                        serializer_may_omit: false,
+                        deserializer_accepts_absent: false,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: true,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: None,
                         example: None,
@@ -8358,9 +8716,12 @@ mod tests {
                     },
                     Field {
                         json_name: "source".to_string(),
-                        required: false,
-                        optional: true,
-                        nullable: false,
+                        serializer_may_omit: true,
+                        deserializer_accepts_absent: true,
+                        deserializer_accepts_null: false,
+                        serializer_may_emit_null: false,
+                        validator_requires_presence: false,
+                        validator_rejects_null: false,
                         schema: Type::Primitive(Prim::String),
                         description: Some("Source description".to_string()),
                         example: Some("source-example".to_string()),
@@ -8464,13 +8825,146 @@ mod tests {
         assert_eq!(title["x-empty"], serde_json::Value::Null);
     }
 
+    /// A schema used in both directions, whose contract differs, so the document publishes it as two
+    /// components.
+    fn split_component_graph() -> ApiGraph {
+        let json_body = |ref_id: &str| SchemaRef {
+            ref_id: ref_id.to_string(),
+        };
+        ApiGraph {
+            operations: vec![
+                Operation {
+                    id: "put".to_string(),
+                    method: "PUT".to_string(),
+                    path: "/shared".to_string(),
+                    handler: "put".to_string(),
+                    summary: None,
+                    description: None,
+                    group: None,
+                    middleware: Vec::new(),
+                    params: Vec::new(),
+                    request_body: Some(json_body("dto.Shared")),
+                    request_body_required: true,
+                    request_body_content_type: Some("application/json".to_string()),
+                    responses: vec![Response {
+                        status: 204,
+                        body: None,
+                        body_kind: "empty".to_string(),
+                        content_type: None,
+                        content_types: Vec::new(),
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+                Operation {
+                    id: "get".to_string(),
+                    method: "GET".to_string(),
+                    path: "/shared".to_string(),
+                    handler: "get".to_string(),
+                    summary: None,
+                    description: None,
+                    group: None,
+                    middleware: Vec::new(),
+                    params: Vec::new(),
+                    request_body: None,
+                    request_body_required: true,
+                    request_body_content_type: None,
+                    responses: vec![Response {
+                        status: 200,
+                        body: Some(json_body("dto.Shared")),
+                        body_kind: "json".to_string(),
+                        content_type: Some("application/json".to_string()),
+                        content_types: vec!["application/json".to_string()],
+                    }],
+                    security: Vec::new(),
+                    security_overrides_global: false,
+                    provenance: span(),
+                },
+            ],
+            schemas: vec![Schema {
+                id: "dto.Shared".to_string(),
+                name: "Shared".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "value".to_string(),
+                    serializer_may_omit: true,
+                    deserializer_accepts_absent: false,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance: span(),
+            }],
+            ..ApiGraph::default()
+        }
+    }
+
+    /// A schema patch is keyed by the PUBLIC component name, and that name changes when a type's two
+    /// directional contracts diverge. "Unknown schema" is true but useless there, so the miss names
+    /// what the projection published instead — the one case where a stale patch target is not a typo.
+    #[test]
+    fn a_schema_patch_on_a_split_component_names_both_directions() {
+        let ir = split_component_graph();
+
+        let error = OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(
+                OpenApiSchemaPatch::new("Shared")
+                    .field(OpenApiFieldPatch::new("value").description("Some prose")),
+            )
+            .generate(&ir, &mut Artifacts::new(), &cx())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("\"SharedInput\" and \"SharedOutput\""),
+            "the miss has to name the two components a patch can target: {error}"
+        );
+
+        // A patch that names one of them lands, so the message points somewhere that works.
+        let mut out = Artifacts::new();
+        OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(
+                OpenApiSchemaPatch::new("SharedInput")
+                    .field(OpenApiFieldPatch::new("value").description("Some prose")),
+            )
+            .generate(&ir, &mut out, &cx())
+            .unwrap();
+        let yaml = out
+            .files()
+            .iter()
+            .find(|artifact| artifact.path == "openapi.yaml")
+            .unwrap()
+            .text
+            .clone();
+        assert!(yaml.contains("description: Some prose"), "{yaml}");
+
+        // A name that never split keeps the bare message: a typo is still a typo.
+        let typo = OpenApi31::new()
+            .to("openapi.yaml")
+            .schema_patch(OpenApiSchemaPatch::new("Nonexistent"))
+            .generate(&ir, &mut Artifacts::new(), &cx())
+            .unwrap_err()
+            .to_string();
+        assert!(typo.ends_with("unknown schema \"Nonexistent\""), "{typo}");
+    }
+
     #[test]
     fn openapi_field_patch_examples_support_primitive_literals() {
         let field = |json_name: &str, schema: Type| Field {
             json_name: json_name.to_string(),
-            required: false,
-            optional: true,
-            nullable: false,
+            serializer_may_omit: true,
+            deserializer_accepts_absent: true,
+            deserializer_accepts_null: false,
+            serializer_may_emit_null: false,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema,
             description: None,
             example: None,

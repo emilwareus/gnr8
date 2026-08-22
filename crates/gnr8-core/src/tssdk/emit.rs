@@ -416,12 +416,10 @@ fn pascal_identifier(value: &str) -> String {
 ///
 /// Unlike the Python `@dataclass` twin there is NO required-first partition (TS `?:` is order-free —
 /// RESEARCH Pitfall 6). The runtime response decoder validates media type, presence, and JSON syntax
-/// before casting into these zero-runtime interfaces. The two axes are: whether the model may leave the
+/// before casting into these zero-runtime interfaces. The projected contract answers whether the model may leave the
 /// key out → `?:` at the field site (answered from the direction the schema is reached from —
-/// [`SchemaDirections::model_field_is_optional`]); `nullable` → `| null` inside [`ts_type`]. All four
-/// combinations are representable, but they are not independent in one direction: a nullable key the
-/// server does not validate is also omittable, since `k?: T | null` and `k: T | null` leave a reader the
-/// same case to handle and only the second makes a caller spell the null out.
+/// [`SchemaDirections::model_field_is_optional`]); accepting or emitting null independently adds
+/// `| null` inside [`ts_type`]. All four presence×null combinations are representable.
 fn emit_interface(
     out: &mut String,
     name: &str,
@@ -448,7 +446,7 @@ fn emit_interface(
         } else {
             ts_string_literal(&field.json_name)
         };
-        let hint = ts_field_type(field, graph, ns)?;
+        let hint = ts_field_type(field, graph, ns, directions)?;
         let opt = if directions.model_field_is_optional(field) {
             "?"
         } else {
@@ -460,7 +458,13 @@ fn emit_interface(
     Ok(())
 }
 
-fn ts_field_type(field: &Field, graph: &ApiGraph, ns: &str) -> Result<String, CoreError> {
+fn ts_field_type(
+    field: &Field,
+    graph: &ApiGraph,
+    ns: &str,
+    directions: SchemaDirections,
+) -> Result<String, CoreError> {
+    let nullable = directions.field_is_nullable(field);
     if matches!(field.schema, Type::Primitive(Prim::String))
         && !field.meta.constraints.enum_values.is_empty()
     {
@@ -472,12 +476,12 @@ fn ts_field_type(field: &Field, graph: &ApiGraph, ns: &str) -> Result<String, Co
             .map(|value| ts_string_literal(value))
             .collect::<Vec<_>>()
             .join(" | ");
-        if field.nullable {
+        if nullable {
             hint.push_str(" | null");
         }
         return Ok(hint);
     }
-    ts_type(&field.schema, field.nullable, graph, ns)
+    ts_type(&field.schema, nullable, graph, ns)
 }
 
 /// Emit `errors.ts`: the typed `ApiError extends Error` carrying status, response metadata, and body.
@@ -3079,20 +3083,23 @@ fn ts_multipart_request_body_arg_type(
             ts_string_literal(&field.json_name)
         };
         // This inline shape is the argument a caller builds a multipart request from and is used for
-        // nothing else, so it occupies the request position by construction and takes the request
-        // answer — not the one the walk would return for the schema as a whole.
+        // nothing else, so it STATES the request position rather than asking the walk for it.
         //
-        // Those differ when the same type is also a response body: the walk then reports both
-        // directions and `models.X` marks a validated-and-omittable field `?:`, because that interface
-        // has to survive a decode too. This argument never decodes anything, so narrowing it to what
-        // the server accepts costs the caller nothing and is the whole point of the rule. One position,
-        // one answer, in both places.
+        // The walk agrees, and that is the point of stating it: a request body reaches the input
+        // component, so `crate::graph::projection` has already given the schema behind this argument
+        // one exact directional contract, and asking would return the same two answers. Naming the
+        // position keeps that true of an inline shape no `$ref` points at — one that is never a
+        // component, never reached by the walk, and never decodes a response.
         let optional = if SchemaDirections::REQUEST.model_field_is_optional(field) {
             "?"
         } else {
             ""
         };
-        let ty = ts_multipart_field_type(&field.schema, field.nullable, graph)?;
+        let ty = ts_multipart_field_type(
+            &field.schema,
+            SchemaDirections::REQUEST.field_is_nullable(field),
+            graph,
+        )?;
         parts.push(format!("{key}{optional}: {ty}"));
     }
     Ok(format!("{{ {} }}", parts.join("; ")))
@@ -3490,7 +3497,7 @@ mod tests {
         {
           "id": "app.models.Author", "name": "Author",
           "body": { "type": "object", "of": [
-            { "json_name": "name", "required": true, "optional": false, "nullable": false,
+            { "json_name": "name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3499,16 +3506,16 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "author", "required": true, "optional": false, "nullable": false,
+            { "json_name": "author", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "named", "of": "app.models.Author" },
               "description": null, "example": null },
-            { "json_name": "rating", "required": false, "optional": true, "nullable": true,
+            { "json_name": "rating", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "union", "of": [
                 { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                 { "type": "primitive", "of": { "prim": "float", "bits": 64 } }
               ] },
               "description": null, "example": null },
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3517,16 +3524,16 @@ mod tests {
         {
           "id": "app.models.BookFilters", "name": "BookFilters",
           "body": { "type": "object", "of": [
-            { "json_name": "genre", "required": true, "optional": false, "nullable": false,
+            { "json_name": "genre", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "in_stock", "required": false, "optional": true, "nullable": false,
+            { "json_name": "in_stock", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "bool" } },
               "description": null, "example": null },
-            { "json_name": "published", "required": true, "optional": false, "nullable": true,
+            { "json_name": "published", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": true, "serializer_may_emit_null": true, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null },
-            { "json_name": "sort", "required": false, "optional": true, "nullable": false,
+            { "json_name": "sort", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
               "schema": { "type": "enum", "of": ["asc", "desc"] },
               "description": null, "example": null }
           ] },
@@ -3548,7 +3555,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3819,11 +3826,7 @@ mod tests {
 
         /// The `?:` and the `| null` are separate marks and the emitter puts each where it belongs.
         ///
-        /// No operation reaches this sample, so no validation rule reaches these models either, and a
-        /// nullable key therefore carries both marks: `k?: T | null` and `k: T | null` leave a reader
-        /// the same case, and only the second makes a caller spell the null out. The `| null`-without-
-        /// `?` form is what a validated key keeps, which needs a routed graph —
-        /// `tests/sdk_model_presence.rs` pins it there.
+        /// Presence and nullability are independent even when no operation reaches this sample.
         #[test]
         fn object_emits_an_interface_with_a_mark_per_field_axis() {
             let out = emit_models(&sample_graph(), "bookstore").unwrap();
@@ -3838,10 +3841,10 @@ mod tests {
                 out.contains("  in_stock?: boolean;"),
                 "optional non-nullable `?:`:\n{out}"
             );
-            // Nullable, and no rule demands the key: both marks.
+            // Required and nullable: value mark only.
             assert!(
-                out.contains("  published?: string | null;"),
-                "nullable with no rule demanding it takes both marks:\n{out}"
+                out.contains("  published: string | null;"),
+                "required nullable field takes only the value mark:\n{out}"
             );
             // optional inline enum field (`?:` + literal union).
             assert!(
@@ -3931,7 +3934,7 @@ mod tests {
         {
           "id": "app.models.Book", "name": "Book",
           "body": { "type": "object", "of": [
-            { "json_name": "title", "required": true, "optional": false, "nullable": false,
+            { "json_name": "title", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3940,10 +3943,10 @@ mod tests {
         {
           "id": "app.models.CreatedMessage", "name": "CreatedMessage",
           "body": { "type": "object", "of": [
-            { "json_name": "id", "required": true, "optional": false, "nullable": false,
+            { "json_name": "id", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
               "description": null, "example": null },
-            { "json_name": "message", "required": true, "optional": false, "nullable": false,
+            { "json_name": "message", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -3952,7 +3955,7 @@ mod tests {
         {
           "id": "app.models.OutOfStock", "name": "OutOfStock",
           "body": { "type": "object", "of": [
-            { "json_name": "reason", "required": true, "optional": false, "nullable": false,
+            { "json_name": "reason", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
               "schema": { "type": "primitive", "of": { "prim": "string" } },
               "description": null, "example": null }
           ] },
@@ -4128,9 +4131,7 @@ mod tests {
                       "body": { "type": "object", "of": [
                         {
                           "json_name": "id",
-                          "required": true,
-                          "optional": false,
-                          "nullable": false,
+                          "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                           "schema": { "type": "primitive", "of": { "prim": "string" } },
                           "description": null,
                           "example": null
@@ -4144,18 +4145,14 @@ mod tests {
                       "body": { "type": "object", "of": [
                         {
                           "json_name": "items",
-                          "required": true,
-                          "optional": false,
-                          "nullable": false,
+                          "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                           "schema": { "type": "array", "of": { "type": "named", "of": "dto.Book" } },
                           "description": null,
                           "example": null
                         },
                         {
                           "json_name": "nextCursor",
-                          "required": false,
-                          "optional": true,
-                          "nullable": false,
+                          "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                           "schema": { "type": "primitive", "of": { "prim": "string" } },
                           "description": null,
                           "example": null
@@ -5353,16 +5350,16 @@ mod tests {
               "schemas": [
                 { "id": "a.Headers", "name": "Headers",
                   "body": { "type": "object", "of": [
-                    { "json_name": "content-type", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "content-type", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null },
-                    { "json_name": "123abc", "required": false, "optional": true, "nullable": false,
+                    { "json_name": "123abc", "serializer_may_omit": true, "deserializer_accepts_absent": true, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": false, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                       "description": null, "example": null },
-                    { "json_name": "user name", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "user name", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "string" } },
                       "description": null, "example": null },
-                    { "json_name": "plainKey", "required": true, "optional": false, "nullable": false,
+                    { "json_name": "plainKey", "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                       "schema": { "type": "primitive", "of": { "prim": "bool" } },
                       "description": null, "example": null }
                   ] },

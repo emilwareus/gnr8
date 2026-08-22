@@ -47,27 +47,27 @@ Recognized route facts include:
 - `ShouldBindJSON`/`BindJSON`; generic bind variants for typed form, multipart, query, and header
   structs.
 - JSON responses, response status/media facts, Go structs, nested types, and string enums.
-- Independent optionality and nullability for Go fields, each read from exactly one thing, and both
-  read from the serializer that owns the field's wire form.
+- Independent inbound/outbound presence and null behavior for Go fields.
 
-  On a `json:`-tagged field (or one with no payload tag), `encoding/json` owns it. Nullability is
-  the declared type: a nil pointer, slice, map, or interface is what the marshaller writes as
-  `null`, and what `json.Unmarshal` accepts a `null` into whatever the tag says — so it holds even
-  for an omission-tagged field, which can never write `null` but can still be sent one. Optionality
-  is the tag's omission option — `,omitzero` on any type, `,omitempty` only on the types it actually
-  omits — and never the declared type, since a bare pointer keeps its key.
+  On a `json:`-tagged field (or one with no payload tag), outbound presence is the omission option —
+  `,omitzero` on any type, `,omitempty` only on the types it actually omits. A bare nilable field with
+  no option is required and can emit null. An omission-tagged ordinary pointer/slice/map is optional
+  and non-null when present. Inbound null acceptance is recorded separately: `encoding/json` accepts
+  null for every ordinary destination, leaving a non-nilable value unchanged. A field-level required
+  validator can reject the resulting zero/nil value; required `json.RawMessage` is the important
+  exception because literal null becomes non-nil bytes. A custom unmarshaler owns its behavior, so an
+  application that rejects null there states that checked correction with `force_non_nullable`.
 
   On a `form:`-tagged field a form/multipart binder owns it, and the rules differ: a part is present
   or absent with no `null` to write, so such a field is never nullable, and it is optional when the
   part is a pointer *or* the tag carries `,omitempty`. `,omitzero` is read on the `json` wire only.
-  Both axes reach every artifact. Which of them answers "must this key be present?" depends on the
-  direction that schema is reached from — validation rules on a request, the presence axis on a
-  response — in the document's `required` array
+  These facts reach every artifact. Direction selects request decoding/validation or response
+  serialization in the document's `required` array and property nullability
   ([OpenAPI generation](../openapi/generation.md#a-component-schemas-required-array)) and in a
-  generated model's `?:` or `= None`
+  generated model's `?:`, `| null`, Python default/type hint, or Go pointer depth
   ([SDK generation](../sdk/generation.md#field-presence-in-generated-models)). A Go model spells
-  omission with `,omitempty`, which drops the zero value rather than marking absence, so there the
-  validation rules can only take the option away — never put one on a field whose tag carries none.
+  omission with `,omitempty`. A value type uses `*T` to preserve optional zero values; a field that is
+  both optional and nullable adds one more pointer level so an explicit null remains constructible.
 - Validation tags read at the scope they are written in: a `required`, `min`, or `max` reached
   through `dive` or `keys`…`endkeys` constrains what the field contains, not the field, so it
   neither makes the key required nor binds the container. A rule gnr8 does not lower, or one whose

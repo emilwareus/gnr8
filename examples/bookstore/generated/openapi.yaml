@@ -142,9 +142,9 @@ components:
           type: string
           format: date-time
         publisher:
-          $ref: '#/components/schemas/Publisher'
+          $ref: '#/components/schemas/PublisherOutput'
         subtitle:
-          type: [string, 'null']
+          type: string
         tags:
           type: [array, 'null']
           items:
@@ -168,9 +168,11 @@ components:
         genre:
           $ref: '#/components/schemas/Genre'
         price:
-          type: number
+          type: [number, 'null']
         publisher:
-          $ref: '#/components/schemas/Publisher'
+          oneOf:
+          - $ref: '#/components/schemas/PublisherInput'
+          - type: null
         subtitle:
           type: [string, 'null']
         tags:
@@ -190,8 +192,16 @@ components:
     Genre:
       type: string
       enum: [fiction, mystery, nonfiction, romance, scifi]
-    Publisher:
+    PublisherInput:
       type: object
+      properties:
+        country:
+          type: [string, 'null']
+        name:
+          type: [string, 'null']
+    PublisherOutput:
+      type: object
+      required: [country, name]
       properties:
         country:
           type: string

@@ -98,17 +98,21 @@ type SchemaFact struct {
 	Span SourceSpan `json:"span"`
 }
 
-// FieldFact is one field of an object schema. Optional (presence) and Nullable
-// (value-may-be-null) are two independent axes; all four combinations are valid.
+// FieldFact is one field of an object schema. Inbound and outbound presence and
+// null behavior remain independent so each payload direction can be projected
+// without widening the other.
 type FieldFact struct {
-	JSONName    string     `json:"json_name"`
-	Required    bool       `json:"required"`
-	Optional    bool       `json:"optional"`
-	Nullable    bool       `json:"nullable"`
-	Schema      Type       `json:"schema"`
-	Description *string    `json:"description"`
-	Example     *string    `json:"example"`
-	Meta        *FieldMeta `json:"meta,omitempty"`
+	JSONName                  string     `json:"json_name"`
+	SerializerMayOmit         bool       `json:"serializer_may_omit"`
+	DeserializerAcceptsAbsent bool       `json:"deserializer_accepts_absent"`
+	DeserializerAcceptsNull   bool       `json:"deserializer_accepts_null"`
+	SerializerMayEmitNull     bool       `json:"serializer_may_emit_null"`
+	ValidatorRequiresPresence bool       `json:"validator_requires_presence"`
+	ValidatorRejectsNull      bool       `json:"validator_rejects_null"`
+	Schema                    Type       `json:"schema"`
+	Description               *string    `json:"description"`
+	Example                   *string    `json:"example"`
+	Meta                      *FieldMeta `json:"meta,omitempty"`
 }
 
 // FieldMeta carries optional field-level constraints, defaults, and extensions.

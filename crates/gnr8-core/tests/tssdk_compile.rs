@@ -209,27 +209,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "count",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "int", "bits": 64, "signed": true } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "name",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "tags",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "string" } } },
                   "description": null,
                   "example": null
@@ -244,27 +238,21 @@ fn media_graph() -> gnr8::graph::ApiGraph {
               "body": { "type": "object", "of": [
                 {
                   "json_name": "file",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "bytes" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "title",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "primitive", "of": { "prim": "string" } },
                   "description": null,
                   "example": null
                 },
                 {
                   "json_name": "files",
-                  "required": true,
-                  "optional": false,
-                  "nullable": false,
+                  "serializer_may_omit": false, "deserializer_accepts_absent": false, "deserializer_accepts_null": false, "serializer_may_emit_null": false, "validator_requires_presence": true, "validator_rejects_null": false,
                   "schema": { "type": "array", "of": { "type": "primitive", "of": { "prim": "bytes" } } },
                   "description": null,
                   "example": null

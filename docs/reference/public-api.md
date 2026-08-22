@@ -67,7 +67,8 @@ See [Transforms and overrides](../pipeline/transforms.md).
 | Symbol | Use |
 |---|---|
 | `OperationSelector` | reusable exact/prefix/method/middleware/boolean selector |
-| `ApiOverrides` | checked field, parameter, body, response, and security corrections |
+| `ApiOverrides` | checked field presence/nullability, schema-use root, parameter, body, response, and security corrections |
+| `SchemaUse` | name the input or output payload position a correction or root applies to |
 | `RequestParameter` | typed query/header/path/cookie parameter builder |
 | `ParameterOverride` | add-if-missing, correct-existing, or replace semantics |
 | `ResponseOverride` | exact status/body/media response replacement |
@@ -98,7 +99,7 @@ See [Transforms and overrides](../pipeline/transforms.md).
 |---|---|
 | `OpenApi31` | deterministic OpenAPI 3.1 YAML target |
 | `OpenApi31Json` | deterministic pretty OpenAPI 3.1 JSON target |
-| `OpenApiSchemaPatch` | collect field patches for one schema |
+| `OpenApiSchemaPatch` | collect field patches for one published component (`TypeInput`/`TypeOutput` when a type splits) |
 | `OpenApiFieldPatch` | constraints, enum order, docs, default/example/extensions for one field |
 
 See [OpenAPI generation](../openapi/generation.md).
@@ -136,7 +137,7 @@ See [SDK generation](../sdk/generation.md).
 | `gnr8::runner::run` | required `.gnr8` child entry point |
 | `gnr8::runner::ArtifactBundle` | versioned child/host wire envelope |
 | `gnr8::runner::PROTOCOL_VERSION` | current host/child protocol number |
-| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph |
+| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph; `project_for_generation()` returns the canonical input/output artifact view |
 | `gnr8::CoreError` | typed core error enum |
 | `gnr8::sdk::validate_openapi_artifact` | generated OpenAPI readiness validation |
 

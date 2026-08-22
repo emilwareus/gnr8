@@ -314,6 +314,7 @@ impl Importer {
             operation_runtime: Vec::new(),
             pagination: Vec::new(),
             operation_docs: std::mem::take(&mut self.operation_docs),
+            schema_uses: Vec::new(),
         })
     }
 
@@ -759,7 +760,8 @@ impl Importer {
                         }
                         Some("formData") if self.version == SpecVersion::Swagger2 => {
                             if let Some(field) = self.field_from_parameter(&parameter) {
-                                request_body_required |= field.required;
+                                request_body_required |= !field.deserializer_accepts_absent
+                                    || field.validator_requires_presence;
                                 form_fields.push(field);
                             }
                         }
@@ -1171,9 +1173,12 @@ impl Importer {
         let imported = self.type_from_schema(parameter);
         Some(FieldFact {
             json_name: name,
-            required,
-            optional: !required,
-            nullable: imported.nullable,
+            serializer_may_omit: !required,
+            deserializer_accepts_absent: !required,
+            deserializer_accepts_null: imported.nullable,
+            serializer_may_emit_null: imported.nullable,
+            validator_requires_presence: false,
+            validator_rejects_null: false,
             schema: imported.ty,
             description: parameter
                 .get("description")
@@ -1956,9 +1961,12 @@ impl Importer {
                 let is_required = required.contains(name);
                 fields.push(FieldFact {
                     json_name: name.clone(),
-                    required: is_required,
-                    optional: !is_required,
-                    nullable: imported.nullable,
+                    serializer_may_omit: !is_required,
+                    deserializer_accepts_absent: !is_required,
+                    deserializer_accepts_null: imported.nullable,
+                    serializer_may_emit_null: imported.nullable,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
                     schema: imported.ty,
                     description: property_schema
                         .get("description")
@@ -2787,10 +2795,10 @@ components:
         };
         assert!(fields
             .iter()
-            .any(|field| field.json_name == "title" && field.required));
+            .any(|field| field.json_name == "title" && !field.deserializer_accepts_absent));
         assert!(fields
             .iter()
-            .any(|field| field.json_name == "note" && field.nullable));
+            .any(|field| field.json_name == "note" && field.deserializer_accepts_null));
         assert!(fields.iter().any(|field| {
             field.json_name == "metadata" && matches!(field.schema, Type::Map { .. })
         }));
