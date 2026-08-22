@@ -604,6 +604,14 @@ type Matrix struct {
 	if !reqRawPtr.ValidatorRequiresPresence || !reqRawPtr.ValidatorRejectsNull {
 		t.Fatalf("a pointer to RawMessage is set to nil for explicit null: %+v", reqRawPtr)
 	}
+	for name, field := range map[string]facts.FieldFact{
+		"req_raw":     reqRaw,
+		"req_raw_ptr": reqRawPtr,
+	} {
+		if field.Schema.Type != facts.TypeAny {
+			t.Errorf("%s: RawMessage must remain free-form JSON, got schema %+v", name, field.Schema)
+		}
+	}
 
 	// The three no-op `,omitempty` fields are the ones worth telling the author
 	// about; nothing else is.

@@ -790,6 +790,13 @@ type mapCtx struct {
 // mapType lowers a Go type into the neutral facts.Type vocabulary, incl. well-known
 // types and the float64 / free-form-map diagnostics (RESEARCH Pattern 6).
 func mapType(t gotypes.Type, ctx mapCtx) facts.Type {
+	// Go 1.27 changed encoding/json.RawMessage from a defined []byte type to an
+	// alias of encoding/json/jsontext.Value. Preserve the public standard-library
+	// identity before Unalias erases it; RawMessage is still a free-form JSON
+	// value, never a component schema owned by that internal package.
+	if isJSONRawMessage(t) {
+		return facts.AnyType()
+	}
 	switch u := gotypes.Unalias(t).(type) {
 	case *gotypes.Pointer:
 		// Nullability/optionality are recorded on the field; the type describes the elem.
@@ -1194,7 +1201,25 @@ func validationRejectsNull(t gotypes.Type) bool {
 }
 
 func isJSONRawMessage(t gotypes.Type) bool {
-	return isNamedType(t, jsonPkgPath, "RawMessage")
+	// Walk the declared alias chain before using Underlying or Unalias. Starting
+	// in Go 1.27, Unalias(json.RawMessage) is jsontext.Value, which has lost the
+	// public name that states the source contract. Alias.Rhs retains that chain,
+	// including through a user alias of json.RawMessage.
+	for {
+		switch current := t.(type) {
+		case *gotypes.Pointer:
+			t = current.Elem()
+		case *gotypes.Alias:
+			if typeNameMatches(current.Obj(), jsonPkgPath, "RawMessage") {
+				return true
+			}
+			t = current.Rhs()
+		case *gotypes.Named:
+			return typeNameMatches(current.Obj(), jsonPkgPath, "RawMessage")
+		default:
+			return false
+		}
+	}
 }
 
 func hasJSONUnmarshaler(t gotypes.Type) bool {
@@ -1219,7 +1244,11 @@ func isNamedType(t gotypes.Type, pkgPath string, name string) bool {
 		unaliased = gotypes.Unalias(pointer.Elem())
 	}
 	named, ok := unaliased.(*gotypes.Named)
-	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == pkgPath && named.Obj().Name() == name
+	return ok && typeNameMatches(named.Obj(), pkgPath, name)
+}
+
+func typeNameMatches(obj *gotypes.TypeName, pkgPath string, name string) bool {
+	return obj.Pkg() != nil && obj.Pkg().Path() == pkgPath && obj.Name() == name
 }
 
 func hasJSONMethod(t gotypes.Type, name string) bool {
