@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-22
+
 ### Breaking
 
 - **Presence and nullability are now modeled independently for input and output payloads.** The
