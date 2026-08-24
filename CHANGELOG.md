@@ -9,6 +9,16 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.8.0 — 2026-08-24
+
+### Breaking
+
+- **`CoreError` has a new variant, `GoToolchainSkew`.** The enum is not `#[non_exhaustive]`, so an
+  exhaustive `match` on `CoreError` in downstream Rust no longer compiles; add an arm or a wildcard.
+  Nothing else in the public Rust API moved. This is the only reason the release moves the minor
+  version — Cargo treats `0.x.y → 0.x.(y+1)` as a compatible upgrade, so shipping it as a patch would
+  hand the change to every consumer who wrote `gnr8 = "0.7"` without warning.
+
 ### Fixed
 
 - **A Go toolchain that cannot read your source now fails the run, instead of writing its own error
