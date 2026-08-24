@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/gnr8/goextract/internal/diag"
@@ -184,6 +185,67 @@ func TestBuildRoutesKeepsRequiredBodyDefaultForMissingHandler(t *testing.T) {
 	}
 	if !routeFacts[0].RequestBodyRequired {
 		t.Fatalf("missing handler should preserve request_body_required default true, got %+v", routeFacts[0])
+	}
+}
+
+// A loader error names the stage that produced it, so a reader can tell an environment
+// failure (the go command could not describe the package) from the package's own source.
+func TestAddLoadDiagnosticsNamesTheLoaderStage(t *testing.T) {
+	diags := diag.New()
+	addLoadDiagnostics(&load.Result{
+		Errors: []load.LoadError{
+			{Pkg: "example.com/app", Pos: "/tmp/app/main.go:1:1", Msg: "boom", Kind: "type"},
+			{Pkg: "example.com/dep", Pos: "", Msg: "no go files", Kind: "list"},
+		},
+	}, diags)
+
+	items := diags.Items()
+	if len(items) != 2 {
+		t.Fatalf("expected two diagnostics, got %d", len(items))
+	}
+	if items[0].Message != "go/packages type error: boom" {
+		t.Fatalf("type-stage message: %q", items[0].Message)
+	}
+	if items[0].File != "/tmp/app/main.go" || items[0].Line != 1 {
+		t.Fatalf("type-stage location: %q:%d", items[0].File, items[0].Line)
+	}
+	if items[1].Message != "go/packages list error: no go files" {
+		t.Fatalf("list-stage message: %q", items[1].Message)
+	}
+	for _, item := range items {
+		if item.Code != "source.load.failed" || item.Severity != "ERROR" {
+			t.Fatalf("load failures keep their stable identity: %+v", item)
+		}
+	}
+}
+
+// The facts document names the toolchain the sidecar was BUILT with. The host compares it
+// against the toolchain the analyzed module selects, because go/types admits only the
+// language version the application was built with.
+func TestRunReportsTheToolchainTheExtractorWasBuiltWith(t *testing.T) {
+	dir, err := filepath.Abs("../fixtures/gin-contract-regression")
+	if err != nil {
+		t.Fatalf("fixture path: %v", err)
+	}
+	tmp, err := os.CreateTemp("", "gnr8-extractor-toolchain-*.json")
+	if err != nil {
+		t.Fatalf("temp facts file: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	if err := run(dir, packageScopes{}, tmp); err != nil {
+		t.Fatalf("run goextract: %v", err)
+	}
+	if _, err := tmp.Seek(0, 0); err != nil {
+		t.Fatalf("rewind facts file: %v", err)
+	}
+	var doc facts.GoFacts
+	if err := json.NewDecoder(tmp).Decode(&doc); err != nil {
+		t.Fatalf("decode facts: %v", err)
+	}
+	if doc.ExtractorToolchain != runtime.Version() {
+		t.Fatalf("extractor_toolchain = %q, want %q", doc.ExtractorToolchain, runtime.Version())
 	}
 }
 

@@ -68,6 +68,35 @@ pub enum CoreError {
         stderr: String,
     },
 
+    /// The compiled `goextract` helper is older than the toolchain the analyzed module selects.
+    ///
+    /// `go/types` admits only the language version the application was built with, so a helper
+    /// built by an older toolchain than the module it reads rejects every package gated on the
+    /// newer release. The loader reports those as per-package errors rather than failing, so
+    /// without this check extraction exits 0 and publishes a graph that describes nothing —
+    /// with hundreds of load errors carried into generated documents as if they were API facts.
+    ///
+    /// Raised instead of returning those facts, so a degraded extraction can never be written,
+    /// cached, or committed.
+    #[error(
+        "the goextract helper at {helper_path} was built with {helper_toolchain}, but the analyzed \
+         module selects {module_toolchain} — go/types admits only the language version the helper \
+         was built with, so every package gated on {module_toolchain} would be reported as a load \
+         error instead of extracted. gnr8 builds the helper under the module's own toolchain \
+         (GOTOOLCHAIN is {selection} here), so make {module_toolchain} available to that build: put \
+         it on PATH, or allow GOTOOLCHAIN to fetch it. Deleting that file forces a rebuild."
+    )]
+    GoToolchainSkew {
+        /// The `GOVERSION` the analyzed module selects (e.g. `"go1.27.0"`).
+        module_toolchain: String,
+        /// The `GOVERSION` the helper binary was compiled with (e.g. `"go1.26.2"`).
+        helper_toolchain: String,
+        /// The caller's effective `GOTOOLCHAIN` selection policy.
+        selection: String,
+        /// The compiled helper this ran, so the reader can act without knowing the cache layout.
+        helper_path: String,
+    },
+
     /// The helper's stdout could not be parsed as the expected JSON facts document.
     ///
     /// Wraps the [`serde_json::Error`] (including position info) so malformed or

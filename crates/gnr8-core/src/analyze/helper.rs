@@ -81,6 +81,89 @@ pub(crate) fn resolve_target(target_dir: &str) -> Result<String, CoreError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// Everything that decides what a Go extraction reports, resolved once per run.
+///
+/// The two facts are not the same, and conflating them is what let a broken extraction be
+/// cached and reported as up to date (issue #67):
+///
+/// - `toolchain` is what the `go` command answers inside the analyzed module. It decides which
+///   files `go list` selects and what stdlib type information comes back.
+/// - `binary_hash` identifies the compiled helper that will run. Its `go/types` decides which
+///   language versions it can type-check at all, and that is NOT recoverable from `go env`:
+///   under `GOTOOLCHAIN=auto`, `go env GOVERSION` reports the version the module SELECTS, which
+///   is identical whether the `go` on `PATH` is that version or an older one auto-switching to
+///   it. Hashing the binary names the artifact instead of predicting it.
+///
+/// One value, resolved once, used for both the cache key and the extraction — so the key can
+/// never describe a different helper than the one that produced the facts (CLAUDE.md rule 3).
+pub(crate) struct ExtractorIdentity {
+    /// The analyzed module's `go env GOVERSION GOOS GOARCH GOFLAGS GOTOOLCHAIN` reading.
+    toolchain: GoToolchain,
+    /// The resolved path of the compiled helper that will run.
+    binary: PathBuf,
+    /// blake3 of that binary's bytes.
+    binary_hash: String,
+}
+
+impl ExtractorIdentity {
+    /// The compiled helper's content hash — the cache-key fact for "what will extract".
+    pub(crate) fn binary_hash(&self) -> &str {
+        &self.binary_hash
+    }
+
+    /// The analyzed module's full `go env` reading — the cache-key fact for "how it will run".
+    pub(crate) fn module_toolchain(&self) -> &str {
+        &self.toolchain.identity
+    }
+
+    /// Build an identity from literal values, without a toolchain or a compiled binary.
+    ///
+    /// The cache key is a pure function of these two strings and the analyzed tree, so a test
+    /// that varies them proves exactly what a real extractor or toolchain change does — and
+    /// proves it on a machine with no `go` at all.
+    #[cfg(test)]
+    pub(crate) fn for_test(binary_hash: &str, module_toolchain: &str) -> Self {
+        Self {
+            toolchain: GoToolchain {
+                version: module_toolchain
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                selection: "auto".to_string(),
+                identity: module_toolchain.to_string(),
+            },
+            binary: PathBuf::new(),
+            binary_hash: binary_hash.to_string(),
+        }
+    }
+}
+
+/// Resolve the extractor identity for `target_dir`, building the helper if it is not cached.
+///
+/// # Errors
+///
+/// - [`CoreError::GoToolchainMissing`] if the `go` binary cannot be spawned.
+/// - [`CoreError::HelperExit`] if `go env` or the helper build exits non-zero.
+/// - [`CoreError::Io`] if the helper source or the built binary cannot be read.
+pub(crate) fn goextract_identity(target_dir: &str) -> Result<ExtractorIdentity, CoreError> {
+    let toolchain = go_toolchain("go", target_dir)?;
+    let binary = goextract_binary("go", &toolchain)?;
+    let bytes = std::fs::read(&binary).map_err(|source| CoreError::Io {
+        message: format!(
+            "failed to read the compiled goextract helper {} for the extraction identity: {source}",
+            binary.display()
+        ),
+    })?;
+    let binary_hash = blake3_hex(&bytes);
+    Ok(ExtractorIdentity {
+        toolchain,
+        binary,
+        binary_hash,
+    })
+}
+
 /// Run the `goextract` helper against `target_dir` and return the parsed facts.
 ///
 /// # Errors
@@ -88,36 +171,28 @@ pub(crate) fn resolve_target(target_dir: &str) -> Result<String, CoreError> {
 /// - [`CoreError::GoToolchainMissing`] if the `go` binary cannot be spawned.
 /// - [`CoreError::HelperExit`] if the helper exits non-zero (carries stderr).
 /// - [`CoreError::FactsParse`] if stdout is not the expected JSON facts document.
+/// - [`CoreError::GoToolchainSkew`] if the helper cannot type-check the language version the
+///   analyzed module selects.
 pub(crate) fn run_goextract(target_dir: &str) -> Result<facts::GoFacts, CoreError> {
-    run_goextract_with("go", target_dir, &[], &[])
+    let identity = goextract_identity(target_dir)?;
+    run_goextract_with_identity(&identity, target_dir, &[], &[])
 }
 
 /// Run the `goextract` helper against `target_dir`, with separate route and schema scopes.
-pub(crate) fn run_goextract_package_scopes(
+///
+/// Takes the already-resolved [`ExtractorIdentity`] so the caller that keyed a cache entry on it
+/// runs the exact binary it keyed on, and pays for one `go env` rather than two.
+///
+/// # Errors
+///
+/// Same as [`run_goextract`].
+pub(crate) fn run_goextract_with_identity(
+    identity: &ExtractorIdentity,
     target_dir: &str,
     route_patterns: &[String],
     schema_patterns: &[String],
 ) -> Result<facts::GoFacts, CoreError> {
-    run_goextract_with("go", target_dir, route_patterns, schema_patterns)
-}
-
-/// Inner driver parameterized on the Go binary name so tests can force a missing
-/// binary (toolchain-missing path) without mutating the process `PATH`.
-fn run_goextract_with(
-    go_bin: &str,
-    target_dir: &str,
-    route_patterns: &[String],
-    schema_patterns: &[String],
-) -> Result<facts::GoFacts, CoreError> {
-    let mut cmd = if go_bin == "go" {
-        Command::new(goextract_binary(go_bin, target_dir)?)
-    } else {
-        let mut cmd = Command::new(go_bin);
-        // Tests can pass a fake Go binary to exercise missing-toolchain categorization.
-        cmd.args(["run", "."]);
-        cmd
-    };
-    let dir = checked_sidecar_dir("goextract", goextract_dir()?)?;
+    let mut cmd = Command::new(&identity.binary);
     cmd.arg(target_dir);
     for pattern in route_patterns {
         cmd.args(["--route-package", pattern]);
@@ -125,6 +200,28 @@ fn run_goextract_with(
     for pattern in schema_patterns {
         cmd.args(["--schema-package", pattern]);
     }
+    let parsed = run_goextract_command(cmd)?;
+    // Refuse the facts BEFORE any caller can cache, lower, or publish them. `go/types` admits
+    // only the language version the helper was built with; a helper that is behind the module
+    // reports every package gated on the newer release as a load error and still exits 0, so
+    // without this the pipeline succeeds and writes a graph that describes nothing.
+    if extractor_is_behind_module(&identity.toolchain.version, &parsed.extractor_toolchain) {
+        return Err(CoreError::GoToolchainSkew {
+            module_toolchain: identity.toolchain.version.clone(),
+            helper_toolchain: parsed.extractor_toolchain,
+            selection: identity.toolchain.selection.clone(),
+            helper_path: identity.binary.display().to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Spawn one prepared `goextract` command from the sidecar directory and parse its stdout.
+///
+/// The single place a helper spawn failure, a non-zero exit, and malformed stdout each map to
+/// their typed error — there is no second categorization path to drift from it.
+fn run_goextract_command(mut cmd: Command) -> Result<facts::GoFacts, CoreError> {
+    let dir = checked_sidecar_dir("goextract", goextract_dir()?)?;
     cmd.current_dir(dir);
     let output = cmd
         .output()
@@ -219,6 +316,53 @@ fn goextract_build_toolchain(version: &str, selection: &str) -> String {
     }
 }
 
+/// The `(major, minor)` LANGUAGE version a `goX.Y[.Z]` toolchain name declares.
+///
+/// The language version is what `go/types` gates on — the refusal reads "requires newer Go
+/// version go1.27 (application built with go1.26)" — so the patch level, a release candidate
+/// suffix, and a development build's commit suffix are all deliberately ignored. A `devel`
+/// prefix (what `runtime.Version()` reports for an unreleased toolchain) is stripped first.
+///
+/// Returns `None` for anything this cannot read as a version, so a name gnr8 does not
+/// understand can never be used to CLAIM a skew. Pure, so every arm is testable without a
+/// toolchain.
+fn language_version(toolchain: &str) -> Option<(u32, u32)> {
+    let name = toolchain.trim();
+    // `runtime.Version()` on an unreleased toolchain reads "devel go1.28-<commit> <date>".
+    let name = name.strip_prefix("devel ").unwrap_or(name);
+    let name = name.split_whitespace().next()?;
+    let rest = name.strip_prefix("go")?;
+    let mut parts = rest.split('.');
+    let major = leading_number(parts.next()?)?;
+    let minor = leading_number(parts.next()?)?;
+    Some((major, minor))
+}
+
+/// The leading run of ASCII digits in `text`, as a number.
+///
+/// `go1.27rc1` and `go1.28-1234abc` both carry a suffix on the minor component; the digits
+/// before it are the language version. Returns `None` when there are no leading digits.
+fn leading_number(text: &str) -> Option<u32> {
+    let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether the helper cannot type-check the language version the analyzed module selects.
+///
+/// `true` only when BOTH names read as versions AND the helper's is strictly lower. Anything
+/// unreadable on either side answers `false`: gnr8 refuses an extraction it can PROVE is
+/// degraded, and never on a guess. A helper NEWER than the module is fine — Go is forward
+/// compatible, and a newer `go/types` accepts an older language version.
+fn extractor_is_behind_module(module_toolchain: &str, helper_toolchain: &str) -> bool {
+    match (
+        language_version(module_toolchain),
+        language_version(helper_toolchain),
+    ) {
+        (Some(module), Some(helper)) => helper < module,
+        _ => false,
+    }
+}
+
 /// The cache directory name for one compiled `goextract` binary, over both facts that decide its
 /// behavior. Pure so the source/toolchain sensitivity is testable without a real toolchain.
 fn goextract_binary_cache_dir_name(source_hash: &str, toolchain: &str) -> String {
@@ -230,13 +374,12 @@ fn goextract_binary_cache_dir_name(source_hash: &str, toolchain: &str) -> String
     hasher.finalize().to_hex().to_string()
 }
 
-fn goextract_binary(go_bin: &str, target_dir: &str) -> Result<PathBuf, CoreError> {
+fn goextract_binary(go_bin: &str, toolchain: &GoToolchain) -> Result<PathBuf, CoreError> {
     let root = checked_sidecar_dir("goextract", goextract_dir()?)?;
     // The binary is goextract's source AND the toolchain that compiled it: a Go upgrade changes the
     // binary's behavior without moving one byte of source. Keying on source alone hands a user whose
     // toolchain moved the binary the PREVIOUS one built, which then reports every dependency file
     // gated on the new release as a `source.load.failed` load error.
-    let toolchain = go_toolchain(go_bin, target_dir)?;
     let dir = std::env::temp_dir()
         .join("gnr8-goextract")
         .join(goextract_binary_cache_dir_name(
@@ -471,11 +614,122 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        goextract_binary_cache_dir_name, goextract_build_toolchain, goextract_dir, pyextract_dir,
-        resolve_target, run_goextract_with, run_pyextract_with, run_tsextract_with, tsextract_dir,
+        extractor_is_behind_module, go_toolchain, goextract_binary_cache_dir_name,
+        goextract_build_toolchain, goextract_dir, language_version, pyextract_dir, resolve_target,
+        run_goextract_command, run_pyextract_with, run_tsextract_with, tsextract_dir,
         typescript_toolchain_present,
     };
     use crate::CoreError;
+
+    /// The language version a toolchain name declares, read the way `go/types` gates on it.
+    mod language_version {
+        use super::language_version;
+
+        #[test]
+        fn reads_a_released_toolchain() {
+            assert_eq!(language_version("go1.26.2"), Some((1, 26)));
+            assert_eq!(language_version("go1.27.0"), Some((1, 27)));
+        }
+
+        /// `go/types` gates on the LANGUAGE version, so the patch level is not part of it: a
+        /// module's `go 1.27` directive and a `go1.27.4` toolchain are the same language version.
+        #[test]
+        fn ignores_the_patch_level() {
+            assert_eq!(language_version("go1.27"), language_version("go1.27.9"));
+        }
+
+        /// A release candidate and a development build both declare a language version, and both
+        /// carry a suffix on the minor component. `runtime.Version()` reports the `devel` form.
+        #[test]
+        fn reads_a_prerelease_and_a_development_build() {
+            assert_eq!(language_version("go1.27rc1"), Some((1, 27)));
+            assert_eq!(
+                language_version("devel go1.28-1234abc Wed Aug"),
+                Some((1, 28))
+            );
+        }
+
+        /// A name this cannot read yields `None` rather than a guessed number, because the only
+        /// thing the caller does with a version is decide whether to REFUSE an extraction.
+        #[test]
+        fn refuses_to_read_a_name_it_does_not_understand() {
+            for name in ["", "   ", "go", "go1", "1.27.0", "python3.12", "goodbye"] {
+                assert_eq!(language_version(name), None, "{name:?}");
+            }
+        }
+    }
+
+    /// Whether the compiled helper can type-check what the analyzed module selects.
+    mod extractor_is_behind_module {
+        use super::extractor_is_behind_module;
+
+        /// The issue #67 case: the module selects go1.27, the helper's `go/types` is go1.26, so
+        /// every package gated on go1.27 comes back as a load error while the helper exits 0.
+        #[test]
+        fn an_older_helper_cannot_type_check_a_newer_module() {
+            assert!(extractor_is_behind_module("go1.27.0", "go1.26.2"));
+        }
+
+        /// Go is forward compatible: a newer `go/types` accepts an older language version, so a
+        /// helper raised to `goextract/go.mod`'s own floor is fine against an older module.
+        #[test]
+        fn a_newer_helper_reads_an_older_module() {
+            assert!(!extractor_is_behind_module("go1.21.0", "go1.26.2"));
+        }
+
+        #[test]
+        fn one_toolchain_on_both_sides_is_not_a_skew() {
+            assert!(!extractor_is_behind_module("go1.27.0", "go1.27.0"));
+        }
+
+        /// The patch level does not decide what `go/types` admits, so it must not raise a skew.
+        #[test]
+        fn a_patch_difference_is_not_a_skew() {
+            assert!(!extractor_is_behind_module("go1.27.4", "go1.27.0"));
+        }
+
+        /// A sidecar that reports no toolchain (`pyextract`, `tsextract`, or an older build) must
+        /// not be accused of one. gnr8 refuses an extraction it can PROVE is degraded, never on a
+        /// guess — a false accusation would break a working pipeline with no way to appeal.
+        #[test]
+        fn an_unreported_or_unreadable_toolchain_never_claims_a_skew() {
+            assert!(!extractor_is_behind_module("go1.27.0", ""));
+            assert!(!extractor_is_behind_module("", "go1.26.2"));
+            assert!(!extractor_is_behind_module("go1.27.0", "not-a-version"));
+            assert!(!extractor_is_behind_module("not-a-version", "go1.26.2"));
+        }
+    }
+
+    /// The analyzed module's `go env` reading: it must name a toolchain, carry the selection
+    /// policy the build pin needs, and be stable — an identity that drifted between two calls
+    /// would key every cache entry to a single run.
+    #[test]
+    fn go_toolchain_names_the_version_and_selection_and_is_stable() {
+        let dir = std::env::temp_dir();
+        let Ok(first) = go_toolchain("go", &dir.to_string_lossy()) else {
+            eprintln!("skipping: no `go` on PATH");
+            return;
+        };
+        let second = go_toolchain("go", &dir.to_string_lossy()).expect("go is present");
+
+        assert!(
+            first.version.starts_with("go1."),
+            "the identity must name the toolchain version, got {:?}",
+            first.version
+        );
+        assert!(
+            !first.selection.is_empty(),
+            "the identity must carry the GOTOOLCHAIN selection the build pin preserves"
+        );
+        assert!(
+            first.identity.contains(&first.version),
+            "the full reading must contain the version it reports"
+        );
+        assert_eq!(
+            first.identity, second.identity,
+            "the identity must be stable across calls"
+        );
+    }
 
     mod goextract_build_toolchain {
         use super::goextract_build_toolchain;
@@ -709,18 +963,14 @@ mod tests {
     }
 
     mod run_goextract {
-        use super::{run_goextract_with, CoreError};
+        use super::{run_goextract_command, CoreError};
 
         #[test]
         fn returns_go_toolchain_missing_when_binary_absent() {
             // A binary name that cannot exist on PATH forces the spawn to fail with
             // an io::Error -> GoToolchainMissing, NOT a panic (GO-06).
-            let result = run_goextract_with(
-                "gnr8-nonexistent-go-binary-xyz",
-                "/some/target/dir",
-                &[],
-                &[],
-            );
+            let result =
+                run_goextract_command(std::process::Command::new("gnr8-nonexistent-go-binary-xyz"));
             let err = result.unwrap_err();
             assert!(
                 matches!(err, CoreError::GoToolchainMissing { .. }),
@@ -729,6 +979,29 @@ mod tests {
             // Display must render without panic and mention the toolchain.
             assert!(err.to_string().contains("Go toolchain"));
         }
+    }
+
+    /// The skew refusal names both toolchains, the selection that produced it, and a way out.
+    ///
+    /// A user reading this has a working `go`, a working project, and a pipeline that refuses to
+    /// run; the message is the whole of what they get, so every fact needed to act on it has to
+    /// be in the line itself.
+    #[test]
+    fn the_toolchain_skew_error_names_both_versions_and_a_remedy() {
+        let error = CoreError::GoToolchainSkew {
+            module_toolchain: "go1.27.0".to_string(),
+            helper_toolchain: "go1.26.2".to_string(),
+            selection: "local".to_string(),
+            helper_path: "/tmp/gnr8-goextract/abc123/goextract".to_string(),
+        };
+        let text = error.to_string();
+        assert!(text.contains("go1.27.0"), "{text}");
+        assert!(text.contains("go1.26.2"), "{text}");
+        assert!(text.contains("GOTOOLCHAIN is local"), "{text}");
+        assert!(
+            text.contains("/tmp/gnr8-goextract/abc123/goextract"),
+            "the reader must be able to act without knowing the cache layout: {text}"
+        );
     }
 
     mod run_pyextract {

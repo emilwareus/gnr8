@@ -14,8 +14,9 @@ import (
 // the test proves Marshal sorts (GRAPH-02 discipline at the sidecar boundary).
 func unsortedDoc() facts.GoFacts {
 	return facts.GoFacts{
-		Module: "github.com/acme/svc",
-		Routes: []facts.RouteFact{}, // empty -> must marshal as [], not null
+		Module:             "github.com/acme/svc",
+		ExtractorToolchain: "go1.26.2",
+		Routes:             []facts.RouteFact{}, // empty -> must marshal as [], not null
 		Schemas: []facts.SchemaFact{
 			{
 				ID:   "internal/dto.Zebra",
@@ -124,7 +125,7 @@ func TestEmptySlicesMarshalAsArrays(t *testing.T) {
 // fails INSIDE 01-01 rather than surfacing as a deny_unknown_fields rejection in 01-02.
 var canonicalFieldNames = []string{
 	// GoFacts
-	"module", "routes", "schemas", "diagnostics",
+	"module", "extractor_toolchain", "routes", "schemas", "diagnostics",
 	// RouteFact ("description" is shared with FieldFact below; "summary" is route-only)
 	"method", "path", "handler", "operation_id", "summary", "group", "middleware", "params",
 	"request_body", "request_body_required", "request_body_content_type", "responses", "span",
@@ -218,7 +219,8 @@ func fullyPopulatedDoc() facts.GoFacts {
 	}
 
 	return facts.GoFacts{
-		Module: "github.com/acme/svc",
+		Module:             "github.com/acme/svc",
+		ExtractorToolchain: "go1.26.2",
 		Routes: []facts.RouteFact{
 			{
 				Method: "PUT", Path: "/{uuid}", Handler: "updateGoal", OperationID: "updateGoal",

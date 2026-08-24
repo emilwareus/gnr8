@@ -485,6 +485,12 @@ fn run_check(output: Output) -> Result<()> {
             (plan, diagnostics, "pipeline", source_files, artifact_files)
         };
 
+    // `check` is the CI gate, so it is the run whose diagnostics a reader most needs. It printed
+    // none: a gate that failed on drift reported a count of stale paths and nothing about WHY the
+    // outputs changed, which is what made the toolchain failure in issue #67 take a manual diff to
+    // find. `generate` has always printed these; `check` now says the same thing.
+    print_diagnostics(output, &diagnostics);
+
     // Partition the plan into stale (would be written) vs drifted (user-edited) vs clean (unchanged).
     let mut stale: Vec<String> = Vec::new();
     let mut drifted: Vec<String> = Vec::new();
@@ -2426,16 +2432,7 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
         return;
     }
     if output.verbose == 0 {
-        let counts = diagnostic_counts(diagnostics);
-        let level = if counts.warn == 0 && counts.error == 0 {
-            "info"
-        } else {
-            "warning"
-        };
-        eprintln!(
-            "{level}: {} pipeline diagnostics (run with -v for details)",
-            counts.total
-        );
+        eprintln!("{}", diagnostic_summary(&diagnostic_counts(diagnostics)));
         return;
     }
     for diag in diagnostics {
@@ -2444,6 +2441,30 @@ fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
             diag.severity, diag.code, diag.message, diag.file, diag.line
         );
     }
+}
+
+/// The one-line diagnostic summary printed without `-v`.
+///
+/// Error-severity diagnostics get their own count and their own verdict. A run that reports
+/// hundreds of them is not a run with "some diagnostics" — extraction did not describe the API,
+/// and the reader has to be told so by the line they actually see. Pure, so the wording is
+/// testable without running a pipeline.
+fn diagnostic_summary(counts: &DiagnosticCounts) -> String {
+    let total = counts.total;
+    if counts.error > 0 {
+        return format!(
+            "error: {total} pipeline diagnostics, {} of them ERROR — extraction is incomplete; \
+             run with -v for the list, or `gnr8 doctor` to fail on them",
+            counts.error
+        );
+    }
+    if counts.warn > 0 {
+        return format!(
+            "warning: {total} pipeline diagnostics, {} of them WARN (run with -v for details)",
+            counts.warn
+        );
+    }
+    format!("info: {total} pipeline diagnostics (run with -v for details)")
 }
 
 fn diagnostic_counts(diagnostics: &[gnr8::graph::Diagnostic]) -> DiagnosticCounts {
@@ -2485,11 +2506,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        content_stamps_from_fast, diagnostic_counts, link_typescript_node_modules,
-        local_node_modules, local_typescript_compiler, pre_child_verified_noop,
-        readiness_for_target, reconcile_doctor_source_probe, text_output_excerpt,
-        typescript_compiler, validate_typescript_package_entrypoints, FastFileStamp,
-        MaterializedTarget, TypeScriptCompiler, VerifiedNoopStamp,
+        content_stamps_from_fast, diagnostic_counts, diagnostic_summary,
+        link_typescript_node_modules, local_node_modules, local_typescript_compiler,
+        pre_child_verified_noop, readiness_for_target, reconcile_doctor_source_probe,
+        text_output_excerpt, typescript_compiler, validate_typescript_package_entrypoints,
+        FastFileStamp, MaterializedTarget, TypeScriptCompiler, VerifiedNoopStamp,
     };
     use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
     use gnr8::sdk::{Artifact, ReadinessKind, ReadinessTarget};
@@ -2888,6 +2909,62 @@ mod tests {
 
         assert_eq!(language, "configured");
         assert!(present);
+    }
+
+    /// The line a reader actually sees without `-v` must say when extraction failed.
+    ///
+    /// It used to say "warning: 240 pipeline diagnostics" whether those were 240 lossy-pattern
+    /// notes or 240 packages that did not load, so a run that described nothing read exactly like
+    /// a healthy one. Issue #67 took a manual diff of the committed output to discover which it
+    /// had been.
+    #[test]
+    fn the_summary_line_calls_out_error_diagnostics() {
+        let summary = diagnostic_summary(&super::DiagnosticCounts {
+            total: 240,
+            info: 0,
+            warn: 0,
+            error: 240,
+        });
+        assert!(summary.starts_with("error: "), "{summary}");
+        assert!(summary.contains("240 pipeline diagnostics"), "{summary}");
+        assert!(summary.contains("240 of them ERROR"), "{summary}");
+        assert!(summary.contains("extraction is incomplete"), "{summary}");
+        assert!(summary.contains("gnr8 doctor"), "{summary}");
+    }
+
+    /// An error among warnings still sets the verdict: one package that did not load makes the
+    /// whole extraction incomplete, however many ordinary notes accompany it.
+    #[test]
+    fn one_error_among_warnings_sets_the_verdict() {
+        let summary = diagnostic_summary(&super::DiagnosticCounts {
+            total: 12,
+            info: 3,
+            warn: 8,
+            error: 1,
+        });
+        assert!(summary.starts_with("error: "), "{summary}");
+        assert!(summary.contains("1 of them ERROR"), "{summary}");
+    }
+
+    /// Warnings and notes keep their own, quieter verdicts — an INFO-only run is not a warning.
+    #[test]
+    fn warnings_and_notes_keep_their_own_verdict() {
+        let warned = diagnostic_summary(&super::DiagnosticCounts {
+            total: 4,
+            info: 1,
+            warn: 3,
+            error: 0,
+        });
+        assert!(warned.starts_with("warning: "), "{warned}");
+        assert!(warned.contains("3 of them WARN"), "{warned}");
+
+        let noted = diagnostic_summary(&super::DiagnosticCounts {
+            total: 2,
+            info: 2,
+            warn: 0,
+            error: 0,
+        });
+        assert!(noted.starts_with("info: "), "{noted}");
     }
 
     #[test]
