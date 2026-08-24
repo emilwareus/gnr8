@@ -205,17 +205,63 @@ fn sdk_reference(language: &str, package: &str, ir: &ApiGraph) -> String {
             schema_kind(&schema.body)
         );
     }
-    if !ir.diagnostics.is_empty() {
-        text.push_str("\n## Diagnostics\n\n");
-        for diagnostic in &ir.diagnostics {
-            let _ = writeln!(
-                text,
-                "- {}: {} ({}:{})",
-                diagnostic.severity, diagnostic.message, diagnostic.file, diagnostic.line
-            );
-        }
-    }
+    append_reference_diagnostics(&mut text, ir);
     text
+}
+
+/// The stable code for "a package loader stage failed", which the reference never publishes.
+///
+/// Matching the CODE is what this identity is for — it is the same key `DiagnosticPolicy` matches
+/// on — so this is a policy decision about a class of diagnostic, not a reading of its text.
+const SOURCE_LOAD_FAILED: &str = "source.load.failed";
+
+/// Whether a diagnostic belongs in a published SDK reference.
+///
+/// Two clauses, for two different reasons. Both exist because a generated document is COMMITTED:
+/// it is read by people who did not run the pipeline, and it is compared byte-for-byte by
+/// `gnr8 check`.
+///
+/// 1. **The location must name a file inside the analyzed module.** A location outside it — a
+///    dependency, the standard library, a downloaded toolchain under the module cache — is not a
+///    fact about the API this document describes, and it is machine-dependent: it holds the
+///    reader's home directory and module-cache layout. Publishing one makes two developers with
+///    byte-identical source commit different bytes, which surfaces as `gnr8 check` drift that no
+///    source change explains (issue #67).
+///
+/// 2. **It must describe the API, not whether the source could be read at all.** A load failure
+///    means there was no surface to describe, so it is not a gap in the published contract — and
+///    its message is the package loader's own text, which can quote a filesystem path wherever the
+///    loader chose to. Excluding the class removes that whole exposure without gnr8 ever reading a
+///    diagnostic's message to decide.
+///
+/// Nothing is lost. Every diagnostic still travels with the graph and still reaches
+/// `gnr8 inspect graph`, `gnr8 doctor` (which exits non-zero on error severity), and `-v` output —
+/// reports, rather than committed artifacts.
+fn is_publishable(diagnostic: &crate::graph::Diagnostic) -> bool {
+    crate::graph::is_module_relative(&diagnostic.file) && diagnostic.code != SOURCE_LOAD_FAILED
+}
+
+/// Render the "Diagnostics" section: what extraction could not state about THIS API.
+///
+/// The section is omitted entirely when nothing is publishable, rather than emitting an empty
+/// heading (see [`is_publishable`]).
+fn append_reference_diagnostics(text: &mut String, ir: &ApiGraph) {
+    let published: Vec<&crate::graph::Diagnostic> = ir
+        .diagnostics
+        .iter()
+        .filter(|d| is_publishable(d))
+        .collect();
+    if published.is_empty() {
+        return;
+    }
+    text.push_str("\n## Diagnostics\n\n");
+    for diagnostic in published {
+        let _ = writeln!(
+            text,
+            "- {}: {} ({}:{})",
+            diagnostic.severity, diagnostic.message, diagnostic.file, diagnostic.line
+        );
+    }
 }
 
 /// Render the "Operation Documentation" section.
@@ -339,11 +385,157 @@ fn schema_kind(schema: &Type) -> &'static str {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::SdkDocs;
+    use super::{sdk_reference, SdkDocs};
+    use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
 
     #[test]
     fn bool_conversion_maps_true_to_reference_and_false_to_none() {
         assert!(!SdkDocs::from(true).is_none());
         assert!(SdkDocs::from(false).is_none());
+    }
+
+    fn diagnostic(code: &str, severity: &str, message: &str, file: &str) -> Diagnostic {
+        Diagnostic::new(
+            code,
+            DiagnosticCategory::Source,
+            severity,
+            message,
+            SourceSpan {
+                file: file.to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        )
+    }
+
+    /// A diagnostic about the API surface, which is what the section is for.
+    fn contract_diagnostic(severity: &str, message: &str, file: &str) -> Diagnostic {
+        diagnostic("request.parameter.unresolved", severity, message, file)
+    }
+
+    /// A diagnostic about a package that did not load, which is not.
+    fn load_failure(message: &str, file: &str) -> Diagnostic {
+        diagnostic("source.load.failed", "ERROR", message, file)
+    }
+
+    fn graph_with(diagnostics: Vec<Diagnostic>) -> ApiGraph {
+        ApiGraph {
+            diagnostics,
+            ..ApiGraph::default()
+        }
+    }
+
+    /// A diagnostic about the analyzed module is exactly what this section is for: it tells an
+    /// agent reading the SDK what the API contract does not state.
+    #[test]
+    fn a_diagnostic_inside_the_module_is_published() {
+        let reference = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![contract_diagnostic(
+                "WARN",
+                "untyped query param 'genre' on GET /books",
+                "internal/http/handlers.go",
+            )]),
+        );
+        assert!(reference.contains("## Diagnostics"), "{reference}");
+        assert!(
+            reference.contains(
+                "- WARN: untyped query param 'genre' on GET /books (internal/http/handlers.go:1)"
+            ),
+            "{reference}"
+        );
+    }
+
+    /// Clause 1, isolated: a location outside the module carries the reader's home directory, so
+    /// two developers with byte-identical source would commit different documents and `gnr8 check`
+    /// would report drift that no source change explains (issue #67). The diagnostic is an ordinary
+    /// contract diagnostic, so ONLY its location can be what excludes it.
+    #[test]
+    fn a_diagnostic_outside_the_module_is_not_published() {
+        let reference = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![contract_diagnostic(
+                "WARN",
+                "untyped query param 'genre' on GET /books",
+                "/Users/someone/go/pkg/mod/example.com/dep@v1.2.3/handlers.go",
+            )]),
+        );
+        assert!(
+            !reference.contains("## Diagnostics"),
+            "a section with nothing publishable must not be emitted: {reference}"
+        );
+        assert!(!reference.contains("/Users/someone"), "{reference}");
+    }
+
+    /// Clause 2, isolated: a package that did not load leaves no API surface to describe, and its
+    /// message is the package loader's own text, which can quote a filesystem path wherever the
+    /// loader chose to. The location here is inside the module, so ONLY the class can exclude it.
+    #[test]
+    fn a_load_failure_is_not_published_even_from_inside_the_module() {
+        let reference = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![load_failure(
+                "go/packages list error: no required module provides package x; \
+                 open /Users/someone/go/pkg/mod/x: no such file",
+                "internal/http/handlers.go",
+            )]),
+        );
+        assert!(
+            !reference.contains("## Diagnostics"),
+            "a section with nothing publishable must not be emitted: {reference}"
+        );
+        assert!(!reference.contains("/Users/someone"), "{reference}");
+        assert!(!reference.contains("go/packages list error"), "{reference}");
+    }
+
+    /// One unpublishable diagnostic must not take the publishable ones with it.
+    #[test]
+    fn publishable_diagnostics_survive_alongside_an_unpublishable_one() {
+        let reference = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![
+                load_failure(
+                    "go/packages type error: boom",
+                    "/home/runner/go/pkg/mod/dep/dep.go",
+                ),
+                contract_diagnostic("WARN", "dynamic response in handler listBooks", "main.go"),
+            ]),
+        );
+        assert!(reference.contains("## Diagnostics"), "{reference}");
+        assert!(
+            reference.contains("- WARN: dynamic response in handler listBooks (main.go:1)"),
+            "{reference}"
+        );
+        assert!(!reference.contains("/home/runner"), "{reference}");
+    }
+
+    /// The rendered document must not depend on the machine that rendered it. Rendering the same
+    /// graph on a host with a POSIX module cache and on one with a Windows module cache has to
+    /// produce the same bytes, or the determinism guarantee holds only within one operating system.
+    #[test]
+    fn rendering_is_identical_whichever_absolute_path_shape_the_host_uses() {
+        let posix = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![contract_diagnostic(
+                "WARN",
+                "boom",
+                "/home/runner/go/pkg/mod/dep/dep.go",
+            )]),
+        );
+        let windows = sdk_reference(
+            "Go",
+            "example.com/sdk",
+            &graph_with(vec![contract_diagnostic(
+                "WARN",
+                "boom",
+                r"C:\Users\runner\go\pkg\mod\dep\dep.go",
+            )]),
+        );
+        assert_eq!(posix, windows);
     }
 }

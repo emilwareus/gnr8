@@ -14,6 +14,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -117,19 +118,31 @@ func run(targetDir string, scopes packageScopes, w *os.File) error {
 	schemas = append(schemas, syntheticSchemas...)
 
 	doc := facts.GoFacts{
-		Module:      module,
-		Routes:      routeFacts,
-		Schemas:     schemas,
-		Diagnostics: diags.Items(),
+		Module: module,
+		// The toolchain this binary was COMPILED with, which is not necessarily the one
+		// `go/packages` shells out to: go/types admits only the language version the
+		// application was built with, so a helper older than the module it reads reports
+		// every package gated on the newer release as a load error. The host compares this
+		// against the toolchain the analyzed module selects and refuses to publish facts
+		// from a helper that cannot type-check them.
+		ExtractorToolchain: runtime.Version(),
+		Routes:             routeFacts,
+		Schemas:            schemas,
+		Diagnostics:        diags.Items(),
 	}
 
 	return facts.Marshal(doc, w)
 }
 
+// addLoadDiagnostics turns each per-package loader error into a diagnostic, naming the
+// loader stage that produced it. Which stage failed decides what the reader has to fix —
+// a "list" error is the go command failing to describe the package (module, build, or
+// toolchain resolution), while "parse"/"type" are the package's own source — so the
+// classification the loader already made is carried through rather than flattened away.
 func addLoadDiagnostics(res *load.Result, diags *diag.Accumulator) {
 	for _, le := range res.Errors {
 		file, line := splitPos(le.Pos)
-		diags.Error("go/packages load error: "+le.Msg, file, line)
+		diags.Error("go/packages "+le.Kind+" error: "+le.Msg, file, line)
 	}
 }
 

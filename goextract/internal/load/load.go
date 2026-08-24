@@ -37,6 +37,36 @@ type LoadError struct {
 	Pos string
 	// Msg is the underlying error text.
 	Msg string
+	// Kind names the loader stage that produced the error, taken from
+	// packages.Error.Kind. Which stage failed decides what the reader has to fix,
+	// and the loader already states it — dropping it left every failure reading as
+	// one undifferentiated "load error".
+	Kind string
+}
+
+// ErrorKind names the loader stage behind a packages.Error.
+//
+// The four values mirror packages.ErrorKind exactly, so the caller renders the
+// loader's own classification rather than a gnr8 invention:
+//
+//   - "list"    the go command could not describe the package (module, build, or
+//     toolchain resolution failed) — the environment, not the code;
+//   - "parse"   a source file did not parse;
+//   - "type"    type-checking rejected the package;
+//   - "unknown" the loader did not classify it.
+func ErrorKind(kind packages.ErrorKind) string {
+	switch kind {
+	case packages.ListError:
+		return "list"
+	case packages.ParseError:
+		return "parse"
+	case packages.TypeError:
+		return "type"
+	case packages.UnknownError:
+		return "unknown"
+	default:
+		return "unknown"
+	}
 }
 
 // Result bundles the loaded packages, the shared FileSet for span resolution, and
@@ -79,9 +109,10 @@ func Load(targetDir string, patterns ...string) (*Result, error) {
 	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
 		for _, e := range pkg.Errors {
 			loadErrs = append(loadErrs, LoadError{
-				Pkg: pkg.PkgPath,
-				Pos: e.Pos,
-				Msg: e.Msg,
+				Pkg:  pkg.PkgPath,
+				Pos:  e.Pos,
+				Msg:  e.Msg,
+				Kind: ErrorKind(e.Kind),
 			})
 		}
 	})

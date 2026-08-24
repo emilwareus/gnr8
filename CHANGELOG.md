@@ -9,6 +9,72 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **A Go toolchain that cannot read your source now fails the run, instead of writing its own error
+  text into your documentation.** gnr8 treated "I could not read the source" as the same kind of
+  fact as "I read it, but one detail is lossy": a `go/packages` load failure became an ordinary
+  diagnostic, so it rode the graph, was published into the generated SDK `reference.md`, did not
+  fail generation, and was cached. A user analyzing a module that declares a newer Go than the
+  compiled extractor could read got a `reference.md` with hundreds of lines of
+  `ERROR: go/packages load error: package requires newer Go version go1.27 (application built with
+  go1.26)` — carrying absolute paths into `/Users/<name>/go/pkg/mod/...` — and `gnr8 generate`
+  exited 0 (#67).
+
+  `goextract` now reports the toolchain it was compiled with, and the driver compares it against the
+  toolchain the analyzed module selects before it accepts any facts. `go/types` admits only the
+  language version the application was built with, so a helper behind the module cannot type-check
+  it, and the loader reports the whole module as per-package errors rather than failing. That is now
+  a typed error naming both versions, the `GOTOOLCHAIN` in force, and the helper to rebuild — so
+  nothing is written, cached, or committed from such a run. The check is one-directional: a helper
+  ahead of the module is fine, because Go is forward compatible. A toolchain name gnr8 cannot read
+  never raises it — gnr8 refuses an extraction it can prove is degraded, never one it suspects.
+
+- **The Go source cache no longer keys on a prediction of the extractor.** It hashed
+  `go env GOVERSION GOOS GOARCH GOFLAGS`, read inside the analyzed module. Under `GOTOOLCHAIN=auto`
+  that reading reports the version the module SELECTS, which is byte-identical whether the `go` on
+  `PATH` is that version or an older one auto-switching to it. So the key did not move when a user
+  corrected their `PATH`, and `gnr8 check` answered `up to date` against a cached graph of load
+  errors — the CI failure in #67 was a locally-committed document that only a manual diff explained.
+
+  The key now covers the **content hash of the compiled `goextract` binary**, which names the
+  artifact whose behaviour is being cached rather than predicting it, plus the module's own `go env`
+  reading (now including `GOTOOLCHAIN`, so the two rival definitions of "the toolchain identity"
+  become one). Both are resolved once and used for the key AND the run, so a key can never describe
+  a different helper than the one that produced the facts. A run that hits the source cache with no
+  compiled helper on disk now builds one first: that build is what proves the entry belongs to this
+  environment, which is exactly the guarantee a restored CI cache was missing.
+
+- **Generated documents no longer carry machine-dependent paths.** A generated SDK `reference.md`
+  now publishes a diagnostic only when its location names a file inside the analyzed module AND it
+  describes the API rather than whether the source could be read at all. A location outside the
+  module — a dependency, the standard library, a downloaded toolchain in the module cache — holds the
+  reader's home directory, so two developers with byte-identical source produced different committed
+  bytes and `gnr8 check` reported drift with no source change behind it. And a `source.load.failed`
+  leaves no API surface to describe while carrying the package loader's own text, which can quote a
+  filesystem path wherever the loader chose to; excluding the class removes that exposure without
+  gnr8 ever reading a diagnostic's message to decide. Those diagnostics still travel with the graph
+  and still reach `inspect`, `doctor`, and `-v` output, which are reports rather than committed
+  artifacts. **No committed example output changes.**
+
+### Changed
+
+- **`gnr8 check` now prints pipeline diagnostics, as `gnr8 generate` always has.** `check` is the CI
+  gate, so it is the run whose diagnostics a reader most needs; it printed none, which left a failing
+  gate reporting a count of stale paths and nothing about why the outputs changed.
+
+- **The one-line diagnostic summary names error-severity diagnostics.** It said
+  `warning: 240 pipeline diagnostics` whether those were 240 lossy-pattern notes or 240 packages that
+  did not load, so a run that described nothing read exactly like a healthy one. It now reads
+  `error: 240 pipeline diagnostics, 240 of them ERROR — extraction is incomplete`, and points at
+  `gnr8 doctor`, which already exits non-zero on them.
+
+- **A `source.load.failed` diagnostic names the loader stage that produced it** (`list`, `parse`,
+  `type`, or `unknown`), taken from `packages.Error.Kind`, which the extractor previously discarded.
+  Which stage failed decides what the reader has to fix. The code is now documented in
+  [the diagnostics reference](docs/diagnostics/reference.md), which listed only
+  `source.load.unresolved` — so the code a user actually hit could not be denied from the docs.
+
 ## 0.7.0 — 2026-08-22
 
 ### Breaking

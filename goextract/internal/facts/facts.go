@@ -20,11 +20,21 @@ import (
 )
 
 // GoFacts is the top-level facts document for a single target module.
+//
+// ExtractorToolchain names the toolchain THIS SIDECAR BINARY was built with, which is
+// not the same fact as the toolchain the analyzed module selects. A sidecar can only
+// type-check the language version it was compiled for, so a sidecar older than the module
+// it reads reports every package gated on the newer release as a load error while still
+// exiting 0. Reporting the toolchain lets the host compare the two and refuse the facts
+// rather than publish an extraction it knows is incomplete. The field is language-neutral
+// by design: any sidecar may report the toolchain identity it runs under, and one that
+// does not simply omits it.
 type GoFacts struct {
-	Module      string           `json:"module"`
-	Routes      []RouteFact      `json:"routes"`
-	Schemas     []SchemaFact     `json:"schemas"`
-	Diagnostics []DiagnosticFact `json:"diagnostics"`
+	Module             string           `json:"module"`
+	ExtractorToolchain string           `json:"extractor_toolchain,omitempty"`
+	Routes             []RouteFact      `json:"routes"`
+	Schemas            []SchemaFact     `json:"schemas"`
+	Diagnostics        []DiagnosticFact `json:"diagnostics"`
 }
 
 // RouteFact describes one HTTP route, derived PURELY from source code. There is

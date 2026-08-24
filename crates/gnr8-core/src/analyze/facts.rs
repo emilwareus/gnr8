@@ -30,6 +30,18 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct GoFacts {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub(crate) module: String,
+    /// The toolchain identity the SIDECAR BINARY itself was built with (e.g. `"go1.27.0"`).
+    ///
+    /// Not the same fact as the toolchain the analyzed module selects. A sidecar can only
+    /// type-check the language version it was compiled for, so a sidecar older than the module
+    /// it reads reports every package gated on the newer release as a load error while still
+    /// exiting 0. The driver compares the two and refuses the facts rather than publish an
+    /// extraction it knows is incomplete.
+    ///
+    /// `#[serde(default)]` keeps a sidecar that does not report one parseable under
+    /// `deny_unknown_fields`; an empty value means "not reported", and the comparison is skipped.
+    #[serde(default)]
+    pub(crate) extractor_toolchain: String,
     /// HTTP routes.
     pub(crate) routes: Vec<RouteFact>,
     /// Extracted named schemas (objects + enums), sorted by id by the sidecar.

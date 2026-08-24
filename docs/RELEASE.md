@@ -162,6 +162,13 @@ machine, and hard-fails outright under `GOTOOLCHAIN=local` — which is a config
 and which our own `crates/gnr8-core/tests/sdk_lint.rs` depends on. Treat a bump to this directive as a
 **breaking change**: it needs a CHANGELOG entry and a note in "Required User Toolchains" above.
 
+The pin is checked rather than assumed. `goextract` reports the toolchain it was compiled with in
+its facts document, and the driver refuses those facts when the analyzed module selects a newer
+language version — a helper behind the module cannot type-check it, and `go/packages` reports the
+whole module as per-package load errors rather than failing. Refusing there keeps a degraded
+extraction out of the graph, the cache, and every generated document. The check is one-directional:
+a helper AHEAD of the module is fine, because Go is forward compatible.
+
 The asymmetry that makes this cheap to get right: Go is forward compatible. A module declaring
 `go 1.26` builds correctly under a 1.27 toolchain, so **CI can lead the floor indefinitely**. There is
 no reason to move the floor just because a new Go shipped.

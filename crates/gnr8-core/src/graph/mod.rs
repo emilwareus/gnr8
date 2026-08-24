@@ -1123,6 +1123,41 @@ fn relativize(file: &str, root: &str) -> String {
     }
 }
 
+/// Whether `file` names a location INSIDE the analyzed module.
+///
+/// This is the property [`relativize`] guarantees for a path it could strip, read back off the
+/// result. `relativize` strips the module root only on a separator boundary and otherwise leaves
+/// the path exactly as the sidecar reported it — absolute. A path that is still absolute therefore
+/// names a file the analyzed module does not contain: a dependency, the standard library, or a
+/// downloaded toolchain under the module cache.
+///
+/// Such a path is MACHINE-DEPENDENT. It carries the reader's home directory and module-cache
+/// layout, so two developers analyzing byte-identical source hold different text. A generated
+/// artifact must never contain one, or `gnr8 check` reports drift for a tree that has none —
+/// which is exactly how the load-error noise in issue #67 reached a committed document.
+///
+/// The classification is host-independent by construction: a POSIX root, a Windows drive, and a
+/// UNC prefix all answer `false` wherever this runs, so the same graph produces the same artifact
+/// on any machine. A `..` component escapes the module and answers `false` for the same reason.
+pub(crate) fn is_module_relative(file: &str) -> bool {
+    if file.is_empty() {
+        return false;
+    }
+    let bytes = file.as_bytes();
+    if bytes[0] == b'/' || bytes[0] == b'\\' {
+        return false;
+    }
+    // A Windows drive-qualified path: one ASCII letter, a colon, then a separator.
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        return false;
+    }
+    !file.split(['/', '\\']).any(|component| component == "..")
+}
+
 /// Map a crate-private `facts::SourceSpan` to the graph-owned [`SourceSpan`], relativizing the file
 /// path against the analyzed module root (provenance portability + byte-stability).
 fn relativize_span(span: &crate::analyze::facts::SourceSpan, root: &str) -> SourceSpan {
@@ -1139,8 +1174,63 @@ mod tests {
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{ApiGraph, RuntimePolicy, Type};
+    use super::{is_module_relative, ApiGraph, RuntimePolicy, Type};
     use crate::analyze::facts::GoFacts;
+
+    /// Which locations name a file INSIDE the analyzed module, and are therefore portable.
+    ///
+    /// `relativize` leaves a path it cannot strip exactly as the sidecar reported it, so an
+    /// absolute path names a dependency, the standard library, or a downloaded toolchain in the
+    /// module cache — and carries the reader's home directory with it. Artifacts must not.
+    mod is_module_relative {
+        use super::is_module_relative;
+
+        #[test]
+        fn a_path_under_the_module_is_published() {
+            for file in ["main.go", "internal/http/handlers.go", "a/b/c.py"] {
+                assert!(is_module_relative(file), "{file:?}");
+            }
+        }
+
+        /// The issue #67 shapes: a home directory, a module cache, and a downloaded toolchain.
+        #[test]
+        fn an_absolute_path_names_a_file_the_module_does_not_contain() {
+            for file in [
+                "/Users/someone/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.27.0.darwin-arm64/src/fmt/print.go",
+                "/home/runner/work/svc/dep/dep.go",
+                "/var/folders/29/T/tmp.abc/app/main.go",
+            ] {
+                assert!(!is_module_relative(file), "{file:?}");
+            }
+        }
+
+        /// The answer must not depend on the host that renders it, or one graph would produce two
+        /// different documents. A Windows drive and a UNC prefix are absolute everywhere.
+        #[test]
+        fn a_windows_absolute_path_is_rejected_on_every_host() {
+            for file in [
+                r"C:\Users\someone\go\pkg\mod\x.go",
+                r"c:/Users/someone/x.go",
+                r"\\server\share\x.go",
+            ] {
+                assert!(!is_module_relative(file), "{file:?}");
+            }
+        }
+
+        /// A relative path can still escape the module, and a `..` chain is just as unportable.
+        #[test]
+        fn a_path_escaping_the_module_is_rejected() {
+            assert!(!is_module_relative("../dep/dep.go"));
+            assert!(!is_module_relative("internal/../../dep/dep.go"));
+        }
+
+        /// A load error with no position at all reports an empty file. It names no location, so
+        /// there is nothing to publish.
+        #[test]
+        fn an_empty_location_is_not_a_location() {
+            assert!(!is_module_relative(""));
+        }
+    }
 
     /// A facts document mirroring real sidecar output: two routes whose operation ids are derived from
     /// the handler symbol (no annotation source), two unsorted schemas (one object with an unsorted

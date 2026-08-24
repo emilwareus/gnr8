@@ -278,15 +278,19 @@ pub(crate) fn build_graph_for_lang(
     Ok(crate::graph::ApiGraph::from_facts(facts, &target))
 }
 
-/// Build a Go graph from `fixture_dir`, with separate route and schema package scopes.
+/// Build a Go graph from an already-resolved `target`, with separate route and schema scopes.
+///
+/// The caller supplies the [`helper::ExtractorIdentity`] it keyed its cache entry on, so the
+/// binary that produced these facts is provably the binary the key names (CLAUDE.md rule 3).
 pub(crate) fn build_go_graph_with_package_scopes(
-    fixture_dir: &str,
+    target: &str,
+    identity: &helper::ExtractorIdentity,
     route_patterns: &[String],
     schema_patterns: &[String],
 ) -> Result<crate::graph::ApiGraph, crate::CoreError> {
-    let target = helper::resolve_target(fixture_dir)?;
-    let facts = helper::run_goextract_package_scopes(&target, route_patterns, schema_patterns)?;
-    Ok(crate::graph::ApiGraph::from_facts(facts, &target))
+    let facts =
+        helper::run_goextract_with_identity(identity, target, route_patterns, schema_patterns)?;
+    Ok(crate::graph::ApiGraph::from_facts(facts, target))
 }
 
 #[cfg(test)]
