@@ -2666,10 +2666,10 @@ fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Res
 /// `url.Values.Set` (WR-02).
 ///
 /// A `string` field is passed through unchanged (so the all-string fixture stays byte-identical); a
-/// named string enum is cast to its underlying wire string; the supported scalar Go types are
-/// converted precisely via `strconv`; and a `time.Time` is formatted as RFC 3339. Any other Go type
-/// (e.g. a slice or a named struct) is an unsupported query-param shape and returns a typed
-/// [`CoreError::SdkGen`] rather than emitting non-compiling Go.
+/// named string enum (including one reached through aliases) is cast to its underlying wire string;
+/// the supported scalar Go types are converted precisely via `strconv`; and a `time.Time` is formatted
+/// as RFC 3339. Any other Go type (e.g. a slice or a named struct) is an unsupported query-param shape
+/// and returns a typed [`CoreError::SdkGen`] rather than emitting non-compiling Go.
 ///
 /// `accessor` is the Go expression that reads the value (e.g. `params.Page` or `*params.Cursor`).
 fn query_string_expr(
@@ -2678,17 +2678,10 @@ fn query_string_expr(
     accessor: &str,
     graph: &ApiGraph,
 ) -> Result<String, CoreError> {
-    if let Type::Named(ref_id) = schema {
-        let target = graph
-            .schemas
-            .iter()
-            .find(|schema| &schema.id == ref_id)
-            .ok_or_else(|| CoreError::SdkGen {
-                message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
-            })?;
-        if matches!(target.body, Type::Enum(_)) {
-            return Ok(format!("string({accessor})"));
-        }
+    if matches!(schema, Type::Named(_))
+        && type_resolves_to_enum(schema, graph, &mut BTreeSet::new())?
+    {
+        return Ok(format!("string({accessor})"));
     }
     match value_ty {
         "string" => Ok(accessor.to_string()),
@@ -2703,6 +2696,42 @@ fn query_string_expr(
                  query parameters can be URL-encoded"
             ),
         }),
+    }
+}
+
+fn type_resolves_to_enum(
+    schema: &Type,
+    graph: &ApiGraph,
+    visited: &mut BTreeSet<String>,
+) -> Result<bool, CoreError> {
+    match schema {
+        Type::Enum(_) => Ok(true),
+        Type::Named(ref_id) => {
+            if !visited.insert(ref_id.clone()) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "cyclic named schema reference '{ref_id}' while resolving Go request parameter wire type"
+                    ),
+                });
+            }
+            let target = graph
+                .schemas
+                .iter()
+                .find(|schema| &schema.id == ref_id)
+                .ok_or_else(|| CoreError::SdkGen {
+                    message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
+                })?;
+            let result = type_resolves_to_enum(&target.body, graph, visited);
+            visited.remove(ref_id);
+            result
+        }
+        Type::Primitive(_)
+        | Type::WellKnown(_)
+        | Type::Array(_)
+        | Type::Map { .. }
+        | Type::Object(_)
+        | Type::Union(_)
+        | Type::Any {} => Ok(false),
     }
 }
 
@@ -3679,6 +3708,21 @@ mod tests {
         graph
     }
 
+    fn add_named_alias(graph: &mut ApiGraph, id: &str, name: &str, target_id: &str) {
+        let mut alias = graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == "dto.TargetDirection")
+            .unwrap()
+            .clone();
+        alias.id = id.to_string();
+        alias.name = name.to_string();
+        alias.body = Type::Named(target_id.to_string());
+        alias.enum_source_order.clear();
+        graph.schemas.push(alias);
+        graph.schemas.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
     fn emit_list_goals_operations(graph: &ApiGraph) -> Result<String, crate::CoreError> {
         let ops: Vec<&crate::graph::Operation> = graph
             .operations
@@ -4297,6 +4341,78 @@ mod tests {
                     "req.AddCookie(&http.Cookie{Name: wireCookieEscape(\"cursor\"), Value: wireCookieEscape(string(*params.Cursor))})"
                 ),
                 "optional named enum cookie must use its string wire value:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_enum_query_param_is_cast_through_alias_chain() {
+            let mut graph =
+                super::named_parameter_graph("aggregation", "query", "dto.DirectionAlias");
+            super::add_named_alias(
+                &mut graph,
+                "dto.DirectionAlias",
+                "DirectionAlias",
+                "dto.SecondDirectionAlias",
+            );
+            super::add_named_alias(
+                &mut graph,
+                "dto.SecondDirectionAlias",
+                "SecondDirectionAlias",
+                "dto.TargetDirection",
+            );
+
+            let out = super::emit_list_goals_operations(&graph).unwrap();
+
+            assert!(
+                out.contains("q.Set(\"aggregation\", string(params.Aggregation))"),
+                "an alias chain ending in a named enum must use its string wire value:\n{out}"
+            );
+        }
+
+        #[test]
+        fn cyclic_named_enum_alias_is_a_typed_error() {
+            let mut graph =
+                super::named_parameter_graph("aggregation", "query", "dto.DirectionAlias");
+            super::add_named_alias(
+                &mut graph,
+                "dto.DirectionAlias",
+                "DirectionAlias",
+                "dto.SecondDirectionAlias",
+            );
+            super::add_named_alias(
+                &mut graph,
+                "dto.SecondDirectionAlias",
+                "SecondDirectionAlias",
+                "dto.DirectionAlias",
+            );
+
+            let err = super::emit_list_goals_operations(&graph).unwrap_err();
+
+            assert!(
+                err.to_string().contains(
+                    "cyclic named schema reference 'dto.DirectionAlias' while resolving Go request parameter wire type"
+                ),
+                "cyclic aliases must fail with a typed generation error: {err}"
+            );
+        }
+
+        #[test]
+        fn named_enum_alias_with_dangling_target_is_a_typed_error() {
+            let mut graph =
+                super::named_parameter_graph("aggregation", "query", "dto.DirectionAlias");
+            super::add_named_alias(
+                &mut graph,
+                "dto.DirectionAlias",
+                "DirectionAlias",
+                "dto.MissingDirection",
+            );
+
+            let err = super::emit_list_goals_operations(&graph).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("dangling $ref 'dto.MissingDirection' is not among graph.schemas"),
+                "a dangling alias target must fail with a typed generation error: {err}"
             );
         }
 
