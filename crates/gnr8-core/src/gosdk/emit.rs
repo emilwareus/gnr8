@@ -2388,7 +2388,7 @@ fn emit_request_dispatch(
                 }
                 writeln!(body, "}}").map_err(sink)?;
             } else {
-                let expr = query_string_expr(&value_ty, &accessor)?;
+                let expr = query_string_expr(&p.schema, &value_ty, &accessor, graph)?;
                 writeln!(body, "q.Set(\"{}\", {expr})", p.name).map_err(sink)?;
                 if p.allow_reserved {
                     writeln!(
@@ -2665,13 +2665,31 @@ fn emit_error_decode(body: &mut String, op: &Operation, graph: &ApiGraph) -> Res
 /// Build the Go expression that coerces a query-param value of Go type `value_ty` to a `string` for
 /// `url.Values.Set` (WR-02).
 ///
-/// A `string` field is passed through unchanged (so the all-string fixture stays byte-identical);
-/// the supported scalar Go types are converted precisely via `strconv`; a `time.Time` is formatted
-/// as RFC 3339. Any other Go type (e.g. a slice or a named struct) is an unsupported query-param
-/// shape and returns a typed [`CoreError::SdkGen`] rather than emitting non-compiling Go.
+/// A `string` field is passed through unchanged (so the all-string fixture stays byte-identical); a
+/// named string enum is cast to its underlying wire string; the supported scalar Go types are
+/// converted precisely via `strconv`; and a `time.Time` is formatted as RFC 3339. Any other Go type
+/// (e.g. a slice or a named struct) is an unsupported query-param shape and returns a typed
+/// [`CoreError::SdkGen`] rather than emitting non-compiling Go.
 ///
 /// `accessor` is the Go expression that reads the value (e.g. `params.Page` or `*params.Cursor`).
-fn query_string_expr(value_ty: &str, accessor: &str) -> Result<String, CoreError> {
+fn query_string_expr(
+    schema: &Type,
+    value_ty: &str,
+    accessor: &str,
+    graph: &ApiGraph,
+) -> Result<String, CoreError> {
+    if let Type::Named(ref_id) = schema {
+        let target = graph
+            .schemas
+            .iter()
+            .find(|schema| &schema.id == ref_id)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!("dangling $ref '{ref_id}' is not among graph.schemas"),
+            })?;
+        if matches!(target.body, Type::Enum(_)) {
+            return Ok(format!("string({accessor})"));
+        }
+    }
     match value_ty {
         "string" => Ok(accessor.to_string()),
         "int64" => Ok(format!("strconv.FormatInt({accessor}, 10)")),
@@ -2797,7 +2815,7 @@ fn emit_non_query_parameter(
         writeln!(body, "}}").map_err(sink)?;
     } else {
         let value_type = go_type(&param.schema, false, graph)?;
-        let value = query_string_expr(&value_type, &accessor)?;
+        let value = query_string_expr(&param.schema, &value_type, &accessor, graph)?;
         if location == "header" {
             writeln!(
                 body,
@@ -3396,7 +3414,7 @@ mod tests {
         emit_client, emit_errors, emit_models, emit_operations, exported, go_type, join_path,
         lower_camel,
     };
-    use crate::graph::ApiGraph;
+    use crate::graph::{ApiGraph, Type};
 
     /// A facts document covering: optional pointer fields, a required field, an enum, uuid/time/number
     /// types, a nested ref, and one POST + one GET-with-query operation — enough to exercise every
@@ -3643,6 +3661,31 @@ mod tests {
         }"#;
         let facts = serde_json::from_slice(facts).unwrap();
         ApiGraph::from_facts(facts, "/root")
+    }
+
+    fn named_parameter_graph(param_name: &str, location: &str, schema_id: &str) -> ApiGraph {
+        let mut graph = sample_graph();
+        let param = graph
+            .operations
+            .iter_mut()
+            .find(|operation| operation.handler == "listGoals")
+            .unwrap()
+            .params
+            .iter_mut()
+            .find(|param| param.name == param_name)
+            .unwrap();
+        param.location = location.to_string();
+        param.schema = Type::Named(schema_id.to_string());
+        graph
+    }
+
+    fn emit_list_goals_operations(graph: &ApiGraph) -> Result<String, crate::CoreError> {
+        let ops: Vec<&crate::graph::Operation> = graph
+            .operations
+            .iter()
+            .filter(|operation| operation.handler == "listGoals")
+            .collect();
+        emit_operations(graph, "goalservice", "/goal", &ops)
     }
 
     /// A minimal graph with ONE POST operation whose only success response is a body-less `{status}`
@@ -4203,6 +4246,70 @@ mod tests {
             assert!(
                 out.contains("\"strconv\""),
                 "the ops file must import strconv for non-string query encoding:\n{out}"
+            );
+        }
+
+        #[test]
+        fn required_named_enum_query_param_is_cast_to_string() {
+            let graph = super::named_parameter_graph("aggregation", "query", "dto.TargetDirection");
+
+            let out = super::emit_list_goals_operations(&graph).unwrap();
+
+            assert!(
+                out.contains("q.Set(\"aggregation\", string(params.Aggregation))"),
+                "named string enum must keep its public Go type and cast only at the wire boundary:\n{out}"
+            );
+        }
+
+        #[test]
+        fn optional_named_enum_query_param_is_cast_after_dereferencing() {
+            let graph = super::named_parameter_graph("cursor", "query", "dto.TargetDirection");
+
+            let out = super::emit_list_goals_operations(&graph).unwrap();
+
+            assert!(
+                out.contains("q.Set(\"cursor\", string(*params.Cursor))"),
+                "optional named enum must be dereferenced before its wire cast:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_enum_header_param_is_cast_to_string() {
+            let graph =
+                super::named_parameter_graph("aggregation", "header", "dto.TargetDirection");
+
+            let out = super::emit_list_goals_operations(&graph).unwrap();
+
+            assert!(
+                out.contains("req.Header.Set(\"aggregation\", string(params.Aggregation))"),
+                "named enum header must use its string wire value:\n{out}"
+            );
+        }
+
+        #[test]
+        fn optional_named_enum_cookie_param_is_cast_to_string() {
+            let graph = super::named_parameter_graph("cursor", "cookie", "dto.TargetDirection");
+
+            let out = super::emit_list_goals_operations(&graph).unwrap();
+
+            assert!(
+                out.contains(
+                    "req.AddCookie(&http.Cookie{Name: wireCookieEscape(\"cursor\"), Value: wireCookieEscape(string(*params.Cursor))})"
+                ),
+                "optional named enum cookie must use its string wire value:\n{out}"
+            );
+        }
+
+        #[test]
+        fn named_object_query_param_remains_unsupported() {
+            let graph = super::named_parameter_graph("aggregation", "query", "dto.GoalResponse");
+
+            let err = super::emit_list_goals_operations(&graph).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("unsupported query-param Go type 'GoalResponse'"),
+                "named objects must not be silently coerced to wire strings: {err}"
             );
         }
 

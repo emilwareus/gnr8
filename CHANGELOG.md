@@ -9,6 +9,12 @@ must move the minor version.
 
 ## Unreleased
 
+### Fixed
+
+- **Named string-enum request parameters now compile in generated Go SDKs.** Query, header, and
+  cookie parameters serialize through their underlying string value while preserving the named enum
+  type in the public params struct.
+
 ## 0.8.0 — 2026-08-24
 
 ### Breaking
