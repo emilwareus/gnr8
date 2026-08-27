@@ -39,18 +39,23 @@ The archive lands under `target/release-local-dist/dist/` and uses the same name
 
 Each archive also gets a matching `.sha256` file.
 Intel macOS has no prebuilt archive because its GitHub-hosted build cannot reliably finish within the
-five-minute job deadline; Intel Mac users can install from crates.io with `cargo install gnr8`.
+five-minute job deadline; Intel Mac users build the CLI from a source checkout
+(`cargo build --release -p gnr8-cli`). `cargo install gnr8` is not an option: the published `gnr8`
+crate is the thin code-as-config SDK and ships no binary.
 
 ## Archive Layout
 
 Each archive contains:
 
 - `bin/gnr8`
-- `share/gnr8/crates/gnr8-sdk`
-- `share/gnr8/crates/gnr8` (keeps the staged Cargo workspace structurally complete)
+- `share/gnr8/crates/gnr8-sdk` (the thin SDK an offline `.gnr8` can point a `path` dependency at)
+- `share/gnr8/crates/gnr8` (the CLI crate source)
 - `share/gnr8/goextract`
 - `share/gnr8/pyextract`
 - `share/gnr8/tsextract`
+
+`crates/gnr8-core` — the host engine — is deliberately **not** shipped: it is already compiled into
+`bin/gnr8`, and a project's `.gnr8` crate must never be able to depend on it.
 
 The `share/gnr8` tree is required because source extraction shells out to the Go/Python/TypeScript
 sidecars. `gnr8` discovers this tree from the archive layout — `share/gnr8` beside the real

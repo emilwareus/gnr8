@@ -98,7 +98,7 @@ target-specific file layout and package policy on targets.
 The traits are public. A custom target must use explicit artifact ownership methods:
 
 ```rust
-use gnr8::{graph::ApiGraph, CoreError};
+use gnr8::{graph::ApiGraph, Error};
 use gnr8::sdk::prelude::*;
 
 struct SummaryTarget;
@@ -120,6 +120,9 @@ impl Target for SummaryTarget {
         vec!["generated/summary.txt".to_string()]
     }
 }
+
+// Compose it like any other stage — the `Custom(...)` wrapper is what marks it as yours:
+//     .target(Custom(SummaryTarget))
 ```
 
 Use `create` for a new path, `overlay` for intentional full replacement, and `rewrite` for an
@@ -137,8 +140,8 @@ readiness, and audit — what it is going to do:
 | `Target::readiness_targets` | the target emits a package/artifact supported by a built-in validator | lets `doctor` validate the declared target without guessing from ownership paths |
 | `Target::producer`, `PostProcess::producer` | a stable custom label is preferable | records ownership/audit identity; defaults to the Rust type name |
 
-Both are read at plan time — before any generation — so the host knows the write surface before it
-asks the worker to produce anything.
+All three are read at plan time — before any generation — so the host knows the write surface and the
+producer labels before it asks the worker to produce anything.
 
 `.gnr8` binaries call `gnr8::worker::run`, which serves the versioned host/worker frame protocol.
 `gnr8 inspect` returns the graph after source plus transforms; generation additionally projects it

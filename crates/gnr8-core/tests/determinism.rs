@@ -15,7 +15,12 @@
 // this test target so the workspace-wide RUST-04 deny stays intact for production code (Pitfall 2).
 // `doc_markdown` is allowed too: these test-target doc comments name many proper nouns (NestJS,
 // FastAPI, OpenAPI, ...) where backtick-per-noun hurts readability.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::doc_markdown
+)]
 
 mod nestjs_toolchain;
 
@@ -73,6 +78,105 @@ fn build_graph_is_byte_identical_across_two_runs() {
     assert_eq!(
         a, b,
         "two build_graph runs over unchanged source must serialize byte-identically (GRAPH-02)"
+    );
+}
+
+/// The graph now crosses a process boundary as JSON inside a protocol frame, so any field the
+/// snapshot silently drops is a fact every custom stage stops seeing — and, because the host sends
+/// the returned graph on to its targets, a fact that stops reaching the generated output.
+///
+/// A real, transform-enriched graph is therefore pushed through the exact frame the host writes and
+/// checked twice: the snapshot must re-serialize byte-identically, and the OpenAPI lowered from the
+/// round-tripped graph must equal the one lowered from the original.
+#[test]
+fn a_graph_survives_the_worker_frame_without_losing_a_field() {
+    use gnr8::protocol::{read_frame, write_frame, HostMessage};
+    use gnr8_engine::sdk::builtins;
+    use gnr8_engine::sdk::BuiltinTransform;
+
+    // Skip gracefully if the Go toolchain is absent so the test never fails for a missing dependency.
+    let Ok(mut graph) = gnr8_engine::analyze::build_graph(FIXTURE_DIR) else {
+        eprintln!("skipping frame round-trip test: go toolchain unavailable for {FIXTURE_DIR}");
+        return;
+    };
+
+    // Extraction alone leaves every configured field at its default, and a default field serializes
+    // to nothing — which is exactly the case a round-trip test must not accidentally check. Populate
+    // the transform-owned metadata first.
+    let cx = gnr8_engine::sdk::Cx::new(std::path::PathBuf::from(FIXTURE_DIR));
+    for transform in [
+        BuiltinTransform::SetBasePath(builtins::SetBasePath::new("/goal")),
+        BuiltinTransform::SetTitle(builtins::SetTitle::new("goalservice")),
+        BuiltinTransform::OpenApiMetadata(
+            builtins::OpenApiMetadata::new()
+                .version("2.1.0")
+                .description("Round-trip fixture")
+                .terms_of_service("https://example.com/tos"),
+        ),
+        BuiltinTransform::ApplySecurity(builtins::ApplySecurity::api_key(
+            "ApiKeyAuth",
+            "X-API-Key",
+        )),
+        BuiltinTransform::ConfigureSdkRuntime(
+            builtins::ConfigureSdkRuntime::new()
+                .max_retries(3)
+                .retry_statuses([429, 503])
+                .request_hooks()
+                .response_hooks()
+                .error_hooks(),
+        ),
+    ] {
+        builtins::apply_transform(&transform, &mut graph, &cx)
+            .expect("the fixture graph must accept every built-in transform used here");
+    }
+
+    // Guard against a vacuously-passing round trip: if the snapshot below no longer carries the
+    // configured metadata, the assertions would compare two empty defaults and prove nothing.
+    let snapshot = serde_json::to_string(&graph).expect("serialize the original graph");
+    for marker in [
+        "2.1.0",
+        "Round-trip fixture",
+        "ApiKeyAuth",
+        "max_retries",
+        "operations",
+        "schemas",
+    ] {
+        assert!(
+            snapshot.contains(marker),
+            "the round-trip fixture must actually carry {marker:?}"
+        );
+    }
+
+    let mut frame = Vec::new();
+    write_frame(
+        &mut frame,
+        &HostMessage::ApplyTransform {
+            index: 0,
+            graph: graph.clone(),
+        },
+    )
+    .expect("the graph must fit in one frame");
+    let HostMessage::ApplyTransform {
+        graph: round_tripped,
+        ..
+    } = read_frame::<_, HostMessage>(&mut frame.as_slice()).expect("the frame must parse back")
+    else {
+        panic!("the frame must decode as the request it was written from");
+    };
+
+    assert_eq!(
+        snapshot,
+        serde_json::to_string(&round_tripped).expect("serialize the round-tripped graph"),
+        "a field that does not survive the frame is a fact every custom stage stops seeing"
+    );
+
+    let security = fixture_security();
+    assert_eq!(
+        gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &security)
+            .expect("lowering the original graph must succeed"),
+        gnr8_engine::lower::to_openapi(&round_tripped, "goalservice", "/goal", &security)
+            .expect("lowering the round-tripped graph must succeed"),
+        "the artifact lowered from a round-tripped graph must be byte-identical"
     );
 }
 

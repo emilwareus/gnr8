@@ -38,10 +38,11 @@ The CLI install path is the GitHub release archive:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the public Rust API. Generated `.gnr8/Cargo.toml` files use the
-exact `crates/gnr8-core` path from the selected source tree or complete release archive. `gnr8 init`
-fails with an actionable error when that resource is missing; it never silently switches to a
-registry version.
+The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on — not a
+CLI install path; it ships no binary. In-repo builds scaffold `.gnr8/Cargo.toml` against the exact
+`crates/gnr8-sdk` path from the selected source tree or complete release archive; a packaged build
+pins `gnr8 = "=<version>"` instead. `gnr8 init` fails with an actionable error when that resource is
+missing; it never silently switches to a registry version.
 
 ## Canonical workflow
 ```

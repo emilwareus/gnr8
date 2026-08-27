@@ -232,10 +232,14 @@ That in turn forces a decision about `Pipeline::transform(…)`'s parameter type
 ### 4.1 Package graph
 
 ```
-crates/gnr8-sdk/   package `gnr8`         published, thin. deps: serde, serde_json, blake3
+crates/gnr8-sdk/   package `gnr8`         published, thin. deps: serde, serde_json, blake3, thiserror
 crates/gnr8-core/  package `gnr8-engine`  publish = false, heavy. deps: gnr8 + all of today's
 crates/gnr8/       package `gnr8-cli`     publish = false, bin `gnr8`. deps: gnr8-engine
 ```
+
+(As built, the SDK's dependency list is those four. The design proposed three; `thiserror` was added
+because typed stage errors are the repository's standing convention and its proc-macro closure is
+already pulled in by `serde`'s derive — see the plan's as-built section.)
 
 Keeping the *published* name `gnr8` on the thin crate preserves `use gnr8::sdk::prelude::*;` and
 `gnr8 = "=x.y.z"` in every `.gnr8/Cargo.toml`, which is the surface users and docs actually touch.

@@ -431,7 +431,11 @@ pub struct UpgradeOutcome {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Workspace`] when the manifest is missing or cannot be read/written.
+/// Returns [`CoreError::Workspace`] when the manifest is missing, cannot be read/written, or states
+/// a gnr8 dependency as a `[dependencies.<name>]` table — a shape this line-based rewrite
+/// deliberately will not touch. Reporting that is the point: silently answering "already current"
+/// would leave the user in a loop between a manifest the host rejects and an upgrade that claims
+/// there is nothing to do.
 pub fn upgrade(root: &Path) -> Result<UpgradeOutcome, CoreError> {
     let gnr8 = root.join(".gnr8");
     let manifest = gnr8.join("Cargo.toml");
@@ -443,10 +447,21 @@ pub fn upgrade(root: &Path) -> Result<UpgradeOutcome, CoreError> {
     })?;
 
     let wanted = core_dependency_line();
-    let (rewritten, replaced) = rewrite_dependency_lines(&text, &wanted);
+    let rewrite = rewrite_dependency_lines(&text, &wanted);
+    if let Some(table) = rewrite.unrewritable_table {
+        return Err(CoreError::Workspace {
+            message: format!(
+                "{} states a gnr8 dependency as the `[{table}]` table. `gnr8 init --upgrade` \
+                 rewrites single-line dependencies only, so edit that section by hand — a .gnr8 \
+                 crate depends on the thin SDK and nothing else:\n\n    [dependencies]\n    \
+                 {wanted}\n",
+                manifest.display()
+            ),
+        });
+    }
     let mut outcome = UpgradeOutcome::default();
-    if replaced {
-        std::fs::write(&manifest, &rewritten).map_err(|e| CoreError::Workspace {
+    if rewrite.changed {
+        std::fs::write(&manifest, &rewrite.text).map_err(|e| CoreError::Workspace {
             message: format!("failed to write {}: {e}", manifest.display()),
         })?;
         outcome.changed.push(relative(root, &manifest));
@@ -454,10 +469,7 @@ pub fn upgrade(root: &Path) -> Result<UpgradeOutcome, CoreError> {
         outcome.already_current = true;
     }
 
-    for stale in [
-        gnr8.join("Cargo.lock"),
-        gnr8.join("cache").join("worker.json"),
-    ] {
+    for stale in [gnr8.join("Cargo.lock"), crate::worker::stamp_path(root)] {
         if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
             outcome.changed.push(relative(root, &stale));
         }
@@ -465,21 +477,45 @@ pub fn upgrade(root: &Path) -> Result<UpgradeOutcome, CoreError> {
     Ok(outcome)
 }
 
+/// The result of rewriting a manifest's dependency lines.
+struct DependencyRewrite {
+    /// The rewritten manifest text.
+    text: String,
+    /// Whether anything about the manifest actually changed.
+    changed: bool,
+    /// The `[dependencies.<name>]` table, if the manifest states a gnr8 dependency in a shape this
+    /// rewrite refuses to touch. The caller turns it into an actionable error rather than a silent
+    /// no-op, because leaving it would keep the host rejecting the manifest forever.
+    unrewritable_table: Option<String>,
+}
+
 /// Replace the `gnr8` dependency line and drop host-only engine dependencies.
 ///
 /// Line-based on purpose: a manifest may carry the user's own dependencies and comments, and a
-/// parse-and-reserialize round trip would silently reformat all of it.
-fn rewrite_dependency_lines(text: &str, wanted: &str) -> (String, bool) {
+/// parse-and-reserialize round trip would silently reformat all of it. The cost of that choice is
+/// that a `[dependencies.gnr8]` *table* is not a line to replace — so it is reported rather than
+/// quietly skipped.
+fn rewrite_dependency_lines(text: &str, wanted: &str) -> DependencyRewrite {
     let mut out = Vec::new();
     let mut changed = false;
-    let mut saw_gnr8 = false;
+    let mut placed = false;
+    let mut unrewritable_table = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
+        if let Some(header) = section_header(trimmed) {
+            if matches!(
+                header,
+                "dependencies.gnr8" | "dependencies.gnr8-engine" | "dependencies.gnr8-core"
+            ) && unrewritable_table.is_none()
+            {
+                unrewritable_table = Some(header.to_string());
+            }
+        }
         if is_dependency_line(trimmed, "gnr8") {
-            saw_gnr8 = true;
             if trimmed != wanted {
                 changed = true;
             }
+            placed = true;
             out.push(wanted.to_string());
             continue;
         }
@@ -489,17 +525,38 @@ fn rewrite_dependency_lines(text: &str, wanted: &str) -> (String, bool) {
         }
         out.push(line.to_string());
     }
-    if !saw_gnr8 {
+    if !placed && unrewritable_table.is_none() {
+        // No `gnr8` line anywhere: put one under the existing `[dependencies]` table, or introduce
+        // that table when the manifest has none. Both are exactly what `init` would have written.
         if let Some(index) = out.iter().position(|line| line.trim() == "[dependencies]") {
             out.insert(index + 1, wanted.to_string());
-            changed = true;
+        } else {
+            if out.last().is_some_and(|line| !line.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("[dependencies]".to_string());
+            out.push(wanted.to_string());
         }
+        changed = true;
+        placed = true;
     }
+    debug_assert!(placed || unrewritable_table.is_some());
     let mut rendered = out.join("\n");
     if text.ends_with('\n') {
         rendered.push('\n');
     }
-    (rendered, changed)
+    DependencyRewrite {
+        text: rendered,
+        changed,
+        unrewritable_table,
+    }
+}
+
+/// The name inside a TOML table header line, if the line is one (`[dependencies]` → `dependencies`).
+fn section_header(line: &str) -> Option<&str> {
+    line.strip_prefix('[')?
+        .split_once(']')
+        .map(|(name, _)| name)
 }
 
 fn is_dependency_line(line: &str, name: &str) -> bool {
@@ -509,8 +566,8 @@ fn is_dependency_line(line: &str, name: &str) -> bool {
 
 /// The path to a project's mandatory generation-crate manifest (`<root>/.gnr8/Cargo.toml`).
 ///
-/// The host requires this to exist before running the child; a missing one is the "run `gnr8 init`"
-/// error. Exposed so the binary's child-run helper resolves the manifest the same way `init` writes it.
+/// The host requires this to exist before building or running the worker; a missing one is the "run
+/// `gnr8 init`" error. Exposed so the CLI resolves the manifest the same way `init` writes it.
 #[must_use]
 pub fn manifest_path(root: &Path) -> PathBuf {
     root.join(".gnr8").join("Cargo.toml")
@@ -523,7 +580,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        core_dependency_line, crate_name_for, path_dependency_line, version_dependency_line,
+        core_dependency_line, crate_name_for, path_dependency_line, rewrite_dependency_lines,
+        upgrade, version_dependency_line,
     };
     use std::path::Path;
 
@@ -568,5 +626,103 @@ mod tests {
             path_dependency_line(&super::sdk_crate_dir()),
             "a non-packaged build must always emit the local path dependency"
         );
+    }
+
+    const WANTED: &str = "gnr8 = \"=0.9.0\"";
+
+    #[test]
+    fn upgrade_rewrites_the_pin_and_preserves_everything_else() {
+        let manifest = "# keep me\n[package]\nname = \"x\"\n\n[dependencies]\ngnr8 = \"=0.8.0\"\nrand = \"0.8\"\n";
+        let rewrite = rewrite_dependency_lines(manifest, WANTED);
+        assert!(rewrite.changed && rewrite.unrewritable_table.is_none());
+        assert!(rewrite.text.contains("# keep me"), "{}", rewrite.text);
+        assert!(rewrite.text.contains("rand = \"0.8\""), "{}", rewrite.text);
+        assert!(rewrite.text.contains(WANTED), "{}", rewrite.text);
+        assert!(!rewrite.text.contains("=0.8.0"), "{}", rewrite.text);
+    }
+
+    #[test]
+    fn upgrade_drops_a_host_engine_dependency() {
+        let manifest =
+            "[package]\nname = \"x\"\n\n[dependencies]\ngnr8 = \"=0.9.0\"\ngnr8-engine = \"0.9.0\"\n";
+        let rewrite = rewrite_dependency_lines(manifest, WANTED);
+        assert!(rewrite.changed && rewrite.unrewritable_table.is_none());
+        assert!(!rewrite.text.contains("gnr8-engine"), "{}", rewrite.text);
+    }
+
+    #[test]
+    fn an_already_current_manifest_is_left_byte_identical() {
+        let manifest = "[package]\nname = \"x\"\n\n[dependencies]\ngnr8 = \"=0.9.0\"\n";
+        let rewrite = rewrite_dependency_lines(manifest, WANTED);
+        assert!(!rewrite.changed, "{}", rewrite.text);
+        assert!(rewrite.unrewritable_table.is_none());
+        assert_eq!(rewrite.text, manifest);
+    }
+
+    /// `validate_workspace` sends a manifest with no `gnr8` dependency here, so this has to add one
+    /// even when there is no `[dependencies]` table to add it to — otherwise the CLI's advice and
+    /// the CLI's behavior disagree forever.
+    #[test]
+    fn upgrade_introduces_the_dependencies_table_when_the_manifest_has_none() {
+        let manifest = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n";
+        let rewrite = rewrite_dependency_lines(manifest, WANTED);
+        assert!(rewrite.changed && rewrite.unrewritable_table.is_none());
+        assert!(
+            rewrite
+                .text
+                .ends_with("\n[dependencies]\ngnr8 = \"=0.9.0\"\n"),
+            "{}",
+            rewrite.text
+        );
+    }
+
+    /// A `[dependencies.gnr8-engine]` table is the same problem wearing the other name: the host
+    /// refuses the manifest for depending on the engine, and a line-based rewrite cannot delete a
+    /// section, so answering "already current" would loop just as hard.
+    #[test]
+    fn an_engine_dependency_table_is_reported_too() {
+        let rewrite = rewrite_dependency_lines(
+            "[package]\nname = \"x\"\n\n[dependencies]\ngnr8 = \"=0.9.0\"\n\n[dependencies.gnr8-engine]\nversion = \"0.9.0\"\n",
+            WANTED,
+        );
+        assert_eq!(
+            rewrite.unrewritable_table.as_deref(),
+            Some("dependencies.gnr8-engine")
+        );
+    }
+
+    #[test]
+    fn upgrade_refuses_a_table_form_dependency_instead_of_claiming_success() {
+        let manifest = "[package]\nname = \"x\"\n\n[dependencies.gnr8]\nversion = \"=0.8.0\"\n";
+        let rewrite = rewrite_dependency_lines(manifest, WANTED);
+        assert_eq!(
+            rewrite.unrewritable_table.as_deref(),
+            Some("dependencies.gnr8"),
+            "a table-form dependency must be reported"
+        );
+
+        let root = temp_dir("upgrade-table");
+        std::fs::create_dir_all(root.join(".gnr8")).unwrap();
+        std::fs::write(root.join(".gnr8/Cargo.toml"), manifest).unwrap();
+        let err = upgrade(&root).unwrap_err().to_string();
+        assert!(err.contains("[dependencies.gnr8]"), "{err}");
+        assert!(err.contains("gnr8 = "), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gnr8/Cargo.toml")).unwrap(),
+            manifest,
+            "a refused upgrade must not half-rewrite the manifest"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "gnr8-workspace-{label}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }

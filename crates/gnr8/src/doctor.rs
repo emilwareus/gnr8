@@ -4,7 +4,7 @@
 //! performs NO I/O: [`DoctorReport::assemble`] takes already-collected facts (the lifecycle booleans,
 //! the pipeline's structured `diagnostics`, and the dry-run drift `WritePlan`) and groups them into a
 //! serializable report. The impure half — probing `.gnr8/`, probing the source-language toolchain, and RUNNING the
-//! user's `.gnr8/` pipeline (the child) to harvest its diagnostics + compute drift — lives in
+//! user's `.gnr8/` pipeline (via the worker) to harvest its diagnostics + compute drift — lives in
 //! `main::run_doctor`, mirroring the `run_check` shell-vs-decision split. Keeping `assemble` pure makes
 //! the entire exit-policy truth table (Pitfall 1 — INFO/WARN diagnostics must not force a non-zero exit)
 //! unit-testable without a filesystem, a toolchain, or a worker process.

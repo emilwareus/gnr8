@@ -37,7 +37,7 @@ use crate::sdk::{Artifact, Cx, StagePlan};
 use crate::CoreError;
 
 pub use build::{
-    discard_stamp, ensure_worker, validate_workspace, WorkerBinary, WorkerPolicy, Workspace,
+    ensure_worker, stamp_path, validate_workspace, WorkerBinary, WorkerPolicy, Workspace,
 };
 
 /// How much worker stderr is retained for an error message before truncation.

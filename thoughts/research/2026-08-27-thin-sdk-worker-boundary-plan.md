@@ -4,6 +4,10 @@ Companion to [`2026-08-27-thin-sdk-worker-boundary.md`](2026-08-27-thin-sdk-work
 Target release: **0.9.0** — a deliberate, breaking, unstable-minor change. There is no second
 backend, no compatibility mode, no automatic fallback, and no deprecation window.
 
+**Sections 1–10 are the plan as written before implementation.** Where the shipped code differs,
+[§11 "As built"](#11-as-built-where-the-implementation-diverged-from-this-plan) records the
+difference and why; read it alongside any specific claim here.
+
 ---
 
 ## 0. The one-sentence contract
@@ -140,8 +144,8 @@ host → Shutdown                                → (worker exits 0)
 - `Hello.protocol` must equal the worker's `PROTOCOL_VERSION` — else the worker replies `Failed` and
   exits 2.
 - `Hello.host_version` must equal the SDK's `CARGO_PKG_VERSION` (exact-version contract, as today).
-- `capability_digest` = `blake3("gnr8-sdk:{version};protocol:{n};frames:1;plan:1")`. Both sides
-  compute it; a mismatch is fatal on both.
+- `capability_digest` = `blake3("gnr8-sdk:{version};protocol:{n};frames:1;plan:1")` — as built the
+  hashed manifest also carries `;artifacts:1`. Both sides compute it; a mismatch is fatal on both.
 - The worker refuses to run at all without a valid `Hello` frame on stdin. Unlike today there is no
   "no handshake ⇒ run anyway" branch: running the worker binary by hand prints usage to stderr and
   exits 2.
@@ -258,7 +262,7 @@ Invalidation matrix (each is a test):
 ## 7. Offline and no-Cargo operation
 
 - `cargo build` is invoked with `--locked` so a committed `.gnr8/Cargo.lock` is authoritative and no
-  network resolution happens for a lock that is already complete.
+  network resolution happens for a lock that is already complete. *(Not as built — see §11.12.)*
 - `--offline` is added when `GNR8_CARGO_OFFLINE=1`. (Single knob, single source; no precedence
   chain.)
 - `gnr8 --no-build <cmd>` never invokes `cargo`; a missing/stale worker is a typed error naming the
@@ -458,5 +462,16 @@ Recorded after the fact, so the plan is evidence of what was decided *and* of wh
    magic; continuing someone else's counter would imply a lineage that does not exist.
 10. **The message names are `ApplyTransform` / `GenerateTarget` / `RunPost`**, not `Transform` /
    `Generate` / `Post` — the shorter names collided with the trait names in every `use` site.
-11. **Not done, and not claimed:** Windows and macOS behaviour is unverified (CI is `ubuntu-latest`);
+11. **`cargo build` is NOT invoked with `--locked`.** §7 proposed it. `ensure_worker` instead runs
+   `cargo generate-lockfile` when `.gnr8/Cargo.lock` is absent and then an ordinary `cargo build`, so
+   a user who adds a dependency to `.gnr8/Cargo.toml` gets a relock rather than a hard failure. The
+   consequence — cargo may rewrite `Cargo.lock` mid-build — is handled explicitly: the fingerprint
+   recorded in the stamp is computed *after* the build and includes the lockfile, while the
+   concurrent-edit bracket that must hold across the build excludes it.
+12. **`upgrade` reports a manifest it will not rewrite.** The line-based rewrite cannot repoint a
+   `[dependencies.gnr8]` *table*, and answering "already current" there would leave a user looping
+   between a manifest the host rejects and an upgrade that claims there is nothing to do. It now
+   errors with the exact line to write, and it introduces a `[dependencies]` table when the manifest
+   has none.
+13. **Not done, and not claimed:** Windows and macOS behaviour is unverified (CI is `ubuntu-latest`);
    the host-side no-op cache remains deliberately out of scope; `gnr8-engine` is not published.

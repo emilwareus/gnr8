@@ -63,7 +63,9 @@ must move the minor version.
 
   A manifest that still pins a pre-0.9 `gnr8`, or that depends on `gnr8-engine`/`gnr8-core`, is
   refused **before** anything is compiled, with those instructions in the error. There is no
-  compatibility mode and no fallback path.
+  compatibility mode and no fallback path. `--upgrade` adds a `[dependencies]` table when the
+  manifest has none, and refuses — with the exact line to write — a manifest that states the
+  dependency as a `[dependencies.gnr8]` table, which its line-based rewrite will not touch.
 
 - **`gnr8` gained `--no-build` and `--no-execute`.** Building and running `.gnr8/` compiles and
   executes Rust from the repository — build scripts, proc macros, and the pipeline's `main()` — with
@@ -85,6 +87,14 @@ must move the minor version.
 
 - **`SdkModel` left the prelude.** It is the SDK emitters' internal model and needs the generation
   projection, which is host-only. Custom targets read `ApiGraph` directly.
+
+- **`Pipeline` no longer runs itself, and `validate_openapi_artifact` is host-only.**
+  `Pipeline::{run, build_ir, output_anchors, readiness_targets}` and
+  `sdk::validate_openapi_artifact` needed the engine, so they moved to it as
+  `gnr8_engine::pipeline::{run_in_process, build_ir_in_process, output_anchors, readiness_targets}`
+  and `gnr8_engine::sdk::validate_openapi_artifact`. A `.gnr8/` worker never called them — it hands
+  its `Pipeline` to `gnr8::worker::run` — so this affects only tooling that linked the old crate as a
+  library. Composing, and every custom `Source`/`Transform`/`Target`/`PostProcess`, is unchanged.
 
 - **`gnr8 generate --json` / `check --json` renamed `cache_mode` to `worker`** (`"built"` or
   `"reused"`), and `timings_ms` lost `hot_noop` (the subsystem it measured is gone) — `pipeline`,

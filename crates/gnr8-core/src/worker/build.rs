@@ -118,8 +118,21 @@ impl Workspace {
     /// The build stamp path.
     #[must_use]
     pub fn stamp_path(&self) -> PathBuf {
-        self.dir.join("cache").join("worker.json")
+        stamp_path(&self.project_root)
     }
+}
+
+/// Where a project's worker build stamp lives — the one definition of that path.
+///
+/// Taken by project root rather than by [`Workspace`] so callers that must reach the stamp *before*
+/// a workspace validates — `gnr8 init --upgrade`, whose whole job is a manifest the host currently
+/// rejects — still go through this function instead of rebuilding the path by hand.
+#[must_use]
+pub fn stamp_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+        .join("worker.json")
 }
 
 #[cfg(windows)]
@@ -612,11 +625,6 @@ fn write_stamp(workspace: &Workspace, stamp: &WorkerStamp) {
     if std::fs::rename(&temporary, &path).is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-}
-
-/// Discard a project's worker build stamp, forcing the next run to rebuild.
-pub fn discard_stamp(workspace: &Workspace) {
-    let _ = std::fs::remove_file(workspace.stamp_path());
 }
 
 fn ensure_lockfile(workspace: &Workspace) -> Result<(), CoreError> {

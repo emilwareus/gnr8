@@ -52,6 +52,13 @@ fn the_sdk_depends_on_exactly_the_declared_commodity_crates() {
         {
             tables.insert(name.to_string());
             in_dependencies = name == "dependencies";
+            // `cargo package` rewrites every inline `serde = { … }` into a `[dependencies.serde]`
+            // table, so the published crate states the same fact in the other TOML spelling. Both
+            // are read here: this file ships inside that package, and a scanner that only knew the
+            // inline form would find an empty set and pass vacuously on the artifact users get.
+            if let Some(sub_table) = name.strip_prefix("dependencies.") {
+                declared.insert(sub_table.to_string());
+            }
             continue;
         }
         if !in_dependencies || line.is_empty() || line.starts_with('#') {

@@ -7,9 +7,10 @@ see [`reference/public-api.md`](reference/public-api.md); for the real trait sig
 [`USAGE.md`](USAGE.md).
 
 Companion to [`code-as-config.md`](code-as-config.md). That doc establishes *how* config is code (the
-`.gnr8/` Rust lifecycle crate; its host/child mechanics were superseded by the 0.9 host/worker split). This doc designs *what that code can compose*: the
-multi-source / multi-target architecture, the extension interfaces a user implements to add their own
-parsers and generators, and the pre/post-process hooks — so it feels powerful and flexible.
+`.gnr8/` Rust lifecycle crate; its host/child mechanics were superseded by the 0.9 host/worker
+split). This doc designs *what that code can compose*: the multi-source / multi-target architecture,
+the extension interfaces a user implements to add their own parsers and generators, and the
+pre/post-process hooks — so it feels powerful and flexible.
 
 ---
 
@@ -270,8 +271,9 @@ Two hook points total: **pre** = `Transform` on the IR (semantic), **post** = `P
 
 ## 8. How it all composes — the pipeline & lifecycle
 
-The user's `.gnr8/src/main.rs` builds one pipeline; the host runs it (the child process from
-`code-as-config.md`), receives the `Artifacts` bundle, and owns writing.
+The user's `.gnr8/src/main.rs` builds one pipeline. As shipped in 0.9, the host executes that
+pipeline itself — running every built-in stage natively and calling the project's worker only for the
+stages wrapped in `Custom(...)` — and owns writing the resulting artifacts.
 
 ```rust
 fn main() -> ExitCode {

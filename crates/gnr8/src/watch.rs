@@ -239,7 +239,7 @@ fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
 /// Run the debounced, loop-safe watch loop until Ctrl-C (the I/O shell — WATCH-02 / WATCH-03).
 ///
 /// Watches the project root recursively, debounces bursts into a single coalesced signal, and on each
-/// qualifying signal times one regeneration (run the child pipeline → write), printing a latency line
+/// qualifying signal times one regeneration (run the project's pipeline → write), printing a latency line
 /// (human, or a [`LatencyReport`] under `json`). A `notify` error in a batch is logged to stderr and the
 /// loop CONTINUES — it never panics.
 ///
