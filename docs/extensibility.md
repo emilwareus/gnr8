@@ -177,6 +177,7 @@ pub trait Target {
 Built-in SDK targets use a shared SDK planning boundary before language rendering. See
 [`sdk-model.md`](sdk-model.md) for the current `ApiGraph -> SdkModel -> emitter` contract and the rule
 that cross-target SDK semantics should be added to `SdkModel` before Go/Python/TypeScript rendering.
+(`SdkModel` is host-internal as of 0.9.0; a custom `Target` reads `ApiGraph` directly.)
 
 How a user adds a target (sketch):
 ```rust

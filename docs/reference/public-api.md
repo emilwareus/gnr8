@@ -116,7 +116,6 @@ See [OpenAPI generation](../openapi/generation.md).
 | `OperationFileSplit` | compact/per-tag/per-endpoint operation layout enum |
 | `SdkDocs` | none/reference generated docs policy |
 | `SdkPackageMetadata` | registry name, version, description, URLs, license, keywords |
-| `SdkModel` | normalized target-facing SDK model built from the graph |
 | `PyModelStyle` | Pydantic v2 or stdlib dataclass model policy |
 | `StaticFiles` | copy exact companion files or included directory trees |
 | `ReadinessTarget` | declare a generated package/artifact for `doctor` validation |

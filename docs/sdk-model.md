@@ -1,5 +1,10 @@
 # SDK Semantic Model
 
+> `SdkModel` is **host-internal** as of 0.9.0. It needs the generation projection, which lives in
+> the engine, so it is not part of the published `gnr8` SDK and is not in the prelude. A custom
+> `Target` reads [`ApiGraph`](reference/public-api.md) directly. This page describes how gnr8's own
+> emitters are organized.
+
 `SdkModel` is the SDK planning boundary between the source-owned `ApiGraph` and language-specific SDK
 emitters. It is built once per SDK target from the frozen graph plus target configuration such as package
 name and layout.
