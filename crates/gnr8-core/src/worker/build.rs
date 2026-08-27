@@ -587,6 +587,12 @@ pub fn ensure_worker(
     })
 }
 
+/// Publish the build stamp atomically.
+///
+/// Two `gnr8` processes in one project can reach this at the same time. A torn stamp would only cost
+/// an extra rebuild — a partial JSON does not parse, and `read_stamp` treats that as "no stamp" — but
+/// write-then-rename removes the window entirely, and the temporary name carries the writer's pid so
+/// two concurrent publishes never collide.
 fn write_stamp(workspace: &Workspace, stamp: &WorkerStamp) {
     let path = workspace.stamp_path();
     let Some(parent) = path.parent() else {
@@ -598,7 +604,14 @@ fn write_stamp(workspace: &Workspace, stamp: &WorkerStamp) {
     let Ok(bytes) = serde_json::to_vec(stamp) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    let temporary = parent.join(format!(".worker.json.{}.tmp", std::process::id()));
+    if std::fs::write(&temporary, bytes).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if std::fs::rename(&temporary, &path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
 }
 
 /// Discard a project's worker build stamp, forcing the next run to rebuild.
