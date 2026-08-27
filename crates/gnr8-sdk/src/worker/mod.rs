@@ -346,6 +346,54 @@ mod tests {
     }
 
     #[test]
+    fn a_session_serves_a_custom_source_and_post_processor() {
+        struct FixedSource;
+        impl crate::sdk::Source for FixedSource {
+            fn load(&self, cx: &Cx) -> Result<ApiGraph, Error> {
+                Ok(ApiGraph {
+                    title: cx.project_root.to_string_lossy().into_owned(),
+                    ..ApiGraph::default()
+                })
+            }
+        }
+
+        struct Banner;
+        impl crate::sdk::PostProcess for Banner {
+            fn run(&self, out: &mut Artifacts, _cx: &Cx) -> Result<(), Error> {
+                out.rewrite("a.txt", |text| format!("// banner\n{text}"))
+            }
+        }
+
+        let pipeline = Pipeline::new()
+            .source(Custom(FixedSource))
+            .post(Custom(Banner));
+        let (result, output) = drive(
+            &pipeline,
+            &[
+                hello(),
+                HostMessage::LoadSource { index: 0 },
+                HostMessage::RunPost {
+                    index: 0,
+                    artifacts: vec![crate::sdk::Artifact::new("a.txt", "body\n")],
+                },
+                HostMessage::Shutdown,
+            ],
+        );
+        assert!(result.is_ok());
+        let messages = replies(&output);
+        let WorkerMessage::Graph { graph } = &messages[1] else {
+            panic!("expected a graph, got {:?}", messages[1]);
+        };
+        // The worker's `Cx` is the project root the host declared in its handshake.
+        assert_eq!(graph.title, "/repo");
+        let WorkerMessage::Artifacts { artifacts } = &messages[2] else {
+            panic!("expected artifacts, got {:?}", messages[2]);
+        };
+        assert_eq!(artifacts[0].text, "// banner\nbody\n");
+        assert!(artifacts[0].producer.starts_with("post[0]:"));
+    }
+
+    #[test]
     fn a_stage_failure_is_reported_as_a_failed_frame() {
         let pipeline = Pipeline::new().transform(Custom(FailingTransform));
         let (result, output) = drive(

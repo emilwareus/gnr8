@@ -74,6 +74,21 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
+Built-in stages — `FastApi`, `SetBasePath`, `OpenApi31`, `PySdk`, `Header` — are declarations the
+installed CLI executes; none of that machinery is compiled into this crate. A stage you write
+yourself is wrapped in `Custom(...)` and runs in this process:
+
+```rust
+struct DropInternalRoutes;
+impl Transform for DropInternalRoutes {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), gnr8::Error> {
+        ir.operations.retain(|op| !op.path.starts_with("/_"));
+        Ok(())
+    }
+}
+// ... .transform(Custom(DropInternalRoutes))
+```
+
 Common changes:
 
 - Change `.source(...)` when the service frontend changes.
