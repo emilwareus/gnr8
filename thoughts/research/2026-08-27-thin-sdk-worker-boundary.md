@@ -312,6 +312,13 @@ project skips `cargo` outright (proven by a sentinel `cargo` shim in
 - The worker no longer needs `GNR8_RESOURCE_DIR`, `go`, `python3`, or `node`: extraction is the
   host's.
 
+`scripts/bench.sh` — the repository's own harness, which scaffolds a fresh `.gnr8` over a scratch
+copy of `fixtures/goalservice` — reports `cold=11921ms warm-no-op=2110ms single-file-edit=2374ms` on
+the shipped code. Read that `warm-no-op` figure the way the harness defines it: it is the *second*
+`generate`, which still pays a Go source-analysis miss because the `GoGin` source cache keys on the
+compiled `goextract` binary and that binary is produced during the first run. A third `generate` in
+the same tree reports `pipeline: 44 ms, total: 50 ms` — the same steady state the examples show.
+
 ### 4.4 What must NOT change
 
 - Byte-identical generated output for all five examples (`make examples-check`).
