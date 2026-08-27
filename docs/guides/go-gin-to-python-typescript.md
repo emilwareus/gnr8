@@ -19,7 +19,7 @@ Then edit `.gnr8/src/main.rs` to add the Python SDK target as a second SDK targe
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/api"))

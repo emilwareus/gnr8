@@ -5,9 +5,9 @@
 //! ## The host owns writing; the child (the Pipeline) produces artifacts
 //!
 //! The host no longer extracts/lowers/generates in-process — the user's `.gnr8/` crate (the
-//! `Pipeline`) does, as a child process (`docs/code-as-config.md`). The host's job is the trusted
+//! `Pipeline`) does, in the project's worker process. The host's job is the trusted
 //! WRITER: it runs the child (`crate::child::run_child` lives in the binary), receives an
-//! [`crate::runner::ArtifactBundle`] of `(path, text)` [`crate::sdk::Artifact`]s, and decides what to
+//! set of `(path, text)` [`crate::sdk::Artifact`]s, and decides what to
 //! write. `regenerate`/`plan_only` therefore take the already-produced artifacts (the binary calls the
 //! child first) and apply ONLY the write machinery below.
 //!
@@ -47,9 +47,7 @@ use cap_std::fs::{Dir, OpenOptions};
 
 use crate::graph::ApiGraph;
 use crate::manifest::{self, blake3_hex, Manifest, ManifestEntry};
-use crate::sdk::{
-    is_internal_transaction_name, portable_path_identity, Artifact, ArtifactMetadata,
-};
+use crate::sdk::{is_internal_transaction_name, portable_path_identity, Artifact};
 
 /// The provenance tag recorded for every artifact the host writes.
 ///
@@ -232,38 +230,6 @@ pub fn plan_writes(
             action,
             new_bytes: new_bytes.to_vec(),
             new_hash,
-            source: SOURCE_GENERATED.to_string(),
-        });
-    }
-    WritePlan { files }
-}
-
-/// Classify generated files from cached path/hash metadata.
-///
-/// This is used by warm no-op host paths where the child has proved the artifact cache is valid but
-/// the host does not yet know whether it needs the full generated text. `new_bytes` is intentionally
-/// empty in the returned plan; callers must only use it for dry-run reporting or when they have already
-/// established that no file needs writing.
-#[must_use]
-pub fn plan_metadata_writes(
-    artifacts: &[ArtifactMetadata],
-    manifest: &Manifest,
-    on_disk_hash: &dyn Fn(&str) -> Option<String>,
-) -> WritePlan {
-    let mut files = Vec::with_capacity(artifacts.len());
-    for artifact in artifacts {
-        let path = &artifact.path;
-        let action = match (on_disk_hash(path), recorded_hash_for_path(manifest, path)) {
-            (Some(disk_hash), _) if disk_hash == artifact.hash => WriteAction::Unchanged,
-            (Some(disk_hash), Some(recorded)) if disk_hash != recorded => WriteAction::UserEdited,
-            (None, _) | (Some(_), Some(_)) => WriteAction::Write,
-            (Some(_), None) => WriteAction::UserEdited,
-        };
-        files.push(PlannedFile {
-            path: path.clone(),
-            action,
-            new_bytes: Vec::new(),
-            new_hash: artifact.hash.clone(),
             source: SOURCE_GENERATED.to_string(),
         });
     }
@@ -951,7 +917,6 @@ fn begin_generation_operation(
     };
     let guard = lock_generation_guard(&journal_dir).map_err(recovery_io_error)?;
     manifest::cleanup_temporary_files(&project_root.join(WORKSPACE_DIR))?;
-    crate::sdk::cleanup_artifact_cache_temporary_files(project_root).map_err(recovery_io_error)?;
     Ok(Some(GenerationOperation {
         project_dir,
         journal_dir,
@@ -2098,35 +2063,6 @@ fn validate_output_paths(
     Ok(())
 }
 
-fn validate_metadata_output_paths(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-) -> Result<(), crate::CoreError> {
-    let mut seen = BTreeMap::new();
-    for artifact in artifacts {
-        safe_output_path(project_root, &artifact.path)?;
-        let collision_key =
-            portable_path_identity(&artifact.path).map_err(|reason| crate::CoreError::Io {
-                message: format!(
-                    "refusing to write non-portable output path {:?}: {reason}",
-                    artifact.path
-                ),
-            })?;
-        if let Some(previous) = seen.insert(collision_key, artifact.path.as_str()) {
-            return Err(crate::CoreError::ArtifactOwnership {
-                code: "artifact.path_collision".to_string(),
-                path: artifact.path.clone(),
-                producer: SOURCE_GENERATED.to_string(),
-                message: format!(
-                    "artifact paths {:?} and {:?} resolve to the same output identity",
-                    previous, artifact.path
-                ),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Operation/type name remaps applied to the graph by [`apply_naming`].
 ///
 /// This is the in-IR form of the old `[naming.*]` knobs, now driven from code: the
@@ -2444,34 +2380,6 @@ pub fn plan_only(
     Ok(plan_writes(artifacts, &manifest, &on_disk))
 }
 
-/// Compute the dry-run write plan from cached artifact path/hash metadata.
-///
-/// The resulting plan is suitable for drift reporting (`gnr8 check` / `gnr8 doctor`). Its
-/// `new_bytes` fields are empty because the metadata cache deliberately avoids loading generated text.
-///
-/// # Errors
-///
-/// Returns [`crate::CoreError::Io`] for a root-escaping output path, or propagates manifest I/O.
-pub fn plan_only_cached(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-) -> Result<WritePlan, crate::CoreError> {
-    validate_metadata_output_paths(project_root, artifacts)?;
-    let mut manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
-    validate_manifest_paths(&manifest)?;
-    let project_dir = open_project_dir(project_root)?;
-    reconcile_manifest_path_aliases(
-        &project_dir,
-        &mut manifest,
-        artifacts.iter().map(|artifact| artifact.path.as_str()),
-    )
-    .map_err(recovery_io_error)?;
-    let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts)?;
-    let on_disk_hash =
-        move |path: &str| -> Option<String> { disk_hashes.get(path).cloned().flatten() };
-    Ok(plan_metadata_writes(artifacts, &manifest, &on_disk_hash))
-}
-
 /// Write the child's `artifacts`, writing only changed files, and return the outcome counts.
 ///
 /// The orchestrator the binary calls after running the child (RESEARCH §architecture). The host owns
@@ -2548,131 +2456,6 @@ pub fn regenerate_with_anchors(
     Ok(outcome)
 }
 
-/// Try to complete a generation from cached artifact metadata without loading generated text.
-///
-/// Returns `Ok(Some(outcome))` when every produced file is either unchanged or protected/skipped, so
-/// full text is unnecessary. Returns `Ok(None)` when at least one file must be written; the caller
-/// should then load the full artifact cache and use [`regenerate_with_anchors`].
-///
-/// # Errors
-///
-/// Propagates manifest/write/prune I/O errors as typed [`crate::CoreError`] values.
-pub fn regenerate_cached_with_anchors(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-    _output_anchors: &[String],
-    force: bool,
-) -> Result<Option<GenerateOutcome>, crate::CoreError> {
-    validate_metadata_output_paths(project_root, artifacts)?;
-    let operation =
-        begin_generation_operation(project_root, true)?.ok_or_else(|| crate::CoreError::Io {
-            message: "failed to open cached generation operation state".to_string(),
-        })?;
-    recover_cached_output_transactions_locked(project_root, artifacts, &operation)?;
-    let gnr8_dir = project_root.join(WORKSPACE_DIR);
-    let mut manifest = manifest::load(&gnr8_dir)?;
-    validate_manifest_paths(&manifest)?;
-    reconcile_manifest_path_aliases(
-        &operation.project_dir,
-        &mut manifest,
-        artifacts.iter().map(|artifact| artifact.path.as_str()),
-    )
-    .map_err(recovery_io_error)?;
-
-    let disk_hashes = read_artifact_hashes_from_disk(project_root, artifacts)?;
-    let on_disk_hash =
-        move |path: &str| -> Option<String> { disk_hashes.get(path).cloned().flatten() };
-    let plan = plan_metadata_writes(artifacts, &manifest, &on_disk_hash);
-    if plan.files.iter().any(|file| {
-        matches!(file.action, WriteAction::Write)
-            || (force && matches!(file.action, WriteAction::UserEdited))
-    }) {
-        return Ok(None);
-    }
-
-    if !force
-        && plan
-            .files
-            .iter()
-            .all(|file| matches!(file.action, WriteAction::Unchanged))
-        && manifest_matches_metadata(&manifest, artifacts)
-    {
-        return Ok(Some(GenerateOutcome {
-            written: Vec::new(),
-            unchanged: artifacts
-                .iter()
-                .map(|artifact| artifact.path.clone())
-                .collect(),
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        }));
-    }
-
-    let recovery_files = generation_recovery_files(
-        &manifest,
-        artifacts
-            .iter()
-            .map(|artifact| (artifact.path.as_str(), artifact.hash.as_str())),
-    )?;
-    let GenerationOperation {
-        project_dir: _,
-        journal_dir,
-        guard,
-    } = operation;
-    let generation_lease = GenerationLease::begin_with_guard(&journal_dir, recovery_files, guard)
-        .map_err(recovery_io_error)?;
-
-    let mut out = GenerateOutcome::default();
-    for file in &plan.files {
-        match file.action {
-            WriteAction::Unchanged => {
-                out.unchanged.push(file.path.clone());
-                manifest.record(&file.path, &file.new_hash, &file.source);
-            }
-            WriteAction::UserEdited => out.skipped.push(file.path.clone()),
-            WriteAction::Write => return Ok(None),
-        }
-    }
-
-    let current_paths = plan
-        .files
-        .iter()
-        .filter_map(|file| {
-            portable_path_identity(&file.path)
-                .ok()
-                .map(|identity| (identity, file.path.clone()))
-        })
-        .collect();
-    prune_stale_manifest_files(project_root, &manifest, &current_paths, force, &mut out)?;
-
-    let current_paths_vec: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
-    manifest.prune_to(&current_paths_vec);
-    manifest.save(&gnr8_dir)?;
-    generation_lease.finish().map_err(recovery_io_error)?;
-    Ok(Some(out))
-}
-
-/// Recover interrupted writes for metadata-cached artifacts before any hot no-op decision.
-///
-/// This is a mutating generate-path operation: it completes or rolls back journaled output writes
-/// and records any recovered generated hashes in the ownership manifest. Read-only check/doctor
-/// paths deliberately do not call it.
-///
-/// # Errors
-///
-/// Returns a typed I/O or manifest error when recovery cannot safely reconcile an output.
-pub fn recover_cached_output_transactions(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-) -> Result<(), crate::CoreError> {
-    validate_metadata_output_paths(project_root, artifacts)?;
-    let operation =
-        begin_generation_operation(project_root, true)?.ok_or_else(|| crate::CoreError::Io {
-            message: "failed to open cached output recovery state".to_string(),
-        })?;
-    recover_cached_output_transactions_locked(project_root, artifacts, &operation)
-}
-
 /// Run a host-side state publication while holding the same project generation lock as output and
 /// manifest commits. This is an internal host seam, not a code-as-config extension point.
 ///
@@ -2694,48 +2477,6 @@ pub fn with_generation_state_lock<T>(
     Ok(result)
 }
 
-fn recover_cached_output_transactions_locked(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-    operation: &GenerationOperation,
-) -> Result<(), crate::CoreError> {
-    recover_abandoned_generations_locked(project_root, operation)?;
-    let gnr8_dir = project_root.join(WORKSPACE_DIR);
-    let mut manifest = manifest::load(&gnr8_dir)?;
-    validate_manifest_paths(&manifest)?;
-    let mut changed = false;
-    for artifact in artifacts {
-        let recovered =
-            recover_output_file(&operation.project_dir, &artifact.path).map_err(|err| {
-                crate::CoreError::Io {
-                    message: format!(
-                        "failed to recover interrupted generated output {}: {err}",
-                        project_root.join(&artifact.path).display()
-                    ),
-                }
-            })?;
-        if let Some(hash) = recovered {
-            changed |= record_recovered_hash(
-                &mut manifest,
-                &operation.project_dir,
-                &artifact.path,
-                &hash,
-            )?;
-        }
-    }
-    if changed {
-        manifest.save(&gnr8_dir)?;
-    }
-    Ok(())
-}
-
-fn manifest_matches_metadata(manifest: &Manifest, artifacts: &[ArtifactMetadata]) -> bool {
-    manifest.files.len() == artifacts.len()
-        && artifacts
-            .iter()
-            .all(|artifact| manifest.recorded_hash(&artifact.path) == Some(artifact.hash.as_str()))
-}
-
 fn read_artifacts_from_disk(
     project_root: &Path,
     artifacts: &[Artifact],
@@ -2751,28 +2492,6 @@ fn read_artifacts_from_disk(
                 ),
             })?;
         disk.insert(artifact.path.clone(), bytes);
-    }
-    Ok(disk)
-}
-
-fn read_artifact_hashes_from_disk(
-    project_root: &Path,
-    artifacts: &[ArtifactMetadata],
-) -> Result<HashMap<String, Option<String>>, crate::CoreError> {
-    let project_dir = open_project_dir(project_root)?;
-    let mut disk = HashMap::with_capacity(artifacts.len());
-    for artifact in artifacts {
-        let bytes =
-            read_output_file(&project_dir, &artifact.path).map_err(|err| crate::CoreError::Io {
-                message: format!(
-                    "failed to inspect generated output {}: {err}",
-                    project_root.join(&artifact.path).display()
-                ),
-            })?;
-        disk.insert(
-            artifact.path.clone(),
-            bytes.map(|contents| blake3_hex(&contents)),
-        );
     }
     Ok(disk)
 }
@@ -3277,44 +2996,6 @@ mod tests {
 
         assert_eq!(std::fs::read(root.join("client.ts")).unwrap(), b"generated");
         assert_eq!(transaction_dir_count(&root), 0);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cached_regenerate_recovers_an_installed_transaction_before_noop() {
-        let root = temp_root("cached-recover-before-noop");
-        std::fs::create_dir(root.join(super::WORKSPACE_DIR)).unwrap();
-        std::fs::write(root.join("client.ts"), b"version-a").unwrap();
-        let mut manifest = Manifest::default();
-        manifest.record(
-            "client.ts",
-            &crate::manifest::blake3_hex(b"version-a"),
-            "generated",
-        );
-        manifest.save(&root.join(super::WORKSPACE_DIR)).unwrap();
-        let parent = super::open_project_dir(&root).unwrap();
-        let transaction =
-            super::OutputTransaction::begin(&parent, "client.ts", b"version-b").unwrap();
-        assert!(transaction.quarantine().unwrap());
-        transaction.approve().unwrap();
-        super::rename_noreplace(&transaction.dir, "next", &parent, "client.ts").unwrap();
-        super::sync_dir(&parent).unwrap();
-        drop(transaction);
-        let metadata = [crate::sdk::ArtifactMetadata {
-            path: "client.ts".to_string(),
-            hash: crate::manifest::blake3_hex(b"version-b"),
-        }];
-
-        let outcome = super::regenerate_cached_with_anchors(&root, &metadata, &[], false).unwrap();
-
-        assert_eq!(outcome.unwrap().unchanged, vec!["client.ts"]);
-        assert_eq!(std::fs::read(root.join("client.ts")).unwrap(), b"version-b");
-        assert_eq!(transaction_dir_count(&root), 0);
-        let manifest = crate::manifest::load(&root.join(super::WORKSPACE_DIR)).unwrap();
-        assert_eq!(
-            manifest.recorded_hash("client.ts"),
-            Some(metadata[0].hash.as_str())
-        );
         let _ = std::fs::remove_dir_all(root);
     }
 

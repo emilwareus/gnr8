@@ -361,13 +361,39 @@ dependencies = [
 
 [[package]]
 name = "gnr8"
-version = "0.8.0"
+version = "0.9.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "gnr8-cli"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "atomicwrites",
+ "clap",
+ "ctrlc",
+ "gnr8-engine",
+ "notify-debouncer-full",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "gnr8-engine"
+version = "0.9.0"
 dependencies = [
  "atomicwrites",
  "blake3",
  "cap-fs-ext",
  "cap-std",
  "fs2",
+ "gnr8",
  "insta",
  "noyalib",
  "rustix 1.1.4",
@@ -380,21 +406,6 @@ dependencies = [
  "unicode-normalization",
  "windows-sys 0.61.2",
  "winx",
-]
-
-[[package]]
-name = "gnr8-cli"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "atomicwrites",
- "clap",
- "ctrlc",
- "gnr8",
- "notify-debouncer-full",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]

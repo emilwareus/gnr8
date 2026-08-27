@@ -61,7 +61,7 @@ facts that source code cannot express reliably. Target stages write artifacts.
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
             .transform(SetBasePath::new("/api"))

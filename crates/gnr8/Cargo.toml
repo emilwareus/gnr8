@@ -17,12 +17,14 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-gnr8 = { workspace = true }
+# The host engine. The thin `gnr8` SDK reaches the CLI only through this re-export, so
+# nothing in the CLI can accidentally become a dependency of a user's `.gnr8/` crate.
+gnr8-engine = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }       # derive Serialize on the CLI Report type for --json output
 serde_json = { workspace = true }
 toml = { workspace = true }
-anyhow = { workspace = true }   # anyhow ONLY here, never in gnr8-core (D-09)
+anyhow = { workspace = true }   # anyhow ONLY here, never in the SDK or the engine (D-09)
 notify-debouncer-full = { workspace = true } # debounced FS watcher for `gnr8 watch` (binary boundary, D-09)
 ctrlc = { workspace = true } # graceful Ctrl-C → AtomicBool stop flag for the watch loop (binary boundary)
 

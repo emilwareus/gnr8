@@ -31,7 +31,7 @@ inputs:
     required: false
     default: "gnr8"
   setup-rust:
-    description: Install a Rust toolchain for .gnr8 child crates and source installs.
+    description: Install a Rust toolchain for .gnr8 worker crates and source installs.
     required: false
     default: "true"
   rust-toolchain:

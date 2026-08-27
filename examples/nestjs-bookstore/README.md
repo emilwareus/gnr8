@@ -64,7 +64,7 @@ prefixes come from static source:
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))             // analyze the src/ tree
             .transform(SetTitle::new("Bookstore API"))         // OpenAPI info.title

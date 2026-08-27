@@ -1,7 +1,8 @@
 //! gnr8 generation lifecycle for the Flask bookstore example. This file IS the config — edit it to
 //! adapt how the API is parsed and how the OpenAPI document + Python SDK are generated. It is an
-//! ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 runner; the runner parses
-//! argv (`__emit` / `__inspect`) and prints a JSON bundle to stdout.
+//! ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 worker runtime. The
+//! built-in stages below are declarations the installed `gnr8` host executes; only your own stages
+//! run here.
 //!
 //! Run it from the example root so `Flask::new().inputs(["."])` analyzes the `app/` package here.
 //! `.gnr8/` is excluded from language detection so the tree reads as Python:
@@ -30,7 +31,7 @@
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(Flask::new().inputs(["."]))
             .transform(ApiOverrides::new().response(

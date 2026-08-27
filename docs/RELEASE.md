@@ -46,7 +46,7 @@ five-minute job deadline; Intel Mac users can install from crates.io with `cargo
 Each archive contains:
 
 - `bin/gnr8`
-- `share/gnr8/crates/gnr8-core`
+- `share/gnr8/crates/gnr8-sdk`
 - `share/gnr8/crates/gnr8` (keeps the staged Cargo workspace structurally complete)
 - `share/gnr8/goextract`
 - `share/gnr8/pyextract`

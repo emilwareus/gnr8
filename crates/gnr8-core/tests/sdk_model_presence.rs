@@ -24,9 +24,9 @@
 // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use gnr8::graph::ApiGraph;
-use gnr8::sdk::layout::SdkFileLayout;
-use gnr8::sdk::model_style::PyModelStyle;
+use gnr8_engine::graph::ApiGraph;
+use gnr8_engine::sdk::layout::SdkFileLayout;
+use gnr8_engine::sdk::model_style::PyModelStyle;
 
 /// Every axis combination a Go struct tag can produce, in one object body: the four presence pairs, and
 /// each of them again with the value axis set. `validated` is the pair the source can state and the two
@@ -167,7 +167,7 @@ fn assert_declares(lines: &[String], expected: &str, model: &str) {
 
 #[test]
 fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
-    let out = gnr8::gosdk::generate(&graph(), "presence", "/api")
+    let out = gnr8_engine::gosdk::generate(&graph(), "presence", "/api")
         .expect("Go SDK generation must succeed (requires gofmt)");
     for (model, table) in [
         ("CreateInput", INPUT),
@@ -200,7 +200,7 @@ fn go_models_omitempty_follows_the_direction_the_schema_is_reached_from() {
 
 #[test]
 fn typescript_interfaces_mark_optional_from_the_direction_the_schema_is_reached_from() {
-    let out = gnr8::tssdk::generate(&graph(), "presence", "/api")
+    let out = gnr8_engine::tssdk::generate(&graph(), "presence", "/api")
         .expect("TypeScript SDK generation must succeed");
     for (model, table) in [
         ("CreateInput", INPUT),
@@ -224,7 +224,7 @@ fn typescript_interfaces_mark_optional_from_the_direction_the_schema_is_reached_
 
 #[test]
 fn pydantic_models_default_from_the_direction_the_schema_is_reached_from() {
-    let out = gnr8::pysdk::generate(&graph(), "presence", "/api")
+    let out = gnr8_engine::pysdk::generate(&graph(), "presence", "/api")
         .expect("Python SDK generation must succeed");
     for (model, table) in [
         ("CreateInput", INPUT),
@@ -258,7 +258,7 @@ fn pydantic_models_default_from_the_direction_the_schema_is_reached_from() {
 
 #[test]
 fn dataclass_models_and_their_decoders_agree_on_the_direction() {
-    let out = gnr8::pysdk::generate_with_options(
+    let out = gnr8_engine::pysdk::generate_with_options(
         &graph(),
         "presence",
         "/api",
@@ -325,7 +325,7 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
     let outputs = [
         (
             "Go",
-            gnr8::gosdk::generate_with_layout(&graph(), "presence", "/api", &split)
+            gnr8_engine::gosdk::generate_with_layout(&graph(), "presence", "/api", &split)
                 .expect("Go split SDK generation must succeed (requires gofmt)"),
             "type {model} struct {",
             "Validated string `json:\"validated\"`",
@@ -333,7 +333,7 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
         ),
         (
             "TypeScript",
-            gnr8::tssdk::generate_with_layout(&graph(), "presence", "/api", &split)
+            gnr8_engine::tssdk::generate_with_layout(&graph(), "presence", "/api", &split)
                 .expect("TypeScript split SDK generation must succeed"),
             "export interface {model} {",
             "validated: string;",
@@ -341,7 +341,7 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
         ),
         (
             "Python",
-            gnr8::pysdk::generate_with_options(
+            gnr8_engine::pysdk::generate_with_options(
                 &graph(),
                 "presence",
                 "/api",
@@ -416,7 +416,7 @@ fn multipart_both_ways_graph() -> ApiGraph {
 /// has to survive a decode as well, so it keeps the answer that cannot break one.
 #[test]
 fn a_multipart_argument_is_a_request_even_when_its_schema_is_also_a_response() {
-    let out = gnr8::tssdk::generate(&multipart_both_ways_graph(), "multipart", "/api")
+    let out = gnr8_engine::tssdk::generate(&multipart_both_ways_graph(), "multipart", "/api")
         .expect("TypeScript multipart SDK generation must succeed");
 
     // The inline argument: `validated` is demanded, `plain` and `loose` are not.

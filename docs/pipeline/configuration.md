@@ -4,7 +4,9 @@
 [Agent docs index](../agents/index.md)
 
 The only gnr8 configuration is a project-local Rust binary at `.gnr8/src/main.rs`. It depends on the
-`gnr8` crate, composes a `Pipeline`, and hands it to `gnr8::runner::run`.
+`gnr8` crate, composes a `Pipeline`, and hands it to `gnr8::worker::run`. Built-in stages are
+declarations the installed CLI executes; your own stages are wrapped in `Custom(...)` and run in the
+worker process.
 
 ## Minimal complete pipeline
 
@@ -12,7 +14,7 @@ The only gnr8 configuration is a project-local Rust binary at `.gnr8/src/main.rs
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
             .transform(SetBasePath::new("/api"))
@@ -107,7 +109,7 @@ impl Target for SummaryTarget {
         graph: &ApiGraph,
         out: &mut Artifacts,
         _cx: &Cx,
-    ) -> Result<(), CoreError> {
+    ) -> Result<(), Error> {
         out.create(
             "generated/summary.txt",
             format!("operations={}\n", graph.operations.len()),
@@ -124,27 +126,23 @@ Use `create` for a new path, `overlay` for intentional full replacement, and `re
 intentional in-place transformation. Collisions and missing ownership targets are errors. See
 [Artifacts and CI](../operations/artifacts-and-ci.md).
 
-## Custom-stage cache and ownership hooks
+## Custom-stage declaration hooks
 
-Default trait hooks are conservative or empty. Override them when a custom stage touches project
-files:
+A custom stage runs in your worker. These hooks are how it tells the host — which owns cleanup,
+readiness, and audit — what it is going to do:
 
 | Trait hook | Override when | Effect |
 |---|---|---|
-| `Source::cache_input_roots` | the source has enumerable input roots | brackets the source snapshot during each child run |
-| `Target::cache_input_files` | the target reads templates/static project files | declares rendering inputs; cross-run artifact reuse is currently disabled |
 | `Target::output_anchors` | the target emits project paths | enables stale cleanup and prevents generated-source re-ingestion |
 | `Target::readiness_targets` | the target emits a package/artifact supported by a built-in validator | lets `doctor` validate the declared target without guessing from ownership paths |
-| `PostProcess::cache_key_fragment` | output depends on executable/config state | reserved for a future complete rendering fingerprint; reuse is currently disabled |
 | `Target::producer`, `PostProcess::producer` | a stable custom label is preferable | records ownership/audit identity; defaults to the Rust type name |
 
-For direct library tooling, `Pipeline::build_ir(&cx)` runs source plus transforms, while
-`Pipeline::run(&cx)` also runs targets and post-processors. Normal `.gnr8` binaries must use
-`gnr8::runner::run`, which implements the versioned host/child boundary.
+Both are read at plan time — before any generation — so the host knows the write surface before it
+asks the worker to produce anything.
 
-`build_ir` returns the unsplit extraction facts. At generation time, `Pipeline` gives every target the
-canonical direction-projected graph, including custom targets. Direct artifact tooling that starts
-from `build_ir` can obtain the identical view with `ApiGraph::project_for_generation()`.
+`.gnr8` binaries call `gnr8::worker::run`, which serves the versioned host/worker frame protocol.
+`gnr8 inspect` returns the graph after source plus transforms; generation additionally projects it
+into the canonical direction-specific view before any target — built-in or custom — sees it.
 
 `Artifacts::files` borrows sorted files, `into_files` consumes the set, and `from_files` restores a
 sorted set. Use `create`, `overlay`, or `rewrite` so ownership intent is explicit.
@@ -152,16 +150,17 @@ sorted set. Use `create`, `overlay`, or `rewrite` so ownership intent is explici
 ## Dependency and lockfile policy
 
 - Commit `.gnr8/Cargo.toml` and `.gnr8/Cargo.lock`.
-- Keep the direct `gnr8` dependency and installed CLI on the same release.
-- The host and child exchange protocol, CLI/core version, and capability fingerprints before output
-  is trusted.
+- Keep the direct `gnr8` dependency and installed CLI on the same release. A manifest pinning a
+  pre-0.9 `gnr8` is refused before anything is compiled; `gnr8 init --upgrade` repoints it.
+- The host and worker exchange protocol version, exact gnr8 version, and a capability digest before
+  output is trusted.
 - When upgrading, update the dependency, regenerate the lockfile, install the same CLI version, run
   `gnr8 generate`, then `gnr8 check`.
 
 ## Determinism and caches
 
 The graph, artifact paths, and built-in output are sorted and deterministic. gnr8 caches source
-analysis, file hashes, and generated artifact bundles under `.gnr8/cache`; Rust build output is under
+analysis, file hashes, and the worker build stamp under `.gnr8/cache`; Rust build output is under
 `.gnr8/target`. Cache hits change work performed, not output semantics.
 
 ## Next pages

@@ -88,15 +88,19 @@ def main() -> None:
         print("error: failed to replace [workspace.package] block", file=sys.stderr)
         sys.exit(1)
 
+    # Both workspace crates carry the release version: the published thin SDK (`gnr8`, the crate a
+    # project's `.gnr8/` depends on) and the host-only engine the CLI links.
     text, count = re.subn(
-        r'^(gnr8 = \{ path = "crates/gnr8-core", version = ")[^"]+("\s*\})',
+        r'^(gnr8(?:-engine)? = \{ path = "crates/gnr8-(?:sdk|core)", version = ")[^"]+("\s*\})',
         rf"\g<1>{new_ver}\2",
         text,
-        count=1,
         flags=re.MULTILINE,
     )
-    if count != 1:
-        print("error: expected exactly one gnr8 workspace dependency version", file=sys.stderr)
+    if count != 2:
+        print(
+            "error: expected the gnr8 and gnr8-engine workspace dependency versions",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     cargo_path.write_text(text, encoding="utf-8")

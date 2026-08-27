@@ -1,7 +1,8 @@
 //! SDK model emitter styles.
 
 /// Python SDK model implementation style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PyModelStyle {
     /// Pydantic v2 `BaseModel` models. This is the preferred/default Python SDK surface.
     #[default]

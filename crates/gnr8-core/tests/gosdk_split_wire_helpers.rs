@@ -13,7 +13,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gnr8::sdk::prelude::*;
+use gnr8_engine::sdk::prelude::*;
+use gnr8_engine::sdk::TargetExec as _;
 
 fn temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -37,7 +38,7 @@ fn write_artifacts(out: &Artifacts, root: &Path) {
     }
 }
 
-fn multi_tag_graph() -> gnr8::graph::ApiGraph {
+fn multi_tag_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "wire.test",
@@ -319,7 +320,7 @@ fn split_per_tag_go_sdk_emits_wire_helpers_once_and_compiles() {
 ///
 /// The second tag has a wire-helper-requiring query param but no body, so the shared helper file is
 /// always emitted — the combination that previously mis-declared imports.
-fn body_encoding_graph(content_type: &str, required: bool) -> gnr8::graph::ApiGraph {
+fn body_encoding_graph(content_type: &str, required: bool) -> gnr8_engine::graph::ApiGraph {
     let schema = if content_type == "application/octet-stream" {
         r#"{"type":"primitive","of":{"prim":"bytes"}}"#
     } else if content_type == "text/plain" {

@@ -56,7 +56,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// Run `go <args>` in `dir`, mapping a non-zero exit to `CoreError::GoBuild` (never a panic — the
 /// harness uses NO `unwrap`/`expect` on the subprocess `Result`, threat T-03-03-04). A spawn failure
 /// (missing toolchain) maps to `CoreError::GoToolchainMissing`.
-fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
+fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8_engine::CoreError> {
     let output = Command::new("go")
         // Discrete args + `current_dir` — never a shell string (threat T-03-03-01).
         .args(args)
@@ -66,9 +66,9 @@ fn run_go(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
         .env("GOPROXY", "off")
         .env("GOFLAGS", "-mod=mod")
         .output()
-        .map_err(|source| gnr8::CoreError::GoToolchainMissing { source })?;
+        .map_err(|source| gnr8_engine::CoreError::GoToolchainMissing { source })?;
     if !output.status.success() {
-        return Err(gnr8::CoreError::GoBuild {
+        return Err(gnr8_engine::CoreError::GoBuild {
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
@@ -97,13 +97,13 @@ fn write_go_mod(dir: &Path) {
 /// Materialize the generated SDK + a hermetic go.mod into a fresh temp dir, returning the dir.
 fn materialize_sdk_from_graph(
     label: &str,
-    graph: &gnr8::graph::ApiGraph,
+    graph: &gnr8_engine::graph::ApiGraph,
     base_path: &str,
 ) -> PathBuf {
-    let bundle = gnr8::gosdk::generate(graph, "goalservice", base_path)
+    let bundle = gnr8_engine::gosdk::generate(graph, "goalservice", base_path)
         .expect("sdk::generate must succeed (requires gofmt)");
     let dir = unique_temp_dir(label);
-    gnr8::sdk::bundle::write_to_dir(&bundle, &dir)
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &dir)
         .expect("write_to_dir must materialize the SDK files");
     write_go_mod(&dir);
     dir
@@ -111,12 +111,12 @@ fn materialize_sdk_from_graph(
 
 /// Materialize the generated SDK + a hermetic go.mod into a fresh temp dir, returning the dir.
 fn materialize_sdk() -> PathBuf {
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires the Go toolchain)");
     materialize_sdk_from_graph("ok", &graph, "/goal")
 }
 
-fn optional_body_graph() -> gnr8::graph::ApiGraph {
+fn optional_body_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
@@ -159,7 +159,7 @@ fn optional_body_graph() -> gnr8::graph::ApiGraph {
     .expect("optional body graph json")
 }
 
-fn precision_and_nullable_graph() -> gnr8::graph::ApiGraph {
+fn precision_and_nullable_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
@@ -197,7 +197,7 @@ fn precision_and_nullable_graph() -> gnr8::graph::ApiGraph {
     .expect("precision and nullable graph json")
 }
 
-fn query_api_key_graph() -> gnr8::graph::ApiGraph {
+fn query_api_key_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
@@ -231,7 +231,7 @@ fn query_api_key_graph() -> gnr8::graph::ApiGraph {
     .expect("query api-key graph json")
 }
 
-fn http_auth_graph() -> gnr8::graph::ApiGraph {
+fn http_auth_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
@@ -292,7 +292,7 @@ fn http_auth_graph() -> gnr8::graph::ApiGraph {
     clippy::too_many_lines,
     reason = "the media graph is an explicit JSON fixture covering four content types"
 )]
-fn media_graph() -> gnr8::graph::ApiGraph {
+fn media_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "github.com/acme/media",
@@ -429,8 +429,8 @@ fn media_graph() -> gnr8::graph::ApiGraph {
     .expect("media graph json")
 }
 
-fn runtime_graph() -> gnr8::graph::ApiGraph {
-    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+fn runtime_graph() -> gnr8_engine::graph::ApiGraph {
+    let mut graph: gnr8_engine::graph::ApiGraph = serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
           "operations": [
@@ -476,14 +476,14 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
         }"#,
     )
     .expect("runtime graph json");
-    graph.runtime = gnr8::graph::RuntimePolicy {
+    graph.runtime = gnr8_engine::graph::RuntimePolicy {
         default_timeout_ms: Some(5_000),
         max_retries: 0,
         retry_statuses: Vec::new(),
         retry_unsafe_methods: false,
         hooks: Vec::new(),
     };
-    graph.operation_runtime = vec![gnr8::graph::OperationRuntimePolicy {
+    graph.operation_runtime = vec![gnr8_engine::graph::OperationRuntimePolicy {
         operation_id: "createIdempotent".to_string(),
         idempotent: true,
         idempotency_key_header: Some("Idempotency-Key".to_string()),
@@ -491,8 +491,8 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
     graph
 }
 
-fn pagination_graph() -> gnr8::graph::ApiGraph {
-    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+fn pagination_graph() -> gnr8_engine::graph::ApiGraph {
+    let mut graph: gnr8_engine::graph::ApiGraph = serde_json::from_str(
         r#"{
           "module": "github.com/acme/svc",
           "operations": [
@@ -562,9 +562,9 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
         }"#,
     )
     .expect("pagination graph json");
-    graph.pagination = vec![gnr8::graph::PaginationPolicy {
+    graph.pagination = vec![gnr8_engine::graph::PaginationPolicy {
         operation_id: "listItems".to_string(),
-        mode: gnr8::graph::PaginationMode::Cursor,
+        mode: gnr8_engine::graph::PaginationMode::Cursor,
         items_field: "items".to_string(),
         cursor_param: Some("cursor".to_string()),
         next_cursor_field: Some("nextCursor".to_string()),
@@ -572,7 +572,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
         page_size_param: None,
         offset_param: None,
         limit_param: None,
-        termination: gnr8::graph::PaginationTermination::NoNextCursor,
+        termination: gnr8_engine::graph::PaginationTermination::NoNextCursor,
     }];
     graph
 }
@@ -586,9 +586,9 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
 /// unreachable from Go source — `encoding/json` cannot both drop a nil slice and write its null — but
 /// an imported `OpenAPI` document, a Python/TypeScript source, and a `force_nullable` override all
 /// state it, so the helper has to read the field through its declared pointer depth.
-fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
+fn nullable_items_pagination_graph() -> gnr8_engine::graph::ApiGraph {
     let mut graph = pagination_graph();
-    graph.pagination[0].termination = gnr8::graph::PaginationTermination::EmptyItems;
+    graph.pagination[0].termination = gnr8_engine::graph::PaginationTermination::EmptyItems;
 
     // A second helper over the same page, in offset mode: its advance step is the third read site.
     let mut by_offset = graph.operations[0].clone();
@@ -596,14 +596,15 @@ fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
     by_offset.handler = "listItemsByOffset".to_string();
     by_offset.path = "/items/offset".to_string();
     by_offset.params[0].name = "offset".to_string();
-    by_offset.params[0].schema = gnr8::graph::Type::Primitive(gnr8::graph::Prim::Int {
-        bits: 64,
-        signed: true,
-    });
+    by_offset.params[0].schema =
+        gnr8_engine::graph::Type::Primitive(gnr8_engine::graph::Prim::Int {
+            bits: 64,
+            signed: true,
+        });
     graph.operations.push(by_offset);
-    graph.pagination.push(gnr8::graph::PaginationPolicy {
+    graph.pagination.push(gnr8_engine::graph::PaginationPolicy {
         operation_id: "listItemsByOffset".to_string(),
-        mode: gnr8::graph::PaginationMode::Offset,
+        mode: gnr8_engine::graph::PaginationMode::Offset,
         items_field: "items".to_string(),
         cursor_param: None,
         next_cursor_field: None,
@@ -611,7 +612,7 @@ fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
         page_size_param: None,
         offset_param: Some("offset".to_string()),
         limit_param: None,
-        termination: gnr8::graph::PaginationTermination::EmptyItems,
+        termination: gnr8_engine::graph::PaginationTermination::EmptyItems,
     });
 
     let page = graph
@@ -619,7 +620,7 @@ fn nullable_items_pagination_graph() -> gnr8::graph::ApiGraph {
         .iter_mut()
         .find(|schema| schema.id == "dto.ItemPage")
         .expect("the page schema");
-    let gnr8::graph::Type::Object(fields) = &mut page.body else {
+    let gnr8_engine::graph::Type::Object(fields) = &mut page.body else {
         panic!("the page schema is an object")
     };
     let items = fields
@@ -1477,7 +1478,7 @@ fn invalid_go_build_maps_to_go_build_error_not_panic() {
 
     let result = run_go(&["build", "./..."], &dir);
     match result {
-        Err(gnr8::CoreError::GoBuild { code, stderr }) => {
+        Err(gnr8_engine::CoreError::GoBuild { code, stderr }) => {
             assert!(
                 code != Some(0),
                 "a failed build must not report exit code 0"

@@ -19,9 +19,12 @@
 //!
 //! ## The `gnr8` dependency: one compile-time choice
 //!
+//! The scaffolded crate depends on exactly one package: the thin `gnr8` SDK. It never depends on the
+//! host engine, so upgrading gnr8 does not recompile a code generator inside the project.
+//!
 //! A packaged build emits `gnr8 = "=<version>"` — the exact published crate — so the scaffolded
 //! `Cargo.toml` is portable and can be committed. A build from this repository emits a path
-//! dependency on the local `crates/gnr8-core` instead, so developing gnr8 itself stays offline.
+//! dependency on the local `crates/gnr8-sdk` instead, so developing gnr8 itself stays offline.
 //! `scripts/package-release.sh` fixes the choice at compile time via `GNR8_PACKAGED_RELEASE`; it is
 //! never inferred from the runtime filesystem. See [`core_dependency_line`].
 //!
@@ -188,29 +191,32 @@ pub fn init_with_presets(
 ///
 /// This file IS the config: it composes a [`crate::sdk::Pipeline`] equivalent to the old default TOML
 /// (one Go+Gin source, a root base path, an `API` title, an OpenAPI 3.1 target, a Go SDK target, and
-/// the generated-header post-process) and hands it to [`crate::runner::run`]. The user edits it to
+/// the generated-header post-process) and hands it to `gnr8::worker::run`. The user edits it to
 /// adapt parsing + generation; `gnr8 generate` compiles and runs it.
 fn main_rs_body(source: SourcePreset, sdk: SdkPreset) -> String {
     format!(
         r#"//! This file IS your gnr8 configuration — edit it to adapt parsing + generation.
-//! `gnr8 generate` compiles and runs it.
+//! `gnr8 generate` compiles it once, then runs it.
 //!
-//! It is an ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 runner. The
-//! runner parses argv (`__emit` / `__inspect`) and prints a JSON bundle on stdout; the `gnr8` host
-//! runs this crate for you, then owns writing the files (ownership manifest, no-op skip, edit
-//! protection). Adapting = ordinary Rust: change an argument, add a `.transform(...)`, write your own
-//! `Source`/`Target`/`Transform`, or wrap a built-in.
+//! It is an ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 worker runtime.
+//! The built-in stages below are DECLARATIONS: the installed `gnr8` host executes them, so none of
+//! the extraction or SDK-emission machinery is compiled into this crate. Your own stages — wrapped
+//! in `Custom(...)` — run right here, against the graph the host sends over.
+//!
+//! Adapting = ordinary Rust: change an argument, add a `.transform(...)`, or write your own
+//! `Source`/`Transform`/`Target`/`PostProcess` and compose it with `Custom(...)`.
 
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {{
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source({source_stage})
             .transform(SetBasePath::new("/"))
             .transform(SetTitle::new("API"))
             // .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
             // .transform(RenameOperation::new("listGoals", "List"))
+            // .transform(Custom(MyOwnTransform))   // <- your Rust runs in this process
             .target(OpenApi31::new().to("openapi.yaml"))
             .target({sdk_stage})
             .post(Header::generated()),
@@ -245,6 +251,9 @@ fn readme_body(source: SourcePreset, sdk: SdkPreset) -> String {
          The `Pipeline` is the configuration. Change the `Source` to select the service frontend, \
          transforms to set metadata such as title/base path/security, and targets to choose generated \
          artifacts.\n\n\
+         Built-in stages are declarations the installed `gnr8` host runs. Your own \
+         `Source`/`Transform`/`Target`/`PostProcess` implementations run in this crate and are \
+         composed with `Custom(...)`.\n\n\
          Common edits:\n\n\
          ```rust\n\
          .transform(SetBasePath::new(\"/api\"))\n\
@@ -285,8 +294,8 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
 /// The `gnr8` dependency line for a scaffolded `.gnr8/Cargo.toml`.
 ///
 /// A packaged build pins the published crate version, so the generated `Cargo.toml` is portable:
-/// committing it does not tie teammates to one machine's install prefix. Sidecar resources still
-/// come from the CLI install (see [`crate::resource`]); crates.io supplies the Rust API only.
+/// committing it does not tie teammates to one machine's install prefix. crates.io supplies the thin
+/// SDK only — extraction sidecars and every generator live in the installed CLI.
 ///
 /// A build from this repository instead points at the local workspace, so developing gnr8 itself
 /// stays offline and tracks uncommitted changes to `gnr8-core`.
@@ -299,8 +308,16 @@ fn cargo_toml_body(crate_name: &str, dependency: &str) -> String {
 fn core_dependency_line() -> String {
     match option_env!("GNR8_PACKAGED_RELEASE") {
         Some(_) => version_dependency_line(env!("CARGO_PKG_VERSION")),
-        None => path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR"))),
+        None => path_dependency_line(&sdk_crate_dir()),
     }
+}
+
+/// The in-repo path of the thin SDK crate, derived from this crate's compile-time manifest dir.
+fn sdk_crate_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        |crates| crates.join("gnr8-sdk"),
+    )
 }
 
 fn version_dependency_line(version: &str) -> String {
@@ -389,6 +406,107 @@ fn relative(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// What [`upgrade`] changed in an existing `.gnr8/` workspace.
+#[derive(Debug, Default)]
+pub struct UpgradeOutcome {
+    /// Relative paths this call rewrote or deleted.
+    pub changed: Vec<String>,
+    /// Whether the manifest already named this gnr8's SDK dependency.
+    pub already_current: bool,
+}
+
+/// Repoint an existing `.gnr8/Cargo.toml` at this gnr8's SDK, in place.
+///
+/// This is the mechanical half of moving a project onto the worker contract, and only that half:
+///
+/// - the `gnr8` dependency line becomes the one [`init`] would scaffold today;
+/// - a dependency on a host-only engine crate is removed;
+/// - `Cargo.lock` is deleted, because it pins the previous dependency tree;
+/// - the worker build stamp is deleted, because it describes a binary built from the old manifest.
+///
+/// It never edits `src/main.rs`. Rewriting a user's Rust is not a mechanical operation, and guessing
+/// at it would be worse than telling them exactly what to change — which the CLI prints.
+///
+/// Every other line of the manifest is preserved, including any dependency a custom stage added.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Workspace`] when the manifest is missing or cannot be read/written.
+pub fn upgrade(root: &Path) -> Result<UpgradeOutcome, CoreError> {
+    let gnr8 = root.join(".gnr8");
+    let manifest = gnr8.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).map_err(|e| CoreError::Workspace {
+        message: format!(
+            "failed to read {} — run `gnr8 init` first: {e}",
+            manifest.display()
+        ),
+    })?;
+
+    let wanted = core_dependency_line();
+    let (rewritten, replaced) = rewrite_dependency_lines(&text, &wanted);
+    let mut outcome = UpgradeOutcome::default();
+    if replaced {
+        std::fs::write(&manifest, &rewritten).map_err(|e| CoreError::Workspace {
+            message: format!("failed to write {}: {e}", manifest.display()),
+        })?;
+        outcome.changed.push(relative(root, &manifest));
+    } else {
+        outcome.already_current = true;
+    }
+
+    for stale in [
+        gnr8.join("Cargo.lock"),
+        gnr8.join("cache").join("worker.json"),
+    ] {
+        if stale.is_file() && std::fs::remove_file(&stale).is_ok() {
+            outcome.changed.push(relative(root, &stale));
+        }
+    }
+    Ok(outcome)
+}
+
+/// Replace the `gnr8` dependency line and drop host-only engine dependencies.
+///
+/// Line-based on purpose: a manifest may carry the user's own dependencies and comments, and a
+/// parse-and-reserialize round trip would silently reformat all of it.
+fn rewrite_dependency_lines(text: &str, wanted: &str) -> (String, bool) {
+    let mut out = Vec::new();
+    let mut changed = false;
+    let mut saw_gnr8 = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if is_dependency_line(trimmed, "gnr8") {
+            saw_gnr8 = true;
+            if trimmed != wanted {
+                changed = true;
+            }
+            out.push(wanted.to_string());
+            continue;
+        }
+        if is_dependency_line(trimmed, "gnr8-engine") || is_dependency_line(trimmed, "gnr8-core") {
+            changed = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if !saw_gnr8 {
+        if let Some(index) = out.iter().position(|line| line.trim() == "[dependencies]") {
+            out.insert(index + 1, wanted.to_string());
+            changed = true;
+        }
+    }
+    let mut rendered = out.join("\n");
+    if text.ends_with('\n') {
+        rendered.push('\n');
+    }
+    (rendered, changed)
+}
+
+fn is_dependency_line(line: &str, name: &str) -> bool {
+    line.strip_prefix(name)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
 /// The path to a project's mandatory generation-crate manifest (`<root>/.gnr8/Cargo.toml`).
 ///
 /// The host requires this to exist before running the child; a missing one is the "run `gnr8 init`"
@@ -432,11 +550,11 @@ mod tests {
     }
 
     #[test]
-    fn in_repo_init_points_at_the_local_gnr8_core_crate() {
-        let line = path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR")));
+    fn in_repo_init_points_at_the_local_thin_sdk_crate() {
+        let line = path_dependency_line(&super::sdk_crate_dir());
         assert!(
-            line.starts_with("gnr8 = { path = \"") && line.ends_with("gnr8-core\" }"),
-            "expected a path dependency on the local crate, got: {line}"
+            line.starts_with("gnr8 = { path = \"") && line.ends_with("gnr8-sdk\" }"),
+            "expected a path dependency on the local SDK crate, got: {line}"
         );
     }
 
@@ -447,7 +565,7 @@ mod tests {
     fn dependency_choice_is_fixed_at_compile_time_not_probed() {
         assert_eq!(
             core_dependency_line(),
-            path_dependency_line(Path::new(env!("CARGO_MANIFEST_DIR"))),
+            path_dependency_line(&super::sdk_crate_dir()),
             "a non-packaged build must always emit the local path dependency"
         );
     }

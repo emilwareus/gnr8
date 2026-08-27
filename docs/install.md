@@ -7,7 +7,7 @@ gnr8-<os>-<arch>/
   bin/gnr8
   share/gnr8/
     Cargo.toml
-    crates/gnr8-core/
+    crates/gnr8-sdk/
     goextract/
     pyextract/
     tsextract/

@@ -21,7 +21,7 @@ from pyextract import facts
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FIXTURE = os.path.join(REPO_ROOT, "fixtures", "fastapi-bookstore")
 
-# Contract key sets (mirror crates/gnr8-core/src/analyze/facts.rs).
+# Contract key sets (mirror crates/gnr8-sdk/src/facts.rs).
 DOC_KEYS = {"module", "routes", "schemas", "diagnostics"}
 SCHEMA_KEYS = {"id", "name", "body", "span"}
 FIELD_KEYS = {

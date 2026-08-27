@@ -1,5 +1,11 @@
 # Research / design: code-as-config — make gnr8 configurable ONLY through Rust
 
+> **Historical.** This document records the design that introduced code-as-config, including the
+> original `cargo run -- __emit` child boundary. gnr8 0.9.0 replaced that boundary with a thin SDK
+> plus a framed host/worker protocol; the decision that configuration is Rust code is unchanged. For
+> the current contract see [`USAGE.md`](USAGE.md) and
+> [`operations/artifacts-and-ci.md`](operations/artifacts-and-ci.md).
+
 Status: design research. Target: the next milestone. **No backwards compatibility** — the TOML config
 (`.gnr8/config.toml`, `crates/gnr8-core/src/config/`) is deleted, not migrated.
 

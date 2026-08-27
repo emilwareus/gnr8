@@ -4427,16 +4427,14 @@ components:
         )
         .unwrap();
 
-        let outcome = Pipeline::new()
+        let pipeline = Pipeline::new()
             .source(OpenApi::new().input("openapi.yaml"))
             .target(OpenApi31Json::new().to("generated/openapi.json"))
-            .target(TsSdk::new().module("@acme/books").to("generated/ts"))
-            .run(&Cx::new(&root))
-            .unwrap();
+            .target(TsSdk::new().module("@acme/books").to("generated/ts"));
+        let outcome = crate::pipeline::run_in_process(&pipeline, &Cx::new(&root)).unwrap();
 
         let paths = outcome
             .artifacts
-            .files()
             .iter()
             .map(|artifact| artifact.path.as_str())
             .collect::<Vec<_>>();

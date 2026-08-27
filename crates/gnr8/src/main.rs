@@ -1,13 +1,13 @@
 //! gnr8 binary entry point — the orchestrator + trusted writer (D-09).
 //!
 //! gnr8 is configured ONLY by code: `gnr8 init` scaffolds a `.gnr8/` Rust crate (the pipeline), and
-//! every generating command runs that crate as a child process (`cargo run --manifest-path`), receives
-//! its [`gnr8::runner::ArtifactBundle`], and owns writing the files (the ownership manifest, no-op
-//! skip, edit protection). There is no TOML config anywhere. Each command surfaces real errors (a
-//! missing `.gnr8/`, a compile error in the user's pipeline, a missing Go toolchain) through this
-//! `anyhow` boundary as a clean stderr message + a deliberate non-zero exit, never a panic (RUST-04).
+//! every generating command builds that crate once, runs the resulting worker, and drives a framed
+//! protocol over its stdio. The host executes every built-in stage itself and asks the worker only
+//! for the stages the user wrote; then it owns the writes (the ownership manifest, no-op skip, edit
+//! protection). There is no TOML config anywhere. Each command surfaces real errors (a missing
+//! `.gnr8/`, a compile error in the user's pipeline, a missing Go toolchain) through this `anyhow`
+//! boundary as a clean stderr message + a deliberate non-zero exit, never a panic (RUST-04).
 
-mod child;
 mod cli;
 mod doctor;
 mod render;
@@ -16,30 +16,47 @@ mod watch;
 use anyhow::{bail, Result};
 use clap::Parser;
 use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
-use std::io::Write;
+use gnr8_engine::worker::WorkerPolicy;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-static VERIFIED_NOOP_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
+/// The gnr8 host: parse argv, resolve the trust policy, dispatch.
+///
+/// `init` and `guide` never touch `.gnr8/`. Every other command builds and runs the project's
+/// worker, which is trusted-code execution — `--no-build` and `--no-execute` are how a caller
+/// withholds that consent.
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let output = Output::new(cli.json, cli.verbose);
+    let policy = worker_policy(&cli);
 
-    // `inspect` renders straight to stdout. With no path it delegates to the user's `.gnr8/` child
-    // pipeline; an explicit path requests direct source analysis.
-    // The remaining commands either scaffold (`init`) or delegate to the user's `.gnr8/` child crate and
-    // own writing/policy.
     match &cli.command {
-        Commands::Inspect { action } => run_inspect(action, output),
-        Commands::Init { source, sdk } => run_init(*source, *sdk, output),
+        Commands::Inspect { action } => run_inspect(action, policy, output),
+        Commands::Init {
+            source,
+            sdk,
+            upgrade,
+        } => run_init(*source, *sdk, *upgrade, output),
         Commands::Guide { topic } => run_guide(*topic, output),
-        Commands::Generate { force } => run_generate(*force, output),
-        Commands::Check => run_check(output),
-        Commands::Watch { debounce_ms } => run_watch(*debounce_ms, output),
-        Commands::Doctor => run_doctor(output),
+        Commands::Generate { force } => run_generate(*force, policy, output),
+        Commands::Check => run_check(policy, output),
+        Commands::Watch { debounce_ms } => run_watch(*debounce_ms, policy, output),
+        Commands::Doctor => run_doctor(policy, output),
+    }
+}
+
+/// Resolve what this invocation may do with the project's `.gnr8/` crate.
+///
+/// `--no-execute` implies `--no-build`: refusing to run the worker while still compiling it would
+/// execute `build.rs` and every proc macro in its dependency tree, which is the same trust decision.
+fn worker_policy(cli: &Cli) -> WorkerPolicy {
+    if cli.no_execute {
+        WorkerPolicy::no_execute()
+    } else if cli.no_build {
+        WorkerPolicy::no_build()
+    } else {
+        WorkerPolicy::default()
     }
 }
 
@@ -88,20 +105,32 @@ impl Output {
 /// The current project root, resolved against the working directory. The child runs with this as its
 /// `current_dir`, and `regenerate`/`plan_only` resolve output paths against it. A `current_dir` failure
 /// surfaces as `CoreError::Workspace` (clean message, never a panic).
-fn project_root() -> Result<std::path::PathBuf, gnr8::CoreError> {
-    std::env::current_dir().map_err(|e| gnr8::CoreError::Workspace {
+fn project_root() -> Result<std::path::PathBuf, gnr8_engine::CoreError> {
+    std::env::current_dir().map_err(|e| gnr8_engine::CoreError::Workspace {
         message: format!("failed to resolve the current directory: {e}"),
     })
 }
 
-/// Scaffold the mandatory `.gnr8/` generation crate in the working directory (idempotent) and summarize
-/// the outcome. Re-running over an existing crate preserves the user's `src/main.rs` and reports
-/// "nothing to do" (D-01). `--json` emits the created/skipped lists.
-fn run_init(source: Option<SourcePreset>, sdk: Option<SdkPreset>, output: Output) -> Result<()> {
+/// Scaffold the mandatory `.gnr8/` generation crate in the working directory (idempotent) and
+/// summarize the outcome. Re-running over an existing crate preserves the user's `src/main.rs` and
+/// reports "nothing to do" (D-01). `--json` emits the created/skipped lists.
+///
+/// With `--upgrade` it instead repoints an existing manifest at this gnr8's SDK and prints the
+/// `src/main.rs` edits it deliberately does not make for you.
+fn run_init(
+    source: Option<SourcePreset>,
+    sdk: Option<SdkPreset>,
+    upgrade: bool,
+    output: Output,
+) -> Result<()> {
     let root = project_root()?;
+    if upgrade {
+        return run_init_upgrade(&root, output);
+    }
     let source = source.unwrap_or(SourcePreset::GoGin);
     let sdk = sdk.unwrap_or_else(|| default_sdk_for_source(source));
-    let outcome = gnr8::workspace::init_with_presets(&root, map_source(source), map_sdk(sdk))?;
+    let outcome =
+        gnr8_engine::workspace::init_with_presets(&root, map_source(source), map_sdk(sdk))?;
 
     if output.json {
         #[derive(serde::Serialize)]
@@ -122,27 +151,59 @@ fn run_init(source: Option<SourcePreset>, sdk: Option<SdkPreset>, output: Output
     }
 
     if outcome.created.is_empty() {
-        output.progress(format!(
-            "nothing to do — .gnr8/ already present (skipped: {})",
-            outcome.skipped.join(", ")
-        ));
+        output.progress("init: nothing to do (.gnr8 already initialized)");
     } else {
-        if outcome.skipped.is_empty() {
-            output.progress(format!(
-                "initialized .gnr8/ (created: {})",
-                outcome.created.join(", ")
-            ));
-        } else {
-            output.progress(format!(
-                "initialized .gnr8/ (created: {}; skipped: {})",
-                outcome.created.join(", "),
-                outcome.skipped.join(", ")
-            ));
+        output.progress(format!(
+            "init: created {} file(s) in .gnr8/",
+            outcome.created.len()
+        ));
+    }
+    output.verbose(format!("source: {}", source_name(source)));
+    output.verbose(format!("sdk: {}", sdk_name(sdk)));
+    output.verbose_paths_at(1, "created", &outcome.created);
+    output.verbose_paths_at(1, "skipped", &outcome.skipped);
+    Ok(())
+}
+
+/// The `src/main.rs` edits `--upgrade` deliberately leaves to the user.
+const UPGRADE_SOURCE_STEPS: [&str; 3] = [
+    "replace `gnr8::runner::run(` with `gnr8::worker::run(`",
+    "wrap each of your own stages in `Custom(...)`, e.g. `.transform(Custom(MyTransform))`",
+    "replace `gnr8::CoreError` with `gnr8::Error` in your stage signatures",
+];
+
+/// Repoint an existing `.gnr8/Cargo.toml` and report what is left to do by hand.
+fn run_init_upgrade(root: &Path, output: Output) -> Result<()> {
+    let outcome = gnr8_engine::workspace::upgrade(root)?;
+
+    if output.json {
+        #[derive(serde::Serialize)]
+        struct UpgradeReport {
+            changed: Vec<String>,
+            already_current: bool,
+            source_steps: Vec<&'static str>,
         }
-        output.progress(
-            "edit .gnr8/src/main.rs to adapt parsing + generation, then run `gnr8 generate`.",
-        );
-        output.progress("see .gnr8/README.md for project-local gnr8 guidance.");
+        let report = UpgradeReport {
+            changed: outcome.changed.clone(),
+            already_current: outcome.already_current,
+            source_steps: UPGRADE_SOURCE_STEPS.to_vec(),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if outcome.changed.is_empty() {
+        output.progress("init --upgrade: .gnr8/Cargo.toml already names this gnr8's SDK");
+    } else {
+        output.progress(format!(
+            "init --upgrade: updated {} file(s)",
+            outcome.changed.len()
+        ));
+        output.verbose_paths_at(1, "changed", &outcome.changed);
+    }
+    println!("Finish in .gnr8/src/main.rs (gnr8 does not edit your Rust):");
+    for step in UPGRADE_SOURCE_STEPS {
+        println!("  - {step}");
     }
     Ok(())
 }
@@ -155,20 +216,20 @@ fn default_sdk_for_source(source: SourcePreset) -> SdkPreset {
     }
 }
 
-fn map_source(source: SourcePreset) -> gnr8::workspace::SourcePreset {
+fn map_source(source: SourcePreset) -> gnr8_engine::workspace::SourcePreset {
     match source {
-        SourcePreset::GoGin => gnr8::workspace::SourcePreset::GoGin,
-        SourcePreset::Fastapi => gnr8::workspace::SourcePreset::FastApi,
-        SourcePreset::Flask => gnr8::workspace::SourcePreset::Flask,
-        SourcePreset::Nestjs => gnr8::workspace::SourcePreset::NestJs,
+        SourcePreset::GoGin => gnr8_engine::workspace::SourcePreset::GoGin,
+        SourcePreset::Fastapi => gnr8_engine::workspace::SourcePreset::FastApi,
+        SourcePreset::Flask => gnr8_engine::workspace::SourcePreset::Flask,
+        SourcePreset::Nestjs => gnr8_engine::workspace::SourcePreset::NestJs,
     }
 }
 
-fn map_sdk(sdk: SdkPreset) -> gnr8::workspace::SdkPreset {
+fn map_sdk(sdk: SdkPreset) -> gnr8_engine::workspace::SdkPreset {
     match sdk {
-        SdkPreset::Go => gnr8::workspace::SdkPreset::Go,
-        SdkPreset::Python => gnr8::workspace::SdkPreset::Python,
-        SdkPreset::Typescript => gnr8::workspace::SdkPreset::TypeScript,
+        SdkPreset::Go => gnr8_engine::workspace::SdkPreset::Go,
+        SdkPreset::Python => gnr8_engine::workspace::SdkPreset::Python,
+        SdkPreset::Typescript => gnr8_engine::workspace::SdkPreset::TypeScript,
     }
 }
 
@@ -300,8 +361,8 @@ struct LifecycleReport {
     timings_ms: LifecycleTimings,
     /// Diagnostic counts from the pipeline.
     diagnostics: DiagnosticCounts,
-    /// Cache/write mode used for the run.
-    cache_mode: String,
+    /// Whether this run built the project's worker or reused the one already on disk.
+    worker: String,
     /// Number of source/input files considered.
     source_files: usize,
     /// Number of generated artifact files considered.
@@ -318,9 +379,8 @@ struct LifecycleCounts {
 
 #[derive(Debug, serde::Serialize)]
 struct LifecycleTimings {
-    hot_noop: u128,
-    pipeline: Option<u128>,
-    write: Option<u128>,
+    pipeline: u128,
+    write: u128,
     total: u128,
 }
 
@@ -332,59 +392,31 @@ struct DiagnosticCounts {
     error: usize,
 }
 
-/// Run `gnr8 generate` (+ `--force`): run the user's `.gnr8/` pipeline (child process), then write only
-/// changed files and report counts. Every protected (user-edited) file is named in a stderr warning so
-/// the "no silent clobbering" protection is VISIBLE (T-04-02-04). Pipeline diagnostics the child carried
-/// are surfaced too. `--json` serializes the counts. A missing `.gnr8/` (run `gnr8 init`), a compile
-/// error in the user's pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
-fn run_generate(force: bool, output: Output) -> Result<()> {
+/// Run `gnr8 generate` (+ `--force`): run the project's pipeline, then write only changed files and
+/// report counts. Every protected (user-edited) file is named in a stderr warning so the "no silent
+/// clobbering" protection is VISIBLE (T-04-02-04). Pipeline diagnostics are surfaced too. `--json`
+/// serializes the counts. A missing `.gnr8/` (run `gnr8 init`), a compile error in the user's
+/// pipeline, or a missing Go toolchain surface via the anyhow boundary, never a panic.
+fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()> {
     let root = project_root()?;
-    gnr8::lifecycle::with_generation_state_lock(&root, || {
-        cleanup_verified_noop_temporary_files(&root)
-    })??;
     let total_start = Instant::now();
-    let hot_start = Instant::now();
-    let hot_noop = if force {
-        None
-    } else {
-        pre_child_generate_verified_noop(&root)?
-    };
-    let hot_elapsed = hot_start.elapsed();
-    let mut pipeline_elapsed = None;
-    let mut write_elapsed = None;
-    let (outcome, diagnostics, cache_label, source_files, artifact_files) =
-        if let Some(noop) = hot_noop {
-            (
-                noop.outcome,
-                noop.diagnostics,
-                "verified hot no-op",
-                noop.source_files,
-                noop.artifact_files,
-            )
-        } else {
-            output.progress("generate: running pipeline");
-            let pipeline_start = Instant::now();
-            let mut bundle = child::run_child(&root, "__emit")?;
-            pipeline_elapsed = Some(pipeline_start.elapsed());
-            let source_files = bundle.cache_input_stamps.len();
-            let mut artifact_files = bundle.artifacts.len();
-            output.progress("generate: writing outputs");
-            let write_start = Instant::now();
-            let outcome = regenerate_bundle(&root, &mut bundle, force)?;
-            write_elapsed = Some(write_start.elapsed());
-            if artifact_files == 0 {
-                artifact_files =
-                    outcome.written.len() + outcome.unchanged.len() + outcome.skipped.len();
-            }
-            (
-                outcome,
-                bundle.diagnostics.clone(),
-                "pipeline",
-                source_files,
-                artifact_files,
-            )
-        };
 
+    output.progress("generate: running pipeline");
+    let pipeline_start = Instant::now();
+    let run = gnr8_engine::worker::run_pipeline(&root, policy)?;
+    let pipeline_elapsed = pipeline_start.elapsed();
+
+    output.progress("generate: writing outputs");
+    let write_start = Instant::now();
+    let outcome = gnr8_engine::lifecycle::regenerate_with_anchors(
+        &root,
+        &run.outcome.artifacts,
+        &run.outcome.output_anchors,
+        force,
+    )?;
+    let write_elapsed = write_start.elapsed();
+
+    let diagnostics = run.outcome.diagnostics;
     print_diagnostics(output, &diagnostics);
     // Warn (stderr) for every protected file so the user SEES which outputs were not clobbered.
     for path in &outcome.skipped {
@@ -408,30 +440,24 @@ fn run_generate(force: bool, output: Output) -> Result<()> {
             deleted: outcome.deleted,
             counts,
             timings_ms: LifecycleTimings {
-                hot_noop: duration_ms(hot_elapsed),
-                pipeline: pipeline_elapsed.map(duration_ms),
-                write: write_elapsed.map(duration_ms),
+                pipeline: duration_ms(pipeline_elapsed),
+                write: duration_ms(write_elapsed),
                 total: duration_ms(total_start.elapsed()),
             },
             diagnostics: diagnostic_counts(&diagnostics),
-            cache_mode: cache_label.to_string(),
-            source_files,
-            artifact_files,
+            worker: worker_label(run.worker_built).to_string(),
+            source_files: run.outcome.source_files,
+            artifact_files: run.outcome.artifacts.len(),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let summary = lifecycle_summary(&outcome);
         output.progress(format!("generate: done ({summary})"));
-        output.verbose(format!("mode: {cache_label}"));
-        output.verbose(format!("parsed/input files: {source_files}"));
-        output.verbose(format!("artifacts: {artifact_files}"));
-        output.verbose(format!("hot no-op check: {}", fmt_duration(hot_elapsed)));
-        if let Some(elapsed) = pipeline_elapsed {
-            output.verbose(format!("pipeline: {}", fmt_duration(elapsed)));
-        }
-        if let Some(elapsed) = write_elapsed {
-            output.verbose(format!("write plan: {}", fmt_duration(elapsed)));
-        }
+        output.verbose(format!("worker: {}", worker_label(run.worker_built)));
+        output.verbose(format!("parsed/input files: {}", run.outcome.source_files));
+        output.verbose(format!("artifacts: {}", run.outcome.artifacts.len()));
+        output.verbose(format!("pipeline: {}", fmt_duration(pipeline_elapsed)));
+        output.verbose(format!("write plan: {}", fmt_duration(write_elapsed)));
         output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
         output.verbose_paths("written", &outcome.written);
         output.verbose_paths("deleted", &outcome.deleted);
@@ -443,47 +469,35 @@ fn run_generate(force: bool, output: Output) -> Result<()> {
     Ok(())
 }
 
-/// Run `gnr8 check`: run the user's `.gnr8/` pipeline, then DRY-RUN the same `plan_writes` decision (no
+/// How the worker for this run was obtained — the only two possibilities, named for the report.
+const fn worker_label(built: bool) -> &'static str {
+    if built {
+        "built"
+    } else {
+        "reused"
+    }
+}
+
+/// Run `gnr8 check`: run the project's pipeline, then DRY-RUN the same `plan_writes` decision (no
 /// writes, no manifest save). Exits NON-ZERO (code 1) if any output is stale (`Write`) or drifted
 /// (`UserEdited`); exits 0 when every output is `Unchanged`. Reuses the exact pure decision function —
 /// zero new policy. `--json` emits the stale/drifted path lists. Pipeline errors flow through the anyhow
 /// boundary, never a panic.
 #[allow(clippy::too_many_lines)]
-fn run_check(output: Output) -> Result<()> {
+fn run_check(policy: WorkerPolicy, output: Output) -> Result<()> {
     let root = project_root()?;
     let total_start = Instant::now();
-    let hot_start = Instant::now();
-    let hot_noop = pre_child_verified_noop(&root);
-    let hot_elapsed = hot_start.elapsed();
-    let mut pipeline_elapsed = None;
-    let mut plan_elapsed = None;
-    let (plan, diagnostics, cache_label, source_files, artifact_files) =
-        if let Some(noop) = hot_noop {
-            let artifact_files = noop.artifact_files;
-            (
-                clean_plan_from_paths(noop.outcome.unchanged),
-                noop.diagnostics,
-                "verified hot no-op",
-                noop.source_files,
-                artifact_files,
-            )
-        } else {
-            output.progress("check: running pipeline");
-            let pipeline_start = Instant::now();
-            let mut bundle = child::run_child(&root, "__emit")?;
-            pipeline_elapsed = Some(pipeline_start.elapsed());
-            let source_files = bundle.cache_input_stamps.len();
-            let mut artifact_files = bundle.artifacts.len();
-            let diagnostics = bundle.diagnostics.clone();
-            output.progress("check: planning writes");
-            let plan_start = Instant::now();
-            let plan = plan_bundle(&root, &mut bundle)?;
-            plan_elapsed = Some(plan_start.elapsed());
-            if artifact_files == 0 {
-                artifact_files = plan.files.len();
-            }
-            (plan, diagnostics, "pipeline", source_files, artifact_files)
-        };
+
+    output.progress("check: running pipeline");
+    let pipeline_start = Instant::now();
+    let run = gnr8_engine::worker::run_pipeline(&root, policy)?;
+    let pipeline_elapsed = pipeline_start.elapsed();
+
+    output.progress("check: planning writes");
+    let plan_start = Instant::now();
+    let plan = gnr8_engine::lifecycle::plan_only(&root, &run.outcome.artifacts)?;
+    let plan_elapsed = plan_start.elapsed();
+    let diagnostics = run.outcome.diagnostics;
 
     // `check` is the CI gate, so it is the run whose diagnostics a reader most needs. It printed
     // none: a gate that failed on drift reported a count of stale paths and nothing about WHY the
@@ -497,9 +511,9 @@ fn run_check(output: Output) -> Result<()> {
     let mut clean: Vec<String> = Vec::new();
     for file in &plan.files {
         match file.action {
-            gnr8::lifecycle::WriteAction::Write => stale.push(file.path.clone()),
-            gnr8::lifecycle::WriteAction::UserEdited => drifted.push(file.path.clone()),
-            gnr8::lifecycle::WriteAction::Unchanged => clean.push(file.path.clone()),
+            gnr8_engine::lifecycle::WriteAction::Write => stale.push(file.path.clone()),
+            gnr8_engine::lifecycle::WriteAction::UserEdited => drifted.push(file.path.clone()),
+            gnr8_engine::lifecycle::WriteAction::Unchanged => clean.push(file.path.clone()),
         }
     }
     let has_drift = plan.has_drift();
@@ -514,7 +528,7 @@ fn run_check(output: Output) -> Result<()> {
             counts: CheckCounts,
             timings_ms: LifecycleTimings,
             diagnostics: DiagnosticCounts,
-            cache_mode: String,
+            worker: String,
             source_files: usize,
             artifact_files: usize,
         }
@@ -535,15 +549,14 @@ fn run_check(output: Output) -> Result<()> {
                 unchanged: clean.len(),
             },
             timings_ms: LifecycleTimings {
-                hot_noop: duration_ms(hot_elapsed),
-                pipeline: pipeline_elapsed.map(duration_ms),
-                write: plan_elapsed.map(duration_ms),
+                pipeline: duration_ms(pipeline_elapsed),
+                write: duration_ms(plan_elapsed),
                 total: duration_ms(total_start.elapsed()),
             },
             diagnostics: diagnostic_counts(&diagnostics),
-            cache_mode: cache_label.to_string(),
-            source_files,
-            artifact_files,
+            worker: worker_label(run.worker_built).to_string(),
+            source_files: run.outcome.source_files,
+            artifact_files: run.outcome.artifacts.len(),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if has_drift {
@@ -555,15 +568,11 @@ fn run_check(output: Output) -> Result<()> {
     } else {
         output.progress(format!("check: up to date ({} unchanged)", clean.len()));
     }
-    output.verbose(format!("parsed/input files: {source_files}"));
+    output.verbose(format!("worker: {}", worker_label(run.worker_built)));
+    output.verbose(format!("parsed/input files: {}", run.outcome.source_files));
     output.verbose(format!("outputs checked: {}", plan.files.len()));
-    output.verbose(format!("hot no-op check: {}", fmt_duration(hot_elapsed)));
-    if let Some(elapsed) = pipeline_elapsed {
-        output.verbose(format!("pipeline: {}", fmt_duration(elapsed)));
-    }
-    if let Some(elapsed) = plan_elapsed {
-        output.verbose(format!("write plan: {}", fmt_duration(elapsed)));
-    }
+    output.verbose(format!("pipeline: {}", fmt_duration(pipeline_elapsed)));
+    output.verbose(format!("write plan: {}", fmt_duration(plan_elapsed)));
     output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
     // The failure message promises these paths at `-v`, so print them at `-v`.
     output.verbose_paths_at(1, "stale", &stale);
@@ -576,845 +585,10 @@ fn run_check(output: Output) -> Result<()> {
     Ok(())
 }
 
-fn clean_plan_from_paths(paths: Vec<String>) -> gnr8::lifecycle::WritePlan {
-    gnr8::lifecycle::WritePlan {
-        files: paths
-            .into_iter()
-            .map(|path| gnr8::lifecycle::PlannedFile {
-                path,
-                action: gnr8::lifecycle::WriteAction::Unchanged,
-                new_bytes: Vec::new(),
-                new_hash: String::new(),
-                source: "generated".to_string(),
-            })
-            .collect(),
-    }
-}
-
-pub(crate) fn regenerate_bundle(
-    root: &std::path::Path,
-    bundle: &mut gnr8::runner::ArtifactBundle,
-    force: bool,
-) -> Result<gnr8::lifecycle::GenerateOutcome, gnr8::CoreError> {
-    if let Some(metadata) = cached_artifact_metadata(root, bundle) {
-        gnr8::lifecycle::recover_cached_output_transactions(root, &metadata)?;
-        if let Some(outcome) = verified_noop_outcome(root, bundle, &metadata) {
-            save_verified_noop_stamp(root, bundle, &metadata, &outcome);
-            return Ok(outcome);
-        }
-        if let Some(outcome) = gnr8::lifecycle::regenerate_cached_with_anchors(
-            root,
-            &metadata,
-            &bundle.output_anchors,
-            force,
-        )? {
-            save_verified_noop_stamp(root, bundle, &metadata, &outcome);
-            return Ok(outcome);
-        }
-    }
-    ensure_bundle_artifacts(root, bundle)?;
-    let outcome = gnr8::lifecycle::regenerate_with_anchors(
-        root,
-        &bundle.artifacts,
-        &bundle.output_anchors,
-        force,
-    )?;
-    save_verified_noop_stamp_from_artifacts(root, bundle, &outcome);
-    Ok(outcome)
-}
-
-fn plan_bundle(
-    root: &std::path::Path,
-    bundle: &mut gnr8::runner::ArtifactBundle,
-) -> Result<gnr8::lifecycle::WritePlan, gnr8::CoreError> {
-    if let Some(metadata) = cached_artifact_metadata(root, bundle) {
-        return gnr8::lifecycle::plan_only_cached(root, &metadata);
-    }
-    ensure_bundle_artifacts(root, bundle)?;
-    gnr8::lifecycle::plan_only(root, &bundle.artifacts)
-}
-
-fn cached_artifact_metadata(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-) -> Option<Vec<gnr8::sdk::ArtifactMetadata>> {
-    let key = bundle.artifact_cache_key.as_deref()?;
-    gnr8::sdk::load_artifact_cache_metadata(root, key)
-}
-
-fn ensure_bundle_artifacts(
-    root: &std::path::Path,
-    bundle: &mut gnr8::runner::ArtifactBundle,
-) -> Result<(), gnr8::CoreError> {
-    if !bundle.artifacts.is_empty() {
-        return Ok(());
-    }
-    let Some(key) = bundle.artifact_cache_key.as_deref() else {
-        return Ok(());
-    };
-    bundle.artifacts =
-        gnr8::sdk::load_artifact_cache_files(root, key).ok_or_else(|| {
-            gnr8::CoreError::ChildRun {
-                message: format!(
-                    "the .gnr8 generation crate emitted artifact cache key {key}, but the host \
-                     could not read the corresponding cache file. Re-run generation to rebuild the cache."
-                ),
-            }
-        })?;
-    Ok(())
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct VerifiedNoopStamp {
-    #[serde(default)]
-    cli_version: String,
-    #[serde(default)]
-    core_version: String,
-    #[serde(default)]
-    capability_fingerprint: String,
-    artifact_cache_key: String,
-    output_anchors: Vec<String>,
-    artifact_paths: Vec<String>,
-    input_roots: Vec<String>,
-    #[serde(default)]
-    input_fast_files: Vec<FastFileStamp>,
-    #[serde(default)]
-    output_artifact_fast_files: Vec<FastFileStamp>,
-    #[serde(default)]
-    output_dir_fast_stamps: Vec<FastDirStamp>,
-    #[serde(default)]
-    input_files: Vec<gnr8::sdk::FileStamp>,
-    #[serde(default)]
-    source_files: Vec<gnr8::sdk::FileStamp>,
-    #[serde(default)]
-    config_files: Vec<gnr8::sdk::FileStamp>,
-    #[serde(default)]
-    tool_files: Vec<gnr8::sdk::FileStamp>,
-    #[serde(default)]
-    pipeline_files: Vec<gnr8::sdk::FileStamp>,
-    #[serde(default)]
-    pipeline_roots: Vec<String>,
-    #[serde(default)]
-    output_files: Vec<gnr8::sdk::FileStamp>,
-    diagnostics: Vec<gnr8::graph::Diagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-struct FastFileStamp {
-    path: String,
-    len: u64,
-    modified_ns: u128,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-struct FastDirStamp {
-    path: String,
-    modified_ns: u128,
-}
-
-struct FastOutputStamps {
-    artifact_files: Vec<FastFileStamp>,
-    dirs: Vec<FastDirStamp>,
-}
-
-struct VerifiedInputStamps {
-    fast: Vec<FastFileStamp>,
-    all: Vec<gnr8::sdk::FileStamp>,
-    source: Vec<gnr8::sdk::FileStamp>,
-    config: Vec<gnr8::sdk::FileStamp>,
-    tools: Vec<gnr8::sdk::FileStamp>,
-    pipeline: Vec<gnr8::sdk::FileStamp>,
-}
-
-struct CachedNoop {
-    outcome: gnr8::lifecycle::GenerateOutcome,
-    diagnostics: Vec<gnr8::graph::Diagnostic>,
-    source_files: usize,
-    artifact_files: usize,
-}
-
-fn pre_child_verified_noop(root: &std::path::Path) -> Option<CachedNoop> {
-    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
-        return None;
-    }
-    let stamp = load_verified_noop_stamp(root)?;
-    if stamp.cli_version != env!("CARGO_PKG_VERSION")
-        || stamp.core_version != env!("CARGO_PKG_VERSION")
-        || stamp.capability_fingerprint != gnr8::runner::capability_fingerprint()
-        || stamp.source_files.is_empty()
-        || stamp.config_files.is_empty()
-        || stamp.tool_files.is_empty()
-        || stamp.output_files.len() != stamp.artifact_paths.len()
-        || !manifest_covers_output_files(root, &stamp.output_files)
-    {
-        return None;
-    }
-    let source_fast = collect_declared_input_fast_stamps(root, &stamp.input_roots)?;
-    let config_fast = collect_required_config_fast_stamps(root)?;
-    let tool_fast = fast_stamps_for_expected_files(root, &stamp.tool_files)?;
-    let pipeline_fast =
-        collect_pipeline_fast_stamps(root, &stamp.pipeline_roots, &stamp.pipeline_files)?;
-    if content_stamps_from_fast(root, &source_fast)? != stamp.source_files
-        || content_stamps_from_fast(root, &config_fast)? != stamp.config_files
-        || content_stamps_from_fast(root, &tool_fast)? != stamp.tool_files
-        || content_stamps_from_fast(root, &pipeline_fast)? != stamp.pipeline_files
-    {
-        return None;
-    }
-    let mut current_inputs = source_fast;
-    current_inputs.extend(config_fast);
-    current_inputs.extend(tool_fast);
-    current_inputs.extend(pipeline_fast);
-    current_inputs.sort();
-    if current_inputs != stamp.input_fast_files {
-        return None;
-    }
-    if content_stamps_from_fast(root, &current_inputs)? != stamp.input_files {
-        return None;
-    }
-    let current_outputs =
-        collect_verified_fast_output_stamps(root, &stamp.output_anchors, &stamp.artifact_paths)?;
-    if current_outputs.artifact_files != stamp.output_artifact_fast_files
-        || current_outputs.dirs != stamp.output_dir_fast_stamps
-    {
-        return None;
-    }
-    if content_stamps_from_fast(root, &current_outputs.artifact_files)? != stamp.output_files {
-        return None;
-    }
-    let source_files = stamp.source_files.len();
-    let artifact_files = stamp.artifact_paths.len();
-    Some(CachedNoop {
-        outcome: gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: stamp.artifact_paths,
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        },
-        diagnostics: stamp.diagnostics,
-        source_files,
-        artifact_files,
-    })
-}
-
-fn pre_child_generate_verified_noop(root: &std::path::Path) -> Result<Option<CachedNoop>> {
-    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
-        return Ok(None);
-    }
-    let Some(stamp) = load_verified_noop_stamp(root) else {
-        return Ok(None);
-    };
-    let metadata = stamp
-        .output_files
-        .iter()
-        .map(|file| gnr8::sdk::ArtifactMetadata {
-            path: file.path.clone(),
-            hash: file.hash.clone(),
-        })
-        .collect::<Vec<_>>();
-    gnr8::lifecycle::recover_cached_output_transactions(root, &metadata)?;
-    Ok(pre_child_verified_noop(root))
-}
-
-fn verified_noop_outcome(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    metadata: &[gnr8::sdk::ArtifactMetadata],
-) -> Option<gnr8::lifecycle::GenerateOutcome> {
-    let key = bundle.artifact_cache_key.as_deref()?;
-    let stamp = load_verified_noop_stamp(root)?;
-    if stamp.artifact_cache_key != key || stamp.output_anchors != bundle.output_anchors {
-        return None;
-    }
-    if !manifest_covers_metadata(root, metadata) {
-        return None;
-    }
-    let artifact_paths = artifact_paths(metadata);
-    if stamp.artifact_paths != artifact_paths {
-        return None;
-    }
-    let current =
-        collect_verified_fast_output_stamps(root, &bundle.output_anchors, &artifact_paths)?;
-    if current.artifact_files != stamp.output_artifact_fast_files
-        || current.dirs != stamp.output_dir_fast_stamps
-    {
-        return None;
-    }
-    let current_files = content_stamps_from_fast(root, &current.artifact_files)?;
-    if current_files != stamp.output_files
-        || metadata.iter().any(|artifact| {
-            current_files
-                .iter()
-                .find(|file| file.path == artifact.path)
-                .is_none_or(|file| file.hash != artifact.hash)
-        })
-    {
-        return None;
-    }
-    Some(gnr8::lifecycle::GenerateOutcome {
-        written: Vec::new(),
-        unchanged: metadata
-            .iter()
-            .map(|artifact| artifact.path.clone())
-            .collect(),
-        skipped: Vec::new(),
-        deleted: Vec::new(),
-    })
-}
-
-fn save_verified_noop_stamp(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    metadata: &[gnr8::sdk::ArtifactMetadata],
-    outcome: &gnr8::lifecycle::GenerateOutcome,
-) {
-    save_verified_noop_stamp_for_metadata(root, bundle, metadata, outcome);
-}
-
-fn save_verified_noop_stamp_from_artifacts(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    outcome: &gnr8::lifecycle::GenerateOutcome,
-) {
-    let metadata: Vec<gnr8::sdk::ArtifactMetadata> = bundle
-        .artifacts
-        .iter()
-        .map(|artifact| gnr8::sdk::ArtifactMetadata {
-            path: artifact.path.clone(),
-            hash: gnr8::manifest::blake3_hex(artifact.text.as_bytes()),
-        })
-        .collect();
-    save_verified_noop_stamp_for_metadata(root, bundle, &metadata, outcome);
-}
-
-fn save_verified_noop_stamp_for_metadata(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    metadata: &[gnr8::sdk::ArtifactMetadata],
-    outcome: &gnr8::lifecycle::GenerateOutcome,
-) {
-    let _ = gnr8::lifecycle::with_generation_state_lock(root, || {
-        save_verified_noop_stamp_locked(root, bundle, metadata, outcome);
-    });
-}
-
-fn save_verified_noop_stamp_locked(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-    metadata: &[gnr8::sdk::ArtifactMetadata],
-    outcome: &gnr8::lifecycle::GenerateOutcome,
-) {
-    if !gnr8::runner::PRE_CHILD_NOOP_SUPPORTED {
-        return;
-    }
-    if cleanup_verified_noop_temporary_files(root).is_err() {
-        return;
-    }
-    if !outcome.written.is_empty() || !outcome.skipped.is_empty() || !outcome.deleted.is_empty() {
-        return;
-    }
-    let Some(key) = bundle.artifact_cache_key.as_deref() else {
-        return;
-    };
-    if bundle.cache_input_roots.is_empty()
-        || bundle.cache_input_stamps.is_empty()
-        || bundle.cache_config_stamps.is_empty()
-        || !bundle.cache_config_complete
-        || !bundle.cache_pipeline_complete
-        || bundle.cache_tool_stamps.is_empty()
-    {
-        return;
-    }
-    let artifact_paths = artifact_paths(metadata);
-    let Some(output_fast) =
-        collect_verified_fast_output_stamps(root, &bundle.output_anchors, &artifact_paths)
-    else {
-        return;
-    };
-    let Some(output_files) = content_stamps_from_fast(root, &output_fast.artifact_files) else {
-        return;
-    };
-    if output_files.len() != artifact_paths.len()
-        || !manifest_covers_output_files(root, &output_files)
-        || metadata.iter().any(|artifact| {
-            output_files
-                .iter()
-                .find(|file| file.path == artifact.path)
-                .is_none_or(|file| file.hash != artifact.hash)
-        })
-    {
-        return;
-    }
-    let Some(inputs) = collect_verified_input_stamps(root, bundle) else {
-        return;
-    };
-    let stamp = VerifiedNoopStamp {
-        cli_version: bundle.cli_version.clone(),
-        core_version: bundle.core_version.clone(),
-        capability_fingerprint: bundle.capability_fingerprint.clone(),
-        artifact_cache_key: key.to_string(),
-        output_anchors: bundle.output_anchors.clone(),
-        artifact_paths,
-        input_roots: bundle.cache_input_roots.clone(),
-        input_fast_files: inputs.fast,
-        output_artifact_fast_files: output_fast.artifact_files,
-        output_dir_fast_stamps: output_fast.dirs,
-        input_files: inputs.all,
-        source_files: inputs.source,
-        config_files: inputs.config,
-        tool_files: inputs.tools,
-        pipeline_files: inputs.pipeline,
-        pipeline_roots: bundle.cache_pipeline_roots.clone(),
-        output_files,
-        diagnostics: bundle.diagnostics.clone(),
-    };
-    let path = verified_noop_stamp_path(root);
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(bytes) = serde_json::to_vec(&stamp) else {
-        return;
-    };
-    let _ = publish_verified_noop_stamp(&path, &bytes);
-}
-
-fn collect_verified_input_stamps(
-    root: &std::path::Path,
-    bundle: &gnr8::runner::ArtifactBundle,
-) -> Option<VerifiedInputStamps> {
-    let source_fast = collect_declared_input_fast_stamps(root, &bundle.cache_input_roots)?;
-    let source = content_stamps_from_fast(root, &source_fast)?;
-    if source != bundle.cache_input_stamps {
-        return None;
-    }
-    let config_fast = collect_required_config_fast_stamps(root)?;
-    let config = content_stamps_from_fast(root, &config_fast)?;
-    if config != bundle.cache_config_stamps {
-        return None;
-    }
-    let tool_fast = fast_stamps_for_expected_files(root, &bundle.cache_tool_stamps)?;
-    let tools = content_stamps_from_fast(root, &tool_fast)?;
-    if tools != bundle.cache_tool_stamps {
-        return None;
-    }
-    let pipeline_fast = collect_pipeline_fast_stamps(
-        root,
-        &bundle.cache_pipeline_roots,
-        &bundle.cache_pipeline_stamps,
-    )?;
-    let pipeline = content_stamps_from_fast(root, &pipeline_fast)?;
-    if pipeline != bundle.cache_pipeline_stamps {
-        return None;
-    }
-    let mut fast = source_fast;
-    fast.extend(config_fast);
-    fast.extend(tool_fast);
-    fast.extend(pipeline_fast);
-    fast.sort();
-    let all = content_stamps_from_fast(root, &fast)?;
-    Some(VerifiedInputStamps {
-        fast,
-        all,
-        source,
-        config,
-        tools,
-        pipeline,
-    })
-}
-
-fn publish_verified_noop_stamp(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "verified no-op stamp has no parent directory",
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let sequence = VERIFIED_NOOP_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(
-        ".verified-noop-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options.open(&temporary)?;
-    let published = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| {
-            drop(file);
-            replace_verified_noop_stamp(&temporary, path)
-        });
-    if published.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    published
-}
-
-fn replace_verified_noop_stamp(
-    from: &std::path::Path,
-    to: &std::path::Path,
-) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        atomicwrites::replace_atomic(from, to)
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(from, to)
-    }
-}
-
-fn cleanup_verified_noop_temporary_files(root: &std::path::Path) -> std::io::Result<()> {
-    let dir = root.join(".gnr8/cache");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if is_verified_noop_temporary_name(name) {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
-}
-
-fn is_verified_noop_temporary_name(name: &str) -> bool {
-    let Some(token) = name
-        .strip_prefix(".verified-noop-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let Some((pid, sequence)) = token.split_once('-') else {
-        return false;
-    };
-    !pid.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
-        && !sequence.is_empty()
-        && sequence.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn content_stamps_from_fast(
-    root: &std::path::Path,
-    fast_files: &[FastFileStamp],
-) -> Option<Vec<gnr8::sdk::FileStamp>> {
-    let mut stamps = Vec::with_capacity(fast_files.len());
-    for fast in fast_files {
-        let path = root.join(&fast.path);
-        let metadata = path.metadata().ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        let bytes = std::fs::read(&path).ok()?;
-        stamps.push(gnr8::sdk::FileStamp {
-            path: fast.path.clone(),
-            len: metadata.len(),
-            modified_ns: fast_modified_ns(&metadata),
-            hash: gnr8::manifest::blake3_hex(&bytes),
-        });
-    }
-    stamps.sort();
-    Some(stamps)
-}
-
-fn manifest_covers_output_files(root: &std::path::Path, files: &[gnr8::sdk::FileStamp]) -> bool {
-    let Ok(manifest) = gnr8::manifest::load(&root.join(".gnr8")) else {
-        return false;
-    };
-    manifest.files.len() == files.len()
-        && files
-            .iter()
-            .all(|file| manifest.recorded_hash(&file.path) == Some(file.hash.as_str()))
-}
-
-fn manifest_covers_metadata(
-    root: &std::path::Path,
-    artifacts: &[gnr8::sdk::ArtifactMetadata],
-) -> bool {
-    let Ok(manifest) = gnr8::manifest::load(&root.join(".gnr8")) else {
-        return false;
-    };
-    manifest.files.len() == artifacts.len()
-        && artifacts
-            .iter()
-            .all(|artifact| manifest.recorded_hash(&artifact.path) == Some(artifact.hash.as_str()))
-}
-
-fn collect_verified_fast_output_stamps(
-    root: &std::path::Path,
-    output_anchors: &[String],
-    artifact_paths: &[String],
-) -> Option<FastOutputStamps> {
-    let artifact_paths: Vec<std::path::PathBuf> =
-        artifact_paths.iter().map(|path| root.join(path)).collect();
-    let artifact_files = stamp_fast_project_files(root, &artifact_paths)?;
-    let mut dirs = std::collections::BTreeSet::new();
-    for anchor in output_anchors {
-        collect_anchor_dir_stamp_paths(root, anchor, &mut dirs)?;
-    }
-    let dirs: Vec<std::path::PathBuf> = dirs.into_iter().collect();
-    let dirs = stamp_fast_project_dirs(root, &dirs)?;
-    Some(FastOutputStamps {
-        artifact_files,
-        dirs,
-    })
-}
-
-fn collect_anchor_dir_stamp_paths(
-    root: &std::path::Path,
-    anchor: &str,
-    paths: &mut std::collections::BTreeSet<std::path::PathBuf>,
-) -> Option<()> {
-    if anchor.is_empty()
-        || std::path::Path::new(anchor).components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
-    {
-        return None;
-    }
-    let anchor_path = root.join(anchor);
-    if anchor_path.is_file() {
-        if let Some(parent) = anchor_path.parent() {
-            paths.insert(parent.to_path_buf());
-        }
-        return Some(());
-    }
-    if !anchor_path.is_dir() {
-        return Some(());
-    }
-    paths.insert(anchor_path.clone());
-    let mut stack = vec![anchor_path];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
-        for entry in entries {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let kind = entry.file_type().ok()?;
-            if kind.is_dir() {
-                paths.insert(path.clone());
-                stack.push(path);
-            }
-        }
-    }
-    Some(())
-}
-
-fn artifact_paths(metadata: &[gnr8::sdk::ArtifactMetadata]) -> Vec<String> {
-    metadata
-        .iter()
-        .map(|artifact| artifact.path.clone())
-        .collect()
-}
-
-fn load_verified_noop_stamp(root: &std::path::Path) -> Option<VerifiedNoopStamp> {
-    std::fs::read(verified_noop_stamp_path(root))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-}
-
-fn collect_declared_input_fast_stamps(
-    root: &std::path::Path,
-    input_roots: &[String],
-) -> Option<Vec<FastFileStamp>> {
-    if input_roots.is_empty() {
-        return None;
-    }
-    let mut stamps = Vec::new();
-    for input_root in input_roots {
-        let path = root.join(input_root);
-        if path.is_file() {
-            push_fast_file_stamp(root, &path, &mut stamps)?;
-        } else {
-            collect_hot_input_file_stamps(root, &path, &mut stamps)?;
-        }
-    }
-    stamps.sort();
-    Some(stamps)
-}
-
-fn collect_required_config_fast_stamps(root: &std::path::Path) -> Option<Vec<FastFileStamp>> {
-    let paths = gnr8::sdk::cache_config_input_paths(root)?;
-    stamp_fast_project_files(root, &paths)
-}
-
-fn fast_stamps_for_expected_files(
-    root: &std::path::Path,
-    expected: &[gnr8::sdk::FileStamp],
-) -> Option<Vec<FastFileStamp>> {
-    if expected.is_empty() {
-        return Some(Vec::new());
-    }
-    let paths = expected
-        .iter()
-        .map(|stamp| root.join(&stamp.path))
-        .collect::<Vec<_>>();
-    stamp_fast_project_files(root, &paths)
-}
-
-fn collect_pipeline_fast_stamps(
-    root: &std::path::Path,
-    input_roots: &[String],
-    expected: &[gnr8::sdk::FileStamp],
-) -> Option<Vec<FastFileStamp>> {
-    let mut stamps = fast_stamps_for_expected_files(root, expected)?;
-    if !input_roots.is_empty() {
-        stamps.extend(collect_declared_input_fast_stamps(root, input_roots)?);
-    }
-    stamps.sort();
-    stamps.dedup();
-    Some(stamps)
-}
-
-fn collect_hot_input_file_stamps(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    out: &mut Vec<FastFileStamp>,
-) -> Option<()> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        let name = path.file_name().and_then(|name| name.to_str())?;
-        let kind = entry.file_type().ok()?;
-        if kind.is_dir() {
-            if matches!(
-                name,
-                ".context"
-                    | ".git"
-                    | ".gnr8"
-                    | "node_modules"
-                    | "target"
-                    | "vendor"
-                    | "__pycache__"
-            ) {
-                continue;
-            }
-            collect_hot_input_file_stamps(root, &path, out)?;
-        } else if kind.is_file() {
-            push_fast_file_stamp(root, &path, out)?;
-        }
-    }
-    Some(())
-}
-
-fn push_fast_file_stamp(
-    root: &std::path::Path,
-    path: &std::path::Path,
-    out: &mut Vec<FastFileStamp>,
-) -> Option<()> {
-    let metadata = path.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    out.push(FastFileStamp {
-        path: fast_project_relative_path(root, path),
-        len: metadata.len(),
-        modified_ns: fast_modified_ns(&metadata),
-    });
-    Some(())
-}
-
-fn stamp_fast_project_files(
-    root: &Path,
-    paths: &[std::path::PathBuf],
-) -> Option<Vec<FastFileStamp>> {
-    if paths.is_empty() {
-        return Some(Vec::new());
-    }
-    let workers = std::thread::available_parallelism().map_or(4, usize::from);
-    let workers = workers.clamp(1, paths.len());
-    if workers == 1 || paths.len() < 512 {
-        return stamp_fast_project_files_serial(root, paths);
-    }
-    let chunk_size = paths.len().div_ceil(workers);
-
-    let mut stamps = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in paths.chunks(chunk_size) {
-            handles.push(scope.spawn(move || stamp_fast_project_files_serial(root, chunk)));
-        }
-
-        let mut stamps = Vec::with_capacity(paths.len());
-        for handle in handles {
-            let chunk = handle.join().ok()??;
-            stamps.extend(chunk);
-        }
-        Some(stamps)
-    })?;
-    stamps.sort();
-    Some(stamps)
-}
-
-fn stamp_fast_project_files_serial(
-    root: &Path,
-    paths: &[std::path::PathBuf],
-) -> Option<Vec<FastFileStamp>> {
-    let mut stamps = Vec::with_capacity(paths.len());
-    for path in paths {
-        let metadata = path.metadata().ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        stamps.push(FastFileStamp {
-            path: fast_project_relative_path(root, path),
-            len: metadata.len(),
-            modified_ns: fast_modified_ns(&metadata),
-        });
-    }
-    stamps.sort();
-    Some(stamps)
-}
-
-fn stamp_fast_project_dirs(root: &Path, paths: &[std::path::PathBuf]) -> Option<Vec<FastDirStamp>> {
-    let mut stamps = Vec::with_capacity(paths.len());
-    for path in paths {
-        let metadata = path.metadata().ok()?;
-        if !metadata.is_dir() {
-            return None;
-        }
-        stamps.push(FastDirStamp {
-            path: fast_project_relative_path(root, path),
-            modified_ns: fast_modified_ns(&metadata),
-        });
-    }
-    stamps.sort();
-    Some(stamps)
-}
-
-fn fast_project_relative_path(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
-}
-
-fn fast_modified_ns(metadata: &std::fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos())
-}
-
-fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {
-    root.join(".gnr8").join("cache").join("verified-noop.json")
-}
-
 /// Probe whether the DETECTED source language's toolchain is ACTUALLY ready, returning `(language,
 /// present)`.
 ///
-/// One `gnr8::analyze::source_toolchain` decision over the project root picks the language (the
+/// One `gnr8_engine::analyze::source_toolchain` decision over the project root picks the language (the
 /// `.gnr8/` crate is excluded from that scan in core, so it does not spoof detection — Open Q2). That
 /// SINGLE decision then routes to exactly one readiness check (no try-go-then-python fallback — CLAUDE.md
 /// rule 3):
@@ -1431,13 +605,13 @@ fn verified_noop_stamp_path(root: &std::path::Path) -> std::path::PathBuf {
 /// surfaced as a doctor finding, never a panic. The binary name is one of three compile-time
 /// `&'static str` arms and the args are literals, never `sh -c` (T-06-01).
 fn probe_source_lang_toolchain(root: &std::path::Path) -> (String, bool) {
-    let Ok(toolchain) = gnr8::analyze::source_toolchain(&root.to_string_lossy()) else {
+    let Ok(toolchain) = gnr8_engine::analyze::source_toolchain(&root.to_string_lossy()) else {
         return ("unknown".to_string(), false);
     };
-    let present = if toolchain == gnr8::analyze::SourceToolchain::TypeScript {
+    let present = if toolchain == gnr8_engine::analyze::SourceToolchain::TypeScript {
         // TypeScript's real toolchain is `node` + a resolvable `typescript`; the core probe verifies
         // BOTH via the same resolution `generate` uses (WR-02 — one source of truth, no fallback).
-        gnr8::analyze::typescript_toolchain_present(&root.to_string_lossy())
+        gnr8_engine::analyze::typescript_toolchain_present(&root.to_string_lossy())
     } else {
         // Go/Python are wholly `go`/`python3`: spawn the discrete probe binary and require a SUCCESSFUL
         // exit (WR-05) — spawn-success alone masked a broken binary that exits non-zero. `go` uses the
@@ -1499,48 +673,11 @@ fn reconcile_doctor_source_probe(
     initial
 }
 
-fn collect_sdk_readiness(
-    root: &Path,
-    bundle: &mut gnr8::runner::ArtifactBundle,
-) -> Vec<doctor::SdkReadiness> {
-    if let Err(err) = ensure_bundle_artifacts(root, bundle) {
-        return vec![doctor::SdkReadiness::not_ready(
-            "artifacts",
-            "generated",
-            "artifact cache",
-            err.to_string(),
-        )];
-    }
-
-    bundle
-        .readiness_targets
-        .iter()
-        .map(|target| {
-            let artifacts = artifacts_for_readiness(bundle, target);
-            readiness_for_target(target, &artifacts)
-        })
-        .collect()
-}
-
-fn artifacts_for_readiness(
-    bundle: &gnr8::runner::ArtifactBundle,
-    target: &gnr8::sdk::ReadinessTarget,
-) -> Vec<gnr8::sdk::Artifact> {
-    let output_path = target.output_path.trim_end_matches('/');
-    let prefix = format!("{output_path}/");
-    bundle
-        .artifacts
-        .iter()
-        .filter(|artifact| artifact.path == output_path || artifact.path.starts_with(&prefix))
-        .cloned()
-        .collect()
-}
-
 fn readiness_for_target(
-    target: &gnr8::sdk::ReadinessTarget,
-    artifacts: &[gnr8::sdk::Artifact],
+    target: &gnr8_engine::sdk::ReadinessTarget,
+    artifacts: &[gnr8_engine::sdk::Artifact],
 ) -> doctor::SdkReadiness {
-    use gnr8::sdk::ReadinessKind;
+    use gnr8_engine::sdk::ReadinessKind;
 
     let output_path = target.output_path.as_str();
     match target.kind {
@@ -1571,7 +708,7 @@ fn path_extension_is(path: &str, ext: &str) -> bool {
 }
 
 fn validate_openapi_target(path: &str, text: &str) -> doctor::SdkReadiness {
-    match gnr8::sdk::validate_openapi_artifact(text, Path::new(path)) {
+    match gnr8_engine::sdk::validate_openapi_artifact(text, Path::new(path)) {
         Ok(()) => doctor::SdkReadiness::ready("openapi", path, "built-in OpenAPI parser"),
         Err(err) => doctor::SdkReadiness::not_ready(
             "openapi",
@@ -1582,7 +719,10 @@ fn validate_openapi_target(path: &str, text: &str) -> doctor::SdkReadiness {
     }
 }
 
-fn validate_go_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+fn validate_go_target(
+    anchor: &str,
+    artifacts: &[gnr8_engine::sdk::Artifact],
+) -> doctor::SdkReadiness {
     const TOOLCHAIN: &str = "go test ./...; go vet ./...";
     if let Err(reason) = command_available("go", &["version"]) {
         return doctor::SdkReadiness::not_ready("go", anchor, TOOLCHAIN, reason);
@@ -1622,7 +762,10 @@ fn validate_go_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor
     doctor::SdkReadiness::ready("go", anchor, TOOLCHAIN)
 }
 
-fn validate_python_target(anchor: &str, artifacts: &[gnr8::sdk::Artifact]) -> doctor::SdkReadiness {
+fn validate_python_target(
+    anchor: &str,
+    artifacts: &[gnr8_engine::sdk::Artifact],
+) -> doctor::SdkReadiness {
     const TOOLCHAIN: &str = "python3 -m py_compile; import package";
     if let Err(reason) = command_available("python3", &["--version"]) {
         return doctor::SdkReadiness::not_ready("python", anchor, TOOLCHAIN, reason);
@@ -1704,7 +847,7 @@ fn python_package_root(target_dir: &Path, root: &Path) -> PathBuf {
 
 fn validate_typescript_target(
     anchor: &str,
-    artifacts: &[gnr8::sdk::Artifact],
+    artifacts: &[gnr8_engine::sdk::Artifact],
 ) -> doctor::SdkReadiness {
     const TOOLCHAIN: &str = "node + typescript --noEmit --strict";
     if let Err(reason) = command_available("node", &["--version"]) {
@@ -1806,7 +949,7 @@ impl Drop for MaterializedTarget {
 
 fn materialize_artifact_group(
     anchor: &str,
-    artifacts: &[gnr8::sdk::Artifact],
+    artifacts: &[gnr8_engine::sdk::Artifact],
     label: &str,
 ) -> Result<MaterializedTarget, String> {
     let root = unique_doctor_temp_dir(label)?;
@@ -2257,45 +1400,41 @@ fn validate_typescript_package_entrypoints(package_dir: &Path) -> Result<(), Str
 /// compile error, a missing toolchain) is REPORTED as a finding, never `?`/unwrap'd into a crash
 /// (Pitfall 4 / D-02). Prints the human report or `--json`, then exits non-zero ONLY on an actionable
 /// problem (mirrors `run_check`).
-fn run_doctor(output: Output) -> Result<()> {
+fn run_doctor(policy: WorkerPolicy, output: Output) -> Result<()> {
     let root = project_root()?;
-    let initialized = gnr8::workspace::manifest_path(&root).is_file();
+    let initialized = gnr8_engine::workspace::manifest_path(&root).is_file();
     let initial_source_probe = probe_source_lang_toolchain(&root);
 
-    // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we get
-    // the child's diagnostics and can compute drift from its artifacts. Both degrade gracefully.
+    // Run the pipeline once. Its `Err` IS the "pipeline broken" finding (do NOT `?`); on success we
+    // get the diagnostics and can compute drift from its artifacts. Both degrade gracefully.
     let total_start = Instant::now();
-    let (mut bundle, mut pipeline_error) = if initialized {
+    let (run, mut pipeline_error) = if initialized {
         output.progress("doctor: running pipeline");
-        match child::run_child(&root, "__emit") {
-            Ok(bundle) => (Some(bundle), None),
+        match doctor_pipeline(&root, policy) {
+            Ok(run) => (Some(run), None),
             Err(error) => (None, Some(format!("{error:#}"))),
         }
     } else {
         (None, None)
     };
-    let pipeline_ran = bundle.is_some();
-    let cache_input_roots = bundle
+    let pipeline_ran = run.is_some();
+    let input_roots = run
         .as_ref()
-        .map(|bundle| bundle.cache_input_roots.clone())
+        .map(|run| run.input_roots.clone())
         .unwrap_or_default();
-    let (language, source_present) = reconcile_doctor_source_probe(
-        &root,
-        initial_source_probe,
-        pipeline_ran,
-        &cache_input_roots,
-    );
-    let diagnostics = bundle.as_ref().map(|b| b.diagnostics.clone());
-    let output_anchors = bundle
+    let (language, source_present) =
+        reconcile_doctor_source_probe(&root, initial_source_probe, pipeline_ran, &input_roots);
+    let diagnostics = run.as_ref().map(|run| run.outcome.diagnostics.clone());
+    let output_anchors = run
         .as_ref()
-        .map(|bundle| bundle.output_anchors.clone())
+        .map(|run| run.outcome.output_anchors.clone())
         .unwrap_or_default();
-    let sdk_readiness = bundle
-        .as_mut()
-        .map(|bundle| collect_sdk_readiness(&root, bundle))
+    let sdk_readiness = run
+        .as_ref()
+        .map(|run| collect_sdk_readiness(&run.outcome))
         .unwrap_or_default();
-    let drift = match bundle.as_mut() {
-        Some(bundle) => match plan_bundle(&root, bundle) {
+    let drift = match run.as_ref() {
+        Some(run) => match gnr8_engine::lifecycle::plan_only(&root, &run.outcome.artifacts) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 pipeline_error = Some(format!("output drift planning failed: {error:#}"));
@@ -2321,7 +1460,7 @@ fn run_doctor(output: Output) -> Result<()> {
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned()),
             resource_dir: Some(
-                gnr8::resource::resource_dir()?
+                gnr8_engine::resource::resource_dir()?
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -2347,13 +1486,62 @@ fn run_doctor(output: Output) -> Result<()> {
     Ok(())
 }
 
+/// What `doctor` needs from one pipeline run: the outcome, plus the source input roots it can probe
+/// the language toolchain from.
+struct DoctorRun {
+    outcome: gnr8_engine::pipeline::PipelineOutcome,
+    input_roots: Vec<String>,
+}
+
+/// Run the project's pipeline once for `doctor`, keeping the plan's declared source roots.
+fn doctor_pipeline(root: &Path, policy: WorkerPolicy) -> Result<DoctorRun, gnr8_engine::CoreError> {
+    let mut session = gnr8_engine::worker::WorkerSession::start(root, policy)?;
+    let plan = session.plan().clone();
+    let cx = gnr8_engine::sdk::Cx::new(root.to_path_buf());
+    let input_roots = gnr8_engine::pipeline::source_input_roots(&plan, &cx);
+    let outcome = gnr8_engine::pipeline::run(&plan, &cx, &mut session)?;
+    session.shutdown()?;
+    Ok(DoctorRun {
+        outcome,
+        input_roots,
+    })
+}
+
+/// Validate every readiness target the pipeline's targets declared.
+fn collect_sdk_readiness(
+    outcome: &gnr8_engine::pipeline::PipelineOutcome,
+) -> Vec<doctor::SdkReadiness> {
+    outcome
+        .readiness_targets
+        .iter()
+        .map(|target| {
+            let artifacts = artifacts_for_readiness(&outcome.artifacts, target);
+            readiness_for_target(target, &artifacts)
+        })
+        .collect()
+}
+
+/// The artifacts that belong to one readiness target's output path.
+fn artifacts_for_readiness(
+    artifacts: &[gnr8_engine::sdk::Artifact],
+    target: &gnr8_engine::sdk::ReadinessTarget,
+) -> Vec<gnr8_engine::sdk::Artifact> {
+    let output_path = target.output_path.trim_end_matches('/');
+    let prefix = format!("{output_path}/");
+    artifacts
+        .iter()
+        .filter(|artifact| artifact.path == output_path || artifact.path.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
 /// Run `gnr8 watch [--debounce-ms N]`: run an initial COLD regeneration (so the cold-latency scenario is
 /// measured and the outputs are current), print a startup line, then enter the debounced watch loop
 /// (WATCH-02/03). The loop watches the project's Go sources AND `.gnr8/src/` (so editing the pipeline
 /// re-runs it), filters out gnr8's own output writes (no self-loop), and times each regeneration. Ctrl-C
 /// exits with code 0; a missing `.gnr8/` or a pipeline error flows through the anyhow boundary — never a
 /// panic (D-09 / RUST-04).
-fn run_watch(debounce_ms: u64, output: Output) -> Result<()> {
+fn run_watch(debounce_ms: u64, policy: WorkerPolicy, output: Output) -> Result<()> {
     // Floor the debounce window at a small minimum (IN-04): `--debounce-ms 0` would create a
     // zero-window debouncer that defeats burst-coalescing and amplifies the delete/rename edge case.
     const MIN_DEBOUNCE_MS: u64 = 10;
@@ -2368,30 +1556,30 @@ fn run_watch(debounce_ms: u64, output: Output) -> Result<()> {
     }
 
     // The COLD scenario: an initial regeneration ensures outputs are current and measures cold latency.
-    watch::cold_regenerate(&root, output.json, output.verbose)?;
+    watch::cold_regenerate(&root, policy, output.json, output.verbose)?;
 
     let debounce = std::time::Duration::from_millis(debounce_ms.max(MIN_DEBOUNCE_MS));
-    watch::run(&root, debounce, output.json, output.verbose)
+    watch::run(&root, debounce, policy, output.json, output.verbose)
 }
 
 /// Build the API graph for an `inspect` subcommand, render it (table or `--json`), and print it.
 ///
-/// With no path, inspect uses the same child `__inspect` pipeline as generation so source package
+/// With no path, inspect runs the same pipeline generation does, through transforms only, so source package
 /// filters, transforms, and resource/toolchain resolution match `generate`/`check`. An explicit path
 /// requests direct source inspection.
-fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
+fn run_inspect(action: &InspectAction, policy: WorkerPolicy, output: Output) -> Result<()> {
     let total_start = Instant::now();
     let rendered = match action {
         InspectAction::Routes { path } => {
-            let graph = inspect_graph(path.as_deref(), output)?;
+            let graph = inspect_graph(path.as_deref(), policy, output)?;
             render::render_routes(&graph, output.json)?
         }
         InspectAction::Schemas { path } => {
-            let graph = inspect_graph(path.as_deref(), output)?;
+            let graph = inspect_graph(path.as_deref(), policy, output)?;
             render::render_schemas(&graph, output.json)?
         }
         InspectAction::Graph { path } => {
-            let graph = inspect_graph(path.as_deref(), output)?;
+            let graph = inspect_graph(path.as_deref(), policy, output)?;
             render::render_graph(&graph, output.json)?
         }
     };
@@ -2400,24 +1588,28 @@ fn run_inspect(action: &InspectAction, output: Output) -> Result<()> {
     Ok(())
 }
 
-fn inspect_graph(path: Option<&str>, output: Output) -> Result<gnr8::graph::ApiGraph> {
+fn inspect_graph(
+    path: Option<&str>,
+    policy: WorkerPolicy,
+    output: Output,
+) -> Result<gnr8_engine::graph::ApiGraph> {
     if let Some(path) = path {
         output.verbose(format!("inspect: analyzing source path directly: {path}"));
-        return Ok(gnr8::analyze::build_graph(path)?);
+        return Ok(gnr8_engine::analyze::build_graph(path)?);
     }
 
     let root = project_root()?;
-    if gnr8::workspace::manifest_path(&root).is_file() {
+    if gnr8_engine::workspace::manifest_path(&root).is_file() {
         output.verbose(format!(
             "inspect: using .gnr8 pipeline at {}",
             root.display()
         ));
-        return Ok(child::inspect_child(&root)?);
+        return Ok(gnr8_engine::worker::inspect_pipeline(&root, policy)?);
     }
     bail!("no .gnr8 pipeline found; run `gnr8 init` or pass a source path to `gnr8 inspect`")
 }
 
-fn lifecycle_summary(outcome: &gnr8::lifecycle::GenerateOutcome) -> String {
+fn lifecycle_summary(outcome: &gnr8_engine::lifecycle::GenerateOutcome) -> String {
     format!(
         "{} written, {} unchanged, {} deleted, {} skipped",
         outcome.written.len(),
@@ -2427,7 +1619,7 @@ fn lifecycle_summary(outcome: &gnr8::lifecycle::GenerateOutcome) -> String {
     )
 }
 
-fn print_diagnostics(output: Output, diagnostics: &[gnr8::graph::Diagnostic]) {
+fn print_diagnostics(output: Output, diagnostics: &[gnr8_engine::graph::Diagnostic]) {
     if diagnostics.is_empty() || output.json {
         return;
     }
@@ -2467,7 +1659,7 @@ fn diagnostic_summary(counts: &DiagnosticCounts) -> String {
     format!("info: {total} pipeline diagnostics (run with -v for details)")
 }
 
-fn diagnostic_counts(diagnostics: &[gnr8::graph::Diagnostic]) -> DiagnosticCounts {
+fn diagnostic_counts(diagnostics: &[gnr8_engine::graph::Diagnostic]) -> DiagnosticCounts {
     let info = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.severity.eq_ignore_ascii_case("INFO"))
@@ -2506,14 +1698,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        content_stamps_from_fast, diagnostic_counts, diagnostic_summary,
-        link_typescript_node_modules, local_node_modules, local_typescript_compiler,
-        pre_child_verified_noop, readiness_for_target, reconcile_doctor_source_probe,
+        diagnostic_counts, diagnostic_summary, link_typescript_node_modules, local_node_modules,
+        local_typescript_compiler, readiness_for_target, reconcile_doctor_source_probe,
         text_output_excerpt, typescript_compiler, validate_typescript_package_entrypoints,
-        FastFileStamp, MaterializedTarget, TypeScriptCompiler, VerifiedNoopStamp,
+        MaterializedTarget, TypeScriptCompiler,
     };
-    use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
-    use gnr8::sdk::{Artifact, ReadinessKind, ReadinessTarget};
+    use gnr8_engine::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
+    use gnr8_engine::sdk::{Artifact, ReadinessKind, ReadinessTarget};
     use std::path::PathBuf;
 
     fn temp_root(name: &str) -> PathBuf {
@@ -2525,362 +1716,6 @@ mod tests {
             std::env::temp_dir().join(format!("gnr8-doctor-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         root
-    }
-
-    fn cache_snapshots(
-        root: &std::path::Path,
-    ) -> (Vec<gnr8::sdk::FileStamp>, Vec<gnr8::sdk::FileStamp>) {
-        let config_fast = super::collect_required_config_fast_stamps(root).unwrap();
-        let config = super::content_stamps_from_fast(root, &config_fast).unwrap();
-        let tool = root.join(".gnr8/test-generation-tool");
-        std::fs::write(&tool, "tool-v1").unwrap();
-        let tools = gnr8::sdk::stamp_project_paths(root, std::slice::from_ref(&tool)).unwrap();
-        (config, tools)
-    }
-
-    #[test]
-    fn old_verified_noop_stamp_cannot_bypass_missing_ownership() {
-        let root = temp_root("orphaned-noop-stamp");
-        let cache = root.join(".gnr8/cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        let stamp = VerifiedNoopStamp {
-            cli_version: String::new(),
-            core_version: String::new(),
-            capability_fingerprint: String::new(),
-            artifact_cache_key: "old-key".to_string(),
-            output_anchors: vec!["openapi.yaml".to_string()],
-            artifact_paths: vec!["openapi.yaml".to_string()],
-            input_roots: vec!["src".to_string()],
-            input_fast_files: Vec::new(),
-            output_artifact_fast_files: Vec::new(),
-            output_dir_fast_stamps: Vec::new(),
-            input_files: Vec::new(),
-            source_files: Vec::new(),
-            config_files: Vec::new(),
-            tool_files: Vec::new(),
-            pipeline_files: Vec::new(),
-            pipeline_roots: Vec::new(),
-            output_files: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        std::fs::write(
-            cache.join("verified-noop.json"),
-            serde_json::to_vec(&stamp).unwrap(),
-        )
-        .unwrap();
-
-        assert!(pre_child_verified_noop(&root).is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn content_stamps_detect_same_length_file_edits() {
-        let root = temp_root("content-stamp");
-        let path = root.join("source.go");
-        std::fs::write(&path, "AAAA").unwrap();
-        let metadata = path.metadata().unwrap();
-        let fast = vec![FastFileStamp {
-            path: "source.go".to_string(),
-            len: metadata.len(),
-            modified_ns: super::fast_modified_ns(&metadata),
-        }];
-        let before = content_stamps_from_fast(&root, &fast).unwrap();
-
-        std::fs::write(&path, "BBBB").unwrap();
-        let after = content_stamps_from_fast(&root, &fast).unwrap();
-
-        assert_ne!(before[0].hash, after[0].hash);
-        assert_eq!(before[0].len, after[0].len);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_noop_temp_cleanup_removes_only_exact_private_names() {
-        let root = temp_root("verified-noop-temp-cleanup");
-        let cache = root.join(".gnr8/cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        let stale = cache.join(".verified-noop-123-4.tmp");
-        let unrelated = cache.join(".verified-noop-not-ours.tmp");
-        std::fs::write(&stale, b"stale").unwrap();
-        std::fs::write(&unrelated, b"keep").unwrap();
-
-        super::cleanup_verified_noop_temporary_files(&root).unwrap();
-
-        assert!(!stale.exists());
-        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_noop_publication_atomically_replaces_an_existing_stamp() {
-        let root = temp_root("verified-noop-replace");
-        let stamp = root.join(".gnr8/cache/verified-noop.json");
-        std::fs::create_dir_all(stamp.parent().unwrap()).unwrap();
-        std::fs::write(&stamp, b"old").unwrap();
-
-        super::publish_verified_noop_stamp(&stamp, b"new").unwrap();
-
-        assert_eq!(std::fs::read(&stamp).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn hot_noop_config_scan_fails_closed_when_required_sources_are_missing() {
-        let root = temp_root("missing-config-source");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::remove_dir_all(root.join(".gnr8/src")).unwrap();
-
-        assert!(super::collect_required_config_fast_stamps(&root).is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_noop_stamp_is_not_published_for_a_different_source_snapshot() {
-        let root = temp_root("source-snapshot-changed");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::create_dir_all(root.join("service")).unwrap();
-        let input = root.join("service/input.go");
-        std::fs::write(&input, "version-a").unwrap();
-        let child_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&input)).unwrap();
-        let (config_stamps, tool_stamps) = cache_snapshots(&root);
-        std::fs::create_dir_all(root.join("generated")).unwrap();
-        let output = root.join("generated/client.go");
-        std::fs::write(&output, "generated").unwrap();
-        let output_hash = gnr8::manifest::blake3_hex(b"generated");
-        let mut manifest = gnr8::manifest::Manifest::default();
-        manifest.record("generated/client.go", &output_hash, "generated");
-        manifest.save(&root.join(".gnr8")).unwrap();
-        let bundle = gnr8::runner::ArtifactBundle {
-            protocol_version: gnr8::runner::PROTOCOL_VERSION,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            core_version: env!("CARGO_PKG_VERSION").to_string(),
-            capability_fingerprint: String::new(),
-            artifacts: vec![Artifact::new("generated/client.go", "generated")],
-            diagnostics: Vec::new(),
-            output_anchors: vec!["generated".to_string()],
-            readiness_targets: Vec::new(),
-            artifact_cache_key: Some("snapshot-key".to_string()),
-            cache_input_roots: vec!["service".to_string()],
-            cache_input_stamps: child_stamps,
-            cache_config_stamps: config_stamps,
-            cache_config_complete: true,
-            cache_pipeline_stamps: Vec::new(),
-            cache_pipeline_roots: Vec::new(),
-            cache_pipeline_complete: true,
-            cache_tool_stamps: tool_stamps,
-        };
-        let outcome = gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: vec!["generated/client.go".to_string()],
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        };
-
-        std::fs::write(&input, "version-b").unwrap();
-        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
-
-        assert!(!super::verified_noop_stamp_path(&root).exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn arbitrary_runtime_inputs_keep_the_pre_child_noop_disabled() {
-        let root = temp_root("static-input-invalidates-noop");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::create_dir_all(root.join("service")).unwrap();
-        let source = root.join("service/input.go");
-        std::fs::write(&source, "stable-source").unwrap();
-        let source_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&source)).unwrap();
-        let (config_stamps, tool_stamps) = cache_snapshots(&root);
-        std::fs::create_dir_all(root.join("assets")).unwrap();
-        let static_input = root.join("assets/template.txt");
-        std::fs::write(&static_input, "version-a").unwrap();
-        let pipeline_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&static_input)).unwrap();
-        std::fs::create_dir_all(root.join("generated")).unwrap();
-        std::fs::write(root.join("generated/template.txt"), "version-a").unwrap();
-        let output_hash = gnr8::manifest::blake3_hex(b"version-a");
-        let mut manifest = gnr8::manifest::Manifest::default();
-        manifest.record("generated/template.txt", &output_hash, "generated");
-        manifest.save(&root.join(".gnr8")).unwrap();
-        let bundle = gnr8::runner::ArtifactBundle {
-            protocol_version: gnr8::runner::PROTOCOL_VERSION,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            core_version: env!("CARGO_PKG_VERSION").to_string(),
-            capability_fingerprint: gnr8::runner::capability_fingerprint(),
-            artifacts: vec![Artifact::new("generated/template.txt", "version-a")],
-            diagnostics: Vec::new(),
-            output_anchors: vec!["generated".to_string()],
-            readiness_targets: Vec::new(),
-            artifact_cache_key: Some("static-input-key".to_string()),
-            cache_input_roots: vec!["service".to_string()],
-            cache_input_stamps: source_stamps,
-            cache_config_stamps: config_stamps,
-            cache_config_complete: true,
-            cache_pipeline_stamps: pipeline_stamps,
-            cache_pipeline_roots: vec!["assets".to_string()],
-            cache_pipeline_complete: true,
-            cache_tool_stamps: tool_stamps,
-        };
-        let outcome = gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: vec!["generated/template.txt".to_string()],
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        };
-
-        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
-        assert!(super::pre_child_verified_noop(&root).is_none());
-
-        std::fs::write(root.join("assets/added.txt"), "new-static-input").unwrap();
-        assert!(super::pre_child_verified_noop(&root).is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pure_file_backed_pipeline_still_runs_child_without_whole_config_contract() {
-        let root = temp_root("empty-pipeline-inputs-noop");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::create_dir_all(root.join("service")).unwrap();
-        let source = root.join("service/input.yaml");
-        std::fs::write(&source, "openapi: 3.1.0\n").unwrap();
-        let source_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&source)).unwrap();
-        let (config_stamps, tool_stamps) = cache_snapshots(&root);
-        std::fs::create_dir_all(root.join("generated")).unwrap();
-        std::fs::write(root.join("generated/openapi.yaml"), "openapi: 3.1.0\n").unwrap();
-        let output_hash = gnr8::manifest::blake3_hex(b"openapi: 3.1.0\n");
-        let mut manifest = gnr8::manifest::Manifest::default();
-        manifest.record("generated/openapi.yaml", &output_hash, "generated");
-        manifest.save(&root.join(".gnr8")).unwrap();
-        let bundle = gnr8::runner::ArtifactBundle {
-            protocol_version: gnr8::runner::PROTOCOL_VERSION,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            core_version: env!("CARGO_PKG_VERSION").to_string(),
-            capability_fingerprint: gnr8::runner::capability_fingerprint(),
-            artifacts: vec![Artifact::new("generated/openapi.yaml", "openapi: 3.1.0\n")],
-            diagnostics: Vec::new(),
-            output_anchors: vec!["generated".to_string()],
-            readiness_targets: Vec::new(),
-            artifact_cache_key: Some("empty-pipeline-key".to_string()),
-            cache_input_roots: vec!["service".to_string()],
-            cache_input_stamps: source_stamps,
-            cache_config_stamps: config_stamps,
-            cache_config_complete: true,
-            cache_pipeline_stamps: Vec::new(),
-            cache_pipeline_roots: Vec::new(),
-            cache_pipeline_complete: true,
-            cache_tool_stamps: tool_stamps,
-        };
-        let outcome = gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: vec!["generated/openapi.yaml".to_string()],
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        };
-
-        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
-        assert!(super::pre_child_verified_noop(&root).is_none());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_noop_stamp_is_not_published_for_a_different_output_snapshot() {
-        let root = temp_root("output-snapshot-changed");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::create_dir_all(root.join("service")).unwrap();
-        let input = root.join("service/input.go");
-        std::fs::write(&input, "stable-source").unwrap();
-        let child_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&input)).unwrap();
-        let (config_stamps, tool_stamps) = cache_snapshots(&root);
-        std::fs::create_dir_all(root.join("generated")).unwrap();
-        std::fs::write(root.join("generated/client.go"), "newer-output").unwrap();
-        let newer_hash = gnr8::manifest::blake3_hex(b"newer-output");
-        let mut manifest = gnr8::manifest::Manifest::default();
-        manifest.record("generated/client.go", &newer_hash, "generated");
-        manifest.save(&root.join(".gnr8")).unwrap();
-        let bundle = gnr8::runner::ArtifactBundle {
-            protocol_version: gnr8::runner::PROTOCOL_VERSION,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            core_version: env!("CARGO_PKG_VERSION").to_string(),
-            capability_fingerprint: String::new(),
-            artifacts: vec![Artifact::new("generated/client.go", "older-output")],
-            diagnostics: Vec::new(),
-            output_anchors: vec!["generated".to_string()],
-            readiness_targets: Vec::new(),
-            artifact_cache_key: Some("snapshot-key".to_string()),
-            cache_input_roots: vec!["service".to_string()],
-            cache_input_stamps: child_stamps,
-            cache_config_stamps: config_stamps,
-            cache_config_complete: true,
-            cache_pipeline_stamps: Vec::new(),
-            cache_pipeline_roots: Vec::new(),
-            cache_pipeline_complete: true,
-            cache_tool_stamps: tool_stamps,
-        };
-        let outcome = gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: vec!["generated/client.go".to_string()],
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        };
-
-        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
-
-        assert!(!super::verified_noop_stamp_path(&root).exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn verified_noop_stamp_is_not_published_for_a_different_config_snapshot() {
-        let root = temp_root("config-snapshot-changed");
-        gnr8::workspace::init(&root).unwrap();
-        std::fs::create_dir_all(root.join("service")).unwrap();
-        let input = root.join("service/input.go");
-        std::fs::write(&input, "stable-source").unwrap();
-        let child_stamps =
-            gnr8::sdk::stamp_project_paths(&root, std::slice::from_ref(&input)).unwrap();
-        let (config_stamps, tool_stamps) = cache_snapshots(&root);
-        std::fs::create_dir_all(root.join("generated")).unwrap();
-        std::fs::write(root.join("generated/client.go"), "generated").unwrap();
-        let output_hash = gnr8::manifest::blake3_hex(b"generated");
-        let mut manifest = gnr8::manifest::Manifest::default();
-        manifest.record("generated/client.go", &output_hash, "generated");
-        manifest.save(&root.join(".gnr8")).unwrap();
-        let bundle = gnr8::runner::ArtifactBundle {
-            protocol_version: gnr8::runner::PROTOCOL_VERSION,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            core_version: env!("CARGO_PKG_VERSION").to_string(),
-            capability_fingerprint: gnr8::runner::capability_fingerprint(),
-            artifacts: vec![Artifact::new("generated/client.go", "generated")],
-            diagnostics: Vec::new(),
-            output_anchors: vec!["generated".to_string()],
-            readiness_targets: Vec::new(),
-            artifact_cache_key: Some("snapshot-key".to_string()),
-            cache_input_roots: vec!["service".to_string()],
-            cache_input_stamps: child_stamps,
-            cache_config_stamps: config_stamps,
-            cache_config_complete: true,
-            cache_pipeline_stamps: Vec::new(),
-            cache_pipeline_roots: Vec::new(),
-            cache_pipeline_complete: true,
-            cache_tool_stamps: tool_stamps,
-        };
-        let outcome = gnr8::lifecycle::GenerateOutcome {
-            written: Vec::new(),
-            unchanged: vec!["generated/client.go".to_string()],
-            skipped: Vec::new(),
-            deleted: Vec::new(),
-        };
-
-        std::fs::write(root.join(".gnr8/src/main.rs"), "fn main() {}\n").unwrap();
-        super::save_verified_noop_stamp_from_artifacts(&root, &bundle, &outcome);
-
-        assert!(!super::verified_noop_stamp_path(&root).exists());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

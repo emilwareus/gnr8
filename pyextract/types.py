@@ -1,6 +1,6 @@
 """Annotation AST -> neutral Type dict — the Python twin of goextract's type extract.
 
-The neutral vocabulary is byte-fixed by ``crates/gnr8-core/src/analyze/facts.rs``
+The neutral vocabulary is byte-fixed by ``crates/gnr8-sdk/src/facts.rs``
 (``Type`` / ``Prim``), and the mapping table by the committed FastAPI snapshot:
 
   * ``str`` -> ``{"type":"primitive","of":{"prim":"string"}}``

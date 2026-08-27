@@ -23,12 +23,12 @@ The release-readiness work added or strengthened these executable contracts:
   dependency injection are covered by extractor tests.
 - NestJS `Promise<T>`, `Promise<T[]>`, and direct array responses are covered by extractor tests.
 - Go SDK `float64` width and nullable string JSON behavior have regression coverage.
-- Doctor treats error-severity extraction diagnostics as actionable and retains the detailed child
+- Doctor treats error-severity extraction diagnostics as actionable and retains the detailed worker
   error. Unknown handlers, missing response facts, and Go package-load errors emit `ERROR` diagnostics.
 - TypeScript scalar-array query parameters use repeated keys; required headers/cookies stay out of
   the URL, and `allowReserved` is verified by a generated-client runtime test. Structured query
   shapes without an explicit wire encoding fail generation.
-- The host supplies the complete protocol/version/capability handshake before the child begins
+- The host supplies the complete protocol/version/capability handshake before the worker begins
   extraction or generation.
 
 ## Checks run in this workspace

@@ -17,7 +17,7 @@ gnr8 init --source nestjs --sdk typescript
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))
             .transform(SetBasePath::new("/api"))

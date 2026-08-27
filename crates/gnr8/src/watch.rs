@@ -42,11 +42,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use gnr8::lifecycle::GenerateOutcome;
+use gnr8_engine::lifecycle::GenerateOutcome;
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
-use crate::child;
+use gnr8_engine::worker::WorkerPolicy;
 
 /// One regeneration's latency + counts — the `--json` shape for WATCH-03.
 ///
@@ -99,7 +99,7 @@ impl LatencyReport {
 /// `true` when EITHER the path is a source file in the DETECTED source language (extension == `source_ext`,
 /// e.g. `go`/`py`/`ts`) that is NOT a gnr8 output and NOT under `.gnr8/` (a real API change), OR it is a
 /// `*.rs` file under `gnr8_src` (the pipeline crate's source — the user edited the config). `source_ext`
-/// is threaded in by the caller from the SINGLE `gnr8::analyze::source_toolchain` decision over the
+/// is threaded in by the caller from the SINGLE `gnr8_engine::analyze::source_toolchain` decision over the
 /// source dir (XLANG-04) — this pure function never re-derives it, so there is no second source of truth
 /// and no per-extension fallback (CLAUDE.md rule 3). `output_set` holds gnr8's own outputs + the
 /// `.gnr8/target`/`.gnr8/cache` dirs; anything under one of those is gnr8's own write and returns `false`
@@ -228,7 +228,7 @@ fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
 
     // Fold in every manifest-recorded output path (the exact files gnr8 last wrote). The manifest lives
     // under `.gnr8/`; absent/corrupt → the two dirs above still hold the loop-safety floor (no panic).
-    if let Ok(manifest) = gnr8::manifest::load(&gnr8) {
+    if let Ok(manifest) = gnr8_engine::manifest::load(&gnr8) {
         for entry in &manifest.files {
             set.insert(canonicalize_or_keep(&project_root.join(&entry.path)));
         }
@@ -258,6 +258,7 @@ fn build_output_set(project_root: &Path) -> HashSet<PathBuf> {
 pub(crate) fn run(
     project_root: &Path,
     debounce: Duration,
+    policy: WorkerPolicy,
     json: bool,
     verbose: u8,
 ) -> anyhow::Result<()> {
@@ -269,7 +270,7 @@ pub(crate) fn run(
     // root (the `.gnr8/` crate is excluded from that scan in core — Open Q2). One decision, no
     // per-extension fallback (CLAUDE.md rule 3); an undetectable/ambiguous source fails startup loudly
     // via the anyhow boundary rather than watching the wrong (or every) extension.
-    let source_ext = gnr8::analyze::source_toolchain(&project_root.to_string_lossy())
+    let source_ext = gnr8_engine::analyze::source_toolchain(&project_root.to_string_lossy())
         .map(|tc| tc.source_extension().to_string())
         .with_context(|| {
             format!(
@@ -349,6 +350,7 @@ pub(crate) fn run(
                 regenerate_and_report(
                     scenario_for_trigger_count(triggers),
                     project_root,
+                    policy,
                     json,
                     verbose,
                 );
@@ -367,20 +369,35 @@ pub(crate) fn run(
     Ok(())
 }
 
-/// Run the child pipeline once and apply the write machinery, returning the [`GenerateOutcome`].
+/// Run the project's pipeline once and apply the write machinery, returning the [`GenerateOutcome`].
 ///
-/// The single regeneration path shared by the cold run and each watch tick: `child::run_child(__emit)`
-/// then `lifecycle::regenerate`. Errors propagate as a typed `CoreError` for the caller to log/surface.
-fn regenerate_once(project_root: &Path) -> Result<GenerateOutcome, gnr8::CoreError> {
-    let mut bundle = child::run_child(project_root, "__emit")?;
-    crate::regenerate_bundle(project_root, &mut bundle, false)
+/// The single regeneration path shared by the cold run and each watch tick. One worker session per
+/// tick: starting a prebuilt binary costs a process spawn, and the build itself is already skipped
+/// whenever `.gnr8/` is unchanged, so a resident worker would add invalidation state for no gain.
+fn regenerate_once(
+    project_root: &Path,
+    policy: WorkerPolicy,
+) -> Result<GenerateOutcome, gnr8_engine::CoreError> {
+    let run = gnr8_engine::worker::run_pipeline(project_root, policy)?;
+    gnr8_engine::lifecycle::regenerate_with_anchors(
+        project_root,
+        &run.outcome.artifacts,
+        &run.outcome.output_anchors,
+        false,
+    )
 }
 
 /// Time one regeneration and print its latency line (human or `--json`). A regeneration error is logged
 /// to stderr and the loop continues (a transient pipeline failure must not kill a long-running watch).
-fn regenerate_and_report(scenario: &str, project_root: &Path, json: bool, verbose: u8) {
+fn regenerate_and_report(
+    scenario: &str,
+    project_root: &Path,
+    policy: WorkerPolicy,
+    json: bool,
+    verbose: u8,
+) {
     let t0 = Instant::now();
-    match regenerate_once(project_root) {
+    match regenerate_once(project_root, policy) {
         Ok(outcome) => {
             let elapsed = t0.elapsed();
             for path in &outcome.skipped {
@@ -428,9 +445,15 @@ fn print_report(report: &LatencyReport, json: bool, verbose: u8, outcome: &Gener
 /// Propagates a regeneration error (missing `.gnr8/`, a pipeline compile/run error, a missing Go
 /// toolchain) so startup fails loudly via the anyhow boundary rather than entering a watch loop with
 /// stale/absent outputs.
-pub(crate) fn cold_regenerate(project_root: &Path, json: bool, verbose: u8) -> anyhow::Result<()> {
+pub(crate) fn cold_regenerate(
+    project_root: &Path,
+    policy: WorkerPolicy,
+    json: bool,
+    verbose: u8,
+) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    let outcome = regenerate_once(project_root).context("initial (cold) regeneration failed")?;
+    let outcome =
+        regenerate_once(project_root, policy).context("initial (cold) regeneration failed")?;
     let elapsed = t0.elapsed();
     for path in &outcome.skipped {
         eprintln!(

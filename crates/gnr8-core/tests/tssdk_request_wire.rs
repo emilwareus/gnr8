@@ -32,7 +32,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn parameter_graph() -> gnr8::graph::ApiGraph {
+fn parameter_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "wire.test",
@@ -105,7 +105,7 @@ fn parameter_graph() -> gnr8::graph::ApiGraph {
     .expect("request parameter graph must deserialize")
 }
 
-fn response_graph() -> gnr8::graph::ApiGraph {
+fn response_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "response.test",
@@ -331,10 +331,10 @@ fn generated_typescript_request_parameters_match_the_wire_contract() {
     }
 
     let graph = parameter_graph();
-    let bundle = gnr8::tssdk::generate(&graph, "wireapi", &graph.base_path)
+    let bundle = gnr8_engine::tssdk::generate(&graph, "wireapi", &graph.base_path)
         .expect("generate TypeScript request-wire SDK");
     let dir = unique_temp_dir("request");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
     std::fs::write(dir.join("driver.ts"), DRIVER).expect("write TypeScript driver");
 
     let mut compile = Command::new("node");
@@ -383,10 +383,10 @@ fn generated_typescript_response_decoder_reports_stable_context() {
     }
 
     let graph = response_graph();
-    let bundle = gnr8::tssdk::generate(&graph, "responseapi", &graph.base_path)
+    let bundle = gnr8_engine::tssdk::generate(&graph, "responseapi", &graph.base_path)
         .expect("generate TypeScript response SDK");
     let dir = unique_temp_dir("response");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TypeScript SDK");
     std::fs::write(dir.join("driver.ts"), RESPONSE_DRIVER).expect("write response driver");
 
     let mut compile = Command::new("node");

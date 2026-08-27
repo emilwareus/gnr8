@@ -329,7 +329,7 @@ fn type_references_any(ty: &Type, ids: &BTreeSet<String>) -> bool {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use super::ApiGraph;
+    use super::{for_generation, ApiGraph};
     use crate::graph::Type;
 
     fn graph_with_unwired_parent() -> ApiGraph {
@@ -453,7 +453,7 @@ mod tests {
                   "span": { "file": "/root/models.go", "start_line": 2, "end_line": 2 }
                 }"#,
         );
-        let error = graph.project_for_generation().unwrap_err().to_string();
+        let error = for_generation(&graph).unwrap_err().to_string();
         assert!(
             error.contains("duplicate public name \"SharedInput\""),
             "the collision has to name the schema a rename would fix: {error}"
@@ -472,7 +472,7 @@ mod tests {
                   "span": { "file": "/root/models.go", "start_line": 2, "end_line": 2 }
                 }"#,
         );
-        let error = graph.project_for_generation().unwrap_err().to_string();
+        let error = for_generation(&graph).unwrap_err().to_string();
         assert!(
             error.contains("duplicate internal id \"app.Shared::input\""),
             "the collision has to name the id a rename would fix: {error}"
@@ -528,7 +528,7 @@ mod tests {
             },
         });
 
-        let projected = graph.project_for_generation().unwrap();
+        let projected = for_generation(&graph).unwrap();
         let param = projected
             .operations
             .iter()
@@ -550,9 +550,8 @@ mod tests {
 
     #[test]
     fn an_unwired_parent_uses_input_references_when_its_child_splits_elsewhere() {
-        let projected = graph_with_unwired_parent()
-            .project_for_generation()
-            .unwrap();
+        let source = graph_with_unwired_parent();
+        let projected = for_generation(&source).unwrap();
         let parent = projected
             .schemas
             .iter()

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gnr8::sdk::prelude::*;
+use gnr8_engine::sdk::prelude::*;
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -80,16 +80,15 @@ fn generate_paginated() -> BTreeMap<String, String> {
 fn run_pipeline(label: &str, pipeline: Pipeline) -> BTreeMap<String, String> {
     let root = temp_dir(label);
     std::fs::copy(Path::new(FIXTURE), root.join("openapi.yaml")).expect("copy fixture");
-    let outcome = pipeline
+    let pipeline = pipeline
         .source(OpenApi::new().input("openapi.yaml"))
         .target(GoSdk::new().module("github.com/acme/fixture").to("go"))
         .target(PySdk::new().module("acme-fixture").to("python"))
-        .target(TsSdk::new().module("@acme/fixture").to("ts"))
-        .run(&Cx::new(&root))
+        .target(TsSdk::new().module("@acme/fixture").to("ts"));
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root))
         .expect("pipeline must generate");
     let files = outcome
         .artifacts
-        .files()
         .iter()
         .map(|artifact| (artifact.path.clone(), artifact.text.clone()))
         .collect();
@@ -272,14 +271,13 @@ fn typescript_and_python_keep_language_native_identifiers() {
 fn openapi_document_is_unchanged_by_go_identifier_spelling() {
     let root = temp_dir("openapi");
     std::fs::copy(Path::new(FIXTURE), root.join("openapi.yaml")).expect("copy fixture");
-    let outcome = Pipeline::new()
+    let pipeline = Pipeline::new()
         .source(OpenApi::new().input("openapi.yaml"))
-        .target(OpenApi31::new().to("out.yaml"))
-        .run(&Cx::new(&root))
+        .target(OpenApi31::new().to("out.yaml"));
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root))
         .expect("pipeline must generate");
     let document = outcome
         .artifacts
-        .files()
         .iter()
         .find(|artifact| artifact.path == "out.yaml")
         .expect("openapi artifact")

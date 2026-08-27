@@ -1,7 +1,8 @@
 //! gnr8 generation lifecycle for the NestJS bookstore example. This file IS the config — edit it to
 //! adapt how the API is parsed and how the OpenAPI document + TypeScript SDK are generated. It is an
-//! ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 runner; the runner parses
-//! argv (`__emit` / `__inspect`) and prints a JSON bundle to stdout.
+//! ordinary Rust binary that composes a `Pipeline` and hands it to the gnr8 worker runtime. The
+//! built-in stages below are declarations the installed `gnr8` host executes; only your own stages
+//! run here.
 //!
 //! Run it from the example root so `NestJs::new().inputs(["src"])` analyzes the `src/` tree here:
 //!
@@ -27,7 +28,7 @@
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(NestJs::new().inputs(["src"]))
             .transform(SetTitle::new("Bookstore API"))

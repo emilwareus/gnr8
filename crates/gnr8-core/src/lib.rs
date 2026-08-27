@@ -1,33 +1,20 @@
-//! gnr8 — the generation API used by project-local `.gnr8/` crates.
+//! `gnr8-engine` — the host engine behind the installed `gnr8` CLI.
 //!
-//! The installed `gnr8` CLI scaffolds a small Rust binary crate at `.gnr8/`. That crate depends on
-//! this package, imports [`sdk::prelude`], builds a [`sdk::Pipeline`], and hands it to
-//! [`runner::run`]. The CLI then compiles and runs the local crate, receives the artifact bundle, and
-//! owns writing generated files.
+//! This crate is **not** a dependency of any project. It holds everything the CLI needs and a
+//! project's `.gnr8/` worker must never compile: source extraction and the language sidecars
+//! ([`analyze`]), the direction analysis and generation projection ([`graph`]), `OpenAPI` lowering
+//! ([`lower`]), the Go/Python/TypeScript emitters ([`gosdk`], [`pysdk`], [`tssdk`]), the ownership
+//! manifest and filesystem writer ([`manifest`], [`lifecycle`]), and the two sides of the worker
+//! boundary — stage ordering ([`pipeline`]) and the worker build/session ([`worker`]).
 //!
-//! A typical `.gnr8/src/main.rs`:
+//! The composition surface a user writes against — the API graph, the four stage traits,
+//! [`sdk::Pipeline`], the built-in stage declarations, and the frame protocol — lives in the
+//! published, deliberately thin `gnr8` crate. This crate depends on it and re-exports it through
+//! [`graph`] and [`sdk`], so there is one definition of every node type on both sides of the wire.
 //!
-//! ```no_run
-//! use gnr8::sdk::prelude::*;
-//!
-//! fn main() -> std::process::ExitCode {
-//!     gnr8::runner::run(
-//!         Pipeline::new()
-//!             .source(FastApi::new().inputs(["."]))
-//!             .transform(SetBasePath::new("/api"))
-//!             .transform(SetTitle::new("Public API"))
-//!             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
-//!             .target(OpenApi31::new().to("generated/openapi.yaml"))
-//!             .target(PySdk::new().module("example.com/public/sdk").to("generated/sdk"))
-//!             .post(Header::generated()),
-//!     )
-//! }
-//! ```
-//!
-//! Supported source stages include [`sdk::builtins::GoGin`], [`sdk::builtins::FastApi`],
-//! [`sdk::builtins::Flask`], and [`sdk::builtins::NestJs`]. Supported generation targets include
-//! [`sdk::builtins::OpenApi31`], [`sdk::builtins::GoSdk`], [`sdk::builtins::PySdk`], and
-//! [`sdk::builtins::TsSdk`].
+//! A built-in stage is a *declaration*: `GoGin::new().inputs(["."])` records what to do, and
+//! `crate::sdk::builtins` is where that declaration becomes work. Everything a user wrote themselves
+//! runs in their worker process instead, reached through [`pipeline::StageRunner`].
 //!
 //! For agent-facing CLI workflows, run `gnr8 guide` or start with the
 //! <https://github.com/emilwareus/gnr8/blob/main/docs/agents/index.md> task index.
@@ -46,16 +33,16 @@ pub mod graph;
 pub mod lifecycle;
 pub mod lower;
 pub mod manifest;
+pub mod pipeline;
 pub mod pysdk;
 pub mod resource;
-pub mod runner;
 pub mod sdk;
 pub mod tssdk;
+pub mod worker;
 pub mod workspace;
 
-/// Convenience re-export of the code-as-config composition surface (the four traits, `Pipeline`,
-/// `Cx`, `Artifacts`, every built-in, and `SecurityScheme`). The user's `.gnr8` lifecycle imports
-/// `use gnr8::sdk::prelude::*;` (or this alias) and composes a [`sdk::Pipeline`].
+/// Convenience re-export of the code-as-config composition surface, so engine code and tests can
+/// name it the same way a user's pipeline does (`use gnr8::sdk::prelude::*;`).
 pub use sdk::prelude;
 
 /// Stub used by Phase-1 CLI arms and unimplemented seams.

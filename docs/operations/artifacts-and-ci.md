@@ -3,31 +3,52 @@
 
 [Agent docs index](../agents/index.md)
 
-The project-local `.gnr8` binary is an untrusted pure generator. The installed gnr8 CLI validates its
-versioned JSON bundle, computes a safe write plan, and is the only component that mutates application
-outputs.
+The installed gnr8 CLI owns the whole generation run: it analyzes source, executes every built-in
+stage, validates artifact paths, computes a safe write plan, and is the only component that mutates
+application outputs. The project-local `.gnr8` worker contributes exactly one thing — the stages you
+wrote yourself.
 
-## Host/child boundary
+## Host/worker boundary
 
 ```text
 gnr8 host
-  └─ cargo run --quiet --manifest-path .gnr8/Cargo.toml -- __emit
-       └─ Source → Transform → Target → PostProcess
-            └─ JSON ArtifactBundle on stdout
-  └─ validate handshake, paths, ownership, hashes
+  ├─ cargo build --target-dir .gnr8/target      (skipped while .gnr8/ is unchanged)
+  ├─ run .gnr8/target/debug/<pkg>, cwd = project root
+  │    └─ frame: b"GN8F" | len:u32be | BLAKE3(payload):32 | payload:JSON
+  ├─ Hello  ──▶  Ready { protocol, sdk_version, capability_digest, plan }
+  ├─ Source → Transform → Target → PostProcess, executed host-side per the plan
+  │    └─ one frame round trip per Custom(...) stage
+  ├─ Shutdown ──▶ Done
+  ├─ validate artifact paths, ownership, hashes
   └─ write/check plan
 ```
 
-The current bundle protocol is version 5 and carries:
+The frame protocol is version 1 and carries:
 
-- protocol, host CLI, child core version, and capability fingerprint;
+- the ordered stage plan: built-in declarations inline, custom stages by index and label;
+- the graph snapshot for a custom transform or target, and the artifact set for a custom target or
+  post-processor;
 - sorted artifacts with producer/ownership/rewrite history;
-- structured diagnostics, target output anchors, and explicitly declared readiness targets;
-- source, configuration, and tool snapshots used to reject inputs that change during a run.
+- structured diagnostics, target output anchors, and explicitly declared readiness targets.
 
-Handshake environment variables are `GNR8_HOST_PROTOCOL_VERSION`, `GNR8_HOST_CLI_VERSION`, and
-`GNR8_HOST_CAPABILITY_FINGERPRINT`. A mismatch fails before output is trusted and instructs the user
-to align the installed CLI with `.gnr8/Cargo.lock`.
+Every frame is BLAKE3-digest-checked and bounded at 64 MiB. The handshake compares protocol version,
+exact gnr8 version, and a capability digest; a mismatch fails before output is trusted and instructs
+the user to align the installed CLI with `.gnr8/Cargo.toml`. A manifest that pins a pre-0.9 `gnr8` is
+refused before anything is compiled, with `gnr8 init --upgrade` as the one-shot fix.
+
+### Worker reuse and cargo
+
+`.gnr8/cache/worker.json` records a fingerprint over every file under `.gnr8/` (excluding `target/`
+and `cache/`), the host executable's own content hash, and the protocol constants — plus the built
+binary's length and hash. When all of that matches, that binary **is** the build output of those
+inputs, so cargo is not invoked at all. `gnr8 generate -v` reports `worker: reused` or `worker: built`.
+
+### Trust
+
+Building and running `.gnr8/` compiles and executes Rust from the repository — `build.rs`, proc macros,
+and the pipeline's `main()` — with the invoking user's privileges. **It is not sandboxed.** Use
+`--no-build` to refuse cargo, or `--no-execute` to refuse both building and running; `gnr8 inspect
+routes <path>` analyzes a source tree without touching `.gnr8/`.
 
 ## Artifact ownership inside the pipeline
 

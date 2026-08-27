@@ -27,9 +27,9 @@ use serde::{Deserialize, Serialize};
 /// The top-level facts document for one analyzed module.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GoFacts {
+pub struct GoFacts {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
-    pub(crate) module: String,
+    pub module: String,
     /// The toolchain identity the SIDECAR BINARY itself was built with (e.g. `"go1.27.0"`).
     ///
     /// Not the same fact as the toolchain the analyzed module selects. A sidecar can only
@@ -41,57 +41,57 @@ pub(crate) struct GoFacts {
     /// `#[serde(default)]` keeps a sidecar that does not report one parseable under
     /// `deny_unknown_fields`; an empty value means "not reported", and the comparison is skipped.
     #[serde(default)]
-    pub(crate) extractor_toolchain: String,
+    pub extractor_toolchain: String,
     /// HTTP routes.
-    pub(crate) routes: Vec<RouteFact>,
+    pub routes: Vec<RouteFact>,
     /// Extracted named schemas (objects + enums), sorted by id by the sidecar.
-    pub(crate) schemas: Vec<SchemaFact>,
+    pub schemas: Vec<SchemaFact>,
     /// Analysis diagnostics (lossy/unsupported patterns), sorted by the sidecar.
-    pub(crate) diagnostics: Vec<DiagnosticFact>,
+    pub diagnostics: Vec<DiagnosticFact>,
 }
 
 /// One HTTP route, derived PURELY from source code by a sidecar (no annotation source).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteFact {
+pub struct RouteFact {
     /// HTTP method, uppercase (e.g. `"POST"`).
-    pub(crate) method: String,
+    pub method: String,
     /// Code-derived, group-relative, normalized path template (`/`, `/list`,
     /// `/{uuid}`). The dynamic mount/base prefix is not folded here.
-    pub(crate) path: String,
+    pub path: String,
     /// The handler function symbol name (e.g. `"createGoal"`).
-    pub(crate) handler: String,
+    pub handler: String,
     /// Operation id, derived deterministically from the handler symbol in code.
-    pub(crate) operation_id: String,
+    pub operation_id: String,
     /// First sentence of the routed handler's own doc comment, read as plain prose via the source
     /// language's native synopsis convention (CLAUDE.md rule 0.1 category 2). `#[serde(default)]`
     /// keeps a sidecar that does not yet emit it parseable under `deny_unknown_fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) summary: Option<String>,
+    pub summary: Option<String>,
     /// The remainder of that doc comment after the summary sentence, trimmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) description: Option<String>,
+    pub description: Option<String>,
     /// Source-derived route group/tag name, if the source router exposes one statically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) group: Option<String>,
+    pub group: Option<String>,
     /// Source middleware symbols applied before the handler.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) middleware: Vec<String>,
+    pub middleware: Vec<String>,
     /// Path and query parameters.
-    pub(crate) params: Vec<ParamFact>,
+    pub params: Vec<ParamFact>,
     /// The request body schema reference, if a typed body was inferred.
-    pub(crate) request_body: Option<TypeRef>,
+    pub request_body: Option<TypeRef>,
     /// Whether the request body is required when present. Older sidecars omit this; required is the
     /// historical/default behavior.
     #[serde(default = "default_true")]
-    pub(crate) request_body_required: bool,
+    pub request_body_required: bool,
     /// The request body media type when source analysis can infer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) request_body_content_type: Option<String>,
+    pub request_body_content_type: Option<String>,
     /// Responses keyed by HTTP status.
-    pub(crate) responses: Vec<ResponseFact>,
+    pub responses: Vec<ResponseFact>,
     /// Source provenance for the route registration.
-    pub(crate) span: SourceSpan,
+    pub span: SourceSpan,
 }
 
 /// One path or query parameter of a route, derived purely from code. Path params
@@ -99,29 +99,29 @@ pub(crate) struct RouteFact {
 /// no description or enum — those were annotation-only and are gone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ParamFact {
+pub struct ParamFact {
     /// The parameter name (e.g. `"uuid"`, `"cursor"`).
-    pub(crate) name: String,
+    pub name: String,
     /// Where the parameter is read from: `"path"` or `"query"`.
-    pub(crate) location: String,
+    pub location: String,
     /// Whether the parameter is required.
-    pub(crate) required: bool,
+    pub required: bool,
     /// The parameter's type.
-    pub(crate) schema: Type,
+    pub schema: Type,
     /// Source-inferred default value, when a query helper exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) default: Option<LiteralValue>,
+    pub default: Option<LiteralValue>,
     /// Explicit `OpenAPI` serialization style when source/config determines it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) style: Option<String>,
+    pub style: Option<String>,
     /// Explicit `OpenAPI` explode behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) explode: Option<bool>,
+    pub explode: Option<bool>,
     /// Whether reserved characters may remain unescaped in a query value.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) allow_reserved: bool,
+    pub allow_reserved: bool,
     /// Source provenance for the parameter access.
-    pub(crate) span: SourceSpan,
+    pub span: SourceSpan,
 }
 
 fn default_true() -> bool {
@@ -131,21 +131,21 @@ fn default_true() -> bool {
 /// One response of a route keyed by HTTP status.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ResponseFact {
+pub struct ResponseFact {
     /// The HTTP status code (e.g. `201`).
-    pub(crate) status: u16,
+    pub status: u16,
     /// The response body schema reference, if a typed body was inferred.
-    pub(crate) body: Option<TypeRef>,
+    pub body: Option<TypeRef>,
     /// The response body kind: `"json"` for schema-backed JSON responses, `"binary"` for file/bytes,
     /// `"sse"` for event streams, and `"empty"` for bodyless responses.
     #[serde(default = "default_response_body_kind")]
-    pub(crate) body_kind: String,
+    pub body_kind: String,
     /// Optional response media type, used primarily for binary/file responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) content_type: Option<String>,
+    pub content_type: Option<String>,
     /// Response media types, used by custom targets that need first-class raw/binary metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) content_types: Vec<String>,
+    pub content_types: Vec<String>,
 }
 
 fn default_response_body_kind() -> String {
@@ -158,15 +158,15 @@ fn default_response_body_kind() -> String {
 /// discriminant (a new kind of named type is a compile error, not a magic string).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SchemaFact {
+pub struct SchemaFact {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
-    pub(crate) id: String,
+    pub id: String,
     /// The declared type's name (e.g. `"CreateGoalInput"`).
-    pub(crate) name: String,
+    pub name: String,
     /// The schema body — typically [`Type::Object`] or [`Type::Enum`].
-    pub(crate) body: Type,
+    pub body: Type,
     /// Source provenance for the type declaration.
-    pub(crate) span: SourceSpan,
+    pub span: SourceSpan,
 }
 
 /// One field of an object schema.
@@ -475,41 +475,41 @@ fn is_false(value: &bool) -> bool {
 /// A reference to a schema by its stable id.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TypeRef {
+pub struct TypeRef {
     /// The referenced schema id.
-    pub(crate) ref_id: String,
+    pub ref_id: String,
 }
 
 /// One diagnostic (lossy/unsupported pattern) with a source location (D-10).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DiagnosticFact {
+pub struct DiagnosticFact {
     /// Stable dotted diagnostic identity.
     #[serde(default = "default_diagnostic_code")]
-    pub(crate) code: String,
+    pub code: String,
     /// Severity, `"INFO"`, `"WARN"`, or `"ERROR"`.
-    pub(crate) severity: String,
+    pub severity: String,
     /// Stable diagnostic category.
     #[serde(default = "default_diagnostic_category")]
-    pub(crate) category: DiagnosticCategoryFact,
+    pub category: DiagnosticCategoryFact,
     /// The human-readable message (rule + identity).
-    pub(crate) message: String,
+    pub message: String,
     /// The source file the diagnostic applies to.
-    pub(crate) file: String,
+    pub file: String,
     /// The 1-based line number.
-    pub(crate) line: u32,
+    pub line: u32,
     /// The inclusive 1-based end line; defaults to `line` when absent.
     #[serde(default)]
-    pub(crate) end_line: u32,
+    pub end_line: u32,
     /// HTTP operation identity when the diagnostic belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) operation: Option<String>,
+    pub operation: Option<String>,
     /// Schema identity when the diagnostic belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) schema: Option<String>,
+    pub schema: Option<String>,
     /// Parameter, field, or other narrow subject identity when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) subject: Option<String>,
+    pub subject: Option<String>,
 }
 
 /// Closed diagnostic categories accepted from language sidecars.
@@ -518,7 +518,7 @@ pub(crate) struct DiagnosticFact {
 /// be silently relabeled as `source` while crossing the sidecar boundary.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DiagnosticCategoryFact {
+pub enum DiagnosticCategoryFact {
     Source,
     RequestParameter,
     RequestBody,
@@ -542,13 +542,13 @@ fn default_diagnostic_category() -> DiagnosticCategoryFact {
 /// Also derives `Serialize` because it flows into the graph serialization.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SourceSpan {
+pub struct SourceSpan {
     /// The source file path.
-    pub(crate) file: String,
+    pub file: String,
     /// The 1-based start line.
-    pub(crate) start_line: u32,
+    pub start_line: u32,
     /// The 1-based end line.
-    pub(crate) end_line: u32,
+    pub end_line: u32,
 }
 
 #[cfg(test)]
@@ -610,7 +610,7 @@ mod tests {
 
     mod go_facts {
         use super::SAMPLE;
-        use crate::analyze::facts::{GoFacts, Prim, Type, WellKnown};
+        use crate::facts::{GoFacts, Prim, Type, WellKnown};
 
         #[test]
         fn deserializes_sample_facts_without_error() {
@@ -784,7 +784,7 @@ mod tests {
     }
 
     mod axes {
-        use crate::analyze::facts::{GoFacts, Type};
+        use crate::facts::{GoFacts, Type};
 
         // Build a one-object-schema facts doc with a single field carrying the
         // given optional/nullable axes, so each combination can be asserted.
@@ -858,7 +858,7 @@ mod tests {
     /// `security_schemes` and no param `description`/`enum_values` — those were
     /// annotation facts and have been removed (CLAUDE.md rules 1, 3 & 4).
     mod route_facts {
-        use crate::analyze::facts::GoFacts;
+        use crate::facts::GoFacts;
 
         const ROUTE: &[u8] = br#"{
           "module": "github.com/acme/svc",
@@ -915,7 +915,7 @@ mod tests {
             assert!(uuid.required);
             assert!(matches!(
                 uuid.schema,
-                crate::analyze::facts::Type::WellKnown(crate::analyze::facts::WellKnown::Uuid)
+                crate::facts::Type::WellKnown(crate::facts::WellKnown::Uuid)
             ));
         }
 

@@ -1,5 +1,10 @@
 # SDK Generation Performance Notes
 
+> **Historical.** Every number below was measured against the pre-0.9 boundary, where `gnr8 generate`
+> ran `cargo run -- __emit` against a child that linked the whole engine. gnr8 0.9.0 replaced that
+> with a thin SDK and a prebuilt worker; these figures are kept as the record they were taken as, not
+> as a description of current behaviour.
+
 Date: 2026-06-26
 
 Benchmark target: a large Go API with split Go, Python, and TypeScript SDK output. Project names and paths are intentionally omitted.

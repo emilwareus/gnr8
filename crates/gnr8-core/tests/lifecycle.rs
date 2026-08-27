@@ -3,8 +3,8 @@
 //! (`regenerate`/`plan_only`) fed SYNTHETIC artifacts — plus the naming-override `$ref` rewrites.
 //!
 //! Config is now CODE: the host no longer extracts/lowers/generates in-process — the user's `.gnr8/`
-//! child crate (the Pipeline) does. So these tests drive the host's WRITE half directly with synthetic
-//! [`gnr8::sdk::Artifact`]s (no Go toolchain, no child process needed); the full host→child→write
+//! worker crate (the Pipeline) does. So these tests drive the host's WRITE half directly with synthetic
+//! [`gnr8_engine::sdk::Artifact`]s (no Go toolchain, no worker process needed); the full host→worker→write
 //! path is exercised by the binary's `generate_e2e` integration test. The naming tests still drive
 //! `apply_naming` + `lower::to_openapi` over the real fixture graph (they require the Go toolchain and
 //! skip gracefully without it).
@@ -23,8 +23,8 @@
 
 use std::path::PathBuf;
 
-use gnr8::sdk::{Artifact, ArtifactMetadata};
-use gnr8::CoreError;
+use gnr8_engine::sdk::Artifact;
+use gnr8_engine::CoreError;
 
 /// Create a UNIQUE temp subdir under `std::env::temp_dir()` (PID + nanosecond timestamp — no
 /// user-supplied path component). No `tempfile` crate (mirrors `tests/sdk_compile.rs`).
@@ -45,13 +45,6 @@ fn artifact(path: &str, text: &str) -> Artifact {
     Artifact::new(path, text)
 }
 
-fn artifact_metadata(path: &str, text: &str) -> ArtifactMetadata {
-    ArtifactMetadata {
-        path: path.to_string(),
-        hash: gnr8::manifest::blake3_hex(text.as_bytes()),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // WS-01 / WS-02 — workspace::init idempotent scaffold of the mandatory .gnr8/ crate
 // ---------------------------------------------------------------------------
@@ -62,7 +55,7 @@ fn artifact_metadata(path: &str, text: &str) -> ArtifactMetadata {
 fn init_scaffolds_workspace() {
     let root = unique_temp_dir("scaffold");
 
-    let outcome = gnr8::workspace::init(&root).expect("init on a fresh dir must succeed");
+    let outcome = gnr8_engine::workspace::init(&root).expect("init on a fresh dir must succeed");
 
     let gnr8 = root.join(".gnr8");
     assert!(gnr8.is_dir(), ".gnr8/ must be created");
@@ -101,7 +94,7 @@ fn init_scaffolds_workspace() {
 #[test]
 fn scaffolded_crate_has_expected_shape() {
     let root = unique_temp_dir("shape");
-    gnr8::workspace::init(&root).expect("init must succeed");
+    gnr8_engine::workspace::init(&root).expect("init must succeed");
 
     let cargo = std::fs::read_to_string(root.join(".gnr8").join("Cargo.toml"))
         .expect("read .gnr8/Cargo.toml");
@@ -126,8 +119,8 @@ fn scaffolded_crate_has_expected_shape() {
         "main.rs must compose a Pipeline:\n{main_rs}"
     );
     assert!(
-        main_rs.contains("gnr8::runner::run"),
-        "main.rs must hand the pipeline to the runner:\n{main_rs}"
+        main_rs.contains("gnr8::worker::run"),
+        "main.rs must hand the pipeline to the worker runtime:\n{main_rs}"
     );
     assert!(
         main_rs.contains("This file IS your gnr8 configuration"),
@@ -143,7 +136,7 @@ fn scaffolded_crate_has_expected_shape() {
 fn init_is_idempotent() {
     let root = unique_temp_dir("idempotent");
 
-    let first = gnr8::workspace::init(&root).expect("first init must succeed");
+    let first = gnr8_engine::workspace::init(&root).expect("first init must succeed");
     assert!(!first.created.is_empty(), "first init must create files");
 
     // User edits src/main.rs — this content must survive a second init.
@@ -151,7 +144,7 @@ fn init_is_idempotent() {
     let user_edit = b"// EDITED PIPELINE\nfn main() {}\n";
     std::fs::write(&main_path, user_edit).expect("user edits src/main.rs");
 
-    let second = gnr8::workspace::init(&root).expect("second init must succeed");
+    let second = gnr8_engine::workspace::init(&root).expect("second init must succeed");
 
     let on_disk = std::fs::read(&main_path).expect("read src/main.rs after second init");
     assert_eq!(
@@ -178,7 +171,7 @@ fn init_is_idempotent() {
 #[test]
 fn gitignore_splits_lifecycle() {
     let root = unique_temp_dir("gitignore");
-    gnr8::workspace::init(&root).expect("init must succeed");
+    gnr8_engine::workspace::init(&root).expect("init must succeed");
 
     let body = std::fs::read_to_string(root.join(".gnr8").join(".gitignore"))
         .expect("read .gnr8/.gitignore");
@@ -193,7 +186,7 @@ fn gitignore_splits_lifecycle() {
     );
     assert_eq!(
         body,
-        gnr8::workspace::GITIGNORE_BODY,
+        gnr8_engine::workspace::GITIGNORE_BODY,
         "written .gitignore must equal the GITIGNORE_BODY constant"
     );
 
@@ -207,8 +200,8 @@ fn gitignore_splits_lifecycle() {
 /// WS-04: `blake3_hex` is a stable 64-char lowercase hex digest — same input ⇒ same digest.
 #[test]
 fn blake3_hex_is_stable() {
-    let a = gnr8::manifest::blake3_hex(b"package goalservice\n");
-    let b = gnr8::manifest::blake3_hex(b"package goalservice\n");
+    let a = gnr8_engine::manifest::blake3_hex(b"package goalservice\n");
+    let b = gnr8_engine::manifest::blake3_hex(b"package goalservice\n");
     assert_eq!(a, b, "same bytes must hash to the same digest");
     assert_eq!(
         a.len(),
@@ -223,7 +216,7 @@ fn blake3_hex_is_stable() {
     );
     assert_ne!(
         a,
-        gnr8::manifest::blake3_hex(b"package other\n"),
+        gnr8_engine::manifest::blake3_hex(b"package other\n"),
         "different bytes must hash differently"
     );
 }
@@ -235,13 +228,13 @@ fn manifest_round_trip() {
     let gnr8 = root.join(".gnr8");
     std::fs::create_dir_all(&gnr8).expect("create .gnr8");
 
-    let mut manifest = gnr8::manifest::Manifest::default();
+    let mut manifest = gnr8_engine::manifest::Manifest::default();
     manifest.record("sdk/client.go", "aaaa", "generated");
     manifest.record("openapi.yaml", "bbbb", "generated");
     manifest.record("sdk/models.go", "cccc", "generated");
     manifest.save(&gnr8).expect("save manifest");
 
-    let loaded = gnr8::manifest::load(&gnr8).expect("load manifest");
+    let loaded = gnr8_engine::manifest::load(&gnr8).expect("load manifest");
     assert_eq!(loaded.recorded_hash("openapi.yaml"), Some("bbbb"));
     assert_eq!(loaded.recorded_hash("sdk/client.go"), Some("aaaa"));
     assert_eq!(loaded.recorded_hash("sdk/models.go"), Some("cccc"));
@@ -267,7 +260,8 @@ fn manifest_absent_loads_empty() {
     let gnr8 = root.join(".gnr8");
     std::fs::create_dir_all(&gnr8).expect("create .gnr8");
 
-    let manifest = gnr8::manifest::load(&gnr8).expect("absent manifest loads as empty default");
+    let manifest =
+        gnr8_engine::manifest::load(&gnr8).expect("absent manifest loads as empty default");
     assert!(
         manifest.files.is_empty(),
         "absent manifest must load with no files"
@@ -287,7 +281,7 @@ fn manifest_corrupt_loads_empty() {
         .expect("write corrupt manifest");
 
     let manifest =
-        gnr8::manifest::load(&root.join(".gnr8")).expect("corrupt manifest loads as empty");
+        gnr8_engine::manifest::load(&root.join(".gnr8")).expect("corrupt manifest loads as empty");
     assert!(
         manifest.files.is_empty(),
         "corrupt manifest must degrade to the empty default, not crash"
@@ -299,7 +293,7 @@ fn manifest_corrupt_loads_empty() {
 /// WS-04 / D-04: `prune_to` drops manifest entries whose path is not in the supplied current set.
 #[test]
 fn manifest_prunes_dropped() {
-    let mut manifest = gnr8::manifest::Manifest::default();
+    let mut manifest = gnr8_engine::manifest::Manifest::default();
     manifest.record("openapi.yaml", "aaaa", "generated");
     manifest.record("sdk/client.go", "bbbb", "generated");
     manifest.record("sdk/dropped.go", "cccc", "generated");
@@ -320,8 +314,8 @@ fn manifest_prunes_dropped() {
 // WS-04 / WATCH-01 — lifecycle: PURE plan_writes truth table (synthetic Artifacts)
 // ---------------------------------------------------------------------------
 
-use gnr8::lifecycle::{self, WriteAction};
-use gnr8::manifest::{blake3_hex, Manifest};
+use gnr8_engine::lifecycle::{self, WriteAction};
+use gnr8_engine::manifest::{blake3_hex, Manifest};
 
 /// Find the action `plan_writes` assigned to `path` (test helper).
 fn action_for<'a>(plan: &'a lifecycle::WritePlan, path: &str) -> &'a WriteAction {
@@ -400,69 +394,6 @@ fn plan_writes_truth_table() {
     assert_eq!(absent.new_hash, blake3_hex(b"NEW"));
 }
 
-#[test]
-fn plan_metadata_writes_truth_table_without_generated_bytes() {
-    let artifacts = vec![
-        artifact_metadata("absent.go", "NEW"),
-        artifact_metadata("noop.go", "SAME"),
-        artifact_metadata("changed.go", "NEW"),
-        artifact_metadata("edited.go", "NEW"),
-        artifact_metadata("adopted.go", "NEW"),
-        artifact_metadata("untracked.go", "NEW"),
-        artifact_metadata("stale-record.go", "NEW"),
-    ];
-
-    let mut manifest = Manifest::default();
-    manifest.record("noop.go", &blake3_hex(b"SAME"), "generated");
-    manifest.record("changed.go", &blake3_hex(b"OLD"), "generated");
-    manifest.record("edited.go", &blake3_hex(b"WHAT-GNR8-WROTE"), "generated");
-    manifest.record("stale-record.go", &blake3_hex(b"OLD"), "generated");
-
-    let on_disk_hash = |path: &str| -> Option<String> {
-        match path {
-            "absent.go" => None,
-            "noop.go" => Some(blake3_hex(b"SAME")),
-            "changed.go" => Some(blake3_hex(b"OLD")),
-            "edited.go" => Some(blake3_hex(b"HUMAN-EDIT")),
-            "adopted.go" | "stale-record.go" => Some(blake3_hex(b"NEW")),
-            "untracked.go" => Some(blake3_hex(b"PRE-EXISTING")),
-            other => panic!("unexpected on_disk lookup for {other}"),
-        }
-    };
-
-    let plan = lifecycle::plan_metadata_writes(&artifacts, &manifest, &on_disk_hash);
-
-    assert!(matches!(action_for(&plan, "absent.go"), WriteAction::Write));
-    assert!(matches!(
-        action_for(&plan, "noop.go"),
-        WriteAction::Unchanged
-    ));
-    assert!(matches!(
-        action_for(&plan, "changed.go"),
-        WriteAction::Write
-    ));
-    assert!(matches!(
-        action_for(&plan, "edited.go"),
-        WriteAction::UserEdited
-    ));
-    assert!(matches!(
-        action_for(&plan, "adopted.go"),
-        WriteAction::Unchanged
-    ));
-    assert!(matches!(
-        action_for(&plan, "untracked.go"),
-        WriteAction::UserEdited
-    ));
-    assert!(matches!(
-        action_for(&plan, "stale-record.go"),
-        WriteAction::Unchanged
-    ));
-    assert!(
-        plan.files.iter().all(|file| file.new_bytes.is_empty()),
-        "metadata planning must not materialize generated text"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // WS-04 / WATCH-01 — host write machinery: regenerate/plan_only over synthetic Artifacts
 // ---------------------------------------------------------------------------
@@ -471,7 +402,7 @@ fn plan_metadata_writes_truth_table_without_generated_bytes() {
 /// returning the root.
 fn init_root(label: &str) -> PathBuf {
     let root = unique_temp_dir(label);
-    gnr8::workspace::init(&root).expect("init .gnr8 workspace");
+    gnr8_engine::workspace::init(&root).expect("init .gnr8 workspace");
     root
 }
 
@@ -542,7 +473,7 @@ fn case_only_output_rename_removes_distinct_old_spelling_without_deleting_an_ali
         std::fs::read_to_string(root.join("generated/b.ts")).unwrap(),
         "export const neighbor = 1;\n"
     );
-    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    let manifest = gnr8_engine::manifest::load(&root.join(".gnr8")).unwrap();
     assert_eq!(
         manifest
             .files
@@ -586,7 +517,7 @@ fn portable_alias_does_not_transfer_ownership_to_a_distinct_case_sensitive_entry
     }
     std::fs::write(root.join("sdk/client.go"), "owned-old").unwrap();
     let old_hash = blake3_hex(b"owned-old");
-    let mut manifest = gnr8::manifest::Manifest::default();
+    let mut manifest = gnr8_engine::manifest::Manifest::default();
     manifest.record("SDK/client.go", &old_hash, "generated");
     manifest.save(&root.join(".gnr8")).unwrap();
 
@@ -601,7 +532,7 @@ fn portable_alias_does_not_transfer_ownership_to_a_distinct_case_sensitive_entry
     assert_eq!(outcome.skipped, vec!["sdk/client.go"]);
     assert!(!root.join("SDK/client.go").exists());
     assert_eq!(outcome.deleted, vec!["SDK/client.go"]);
-    let manifest = gnr8::manifest::load(&root.join(".gnr8")).unwrap();
+    let manifest = gnr8_engine::manifest::load(&root.join(".gnr8")).unwrap();
     assert!(manifest.files.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
@@ -633,7 +564,8 @@ fn missing_manifest_adopts_identical_outputs_without_rewriting() {
         openapi_mtime,
         "adoption must not rewrite byte-identical output"
     );
-    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
+    let manifest =
+        gnr8_engine::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
     assert_eq!(manifest.files.len(), 2);
     assert_eq!(
         manifest.recorded_hash("sdk/client.go"),
@@ -665,49 +597,12 @@ fn corrupt_manifest_adopts_only_identical_outputs() {
         std::fs::read_to_string(root.join("sdk/client.go")).expect("read protected output"),
         "package custom\n"
     );
-    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
+    let manifest =
+        gnr8_engine::manifest::load(&root.join(".gnr8")).expect("load recovered manifest");
     assert!(manifest.recorded_hash("openapi.yaml").is_some());
     assert_eq!(manifest.recorded_hash("sdk/client.go"), None);
 
     let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn cached_regenerate_finishes_noop_without_generated_bytes() {
-    let root = init_root("cached-noop");
-    let artifacts = vec![
-        artifact("openapi.yaml", "openapi: 3.1.0\n"),
-        artifact("sdk/client.go", "package sdk\n"),
-    ];
-    lifecycle::regenerate(&root, &artifacts, false).expect("cold regenerate");
-
-    let metadata = vec![
-        artifact_metadata("openapi.yaml", "openapi: 3.1.0\n"),
-        artifact_metadata("sdk/client.go", "package sdk\n"),
-    ];
-    let outcome = lifecycle::regenerate_cached_with_anchors(&root, &metadata, &[], false)
-        .expect("cached regenerate should succeed")
-        .expect("unchanged files should not require full generated text");
-
-    assert!(outcome.written.is_empty(), "{outcome:?}");
-    assert_eq!(outcome.unchanged.len(), 2, "{outcome:?}");
-    assert!(outcome.skipped.is_empty(), "{outcome:?}");
-
-    std::fs::write(root.join("sdk/client.go"), "package sdk\n// edited\n")
-        .expect("simulate hand edit");
-    let protected = lifecycle::regenerate_cached_with_anchors(&root, &metadata, &[], false)
-        .expect("cached regenerate should classify hand edits")
-        .expect("hand-edited file can be skipped without full generated text");
-    assert_eq!(protected.skipped, vec!["sdk/client.go"], "{protected:?}");
-
-    let forced = lifecycle::regenerate_cached_with_anchors(&root, &metadata, &[], true)
-        .expect("cached regenerate should classify forced hand edits");
-    assert!(
-        forced.is_none(),
-        "force needs full generated bytes to overwrite protected files"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// WATCH-01 / D-05: a no-op second run does NOT touch file mtimes (no write ⇒ no mtime churn).
@@ -934,14 +829,6 @@ fn planning_propagates_output_read_errors_instead_of_treating_them_as_absent() {
         .expect_err("a generated output that cannot be read as a file must fail planning");
     assert!(matches!(full_err, CoreError::Io { .. }), "{full_err:?}");
 
-    let metadata = vec![gnr8::sdk::ArtifactMetadata {
-        path: "generated/client.go".to_string(),
-        hash: gnr8::manifest::blake3_hex(b"generated"),
-    }];
-    let cached_err = lifecycle::plan_only_cached(&root, &metadata)
-        .expect_err("cached planning must propagate the same output read failure");
-    assert!(matches!(cached_err, CoreError::Io { .. }), "{cached_err:?}");
-
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -965,8 +852,8 @@ fn go_available() -> bool {
 
 /// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4): one
 /// `ApiKeyAuth` / `X-API-Key` scheme (graph-owned, as `ApplySecurity` would set them).
-fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
-    vec![gnr8::graph::SecurityScheme {
+fn fixture_security() -> Vec<gnr8_engine::graph::SecurityScheme> {
+    vec![gnr8_engine::graph::SecurityScheme {
         id: "ApiKeyAuth".to_string(),
         kind: "apiKey".to_string(),
         location: "header".to_string(),
@@ -982,7 +869,7 @@ fn naming_overrides_apply() {
         eprintln!("skipping naming_overrides_apply: go toolchain unavailable");
         return;
     }
-    let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+    let mut graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
 
     let mut naming = lifecycle::NamingOverrides::default();
     naming
@@ -990,7 +877,7 @@ fn naming_overrides_apply() {
         .insert("updateGoal".to_string(), "RenamedUpdateGoal".to_string());
 
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a valid override");
-    let yaml = gnr8::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
+    let yaml = gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
         .expect("to_openapi after naming override");
 
     assert!(
@@ -1003,14 +890,15 @@ fn naming_overrides_apply() {
     );
 
     // A naming key with NO match is a silent no-op.
-    let mut graph2 = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+    let mut graph2 = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
     let mut noop_naming = lifecycle::NamingOverrides::default();
     noop_naming
         .operations
         .insert("doesNotExist".to_string(), "Whatever".to_string());
     lifecycle::apply_naming(&mut graph2, &noop_naming).expect("an unmatched key is a no-op");
     assert!(
-        gnr8::lower::to_openapi(&graph2, "goalservice", "/goal", &fixture_security()).is_ok(),
+        gnr8_engine::lower::to_openapi(&graph2, "goalservice", "/goal", &fixture_security())
+            .is_ok(),
         "an unmatched naming key must be a silent no-op"
     );
 }
@@ -1023,7 +911,7 @@ fn naming_type_rename_updates_refs_no_dangling() {
         eprintln!("skipping naming_type_rename_updates_refs_no_dangling: go toolchain unavailable");
         return;
     }
-    let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+    let mut graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
 
     let mut naming = lifecycle::NamingOverrides::default();
     naming
@@ -1032,7 +920,7 @@ fn naming_type_rename_updates_refs_no_dangling() {
 
     lifecycle::apply_naming(&mut graph, &naming).expect("apply_naming with a referenced rename");
 
-    let yaml = gnr8::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
+    let yaml = gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &fixture_security())
         .expect("to_openapi must succeed after a referenced-type rename (no dangling $ref)");
 
     assert!(
@@ -1062,7 +950,7 @@ fn naming_type_rename_collision_is_a_typed_error() {
 
     // Collision: rename CreateGoalInput → GoalResponse, but GoalResponse already exists in the fixture.
     {
-        let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
         let mut naming = lifecycle::NamingOverrides::default();
         naming
             .types
@@ -1077,7 +965,7 @@ fn naming_type_rename_collision_is_a_typed_error() {
 
     // Collapse: two distinct types renamed to the SAME target.
     {
-        let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
         let mut naming = lifecycle::NamingOverrides::default();
         naming
             .types
@@ -1095,7 +983,7 @@ fn naming_type_rename_collision_is_a_typed_error() {
 
     // Chain: A → B while B → C in the same pass (order-dependent → reject).
     {
-        let mut graph = gnr8::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
+        let mut graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR).expect("build_graph");
         let mut naming = lifecycle::NamingOverrides::default();
         naming
             .types

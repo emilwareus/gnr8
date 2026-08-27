@@ -1,33 +1,39 @@
-//! The built-in pipeline stages — thin wrappers over the existing deterministic core functions.
+//! Execution of the built-in pipeline stages the SDK only *declares*.
 //!
-//! Every stage here reproduces a knob that used to live in `.gnr8/config.toml`, now expressed as a
-//! composable Rust value. CRITICAL (CLAUDE.md rules 2 & 3): these NEVER re-implement extraction,
-//! lowering, or SDK emission, and they NEVER add a second source for a fact or a fallback path. A
-//! source calls [`crate::analyze::build_graph`]; a target reads the graph metadata a transform set
-//! and calls the existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`]; a transform
-//! mutates the one graph. One deterministic path per fact.
+//! A project's `.gnr8/` crate composes `GoGin::new().inputs(["."])` — plain configuration data from
+//! the thin `gnr8` SDK. Nothing in that crate knows how to run it. This module is where a
+//! declaration becomes work: it holds the four execution traits, one implementation per built-in,
+//! and the `match` that dispatches a serialized declaration to the right one.
+//!
+//! CRITICAL (CLAUDE.md rules 2 & 3): these NEVER re-implement extraction, lowering, or SDK emission,
+//! and they NEVER add a second source for a fact or a fallback path. A source calls
+//! [`crate::analyze::build_graph`]; a target reads the graph metadata a transform set and calls the
+//! existing [`crate::lower::to_openapi`] / [`crate::gosdk::generate`]; a transform mutates the one
+//! graph. One deterministic path per fact.
 
 // User-facing prose dense with proper nouns (Gin, OpenAPI, SDK, apiKey, ...); allow doc_markdown
 // module-wide (mirrors the rest of the framework surface).
 #![allow(clippy::doc_markdown)]
 
-use super::{
-    hash_files, Artifacts, Cx, PostProcess, ReadinessKind, ReadinessTarget, Source, Target,
-    Transform,
+/// Every built-in declaration, re-exported so `crate::sdk::builtins::GoGin` names the one definition
+/// in the SDK rather than a second copy here.
+pub use gnr8::sdk::builtins::*;
+use gnr8::sdk::{
+    Artifacts, BuiltinPost, BuiltinSource, BuiltinTarget, BuiltinTransform, Cx, ReadinessKind,
+    ReadinessTarget,
 };
-use crate::analyze::facts::{Constraints, Extension, LiteralValue};
+
+use crate::analyze::facts::LiteralValue;
 use crate::analyze::helper::ExtractorIdentity;
 use crate::graph::{
-    ApiGraph, DiagnosticCategory, Field, MediaExample, OpenApiContact, OpenApiLicense,
-    OpenApiMetadataPolicy, OpenApiServer, OperationDocsPolicy, OperationRuntimePolicy,
-    PaginationMode, PaginationPolicy, PaginationTermination, Response, ResponseDocsPolicy,
-    RuntimeHookKind, RuntimePolicy, Schema, SchemaRef, SchemaUse, SchemaUseRoot,
-    SecurityRequirementGroup, SecurityScheme, Type,
+    ApiGraph, DiagnosticCategory, Field, MediaExample, OperationDocsPolicy, OperationRuntimePolicy,
+    PaginationMode, PaginationPolicy, Response, ResponseDocsPolicy, RuntimeHookKind, Schema,
+    SchemaRef, SchemaUse, SchemaUseRoot, Type,
 };
 use crate::lower::model::{OpenApiDoc, SchemaObject};
-use crate::sdk::docs::{write_sdk_docs, SdkDocs};
+use crate::sdk::docs::write_sdk_docs;
 use crate::sdk::emit_common::quoted_string_literal;
-use crate::sdk::layout::SdkFileLayout;
+use crate::sdk::hash_files;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
 use crate::CoreError;
@@ -37,79 +43,83 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Run a declared source.
+pub trait SourceExec {
+    /// Load the API graph this declaration describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source's own typed failure (a missing toolchain, an unreadable tree, …).
+    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError>;
+}
+
+/// Apply a declared transform.
+pub trait TransformExec {
+    /// Mutate `ir` in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transform's own typed failure (an invalid declaration, a rename collision, …).
+    fn apply(&self, ir: &mut ApiGraph, cx: &Cx) -> Result<(), CoreError>;
+}
+
+/// Generate a declared target.
+pub trait TargetExec {
+    /// Generate this target's files into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the target's own typed failure (a fact it cannot represent, a formatter failure, …).
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
+
+    /// The project-relative output path(s) this target writes — its loop-safety anchors.
+    fn output_anchors(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Generated targets `gnr8 doctor` can validate with a built-in readiness check.
+    fn readiness_targets(&self) -> Vec<ReadinessTarget> {
+        Vec::new()
+    }
+}
+
+/// Run a declared post-processor.
+pub trait PostExec {
+    /// Rewrite `out` in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the post-processor's own typed failure.
+    fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError>;
+}
+
+/// Validation a pagination declaration must pass before it edits the graph.
+trait PaginationChecks {
+    fn validate(&self) -> Result<(), CoreError>;
+    fn validate_operation_params(&self, op: &crate::graph::Operation) -> Result<(), CoreError>;
+    fn required_request_params(&self) -> Vec<&str>;
+}
+
+/// Validation an operation-documentation declaration must pass before it edits the graph.
+trait DocumentOperationChecks {
+    fn validate(&self) -> Result<(), CoreError>;
+}
+
+/// Resolution of a static-file declaration's source tree.
+trait StaticFilesSources {
+    fn static_source_files(&self, cx: &Cx) -> Result<(PathBuf, Vec<String>), CoreError>;
+}
+
+/// Execution of a formatter declaration inside a staging directory.
+trait FormatCommandRun {
+    fn run_in_temp(&self, out: &mut Artifacts, temp: &Path) -> Result<(), CoreError>;
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Source
 // ---------------------------------------------------------------------------------------------------
 
-/// The Go + Gin source: wraps [`crate::analyze::build_graph`] (the goextract subprocess driver).
-///
-/// `inputs` are project-relative source directories; for now exactly ONE is supported (multi-input
-/// fan-in is a documented later stage), and a different count is a clear typed error rather than a
-/// silent first-wins. The single input is resolved against [`Cx::project_root`] so a relative `"."`
-/// analyzes the project root, not the process cwd.
-#[derive(Debug, Default, Clone)]
-pub struct GoGin {
-    inputs: Vec<String>,
-    route_package_patterns: Vec<String>,
-    schema_package_patterns: Vec<String>,
-}
-
-impl GoGin {
-    /// A Go + Gin source with no inputs yet (configure with [`GoGin::inputs`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the source input directories (project-relative). Exactly one is supported for now.
-    #[must_use]
-    pub fn inputs<I, S>(mut self, inputs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.inputs = inputs.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Scope Go package loading to the given `go/packages` patterns, resolved from the input module
-    /// root. Empty means the historical whole-module `"./..."` load.
-    #[must_use]
-    pub fn packages<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let patterns: Vec<String> = patterns.into_iter().map(Into::into).collect();
-        self.route_package_patterns.clone_from(&patterns);
-        self.schema_package_patterns = patterns;
-        self
-    }
-
-    /// Scope Go route recognition and handler analysis to the given `go/packages` patterns.
-    #[must_use]
-    pub fn route_packages<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.route_package_patterns = patterns.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Scope Go schema extraction to the given `go/packages` patterns.
-    #[must_use]
-    pub fn schema_packages<I, S>(mut self, patterns: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.schema_package_patterns = patterns.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl Source for GoGin {
+impl SourceExec for GoGin {
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         // Exactly one input dir for now (mirrors the lifecycle single-input PoC restriction): reject
         // zero or many with a clear typed error rather than silently analyzing the first (D-02).
@@ -167,10 +177,6 @@ impl Source for GoGin {
             save_go_gin_cache(cx, key, &graph);
         }
         Ok(graph)
-    }
-
-    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        single_input_cache_root(&cx.project_root, &self.inputs)
     }
 }
 
@@ -428,37 +434,7 @@ fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {
         .join(format!("{key}.json"))
 }
 
-/// An OpenAPI/Swagger artifact source.
-///
-/// Accepts JSON or YAML Swagger 2.0, OpenAPI 3.0, and OpenAPI 3.1 documents, then normalizes paths,
-/// operations, parameters, request/response schemas, and named components into the shared
-/// [`ApiGraph`]. Output generation remains owned by normal targets such as [`OpenApi31`],
-/// [`TsSdk`], and [`GoSdk`].
-#[derive(Debug, Default, Clone)]
-pub struct OpenApi {
-    input: String,
-}
-
-impl OpenApi {
-    /// An OpenAPI source with no input yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the project-relative OpenAPI/Swagger JSON or YAML input file.
-    #[must_use]
-    pub fn input(mut self, input: impl Into<String>) -> Self {
-        self.input = input.into();
-        self
-    }
-}
-
-impl Source for OpenApi {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl SourceExec for OpenApi {
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         if self.input.is_empty() {
             return Err(CoreError::Config {
@@ -467,49 +443,9 @@ impl Source for OpenApi {
         }
         crate::sdk::openapi_source::load_openapi(&cx.project_root, &self.input)
     }
-
-    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        if self.input.is_empty() {
-            None
-        } else {
-            Some(vec![cx.project_root.join(&self.input)])
-        }
-    }
 }
 
-/// The FastAPI (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
-/// driver), exactly like [`GoGin`] wraps goextract.
-///
-/// `inputs` are project-relative source directories; for now exactly ONE is supported, and a
-/// different count is a clear typed error rather than a silent first-wins. The single input is
-/// resolved against [`Cx::project_root`]. This Source does NOT pick the language — it calls the SAME
-/// [`crate::analyze::build_graph`], which detects Python by scanning the target (CLAUDE.md rule 3):
-/// one deterministic path per fact, never a per-Source extraction fork.
-#[derive(Debug, Default, Clone)]
-pub struct FastApi {
-    inputs: Vec<String>,
-}
-
-impl FastApi {
-    /// A FastAPI source with no inputs yet (configure with [`FastApi::inputs`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the source input directories (project-relative). Exactly one is supported for now.
-    #[must_use]
-    pub fn inputs<I, S>(mut self, inputs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.inputs = inputs.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl Source for FastApi {
+impl SourceExec for FastApi {
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         // Exactly one input dir for now: reject zero or many with a clear typed error rather than
         // silently analyzing the first (mirrors GoGin).
@@ -540,43 +476,9 @@ impl Source for FastApi {
             crate::analyze::Lang::Python,
         )
     }
-
-    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        single_input_cache_root(&cx.project_root, &self.inputs)
-    }
 }
 
-/// The Flask (Python) source: wraps [`crate::analyze::build_graph`] (the pyextract subprocess
-/// driver), a verbatim twin of [`FastApi`]/[`GoGin`] differing only in the error proper noun.
-///
-/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
-/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
-/// target, never from which Source was used (CLAUDE.md rule 3).
-#[derive(Debug, Default, Clone)]
-pub struct Flask {
-    inputs: Vec<String>,
-}
-
-impl Flask {
-    /// A Flask source with no inputs yet (configure with [`Flask::inputs`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the source input directories (project-relative). Exactly one is supported for now.
-    #[must_use]
-    pub fn inputs<I, S>(mut self, inputs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.inputs = inputs.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl Source for Flask {
+impl SourceExec for Flask {
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         let input = match self.inputs.as_slice() {
             [single] => single,
@@ -603,45 +505,9 @@ impl Source for Flask {
             crate::analyze::Lang::Python,
         )
     }
-
-    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        single_input_cache_root(&cx.project_root, &self.inputs)
-    }
 }
 
-/// The NestJS (TypeScript) source: wraps [`crate::analyze::build_graph`] (the tsextract subprocess
-/// driver), a verbatim twin of [`FastApi`]/[`Flask`]/[`GoGin`] differing only in the error proper
-/// noun.
-///
-/// `inputs` are project-relative source directories; exactly ONE is supported for now. Like every
-/// other source it calls the SAME [`crate::analyze::build_graph`] — language is detected from the
-/// TARGET (the `*.ts` tree), never from which Source was used (CLAUDE.md rule 3/4): there is no
-/// per-Source extraction fork.
-#[derive(Debug, Default, Clone)]
-pub struct NestJs {
-    inputs: Vec<String>,
-}
-
-impl NestJs {
-    /// A NestJS source with no inputs yet (configure with [`NestJs::inputs`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the source input directories (project-relative). Exactly one is supported for now.
-    #[must_use]
-    pub fn inputs<I, S>(mut self, inputs: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.inputs = inputs.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl Source for NestJs {
+impl SourceExec for NestJs {
     fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
         let input = match self.inputs.as_slice() {
             [single] => single,
@@ -668,38 +534,13 @@ impl Source for NestJs {
             crate::analyze::Lang::TypeScript,
         )
     }
-
-    fn cache_input_roots(&self, cx: &Cx) -> Option<Vec<std::path::PathBuf>> {
-        single_input_cache_root(&cx.project_root, &self.inputs)
-    }
 }
 
 // ---------------------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------------------
 
-/// Set [`ApiGraph::base_path`] — the API base/mount path joined to every group-relative operation
-/// path (replaces the `base_path` TOML knob).
-#[derive(Debug, Clone)]
-pub struct SetBasePath {
-    base_path: String,
-}
-
-impl SetBasePath {
-    /// Build the transform with the given base path (e.g. `"/books"`).
-    #[must_use]
-    pub fn new(base_path: impl Into<String>) -> Self {
-        Self {
-            base_path: base_path.into(),
-        }
-    }
-}
-
-impl Transform for SetBasePath {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for SetBasePath {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         validate_base_path(&self.base_path)?;
         ir.base_path.clone_from(&self.base_path);
@@ -728,115 +569,14 @@ fn validate_base_path(base_path: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Set [`ApiGraph::title`] — the OpenAPI document title (`info.title`) (replaces the `title` knob).
-#[derive(Debug, Clone)]
-pub struct SetTitle {
-    title: String,
-}
-
-impl SetTitle {
-    /// Build the transform with the given title (e.g. `"Bookstore API"`).
-    #[must_use]
-    pub fn new(title: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-        }
-    }
-}
-
-impl Transform for SetTitle {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for SetTitle {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.title.clone_from(&self.title);
         Ok(())
     }
 }
 
-/// Configure public OpenAPI document metadata in Rust code.
-#[derive(Debug, Clone, Default)]
-pub struct OpenApiMetadata {
-    title: Option<String>,
-    policy: OpenApiMetadataPolicy,
-}
-
-impl OpenApiMetadata {
-    /// Create empty metadata updates.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set `info.title`.
-    #[must_use]
-    pub fn title(mut self, title: impl Into<String>) -> Self {
-        self.title = Some(title.into());
-        self
-    }
-
-    /// Set `info.version`.
-    #[must_use]
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.policy.version = Some(version.into());
-        self
-    }
-
-    /// Set `info.description`.
-    #[must_use]
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.policy.description = Some(description.into());
-        self
-    }
-
-    /// Set `info.termsOfService`.
-    #[must_use]
-    pub fn terms_of_service(mut self, url: impl Into<String>) -> Self {
-        self.policy.terms_of_service = Some(url.into());
-        self
-    }
-
-    /// Set all optional contact fields.
-    #[must_use]
-    pub fn contact(mut self, contact: OpenApiContact) -> Self {
-        self.policy.contact = Some(contact);
-        self
-    }
-
-    /// Set the public license name and optional URL.
-    #[must_use]
-    pub fn license(mut self, license: OpenApiLicense) -> Self {
-        self.policy.license = Some(license);
-        self
-    }
-
-    /// Add one server URL.
-    #[must_use]
-    pub fn server(mut self, url: impl Into<String>) -> Self {
-        self.policy.servers.push(OpenApiServer::new(url));
-        self
-    }
-
-    /// Add one server URL with a public description.
-    #[must_use]
-    pub fn described_server(
-        mut self,
-        url: impl Into<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        self.policy
-            .servers
-            .push(OpenApiServer::new(url).description(description));
-        self
-    }
-}
-
-impl Transform for OpenApiMetadata {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for OpenApiMetadata {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         validate_optional_metadata_value("OpenAPI title", self.title.as_deref())?;
         validate_optional_metadata_value("OpenAPI version", self.policy.version.as_deref())?;
@@ -872,43 +612,7 @@ impl Transform for OpenApiMetadata {
     }
 }
 
-/// Fail the pipeline when selected structured diagnostics remain after preceding transforms.
-///
-/// Place this transform after explicit correction transforms so a resolved extraction limitation no
-/// longer trips the policy, and before targets so generation cannot write incomplete artifacts.
-#[derive(Debug, Clone, Default)]
-pub struct DiagnosticPolicy {
-    denied_codes: BTreeSet<String>,
-    denied_categories: BTreeSet<DiagnosticCategory>,
-}
-
-impl DiagnosticPolicy {
-    /// Create a policy that permits all diagnostics.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Deny one exact stable diagnostic code.
-    #[must_use]
-    pub fn deny(mut self, code: impl Into<String>) -> Self {
-        self.denied_codes.insert(code.into());
-        self
-    }
-
-    /// Deny every diagnostic in a category.
-    #[must_use]
-    pub fn deny_category(mut self, category: DiagnosticCategory) -> Self {
-        self.denied_categories.insert(category);
-        self
-    }
-}
-
-impl Transform for DiagnosticPolicy {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for DiagnosticPolicy {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if self.denied_codes.iter().any(|code| code.trim().is_empty()) {
             return Err(CoreError::Config {
@@ -934,45 +638,7 @@ impl Transform for DiagnosticPolicy {
     }
 }
 
-/// Require every remaining operation to carry a summary.
-///
-/// This is the completeness gate for operation prose. It is OPT-IN and a PIPELINE STAGE
-/// rather than a check inside a `Source`, because only the user's own pipeline knows when
-/// their public-surface filtering has finished: gnr8 has no built-in operation-exclusion
-/// transform, so an internal route a consumer strips later must not fail the gate before
-/// it is stripped. Place it after those filters and before the targets.
-///
-/// A missing summary is a hard error naming the operation id, method, path, and handler,
-/// so the fix is always locatable: write a doc comment on that handler.
-///
-/// Descriptions stay optional — a one-line operation is a legitimately documented
-/// operation, and requiring more would push authors toward filler prose.
-///
-/// ```no_run
-/// # use gnr8::sdk::prelude::*;
-/// Pipeline::new()
-///     .source(GoGin::new().inputs(["."]))
-///     .transform(RequireOperationDocs::new())
-///     .target(OpenApi31::new().to("openapi.yaml"));
-/// ```
-#[derive(Debug, Clone, Default)]
-pub struct RequireOperationDocs {
-    _private: (),
-}
-
-impl RequireOperationDocs {
-    /// Require a summary on every operation still in the graph.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Transform for RequireOperationDocs {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for RequireOperationDocs {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         // Report EVERY undocumented operation, not just the first: a consumer adopting
         // the gate wants one list to work through, not one error per re-run.
@@ -1005,65 +671,7 @@ impl Transform for RequireOperationDocs {
     }
 }
 
-/// Set or replace the typed success response for one operation.
-///
-/// This is a graph-level correction hook for source frameworks where a handler's response type is not
-/// statically recoverable. Because it mutates the neutral IR, every downstream target sees the same
-/// response fact: OpenAPI, Go, Python, and TypeScript stay in agreement.
-#[derive(Debug, Clone)]
-pub struct SetOperationSuccessResponse {
-    matcher: OperationMatcher,
-    schema: String,
-    status: u16,
-}
-
-#[derive(Debug, Clone)]
-enum OperationMatcher {
-    Id(String),
-    Route { method: String, path: String },
-}
-
-impl SetOperationSuccessResponse {
-    /// Match an operation by generated operation id.
-    #[must_use]
-    pub fn for_operation(operation_id: impl Into<String>, schema: impl Into<String>) -> Self {
-        Self {
-            matcher: OperationMatcher::Id(operation_id.into()),
-            schema: schema.into(),
-            status: 200,
-        }
-    }
-
-    /// Match an operation by method and graph path.
-    #[must_use]
-    pub fn for_route(
-        method: impl Into<String>,
-        path: impl Into<String>,
-        schema: impl Into<String>,
-    ) -> Self {
-        Self {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            schema: schema.into(),
-            status: 200,
-        }
-    }
-
-    /// Override the success status code to set. Defaults to 200.
-    #[must_use]
-    pub const fn status(mut self, status: u16) -> Self {
-        self.status = status;
-        self
-    }
-}
-
-impl Transform for SetOperationSuccessResponse {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for SetOperationSuccessResponse {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if !(200..300).contains(&self.status) {
             return Err(CoreError::Config {
@@ -1151,41 +759,7 @@ impl Transform for SetOperationSuccessResponse {
     }
 }
 
-/// Override the type of one field in one object schema.
-///
-/// This is a graph-level correction hook for schema shapes that are intentionally dynamic in source
-/// code and cannot be recovered precisely by static extraction. Because the override happens in the
-/// neutral IR, OpenAPI and every SDK target agree on the corrected field shape.
-#[derive(Debug, Clone)]
-pub struct SetSchemaFieldType {
-    schema: String,
-    field: String,
-    ty: Type,
-}
-
-impl SetSchemaFieldType {
-    /// Match a schema by id or bare generated name, then replace `field`'s type.
-    #[must_use]
-    pub fn new(schema: impl Into<String>, field: impl Into<String>, ty: Type) -> Self {
-        Self {
-            schema: schema.into(),
-            field: field.into(),
-            ty,
-        }
-    }
-
-    /// Set the field to a homogeneous array of free-form object/value payloads.
-    #[must_use]
-    pub fn array_of_free_form_objects(schema: impl Into<String>, field: impl Into<String>) -> Self {
-        Self::new(schema, field, Type::Array(Box::new(Type::Any {})))
-    }
-}
-
-impl Transform for SetSchemaFieldType {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for SetSchemaFieldType {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let matches: Vec<usize> = ir
             .schemas
@@ -1240,607 +814,7 @@ impl Transform for SetSchemaFieldType {
     }
 }
 
-/// Graph-level API fact overrides for source patterns that need explicit correction.
-///
-/// These overrides mutate the neutral IR before targets render, so OpenAPI and every SDK target read
-/// the same corrected API facts.
-#[derive(Debug, Clone, Default)]
-pub struct ApiOverrides {
-    field_presence: Vec<FieldPresenceOverride>,
-    field_nullability: Vec<FieldNullabilityOverride>,
-    schema_uses: Vec<(String, SchemaUse)>,
-    parameters: Vec<(OperationSelector, ParameterOverride)>,
-    security_overrides: Vec<(OperationSelector, SecurityOverride)>,
-    request_bodies: Vec<RequestBodyOverride>,
-    responses: Vec<(OperationSelector, ResponseOverride)>,
-    default_responses: Vec<DefaultResponseOverride>,
-    configuration_errors: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct FieldPresenceOverride {
-    schema: String,
-    field: String,
-    required: bool,
-}
-
-#[derive(Debug, Clone)]
-struct FieldNullabilityOverride {
-    schema: String,
-    field: String,
-    use_: SchemaUse,
-    nullable: bool,
-}
-
-#[derive(Debug, Clone)]
-struct RequestBodyOverride {
-    matcher: OperationMatcher,
-    required: Option<bool>,
-    schema_ref: Option<String>,
-    content_type: Option<String>,
-}
-
-/// Structured route response replacement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResponseOverride {
-    status: u16,
-    body_kind: String,
-    content_type: Option<String>,
-    content_types: Vec<String>,
-    schema_ref: Option<String>,
-}
-
-impl ResponseOverride {
-    /// Start a bodyless response override for `status`.
-    #[must_use]
-    pub fn status(status: u16) -> Self {
-        Self {
-            status,
-            body_kind: "empty".to_string(),
-            content_type: None,
-            content_types: Vec::new(),
-            schema_ref: None,
-        }
-    }
-
-    /// Attach a JSON schema and default `application/json` media type.
-    #[must_use]
-    pub fn json_schema(mut self, schema: impl Into<String>) -> Self {
-        self.body_kind = "json".to_string();
-        self.schema_ref = Some(schema.into());
-        self.content_type = Some("application/json".to_string());
-        self.content_types = vec!["application/json".to_string()];
-        self
-    }
-
-    /// Emit a bodyless response (including a 204).
-    #[must_use]
-    pub fn empty(mut self) -> Self {
-        self.body_kind = "empty".to_string();
-        self.schema_ref = None;
-        self.content_type = None;
-        self.content_types.clear();
-        self
-    }
-
-    /// Emit a binary response with the given media type.
-    #[must_use]
-    pub fn binary(mut self, media_type: impl Into<String>) -> Self {
-        let media_type = media_type.into();
-        self.body_kind = "binary".to_string();
-        self.schema_ref = None;
-        self.content_type = Some(media_type.clone());
-        self.content_types = vec![media_type];
-        self
-    }
-
-    /// Emit a server-sent event response, optionally using an envelope schema.
-    #[must_use]
-    pub fn event_stream(mut self) -> Self {
-        self.body_kind = "sse".to_string();
-        self.schema_ref = None;
-        self.content_type = Some("text/event-stream".to_string());
-        self.content_types = vec!["text/event-stream".to_string()];
-        self
-    }
-
-    /// Attach an event envelope schema to an SSE response.
-    #[must_use]
-    pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
-        self.schema_ref = Some(schema.into());
-        self
-    }
-
-    /// Add a response media type without discarding existing alternatives.
-    #[must_use]
-    pub fn media_type(mut self, media_type: impl Into<String>) -> Self {
-        let media_type = media_type.into();
-        if self.content_type.is_none() {
-            self.content_type = Some(media_type.clone());
-        }
-        if !self.content_types.contains(&media_type) {
-            self.content_types.push(media_type);
-        }
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DefaultResponseOverride {
-    status: u16,
-    body_kind: String,
-    content_type: Option<String>,
-    content_types: Vec<String>,
-    schema_ref: Option<String>,
-}
-
-/// A typed request parameter at any OpenAPI parameter location.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestParameter {
-    name: String,
-    location: String,
-    schema: Type,
-    required: bool,
-    default: Option<LiteralValue>,
-    style: Option<String>,
-    explode: Option<bool>,
-    allow_reserved: bool,
-}
-
-impl RequestParameter {
-    /// Build a parameter at an explicit location (`query`, `header`, `path`, or `cookie`).
-    #[must_use]
-    pub fn new(name: impl Into<String>, location: impl Into<String>, schema: Type) -> Self {
-        let location = location.into();
-        Self {
-            name: name.into(),
-            required: location == "path",
-            location,
-            schema,
-            default: None,
-            style: None,
-            explode: None,
-            allow_reserved: false,
-        }
-    }
-
-    /// Build a query parameter.
-    #[must_use]
-    pub fn query(name: impl Into<String>, schema: Type) -> Self {
-        Self::new(name, "query", schema)
-    }
-
-    /// Build a header parameter.
-    #[must_use]
-    pub fn header(name: impl Into<String>, schema: Type) -> Self {
-        Self::new(name, "header", schema)
-    }
-
-    /// Build a path parameter (always required).
-    #[must_use]
-    pub fn path(name: impl Into<String>, schema: Type) -> Self {
-        Self::new(name, "path", schema).required()
-    }
-
-    /// Build a cookie parameter.
-    #[must_use]
-    pub fn cookie(name: impl Into<String>, schema: Type) -> Self {
-        Self::new(name, "cookie", schema)
-    }
-
-    /// Require the parameter.
-    #[must_use]
-    pub const fn required(mut self) -> Self {
-        self.required = true;
-        self
-    }
-
-    /// Make the parameter optional. Path parameters are rejected during validation.
-    #[must_use]
-    pub const fn optional(mut self) -> Self {
-        self.required = false;
-        self
-    }
-
-    /// Set an exact literal default.
-    #[must_use]
-    pub fn default(mut self, value: LiteralValue) -> Self {
-        self.default = Some(value);
-        self
-    }
-
-    /// Set an explicit OpenAPI serialization style.
-    #[must_use]
-    pub fn style(mut self, style: impl Into<String>) -> Self {
-        self.style = Some(style.into());
-        self
-    }
-
-    /// Set explicit OpenAPI explode behavior.
-    #[must_use]
-    pub const fn explode(mut self, explode: bool) -> Self {
-        self.explode = Some(explode);
-        self
-    }
-
-    /// Permit reserved characters in query serialization.
-    #[must_use]
-    pub const fn allow_reserved(mut self, allow: bool) -> Self {
-        self.allow_reserved = allow;
-        self
-    }
-}
-
-/// Checked semantics for applying one typed request parameter override.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParameterOverride {
-    mode: ParameterOverrideMode,
-    parameter: RequestParameter,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParameterOverrideMode {
-    AddIfMissing,
-    CorrectExisting,
-    Replace,
-}
-
-impl ParameterOverride {
-    /// Add the parameter only when no parameter with this name and location exists.
-    #[must_use]
-    pub fn add_if_missing(parameter: RequestParameter) -> Self {
-        Self {
-            mode: ParameterOverrideMode::AddIfMissing,
-            parameter,
-        }
-    }
-
-    /// Correct an extracted parameter, failing when it is missing or already identical.
-    #[must_use]
-    pub fn correct_existing(parameter: RequestParameter) -> Self {
-        Self {
-            mode: ParameterOverrideMode::CorrectExisting,
-            parameter,
-        }
-    }
-
-    /// Intentionally replace a parameter with the same name and location, recording the change.
-    #[must_use]
-    pub fn replace(parameter: RequestParameter) -> Self {
-        Self {
-            mode: ParameterOverrideMode::Replace,
-            parameter,
-        }
-    }
-}
-
-/// Exact per-operation security replacement, preserving OpenAPI OR alternatives and AND groups.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecurityOverride {
-    alternatives: Vec<SecurityRequirementGroup>,
-}
-
-impl SecurityOverride {
-    /// Make an operation explicitly public (`security: []`).
-    #[must_use]
-    pub fn public() -> Self {
-        Self {
-            alternatives: Vec::new(),
-        }
-    }
-
-    /// Require one scheme, replacing any inherited document default.
-    #[must_use]
-    pub fn scheme(scheme: impl Into<String>) -> Self {
-        Self {
-            alternatives: vec![SecurityRequirementGroup {
-                schemes: vec![scheme.into()],
-            }],
-        }
-    }
-
-    /// Add an OR alternative containing one required scheme.
-    #[must_use]
-    pub fn or_scheme(mut self, scheme: impl Into<String>) -> Self {
-        self.alternatives.push(SecurityRequirementGroup {
-            schemes: vec![scheme.into()],
-        });
-        self
-    }
-
-    /// Add a scheme to the last alternative (AND). If none exists, create one.
-    #[must_use]
-    pub fn and_scheme(mut self, scheme: impl Into<String>) -> Self {
-        let scheme = scheme.into();
-        if let Some(group) = self.alternatives.last_mut() {
-            group.schemes.push(scheme);
-        } else {
-            self.alternatives.push(SecurityRequirementGroup {
-                schemes: vec![scheme],
-            });
-        }
-        self
-    }
-
-    /// Replace all alternatives from an iterator of AND groups.
-    #[must_use]
-    pub fn alternatives<I, G, S>(groups: I) -> Self
-    where
-        I: IntoIterator<Item = G>,
-        G: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            alternatives: groups
-                .into_iter()
-                .map(|group| SecurityRequirementGroup {
-                    schemes: group.into_iter().map(Into::into).collect(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl ApiOverrides {
-    /// Create an empty override set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// State that one schema field's key is always present: it is in the schema's `required` array
-    /// in every direction, and no SDK model marks it omittable.
-    #[must_use]
-    pub fn force_required(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
-        self.field_presence.push(FieldPresenceOverride {
-            schema: schema.into(),
-            field: field.into(),
-            required: true,
-        });
-        self
-    }
-
-    /// State that one schema field's key may be absent: it is out of the schema's `required` array
-    /// in every direction, and every SDK model marks it omittable.
-    #[must_use]
-    pub fn force_optional(mut self, schema: impl Into<String>, field: impl Into<String>) -> Self {
-        self.field_presence.push(FieldPresenceOverride {
-            schema: schema.into(),
-            field: field.into(),
-            required: false,
-        });
-        self
-    }
-
-    /// Register a non-HTTP schema as an input root for transitive direction analysis.
-    #[must_use]
-    pub fn register_input_schema(mut self, schema: impl Into<String>) -> Self {
-        self.schema_uses.push((schema.into(), SchemaUse::Input));
-        self
-    }
-
-    /// Register a non-HTTP schema as an output root for transitive direction analysis.
-    #[must_use]
-    pub fn register_output_schema(mut self, schema: impl Into<String>) -> Self {
-        self.schema_uses.push((schema.into(), SchemaUse::Output));
-        self
-    }
-
-    /// Assert that a field which extraction currently marks nullable is non-null in one direction.
-    /// The transform fails if the schema/field disappears or the correction is already redundant.
-    #[must_use]
-    pub fn force_non_nullable(
-        mut self,
-        schema: impl Into<String>,
-        field: impl Into<String>,
-        use_: SchemaUse,
-    ) -> Self {
-        self.field_nullability.push(FieldNullabilityOverride {
-            schema: schema.into(),
-            field: field.into(),
-            use_,
-            nullable: false,
-        });
-        self
-    }
-
-    /// Assert that a field which extraction currently marks non-null is nullable in one direction.
-    /// The transform fails if the schema/field disappears or the correction is already redundant.
-    #[must_use]
-    pub fn force_nullable(
-        mut self,
-        schema: impl Into<String>,
-        field: impl Into<String>,
-        use_: SchemaUse,
-    ) -> Self {
-        self.field_nullability.push(FieldNullabilityOverride {
-            schema: schema.into(),
-            field: field.into(),
-            use_,
-            nullable: true,
-        });
-        self
-    }
-
-    /// Apply a checked, fully typed request parameter override to exactly one selected operation.
-    #[must_use]
-    pub fn parameter(mut self, selector: OperationSelector, override_: ParameterOverride) -> Self {
-        self.parameters.push((selector, override_));
-        self
-    }
-
-    /// Replace inherited security on exactly one selected operation.
-    #[must_use]
-    pub fn security(mut self, selector: OperationSelector, override_: SecurityOverride) -> Self {
-        self.security_overrides.push((selector, override_));
-        self
-    }
-
-    /// Replace one status response on exactly one selected operation.
-    #[must_use]
-    pub fn response(mut self, selector: OperationSelector, override_: ResponseOverride) -> Self {
-        self.responses.push((selector, override_));
-        self
-    }
-
-    /// Target a request body on an operation matched by method and graph path.
-    #[must_use]
-    pub fn request_body(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
-        self.request_bodies.push(RequestBodyOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            required: None,
-            schema_ref: None,
-            content_type: None,
-        });
-        self
-    }
-
-    /// Set or replace one JSON request body on an operation matched by method and graph path.
-    #[must_use]
-    pub fn json_request_body(
-        self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        schema: impl Into<String>,
-    ) -> Self {
-        self.typed_request_body(method, path, schema, "application/json")
-    }
-
-    /// Set or replace one `application/x-www-form-urlencoded` request body.
-    #[must_use]
-    pub fn form_request_body(
-        self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        schema: impl Into<String>,
-    ) -> Self {
-        self.typed_request_body(method, path, schema, "application/x-www-form-urlencoded")
-    }
-
-    /// Set or replace one `multipart/form-data` request body.
-    #[must_use]
-    pub fn multipart_request_body(
-        self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        schema: impl Into<String>,
-    ) -> Self {
-        self.typed_request_body(method, path, schema, "multipart/form-data")
-    }
-
-    fn typed_request_body(
-        mut self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        schema: impl Into<String>,
-        content_type: impl Into<String>,
-    ) -> Self {
-        self.request_bodies.push(RequestBodyOverride {
-            matcher: OperationMatcher::Route {
-                method: method.into().to_ascii_uppercase(),
-                path: path.into(),
-            },
-            required: Some(true),
-            schema_ref: Some(schema.into()),
-            content_type: Some(content_type.into()),
-        });
-        self
-    }
-
-    /// Mark the most recently configured request body optional.
-    #[must_use]
-    pub fn optional(mut self) -> Self {
-        if let Some(body) = self.request_bodies.last_mut() {
-            body.required = Some(false);
-        } else {
-            self.configuration_errors.push(
-                "ApiOverrides::optional() requires a preceding request-body override".to_string(),
-            );
-        }
-        self
-    }
-
-    /// Mark one response as binary/file content.
-    #[must_use]
-    pub fn binary_response(
-        mut self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        status: u16,
-    ) -> Self {
-        self.responses.push((
-            OperationSelector::route(method, path),
-            ResponseOverride::status(status).binary("application/octet-stream"),
-        ));
-        self
-    }
-
-    /// Set or replace one JSON response body on an operation matched by method and graph path.
-    #[must_use]
-    pub fn json_response(
-        mut self,
-        method: impl Into<String>,
-        path: impl Into<String>,
-        status: u16,
-        schema: impl Into<String>,
-    ) -> Self {
-        self.responses.push((
-            OperationSelector::route(method, path),
-            ResponseOverride::status(status).json_schema(schema),
-        ));
-        self
-    }
-
-    /// Attach a JSON error response model to every operation that does not already declare `status`.
-    #[must_use]
-    pub fn default_error_response(mut self, status: u16, schema: impl Into<String>) -> Self {
-        self.default_responses.push(DefaultResponseOverride {
-            status,
-            body_kind: "json".to_string(),
-            content_type: None,
-            content_types: vec!["application/json".to_string()],
-            schema_ref: Some(schema.into()),
-        });
-        self
-    }
-
-    /// Mark one response as server-sent events.
-    #[must_use]
-    pub fn sse_response(mut self, method: impl Into<String>, path: impl Into<String>) -> Self {
-        self.responses.push((
-            OperationSelector::route(method, path),
-            ResponseOverride::status(200).event_stream(),
-        ));
-        self
-    }
-
-    /// Attach an existing schema as the event envelope for the most recently configured SSE response.
-    #[must_use]
-    pub fn event_schema(mut self, schema: impl Into<String>) -> Self {
-        match self.responses.last_mut() {
-            Some((_, response)) if response.body_kind == "sse" => {
-                response.schema_ref = Some(schema.into());
-            }
-            Some(_) => self.configuration_errors.push(
-                "ApiOverrides::event_schema() requires the preceding response to be SSE"
-                    .to_string(),
-            ),
-            None => self
-                .configuration_errors
-                .push("ApiOverrides::event_schema() requires a preceding SSE response".to_string()),
-        }
-        self
-    }
-}
-
-impl Transform for ApiOverrides {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for ApiOverrides {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if let Some(message) = self.configuration_errors.first() {
             return Err(CoreError::Config {
@@ -2650,61 +1624,7 @@ fn remove_one_operation_diagnostic(
     }
 }
 
-/// Enum ordering policy for generated OpenAPI/SDK surfaces.
-#[derive(Debug, Clone)]
-pub enum EnumOrder {
-    /// Lexical ordering (the default graph normalization behavior).
-    Lexical,
-    /// Restore source declaration order when the source sidecar provided it.
-    Source,
-    /// Apply explicit overrides. Targets are schema id/name or `Schema.field` for inline enum fields.
-    Explicit(Vec<(String, Vec<String>)>),
-}
-
-/// Apply enum ordering controls to the graph before targets render it.
-#[derive(Debug, Clone)]
-pub struct SetEnumOrder {
-    order: EnumOrder,
-}
-
-impl SetEnumOrder {
-    /// Create an enum-order transform.
-    #[must_use]
-    pub fn new(order: EnumOrder) -> Self {
-        Self { order }
-    }
-
-    /// Restore source declaration order for named enums where available.
-    #[must_use]
-    pub fn source() -> Self {
-        Self::new(EnumOrder::Source)
-    }
-
-    /// Sort every enum lexically.
-    #[must_use]
-    pub fn lexical() -> Self {
-        Self::new(EnumOrder::Lexical)
-    }
-
-    /// Apply one explicit override.
-    #[must_use]
-    pub fn explicit<I, S>(target: impl Into<String>, values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::new(EnumOrder::Explicit(vec![(
-            target.into(),
-            values.into_iter().map(Into::into).collect(),
-        )]))
-    }
-}
-
-impl Transform for SetEnumOrder {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for SetEnumOrder {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         match &self.order {
             EnumOrder::Lexical => {
@@ -2828,229 +1748,7 @@ fn ensure_same_enum_members(
     })
 }
 
-/// Push a security scheme onto [`ApiGraph::security`] — the single source of truth for the generated
-/// `security` requirement + `components.securitySchemes` (replaces the `[[security.schemes]]` knob,
-/// CLAUDE.md rule 4).
-#[derive(Debug, Clone)]
-pub struct ApplySecurity {
-    scheme: SecurityScheme,
-    selectors: Vec<OperationSelector>,
-}
-
-/// Reusable operation selector for transforms that need to match routes by path, method, middleware,
-/// or boolean composition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OperationSelector {
-    /// Match one operation id exactly.
-    OperationId(String),
-    /// Match one exact HTTP method and graph path.
-    Route { method: String, path: String },
-    /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
-    PathPrefix(String),
-    /// Match operations whose HTTP method is one of these uppercase method names.
-    Methods(Vec<String>),
-    /// Match operations carrying this source middleware symbol.
-    Middleware(String),
-    /// Match if any nested selector matches.
-    Any(Vec<OperationSelector>),
-    /// Match only if all nested selectors match.
-    All(Vec<OperationSelector>),
-}
-
-impl OperationSelector {
-    /// Match one operation id exactly.
-    #[must_use]
-    pub fn operation(id: impl Into<String>) -> Self {
-        Self::OperationId(id.into())
-    }
-
-    /// Match one exact route.
-    #[must_use]
-    pub fn route(method: impl Into<String>, path: impl Into<String>) -> Self {
-        Self::Route {
-            method: method.into().to_ascii_uppercase(),
-            path: path.into(),
-        }
-    }
-
-    /// Match one exact GET route.
-    #[must_use]
-    pub fn get(path: impl Into<String>) -> Self {
-        Self::route("GET", path)
-    }
-
-    /// Match one exact POST route.
-    #[must_use]
-    pub fn post(path: impl Into<String>) -> Self {
-        Self::route("POST", path)
-    }
-
-    /// Match one exact PUT route.
-    #[must_use]
-    pub fn put(path: impl Into<String>) -> Self {
-        Self::route("PUT", path)
-    }
-
-    /// Match one exact PATCH route.
-    #[must_use]
-    pub fn patch(path: impl Into<String>) -> Self {
-        Self::route("PATCH", path)
-    }
-
-    /// Match one exact DELETE route.
-    #[must_use]
-    pub fn delete(path: impl Into<String>) -> Self {
-        Self::route("DELETE", path)
-    }
-
-    /// Match operations whose graph path, or base-path-joined path, starts with `prefix`.
-    #[must_use]
-    pub fn path_prefix(prefix: impl Into<String>) -> Self {
-        Self::PathPrefix(prefix.into())
-    }
-
-    /// Match operations whose HTTP method is in `methods`.
-    #[must_use]
-    pub fn methods<I, S>(methods: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let mut methods: Vec<String> = methods
-            .into_iter()
-            .map(Into::into)
-            .map(|method| method.to_ascii_uppercase())
-            .collect();
-        methods.sort();
-        methods.dedup();
-        Self::Methods(methods)
-    }
-
-    /// Match operations carrying a source middleware symbol.
-    #[must_use]
-    pub fn middleware(symbol: impl Into<String>) -> Self {
-        Self::Middleware(symbol.into())
-    }
-
-    /// Match if any nested selector matches.
-    #[must_use]
-    pub fn any<I>(selectors: I) -> Self
-    where
-        I: IntoIterator<Item = OperationSelector>,
-    {
-        Self::Any(selectors.into_iter().collect())
-    }
-
-    /// Match only if all nested selectors match.
-    #[must_use]
-    pub fn all<I>(selectors: I) -> Self
-    where
-        I: IntoIterator<Item = OperationSelector>,
-    {
-        Self::All(selectors.into_iter().collect())
-    }
-}
-
-impl ApplySecurity {
-    /// An `apiKey`-in-`header` scheme: `id` is the OpenAPI scheme id (e.g. `"ApiKeyAuth"`),
-    /// `header_name` is the credential header (e.g. `"X-API-Key"`).
-    #[must_use]
-    pub fn api_key(id: impl Into<String>, header_name: impl Into<String>) -> Self {
-        Self {
-            scheme: SecurityScheme {
-                id: id.into(),
-                kind: "apiKey".to_string(),
-                location: "header".to_string(),
-                name: header_name.into(),
-                global: true,
-            },
-            selectors: Vec::new(),
-        }
-    }
-
-    /// An `apiKey`-in-`query` scheme: `id` is the OpenAPI scheme id (e.g. `"ApiKeyQueryAuth"`),
-    /// `param_name` is the credential query parameter (e.g. `"api_key"`).
-    #[must_use]
-    pub fn api_key_query(id: impl Into<String>, param_name: impl Into<String>) -> Self {
-        Self {
-            scheme: SecurityScheme {
-                id: id.into(),
-                kind: "apiKey".to_string(),
-                location: "query".to_string(),
-                name: param_name.into(),
-                global: true,
-            },
-            selectors: Vec::new(),
-        }
-    }
-
-    /// An HTTP bearer scheme: `id` is the OpenAPI scheme id (e.g. `"BearerAuth"`).
-    #[must_use]
-    pub fn bearer(id: impl Into<String>) -> Self {
-        Self {
-            scheme: SecurityScheme {
-                id: id.into(),
-                kind: "http".to_string(),
-                location: String::new(),
-                name: "bearer".to_string(),
-                global: true,
-            },
-            selectors: Vec::new(),
-        }
-    }
-
-    /// An HTTP basic scheme: `id` is the OpenAPI scheme id (e.g. `"BasicAuth"`).
-    #[must_use]
-    pub fn basic(id: impl Into<String>) -> Self {
-        Self {
-            scheme: SecurityScheme {
-                id: id.into(),
-                kind: "http".to_string(),
-                location: String::new(),
-                name: "basic".to_string(),
-                global: true,
-            },
-            selectors: Vec::new(),
-        }
-    }
-
-    /// Apply this scheme only to operations matched by `selector`.
-    #[must_use]
-    pub fn when(mut self, selector: OperationSelector) -> Self {
-        self.scheme.global = false;
-        self.selectors.push(selector);
-        self
-    }
-
-    /// Apply this scheme only to operations whose graph path, or base-path-joined path, starts with
-    /// `prefix`.
-    #[must_use]
-    pub fn when_path_prefix(self, prefix: impl Into<String>) -> Self {
-        self.when(OperationSelector::path_prefix(prefix))
-    }
-
-    /// Apply this scheme only to operations whose HTTP method is in `methods`.
-    #[must_use]
-    pub fn when_methods<I, S>(self, methods: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.when(OperationSelector::methods(methods))
-    }
-
-    /// Apply this scheme only to operations that carry a source middleware symbol.
-    #[must_use]
-    pub fn when_middleware(self, symbol: impl Into<String>) -> Self {
-        self.when(OperationSelector::middleware(symbol))
-    }
-}
-
-impl Transform for ApplySecurity {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for ApplySecurity {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         ir.security.push(self.scheme.clone());
         if self.selectors.is_empty() {
@@ -3135,89 +1833,7 @@ fn find_selected_operation_index(
     }
 }
 
-/// Configure generated SDK runtime defaults.
-#[derive(Debug, Clone)]
-pub struct ConfigureSdkRuntime {
-    policy: RuntimePolicy,
-}
-
-impl ConfigureSdkRuntime {
-    /// Create a no-op SDK runtime policy builder.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            policy: RuntimePolicy::default(),
-        }
-    }
-
-    /// Set the client-level default timeout in milliseconds.
-    #[must_use]
-    pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.policy.default_timeout_ms = Some(timeout_ms);
-        self
-    }
-
-    /// Set the client-level default max retry count.
-    #[must_use]
-    pub fn max_retries(mut self, max_retries: u8) -> Self {
-        self.policy.max_retries = max_retries;
-        if max_retries > 0 && self.policy.retry_statuses.is_empty() {
-            self.policy.retry_statuses = vec![408, 429];
-        }
-        self
-    }
-
-    /// Override exact retryable status codes. Generated runtimes also treat every `5xx` status as
-    /// retryable when retries are enabled.
-    #[must_use]
-    pub fn retry_statuses<I>(mut self, statuses: I) -> Self
-    where
-        I: IntoIterator<Item = u16>,
-    {
-        self.policy.retry_statuses = statuses.into_iter().collect();
-        self
-    }
-
-    /// Allow generated runtimes to retry unsafe methods without per-operation idempotency metadata.
-    #[must_use]
-    pub const fn retry_unsafe_methods(mut self, enabled: bool) -> Self {
-        self.policy.retry_unsafe_methods = enabled;
-        self
-    }
-
-    /// Enable generated request hooks.
-    #[must_use]
-    pub fn request_hooks(mut self) -> Self {
-        self.policy.hooks.push(RuntimeHookKind::Request);
-        self
-    }
-
-    /// Enable generated response hooks.
-    #[must_use]
-    pub fn response_hooks(mut self) -> Self {
-        self.policy.hooks.push(RuntimeHookKind::Response);
-        self
-    }
-
-    /// Enable generated error hooks.
-    #[must_use]
-    pub fn error_hooks(mut self) -> Self {
-        self.policy.hooks.push(RuntimeHookKind::Error);
-        self
-    }
-}
-
-impl Default for ConfigureSdkRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transform for ConfigureSdkRuntime {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for ConfigureSdkRuntime {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut policy = self.policy.clone();
         policy.retry_statuses.sort_unstable();
@@ -3242,45 +1858,7 @@ impl Transform for ConfigureSdkRuntime {
     }
 }
 
-/// Mark matched operations as explicitly idempotent for generated SDK retry policy.
-#[derive(Debug, Clone)]
-pub struct MarkIdempotent {
-    selector: OperationSelector,
-    idempotency_key_header: Option<String>,
-}
-
-impl MarkIdempotent {
-    /// Mark one operation id as idempotent.
-    #[must_use]
-    pub fn operation(id: impl Into<String>) -> Self {
-        Self {
-            selector: OperationSelector::operation(id),
-            idempotency_key_header: Some("Idempotency-Key".to_string()),
-        }
-    }
-
-    /// Mark operations matched by `selector` as idempotent.
-    #[must_use]
-    pub fn when(selector: OperationSelector) -> Self {
-        Self {
-            selector,
-            idempotency_key_header: Some("Idempotency-Key".to_string()),
-        }
-    }
-
-    /// Set the header generated clients use for consumer-supplied idempotency keys.
-    #[must_use]
-    pub fn idempotency_key_header(mut self, header: impl Into<String>) -> Self {
-        self.idempotency_key_header = Some(header.into());
-        self
-    }
-}
-
-impl Transform for MarkIdempotent {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for MarkIdempotent {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         if self
             .idempotency_key_header
@@ -3317,108 +1895,7 @@ impl Transform for MarkIdempotent {
     }
 }
 
-/// Configure generated SDK pagination helpers for matched operations.
-#[derive(Debug, Clone)]
-pub struct ConfigurePagination {
-    selector: OperationSelector,
-    mode: PaginationMode,
-    items_field: String,
-    cursor_param: Option<String>,
-    next_cursor_field: Option<String>,
-    page_param: Option<String>,
-    page_size_param: Option<String>,
-    offset_param: Option<String>,
-    limit_param: Option<String>,
-    termination: PaginationTermination,
-}
-
-impl ConfigurePagination {
-    /// Configure cursor pagination.
-    #[must_use]
-    pub fn cursor(
-        selector: OperationSelector,
-        cursor_param: impl Into<String>,
-        next_cursor_field: impl Into<String>,
-        items_field: impl Into<String>,
-    ) -> Self {
-        Self {
-            selector,
-            mode: PaginationMode::Cursor,
-            items_field: items_field.into(),
-            cursor_param: Some(cursor_param.into()),
-            next_cursor_field: Some(next_cursor_field.into()),
-            page_param: None,
-            page_size_param: None,
-            offset_param: None,
-            limit_param: None,
-            termination: PaginationTermination::NoNextCursor,
-        }
-    }
-
-    /// Configure page-number pagination.
-    #[must_use]
-    pub fn page(
-        selector: OperationSelector,
-        page_param: impl Into<String>,
-        page_size_param: impl Into<String>,
-        items_field: impl Into<String>,
-    ) -> Self {
-        Self {
-            selector,
-            mode: PaginationMode::Page,
-            items_field: items_field.into(),
-            cursor_param: None,
-            next_cursor_field: None,
-            page_param: Some(page_param.into()),
-            page_size_param: Some(page_size_param.into()),
-            offset_param: None,
-            limit_param: None,
-            termination: PaginationTermination::EmptyItems,
-        }
-    }
-
-    /// Configure offset/limit pagination.
-    #[must_use]
-    pub fn offset(
-        selector: OperationSelector,
-        offset_param: impl Into<String>,
-        limit_param: impl Into<String>,
-        items_field: impl Into<String>,
-    ) -> Self {
-        Self {
-            selector,
-            mode: PaginationMode::Offset,
-            items_field: items_field.into(),
-            cursor_param: None,
-            next_cursor_field: None,
-            page_param: None,
-            page_size_param: None,
-            offset_param: Some(offset_param.into()),
-            limit_param: Some(limit_param.into()),
-            termination: PaginationTermination::EmptyItems,
-        }
-    }
-
-    /// Set the optional page-size parameter for cursor pagination.
-    #[must_use]
-    pub fn page_size_param(mut self, page_size_param: impl Into<String>) -> Self {
-        self.page_size_param = Some(page_size_param.into());
-        self
-    }
-
-    /// Terminate generated helpers when the returned items field is empty.
-    #[must_use]
-    pub const fn stop_when_empty_items(mut self) -> Self {
-        self.termination = PaginationTermination::EmptyItems;
-        self
-    }
-}
-
-impl Transform for ConfigurePagination {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for ConfigurePagination {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         self.validate()?;
         let base_path = ir.base_path.clone();
@@ -3456,7 +1933,7 @@ impl Transform for ConfigurePagination {
     }
 }
 
-impl ConfigurePagination {
+impl PaginationChecks for ConfigurePagination {
     fn validate(&self) -> Result<(), CoreError> {
         let required = match self.mode {
             PaginationMode::Cursor => [
@@ -3531,26 +2008,6 @@ impl ConfigurePagination {
     }
 }
 
-/// Configure public operation documentation and documented JSON error responses.
-#[derive(Debug, Clone)]
-pub struct DocumentOperation {
-    selector: OperationSelector,
-    summary: Option<String>,
-    description: Option<String>,
-    deprecated: Option<bool>,
-    tags: Vec<String>,
-    request_examples: Vec<MediaExample>,
-    response_docs: Vec<ResponseDocsPolicy>,
-    error_responses: Vec<DocumentedJsonErrorResponse>,
-}
-
-#[derive(Debug, Clone)]
-struct DocumentedJsonErrorResponse {
-    status: u16,
-    schema: String,
-    description: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedDocumentedJsonErrorResponse {
     status: u16,
@@ -3558,167 +2015,7 @@ struct ResolvedDocumentedJsonErrorResponse {
     description: Option<String>,
 }
 
-impl DocumentOperation {
-    /// Document operations matched by `selector`.
-    #[must_use]
-    pub fn when(selector: OperationSelector) -> Self {
-        Self {
-            selector,
-            summary: None,
-            description: None,
-            deprecated: None,
-            tags: Vec::new(),
-            request_examples: Vec::new(),
-            response_docs: Vec::new(),
-            error_responses: Vec::new(),
-        }
-    }
-
-    /// Set a short operation summary.
-    #[must_use]
-    pub fn summary(mut self, summary: impl Into<String>) -> Self {
-        self.summary = Some(summary.into());
-        self
-    }
-
-    /// Set a longer operation description.
-    #[must_use]
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    /// Mark the operation deprecated.
-    #[must_use]
-    pub const fn deprecated(mut self) -> Self {
-        self.deprecated = Some(true);
-        self
-    }
-
-    /// Add a public operation tag.
-    #[must_use]
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.tags.push(tag.into());
-        self
-    }
-
-    /// Add public operation tags.
-    #[must_use]
-    pub fn tags<I, S>(mut self, tags: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.tags.extend(tags.into_iter().map(Into::into));
-        self
-    }
-
-    /// Set a response description for a status.
-    #[must_use]
-    pub fn response_description(mut self, status: u16, description: impl Into<String>) -> Self {
-        self.response_docs.push(ResponseDocsPolicy {
-            status,
-            description: Some(description.into()),
-            examples: Vec::new(),
-        });
-        self
-    }
-
-    /// Add a JSON request example for `application/json`.
-    #[must_use]
-    pub fn request_example_json(
-        self,
-        name: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.request_example(name, "application/json", value)
-    }
-
-    /// Add a text request example for `text/plain`.
-    #[must_use]
-    pub fn request_example_text(self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.request_example(name, "text/plain", serde_json::Value::String(value.into()))
-    }
-
-    /// Add a request example for a specific media type.
-    #[must_use]
-    pub fn request_example(
-        mut self,
-        name: impl Into<String>,
-        content_type: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.request_examples
-            .push(media_example(name, content_type, value));
-        self
-    }
-
-    /// Add a JSON response example for `application/json`.
-    #[must_use]
-    pub fn response_example_json(
-        self,
-        status: u16,
-        name: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.response_example(status, name, "application/json", value)
-    }
-
-    /// Add a text response example for `text/plain`.
-    #[must_use]
-    pub fn response_example_text(
-        self,
-        status: u16,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.response_example(
-            status,
-            name,
-            "text/plain",
-            serde_json::Value::String(value.into()),
-        )
-    }
-
-    /// Add a response example for a specific media type.
-    #[must_use]
-    pub fn response_example(
-        mut self,
-        status: u16,
-        name: impl Into<String>,
-        content_type: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.response_docs.push(ResponseDocsPolicy {
-            status,
-            description: None,
-            examples: vec![media_example(name, content_type, value)],
-        });
-        self
-    }
-
-    /// Add or replace a documented JSON error response on matched operations.
-    #[must_use]
-    pub fn json_error_response(
-        mut self,
-        status: u16,
-        schema: impl Into<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        self.error_responses.push(DocumentedJsonErrorResponse {
-            status,
-            schema: schema.into(),
-            description: Some(description.into()),
-        });
-        self
-    }
-}
-
-impl Transform for DocumentOperation {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for DocumentOperation {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         self.validate()?;
         let resolved_errors = self
@@ -3783,7 +2080,7 @@ impl Transform for DocumentOperation {
     }
 }
 
-impl DocumentOperation {
+impl DocumentOperationChecks for DocumentOperation {
     fn validate(&self) -> Result<(), CoreError> {
         validate_optional_metadata_value("operation summary", self.summary.as_deref())?;
         validate_optional_metadata_value("operation description", self.description.as_deref())?;
@@ -3817,20 +2114,6 @@ impl DocumentOperation {
             )?;
         }
         Ok(())
-    }
-}
-
-fn media_example(
-    name: impl Into<String>,
-    content_type: impl Into<String>,
-    value: impl Into<serde_json::Value>,
-) -> MediaExample {
-    MediaExample {
-        name: name.into(),
-        content_type: content_type.into(),
-        summary: None,
-        description: None,
-        value: value.into(),
     }
 }
 
@@ -4051,31 +2334,7 @@ fn joined_operation_path(base_path: &str, path: &str) -> String {
     }
 }
 
-/// Rename an operation by id: remap `from`'s `operation.id` to `to` (replaces a `[naming.operations]`
-/// entry). Reuses the existing [`crate::lifecycle::apply_naming`] logic so the rename semantics (and
-/// the `$ref`-rewrite guarantees) stay identical to the host path.
-#[derive(Debug, Clone)]
-pub struct RenameOperation {
-    from: String,
-    to: String,
-}
-
-impl RenameOperation {
-    /// Remap the operation whose id is `from` to `to`.
-    #[must_use]
-    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-        }
-    }
-}
-
-impl Transform for RenameOperation {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for RenameOperation {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut naming = crate::lifecycle::NamingOverrides::default();
         naming.operations.insert(self.from.clone(), self.to.clone());
@@ -4083,31 +2342,7 @@ impl Transform for RenameOperation {
     }
 }
 
-/// Rename a type (schema) by id-or-bare-name: remap `from` to `to`, rewriting every `$ref` that
-/// pointed at it (replaces a `[naming.types]` entry). Reuses [`crate::lifecycle::apply_naming`] so a
-/// rename that would collide/collapse/chain is rejected exactly as on the host path.
-#[derive(Debug, Clone)]
-pub struct RenameType {
-    from: String,
-    to: String,
-}
-
-impl RenameType {
-    /// Remap the schema matched by `from` (its id OR bare name) to `to`.
-    #[must_use]
-    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
-        Self {
-            from: from.into(),
-            to: to.into(),
-        }
-    }
-}
-
-impl Transform for RenameType {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for RenameType {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         let mut naming = crate::lifecycle::NamingOverrides::default();
         naming.types.insert(self.from.clone(), self.to.clone());
@@ -4115,76 +2350,7 @@ impl Transform for RenameType {
     }
 }
 
-/// Assign SDK operation groups from configurable rules.
-///
-/// Groups are generation metadata used by SDK layout templates and future grouped client surfaces.
-/// Rules run in the order they are configured; the first match for an operation wins.
-#[derive(Debug, Clone, Default)]
-pub struct GroupOperations {
-    rules: Vec<GroupRule>,
-}
-
-#[derive(Debug, Clone)]
-enum GroupRule {
-    PathPrefix { prefix: String, group: String },
-    SourcePrefix { prefix: String, group: String },
-    ExistingGroup { existing: String, group: String },
-    Operation { id: String, group: String },
-}
-
-impl GroupOperations {
-    /// No grouping rules.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Group operations whose path starts with `prefix`.
-    #[must_use]
-    pub fn by_path_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
-        self.rules.push(GroupRule::PathPrefix {
-            prefix: prefix.into(),
-            group: group.into(),
-        });
-        self
-    }
-
-    /// Group operations whose source provenance file starts with `prefix`.
-    #[must_use]
-    pub fn by_source_prefix(mut self, prefix: impl Into<String>, group: impl Into<String>) -> Self {
-        self.rules.push(GroupRule::SourcePrefix {
-            prefix: prefix.into(),
-            group: group.into(),
-        });
-        self
-    }
-
-    /// Group operations by a source/imported tag already present on the graph.
-    #[must_use]
-    pub fn by_tag(mut self, tag: impl Into<String>, group: impl Into<String>) -> Self {
-        self.rules.push(GroupRule::ExistingGroup {
-            existing: tag.into(),
-            group: group.into(),
-        });
-        self
-    }
-
-    /// Group one operation by exact operation id.
-    #[must_use]
-    pub fn by_operation(mut self, id: impl Into<String>, group: impl Into<String>) -> Self {
-        self.rules.push(GroupRule::Operation {
-            id: id.into(),
-            group: group.into(),
-        });
-        self
-    }
-}
-
-impl Transform for GroupOperations {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TransformExec for GroupOperations {
     fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
         for op in &mut ir.operations {
             for rule in &self.rules {
@@ -4234,208 +2400,6 @@ impl Transform for GroupOperations {
 // ---------------------------------------------------------------------------------------------------
 // Targets
 // ---------------------------------------------------------------------------------------------------
-
-/// Typed OpenAPI schema patch. Field patches mutate properties on the named object schema.
-#[derive(Debug, Clone)]
-pub struct OpenApiSchemaPatch {
-    schema: String,
-    field_patches: Vec<OpenApiFieldPatch>,
-}
-
-impl OpenApiSchemaPatch {
-    /// Patch an existing named component schema.
-    #[must_use]
-    pub fn new(schema: impl Into<String>) -> Self {
-        Self {
-            schema: schema.into(),
-            field_patches: Vec::new(),
-        }
-    }
-
-    /// Add a field patch for a property on this object schema.
-    #[must_use]
-    pub fn field(mut self, patch: OpenApiFieldPatch) -> Self {
-        self.field_patches.push(patch);
-        self
-    }
-}
-
-/// Typed OpenAPI field patch builder for constraints/defaults/extensions.
-#[derive(Debug, Clone)]
-pub struct OpenApiFieldPatch {
-    field: String,
-    constraints: Constraints,
-    description: Option<String>,
-    default: Option<LiteralValue>,
-    example: Option<LiteralValue>,
-    extensions: Vec<Extension>,
-}
-
-impl OpenApiFieldPatch {
-    /// Patch an existing object property.
-    #[must_use]
-    pub fn new(field: impl Into<String>) -> Self {
-        Self {
-            field: field.into(),
-            constraints: Constraints::default(),
-            description: None,
-            default: None,
-            example: None,
-            extensions: Vec::new(),
-        }
-    }
-
-    /// Set `minLength`.
-    #[must_use]
-    pub fn min_length(mut self, value: u64) -> Self {
-        self.constraints.min_length = Some(value);
-        self
-    }
-
-    /// Set `maxLength`.
-    #[must_use]
-    pub fn max_length(mut self, value: u64) -> Self {
-        self.constraints.max_length = Some(value);
-        self
-    }
-
-    /// Set inclusive numeric `minimum`.
-    #[must_use]
-    pub fn minimum(mut self, value: impl Into<String>) -> Self {
-        self.constraints.minimum = Some(value.into());
-        self
-    }
-
-    /// Set inclusive numeric `maximum`.
-    #[must_use]
-    pub fn maximum(mut self, value: impl Into<String>) -> Self {
-        self.constraints.maximum = Some(value.into());
-        self
-    }
-
-    /// Set a field-level enum.
-    #[must_use]
-    pub fn enum_values<I, S>(mut self, values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.constraints.enum_values = values.into_iter().map(Into::into).collect();
-        self.constraints.enum_values.sort();
-        self
-    }
-
-    /// Set a field-level enum while preserving caller-provided order.
-    #[must_use]
-    pub fn enum_values_in_order<I, S>(mut self, values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.constraints.enum_values = values.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Set a field description.
-    #[must_use]
-    pub fn description(mut self, value: impl Into<String>) -> Self {
-        self.description = Some(value.into());
-        self
-    }
-
-    /// Set a string default.
-    #[must_use]
-    pub fn default_string(mut self, value: impl Into<String>) -> Self {
-        self.default = Some(LiteralValue::String(value.into()));
-        self
-    }
-
-    /// Set a numeric default.
-    #[must_use]
-    pub fn default_number(mut self, value: impl Into<String>) -> Self {
-        self.default = Some(LiteralValue::Number(value.into()));
-        self
-    }
-
-    /// Set a boolean default.
-    #[must_use]
-    pub fn default_bool(mut self, value: bool) -> Self {
-        self.default = Some(LiteralValue::Bool(value));
-        self
-    }
-
-    /// Set a string example.
-    #[must_use]
-    pub fn example_string(mut self, value: impl Into<String>) -> Self {
-        self.example = Some(LiteralValue::String(value.into()));
-        self
-    }
-
-    /// Set a numeric example.
-    #[must_use]
-    pub fn example_number(mut self, value: impl std::fmt::Display) -> Self {
-        self.example = Some(LiteralValue::Number(value.to_string()));
-        self
-    }
-
-    /// Set a boolean example.
-    #[must_use]
-    pub fn example_bool(mut self, value: bool) -> Self {
-        self.example = Some(LiteralValue::Bool(value));
-        self
-    }
-
-    /// Set an explicit null example.
-    #[must_use]
-    pub fn example_null(mut self) -> Self {
-        self.example = Some(LiteralValue::Null);
-        self
-    }
-
-    /// Add or replace a string vendor extension.
-    #[must_use]
-    pub fn extension_string(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.extensions.push(Extension {
-            name: name.into(),
-            value: LiteralValue::String(value.into()),
-        });
-        self
-    }
-
-    /// Add or replace a numeric vendor extension.
-    #[must_use]
-    pub fn extension_number(
-        mut self,
-        name: impl Into<String>,
-        value: impl std::fmt::Display,
-    ) -> Self {
-        self.extensions.push(Extension {
-            name: name.into(),
-            value: LiteralValue::Number(value.to_string()),
-        });
-        self
-    }
-
-    /// Add or replace a boolean vendor extension.
-    #[must_use]
-    pub fn extension_bool(mut self, name: impl Into<String>, value: bool) -> Self {
-        self.extensions.push(Extension {
-            name: name.into(),
-            value: LiteralValue::Bool(value),
-        });
-        self
-    }
-
-    /// Add or replace an explicit null vendor extension.
-    #[must_use]
-    pub fn extension_null(mut self, name: impl Into<String>) -> Self {
-        self.extensions.push(Extension {
-            name: name.into(),
-            value: LiteralValue::Null,
-        });
-        self
-    }
-}
 
 fn apply_openapi_customizations(
     doc: &mut OpenApiDoc,
@@ -4566,53 +2530,7 @@ fn apply_openapi_field_patch(
     Ok(())
 }
 
-/// The OpenAPI 3.1 target: lowers the frozen IR to an OpenAPI document and writes it at [`OpenApi31::to`].
-///
-/// Reads `ir.title` / `ir.base_path` / `ir.security` (the metadata transforms set) and calls the
-/// existing [`crate::lower::to_openapi`] — NOT a re-implementation. The graph's [`SecurityScheme`]s
-/// are passed straight through (`to_openapi` takes `&[SecurityScheme]` directly).
-#[derive(Debug, Clone)]
-pub struct OpenApi31 {
-    path: String,
-    schema_patches: Vec<OpenApiSchemaPatch>,
-}
-
-impl OpenApi31 {
-    /// An OpenAPI 3.1 target with no output path yet (set with [`OpenApi31::to`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            path: String::new(),
-            schema_patches: Vec::new(),
-        }
-    }
-
-    /// Set the output path for the OpenAPI document (e.g. `"generated/openapi.yaml"`).
-    #[must_use]
-    pub fn to(mut self, path: impl Into<String>) -> Self {
-        self.path = path.into();
-        self
-    }
-
-    /// Add a typed schema patch.
-    #[must_use]
-    pub fn schema_patch(mut self, patch: OpenApiSchemaPatch) -> Self {
-        self.schema_patches.push(patch);
-        self
-    }
-}
-
-impl Default for OpenApi31 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Target for OpenApi31 {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TargetExec for OpenApi31 {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.path.is_empty() {
             return Err(CoreError::Config {
@@ -4650,49 +2568,7 @@ impl Target for OpenApi31 {
     }
 }
 
-/// The OpenAPI 3.1 JSON target: lowers the frozen IR to OpenAPI and writes pretty JSON.
-#[derive(Debug, Clone)]
-pub struct OpenApi31Json {
-    path: String,
-    schema_patches: Vec<OpenApiSchemaPatch>,
-}
-
-impl OpenApi31Json {
-    /// An OpenAPI 3.1 JSON target with no output path yet (set with [`OpenApi31Json::to`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            path: String::new(),
-            schema_patches: Vec::new(),
-        }
-    }
-
-    /// Set the output path for the OpenAPI JSON document (e.g. `"generated/openapi.json"`).
-    #[must_use]
-    pub fn to(mut self, path: impl Into<String>) -> Self {
-        self.path = path.into();
-        self
-    }
-
-    /// Add a typed schema patch.
-    #[must_use]
-    pub fn schema_patch(mut self, patch: OpenApiSchemaPatch) -> Self {
-        self.schema_patches.push(patch);
-        self
-    }
-}
-
-impl Default for OpenApi31Json {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Target for OpenApi31Json {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TargetExec for OpenApi31Json {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.path.is_empty() {
             return Err(CoreError::Config {
@@ -4726,53 +2602,7 @@ impl Target for OpenApi31Json {
     }
 }
 
-/// A static text-file target for SDK/runtime files that should be produced alongside generated code.
-///
-/// Include entries are exact relative file paths, or directory prefixes ending in `/**`.
-/// Files are read from `from` and written under `to` with the same relative path. This keeps
-/// hand-authored support modules, package metadata, examples, or docs inside the same deterministic
-/// lifecycle as generated SDK files without baking any project-specific paths into gnr8.
-#[derive(Debug, Clone, Default)]
-pub struct StaticFiles {
-    from_dir: String,
-    to_dir: String,
-    includes: Vec<String>,
-}
-
-impl StaticFiles {
-    /// A static file target with no source/destination yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the project-relative source directory to read static files from.
-    #[must_use]
-    pub fn from(mut self, dir: impl Into<String>) -> Self {
-        self.from_dir = dir.into();
-        self
-    }
-
-    /// Set the project-relative destination directory to write static files under.
-    #[must_use]
-    pub fn to(mut self, dir: impl Into<String>) -> Self {
-        self.to_dir = dir.into();
-        self
-    }
-
-    /// Set exact file includes and/or recursive directory includes ending in `/**`.
-    #[must_use]
-    pub fn include<I, S>(mut self, includes: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.includes = includes.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl Target for StaticFiles {
+impl TargetExec for StaticFiles {
     fn generate(&self, _ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
         let (source_root, files) = self.static_source_files(cx)?;
         let to_dir = validate_static_dir("output dir", &self.to_dir)?;
@@ -4787,20 +2617,6 @@ impl Target for StaticFiles {
             out.create(format!("{to_dir}/{rel}"), text)?;
         }
         Ok(())
-    }
-
-    fn cache_input_files(&self, cx: &Cx) -> Result<Vec<std::path::PathBuf>, CoreError> {
-        let (source_root, files) = self.static_source_files(cx)?;
-        Ok(files.into_iter().map(|rel| source_root.join(rel)).collect())
-    }
-
-    fn verified_noop_input_files(&self, cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        self.cache_input_files(cx).map(Some)
-    }
-
-    fn verified_noop_input_roots(&self, cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        let (source_root, _) = self.static_source_files(cx)?;
-        Ok(Some(vec![source_root]))
     }
 
     fn output_anchors(&self) -> Vec<String> {
@@ -4824,7 +2640,7 @@ impl Target for StaticFiles {
     }
 }
 
-impl StaticFiles {
+impl StaticFilesSources for StaticFiles {
     fn static_source_files(&self, cx: &Cx) -> Result<(std::path::PathBuf, Vec<String>), CoreError> {
         let from_dir = validate_static_dir("source dir", &self.from_dir)?;
         validate_static_dir("output dir", &self.to_dir)?;
@@ -4840,133 +2656,7 @@ impl StaticFiles {
     }
 }
 
-/// The Go SDK target: generates the multi-file Go SDK bundle and writes each file under [`GoSdk::to`].
-///
-/// Derives the SDK's Go package name from [`GoSdk::module`] (the last path segment, sanitized — the
-/// same single-source-of-truth derivation the config used), calls the existing
-/// [`crate::gosdk::generate`] to produce the bundle, splits it into files via
-/// [`crate::gosdk::split_bundle`], and writes each at `<dir>/<name>`.
-#[derive(Debug, Clone)]
-pub struct GoSdk {
-    module: String,
-    go_version: String,
-    dir: String,
-    layout: SdkFileLayout,
-    docs: SdkDocs,
-    package_metadata: bool,
-    package_info: SdkPackageMetadata,
-}
-
-impl GoSdk {
-    /// A Go SDK target with no module/output yet (set with [`GoSdk::module`] + [`GoSdk::to`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            module: String::new(),
-            go_version: "1.23".to_string(),
-            dir: String::new(),
-            layout: SdkFileLayout::compact(),
-            docs: SdkDocs::default(),
-            package_metadata: true,
-            package_info: SdkPackageMetadata::default(),
-        }
-    }
-
-    /// Set the Go module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The package
-    /// name is derived from this — the single source of truth (CLAUDE.md rule 3).
-    #[must_use]
-    pub fn module(mut self, module: impl Into<String>) -> Self {
-        self.module = module.into();
-        self
-    }
-
-    /// Set the Go module path for the generated SDK.
-    ///
-    /// Alias for [`GoSdk::module`] for call sites that prefer `module_path(...)`.
-    #[must_use]
-    pub fn module_path(self, module: impl Into<String>) -> Self {
-        self.module(module)
-    }
-
-    /// Set the Go language version for the generated `go.mod`.
-    #[must_use]
-    pub fn go_version(mut self, version: impl Into<String>) -> Self {
-        self.go_version = version.into();
-        self
-    }
-
-    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk"`).
-    #[must_use]
-    pub fn to(mut self, dir: impl Into<String>) -> Self {
-        self.dir = dir.into();
-        self
-    }
-
-    /// Set the generated file layout.
-    #[must_use]
-    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
-        self.layout = layout;
-        self
-    }
-
-    /// Use the split layout for larger SDKs.
-    #[must_use]
-    pub fn split_files(self) -> Self {
-        self.layout(
-            SdkFileLayout::split()
-                .operations_per_endpoint()
-                .root_operations()
-                .root_models(),
-        )
-    }
-
-    /// Configure generated SDK documentation output.
-    #[must_use]
-    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
-        self.docs = docs.into();
-        self
-    }
-
-    /// Disable generated SDK README/reference docs.
-    #[must_use]
-    pub fn without_docs(self) -> Self {
-        self.docs(false)
-    }
-
-    /// Enable or disable package metadata files such as `go.mod`.
-    #[must_use]
-    pub const fn package_metadata(mut self, enabled: bool) -> Self {
-        self.package_metadata = enabled;
-        self
-    }
-
-    /// Configure generated package metadata and publishing recipe content.
-    #[must_use]
-    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
-        self.package_info = metadata;
-        self
-    }
-
-    /// Emit source files only, without docs or package metadata.
-    #[must_use]
-    pub fn source_only(self) -> Self {
-        self.docs(false).package_metadata(false)
-    }
-}
-
-impl Default for GoSdk {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Target for GoSdk {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        // `gofmt` is selected through PATH. A file stamp cannot prove that a later host process
-        // would resolve the same executable, so this target deliberately disables pre-child skips.
-        Ok(None)
-    }
-
+impl TargetExec for GoSdk {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -5036,153 +2726,7 @@ impl Target for GoSdk {
     }
 }
 
-/// The Python SDK target: generates the multi-file Python SDK bundle and writes each file under
-/// [`PySdk::to`].
-///
-/// The structural twin of [`GoSdk`] (minus the `gofmt` step Python has no analog for). Derives the
-/// SDK's Python package name from [`PySdk::module`] via the SAME [`sdk_package`] single-source-of-truth
-/// derivation `GoSdk` uses (CLAUDE.md rule 3 — no second derivation), takes the URL prefix from
-/// `ir.base_path` (the value `SetBasePath` set and the OpenAPI lowering reads — never re-derived),
-/// calls the existing [`crate::pysdk::generate`] to produce the bundle, splits it into files via
-/// [`crate::pysdk::split_bundle`], and writes each at `<dir>/<name>`.
-#[derive(Debug, Clone)]
-pub struct PySdk {
-    module: String,
-    dir: String,
-    layout: SdkFileLayout,
-    model_style: PyModelStyle,
-    docs: SdkDocs,
-    package_metadata: bool,
-    package_info: SdkPackageMetadata,
-    root_exports: Vec<(String, String)>,
-}
-
-impl PySdk {
-    /// A Python SDK target with no module/output yet (set with [`PySdk::module`] + [`PySdk::to`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            module: String::new(),
-            dir: String::new(),
-            layout: SdkFileLayout::compact(),
-            model_style: PyModelStyle::default(),
-            docs: SdkDocs::default(),
-            package_metadata: true,
-            package_info: SdkPackageMetadata::default(),
-            root_exports: Vec::new(),
-        }
-    }
-
-    /// Set the module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The Python
-    /// package name is derived from this — the single source of truth (CLAUDE.md rule 3), the same
-    /// derivation `GoSdk` uses.
-    #[must_use]
-    pub fn module(mut self, module: impl Into<String>) -> Self {
-        self.module = module.into();
-        self
-    }
-
-    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk-py"`).
-    #[must_use]
-    pub fn to(mut self, dir: impl Into<String>) -> Self {
-        self.dir = dir.into();
-        self
-    }
-
-    /// Set the generated file layout.
-    #[must_use]
-    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
-        self.layout = layout;
-        self
-    }
-
-    /// Use the split layout for larger SDKs.
-    #[must_use]
-    pub fn split_files(self) -> Self {
-        self.layout(
-            SdkFileLayout::split()
-                .operations_per_endpoint()
-                .model_dir("models"),
-        )
-    }
-
-    /// Use Pydantic v2 `BaseModel` models. This is the default.
-    #[must_use]
-    pub fn pydantic(mut self) -> Self {
-        self.model_style = PyModelStyle::Pydantic;
-        self
-    }
-
-    /// Use stdlib dataclass models instead of Pydantic.
-    #[must_use]
-    pub fn dataclasses(mut self) -> Self {
-        self.model_style = PyModelStyle::Dataclass;
-        self
-    }
-
-    /// Configure generated SDK documentation output.
-    #[must_use]
-    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
-        self.docs = docs.into();
-        self
-    }
-
-    /// Disable generated SDK README/reference docs.
-    #[must_use]
-    pub fn without_docs(self) -> Self {
-        self.docs(false)
-    }
-
-    /// Enable or disable package metadata files such as `pyproject.toml`.
-    #[must_use]
-    pub const fn package_metadata(mut self, enabled: bool) -> Self {
-        self.package_metadata = enabled;
-        self
-    }
-
-    /// Set the generated Python package version.
-    #[must_use]
-    pub fn package_version(mut self, version: impl Into<String>) -> Self {
-        self.package_info = self.package_info.clone().version(version);
-        self
-    }
-
-    /// Configure generated package metadata and publishing recipe content.
-    #[must_use]
-    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
-        self.package_info = metadata;
-        self
-    }
-
-    /// Re-export a symbol from an additional module at the generated package root.
-    ///
-    /// This is intended for first-party handwritten modules shipped beside generated sources. For
-    /// example, `.root_export("exceptions_user", "CodeActionFailure")` emits
-    /// `from .exceptions_user import CodeActionFailure` and includes the symbol in `__all__`.
-    #[must_use]
-    pub fn root_export(mut self, module: impl Into<String>, symbol: impl Into<String>) -> Self {
-        self.root_exports.push((module.into(), symbol.into()));
-        self
-    }
-
-    /// Emit source files only, without generated docs.
-    #[must_use]
-    pub fn source_only(self) -> Self {
-        self.docs(false).package_metadata(false)
-    }
-}
-
-impl Default for PySdk {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Target for PySdk {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TargetExec for PySdk {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -5387,124 +2931,7 @@ fn is_python_identifier(value: &str) -> bool {
         )
 }
 
-/// The TypeScript SDK target: generates the multi-file TypeScript SDK bundle and writes each file
-/// under [`TsSdk::to`].
-///
-/// The structural twin of [`PySdk`]/[`GoSdk`]. Derives the SDK's package name from [`TsSdk::module`]
-/// via the SAME [`sdk_package`] single-source-of-truth derivation `PySdk`/`GoSdk` use (CLAUDE.md
-/// rule 3 — no second derivation, no TS-specific sanitizer), takes the URL prefix from `ir.base_path`
-/// (the value `SetBasePath` set and the OpenAPI lowering reads — never re-derived), calls the existing
-/// [`crate::tssdk::generate`] to produce the bundle, splits it into files via
-/// [`crate::tssdk::split_bundle`], and writes each at `<dir>/<name>`.
-#[derive(Debug, Clone)]
-pub struct TsSdk {
-    module: String,
-    dir: String,
-    layout: SdkFileLayout,
-    docs: SdkDocs,
-    package_metadata: Option<bool>,
-    package_info: SdkPackageMetadata,
-}
-
-impl TsSdk {
-    /// A TypeScript SDK target with no module/output yet (set with [`TsSdk::module`] + [`TsSdk::to`]).
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            module: String::new(),
-            dir: String::new(),
-            layout: SdkFileLayout::compact(),
-            docs: SdkDocs::default(),
-            package_metadata: None,
-            package_info: SdkPackageMetadata::default(),
-        }
-    }
-
-    /// Set the module path for the generated SDK (e.g. `"example.com/bookstore/sdk"`). The package
-    /// name is derived from this — the single source of truth (CLAUDE.md rule 3), the same derivation
-    /// `PySdk`/`GoSdk` use.
-    #[must_use]
-    pub fn module(mut self, module: impl Into<String>) -> Self {
-        self.module = module.into();
-        self
-    }
-
-    /// Set the output directory for the generated SDK files (e.g. `"generated/sdk-ts"`).
-    #[must_use]
-    pub fn to(mut self, dir: impl Into<String>) -> Self {
-        self.dir = dir.into();
-        self
-    }
-
-    /// Set the generated file layout.
-    #[must_use]
-    pub fn layout(mut self, layout: SdkFileLayout) -> Self {
-        self.layout = layout;
-        self
-    }
-
-    /// Use the split layout for larger SDKs.
-    #[must_use]
-    pub fn split_files(self) -> Self {
-        self.layout(
-            SdkFileLayout::split()
-                .operations_per_endpoint()
-                .model_dir("models"),
-        )
-    }
-
-    /// Configure generated SDK documentation output.
-    #[must_use]
-    pub fn docs(mut self, docs: impl Into<SdkDocs>) -> Self {
-        self.docs = docs.into();
-        self
-    }
-
-    /// Disable generated SDK README/reference docs.
-    #[must_use]
-    pub fn without_docs(self) -> Self {
-        self.docs(false)
-    }
-
-    /// Enable or disable package metadata files such as `package.json`.
-    #[must_use]
-    pub const fn package_metadata(mut self, enabled: bool) -> Self {
-        self.package_metadata = Some(enabled);
-        self
-    }
-
-    /// Configure generated package metadata and publishing recipe content.
-    #[must_use]
-    pub fn package(mut self, metadata: SdkPackageMetadata) -> Self {
-        if self.package_metadata.is_none() {
-            self.package_metadata = Some(true);
-        }
-        self.package_info = metadata;
-        self
-    }
-
-    /// Emit source files only, without docs or package metadata.
-    #[must_use]
-    pub fn source_only(self) -> Self {
-        self.docs(false).package_metadata(false)
-    }
-
-    fn effective_package_metadata(&self) -> bool {
-        self.package_metadata.unwrap_or(false)
-    }
-}
-
-impl Default for TsSdk {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Target for TsSdk {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl TargetExec for TsSdk {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
@@ -5595,152 +3022,11 @@ impl Target for TsSdk {
     }
 }
 
-/// Package-manager metadata shared by generated SDK targets.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SdkPackageMetadata {
-    registry_name: Option<String>,
-    version: Option<String>,
-    description: Option<String>,
-    license: Option<String>,
-    repository_url: Option<String>,
-    homepage_url: Option<String>,
-    documentation_url: Option<String>,
-    keywords: Vec<String>,
-}
-
-impl SdkPackageMetadata {
-    /// Empty metadata: targets derive package name from their module/import path and use version
-    /// `0.1.0`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the registry/distribution package name.
-    #[must_use]
-    pub fn registry_name(mut self, name: impl Into<String>) -> Self {
-        self.registry_name = Some(name.into());
-        self
-    }
-
-    /// Alias for [`Self::registry_name`].
-    #[must_use]
-    pub fn name(self, name: impl Into<String>) -> Self {
-        self.registry_name(name)
-    }
-
-    /// Set the package version.
-    #[must_use]
-    pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = Some(version.into());
-        self
-    }
-
-    /// Set a human-readable package description.
-    #[must_use]
-    pub fn description(mut self, description: impl Into<String>) -> Self {
-        self.description = Some(description.into());
-        self
-    }
-
-    /// Set the SPDX license expression or license label.
-    #[must_use]
-    pub fn license(mut self, license: impl Into<String>) -> Self {
-        self.license = Some(license.into());
-        self
-    }
-
-    /// Set the repository URL.
-    #[must_use]
-    pub fn repository(mut self, url: impl Into<String>) -> Self {
-        self.repository_url = Some(url.into());
-        self
-    }
-
-    /// Set the homepage URL.
-    #[must_use]
-    pub fn homepage(mut self, url: impl Into<String>) -> Self {
-        self.homepage_url = Some(url.into());
-        self
-    }
-
-    /// Set the documentation URL.
-    #[must_use]
-    pub fn documentation(mut self, url: impl Into<String>) -> Self {
-        self.documentation_url = Some(url.into());
-        self
-    }
-
-    /// Add one package keyword.
-    #[must_use]
-    pub fn keyword(mut self, keyword: impl Into<String>) -> Self {
-        self.keywords.push(keyword.into());
-        self
-    }
-
-    /// Replace package keywords.
-    #[must_use]
-    pub fn keywords<I, S>(mut self, keywords: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.keywords = keywords.into_iter().map(Into::into).collect();
-        self
-    }
-
-    fn resolved_name(&self, default: &str) -> Result<String, CoreError> {
-        let name = self.registry_name.as_deref().unwrap_or(default);
-        validate_metadata_value("package name", name)?;
-        Ok(name.to_string())
-    }
-
-    fn resolved_version(&self) -> Result<String, CoreError> {
-        let version = self.version.as_deref().unwrap_or("0.1.0");
-        validate_metadata_value("package version", version)?;
-        if version.chars().any(char::is_whitespace) {
-            return Err(CoreError::Config {
-                message: "package version must contain no whitespace".to_string(),
-            });
-        }
-        Ok(version.to_string())
-    }
-}
-
 // ---------------------------------------------------------------------------------------------------
 // PostProcess
 // ---------------------------------------------------------------------------------------------------
 
-/// Run a formatter or normalizer against generated artifacts before the host writes them.
-#[derive(Debug, Clone)]
-pub struct FormatCommand {
-    program: String,
-    args: Vec<String>,
-}
-
-impl FormatCommand {
-    /// Create a command postprocessor.
-    #[must_use]
-    pub fn new(program: impl Into<String>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-        }
-    }
-
-    /// Set command arguments.
-    #[must_use]
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.args = args.into_iter().map(Into::into).collect();
-        self
-    }
-}
-
-impl PostProcess for FormatCommand {
+impl PostExec for FormatCommand {
     fn run(&self, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
         let temp = create_unique_postprocess_dir(&cx.project_root)?;
         let result = self.run_in_temp(out, &temp);
@@ -5756,31 +3042,9 @@ impl PostProcess for FormatCommand {
             (Ok(()), Ok(())) => Ok(()),
         }
     }
-
-    fn cache_key_fragment(&self, _cx: &Cx) -> Result<Vec<u8>, CoreError> {
-        let mut fragment = format!("FormatCommand\0{}\0", self.program).into_bytes();
-        for arg in &self.args {
-            fragment.extend(arg.as_bytes());
-            fragment.push(0);
-        }
-        if let Some(path) = resolve_command_path(&self.program) {
-            fragment.extend(path.to_string_lossy().as_bytes());
-            fragment.push(0);
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                fragment.extend(metadata.len().to_string().as_bytes());
-                fragment.push(0);
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                        fragment.extend(duration.as_nanos().to_string().as_bytes());
-                    }
-                }
-            }
-        }
-        Ok(fragment)
-    }
 }
 
-impl FormatCommand {
+impl FormatCommandRun for FormatCommand {
     fn run_in_temp(&self, out: &mut Artifacts, temp: &Path) -> Result<(), CoreError> {
         let artifact_paths: BTreeSet<String> = out
             .files()
@@ -5944,39 +3208,10 @@ fn collect_temp_files(root: &Path) -> Result<BTreeSet<String>, CoreError> {
     Ok(out)
 }
 
-fn resolve_command_path(program: &str) -> Option<PathBuf> {
-    let program_path = Path::new(program);
-    if program_path.components().count() > 1 {
-        return program_path.is_file().then(|| program_path.to_path_buf());
-    }
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
-
 /// The "Code generated by gnr8" banner line prepended to every generated `.go` file.
 const GENERATED_HEADER: &str = "// Code generated by gnr8. DO NOT EDIT.";
 
-/// A post-processor that prepends a "Code generated by gnr8. DO NOT EDIT." line to every `.go`
-/// artifact (non-`.go` files are skipped). A small, useful built-in demonstrating the post-process
-/// seam; the line is idempotent (a file that already starts with it is left unchanged).
-#[derive(Debug, Default, Clone)]
-pub struct Header;
-
-impl Header {
-    /// The generated-code banner post-processor.
-    #[must_use]
-    pub fn generated() -> Self {
-        Self
-    }
-}
-
-impl PostProcess for Header {
-    fn verified_noop_input_files(&self, _cx: &Cx) -> Result<Option<Vec<PathBuf>>, CoreError> {
-        Ok(Some(Vec::new()))
-    }
-
+impl PostExec for Header {
     fn run(&self, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
         // Collect the rewrites first (we can't mutate while iterating `files()`), then re-write each
         // through explicit artifact ownership so the set stays sorted (a rewrite of an existing path replaces
@@ -6297,15 +3532,6 @@ fn validate_metadata_values(field: &str, values: &[String]) -> Result<(), CoreEr
     Ok(())
 }
 
-fn validate_metadata_value(field: &str, value: &str) -> Result<(), CoreError> {
-    if value.trim().is_empty() || value.contains('\n') || value.contains('\r') {
-        return Err(CoreError::Config {
-            message: format!("{field} must be non-empty and stay on one line"),
-        });
-    }
-    Ok(())
-}
-
 fn collect_static_include(
     source_root: &Path,
     include: &str,
@@ -6404,6 +3630,136 @@ fn rel_to_slash_string(path: &Path) -> Result<String, CoreError> {
     Ok(parts.join("/"))
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Dispatch: one declaration → one execution, with no other path.
+// ---------------------------------------------------------------------------------------------------
+
+/// Execute a declared source.
+///
+/// # Errors
+///
+/// Propagates the source's own typed failure.
+pub fn load_source(spec: &BuiltinSource, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    match spec {
+        BuiltinSource::GoGin(s) => s.load(cx),
+        BuiltinSource::OpenApi(s) => s.load(cx),
+        BuiltinSource::FastApi(s) => s.load(cx),
+        BuiltinSource::Flask(s) => s.load(cx),
+        BuiltinSource::NestJs(s) => s.load(cx),
+    }
+}
+
+/// The project-relative input roots a declared source reads.
+///
+/// `gnr8 doctor` probes the source language from these; a declaration that names no single input
+/// root answers `None` rather than guessing.
+#[must_use]
+pub fn source_input_roots(spec: &BuiltinSource, cx: &Cx) -> Option<Vec<PathBuf>> {
+    match spec {
+        BuiltinSource::GoGin(s) => single_input_cache_root(&cx.project_root, &s.inputs),
+        BuiltinSource::FastApi(s) => single_input_cache_root(&cx.project_root, &s.inputs),
+        BuiltinSource::Flask(s) => single_input_cache_root(&cx.project_root, &s.inputs),
+        BuiltinSource::NestJs(s) => single_input_cache_root(&cx.project_root, &s.inputs),
+        BuiltinSource::OpenApi(s) => {
+            if s.input.is_empty() {
+                None
+            } else {
+                Some(vec![cx.project_root.join(&s.input)])
+            }
+        }
+    }
+}
+
+/// Execute a declared transform against `ir`.
+///
+/// # Errors
+///
+/// Propagates the transform's own typed failure.
+pub fn apply_transform(
+    spec: &BuiltinTransform,
+    ir: &mut ApiGraph,
+    cx: &Cx,
+) -> Result<(), CoreError> {
+    match spec {
+        BuiltinTransform::SetBasePath(t) => t.apply(ir, cx),
+        BuiltinTransform::SetTitle(t) => t.apply(ir, cx),
+        BuiltinTransform::OpenApiMetadata(t) => t.apply(ir, cx),
+        BuiltinTransform::DiagnosticPolicy(t) => t.apply(ir, cx),
+        BuiltinTransform::RequireOperationDocs(t) => t.apply(ir, cx),
+        BuiltinTransform::SetOperationSuccessResponse(t) => t.apply(ir, cx),
+        BuiltinTransform::SetSchemaFieldType(t) => t.apply(ir, cx),
+        BuiltinTransform::ApiOverrides(t) => t.apply(ir, cx),
+        BuiltinTransform::SetEnumOrder(t) => t.apply(ir, cx),
+        BuiltinTransform::ApplySecurity(t) => t.apply(ir, cx),
+        BuiltinTransform::ConfigureSdkRuntime(t) => t.apply(ir, cx),
+        BuiltinTransform::MarkIdempotent(t) => t.apply(ir, cx),
+        BuiltinTransform::ConfigurePagination(t) => t.apply(ir, cx),
+        BuiltinTransform::DocumentOperation(t) => t.apply(ir, cx),
+        BuiltinTransform::RenameOperation(t) => t.apply(ir, cx),
+        BuiltinTransform::RenameType(t) => t.apply(ir, cx),
+        BuiltinTransform::GroupOperations(t) => t.apply(ir, cx),
+    }
+}
+
+/// Execute a declared target against the frozen `ir`.
+///
+/// # Errors
+///
+/// Propagates the target's own typed failure.
+pub fn generate_target(
+    spec: &BuiltinTarget,
+    ir: &ApiGraph,
+    out: &mut Artifacts,
+    cx: &Cx,
+) -> Result<(), CoreError> {
+    match spec {
+        BuiltinTarget::OpenApi31(t) => t.generate(ir, out, cx),
+        BuiltinTarget::OpenApi31Json(t) => t.generate(ir, out, cx),
+        BuiltinTarget::StaticFiles(t) => t.generate(ir, out, cx),
+        BuiltinTarget::GoSdk(t) => t.generate(ir, out, cx),
+        BuiltinTarget::PySdk(t) => t.generate(ir, out, cx),
+        BuiltinTarget::TsSdk(t) => t.generate(ir, out, cx),
+    }
+}
+
+/// The loop-safety anchors a declared target writes.
+#[must_use]
+pub fn target_output_anchors(spec: &BuiltinTarget) -> Vec<String> {
+    match spec {
+        BuiltinTarget::OpenApi31(t) => t.output_anchors(),
+        BuiltinTarget::OpenApi31Json(t) => t.output_anchors(),
+        BuiltinTarget::StaticFiles(t) => t.output_anchors(),
+        BuiltinTarget::GoSdk(t) => t.output_anchors(),
+        BuiltinTarget::PySdk(t) => t.output_anchors(),
+        BuiltinTarget::TsSdk(t) => t.output_anchors(),
+    }
+}
+
+/// The readiness checks a declared target opts into.
+#[must_use]
+pub fn target_readiness_targets(spec: &BuiltinTarget) -> Vec<ReadinessTarget> {
+    match spec {
+        BuiltinTarget::OpenApi31(t) => t.readiness_targets(),
+        BuiltinTarget::OpenApi31Json(t) => t.readiness_targets(),
+        BuiltinTarget::StaticFiles(t) => t.readiness_targets(),
+        BuiltinTarget::GoSdk(t) => t.readiness_targets(),
+        BuiltinTarget::PySdk(t) => t.readiness_targets(),
+        BuiltinTarget::TsSdk(t) => t.readiness_targets(),
+    }
+}
+
+/// Execute a declared post-processor over `out`.
+///
+/// # Errors
+///
+/// Propagates the post-processor's own typed failure.
+pub fn run_post(spec: &BuiltinPost, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
+    match spec {
+        BuiltinPost::FormatCommand(p) => p.run(out, cx),
+        BuiltinPost::Header(p) => p.run(out, cx),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect (rust-best-practices skill ch.4 + ch.5); scope the allow
@@ -6412,14 +3768,14 @@ mod tests {
 
     use super::{
         create_unique_postprocess_dir, go_gin_cache_key, go_gin_cache_path, load_go_gin_cache,
-        save_go_gin_cache, sdk_package, ApiOverrides, ApplySecurity, ConfigurePagination,
-        ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, ExtractorIdentity, FastApi, Flask,
-        FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
-        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
-        ParameterOverride, PostProcess, PySdk, RenameType, RequestParameter, ResponseOverride,
-        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
-        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, Source, StaticFiles, Target,
-        Transform, TsSdk,
+        save_go_gin_cache, sdk_package, source_input_roots, ApiOverrides, ApplySecurity,
+        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder,
+        ExtractorIdentity, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
+        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata,
+        OpenApiSchemaPatch, OperationSelector, ParameterOverride, PostExec, PySdk, RenameType,
+        RequestParameter, ResponseOverride, SdkPackageMetadata, SecurityOverride, SetBasePath,
+        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec,
+        StaticFiles, StaticFilesSources, TargetExec, TransformExec, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta, LiteralValue};
     use crate::graph::{
@@ -6427,6 +3783,7 @@ mod tests {
         PaginationTermination, Param, Prim, Response, RuntimeHookKind, Schema, SchemaRef,
         SchemaUse, SourceSpan, Type,
     };
+    use gnr8::sdk::BuiltinSource;
 
     use crate::sdk::layout::SdkFileLayout;
     use crate::sdk::model::SdkModel;
@@ -6898,21 +4255,29 @@ mod tests {
     }
 
     #[test]
-    fn language_sources_report_cache_input_roots_for_doctor_probe() {
+    fn language_sources_report_input_roots_for_the_doctor_probe() {
         let root = temp_project("source-roots");
         let cx = Cx::new(&root);
 
         assert_eq!(
-            FastApi::new().inputs(["api"]).cache_input_roots(&cx),
+            source_input_roots(&BuiltinSource::FastApi(FastApi::new().inputs(["api"])), &cx),
             Some(vec![root.join("api")])
         );
         assert_eq!(
-            Flask::new().inputs(["flask_app"]).cache_input_roots(&cx),
+            source_input_roots(
+                &BuiltinSource::Flask(Flask::new().inputs(["flask_app"])),
+                &cx
+            ),
             Some(vec![root.join("flask_app")])
         );
         assert_eq!(
-            NestJs::new().inputs(["src"]).cache_input_roots(&cx),
+            source_input_roots(&BuiltinSource::NestJs(NestJs::new().inputs(["src"])), &cx),
             Some(vec![root.join("src")])
+        );
+        assert_eq!(
+            source_input_roots(&BuiltinSource::GoGin(GoGin::new()), &cx),
+            None,
+            "a source with no single input declares no root to probe"
         );
     }
 
@@ -9184,8 +6549,8 @@ mod tests {
     }
 
     #[test]
-    fn static_files_target_reports_cache_inputs() {
-        let root = temp_project("cache-inputs");
+    fn static_files_target_resolves_its_declared_source_files() {
+        let root = temp_project("static-inputs");
         std::fs::create_dir_all(root.join("static/runtime")).unwrap();
         std::fs::write(root.join("static/runtime/__init__.py"), "ROOT\n").unwrap();
         std::fs::write(root.join("static/README.md"), "README\n").unwrap();
@@ -9194,15 +6559,10 @@ mod tests {
             .from("static")
             .to("pkg")
             .include(["runtime/**", "README.md"]);
-        let files = target.cache_input_files(&Cx::new(&root)).unwrap();
-        assert_eq!(
-            target.verified_noop_input_files(&Cx::new(&root)).unwrap(),
-            Some(files.clone())
-        );
-        assert_eq!(
-            target.verified_noop_input_roots(&Cx::new(&root)).unwrap(),
-            Some(vec![root.join("static")])
-        );
+        let (source_root, names) = target.static_source_files(&Cx::new(&root)).unwrap();
+        assert_eq!(source_root, root.join("static"));
+        let files: Vec<std::path::PathBuf> =
+            names.iter().map(|name| source_root.join(name)).collect();
         let rels: Vec<_> = files
             .iter()
             .map(|path| {

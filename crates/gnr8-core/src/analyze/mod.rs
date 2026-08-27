@@ -8,7 +8,11 @@
 //! assembles the router-agnostic [`crate::graph::ApiGraph`] (stable ids, sorted serialization,
 //! provenance on every node — GRAPH-01/02, D-07/D-08).
 
-pub(crate) mod facts;
+/// The language-neutral facts DTO the sidecars emit.
+///
+/// Defined in the thin `gnr8` SDK because the graph's own type vocabulary (`Type`, `Prim`,
+/// `Field`, ...) is built from it and must be one definition on both sides of the boundary.
+pub use gnr8::facts;
 pub(crate) mod helper;
 
 /// The source language of an analyzed target directory.
