@@ -497,14 +497,25 @@ fn validate_write_plan(
     let mut seen = BTreeMap::new();
     let mut paths = OutputPathGuard::new(project_root);
     let mut safe_paths = Vec::with_capacity(plan.files.len());
-    // Re-hashing every planned file is megabytes of digest that says nothing about any other file,
-    // so it is spread across the cores; the path walk below stays in order because the collision it
-    // reports must name the FIRST pair, not whichever thread got there first.
-    let actual_hashes =
-        crate::parallel::map_ordered(&plan.files, |file| Ok(blake3_hex(&file.new_bytes)))?;
-    for (file, actual_hash) in plan.files.iter().zip(&actual_hashes) {
-        let (safe, identity) = paths.resolve_with_identity(&file.path)?;
-        safe_paths.push(safe);
+    // Re-hashing every planned file, and folding every planned path to its portable identity, are
+    // both work that says nothing about any other file — and on a large SDK there are megabytes of
+    // the first and thousands of the second. Both are spread across the cores; the walk below stays
+    // in order, because the collision it reports must name the FIRST pair.
+    let (actual_hashes, identities) = crate::parallel::join(
+        || crate::parallel::map_ordered(&plan.files, |file| Ok(blake3_hex(&file.new_bytes))),
+        || {
+            crate::parallel::map_ordered(&plan.files, |file| {
+                portable_path_identity(&file.path).map_err(|reason| crate::CoreError::Io {
+                    message: format!(
+                        "refusing to write non-portable output path {:?}: {reason}",
+                        file.path
+                    ),
+                })
+            })
+        },
+    )?;
+    for ((file, actual_hash), identity) in plan.files.iter().zip(&actual_hashes).zip(identities) {
+        safe_paths.push(paths.prove(&file.path)?);
         if let Some(previous) = seen.insert(identity, file.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),
