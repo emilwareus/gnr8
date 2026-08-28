@@ -206,6 +206,7 @@ fn dispatch(
                     "the host asked for a custom target before handing over the frozen graph",
                 )
             })?;
+            let received = artifacts.clone();
             let mut out = Artifacts::from_files(artifacts);
             for index in indices {
                 let target = pipeline
@@ -214,11 +215,12 @@ fn dispatch(
                 out.begin_stage(format!("target[{index}]:{}", target.producer()));
                 target.generate(graph, &mut out, cx)?;
             }
-            Ok(WorkerMessage::Artifacts {
-                artifacts: out.into_files(),
+            Ok(WorkerMessage::ArtifactChanges {
+                changed: artifact_changes(&received, out.into_files()),
             })
         }
         HostMessage::RunPosts { indices, artifacts } => {
+            let received = artifacts.clone();
             let mut out = Artifacts::from_files(artifacts);
             for index in indices {
                 let post = pipeline
@@ -227,8 +229,8 @@ fn dispatch(
                 out.begin_stage(format!("post[{index}]:{}", post.producer()));
                 post.run(&mut out, cx)?;
             }
-            Ok(WorkerMessage::Artifacts {
-                artifacts: out.into_files(),
+            Ok(WorkerMessage::ArtifactChanges {
+                changed: artifact_changes(&received, out.into_files()),
             })
         }
         HostMessage::Hello { .. } | HostMessage::Shutdown | HostMessage::FreezeGraph { .. } => {
@@ -237,6 +239,30 @@ fn dispatch(
             ))
         }
     }
+}
+
+/// The artifacts in `after` that `before` did not already hold identically.
+///
+/// Both are sorted by path and `after` is a superset of `before` by path — a stage can create,
+/// overlay or rewrite, never drop — so one merge walk answers it.
+fn artifact_changes(
+    before: &[crate::sdk::Artifact],
+    after: Vec<crate::sdk::Artifact>,
+) -> Vec<crate::sdk::Artifact> {
+    let mut kept = before.iter().peekable();
+    let mut changed = Vec::new();
+    for artifact in after {
+        while kept.peek().is_some_and(|held| held.path < artifact.path) {
+            kept.next();
+        }
+        let held = kept
+            .next_if(|held| held.path == artifact.path)
+            .is_some_and(|held| *held == artifact);
+        if !held {
+            changed.push(artifact);
+        }
+    }
+    changed
 }
 
 fn unknown_stage(kind: &str, index: usize) -> Error {
@@ -363,8 +389,8 @@ mod tests {
         };
         assert_eq!(graph.title, "Base::marked");
         assert!(matches!(messages[2], WorkerMessage::Done));
-        let WorkerMessage::Artifacts { artifacts } = &messages[3] else {
-            panic!("expected artifacts, got {:?}", messages[3]);
+        let WorkerMessage::ArtifactChanges { changed: artifacts } = &messages[3] else {
+            panic!("expected artifact changes, got {:?}", messages[3]);
         };
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].path, "generated/API.md");
@@ -435,11 +461,45 @@ mod tests {
         };
         // The worker's `Cx` is the project root the host declared in its handshake.
         assert_eq!(graph.title, "/repo");
-        let WorkerMessage::Artifacts { artifacts } = &messages[2] else {
-            panic!("expected artifacts, got {:?}", messages[2]);
+        let WorkerMessage::ArtifactChanges { changed: artifacts } = &messages[2] else {
+            panic!("expected artifact changes, got {:?}", messages[2]);
         };
+        assert_eq!(artifacts.len(), 1, "only the rewritten artifact comes back");
         assert_eq!(artifacts[0].text, "// banner\nbody\n");
         assert!(artifacts[0].producer.starts_with("post[0]:"));
+    }
+
+    /// The reply is what the run changed, so an untouched artifact is not shipped back at all.
+    #[test]
+    fn an_untouched_artifact_is_not_in_the_reply() {
+        struct TouchOne;
+        impl crate::sdk::PostProcess for TouchOne {
+            fn run(&self, out: &mut Artifacts, _cx: &Cx) -> Result<(), Error> {
+                out.rewrite("b.txt", |text| format!("{text}!"))
+            }
+        }
+        let pipeline = Pipeline::new().post(Custom(TouchOne));
+        let (result, output) = drive(
+            &pipeline,
+            &[
+                hello(),
+                HostMessage::RunPosts {
+                    indices: vec![0],
+                    artifacts: vec![
+                        crate::sdk::Artifact::new("a.txt", "untouched"),
+                        crate::sdk::Artifact::new("b.txt", "body"),
+                    ],
+                },
+                HostMessage::Shutdown,
+            ],
+        );
+        assert!(result.is_ok());
+        let WorkerMessage::ArtifactChanges { changed } = &replies(&output)[1] else {
+            panic!("expected artifact changes");
+        };
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].path, "b.txt");
+        assert_eq!(changed[0].text, "body!");
     }
 
     #[test]

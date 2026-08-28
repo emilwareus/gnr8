@@ -146,10 +146,18 @@ pub enum WorkerMessage {
         /// The produced or mutated graph.
         graph: ApiGraph,
     },
-    /// The result of a target or post-process request.
-    Artifacts {
-        /// The artifact set after the stage ran.
-        artifacts: Vec<Artifact>,
+    /// The result of a target or post-process request: what the run CHANGED.
+    ///
+    /// The host already holds the set it sent, so shipping it back would re-encode and re-decode
+    /// megabytes to say "unchanged" — a post-processor that rewrites two files of five thousand paid
+    /// for all five thousand. The reply is therefore the artifacts the run created or altered, and
+    /// the host merges them into the set it kept.
+    ///
+    /// This is also what makes "a stage may create, overlay or rewrite an artifact but never drop
+    /// one" true of the WIRE and not just of the process: an additive reply cannot express a drop.
+    ArtifactChanges {
+        /// The artifacts the run created or changed, sorted by path.
+        changed: Vec<Artifact>,
     },
     /// Acknowledgement of [`HostMessage::Shutdown`].
     Done,

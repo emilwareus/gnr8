@@ -411,16 +411,69 @@ impl WorkerSession {
         }
     }
 
-    fn expect_artifacts(&mut self, request: &HostMessage) -> Result<Vec<Artifact>, CoreError> {
-        self.send(request)?;
+    /// Send a work request that carries an artifact set, and merge the worker's changes back into it.
+    ///
+    /// The set is handed to `request` by value and taken back out of it after the frame is written,
+    /// so the host neither clones it to keep a copy nor ships it back to itself: the worker answers
+    /// with what it changed, and those changes are merged into the set the host still holds.
+    fn expect_artifacts(&mut self, request: HostMessage) -> Result<Vec<Artifact>, CoreError> {
+        self.send(&request)?;
+        let sent = match request {
+            HostMessage::GenerateTargets { artifacts, .. }
+            | HostMessage::RunPosts { artifacts, .. } => artifacts,
+            other => {
+                return Err(Self::protocol_error(format!(
+                    "{} does not carry an artifact set",
+                    host_message_name(&other)
+                )))
+            }
+        };
         match self.receive()? {
-            WorkerMessage::Artifacts { artifacts } => Ok(artifacts),
+            WorkerMessage::ArtifactChanges { changed } => Ok(merge_artifact_changes(sent, changed)),
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
             other => Err(Self::protocol_error(format!(
-                "expected artifacts from the .gnr8 worker, got {}",
+                "expected artifact changes from the .gnr8 worker, got {}",
                 message_name(&other)
             ))),
         }
+    }
+}
+
+/// Fold the worker's changes into the artifact set the host sent, keeping it sorted by path.
+///
+/// Both sides are sorted by path and a change is either a new path or a replacement for an existing
+/// one, so one merge walk rebuilds the finished set.
+fn merge_artifact_changes(sent: Vec<Artifact>, changed: Vec<Artifact>) -> Vec<Artifact> {
+    if changed.is_empty() {
+        return sent;
+    }
+    let mut merged = Vec::with_capacity(sent.len() + changed.len());
+    let mut sent = sent.into_iter().peekable();
+    for change in changed {
+        while sent.peek().is_some_and(|held| held.path < change.path) {
+            if let Some(held) = sent.next() {
+                merged.push(held);
+            }
+        }
+        if sent.peek().is_some_and(|held| held.path == change.path) {
+            sent.next();
+        }
+        merged.push(change);
+    }
+    merged.extend(sent);
+    merged
+}
+
+/// The name of a host message, for a protocol diagnostic.
+fn host_message_name(message: &HostMessage) -> &'static str {
+    match message {
+        HostMessage::Hello { .. } => "a handshake",
+        HostMessage::LoadSource { .. } => "a source request",
+        HostMessage::ApplyTransforms { .. } => "a transform request",
+        HostMessage::FreezeGraph { .. } => "a frozen graph",
+        HostMessage::GenerateTargets { .. } => "a target request",
+        HostMessage::RunPosts { .. } => "a post-process request",
+        HostMessage::Shutdown => "a shutdown",
     }
 }
 
@@ -467,7 +520,7 @@ impl StageRunner for WorkerSession {
         indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::GenerateTargets {
+        self.expect_artifacts(HostMessage::GenerateTargets {
             indices: indices.to_vec(),
             artifacts,
         })
@@ -478,7 +531,7 @@ impl StageRunner for WorkerSession {
         indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::RunPosts {
+        self.expect_artifacts(HostMessage::RunPosts {
             indices: indices.to_vec(),
             artifacts,
         })
@@ -489,7 +542,7 @@ fn message_name(message: &WorkerMessage) -> &'static str {
     match message {
         WorkerMessage::Ready { .. } => "a handshake",
         WorkerMessage::Graph { .. } => "a graph",
-        WorkerMessage::Artifacts { .. } => "artifacts",
+        WorkerMessage::ArtifactChanges { .. } => "artifact changes",
         WorkerMessage::Done => "a shutdown acknowledgement",
         WorkerMessage::Failed { .. } => "a failure",
     }
@@ -574,7 +627,48 @@ pub fn inspect_pipeline(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{StderrBuffer, STDERR_CAPTURE_BYTES};
+    use super::{merge_artifact_changes, StderrBuffer, STDERR_CAPTURE_BYTES};
+    use crate::sdk::Artifact;
+
+    fn artifact(path: &str, text: &str) -> Artifact {
+        Artifact::new(path, text)
+    }
+
+    /// Merging a reply must rebuild exactly the set the worker finished with.
+    #[test]
+    fn changes_replace_by_path_and_new_paths_land_in_order() {
+        let sent = vec![
+            artifact("a.txt", "a"),
+            artifact("c.txt", "c"),
+            artifact("e.txt", "e"),
+        ];
+        let changed = vec![
+            artifact("b.txt", "new-b"),
+            artifact("c.txt", "rewritten-c"),
+            artifact("f.txt", "new-f"),
+        ];
+        let merged = merge_artifact_changes(sent, changed);
+        let rendered: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|item| (item.path.as_str(), item.text.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("a.txt", "a"),
+                ("b.txt", "new-b"),
+                ("c.txt", "rewritten-c"),
+                ("e.txt", "e"),
+                ("f.txt", "new-f"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_leaves_the_sent_set_alone() {
+        let sent = vec![artifact("a.txt", "a"), artifact("b.txt", "b")];
+        assert_eq!(merge_artifact_changes(sent.clone(), Vec::new()), sent);
+    }
 
     #[test]
     fn captured_stderr_is_bounded_and_says_so() {
