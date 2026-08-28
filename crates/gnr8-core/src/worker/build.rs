@@ -55,12 +55,12 @@ const WORKER_PROFILE: &str = "gnr8";
 /// alike: a 332-artifact warm generate measured 0.28s that way against 0.57s with none of it
 /// optimized, 0.47s with only the SDK optimized, and 0.29s with the user's own crate left out.
 ///
-/// `opt-level = 2` is where that stops paying: it is worth about 10% of a warm run over `1` on both
-/// projects (a 332-artifact `check` at 0.228s against 0.245s, `generate` at 0.235s against 0.252s;
-/// a 4,836-artifact `check` at 0.588s against 0.633s) for 3s of a from-scratch build, and `3`
-/// measured within noise of `2` on both axes. Dependency debug info is dropped because it is 10x of
-/// the binary gnr8 re-hashes on every run and nothing reads it; the user's own crate keeps its own,
-/// which is what a panic in a stage they wrote needs.
+/// `opt-level = 1` is the whole of that win at the least compile time. `2` was worth about 10% of a
+/// warm run while the frames still carried generated text as JSON strings; with that text moved
+/// beside the JSON the two measure within 2-3ms of each other over four alternating blocks of
+/// twelve runs — noise — and `1` compiles the worker from scratch 3.5s faster. Dependency debug info
+/// is dropped because it is 10x of the binary gnr8 re-hashes on every run and nothing reads it; the
+/// user's own crate keeps its own, which is what a panic in a stage they wrote needs.
 ///
 /// A build script or a proc macro runs in the COMPILER, not in the worker, so optimizing one buys
 /// the worker nothing and costs the build the time twice over: `syn` went from 1.6s to 4.6s and
@@ -71,7 +71,7 @@ const WORKER_PROFILE: &str = "gnr8";
 /// back out: a from-scratch worker build went from 20.2s to 15.8s with the warm run unchanged.
 const WORKER_PROFILE_CONFIG: [&str; 5] = [
     r#"profile.gnr8.inherits="dev""#,
-    "profile.gnr8.opt-level=2",
+    "profile.gnr8.opt-level=1",
     "profile.gnr8.build-override.opt-level=0",
     "profile.gnr8.build-override.debug=false",
     r#"profile.gnr8.package."*".debug=false"#,
