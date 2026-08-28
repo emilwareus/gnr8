@@ -358,7 +358,7 @@ pub fn apply_writes_with_anchors(
     _output_anchors: &[String],
 ) -> Result<GenerateOutcome, crate::CoreError> {
     validate_manifest_paths(manifest)?;
-    validate_write_plan(project_root, plan)?;
+    let safe_paths = validate_write_plan(project_root, plan)?;
     let mut out = GenerateOutcome::default();
     let project_dir = open_project_dir(project_root)?;
     reconcile_manifest_path_aliases(
@@ -367,56 +367,11 @@ pub fn apply_writes_with_anchors(
         plan.files.iter().map(|file| file.path.as_str()),
     )
     .map_err(recovery_io_error)?;
-    for file in &plan.files {
-        let safe = safe_output_path(project_root, &file.path)?;
-        let recovered_hash =
-            recover_output_file(&project_dir, &file.path).map_err(|err| crate::CoreError::Io {
-                message: format!(
-                    "failed to recover an interrupted write for {}: {err}",
-                    safe.display()
-                ),
-            })?;
-        if let Some(hash) = recovered_hash {
-            manifest.record(&file.path, &hash, SOURCE_GENERATED);
-        }
-        let current =
-            read_output_file(&project_dir, &file.path).map_err(|err| crate::CoreError::Io {
-                message: format!(
-                    "failed to revalidate {} before writing: {err}",
-                    safe.display()
-                ),
-            })?;
-        let current_action = classify_planned_file(file, manifest, current.as_deref());
-        if current_action == WriteAction::Unchanged {
-            // This is idempotent for an owned no-op and safely reconstructs ownership when the
-            // disposable local manifest was absent but the deterministic bytes already matched.
-            manifest.record(&file.path, &file.new_hash, &file.source);
-            out.unchanged.push(file.path.clone());
-        } else if current_action == WriteAction::UserEdited && !force {
-            // UserEdited without force → protected, skipped (CLI warns naming the file).
-            out.skipped.push(file.path.clone());
-        } else {
-            let applied =
-                replace_planned_file(&project_dir, file, manifest, force).map_err(|err| {
-                    crate::CoreError::Io {
-                        message: format!(
-                            "failed to transactionally write {}: {err}",
-                            safe.display()
-                        ),
-                    }
-                })?;
-            match applied {
-                WriteAction::Write => {
-                    manifest.record(&file.path, &file.new_hash, &file.source);
-                    out.written.push(file.path.clone());
-                }
-                WriteAction::Unchanged => {
-                    manifest.record(&file.path, &file.new_hash, &file.source);
-                    out.unchanged.push(file.path.clone());
-                }
-                WriteAction::UserEdited => out.skipped.push(file.path.clone()),
-            }
-        }
+    // Every output directory is opened and scanned for interrupted transactions once, on first
+    // reach, and every file in it is then served from that one scan.
+    let mut dirs = OutputDirs::new(&project_dir);
+    for (file, safe) in plan.files.iter().zip(&safe_paths) {
+        apply_planned_file(&mut dirs, file, safe, manifest, force, &mut out)?;
     }
 
     let current_paths = plan
@@ -428,7 +383,14 @@ pub fn apply_writes_with_anchors(
                 .map(|identity| (identity, file.path.clone()))
         })
         .collect();
-    prune_stale_manifest_files(project_root, manifest, &current_paths, force, &mut out)?;
+    prune_stale_manifest_files(
+        project_root,
+        &mut dirs,
+        manifest,
+        &current_paths,
+        force,
+        &mut out,
+    )?;
 
     // D-04: drop manifest entries for paths this generation no longer produces.
     let current_paths_vec: Vec<String> = plan.files.iter().map(|file| file.path.clone()).collect();
@@ -436,10 +398,97 @@ pub fn apply_writes_with_anchors(
     Ok(out)
 }
 
-fn validate_write_plan(project_root: &Path, plan: &WritePlan) -> Result<(), crate::CoreError> {
+/// Write one planned output, revalidating its on-disk bytes under the generation lock.
+///
+/// The plan's own `action` is advisory: it was decided against a snapshot of the tree, so the file
+/// is reclassified here against what the directory holds right now. `dirs` supplies the output
+/// directory already scanned for interrupted transactions.
+fn apply_planned_file(
+    dirs: &mut OutputDirs<'_>,
+    file: &PlannedFile,
+    safe: &Path,
+    manifest: &mut Manifest,
+    force: bool,
+    out: &mut GenerateOutcome,
+) -> Result<(), crate::CoreError> {
+    let (parent_rel, leaf) = split_output_path(&file.path).map_err(|err| crate::CoreError::Io {
+        message: format!("failed to resolve output path {}: {err}", safe.display()),
+    })?;
+    // A directory that does not exist yet holds no interrupted write and no current bytes; the
+    // write below creates it.
+    let current = match dirs
+        .dir(parent_rel, false)
+        .map_err(|err| crate::CoreError::Io {
+            message: format!(
+                "failed to recover an interrupted write for {}: {err}",
+                safe.display()
+            ),
+        })? {
+        Some(parent) => {
+            let recovered_hash = parent
+                .recover_leaf(leaf)
+                .map_err(|err| crate::CoreError::Io {
+                    message: format!(
+                        "failed to recover an interrupted write for {}: {err}",
+                        safe.display()
+                    ),
+                })?;
+            if let Some(hash) = recovered_hash {
+                manifest.record(&file.path, &hash, SOURCE_GENERATED);
+            }
+            read_file_optional(&parent.dir, leaf).map_err(|err| crate::CoreError::Io {
+                message: format!(
+                    "failed to revalidate {} before writing: {err}",
+                    safe.display()
+                ),
+            })?
+        }
+        None => None,
+    };
+    let current_action = classify_planned_file(file, manifest, current.as_deref());
+    if current_action == WriteAction::Unchanged {
+        // This is idempotent for an owned no-op and safely reconstructs ownership when the
+        // disposable local manifest was absent but the deterministic bytes already matched.
+        manifest.record(&file.path, &file.new_hash, &file.source);
+        out.unchanged.push(file.path.clone());
+        return Ok(());
+    }
+    if current_action == WriteAction::UserEdited && !force {
+        // UserEdited without force → protected, skipped (CLI warns naming the file).
+        out.skipped.push(file.path.clone());
+        return Ok(());
+    }
+    let write_error = |err: &dyn std::fmt::Display| crate::CoreError::Io {
+        message: format!("failed to transactionally write {}: {err}", safe.display()),
+    };
+    let parent = dirs
+        .dir(parent_rel, true)
+        .map_err(|err| write_error(&err))?
+        .ok_or_else(|| write_error(&"its directory is missing"))?;
+    let applied = replace_planned_file(parent, leaf, file, manifest, force)
+        .map_err(|err| write_error(&err))?;
+    match applied {
+        WriteAction::Write => {
+            manifest.record(&file.path, &file.new_hash, &file.source);
+            out.written.push(file.path.clone());
+        }
+        WriteAction::Unchanged => {
+            manifest.record(&file.path, &file.new_hash, &file.source);
+            out.unchanged.push(file.path.clone());
+        }
+        WriteAction::UserEdited => out.skipped.push(file.path.clone()),
+    }
+    Ok(())
+}
+
+fn validate_write_plan(
+    project_root: &Path,
+    plan: &WritePlan,
+) -> Result<Vec<std::path::PathBuf>, crate::CoreError> {
     let mut seen = BTreeMap::new();
+    let mut safe_paths = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        safe_output_path(project_root, &file.path)?;
+        safe_paths.push(safe_output_path(project_root, &file.path)?);
         let identity =
             portable_path_identity(&file.path).map_err(|reason| crate::CoreError::Io {
                 message: format!(
@@ -468,7 +517,7 @@ fn validate_write_plan(project_root: &Path, plan: &WritePlan) -> Result<(), crat
             });
         }
     }
-    Ok(())
+    Ok(safe_paths)
 }
 
 fn classify_planned_file(
@@ -485,13 +534,13 @@ fn classify_planned_file(
 }
 
 fn replace_planned_file(
-    project_dir: &Dir,
+    parent: &OutputDir,
+    leaf: &str,
     file: &PlannedFile,
     manifest: &Manifest,
     force: bool,
 ) -> std::io::Result<WriteAction> {
-    let (parent, leaf) = open_output_parent(project_dir, &file.path, true)?;
-    let transaction = OutputTransaction::begin(&parent, &leaf, &file.new_bytes)?;
+    let transaction = OutputTransaction::begin(parent, leaf, &file.new_bytes)?;
     run_before_quarantine_hook();
     let had_previous = transaction.quarantine()?;
     let current_action = if force {
@@ -530,12 +579,13 @@ fn replace_planned_file(
 
 fn prune_stale_manifest_files(
     project_root: &Path,
+    dirs: &mut OutputDirs<'_>,
     manifest: &Manifest,
     current_paths: &BTreeMap<String, String>,
     force: bool,
     out: &mut GenerateOutcome,
 ) -> Result<(), crate::CoreError> {
-    let project_dir = open_project_dir(project_root)?;
+    let project_dir = dirs.project_dir.try_clone().map_err(recovery_io_error)?;
     for entry in &manifest.files {
         let identity =
             portable_path_identity(&entry.path).map_err(|reason| crate::CoreError::Manifest {
@@ -560,7 +610,7 @@ fn prune_stale_manifest_files(
                 continue;
             }
         }
-        prune_stale_manifest_entry(project_root, &project_dir, entry, force, out)?;
+        prune_stale_manifest_entry(project_root, dirs, entry, force, out)?;
     }
     Ok(())
 }
@@ -571,14 +621,13 @@ fn output_paths_are_same_directory_entry(
     right: &str,
 ) -> std::io::Result<bool> {
     let open = |path: &str| -> std::io::Result<Option<std::fs::File>> {
-        let (parent, leaf) = match open_output_parent(project_dir, path, false) {
-            Ok(parts) => parts,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err),
+        let (parent_rel, leaf) = split_output_path(path)?;
+        let Some(parent) = open_output_dir(project_dir, parent_rel, false)? else {
+            return Ok(None);
         };
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
-        match parent.open_with(&leaf, &options) {
+        match parent.open_with(leaf, &options) {
             Ok(file) => Ok(Some(file.into_std())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
@@ -620,34 +669,36 @@ fn output_paths_are_same_directory_entry(
 
 fn prune_stale_manifest_entry(
     project_root: &Path,
-    project_dir: &Dir,
+    dirs: &mut OutputDirs<'_>,
     entry: &ManifestEntry,
     force: bool,
     out: &mut GenerateOutcome,
 ) -> Result<(), crate::CoreError> {
     let safe = safe_output_path(project_root, &entry.path)?;
-    let (parent, leaf) = match open_output_parent(project_dir, &entry.path, false) {
-        Ok(parts) => parts,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(crate::CoreError::Io {
-                message: format!("failed to open stale output {}: {err}", safe.display()),
-            });
-        }
+    let (parent_rel, leaf) =
+        split_output_path(&entry.path).map_err(|err| crate::CoreError::Io {
+            message: format!("failed to open stale output {}: {err}", safe.display()),
+        })?;
+    let Some(parent) = dirs
+        .dir(parent_rel, false)
+        .map_err(|err| crate::CoreError::Io {
+            message: format!("failed to open stale output {}: {err}", safe.display()),
+        })?
+    else {
+        return Ok(());
     };
-    let recovered =
-        recover_transactions(&parent, Some(&leaf)).map_err(|err| crate::CoreError::Io {
+    let recovered = parent
+        .recover_leaf(leaf)
+        .map_err(|err| crate::CoreError::Io {
             message: format!(
                 "failed to recover an interrupted stale output {}: {err}",
                 safe.display()
             ),
         })?;
-    let owned_hash = recovered
-        .generated_hashes
-        .get(&leaf)
-        .map_or(entry.hash.as_str(), String::as_str);
+    let owned_hash = recovered.unwrap_or_else(|| entry.hash.clone());
+    let owned_hash = owned_hash.as_str();
     let transaction =
-        OutputTransaction::begin(&parent, &leaf, &[]).map_err(|err| crate::CoreError::Io {
+        OutputTransaction::begin(parent, leaf, &[]).map_err(|err| crate::CoreError::Io {
             message: format!(
                 "failed to start stale-output transaction {}: {err}",
                 safe.display()
@@ -832,20 +883,39 @@ pub(crate) fn open_project_dir(project_root: &Path) -> Result<Dir, crate::CoreEr
     })
 }
 
-fn open_output_parent(
+/// Split a project-relative output path into its directory prefix and its leaf name.
+///
+/// The prefix is `""` for an output written straight into the project root.
+fn split_output_path(rel: &str) -> std::io::Result<(&str, &str)> {
+    let (parent, leaf) = rel.rsplit_once('/').unwrap_or(("", rel));
+    if leaf.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty output path",
+        ));
+    }
+    Ok((parent, leaf))
+}
+
+/// Open the directory `parent_rel` names beneath `project_dir`, one no-follow step per component.
+///
+/// `Ok(None)` means a component is missing and `create` did not ask for it to exist.
+fn open_output_dir(
     project_dir: &Dir,
-    rel: &str,
+    parent_rel: &str,
     create: bool,
-) -> std::io::Result<(Dir, String)> {
-    let mut components = rel.split('/');
-    let leaf = components.next_back().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty output path")
-    })?;
+) -> std::io::Result<Option<Dir>> {
     let mut parent = project_dir.try_clone()?;
-    for component in components {
+    if parent_rel.is_empty() {
+        return Ok(Some(parent));
+    }
+    for component in parent_rel.split('/') {
         match parent.open_dir_nofollow(component) {
             Ok(next) => parent = next,
-            Err(err) if create && err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(None);
+                }
                 match parent.create_dir(component) {
                     Ok(()) => {}
                     Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -856,26 +926,83 @@ fn open_output_parent(
             Err(err) => return Err(err),
         }
     }
-    Ok((parent, leaf.to_string()))
+    Ok(Some(parent))
+}
+
+/// One generated-output directory, already scanned for transactions that predate this write pass.
+///
+/// Scanning is what makes an interrupted write recoverable, and it reads the whole directory. That
+/// is a property of the DIRECTORY, not of any one file in it, so it happens once — when a pass first
+/// reaches the directory. Doing it per output made a directory holding N generated files cost N
+/// directory reads of N entries each, which is the whole cost of writing a large SDK.
+///
+/// The set of transactions predating a pass cannot grow while the pass runs: the project generation
+/// lock serializes gnr8 processes, and every transaction a pass opens it also finishes before moving
+/// on. A transaction another process holds the lease for stays in `pending` and is retried, exactly
+/// as a per-file scan would have retried it.
+struct OutputDir {
+    dir: Dir,
+    /// Published transactions the scan found and no call has recovered yet, in scan order.
+    pending: Vec<String>,
+}
+
+impl OutputDir {
+    /// The hash an interrupted write to `leaf` left behind, recovering that write if it is pending.
+    fn recover_leaf(&mut self, leaf: &str) -> std::io::Result<Option<String>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let recovered = recover_scanned(&self.dir, &mut self.pending, Some(leaf))?;
+        Ok(recovered.generated_hashes.get(leaf).cloned())
+    }
+}
+
+/// The generated-output directories one write pass has reached, each opened and scanned once.
+struct OutputDirs<'a> {
+    project_dir: &'a Dir,
+    dirs: HashMap<String, OutputDir>,
+}
+
+impl<'a> OutputDirs<'a> {
+    fn new(project_dir: &'a Dir) -> Self {
+        Self {
+            project_dir,
+            dirs: HashMap::new(),
+        }
+    }
+
+    /// The scanned directory that holds `parent_rel`, opening and scanning it on first reach.
+    ///
+    /// `Ok(None)` means the directory does not exist and `create` did not ask for it; nothing is
+    /// remembered in that case, so a later write may still create it.
+    fn dir(&mut self, parent_rel: &str, create: bool) -> std::io::Result<Option<&mut OutputDir>> {
+        if !self.dirs.contains_key(parent_rel) {
+            let Some(dir) = open_output_dir(self.project_dir, parent_rel, create)? else {
+                return Ok(None);
+            };
+            let pending = scan_transactions(&dir)?;
+            self.dirs
+                .insert(parent_rel.to_string(), OutputDir { dir, pending });
+        }
+        Ok(self.dirs.get_mut(parent_rel))
+    }
 }
 
 pub(crate) fn read_output_file(project_dir: &Dir, rel: &str) -> std::io::Result<Option<Vec<u8>>> {
-    let (parent, leaf) = match open_output_parent(project_dir, rel, false) {
-        Ok(parts) => parts,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+    let (parent_rel, leaf) = split_output_path(rel)?;
+    let Some(parent) = open_output_dir(project_dir, parent_rel, false)? else {
+        return Ok(None);
     };
-    read_file_optional(&parent, &leaf)
+    read_file_optional(&parent, leaf)
 }
 
 fn recover_output_file(project_dir: &Dir, rel: &str) -> std::io::Result<Option<String>> {
-    let (parent, leaf) = match open_output_parent(project_dir, rel, false) {
-        Ok(parts) => parts,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+    let (parent_rel, leaf) = split_output_path(rel)?;
+    let Some(parent) = open_output_dir(project_dir, parent_rel, false)? else {
+        return Ok(None);
     };
-    let recovered = recover_transactions(&parent, Some(&leaf))?;
-    Ok(recovered.generated_hashes.get(&leaf).cloned())
+    let recovered = recover_transactions(&parent, Some(leaf))?;
+    Ok(recovered.generated_hashes.get(leaf).cloned())
 }
 
 fn recovery_io_error(err: std::io::Error) -> crate::CoreError {
@@ -1137,8 +1264,17 @@ pub(crate) fn transactional_replace_output(
     rel: &str,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    let (parent, leaf) = open_output_parent(project_dir, rel, true)?;
-    let transaction = OutputTransaction::begin(&parent, &leaf, bytes)?;
+    let (parent_rel, leaf) = split_output_path(rel)?;
+    let dir = open_output_dir(project_dir, parent_rel, true)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("output directory for {rel:?} is missing"),
+        )
+    })?;
+    let pending = scan_transactions(&dir)?;
+    let mut parent = OutputDir { dir, pending };
+    parent.recover_leaf(leaf)?;
+    let transaction = OutputTransaction::begin(&parent, leaf, bytes)?;
     let _ = transaction.quarantine()?;
     transaction.approve()?;
     if let Err(err) = transaction.install() {
@@ -1502,8 +1638,13 @@ fn read_transaction_journal(dir: &Dir) -> std::io::Result<Option<OutputTransacti
 }
 
 impl OutputTransaction {
-    fn begin(parent: &Dir, leaf: &str, bytes: &[u8]) -> std::io::Result<Self> {
-        let _ = recover_transactions(parent, Some(leaf))?;
+    /// Open a transaction for `leaf` inside an output directory this pass has already scanned.
+    ///
+    /// Taking [`OutputDir`] rather than a bare handle is what makes the precondition structural: the
+    /// directory has been scanned for interrupted transactions, and `leaf`'s own interrupted write
+    /// (if any) has been recovered, before a new transaction can be opened over it.
+    fn begin(parent: &OutputDir, leaf: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        let parent = &parent.dir;
         let (dir_name, building_name, construction_lease_name, lease) = loop {
             let candidate = transaction_name();
             let building = candidate.replace("-txn", "-building");
@@ -1811,54 +1952,113 @@ fn cleanup_orphaned_construction_leases(parent: &Dir) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The published transactions `parent` holds, after clearing any half-built ones.
+///
+/// This is the directory-wide half of recovery, and the only half that reads the directory itself.
+/// [`recover_scanned`] is the per-transaction half: it opens only the transaction directories this
+/// scan named. Separating them is what lets one write pass scan an output directory ONCE instead of
+/// once per file it writes there.
+fn scan_transactions(parent: &Dir) -> std::io::Result<Vec<String>> {
+    cleanup_building_transactions(parent)?;
+    published_transaction_names(parent)
+}
+
+/// Whether one scanned transaction was finished, or left for a later call.
+enum ScannedTransaction {
+    /// Recovered (or found already gone); it is no longer pending.
+    Finished,
+    /// Not this call's to finish — another process holds its lease, or `destination_filter` names a
+    /// different output. It stays pending.
+    Pending,
+}
+
+/// Recover every scanned transaction `destination_filter` selects, dropping the finished names.
+///
+/// `scanned` is the list [`scan_transactions`] produced for `parent`. Names that are not recovered
+/// remain in it, in scan order, so a later call with a different filter still sees them.
+fn recover_scanned(
+    parent: &Dir,
+    scanned: &mut Vec<String>,
+    destination_filter: Option<&str>,
+) -> std::io::Result<RecoveryOutcome> {
+    let mut outcome = RecoveryOutcome::default();
+    let mut index = 0;
+    while index < scanned.len() {
+        let dir_name = scanned[index].clone();
+        match recover_scanned_transaction(parent, &dir_name, destination_filter, &mut outcome)? {
+            ScannedTransaction::Finished => {
+                scanned.remove(index);
+            }
+            ScannedTransaction::Pending => index += 1,
+        }
+    }
+    Ok(outcome)
+}
+
+/// Recover the one published transaction named `dir_name` under `parent`.
+fn recover_scanned_transaction(
+    parent: &Dir,
+    dir_name: &str,
+    destination_filter: Option<&str>,
+    outcome: &mut RecoveryOutcome,
+) -> std::io::Result<ScannedTransaction> {
+    let dir = match parent.open_dir_nofollow(dir_name) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScannedTransaction::Finished)
+        }
+        Err(err) => return Err(err),
+    };
+    let lease = match open_transaction_lease(&dir)? {
+        TransactionLeaseState::Acquired(lease) => lease,
+        TransactionLeaseState::Held => return Ok(ScannedTransaction::Pending),
+        TransactionLeaseState::Missing => {
+            if is_published_cleanup_residue(&dir)? {
+                cleanup_published_transaction_residue(parent, dir, dir_name, None)?;
+                return Ok(ScannedTransaction::Finished);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("generated-output transaction {dir_name:?} has no lease"),
+            ));
+        }
+    };
+    let Some(journal) = read_transaction_journal(&dir)? else {
+        if is_published_cleanup_residue(&dir)? {
+            cleanup_published_transaction_residue(parent, dir, dir_name, Some(lease))?;
+            return Ok(ScannedTransaction::Finished);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("generated-output transaction {dir_name:?} has no valid recovery journal"),
+        ));
+    };
+    // A transaction for another output is left exactly as it was found — including its unvalidated
+    // destination — so a filtered recovery answers only for the output it was asked about. Dropping
+    // the lease file releases the lock it just took.
+    if destination_filter.is_some_and(|filter| filter != journal.destination) {
+        drop(lease);
+        return Ok(ScannedTransaction::Pending);
+    }
+    if let Some((leaf, hash)) =
+        recover_published_transaction(parent, dir, dir_name, lease, journal)?
+    {
+        outcome.generated_hashes.insert(leaf, hash);
+    }
+    Ok(ScannedTransaction::Finished)
+}
+
+/// Scan `parent` and recover the transactions `destination_filter` selects.
+///
+/// The whole-directory entry point, for callers that touch a directory once. A pass that writes many
+/// files into one directory uses [`OutputDirs`] instead, which scans that directory once and then
+/// recovers per output from the scan.
 fn recover_transactions(
     parent: &Dir,
     destination_filter: Option<&str>,
 ) -> std::io::Result<RecoveryOutcome> {
-    cleanup_building_transactions(parent)?;
-    let mut outcome = RecoveryOutcome::default();
-    for dir_name in published_transaction_names(parent)? {
-        let dir = match parent.open_dir_nofollow(&dir_name) {
-            Ok(dir) => dir,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        let lease = match open_transaction_lease(&dir)? {
-            TransactionLeaseState::Acquired(lease) => lease,
-            TransactionLeaseState::Held => continue,
-            TransactionLeaseState::Missing => {
-                if is_published_cleanup_residue(&dir)? {
-                    cleanup_published_transaction_residue(parent, dir, &dir_name, None)?;
-                    continue;
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("generated-output transaction {dir_name:?} has no lease"),
-                ));
-            }
-        };
-        let Some(journal) = read_transaction_journal(&dir)? else {
-            if is_published_cleanup_residue(&dir)? {
-                cleanup_published_transaction_residue(parent, dir, &dir_name, Some(lease))?;
-                continue;
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("generated-output transaction {dir_name:?} has no valid recovery journal"),
-            ));
-        };
-        if let Some((leaf, hash)) = recover_published_transaction(
-            parent,
-            dir,
-            &dir_name,
-            lease,
-            journal,
-            destination_filter,
-        )? {
-            outcome.generated_hashes.insert(leaf, hash);
-        }
-    }
-    Ok(outcome)
+    let mut scanned = scan_transactions(parent)?;
+    recover_scanned(parent, &mut scanned, destination_filter)
 }
 
 fn published_transaction_names(parent: &Dir) -> std::io::Result<Vec<String>> {
@@ -1885,12 +2085,8 @@ fn recover_published_transaction(
     dir_name: &str,
     lease: std::fs::File,
     journal: OutputTransactionJournal,
-    destination_filter: Option<&str>,
 ) -> std::io::Result<Option<(String, String)>> {
     let leaf = journal.destination;
-    if destination_filter.is_some_and(|filter| filter != leaf) {
-        return Ok(None);
-    }
     if leaf.contains('/') || portable_path_identity(&leaf).is_err() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2501,6 +2697,14 @@ mod tests {
     // allow so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    /// A directory scanned for interrupted transactions, the way a write pass hands one to
+    /// [`super::OutputTransaction::begin`].
+    fn scanned(dir: &cap_std::fs::Dir) -> super::OutputDir {
+        let dir = dir.try_clone().unwrap();
+        let pending = super::scan_transactions(&dir).unwrap();
+        super::OutputDir { dir, pending }
+    }
+
     use super::{apply_writes, apply_writes_with_anchors, safe_output_path, WriteAction};
     use crate::manifest::Manifest;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2731,7 +2935,8 @@ mod tests {
         let root = temp_root("recover-quarantine");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         drop(transaction);
         assert!(!root.join("client.ts").exists());
@@ -2751,7 +2956,8 @@ mod tests {
         let root = temp_root("recover-install");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         super::rename_noreplace(&transaction.dir, "next", &parent, "client.ts").unwrap();
@@ -2773,7 +2979,8 @@ mod tests {
         let root = temp_root("recover-approved");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         drop(transaction);
@@ -2793,7 +3000,8 @@ mod tests {
         let root = temp_root("live-transaction");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
 
         super::recover_transactions(&parent, None).unwrap();
@@ -2817,7 +3025,8 @@ mod tests {
         let root = temp_root("recover-identical");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         std::fs::write(root.join("client.ts"), b"new").unwrap();
@@ -2839,7 +3048,8 @@ mod tests {
         let root = temp_root("recover-two-name-quarantine");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         parent
             .hard_link("client.ts", &transaction.dir, "previous")
             .unwrap();
@@ -2857,7 +3067,8 @@ mod tests {
         let root = temp_root("recover-two-name-restore");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         transaction
@@ -2884,7 +3095,7 @@ mod tests {
             std::fs::write(root.join("client.ts"), b"old").unwrap();
             let parent = super::open_project_dir(&root).unwrap();
             let transaction =
-                super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+                super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
             assert!(transaction.quarantine().unwrap());
             if approved {
                 transaction.approve().unwrap();
@@ -2932,7 +3143,8 @@ mod tests {
     fn recovery_reports_a_published_transaction_without_a_lease() {
         let root = temp_root("missing-transaction-lease");
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         transaction.dir.remove_file("lease").unwrap();
         drop(transaction);
 
@@ -2976,7 +3188,8 @@ mod tests {
         let creator = std::thread::spawn(move || {
             let parent = super::open_project_dir(&creator_root).unwrap();
             let transaction =
-                super::OutputTransaction::begin(&parent, "client.ts", b"generated").unwrap();
+                super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"generated")
+                    .unwrap();
             assert!(!transaction.quarantine().unwrap());
             transaction.approve().unwrap();
             transaction.install().unwrap();
@@ -3121,7 +3334,8 @@ mod tests {
         )
         .unwrap();
         let transaction =
-            super::OutputTransaction::begin(&project_dir, "b.ts", b"generated-b").unwrap();
+            super::OutputTransaction::begin(&scanned(&project_dir), "b.ts", b"generated-b")
+                .unwrap();
         assert!(!transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         std::fs::write(root.join("b.ts"), b"concurrent").unwrap();
@@ -3192,7 +3406,8 @@ mod tests {
                 std::fs::write(root.join("client.ts"), b"version-a").unwrap();
                 let parent = super::open_project_dir(&root).unwrap();
                 let transaction =
-                    super::OutputTransaction::begin(&parent, "client.ts", b"version-b").unwrap();
+                    super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"version-b")
+                        .unwrap();
                 assert!(transaction.quarantine().unwrap());
                 transaction.approve().unwrap();
                 if prior_install_started {
@@ -3229,7 +3444,7 @@ mod tests {
         std::fs::write(root.join("client.ts"), b"version-a").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
         let transaction =
-            super::OutputTransaction::begin(&parent, "client.ts", b"version-b").unwrap();
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"version-b").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         drop(transaction);
@@ -3261,7 +3476,8 @@ mod tests {
                 &crate::manifest::blake3_hex(b"version-a"),
                 "generated",
             );
-            let transaction = super::OutputTransaction::begin(&parent, path, b"version-b").unwrap();
+            let transaction =
+                super::OutputTransaction::begin(&scanned(&parent), path, b"version-b").unwrap();
             assert!(transaction.quarantine().unwrap());
             transaction.approve().unwrap();
             drop(transaction);
@@ -3321,7 +3537,8 @@ mod tests {
             });
             let parent = super::open_project_dir(&creator_root).unwrap();
             let transaction =
-                super::OutputTransaction::begin(&parent, "client.ts", b"generated").unwrap();
+                super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"generated")
+                    .unwrap();
             assert!(!transaction.quarantine().unwrap());
             transaction.approve().unwrap();
             transaction.install().unwrap();
@@ -3455,7 +3672,8 @@ mod tests {
         let root = temp_root("rename-no-replace");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         transaction.approve().unwrap();
         std::fs::write(root.join("client.ts"), b"concurrent").unwrap();
@@ -3475,7 +3693,8 @@ mod tests {
         let root = temp_root("recover-conflict");
         std::fs::write(root.join("client.ts"), b"old").unwrap();
         let parent = super::open_project_dir(&root).unwrap();
-        let transaction = super::OutputTransaction::begin(&parent, "client.ts", b"new").unwrap();
+        let transaction =
+            super::OutputTransaction::begin(&scanned(&parent), "client.ts", b"new").unwrap();
         assert!(transaction.quarantine().unwrap());
         std::fs::write(root.join("client.ts"), b"concurrent").unwrap();
         drop(transaction);
