@@ -437,29 +437,39 @@ impl StageRunner for WorkerSession {
         self.expect_graph(&HostMessage::LoadSource { index })
     }
 
-    fn apply_transform(&mut self, index: usize, graph: ApiGraph) -> Result<ApiGraph, CoreError> {
-        self.expect_graph(&HostMessage::ApplyTransform { index, graph })
+    fn apply_transforms(
+        &mut self,
+        indices: &[usize],
+        graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError> {
+        self.expect_graph(&HostMessage::ApplyTransforms {
+            indices: indices.to_vec(),
+            graph,
+        })
     }
 
-    fn generate_target(
+    fn generate_targets(
         &mut self,
-        index: usize,
+        indices: &[usize],
         graph: &ApiGraph,
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::GenerateTarget {
-            index,
+        self.expect_artifacts(&HostMessage::GenerateTargets {
+            indices: indices.to_vec(),
             graph: graph.clone(),
             artifacts,
         })
     }
 
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::RunPost { index, artifacts })
+        self.expect_artifacts(&HostMessage::RunPosts {
+            indices: indices.to_vec(),
+            artifacts,
+        })
     }
 }
 

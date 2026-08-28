@@ -26,35 +26,66 @@ pub trait StageRunner {
     /// Returns the worker's typed failure.
     fn load_source(&mut self, index: usize) -> Result<ApiGraph, CoreError>;
 
-    /// Run the custom transform at `index` over `graph`.
+    /// Run the custom transforms at `indices`, in order, over `graph`.
     ///
     /// # Errors
     ///
     /// Returns the worker's typed failure.
-    fn apply_transform(&mut self, index: usize, graph: ApiGraph) -> Result<ApiGraph, CoreError>;
-
-    /// Run the custom target at `index` against `graph`, given the artifacts produced so far.
-    ///
-    /// # Errors
-    ///
-    /// Returns the worker's typed failure.
-    fn generate_target(
+    fn apply_transforms(
         &mut self,
-        index: usize,
+        indices: &[usize],
+        graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError>;
+
+    /// Run the custom targets at `indices`, in order, against `graph`, given the artifacts so far.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's typed failure.
+    fn generate_targets(
+        &mut self,
+        indices: &[usize],
         graph: &ApiGraph,
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError>;
 
-    /// Run the custom post-processor at `index` over `artifacts`.
+    /// Run the custom post-processors at `indices`, in order, over `artifacts`.
     ///
     /// # Errors
     ///
     /// Returns the worker's typed failure.
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError>;
+}
+
+/// One contiguous span of a plan's stages that runs in one place.
+///
+/// The host runs built-ins itself and asks the worker for the user's own stages, so a plan reads as
+/// alternating spans. Grouping them is what makes the graph — or the whole artifact set — cross the
+/// process boundary once per SPAN rather than once per stage.
+enum StageSpan<'a, B> {
+    /// One built-in stage, with its position in the plan's stage vector.
+    Builtin(usize, &'a B),
+    /// A run of consecutive custom stages, by their position in the pipeline's custom vector.
+    Custom(Vec<usize>),
+}
+
+/// Split `stages` into the spans [`StageSpan`] describes, preserving composition order.
+fn stage_spans<B>(stages: &[PlanStage<B>]) -> Vec<StageSpan<'_, B>> {
+    let mut spans: Vec<StageSpan<'_, B>> = Vec::new();
+    for (position, stage) in stages.iter().enumerate() {
+        match stage {
+            PlanStage::Builtin(spec) => spans.push(StageSpan::Builtin(position, spec)),
+            PlanStage::Custom { index, .. } => match spans.last_mut() {
+                Some(StageSpan::Custom(indices)) => indices.push(*index),
+                _ => spans.push(StageSpan::Custom(vec![*index])),
+            },
+        }
+    }
+    spans
 }
 
 /// A [`StageRunner`] for a plan that declares no custom stages.
@@ -68,25 +99,29 @@ impl StageRunner for NoCustomStages {
         Err(no_custom_stage("source", index))
     }
 
-    fn apply_transform(&mut self, index: usize, _graph: ApiGraph) -> Result<ApiGraph, CoreError> {
-        Err(no_custom_stage("transform", index))
+    fn apply_transforms(
+        &mut self,
+        indices: &[usize],
+        _graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError> {
+        Err(no_custom_span("transform", indices))
     }
 
-    fn generate_target(
+    fn generate_targets(
         &mut self,
-        index: usize,
+        indices: &[usize],
         _graph: &ApiGraph,
         _artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        Err(no_custom_stage("target", index))
+        Err(no_custom_span("target", indices))
     }
 
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         _artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        Err(no_custom_stage("post-process", index))
+        Err(no_custom_span("post-process", indices))
     }
 }
 
@@ -96,6 +131,10 @@ fn no_custom_stage(kind: &str, index: usize) -> CoreError {
             "the plan declares no custom {kind} at position {index}, but the host tried to run one"
         ),
     }
+}
+
+fn no_custom_span(kind: &str, indices: &[usize]) -> CoreError {
+    no_custom_stage(kind, indices.first().copied().unwrap_or_default())
 }
 
 /// Everything one pipeline run produced.
@@ -207,10 +246,10 @@ pub fn build_ir(
     let anchor_refs: Vec<&str> = anchors.iter().map(String::as_str).collect();
     crate::lifecycle::exclude_output_anchors(&mut ir, &anchor_refs);
 
-    for stage in &plan.transforms {
-        match stage {
-            PlanStage::Builtin(spec) => builtins::apply_transform(spec, &mut ir, cx)?,
-            PlanStage::Custom { index, .. } => ir = runner.apply_transform(*index, ir)?,
+    for span in stage_spans(&plan.transforms) {
+        match span {
+            StageSpan::Builtin(_, spec) => builtins::apply_transform(spec, &mut ir, cx)?,
+            StageSpan::Custom(indices) => ir = runner.apply_transforms(&indices, ir)?,
         }
     }
     Ok(ir)
@@ -237,39 +276,33 @@ pub fn run(
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
         // projection belongs at the artifact boundary.
         let generation_ir = crate::graph::projection::for_generation(&ir)?;
-        for (index, stage) in plan.targets.iter().enumerate() {
-            match stage {
-                PlanStage::Builtin(spec) => {
-                    artifacts.begin_stage(builtin_target_producer(index, spec));
+        for span in stage_spans(&plan.targets) {
+            match span {
+                StageSpan::Builtin(position, spec) => {
+                    artifacts.begin_stage(builtin_target_producer(position, spec));
                     builtins::generate_target(spec, &generation_ir, &mut artifacts, cx)?;
                 }
-                PlanStage::Custom {
-                    index: custom_index,
-                    ..
-                } => {
+                StageSpan::Custom(indices) => {
                     let sent = artifacts.into_files();
                     let produced =
-                        runner.generate_target(*custom_index, &generation_ir, sent.clone())?;
-                    require_no_dropped_artifacts("target", *custom_index, &sent, &produced)?;
+                        runner.generate_targets(&indices, &generation_ir, sent.clone())?;
+                    require_no_dropped_artifacts("target", &indices, &sent, &produced)?;
                     artifacts = Artifacts::from_files(produced);
                 }
             }
         }
     }
 
-    for (index, stage) in plan.posts.iter().enumerate() {
-        match stage {
-            PlanStage::Builtin(spec) => {
-                artifacts.begin_stage(format!("post[{index}]:{}", spec.label()));
+    for span in stage_spans(&plan.posts) {
+        match span {
+            StageSpan::Builtin(position, spec) => {
+                artifacts.begin_stage(format!("post[{position}]:{}", spec.label()));
                 builtins::run_post(spec, &mut artifacts, cx)?;
             }
-            PlanStage::Custom {
-                index: custom_index,
-                ..
-            } => {
+            StageSpan::Custom(indices) => {
                 let sent = artifacts.into_files();
-                let produced = runner.run_post(*custom_index, sent.clone())?;
-                require_no_dropped_artifacts("post-process", *custom_index, &sent, &produced)?;
+                let produced = runner.run_posts(&indices, sent.clone())?;
+                require_no_dropped_artifacts("post-process", &indices, &sent, &produced)?;
                 artifacts = Artifacts::from_files(produced);
             }
         }
@@ -288,12 +321,13 @@ pub fn run(
 
 /// A stage may create, overlay or rewrite an artifact. It may not make one disappear.
 ///
-/// In this process that is guaranteed by construction — [`Artifacts`] has no removal API. Across the
-/// wire it is not: a reply is just a list, and a stage that returned the wrong one would have the
-/// host treat another target's output as stale and delete it from disk. So the host checks.
+/// Inside either process that is guaranteed by construction — [`Artifacts`] has no removal API, and
+/// a run of stages shares one accumulator. Across the wire it is not: a reply is just a list, and a
+/// worker that returned the wrong one would have the host treat another target's output as stale and
+/// delete it from disk. So the host checks what came back against what it sent.
 fn require_no_dropped_artifacts(
     kind: &str,
-    index: usize,
+    indices: &[usize],
     sent: &[Artifact],
     produced: &[Artifact],
 ) -> Result<(), CoreError> {
@@ -305,6 +339,7 @@ fn require_no_dropped_artifacts(
         .iter()
         .find(|artifact| !kept.contains(artifact.path.as_str()))
     {
+        let index = indices.first().copied().unwrap_or_default();
         return Err(CoreError::Protocol {
             message: format!(
                 "custom {kind} #{index} returned an artifact set that no longer contains \
@@ -371,47 +406,53 @@ impl StageRunner for InProcessRunner<'_> {
         Ok(source.load(self.cx)?)
     }
 
-    fn apply_transform(
+    fn apply_transforms(
         &mut self,
-        index: usize,
+        indices: &[usize],
         mut graph: ApiGraph,
     ) -> Result<ApiGraph, CoreError> {
-        let transform = self
-            .pipeline
-            .custom_transform(index)
-            .ok_or_else(|| no_custom_stage("transform", index))?;
-        transform.apply(&mut graph, self.cx)?;
+        for &index in indices {
+            let transform = self
+                .pipeline
+                .custom_transform(index)
+                .ok_or_else(|| no_custom_stage("transform", index))?;
+            transform.apply(&mut graph, self.cx)?;
+        }
         Ok(graph)
     }
 
-    fn generate_target(
+    fn generate_targets(
         &mut self,
-        index: usize,
+        indices: &[usize],
         graph: &ApiGraph,
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        let target = self
-            .pipeline
-            .custom_target(index)
-            .ok_or_else(|| no_custom_stage("target", index))?;
         let mut out = Artifacts::from_files(artifacts);
-        out.begin_stage(format!("target[{index}]:{}", target.producer()));
-        target.generate(graph, &mut out, self.cx)?;
+        for &index in indices {
+            let target = self
+                .pipeline
+                .custom_target(index)
+                .ok_or_else(|| no_custom_stage("target", index))?;
+            out.begin_stage(format!("target[{index}]:{}", target.producer()));
+            target.generate(graph, &mut out, self.cx)?;
+        }
         Ok(out.into_files())
     }
 
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        let post = self
-            .pipeline
-            .custom_post(index)
-            .ok_or_else(|| no_custom_stage("post-process", index))?;
         let mut out = Artifacts::from_files(artifacts);
-        out.begin_stage(format!("post[{index}]:{}", post.producer()));
-        post.run(&mut out, self.cx)?;
+        for &index in indices {
+            let post = self
+                .pipeline
+                .custom_post(index)
+                .ok_or_else(|| no_custom_stage("post-process", index))?;
+            out.begin_stage(format!("post[{index}]:{}", post.producer()));
+            post.run(&mut out, self.cx)?;
+        }
         Ok(out.into_files())
     }
 }
@@ -469,39 +510,45 @@ mod tests {
             })
         }
 
-        fn apply_transform(
+        fn apply_transforms(
             &mut self,
-            index: usize,
+            indices: &[usize],
             mut graph: ApiGraph,
         ) -> Result<ApiGraph, CoreError> {
-            self.calls.push(format!("transform[{index}]"));
-            graph.title = format!("{}+t{index}", graph.title);
+            self.calls.push(format!("transforms{indices:?}"));
+            for index in indices {
+                graph.title = format!("{}+t{index}", graph.title);
+            }
             Ok(graph)
         }
 
-        fn generate_target(
+        fn generate_targets(
             &mut self,
-            index: usize,
+            indices: &[usize],
             graph: &ApiGraph,
             mut artifacts: Vec<Artifact>,
         ) -> Result<Vec<Artifact>, CoreError> {
-            self.calls.push(format!("target[{index}]"));
-            artifacts.push(Artifact::new(
-                format!("generated/custom-{index}.md"),
-                format!("# {}\n", graph.title),
-            ));
+            self.calls.push(format!("targets{indices:?}"));
+            for index in indices {
+                artifacts.push(Artifact::new(
+                    format!("generated/custom-{index}.md"),
+                    format!("# {}\n", graph.title),
+                ));
+            }
             artifacts.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(artifacts)
         }
 
-        fn run_post(
+        fn run_posts(
             &mut self,
-            index: usize,
+            indices: &[usize],
             mut artifacts: Vec<Artifact>,
         ) -> Result<Vec<Artifact>, CoreError> {
-            self.calls.push(format!("post[{index}]"));
-            for artifact in &mut artifacts {
-                artifact.text = format!("//post\n{}", artifact.text);
+            self.calls.push(format!("posts{indices:?}"));
+            for _ in indices {
+                for artifact in &mut artifacts {
+                    artifact.text = format!("//post\n{}", artifact.text);
+                }
             }
             Ok(artifacts)
         }
@@ -569,9 +616,11 @@ mod tests {
         let mut runner = RecordingRunner::default();
         let outcome = run(&plan, &cx(), &mut runner).unwrap();
 
+        // The two custom transforms are separated by a built-in, so they are two runs; a run of
+        // adjacent customs would have been one request.
         assert_eq!(
             runner.calls,
-            vec!["source[0]", "transform[0]", "transform[2]", "target[0]"]
+            vec!["source[0]", "transforms[0]", "transforms[2]", "targets[0]"]
         );
         assert_eq!(outcome.artifacts.len(), 1);
         assert_eq!(outcome.artifacts[0].path, "generated/custom-0.md");
@@ -602,24 +651,24 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn generate_targets(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 _graph: &ApiGraph,
                 _artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(vec![Artifact::new("../escape.txt", "x")])
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)
@@ -644,25 +693,25 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn generate_targets(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 _graph: &ApiGraph,
                 _artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 // Answers with only its own file, discarding whatever the OpenAPI target produced.
                 Ok(vec![Artifact::new("generated/only-mine.md", "x")])
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)
@@ -688,33 +737,35 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn generate_targets(
                 &mut self,
-                _index: usize,
+                indices: &[usize],
                 _graph: &ApiGraph,
                 mut artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
-                self.0 += 1;
-                artifacts.push(Artifact::new(
-                    if self.0 == 1 {
-                        "out/File.txt"
-                    } else {
-                        "out/file.txt"
-                    },
-                    "x",
-                ));
+                for _ in indices {
+                    self.0 += 1;
+                    artifacts.push(Artifact::new(
+                        if self.0 == 1 {
+                            "out/File.txt"
+                        } else {
+                            "out/file.txt"
+                        },
+                        "x",
+                    ));
+                }
                 Ok(artifacts)
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)

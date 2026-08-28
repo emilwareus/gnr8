@@ -150,13 +150,13 @@ fn a_graph_survives_the_worker_frame_without_losing_a_field() {
     let mut frame = Vec::new();
     write_frame(
         &mut frame,
-        &HostMessage::ApplyTransform {
-            index: 0,
+        &HostMessage::ApplyTransforms {
+            indices: vec![0],
             graph: graph.clone(),
         },
     )
     .expect("the graph must fit in one frame");
-    let HostMessage::ApplyTransform {
+    let HostMessage::ApplyTransforms {
         graph: round_tripped,
         ..
     } = read_frame::<_, HostMessage>(&mut frame.as_slice()).expect("the frame must parse back")

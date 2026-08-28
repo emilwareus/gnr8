@@ -164,7 +164,12 @@ fn handshake<R: Read, W: Write>(
     Ok(Cx::new(project_root))
 }
 
-/// Run one custom stage and build the reply frame.
+/// Run one request's whole run of custom stages and build the reply frame.
+///
+/// The stages in a run execute in the order the host listed them, against ONE accumulator: an
+/// [`Artifacts`] has no removal API, so the "a stage may create, overlay or rewrite an artifact but
+/// never drop one" rule holds between the stages of a run by construction, exactly as it does for a
+/// run of one.
 fn dispatch(pipeline: &Pipeline, cx: &Cx, request: HostMessage) -> Result<WorkerMessage, Error> {
     match request {
         HostMessage::LoadSource { index } => {
@@ -175,35 +180,41 @@ fn dispatch(pipeline: &Pipeline, cx: &Cx, request: HostMessage) -> Result<Worker
                 graph: source.load(cx)?,
             })
         }
-        HostMessage::ApplyTransform { index, mut graph } => {
-            let transform = pipeline
-                .custom_transform(index)
-                .ok_or_else(|| unknown_stage("transform", index))?;
-            transform.apply(&mut graph, cx)?;
+        HostMessage::ApplyTransforms { indices, mut graph } => {
+            for index in indices {
+                let transform = pipeline
+                    .custom_transform(index)
+                    .ok_or_else(|| unknown_stage("transform", index))?;
+                transform.apply(&mut graph, cx)?;
+            }
             Ok(WorkerMessage::Graph { graph })
         }
-        HostMessage::GenerateTarget {
-            index,
+        HostMessage::GenerateTargets {
+            indices,
             graph,
             artifacts,
         } => {
-            let target = pipeline
-                .custom_target(index)
-                .ok_or_else(|| unknown_stage("target", index))?;
             let mut out = Artifacts::from_files(artifacts);
-            out.begin_stage(format!("target[{index}]:{}", target.producer()));
-            target.generate(&graph, &mut out, cx)?;
+            for index in indices {
+                let target = pipeline
+                    .custom_target(index)
+                    .ok_or_else(|| unknown_stage("target", index))?;
+                out.begin_stage(format!("target[{index}]:{}", target.producer()));
+                target.generate(&graph, &mut out, cx)?;
+            }
             Ok(WorkerMessage::Artifacts {
                 artifacts: out.into_files(),
             })
         }
-        HostMessage::RunPost { index, artifacts } => {
-            let post = pipeline
-                .custom_post(index)
-                .ok_or_else(|| unknown_stage("post-process", index))?;
+        HostMessage::RunPosts { indices, artifacts } => {
             let mut out = Artifacts::from_files(artifacts);
-            out.begin_stage(format!("post[{index}]:{}", post.producer()));
-            post.run(&mut out, cx)?;
+            for index in indices {
+                let post = pipeline
+                    .custom_post(index)
+                    .ok_or_else(|| unknown_stage("post-process", index))?;
+                out.begin_stage(format!("post[{index}]:{}", post.producer()));
+                post.run(&mut out, cx)?;
+            }
             Ok(WorkerMessage::Artifacts {
                 artifacts: out.into_files(),
             })
@@ -313,12 +324,12 @@ mod tests {
             &pipeline,
             &[
                 hello(),
-                HostMessage::ApplyTransform {
-                    index: 0,
+                HostMessage::ApplyTransforms {
+                    indices: vec![0],
                     graph: graph.clone(),
                 },
-                HostMessage::GenerateTarget {
-                    index: 0,
+                HostMessage::GenerateTargets {
+                    indices: vec![0],
                     graph: ApiGraph {
                         title: "Base::marked".to_string(),
                         ..ApiGraph::default()
@@ -372,8 +383,8 @@ mod tests {
             &[
                 hello(),
                 HostMessage::LoadSource { index: 0 },
-                HostMessage::RunPost {
-                    index: 0,
+                HostMessage::RunPosts {
+                    indices: vec![0],
                     artifacts: vec![crate::sdk::Artifact::new("a.txt", "body\n")],
                 },
                 HostMessage::Shutdown,
@@ -400,8 +411,8 @@ mod tests {
             &pipeline,
             &[
                 hello(),
-                HostMessage::ApplyTransform {
-                    index: 0,
+                HostMessage::ApplyTransforms {
+                    indices: vec![0],
                     graph: ApiGraph::default(),
                 },
             ],
@@ -483,8 +494,8 @@ mod tests {
             &pipeline,
             &[
                 hello(),
-                HostMessage::ApplyTransform {
-                    index: 0,
+                HostMessage::ApplyTransforms {
+                    indices: vec![0],
                     graph: ApiGraph::default(),
                 },
             ],

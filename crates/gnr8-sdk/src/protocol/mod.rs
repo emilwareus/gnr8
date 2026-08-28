@@ -1,8 +1,15 @@
 //! The host↔worker frame protocol.
 //!
 //! The installed `gnr8` host builds a project's `.gnr8/` crate once, then executes the resulting
-//! binary directly and talks to it over its stdin/stdout. Every message is one self-delimiting,
-//! digest-checked frame:
+//! binary directly and talks to it over its stdin/stdout.
+//!
+//! A work request names a CONSECUTIVE RUN of the user's own stages, not one stage. The host runs
+//! built-ins itself, so a plan is a sequence of alternating host and worker runs, and the graph or
+//! artifact set only has to cross the process boundary once per run. On a pipeline with seventeen
+//! custom transforms in five runs that is five crossings instead of seventeen, and the crossing —
+//! encode, pipe, decode, on both sides — is what a large graph costs.
+//!
+//! Every message is one self-delimiting, digest-checked frame:
 //!
 //! ```text
 //! b"GN8F" | payload length: u32 big-endian | BLAKE3(payload): 32 bytes | payload: compact JSON
@@ -30,7 +37,7 @@ use crate::Error;
 /// Bumped on any breaking change to the frame or message shape. Both sides refuse to proceed on a
 /// mismatch, so a `.gnr8/` crate built against a skewed SDK fails with an actionable error rather
 /// than a confusing parse failure or silently-wrong output.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The frame magic. A stream that does not start with it is not this protocol.
 pub const FRAME_MAGIC: [u8; 4] = *b"GN8F";
@@ -83,26 +90,26 @@ pub enum HostMessage {
         /// Position within the pipeline's source vector.
         index: usize,
     },
-    /// Run the custom transform at `index` over `graph` and return the mutated graph.
-    ApplyTransform {
-        /// Position within the pipeline's transform vector.
-        index: usize,
+    /// Run the custom transforms at `indices`, in order, over `graph`.
+    ApplyTransforms {
+        /// Positions within the pipeline's transform vector, in composition order.
+        indices: Vec<usize>,
         /// The graph as it stands after every earlier stage.
         graph: ApiGraph,
     },
-    /// Run the custom target at `index` and return the artifact set it produced.
-    GenerateTarget {
-        /// Position within the pipeline's target vector.
-        index: usize,
+    /// Run the custom targets at `indices`, in order, and return the artifact set they produced.
+    GenerateTargets {
+        /// Positions within the pipeline's target vector, in composition order.
+        indices: Vec<usize>,
         /// The frozen, generation-ready graph.
         graph: ApiGraph,
         /// The artifact set as it stands after every earlier target.
         artifacts: Vec<Artifact>,
     },
-    /// Run the custom post-processor at `index` over `artifacts`.
-    RunPost {
-        /// Position within the pipeline's post vector.
-        index: usize,
+    /// Run the custom post-processors at `indices`, in order, over `artifacts`.
+    RunPosts {
+        /// Positions within the pipeline's post vector, in composition order.
+        indices: Vec<usize>,
         /// The artifact set as it stands after every earlier stage.
         artifacts: Vec<Artifact>,
     },
