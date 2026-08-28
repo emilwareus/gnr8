@@ -99,11 +99,42 @@ where
     }
 }
 
+/// Run two independent computations at once and return both results.
+///
+/// For the places where a run must read two large, unrelated things before it can decide anything:
+/// the analyzed module's sources and the compiled extractor that will read them, or the host binary
+/// and the worker it built. Both are read either way; this only stops one waiting for the other.
+///
+/// # Errors
+///
+/// Returns `left`'s failure if it has one, otherwise `right`'s — a fixed order, so which side
+/// happened to finish first cannot decide which error a user sees. A panicking computation becomes
+/// [`CoreError::SdkGen`] rather than a propagated unwind.
+pub(crate) fn join<L, R, TL, TR>(left: L, right: R) -> Result<(TL, TR), CoreError>
+where
+    L: FnOnce() -> Result<TL, CoreError> + Send,
+    R: FnOnce() -> Result<TR, CoreError> + Send,
+    TL: Send,
+    TR: Send,
+{
+    let (left, right) = std::thread::scope(|scope| {
+        let handle = scope.spawn(right);
+        let left = left();
+        (left, handle.join())
+    });
+    let right = right.unwrap_or_else(|_| {
+        Err(CoreError::SdkGen {
+            message: "a worker thread stopped unexpectedly".to_string(),
+        })
+    });
+    Ok((left?, right?))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{map_ordered, MIN_PARALLEL_ITEMS};
+    use super::{join, map_ordered, MIN_PARALLEL_ITEMS};
     use crate::CoreError;
 
     #[test]
@@ -136,6 +167,30 @@ mod tests {
             map_ordered(&long, render).unwrap(),
             long.iter().map(usize::to_string).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn join_reports_the_left_failure_first() {
+        let err = join::<_, _, (), ()>(
+            || {
+                Err(CoreError::SdkGen {
+                    message: "left".to_string(),
+                })
+            },
+            || {
+                Err(CoreError::SdkGen {
+                    message: "right".to_string(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("left"), "{err}");
+    }
+
+    #[test]
+    fn join_returns_both_results() {
+        let (left, right) = join(|| Ok(1_u8), || Ok("two")).unwrap();
+        assert_eq!((left, right), (1, "two"));
     }
 
     #[test]

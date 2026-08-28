@@ -489,14 +489,8 @@ fn validate_write_plan(
     let mut paths = OutputPathGuard::new(project_root);
     let mut safe_paths = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        safe_paths.push(paths.resolve(&file.path)?);
-        let identity =
-            portable_path_identity(&file.path).map_err(|reason| crate::CoreError::Io {
-                message: format!(
-                    "refusing to write non-portable output path {:?}: {reason}",
-                    file.path
-                ),
-            })?;
+        let (safe, identity) = paths.resolve_with_identity(&file.path)?;
+        safe_paths.push(safe);
         if let Some(previous) = seen.insert(identity, file.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),
@@ -848,8 +842,20 @@ impl OutputPathGuard {
         }
     }
 
+    /// The absolute path `rel` resolves to, discarding the portable identity it proved on the way.
     fn resolve(&mut self, rel: &str) -> Result<std::path::PathBuf, crate::CoreError> {
-        portable_path_identity(rel).map_err(|reason| crate::CoreError::Io {
+        self.resolve_with_identity(rel).map(|(path, _)| path)
+    }
+
+    /// The absolute path AND the portable identity, for callers that need both.
+    ///
+    /// Proving a path portable computes its identity; handing it back stops the caller computing the
+    /// same Unicode fold a second time for its collision map.
+    fn resolve_with_identity(
+        &mut self,
+        rel: &str,
+    ) -> Result<(std::path::PathBuf, String), crate::CoreError> {
+        let identity = portable_path_identity(rel).map_err(|reason| crate::CoreError::Io {
             message: format!("refusing to write non-portable output path {rel:?}: {reason}"),
         })?;
         let candidate = Path::new(rel);
@@ -910,7 +916,7 @@ impl OutputPathGuard {
                 }
             }
         }
-        Ok(safe)
+        Ok((safe, identity))
     }
 }
 
@@ -2278,14 +2284,7 @@ fn validate_output_paths(
     let mut seen = BTreeMap::new();
     let mut paths = OutputPathGuard::new(project_root);
     for artifact in artifacts {
-        paths.resolve(&artifact.path)?;
-        let collision_key =
-            portable_path_identity(&artifact.path).map_err(|reason| crate::CoreError::Io {
-                message: format!(
-                    "refusing to write non-portable output path {:?}: {reason}",
-                    artifact.path
-                ),
-            })?;
+        let (_, collision_key) = paths.resolve_with_identity(&artifact.path)?;
         if let Some(previous) = seen.insert(collision_key, artifact.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),

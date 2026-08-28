@@ -463,12 +463,21 @@ struct Fingerprints {
 
 fn fingerprints(workspace: &Workspace, host_hash: &str) -> Result<Fingerprints, CoreError> {
     let files = workspace_input_files(&workspace.dir)?;
+    fingerprints_of(workspace, host_hash, &files)
+}
+
+/// The two fingerprints over an already-enumerated input set.
+fn fingerprints_of(
+    workspace: &Workspace,
+    host_hash: &str,
+    files: &[PathBuf],
+) -> Result<Fingerprints, CoreError> {
     let prefix = format!(
         "{host_hash}\n{}\n{}\n",
         gnr8::protocol::PROTOCOL_VERSION,
         gnr8::protocol::capability_digest(gnr8::protocol::sdk_version())
     );
-    let (complete, authored) = hash_paths(&workspace.dir, &files, "Cargo.lock")?;
+    let (complete, authored) = hash_paths(&workspace.dir, files, "Cargo.lock")?;
     Ok(Fingerprints {
         complete: blake3_hex(format!("{prefix}{complete}").as_bytes()),
         authored: blake3_hex(format!("{prefix}{authored}").as_bytes()),
@@ -487,7 +496,14 @@ fn binary_identity(path: &Path) -> Option<(u64, String)> {
 }
 
 /// Whether a recorded stamp still describes the binary on disk.
-fn stamp_matches(workspace: &Workspace, stamp: &WorkerStamp, fingerprint: &str) -> bool {
+///
+/// `on_disk` is that binary's already-read identity, or `None` if there is no binary there.
+fn stamp_matches(
+    workspace: &Workspace,
+    stamp: &WorkerStamp,
+    fingerprint: &str,
+    on_disk: Option<&(u64, String)>,
+) -> bool {
     if stamp.fingerprint != fingerprint {
         return false;
     }
@@ -495,8 +511,7 @@ fn stamp_matches(workspace: &Workspace, stamp: &WorkerStamp, fingerprint: &str) 
     if project_relative(&workspace.project_root, &binary) != stamp.binary {
         return false;
     }
-    binary_identity(&binary)
-        .is_some_and(|(len, hash)| len == stamp.binary_len && hash == stamp.binary_hash)
+    on_disk.is_some_and(|(len, hash)| *len == stamp.binary_len && *hash == stamp.binary_hash)
 }
 
 fn project_relative(root: &Path, path: &Path) -> String {
@@ -574,10 +589,25 @@ pub fn ensure_worker(
     workspace: &Workspace,
     policy: WorkerPolicy,
 ) -> Result<WorkerBinary, CoreError> {
-    let host_hash = host_executable_hash()?;
-    let before = fingerprints(workspace, &host_hash)?;
+    // Deciding whether the recorded worker is still current means reading the host executable, every
+    // `.gnr8/` input, and the built worker — tens of megabytes of unrelated files. They are read at
+    // the same time rather than one after another.
+    let ((host_hash, workspace_files), recorded_binary) = crate::parallel::join(
+        || {
+            let host_hash = host_executable_hash()?;
+            let files = workspace_input_files(&workspace.dir)?;
+            Ok((host_hash, files))
+        },
+        || Ok(binary_identity(&workspace.binary_path())),
+    )?;
+    let before = fingerprints_of(workspace, &host_hash, &workspace_files)?;
     if let Some(stamp) = read_stamp(workspace) {
-        if stamp_matches(workspace, &stamp, &before.complete) {
+        if stamp_matches(
+            workspace,
+            &stamp,
+            &before.complete,
+            recorded_binary.as_ref(),
+        ) {
             let binary = workspace.binary_path();
             confirm_binary_is_inside_the_workspace(workspace, &binary)?;
             return Ok(WorkerBinary {

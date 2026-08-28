@@ -219,7 +219,19 @@ pub(crate) fn generate_files_with_options(
         // the model. Building it per schema made a 1,576-model SDK construct the same 1,576-entry
         // map 1,576 times — 2.5M string clones for one directory's worth of answers.
         let mut dep_modules_by_dir: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        for schema in &graph.schemas {
+        for name in schema_file_names.values() {
+            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+            dep_modules_by_dir.entry(from_dir).or_insert_with(|| {
+                schema_file_names
+                    .iter()
+                    .map(|(model, file)| (model.clone(), python_relative_module(name, file)))
+                    .collect()
+            });
+        }
+        // Each model file is a pure function of the frozen graph and its own schema, so they render
+        // across the machine's cores; `map_ordered` fills the result by index, leaving the emitted
+        // sequence — and the bytes — independent of how many cores rendered it.
+        files.extend(crate::parallel::map_ordered(&graph.schemas, |schema| {
             let name = schema_file_names
                 .get(&schema.name)
                 .ok_or_else(|| crate::CoreError::SdkGen {
@@ -229,24 +241,22 @@ pub(crate) fn generate_files_with_options(
                     ),
                 })?
                 .clone();
-            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
-            let dep_modules = dep_modules_by_dir.entry(from_dir).or_insert_with(|| {
-                schema_file_names
-                    .iter()
-                    .map(|(model, file)| (model.clone(), python_relative_module(&name, file)))
-                    .collect()
-            });
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_schema(
-                    graph,
-                    schema,
-                    model_style,
-                    dep_modules,
-                    directions_of(&directions, &schema.id),
-                )?,
-            });
-        }
+            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let dep_modules =
+                dep_modules_by_dir
+                    .get(from_dir)
+                    .ok_or_else(|| crate::CoreError::SdkGen {
+                        message: format!("schema {} did not have a module map", schema.name),
+                    })?;
+            let contents = emit::emit_model_schema(
+                graph,
+                schema,
+                model_style,
+                dep_modules,
+                directions_of(&directions, &schema.id),
+            )?;
+            Ok(SdkFile { name, contents })
+        })?);
     } else {
         files.push(SdkFile {
             name: "models.py".to_string(),

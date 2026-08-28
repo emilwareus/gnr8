@@ -153,13 +153,20 @@ impl SourceExec for GoGin {
         // reading — used for the cache key AND for the run. Resolving it twice, or predicting the
         // helper from `go env` rather than naming it, is what let a broken extraction be cached
         // and then reported as up to date (issue #67).
-        let extractor = crate::analyze::helper::goextract_identity(&target)?;
+        // Naming the extractor means a `go env` probe and hashing the compiled helper; keying the
+        // cache means walking and hashing the analyzed module. Neither needs the other's answer, so
+        // they are read at the same time.
+        let (extractor, scope_digest) = crate::parallel::join(
+            || crate::analyze::helper::goextract_identity(&target),
+            || Ok(go_gin_scope_digest(&resolved, cx)),
+        )?;
         let cache_key = go_gin_cache_key(
             &resolved,
             &self.route_package_patterns,
             &self.schema_package_patterns,
             &extractor,
             cx,
+            scope_digest,
         );
         if let Some(cached) = cache_key
             .as_deref()
@@ -342,15 +349,27 @@ fn go_gin_cache_scope_files(scope: &Path) -> Option<Vec<PathBuf>> {
 ///
 /// Pure with respect to the toolchain: the caller resolves [`ExtractorIdentity`] once and hands it
 /// in, so the key and the run can never describe two different helpers.
+/// The analyzed module's directory and one digest over every build input under it.
+///
+/// `None` whenever the input surface cannot be proven exactly — no enclosing module inside the
+/// project, a Go workspace, or a tree that cannot be enumerated — which means no cache key, which
+/// means the analysis is simply recomputed.
+fn go_gin_scope_digest(input: &Path, cx: &Cx) -> Option<(PathBuf, String)> {
+    let scope = go_gin_cache_scope(&cx.project_root, input)?;
+    let files = go_gin_cache_scope_files(&scope)?;
+    let digest = hash_files(&files, &cx.project_root).ok()?;
+    Some((scope, digest))
+}
+
 fn go_gin_cache_key(
     input: &Path,
     route_package_patterns: &[String],
     schema_package_patterns: &[String],
     extractor: &ExtractorIdentity,
     cx: &Cx,
+    scope_digest: Option<(PathBuf, String)>,
 ) -> Option<String> {
-    let scope = go_gin_cache_scope(&cx.project_root, input)?;
-    let files = go_gin_cache_scope_files(&scope)?;
+    let (scope, files_digest) = scope_digest?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-go-gin-source-cache-v6\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -379,7 +398,7 @@ fn go_gin_cache_key(
         hasher.update(pattern.as_bytes());
         hasher.update(b"\0");
     }
-    hasher.update(hash_files(&files, &cx.project_root).ok()?.as_bytes());
+    hasher.update(files_digest.as_bytes());
     Some(hasher.finalize().to_hex().to_string())
 }
 
@@ -3773,15 +3792,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        create_unique_postprocess_dir, go_gin_cache_key, go_gin_cache_path, load_go_gin_cache,
-        save_go_gin_cache, sdk_package, source_input_roots, ApiOverrides, ApplySecurity,
-        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder,
-        ExtractorIdentity, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
-        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata,
-        OpenApiSchemaPatch, OperationSelector, ParameterOverride, PostExec, PySdk, RenameType,
-        RequestParameter, ResponseOverride, SdkPackageMetadata, SecurityOverride, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec,
-        StaticFiles, StaticFilesSources, TargetExec, TransformExec, TsSdk,
+        create_unique_postprocess_dir, go_gin_cache_path, load_go_gin_cache, save_go_gin_cache,
+        sdk_package, source_input_roots, ApiOverrides, ApplySecurity, ConfigurePagination,
+        ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, ExtractorIdentity, FastApi, Flask,
+        FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
+        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
+        ParameterOverride, PostExec, PySdk, RenameType, RequestParameter, ResponseOverride,
+        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec, StaticFiles,
+        StaticFilesSources, TargetExec, TransformExec, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta, LiteralValue};
     use crate::graph::{
@@ -3797,6 +3816,24 @@ mod tests {
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
+    }
+
+    /// The cache key for a real input tree, resolving the scope the way a run's `join` does.
+    fn go_gin_cache_key(
+        input: &std::path::Path,
+        routes: &[String],
+        schemas: &[String],
+        extractor: &ExtractorIdentity,
+        cx: &Cx,
+    ) -> Option<String> {
+        super::go_gin_cache_key(
+            input,
+            routes,
+            schemas,
+            extractor,
+            cx,
+            super::go_gin_scope_digest(input, cx),
+        )
     }
 
     /// A stand-in extractor identity for the cache-key tests.

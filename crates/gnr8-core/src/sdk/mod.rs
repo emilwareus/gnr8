@@ -63,7 +63,10 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
     if path.is_empty() {
         return Err("path is empty".to_string());
     }
-    if path.nfc().collect::<String>() != path {
+    // ASCII is already NFC, so normalizing it is provably the identity. Skipping the walk matters:
+    // a generation asks this question tens of thousands of times, and essentially every real output
+    // path is ASCII.
+    if !path.is_ascii() && path.nfc().collect::<String>() != path {
         return Err("path must use Unicode NFC normalization".to_string());
     }
     if path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
@@ -123,8 +126,14 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
             ));
         }
 
-        let folded = component.case_fold().collect::<String>();
-        identity.push(folded.nfc().collect::<String>());
+        // Full case folding maps A-Z to a-z and leaves every other ASCII character alone — no ASCII
+        // character folds to a longer or non-ASCII one — and the result is again ASCII, hence again
+        // NFC. So for an ASCII component the two Unicode passes are exactly `to_ascii_lowercase`.
+        identity.push(if component.is_ascii() {
+            component.to_ascii_lowercase()
+        } else {
+            component.case_fold().collect::<String>().nfc().collect()
+        });
     }
     Ok(identity.join("/"))
 }
