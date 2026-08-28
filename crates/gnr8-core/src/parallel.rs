@@ -133,43 +133,63 @@ where
     }
 }
 
-/// Start every task at once and take the results back in the order the tasks were given.
+/// Run `tasks` ahead of the caller and take the results back in the order they were given.
 ///
 /// [`map_ordered`] makes the caller wait for all of it. This does not: [`Started::next`] blocks only
 /// on the task whose turn it is, so the tasks the caller has not reached keep running while it does
 /// something else — which is the whole point when what the caller does in between is wait on another
 /// process.
 ///
+/// The FIRST task runs on the caller's own thread, because the caller is about to block on it and
+/// nothing is gained by making it share the machine with tasks whose results are not wanted yet. The
+/// rest start behind it, in the window the caller was going to spend elsewhere.
+///
 /// Order and failure reporting match [`map_ordered`]: results come back in task order, and a task
 /// that panics becomes a typed error rather than a propagated unwind (RUST-04).
-pub(crate) fn start_all<'scope, 'env, T, F>(
+pub(crate) fn run_ahead<'scope, 'env, T, F>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     tasks: Vec<F>,
-) -> Started<'scope, T>
+) -> Started<'scope, 'env, T, F>
 where
     F: FnOnce() -> Result<T, CoreError> + Send + 'scope,
     T: Send + 'scope,
 {
     Started {
-        handles: tasks.into_iter().map(|task| scope.spawn(task)).collect(),
+        scope,
+        waiting: tasks.into(),
+        running: std::collections::VecDeque::new(),
     }
 }
 
-/// Tasks started by [`start_all`], taken back in the order they were given.
-pub(crate) struct Started<'scope, T> {
-    handles:
+/// Tasks handed to [`run_ahead`], taken back in the order they were given.
+pub(crate) struct Started<'scope, 'env, T, F> {
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    waiting: std::collections::VecDeque<F>,
+    running:
         std::collections::VecDeque<std::thread::ScopedJoinHandle<'scope, Result<T, CoreError>>>,
 }
 
-impl<T> Started<'_, T> {
+impl<'scope, T, F> Started<'scope, '_, T, F>
+where
+    F: FnOnce() -> Result<T, CoreError> + Send + 'scope,
+    T: Send + 'scope,
+{
     /// Wait for the next task's result.
     ///
     /// # Errors
     ///
     /// Returns the task's own failure, or [`CoreError::SdkGen`] if it panicked or if more results
-    /// were asked for than tasks were started.
+    /// were asked for than tasks were given.
     pub(crate) fn next(&mut self) -> Result<T, CoreError> {
-        let Some(handle) = self.handles.pop_front() else {
+        if let Some(first) = self.waiting.pop_front() {
+            // Everything still waiting goes to the machine now: from here on the caller has other
+            // work between one result and the next, and that window is what pays for them.
+            for task in self.waiting.drain(..) {
+                self.running.push_back(self.scope.spawn(task));
+            }
+            return first();
+        }
+        let Some(handle) = self.running.pop_front() else {
             return Err(CoreError::SdkGen {
                 message: "asked for the result of a computation that was never started".to_string(),
             });
