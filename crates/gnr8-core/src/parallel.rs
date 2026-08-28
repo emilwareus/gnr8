@@ -140,40 +140,38 @@ where
 /// something else — which is the whole point when what the caller does in between is wait on another
 /// process.
 ///
-/// Only the FIRST task starts immediately: the caller is about to block on it, and handing the
-/// machine to tasks whose results are not wanted yet just makes that wait longer. The rest start
-/// once that first result is taken — in the window the caller was going to spend elsewhere.
+/// Every task starts at once. What bounds the caller is the LAST result it takes, and holding a task
+/// back until an earlier result has been taken makes that bound the sum of the waits rather than the
+/// longest of them. It is tempting to give the first task the machine to itself, since the caller is
+/// about to block on it — but the caller then blocks on the second with everything else running
+/// anyway, so the head start only ever buys the first wait and always costs the last one. On a
+/// project whose plan is five built-in targets and no custom stage, there is no worker round trip to
+/// pay the later ones out of and the phase measured 93ms against a 63ms longest target; starting
+/// them together took a warm check from 539ms to 503ms and a warm generate from 621ms to 595ms, with
+/// a project that does have custom targets unchanged either way.
 ///
 /// Order and failure reporting match [`map_ordered`]: results come back in task order, and a task
 /// that panics becomes a typed error rather than a propagated unwind (RUST-04).
 pub(crate) fn run_ahead<'scope, 'env, T, F>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     tasks: Vec<F>,
-) -> Started<'scope, 'env, T, F>
+) -> Started<'scope, T>
 where
     F: FnOnce() -> Result<T, CoreError> + Send + 'scope,
     T: Send + 'scope,
 {
     Started {
-        scope,
-        waiting: tasks.into(),
-        running: std::collections::VecDeque::new(),
+        running: tasks.into_iter().map(|task| scope.spawn(task)).collect(),
     }
 }
 
 /// Tasks handed to [`run_ahead`], taken back in the order they were given.
-pub(crate) struct Started<'scope, 'env, T, F> {
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    waiting: std::collections::VecDeque<F>,
+pub(crate) struct Started<'scope, T> {
     running:
         std::collections::VecDeque<std::thread::ScopedJoinHandle<'scope, Result<T, CoreError>>>,
 }
 
-impl<'scope, T, F> Started<'scope, '_, T, F>
-where
-    F: FnOnce() -> Result<T, CoreError> + Send + 'scope,
-    T: Send + 'scope,
-{
+impl<T> Started<'_, T> {
     /// Wait for the next task's result.
     ///
     /// # Errors
@@ -181,29 +179,16 @@ where
     /// Returns the task's own failure, or [`CoreError::SdkGen`] if it panicked or if more results
     /// were asked for than tasks were given.
     pub(crate) fn next(&mut self) -> Result<T, CoreError> {
-        if self.running.is_empty() {
-            // Nothing is running yet, so start ONLY what the caller is waiting for. Handing the
-            // machine to tasks whose results are not wanted yet just makes this one take longer.
-            if let Some(first) = self.waiting.pop_front() {
-                self.running.push_back(self.scope.spawn(first));
-            }
-        }
         let Some(handle) = self.running.pop_front() else {
             return Err(CoreError::SdkGen {
                 message: "asked for the result of a computation that was never started".to_string(),
             });
         };
-        let result = handle.join().unwrap_or_else(|_| {
+        handle.join().unwrap_or_else(|_| {
             Err(CoreError::SdkGen {
                 message: "a generation worker thread stopped unexpectedly".to_string(),
             })
-        });
-        // From here on the caller has its own work between one result and the next, and that window
-        // is what everything still waiting is paid for out of.
-        for task in self.waiting.drain(..) {
-            self.running.push_back(self.scope.spawn(task));
-        }
-        result
+        })
     }
 }
 

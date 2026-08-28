@@ -301,10 +301,11 @@ pub fn run(
         }
         // A BUILT-IN target is a pure function of the frozen graph: every one of them only creates
         // files, and not one reads the set it writes into. WHEN it runs is therefore not observable
-        // — only WHERE its files land in the accumulated set is. So they run ahead of the loop that
-        // places them, and the loop takes each one's files back at the position the plan gives it. A
-        // run that spends a tenth of a second inside one worker stage emits its whole Go SDK during
-        // that wait instead of after it.
+        // — only WHERE its files land in the accumulated set is. So they ALL run ahead of the loop
+        // that places them, and the loop takes each one's files back at the position the plan gives
+        // it. A run that spends a tenth of a second inside one worker stage emits its whole Go SDK
+        // during that wait instead of after it, and a plan with no worker stage at all is bounded by
+        // its slowest target rather than by the sum of them.
         let graph = &generation_ir;
         std::thread::scope(|scope| -> Result<(), CoreError> {
             let mut produced = crate::parallel::run_ahead(
