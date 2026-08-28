@@ -486,9 +486,10 @@ fn validate_write_plan(
     plan: &WritePlan,
 ) -> Result<Vec<std::path::PathBuf>, crate::CoreError> {
     let mut seen = BTreeMap::new();
+    let mut paths = OutputPathGuard::new(project_root);
     let mut safe_paths = Vec::with_capacity(plan.files.len());
     for file in &plan.files {
-        safe_paths.push(safe_output_path(project_root, &file.path)?);
+        safe_paths.push(paths.resolve(&file.path)?);
         let identity =
             portable_path_identity(&file.path).map_err(|reason| crate::CoreError::Io {
                 message: format!(
@@ -818,58 +819,99 @@ fn safe_output_path(
     project_root: &Path,
     rel: &str,
 ) -> Result<std::path::PathBuf, crate::CoreError> {
-    portable_path_identity(rel).map_err(|reason| crate::CoreError::Io {
-        message: format!("refusing to write non-portable output path {rel:?}: {reason}"),
-    })?;
-    let candidate = Path::new(rel);
-    let mut segments = Vec::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(segment) => segments.push(segment.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            // `..`, a root `/`, or a Windows prefix could escape the project root → reject.
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(crate::CoreError::Io {
-                    message: format!(
-                        "refusing to write output path {rel:?}: it escapes the project root \
-                         (no absolute paths or `..` segments allowed)"
-                    ),
-                });
-            }
+    OutputPathGuard::new(project_root).resolve(rel)
+}
+
+/// Resolves generated-output paths against one project root, proving each directory once.
+///
+/// [`OutputPathGuard::resolve`] is the single definition of "is this path writable": the path is
+/// portable, canonical, free of `..`, and no component of it is a symlink. The last part means one
+/// `symlink_metadata` per ANCESTOR, and outputs share their ancestors — a 4,836-file SDK has nine
+/// directories — so proving them per file re-walked the same nine directories 4,836 times, three
+/// times over per generation.
+///
+/// The guard therefore remembers which ancestors it has already proven, for the one pass it was
+/// built for. That is a pre-flight check, not the enforcement: the writes themselves reach every
+/// component through `open_dir_nofollow` (see [`open_output_dir`]), which refuses a symlink at the
+/// moment of use rather than at the moment of checking.
+struct OutputPathGuard {
+    root: std::path::PathBuf,
+    proven: std::collections::BTreeSet<String>,
+}
+
+impl OutputPathGuard {
+    fn new(project_root: &Path) -> Self {
+        Self {
+            root: std::fs::canonicalize(project_root)
+                .unwrap_or_else(|_| project_root.to_path_buf()),
+            proven: std::collections::BTreeSet::new(),
         }
-    }
-    let normalized = segments.join("/");
-    if normalized.is_empty() || normalized != rel {
-        return Err(crate::CoreError::Io {
-            message: format!(
-                "refusing to write non-canonical output path {rel:?}; use {normalized:?}"
-            ),
-        });
     }
 
-    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    let mut safe = root;
-    for segment in segments {
-        safe.push(segment);
-        match std::fs::symlink_metadata(&safe) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(crate::CoreError::Io {
-                    message: format!(
-                        "refusing to follow symlink in output path {}",
-                        safe.display()
-                    ),
-                });
-            }
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(crate::CoreError::Io {
-                    message: format!("failed to inspect output path {}: {err}", safe.display()),
-                });
+    fn resolve(&mut self, rel: &str) -> Result<std::path::PathBuf, crate::CoreError> {
+        portable_path_identity(rel).map_err(|reason| crate::CoreError::Io {
+            message: format!("refusing to write non-portable output path {rel:?}: {reason}"),
+        })?;
+        let candidate = Path::new(rel);
+        let mut segments = Vec::new();
+        for component in candidate.components() {
+            match component {
+                Component::Normal(segment) => segments.push(segment.to_string_lossy().into_owned()),
+                Component::CurDir => {}
+                // `..`, a root `/`, or a Windows prefix could escape the project root → reject.
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(crate::CoreError::Io {
+                        message: format!(
+                            "refusing to write output path {rel:?}: it escapes the project root \
+                             (no absolute paths or `..` segments allowed)"
+                        ),
+                    });
+                }
             }
         }
+        let normalized = segments.join("/");
+        if normalized.is_empty() || normalized != rel {
+            return Err(crate::CoreError::Io {
+                message: format!(
+                    "refusing to write non-canonical output path {rel:?}; use {normalized:?}"
+                ),
+            });
+        }
+
+        let mut safe = self.root.clone();
+        let mut prefix = String::new();
+        let last = segments.len().saturating_sub(1);
+        for (index, segment) in segments.into_iter().enumerate() {
+            safe.push(&segment);
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&segment);
+            // The leaf is a different file for every output, so it is always inspected; a directory
+            // is inspected the first time this pass reaches it.
+            if index < last && !self.proven.insert(prefix.clone()) {
+                continue;
+            }
+            match std::fs::symlink_metadata(&safe) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(crate::CoreError::Io {
+                        message: format!(
+                            "refusing to follow symlink in output path {}",
+                            safe.display()
+                        ),
+                    });
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(crate::CoreError::Io {
+                        message: format!("failed to inspect output path {}: {err}", safe.display()),
+                    });
+                }
+            }
+        }
+        Ok(safe)
     }
-    Ok(safe)
 }
 
 pub(crate) fn open_project_dir(project_root: &Path) -> Result<Dir, crate::CoreError> {
@@ -2234,8 +2276,9 @@ fn validate_output_paths(
     artifacts: &[Artifact],
 ) -> Result<(), crate::CoreError> {
     let mut seen = BTreeMap::new();
+    let mut paths = OutputPathGuard::new(project_root);
     for artifact in artifacts {
-        safe_output_path(project_root, &artifact.path)?;
+        paths.resolve(&artifact.path)?;
         let collision_key =
             portable_path_identity(&artifact.path).map_err(|reason| crate::CoreError::Io {
                 message: format!(
@@ -2560,7 +2603,9 @@ pub fn plan_only(
     project_root: &Path,
     artifacts: &[Artifact],
 ) -> Result<WritePlan, crate::CoreError> {
-    validate_output_paths(project_root, artifacts)?;
+    {
+        validate_output_paths(project_root, artifacts)?;
+    }
     let mut manifest = manifest::load(&project_root.join(WORKSPACE_DIR))?;
     validate_manifest_paths(&manifest)?;
     let project_dir = open_project_dir(project_root)?;
@@ -2610,7 +2655,9 @@ pub fn regenerate_with_anchors(
     output_anchors: &[String],
     force: bool,
 ) -> Result<GenerateOutcome, crate::CoreError> {
-    validate_output_paths(project_root, artifacts)?;
+    {
+        validate_output_paths(project_root, artifacts)?;
+    }
     let operation =
         begin_generation_operation(project_root, true)?.ok_or_else(|| crate::CoreError::Io {
             message: "failed to open generation operation state".to_string(),

@@ -431,23 +431,35 @@ fn unknown_security_scheme_error(op: &Operation, scheme_id: &str) -> CoreError {
     }
 }
 
-/// Reject duplicate graph schema names before a target turns them into top-level symbols.
+/// Proof that a graph's schema names are unique in one target's symbol space.
 ///
-/// Schema ids can be package-qualified while schema names are local. The local name is what OpenAPI
-/// components and SDK model symbols use, so two ids with the same name must be handled before emission.
-pub(crate) fn check_unique_schema_names(graph: &ApiGraph, target: &str) -> Result<(), CoreError> {
-    let mut seen = BTreeSet::new();
-    for schema in &graph.schemas {
-        if !seen.insert(schema.name.as_str()) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "two schemas share the {target} name '{}' (distinct ids map to one emitted symbol)",
-                    schema.name
-                ),
-            });
+/// Uniqueness is a property of the GRAPH, not of any one emitted file, so it is established once per
+/// generation and then CARRIED to the emitters that depend on it. Carrying it is not ceremony: a
+/// per-schema emitter that re-established it walked every schema for every file it wrote, which is
+/// quadratic in the size of the SDK and was most of the cost of emitting a 1,576-model bundle.
+#[derive(Clone, Copy)]
+pub(crate) struct UniqueSchemaNames(());
+
+impl UniqueSchemaNames {
+    /// Reject duplicate graph schema names before a target turns them into top-level symbols.
+    ///
+    /// Schema ids can be package-qualified while schema names are local. The local name is what
+    /// OpenAPI components and SDK model symbols use, so two ids with the same name must be handled
+    /// before emission.
+    pub(crate) fn check(graph: &ApiGraph, target: &str) -> Result<Self, CoreError> {
+        let mut seen = BTreeSet::new();
+        for schema in &graph.schemas {
+            if !seen.insert(schema.name.as_str()) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "two schemas share the {target} name '{}' (distinct ids map to one emitted symbol)",
+                        schema.name
+                    ),
+                });
+            }
         }
+        Ok(Self(()))
     }
-    Ok(())
 }
 
 /// Reject two schemas whose per-schema model files would land on one path.
@@ -1064,9 +1076,8 @@ pub(crate) fn operation_prose(
 #[cfg(test)]
 mod tests {
     use super::{
-        check_unique_model_file_names, check_unique_schema_names, file_stem, http_auth_features,
-        operation_auth_alternatives, split_words, success_responses_of, ApiKeyLocation,
-        HttpAuthScheme, OperationAuthScheme,
+        check_unique_model_file_names, file_stem, http_auth_features, operation_auth_alternatives,
+        split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationAuthScheme,
     };
     use crate::graph::{
         ApiGraph, Operation, OperationSecurityPolicy, Response, SecurityRequirementGroup,
@@ -1107,7 +1118,7 @@ mod tests {
         assert!(message.contains("model_user_ids.go"), "{message}");
 
         // Distinct names remain distinct symbols, so the NAME check never rejects them.
-        assert!(check_unique_schema_names(&graph, "Go SDK").is_ok());
+        assert!(super::UniqueSchemaNames::check(&graph, "Go SDK").is_ok());
 
         // A compact bundle writes no per-schema file, so it cannot collide.
         assert!(check_unique_model_file_names(

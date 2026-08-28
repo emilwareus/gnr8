@@ -33,6 +33,7 @@ pub mod graph;
 pub mod lifecycle;
 pub mod lower;
 pub mod manifest;
+pub(crate) mod parallel;
 pub mod pipeline;
 pub mod pysdk;
 pub mod resource;

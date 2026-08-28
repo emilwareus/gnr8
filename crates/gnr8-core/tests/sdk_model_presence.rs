@@ -325,7 +325,7 @@ fn a_split_layout_reaches_the_same_answer_as_a_compact_one() {
     let outputs = [
         (
             "Go",
-            gnr8_engine::gosdk::generate_with_layout(&graph(), "presence", "/api", &split)
+            gnr8_engine::gosdk::generate_with_layout(&graph(), "presence", "/api", &split, None)
                 .expect("Go split SDK generation must succeed (requires gofmt)"),
             "type {model} struct {",
             "Validated string `json:\"validated\"`",

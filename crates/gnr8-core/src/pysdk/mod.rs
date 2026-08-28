@@ -20,9 +20,9 @@ use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names, file_stem,
-    http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
-    operation_group_name, validate_sdk_base_path,
+    api_key_credential_names, check_unique_model_file_names, file_stem, http_auth_features,
+    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
+    validate_sdk_base_path, UniqueSchemaNames,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
@@ -105,7 +105,7 @@ pub(crate) fn generate_files_with_options(
     model_style: PyModelStyle,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
-    check_unique_schema_names(graph, "Python SDK")?;
+    UniqueSchemaNames::check(graph, "Python SDK")?;
     check_unique_model_file_names(graph, "Python SDK", layout, |schema| {
         format!("{}.py", file_stem(&schema.name))
     })?;

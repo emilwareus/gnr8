@@ -426,12 +426,17 @@ fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
 }
 
 fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {
-    cx.project_root
-        .join(crate::lifecycle::WORKSPACE_DIR)
-        .join("cache")
+    cache_dir(cx)
         .join("sources")
         .join("go-gin")
         .join(format!("{key}.json"))
+}
+
+/// The project's gnr8 cache directory: where a run keeps everything it may recompute but need not.
+fn cache_dir(cx: &Cx) -> std::path::PathBuf {
+    cx.project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
 }
 
 impl SourceExec for OpenApi {
@@ -2657,7 +2662,7 @@ impl StaticFilesSources for StaticFiles {
 }
 
 impl TargetExec for GoSdk {
-    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
                 message: "GoSdk target has no module — call .module(\"example.com/acme/sdk\")"
@@ -2686,6 +2691,7 @@ impl TargetExec for GoSdk {
             &model.package,
             &model.base_path,
             &self.layout,
+            Some(&cache_dir(cx)),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;

@@ -275,7 +275,7 @@ pub fn run(
         // Every target, including a user-defined one, receives the same canonical directional
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
         // projection belongs at the artifact boundary.
-        let generation_ir = crate::graph::projection::for_generation(&ir)?;
+        let generation_ir = { crate::graph::projection::for_generation(&ir)? };
         for span in stage_spans(&plan.targets) {
             match span {
                 StageSpan::Builtin(position, spec) => {
@@ -309,7 +309,9 @@ pub fn run(
     }
 
     let artifacts = artifacts.into_files();
-    validate_artifact_paths(&artifacts)?;
+    {
+        validate_artifact_paths(&artifacts)?;
+    }
     Ok(PipelineOutcome {
         artifacts,
         diagnostics,

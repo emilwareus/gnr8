@@ -46,18 +46,21 @@ const WORKER_PROFILE: &str = "gnr8";
 
 /// The profile definition passed to every worker build, one `--config` value per line.
 ///
-/// The worker's hot path is the SDK's own work on a graph frame — `serde_json` over the graph and
-/// the frame's blake3 digest — not the user's stage code. On a 4,836-artifact project one graph
-/// round trip cost 408ms of encode + decode with those compiled unoptimized against 27ms with them
-/// optimized, and 17 round trips of that IS the pipeline. Compiling the user's own crate optimized
-/// as well changed nothing measurable, so it is deliberately left alone: their code stays fast to
-/// rebuild and keeps its debug info, which is what a panic in a stage they wrote needs.
+/// The worker spends its time on two things, and an unoptimized build makes both dominate. The
+/// first is the SDK's own work on a frame — `serde_json` over the API graph and the frame's blake3
+/// digest: on a 4,836-artifact project one graph round trip cost 408ms of encode + decode built
+/// unoptimized against 27ms optimized, and the pipeline is several of those. The second is the
+/// user's own stages, which on a project whose custom targets generate content was another ~20% of
+/// a warm run. So the whole worker is optimized, dependencies and user crate alike.
 ///
-/// `opt-level = 1` is the whole of that win at the least compile time — the same pipeline measured
-/// 4.22s at both `1` and `2` — and dependency debug info is dropped because it is 10x of the built
-/// binary that gnr8 re-hashes on every run and nothing reads it.
-const WORKER_PROFILE_CONFIG: [&str; 3] = [
+/// `opt-level = 1` is the whole of that win at the least compile time: `2` measured within noise of
+/// it on both projects (a 4,836-artifact `check` at 1.21-1.25s against 1.28-1.58s, a 332-artifact
+/// one at 0.39-0.48s against 0.40-0.41s) while adding up to 20s to a from-scratch build. Dependency
+/// debug info is dropped because it is 10x of the binary gnr8 re-hashes on every run and nothing
+/// reads it; the user's own crate keeps its own, which is what a panic in a stage they wrote needs.
+const WORKER_PROFILE_CONFIG: [&str; 4] = [
     r#"profile.gnr8.inherits="dev""#,
+    "profile.gnr8.opt-level=1",
     r#"profile.gnr8.package."*".opt-level=1"#,
     r#"profile.gnr8.package."*".debug=false"#,
 ];

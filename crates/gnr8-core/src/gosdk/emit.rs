@@ -30,10 +30,10 @@ use crate::graph::{
     RuntimePolicy, Schema, Type, WellKnown,
 };
 use crate::sdk::emit_common::{
-    check_unique_schema_names, error_response_bodies_of, join_path, operation_auth_alternatives,
-    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
-    split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
-    OperationAuthScheme, RequestBodyEncoding, SuccessResponses,
+    error_response_bodies_of, join_path, operation_auth_alternatives, operation_prose, path_tokens,
+    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
+    OperationAuthScheme, RequestBodyEncoding, SuccessResponses, UniqueSchemaNames,
 };
 use crate::CoreError;
 
@@ -302,7 +302,7 @@ fn type_needs_time(schema: &Type, graph: &ApiGraph) -> bool {
 ///
 /// Returns [`CoreError::SdkGen`] if any field's schema cannot be mapped to a Go type.
 pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "Go SDK")?;
+    UniqueSchemaNames::check(graph, "Go SDK")?;
 
     let mut body = String::new();
     let mut needs_time = false;

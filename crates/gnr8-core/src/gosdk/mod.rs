@@ -20,9 +20,9 @@ use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names, file_stem,
-    http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
-    operation_group_name, validate_sdk_base_path,
+    api_key_credential_names, check_unique_model_file_names, file_stem, http_auth_features,
+    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
+    validate_sdk_base_path, UniqueSchemaNames,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 
@@ -50,10 +50,14 @@ pub fn generate(
     package: &str,
     base_path: &str,
 ) -> Result<String, crate::CoreError> {
-    generate_with_layout(graph, package, base_path, &SdkFileLayout::compact())
+    generate_with_layout(graph, package, base_path, &SdkFileLayout::compact(), None)
 }
 
 /// Generate the Go SDK with a configurable file layout.
+///
+/// `memo_dir` is where the canonical formatter keeps its record of already-formatted sources — the
+/// project's `.gnr8/cache` for a pipeline run, `None` for a caller with no project to keep one in.
+/// It changes nothing about the emitted bytes.
 ///
 /// # Errors
 ///
@@ -63,9 +67,10 @@ pub fn generate_with_layout(
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
+    memo_dir: Option<&std::path::Path>,
 ) -> Result<String, crate::CoreError> {
     let projected = crate::graph::projection::for_generation(graph)?;
-    let files = generate_files_with_layout(&projected, package, base_path, layout)?;
+    let files = generate_files_with_layout(&projected, package, base_path, layout, memo_dir)?;
     let bundle = SdkBundle { files };
     Ok(bundle.to_string())
 }
@@ -80,9 +85,10 @@ pub(crate) fn generate_files_with_layout(
     package: &str,
     base_path: &str,
     layout: &SdkFileLayout,
+    memo_dir: Option<&std::path::Path>,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
-    check_unique_schema_names(graph, "Go SDK")?;
+    UniqueSchemaNames::check(graph, "Go SDK")?;
     check_unique_model_file_names(graph, "Go SDK", layout, |schema| {
         format!("model_{}.go", file_stem(&schema.name))
     })?;
@@ -150,7 +156,10 @@ pub(crate) fn generate_files_with_layout(
         // One walk for the whole bundle: the positions a schema is reached from are a property of the
         // graph, not of the file it lands in.
         let directions = schema_directions(graph);
-        for schema in &graph.schemas {
+        // Each model file is a pure function of the frozen graph and its own schema, and on a large
+        // SDK rendering them is the bulk of generation. `map_ordered` fills the result by index, so
+        // the sequence — and the bytes — do not depend on how many cores rendered it.
+        files.extend(crate::parallel::map_ordered(&graph.schemas, |schema| {
             let raw = emit::emit_model_schema(
                 graph,
                 package,
@@ -162,8 +171,8 @@ pub(crate) fn generate_files_with_layout(
                 schema,
                 &format!("model_{}.go", file_stem(&schema.name)),
             )?;
-            files.push(raw_go_file(name, raw));
-        }
+            Ok(raw_go_file(name, raw))
+        })?);
     } else {
         // All operations go into a single generic `operations.go` resource surface. Tags were an
         // annotation fact and have been removed (CLAUDE.md rules 1 & 3), so there is no per-tag grouping;
@@ -176,7 +185,7 @@ pub(crate) fn generate_files_with_layout(
     }
 
     check_unique_file_names(&files, "Go SDK")?;
-    let mut files = gofmt::gofmt_files(files)?;
+    let mut files = gofmt::gofmt_files(files, memo_dir)?;
     check_unique_file_names(&files, "Go SDK")?;
     files.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(files)
@@ -399,6 +408,7 @@ mod tests {
             "goalservice",
             "/goal",
             &SdkFileLayout::split(),
+            None,
         )
         .unwrap();
         for marker in [
@@ -425,7 +435,8 @@ mod tests {
             return;
         }
         let layout = SdkFileLayout::split().operations_per_endpoint();
-        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap();
+        let out =
+            generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout, None).unwrap();
         for marker in [
             "// ==== gnr8:file api_create_goal.go ====",
             "// ==== gnr8:file api_list_goals.go ====",
@@ -444,8 +455,8 @@ mod tests {
         let layout = SdkFileLayout::split()
             .operations_per_endpoint()
             .operation_file_template("api_{service_snake}.go");
-        let err =
-            generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap_err();
+        let err = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout, None)
+            .unwrap_err();
         assert!(
             err.to_string().contains("duplicate SDK file"),
             "unexpected error: {err}"
@@ -462,8 +473,14 @@ mod tests {
         for op in &mut graph.operations {
             op.group = Some("Goals".to_string());
         }
-        let out =
-            generate_with_layout(&graph, "goalservice", "/goal", &SdkFileLayout::split()).unwrap();
+        let out = generate_with_layout(
+            &graph,
+            "goalservice",
+            "/goal",
+            &SdkFileLayout::split(),
+            None,
+        )
+        .unwrap();
         assert!(
             out.contains("// ==== gnr8:file facades.go ===="),
             "split layout should emit a dedicated facade file:\n{out}"
@@ -487,7 +504,7 @@ mod tests {
             op.group = Some("Goals".to_string());
         }
         let layout = SdkFileLayout::split().compact_operations();
-        let out = generate_with_layout(&graph, "goalservice", "/goal", &layout).unwrap();
+        let out = generate_with_layout(&graph, "goalservice", "/goal", &layout, None).unwrap();
         assert!(
             out.contains("// ==== gnr8:file operations.go ===="),
             "compact operations should emit operations.go:\n{out}"
@@ -518,7 +535,8 @@ mod tests {
             .operations_per_endpoint()
             .operation_dir("apis")
             .model_dir("types");
-        let out = generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout).unwrap();
+        let out =
+            generate_with_layout(&sample_graph(), "goalservice", "/goal", &layout, None).unwrap();
         for marker in [
             "// ==== gnr8:file apis/api_create_goal.go ====",
             "// ==== gnr8:file types/model_create_goal_input.go ====",
