@@ -51,17 +51,28 @@ const WORKER_PROFILE: &str = "gnr8";
 /// digest: on a 4,836-artifact project one graph round trip cost 408ms of encode + decode built
 /// unoptimized against 27ms optimized, and the pipeline is several of those. The second is the
 /// user's own stages, which on a project whose custom targets generate content was another ~20% of
-/// a warm run. So the whole worker is optimized, dependencies and user crate alike.
+/// a warm run. So everything that RUNS IN THE WORKER is optimized, dependencies and user crate
+/// alike: a 332-artifact warm generate measured 0.28s that way against 0.57s with none of it
+/// optimized, and 0.47s with only the SDK optimized.
 ///
 /// `opt-level = 1` is the whole of that win at the least compile time: `2` measured within noise of
 /// it on both projects (a 4,836-artifact `check` at 1.21-1.25s against 1.28-1.58s, a 332-artifact
 /// one at 0.39-0.48s against 0.40-0.41s) while adding up to 20s to a from-scratch build. Dependency
 /// debug info is dropped because it is 10x of the binary gnr8 re-hashes on every run and nothing
 /// reads it; the user's own crate keeps its own, which is what a panic in a stage they wrote needs.
-const WORKER_PROFILE_CONFIG: [&str; 4] = [
+///
+/// A build script or a proc macro runs in the COMPILER, not in the worker, so optimizing one buys
+/// the worker nothing and costs the build the time twice over: `syn` went from 1.6s to 4.6s and
+/// `serde_derive` from 1.8s to 3.4s, both squarely on the critical path to the SDK. `build-override`
+/// is where cargo names those units — and it only reaches them when `package."*"` does not also set
+/// `opt-level`, because a package override is applied last and would shadow it. The profile-wide
+/// setting therefore carries the optimization and `build-override` carves the compiler's own code
+/// back out: a from-scratch worker build went from 20.2s to 15.8s with the warm run unchanged.
+const WORKER_PROFILE_CONFIG: [&str; 5] = [
     r#"profile.gnr8.inherits="dev""#,
     "profile.gnr8.opt-level=1",
-    r#"profile.gnr8.package."*".opt-level=1"#,
+    "profile.gnr8.build-override.opt-level=0",
+    "profile.gnr8.build-override.debug=false",
     r#"profile.gnr8.package."*".debug=false"#,
 ];
 
