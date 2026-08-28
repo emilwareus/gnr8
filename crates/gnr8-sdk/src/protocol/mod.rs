@@ -97,12 +97,18 @@ pub enum HostMessage {
         /// The graph as it stands after every earlier stage.
         graph: ApiGraph,
     },
+    /// Hand over the frozen, generation-ready graph every target sees.
+    ///
+    /// Sent once, before the first target run: the graph is frozen for the whole target phase, so
+    /// re-sending it with each run would ship the same megabytes again for no new fact.
+    FreezeGraph {
+        /// The frozen, generation-ready graph.
+        graph: ApiGraph,
+    },
     /// Run the custom targets at `indices`, in order, and return the artifact set they produced.
     GenerateTargets {
         /// Positions within the pipeline's target vector, in composition order.
         indices: Vec<usize>,
-        /// The frozen, generation-ready graph.
-        graph: ApiGraph,
         /// The artifact set as it stands after every earlier target.
         artifacts: Vec<Artifact>,
     },

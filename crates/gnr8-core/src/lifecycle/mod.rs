@@ -2724,15 +2724,18 @@ fn read_artifacts_from_disk(
     artifacts: &[Artifact],
 ) -> Result<HashMap<String, Option<Vec<u8>>>, crate::CoreError> {
     let project_dir = open_project_dir(project_root)?;
+    // Reading a few thousand generated files is I/O the machine can overlap; the map this builds is
+    // keyed by path, so the order the reads finish in cannot reach the write decision.
+    let bytes = crate::parallel::map_ordered(artifacts, |artifact| {
+        read_output_file(&project_dir, &artifact.path).map_err(|err| crate::CoreError::Io {
+            message: format!(
+                "failed to inspect generated output {}: {err}",
+                project_root.join(&artifact.path).display()
+            ),
+        })
+    })?;
     let mut disk = HashMap::with_capacity(artifacts.len());
-    for artifact in artifacts {
-        let bytes =
-            read_output_file(&project_dir, &artifact.path).map_err(|err| crate::CoreError::Io {
-                message: format!(
-                    "failed to inspect generated output {}: {err}",
-                    project_root.join(&artifact.path).display()
-                ),
-            })?;
+    for (artifact, bytes) in artifacts.iter().zip(bytes) {
         disk.insert(artifact.path.clone(), bytes);
     }
     Ok(disk)

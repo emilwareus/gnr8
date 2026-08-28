@@ -379,7 +379,7 @@ fn go_gin_cache_key(
         hasher.update(pattern.as_bytes());
         hasher.update(b"\0");
     }
-    hasher.update(hash_files(&files, &cx.project_root).as_bytes());
+    hasher.update(hash_files(&files, &cx.project_root).ok()?.as_bytes());
     Some(hasher.finalize().to_hex().to_string())
 }
 

@@ -448,15 +448,27 @@ impl StageRunner for WorkerSession {
         })
     }
 
+    fn freeze_graph(&mut self, graph: &ApiGraph) -> Result<(), CoreError> {
+        self.send(&HostMessage::FreezeGraph {
+            graph: graph.clone(),
+        })?;
+        match self.receive()? {
+            WorkerMessage::Done => Ok(()),
+            WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
+            other => Err(Self::protocol_error(format!(
+                "the .gnr8 worker answered the frozen graph with {}",
+                message_name(&other)
+            ))),
+        }
+    }
+
     fn generate_targets(
         &mut self,
         indices: &[usize],
-        graph: &ApiGraph,
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
         self.expect_artifacts(&HostMessage::GenerateTargets {
             indices: indices.to_vec(),
-            graph: graph.clone(),
             artifacts,
         })
     }

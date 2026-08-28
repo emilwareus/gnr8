@@ -409,21 +409,26 @@ fn workspace_input_files(dir: &Path) -> Result<Vec<PathBuf>, CoreError> {
 /// itself may rewrite during the build and which therefore cannot be part of the concurrent-edit
 /// bracket.
 fn hash_paths(root: &Path, paths: &[PathBuf], skip: &str) -> Result<(String, String), CoreError> {
-    let mut complete = blake3::Hasher::new();
-    let mut authored = blake3::Hasher::new();
-    complete.update(b"gnr8-worker-v1\n");
-    authored.update(b"gnr8-worker-v1\n");
-    for path in paths {
+    // The reads are spread across the machine's cores; `map_ordered` keeps them in `paths` order, so
+    // both accumulators fold the same sequence at any thread count.
+    let entries = crate::parallel::map_ordered(paths, |path| {
         let rel = path.strip_prefix(root).unwrap_or(path);
         let rel = rel.to_string_lossy().replace('\\', "/");
         let bytes = std::fs::read(path).map_err(|err| CoreError::WorkerBuild {
             message: format!("failed to read {}: {err}", path.display()),
         })?;
-        let digest = blake3_hex(&bytes);
-        let entry = format!("{rel}\0{digest}\n");
-        complete.update(entry.as_bytes());
+        Ok((rel, format!("\0{}\n", blake3_hex(&bytes))))
+    })?;
+    let mut complete = blake3::Hasher::new();
+    let mut authored = blake3::Hasher::new();
+    complete.update(b"gnr8-worker-v1\n");
+    authored.update(b"gnr8-worker-v1\n");
+    for (rel, digest) in &entries {
+        complete.update(rel.as_bytes());
+        complete.update(digest.as_bytes());
         if rel != skip {
-            authored.update(entry.as_bytes());
+            authored.update(rel.as_bytes());
+            authored.update(digest.as_bytes());
         }
     }
     Ok((

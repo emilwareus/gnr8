@@ -84,6 +84,8 @@ pub(crate) fn serve<R: Read, W: Write>(
     output: &mut W,
 ) -> Result<(), Session> {
     let cx = handshake(pipeline, input, output)?;
+    // The frozen graph the target phase runs against, once the host has handed it over.
+    let mut frozen: Option<crate::graph::ApiGraph> = None;
     loop {
         let request: HostMessage = read_frame(input).map_err(Session::Run)?;
         match request {
@@ -96,7 +98,11 @@ pub(crate) fn serve<R: Read, W: Write>(
                 write_frame(output, &WorkerMessage::Done).map_err(Session::Run)?;
                 return Ok(());
             }
-            other => match dispatch(pipeline, &cx, other) {
+            HostMessage::FreezeGraph { graph } => {
+                frozen = Some(graph);
+                write_frame(output, &WorkerMessage::Done).map_err(Session::Run)?;
+            }
+            other => match dispatch(pipeline, &cx, frozen.as_ref(), other) {
                 Ok(reply) => write_frame(output, &reply).map_err(Session::Run)?,
                 Err(err) => {
                     report(output, &err);
@@ -170,7 +176,12 @@ fn handshake<R: Read, W: Write>(
 /// [`Artifacts`] has no removal API, so the "a stage may create, overlay or rewrite an artifact but
 /// never drop one" rule holds between the stages of a run by construction, exactly as it does for a
 /// run of one.
-fn dispatch(pipeline: &Pipeline, cx: &Cx, request: HostMessage) -> Result<WorkerMessage, Error> {
+fn dispatch(
+    pipeline: &Pipeline,
+    cx: &Cx,
+    frozen: Option<&crate::graph::ApiGraph>,
+    request: HostMessage,
+) -> Result<WorkerMessage, Error> {
     match request {
         HostMessage::LoadSource { index } => {
             let source = pipeline
@@ -189,18 +200,19 @@ fn dispatch(pipeline: &Pipeline, cx: &Cx, request: HostMessage) -> Result<Worker
             }
             Ok(WorkerMessage::Graph { graph })
         }
-        HostMessage::GenerateTargets {
-            indices,
-            graph,
-            artifacts,
-        } => {
+        HostMessage::GenerateTargets { indices, artifacts } => {
+            let graph = frozen.ok_or_else(|| {
+                Error::protocol(
+                    "the host asked for a custom target before handing over the frozen graph",
+                )
+            })?;
             let mut out = Artifacts::from_files(artifacts);
             for index in indices {
                 let target = pipeline
                     .custom_target(index)
                     .ok_or_else(|| unknown_stage("target", index))?;
                 out.begin_stage(format!("target[{index}]:{}", target.producer()));
-                target.generate(&graph, &mut out, cx)?;
+                target.generate(graph, &mut out, cx)?;
             }
             Ok(WorkerMessage::Artifacts {
                 artifacts: out.into_files(),
@@ -219,9 +231,11 @@ fn dispatch(pipeline: &Pipeline, cx: &Cx, request: HostMessage) -> Result<Worker
                 artifacts: out.into_files(),
             })
         }
-        HostMessage::Hello { .. } | HostMessage::Shutdown => Err(Error::protocol(
-            "handshake and shutdown are handled by the session loop",
-        )),
+        HostMessage::Hello { .. } | HostMessage::Shutdown | HostMessage::FreezeGraph { .. } => {
+            Err(Error::protocol(
+                "handshake, graph handover and shutdown are handled by the session loop",
+            ))
+        }
     }
 }
 
@@ -328,12 +342,14 @@ mod tests {
                     indices: vec![0],
                     graph: graph.clone(),
                 },
-                HostMessage::GenerateTargets {
-                    indices: vec![0],
+                HostMessage::FreezeGraph {
                     graph: ApiGraph {
                         title: "Base::marked".to_string(),
                         ..ApiGraph::default()
                     },
+                },
+                HostMessage::GenerateTargets {
+                    indices: vec![0],
                     artifacts: Vec::new(),
                 },
                 HostMessage::Shutdown,
@@ -346,14 +362,36 @@ mod tests {
             panic!("expected a graph reply, got {:?}", messages[1]);
         };
         assert_eq!(graph.title, "Base::marked");
-        let WorkerMessage::Artifacts { artifacts } = &messages[2] else {
-            panic!("expected artifacts, got {:?}", messages[2]);
+        assert!(matches!(messages[2], WorkerMessage::Done));
+        let WorkerMessage::Artifacts { artifacts } = &messages[3] else {
+            panic!("expected artifacts, got {:?}", messages[3]);
         };
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].path, "generated/API.md");
         assert_eq!(artifacts[0].text, "# Base::marked\n");
         assert!(artifacts[0].producer.starts_with("target[0]:"));
-        assert!(matches!(messages[3], WorkerMessage::Done));
+        assert!(matches!(messages[4], WorkerMessage::Done));
+    }
+
+    /// A target request that arrives before the graph handover is a protocol error, not a guess.
+    #[test]
+    fn a_custom_target_before_the_frozen_graph_is_refused() {
+        let pipeline = Pipeline::new().target(Custom(MarkdownTarget));
+        let (result, output) = drive(
+            &pipeline,
+            &[
+                hello(),
+                HostMessage::GenerateTargets {
+                    indices: vec![0],
+                    artifacts: Vec::new(),
+                },
+            ],
+        );
+        assert!(matches!(result, Err(Session::Run(_))));
+        let WorkerMessage::Failed { message } = &replies(&output)[1] else {
+            panic!("expected Failed");
+        };
+        assert!(message.contains("frozen graph"), "{message}");
     }
 
     #[test]
