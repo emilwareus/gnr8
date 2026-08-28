@@ -9,6 +9,37 @@ must move the minor version.
 
 ## Unreleased
 
+### Changed
+
+- **`gnr8 generate` and `gnr8 check` are 10-35x faster on an unchanged project, and generation from
+  scratch is faster on a large one.** Nothing about what gets generated changed: every committed
+  example is byte-identical, and both benchmark projects report `0 written` with a clean working
+  tree after a warm run.
+
+  Measured on an 8-core machine (Linux, `GOTOOLCHAIN=go1.27.0`), median of repeated runs, against
+  the released 0.10.0 host:
+
+  | project | run | 0.10.0 | now | |
+  |---|---|---:|---:|---:|
+  | 332 artifacts, 77 source files | cold generate | 15.04 s | 18.44 s | 0.82x |
+  | | warm generate | 2.42 s | 0.22 s | **11.0x** |
+  | | warm check | 2.17 s | 0.21 s | **10.1x** |
+  | 4,836 artifacts, 251 source files | cold generate | 35.28 s | 19.96 s | **1.77x** |
+  | | warm generate | 20.94 s | 0.59 s | **35.5x** |
+  | | warm check | 9.40 s | 0.52 s | **18.3x** |
+
+  Where the time went, in order of what it was worth: the host now runs every built-in stage itself
+  and asks the worker only for the user's own stages, one request per consecutive run of them; the
+  graph and the artifact set cross that boundary as what CHANGED rather than whole, with a generated
+  file's text carried beside the JSON rather than escaped into it; SDK emission, input hashing,
+  artifact reads and output-path inspection are spread across the cores; a warm run answers with the
+  paths it touched and publishes a manifest only when one changed; and the built-in targets are
+  produced while the worker works.
+
+  The one regression is generation from scratch on a SMALL project, and it is a deliberate trade:
+  the worker and its dependencies are now compiled optimized, which costs 4.7 s of first build and
+  is worth 1.5-1.8x on every warm run after it.
+
 ## 0.10.0 — 2026-08-28
 
 ### Breaking
