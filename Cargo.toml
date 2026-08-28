@@ -64,7 +64,7 @@ same-file = "1.0"
 unicode-normalization = "0.1"
 unicode-casefold = "0.2"
 # Atomic no-clobber rename is the commit primitive for staged generated files on Unix.
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "pipe"] }
 # A focused Windows-only wrapper supplies MoveFileExW's atomic fail-if-destination-exists move on
 # filesystems that do not support hard links. windows-sys constants configure directory durability.
 atomicwrites = "0.4"
