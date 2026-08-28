@@ -239,9 +239,7 @@ fn dispatch(
                     "the host asked for a custom target before handing over the frozen graph",
                 )
             })?;
-            let received = artifacts.resolve(&session.artifacts)?;
-            session.artifacts.clone_from(&received);
-            let mut out = Artifacts::from_files(received);
+            let mut out = Artifacts::from_files(artifacts.resolve(&session.artifacts)?);
             for index in indices {
                 let target = pipeline
                     .custom_target(index)
@@ -249,12 +247,10 @@ fn dispatch(
                 out.begin_stage(format!("target[{index}]:{}", target.producer()));
                 target.generate(graph, &mut out, cx)?;
             }
-            Ok(answer_with_changes(session, out.into_files()))
+            Ok(answer_with_changes(session, out))
         }
         HostMessage::RunPosts { indices, artifacts } => {
-            let received = artifacts.resolve(&session.artifacts)?;
-            session.artifacts.clone_from(&received);
-            let mut out = Artifacts::from_files(received);
+            let mut out = Artifacts::from_files(artifacts.resolve(&session.artifacts)?);
             for index in indices {
                 let post = pipeline
                     .custom_post(index)
@@ -262,7 +258,7 @@ fn dispatch(
                 out.begin_stage(format!("post[{index}]:{}", post.producer()));
                 post.run(&mut out, cx)?;
             }
-            Ok(answer_with_changes(session, out.into_files()))
+            Ok(answer_with_changes(session, out))
         }
         HostMessage::Hello { .. } | HostMessage::Shutdown | HostMessage::FreezeGraph { .. } => {
             Err(Error::protocol(
@@ -273,34 +269,14 @@ fn dispatch(
 }
 
 /// Answer a run with what it changed, and record the set the host will hold once it merges them.
-fn answer_with_changes(session: &mut Held, after: Vec<crate::sdk::Artifact>) -> WorkerMessage {
-    let changed = artifact_changes(&session.artifacts, &after);
-    session.artifacts = after;
-    WorkerMessage::ArtifactChanges { changed }
-}
-
-/// The artifacts in `after` that `before` did not already hold identically.
 ///
-/// Both are sorted by path and `after` is a superset of `before` by path — a stage can create,
-/// overlay or rewrite, never drop — so one merge walk answers it.
-fn artifact_changes(
-    before: &[crate::sdk::Artifact],
-    after: &[crate::sdk::Artifact],
-) -> Vec<crate::sdk::Artifact> {
-    let mut kept = before.iter().peekable();
-    let mut changed = Vec::new();
-    for artifact in after {
-        while kept.peek().is_some_and(|held| held.path < artifact.path) {
-            kept.next();
-        }
-        let held = kept
-            .next_if(|held| held.path == artifact.path)
-            .is_some_and(|held| held == artifact);
-        if !held {
-            changed.push(artifact.clone());
-        }
-    }
-    changed
+/// The accumulator itself knows which paths the run reached, so nothing here compares the finished
+/// set against a copy of the one it started from — on a five-thousand-file project that copy, and
+/// the walk over it, cost more than the two files a post-processor actually rewrote.
+fn answer_with_changes(session: &mut Held, out: Artifacts) -> WorkerMessage {
+    let changed = out.changes();
+    session.artifacts = out.into_files();
+    WorkerMessage::ArtifactChanges { changed }
 }
 
 fn unknown_stage(kind: &str, index: usize) -> Error {

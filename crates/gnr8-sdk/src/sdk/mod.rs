@@ -54,6 +54,7 @@ pub mod layout;
 pub mod model_style;
 pub mod stage;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::graph::{ApiGraph, Diagnostic};
@@ -182,6 +183,13 @@ pub struct Artifacts {
     files: Vec<Artifact>,
     /// The pipeline stage responsible for the next ownership transition.
     current_producer: String,
+    /// For each path a stage has reached since the set was handed over, the value the set held
+    /// then — `None` when it held no such path at all.
+    ///
+    /// A run answers the host with what it CHANGED, and this is what makes that answerable without
+    /// keeping a second copy of every file: only a path a stage actually touched is remembered, and
+    /// only the one value it replaced.
+    replaced: BTreeMap<String, Option<Artifact>>,
 }
 
 impl Default for Artifacts {
@@ -189,6 +197,7 @@ impl Default for Artifacts {
         Self {
             files: Vec::new(),
             current_producer: "direct".to_string(),
+            replaced: BTreeMap::new(),
         }
     }
 }
@@ -258,6 +267,7 @@ impl Artifacts {
                 ))
             }
             Err(index) => {
+                self.replaced.entry(path.clone()).or_insert(None);
                 self.files.insert(
                     index,
                     Artifact {
@@ -335,6 +345,11 @@ impl Artifacts {
     }
 
     fn replace_at(&mut self, index: usize, text: String, ownership: ArtifactOwnership) {
+        if let Some(held) = self.files.get(index) {
+            if !self.replaced.contains_key(&held.path) {
+                self.replaced.insert(held.path.clone(), Some(held.clone()));
+            }
+        }
         if let Some(existing) = self.files.get_mut(index) {
             let previous_producer = existing.producer.clone();
             existing.text = text;
@@ -383,7 +398,28 @@ impl Artifacts {
         Self {
             files,
             current_producer: "restored".to_string(),
+            replaced: BTreeMap::new(),
         }
+    }
+
+    /// The artifacts that differ from what this set held when it was handed over, sorted by path.
+    ///
+    /// A stage reaches a handful of paths out of thousands, so only those are examined: an artifact
+    /// no stage touched cannot have changed, and one that was rewritten back to the value it already
+    /// held has not changed either. Equality is over the whole artifact, so a rewrite that leaves the
+    /// text alone but moves ownership is still a change — the host's copy has to learn that too.
+    pub(crate) fn changes(&self) -> Vec<Artifact> {
+        self.replaced
+            .iter()
+            .filter_map(|(path, before)| {
+                let index = self
+                    .files
+                    .binary_search_by(|a| a.path.as_str().cmp(path))
+                    .ok()?;
+                let current = self.files.get(index)?;
+                (before.as_ref() != Some(current)).then(|| current.clone())
+            })
+            .collect()
     }
 }
 
@@ -633,6 +669,46 @@ mod tests {
 
     use super::{Artifacts, Custom, Cx, Pipeline, Source, Target, Transform};
     use crate::graph::ApiGraph;
+
+    #[test]
+    fn changes_names_only_the_paths_a_stage_reached() {
+        let mut out = Artifacts::from_files(vec![
+            super::Artifact::new("a.txt", "a"),
+            super::Artifact::new("b.txt", "b"),
+        ]);
+        out.begin_stage("post[0]:Banner");
+        out.rewrite("b.txt", |text| format!("{text}!")).unwrap();
+        out.create("c.txt", "c").unwrap();
+
+        let changed = out.changes();
+        let paths: Vec<&str> = changed
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["b.txt", "c.txt"], "a.txt was never reached");
+    }
+
+    /// A rewrite is a change even when the text comes back the same: the host's copy still has to
+    /// learn that the file moved owner.
+    #[test]
+    fn a_rewrite_to_the_same_text_is_still_a_change() {
+        let mut out = Artifacts::from_files(vec![super::Artifact::new("a.txt", "a")]);
+        out.begin_stage("post[0]:Noop");
+        out.rewrite("a.txt", ToString::to_string).unwrap();
+        let changed = out.changes();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].text, "a");
+        assert_eq!(changed[0].producer, "post[0]:Noop");
+    }
+
+    #[test]
+    fn a_set_no_stage_touched_reports_no_changes() {
+        let out = Artifacts::from_files(vec![
+            super::Artifact::new("a.txt", "a"),
+            super::Artifact::new("b.txt", "b"),
+        ]);
+        assert!(out.changes().is_empty());
+    }
     use crate::sdk::stage::PlanStage;
     use crate::Error;
 

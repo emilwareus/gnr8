@@ -325,12 +325,6 @@ impl Manifest {
         let cache = path.parent().ok_or_else(|| crate::CoreError::Manifest {
             message: format!("manifest path {} has no parent directory", path.display()),
         })?;
-        std::fs::create_dir_all(cache).map_err(|err| crate::CoreError::Manifest {
-            message: format!("failed to create {}: {err}", cache.display()),
-        })?;
-        sync_directory(gnr8_dir).map_err(|err| crate::CoreError::Manifest {
-            message: format!("failed to sync {}: {err}", gnr8_dir.display()),
-        })?;
 
         // Serialize a normalized view: current version + path-sorted entries (deterministic diff).
         let normalized = Manifest {
@@ -341,6 +335,23 @@ impl Manifest {
             crate::CoreError::Manifest {
                 message: format!("failed to serialize manifest: {err}"),
             }
+        })?;
+
+        // A run that changed no output records the same ownership it recorded last time, and the
+        // file on disk already holds those exact bytes — durably, because publishing them is what
+        // this function does. Republishing them costs three directory/file syncs to end up where it
+        // started, so the identical case is simply not written. This is the same rule the lifecycle
+        // applies to a generated file whose bytes did not change; it is not a second way to decide
+        // what the manifest says.
+        if std::fs::read(&path).is_ok_and(|published| published == json.as_bytes()) {
+            return Ok(());
+        }
+
+        std::fs::create_dir_all(cache).map_err(|err| crate::CoreError::Manifest {
+            message: format!("failed to create {}: {err}", cache.display()),
+        })?;
+        sync_directory(gnr8_dir).map_err(|err| crate::CoreError::Manifest {
+            message: format!("failed to sync {}: {err}", gnr8_dir.display()),
         })?;
 
         let temp_path = manifest_temp_path(cache);
